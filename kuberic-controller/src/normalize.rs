@@ -280,6 +280,12 @@ fn authority_replica_ids(status: &AcceptedStatus) -> BTreeSet<ReplicaId> {
                 .flat_map(|transition| &transition.current_configuration.members),
         )
         .map(|member| member.identity.replica_id)
+        .chain(
+            status
+                .scale_up_allocation
+                .iter()
+                .map(|allocation| allocation.target_replica_id),
+        )
         .chain(status.provisioning.iter().map(|intent| intent.replica_id()))
         .chain(
             status

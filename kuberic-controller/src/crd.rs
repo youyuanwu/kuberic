@@ -171,6 +171,20 @@ mod tests {
         }
         assert!(status.get("scaleUpCleanup").is_some());
         assert!(status.get("lastScaleUp").is_some());
+        let allocation = &status["scaleUpAllocation"]["properties"];
+        for field in [
+            "resourceUid",
+            "specGeneration",
+            "desiredReplicas",
+            "previousConfigurationId",
+            "targetReplicaId",
+            "operationId",
+            "podUid",
+            "pvcUid",
+        ] {
+            assert!(allocation.get(field).is_some(), "{field}");
+        }
+        assert_eq!(allocation["targetReplicaId"]["minimum"], 1.0);
 
         let provisioning = &status["provisioning"]["properties"]["purpose"]["properties"];
         assert_eq!(

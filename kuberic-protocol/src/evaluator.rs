@@ -142,6 +142,7 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         };
     }
     let scale_up_authority_present = snapshot.status.scale_up_cleanup.is_some()
+        || snapshot.status.scale_up_allocation.is_some()
         || snapshot.status.last_scale_up.is_some()
         || snapshot
             .status
@@ -211,6 +212,12 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             return replacement_cleanup::waiting(snapshot, config);
         }
         return evaluate_transition(snapshot, transition, config);
+    }
+
+    if config.allow_scale_up
+        && let Some(allocation) = &snapshot.status.scale_up_allocation
+    {
+        return scale_up::allocation(snapshot, allocation, config);
     }
 
     if let Some(provisioning) = &snapshot.status.provisioning {

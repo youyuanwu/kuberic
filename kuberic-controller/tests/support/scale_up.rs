@@ -2,6 +2,7 @@ use super::*;
 use kube::Resource;
 use kuberic_protocol::command::{KubernetesChange, ScaleDownResource};
 use kuberic_protocol::types::{AccessStatus, Epoch, TransitionKind};
+use std::collections::BTreeSet;
 
 fn enabled() -> EvaluationConfig {
     EvaluationConfig {
@@ -24,7 +25,12 @@ fn accepted_count(raw: &RawObservation) -> u32 {
 }
 
 fn candidate_key(raw: &RawObservation) -> Option<(ReplicaObservationKey, String)> {
-    let accepted = accepted_count(raw);
+    let accepted = raw
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.topology.as_ref())
+        .map(|topology| &topology.configuration.members);
     raw.pods.iter().find_map(|pod| {
         let replica_id = pod
             .labels()
@@ -32,10 +38,15 @@ fn candidate_key(raw: &RawObservation) -> Option<(ReplicaObservationKey, String)
             .parse::<i64>()
             .ok()
             .map(ReplicaId::new)?;
-        if replica_id.value() <= i64::from(accepted) {
+        let pod_uid = pod.uid()?;
+        if accepted.is_some_and(|members| {
+            members.iter().any(|member| {
+                member.identity.replica_id == replica_id
+                    && member.identity.instance_id.as_str() == pod_uid
+            })
+        }) {
             return None;
         }
-        let pod_uid = pod.uid()?;
         let pvc_name = pod
             .spec
             .as_ref()?
@@ -86,6 +97,29 @@ async fn observe_fresh_candidate(api: &InMemoryClusterApi) {
 }
 
 async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
+    if matches!(
+        command,
+        ProtocolCommand::PrepareSecondaryRemoval(_)
+            | ProtocolCommand::AcceptSecondaryRemovalCommit(_)
+            | ProtocolCommand::RetireReplica(_)
+    ) || matches!(
+        command,
+        ProtocolCommand::EnsureConfiguration(command)
+            if command.secondary_removal_evidence.is_some()
+    ) {
+        secondary_scale_down::apply_command(api, command).await;
+        return;
+    }
+    if matches!(command, ProtocolCommand::PrepareSwitchover(_))
+        || matches!(
+            command,
+            ProtocolCommand::EnsureConfiguration(command)
+                if command.transition_kind == TransitionKind::PlannedSwitchover
+        )
+    {
+        observe_switchover_result(api, command).await;
+        return;
+    }
     let mut raw = api.observation().await;
     match command {
         ProtocolCommand::InitializeAgentStore(command) => {
@@ -214,13 +248,17 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
                 .scale_up_evidence
                 .as_deref()
                 .map(|evidence| evidence.intent().clone().into());
+            if command.scale_up_evidence.is_some() {
+                report.prepared_secondary_removal = None;
+                report.secondary_removal_evidence = None;
+                report.accepted_secondary_removal = None;
+            }
             if command.transition_kind == TransitionKind::Failover {
                 report.deactivation_epoch = Some(command.current_epoch.into());
                 report.deactivated_lsn = Some(boundary);
             }
             report.report_sequence += 1;
         }
-        ProtocolCommand::PrepareSwitchover(_) => {}
         other => panic!("unexpected scale-up command {other:?}"),
     }
     api.set_observation(raw).await;
@@ -231,6 +269,7 @@ async fn tick(api: &Arc<InMemoryClusterApi>) -> (ReconcileKind, Vec<EffectRecord
     let mut restored = api.observation().await;
     restored.set = serde_json::from_value(serde_json::to_value(&restored.set).unwrap()).unwrap();
     api.set_observation(restored).await;
+    refresh_switchover_reports(api).await;
     let before = api.effects().await.len();
     let observed = api.observation_count().await;
     let action = Reconciler::new(api.clone(), enabled())
@@ -245,6 +284,9 @@ async fn tick(api: &Arc<InMemoryClusterApi>) -> (ReconcileKind, Vec<EffectRecord
                 effects.as_slice(),
                 [
                     EffectRecord::RemoveWriteRouting,
+                    EffectRecord::ReplaceStatus
+                ] | [
+                    EffectRecord::PublishWriteRouting(_),
                     EffectRecord::ReplaceStatus
                 ]
             ),
@@ -278,9 +320,53 @@ async fn finish(api: &Arc<InMemoryClusterApi>, desired: u32) -> Vec<(String, Str
             }
         }
     }
+    let effects = api.effects().await;
     panic!(
-        "scale-up did not converge: {:?}",
-        api.observation().await.set.status
+        "scale-up did not converge: status={:?} recent_effects={:?}",
+        api.observation().await.set.status,
+        &effects[effects.len().saturating_sub(12)..]
+    );
+}
+
+async fn finish_switchover(api: &Arc<InMemoryClusterApi>, primary_id: i64) {
+    for _ in 0..200 {
+        tick(api).await;
+        let raw = api.observation().await;
+        let status = raw.set.status.as_ref().unwrap();
+        if status
+            .authority
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.configuration.primary_id.value() == primary_id)
+            && status.authority.transition.is_none()
+            && status.authority.last_switchover.is_some()
+        {
+            return;
+        }
+    }
+    panic!("switchover did not converge");
+}
+
+async fn finish_scale_down(api: &Arc<InMemoryClusterApi>, desired: u32) {
+    for _ in 0..300 {
+        let (kind, _) = tick(api).await;
+        let raw = api.observation().await;
+        if kind == ReconcileKind::Stable
+            && accepted_count(&raw) == desired
+            && raw.set.status.as_ref().is_some_and(|status| {
+                status.authority.transition.is_none()
+                    && status.authority.secondary_scale_down_cleanup.is_none()
+            })
+        {
+            return;
+        }
+    }
+    let raw = api.observation().await;
+    let status = raw.set.status.clone();
+    panic!(
+        "scale-down did not converge: status={:?} plan={:?}",
+        status,
+        evaluate(&normalize(raw, BTreeMap::new()).unwrap(), &enabled())
     );
 }
 
@@ -327,6 +413,7 @@ async fn drive_until_cleanup(api: &Arc<InMemoryClusterApi>) {
 async fn canonical_candidate_is_created_pvc_before_pod_and_lost_create_replays() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
     api.lose_next_create_reply().await;
+    assert_eq!(tick(&api).await.0, ReconcileKind::Applied);
     assert_eq!(tick(&api).await.0, ReconcileKind::ObservationStale);
     let after_lost_reply = api.observation().await;
     assert!(
@@ -342,7 +429,18 @@ async fn canonical_candidate_is_created_pvc_before_pod_and_lost_create_replays()
             .all(|pod| pod.name_any() != "db-2")
     );
 
-    tick(&api).await;
+    for _ in 0..4 {
+        tick(&api).await;
+        if api
+            .observation()
+            .await
+            .pods
+            .iter()
+            .any(|pod| pod.name_any() == "db-2")
+        {
+            break;
+        }
+    }
     let after_pod = api.observation().await;
     let pod = after_pod
         .pods
@@ -1040,4 +1138,396 @@ async fn completion_receipt_does_not_block_exact_pod_safety_fencing() {
         effect,
         EffectRecord::DeleteExactPod { pod_uid, .. } if pod_uid == &uid
     )));
+}
+
+#[tokio::test]
+async fn switchover_scale_down_scale_up_restores_missing_ordinal_with_fresh_incarnation() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(3, 3)));
+    let old_member_two = api
+        .observation()
+        .await
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == 2)
+        .unwrap()
+        .identity
+        .clone();
+
+    let mut raw = api.observation().await;
+    raw.set.spec.switchover = Some(PlannedSwitchoverRequestSpec {
+        request_id: "primary-to-three".into(),
+        target_replica_id: 3,
+    });
+    raw.set.metadata.generation = Some(raw.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(raw).await;
+    finish_switchover(&api, 3).await;
+
+    let mut raw = api.observation().await;
+    raw.set.spec.replicas = 2;
+    raw.set.metadata.generation = Some(raw.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(raw).await;
+    finish_scale_down(&api, 2).await;
+    let reduced = api.observation().await;
+    assert_eq!(
+        reduced
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .iter()
+            .map(|member| member.identity.replica_id.value())
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+
+    let mut raw = reduced;
+    raw.set.spec.replicas = 3;
+    raw.set.metadata.generation = Some(raw.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(raw).await;
+    finish(&api, 3).await;
+
+    let completed = api.observation().await;
+    let authority = &completed.set.status.as_ref().unwrap().authority;
+    let restored = authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == 2)
+        .expect("missing logical member is restored");
+    assert_ne!(restored.identity, old_member_two);
+    let primary = authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap();
+    assert_eq!(primary.identity.replica_id.value(), 3);
+    assert!(completed.services.iter().any(|service| {
+        service.name_any() == "db-write"
+            && service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.selector.as_ref())
+                .and_then(|selector| selector.get(INSTANCE_LABEL))
+                .map(String::as_str)
+                == Some(primary.identity.instance_id.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn committed_candidate_pod_loss_replaces_and_converges_with_receipt_retained() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    finish(&api, 3).await;
+    let before = api.observation().await;
+    let old = before
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == 3)
+        .unwrap()
+        .identity
+        .clone();
+    let old_pvc_uid = before
+        .pvcs
+        .iter()
+        .find(|pvc| pvc.name_any() == "db-3-data")
+        .and_then(ResourceExt::uid)
+        .unwrap();
+    api.delete_exact_pod(&before, "db-3", &PodUid::new(old.instance_id.as_str()))
+        .await
+        .unwrap();
+    assert!(
+        api.observation()
+            .await
+            .pvcs
+            .iter()
+            .any(|pvc| pvc.uid().as_deref() == Some(old_pvc_uid.as_str()))
+    );
+
+    finish(&api, 3).await;
+    let completed = api.observation().await;
+    let authority = &completed.set.status.as_ref().unwrap().authority;
+    let replacement = authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == 3)
+        .unwrap();
+    assert_ne!(replacement.identity.instance_id, old.instance_id);
+    assert!(authority.last_scale_up.is_some());
+    assert!(authority.pending_replacement_cleanup.is_none());
+    assert!(authority.last_replacement.is_none());
+}
+
+#[tokio::test]
+async fn repeated_primary_loss_outranks_deferred_candidate_cleanup() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(4, 5)));
+    for _ in 0..30 {
+        tick(&api).await;
+        if api
+            .observation()
+            .await
+            .set
+            .status
+            .as_ref()
+            .is_some_and(|status| status.authority.provisioning.is_some())
+        {
+            break;
+        }
+    }
+    let raw = api.observation().await;
+    let provisioning = raw
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .provisioning
+        .as_ref()
+        .expect("active scale-up provisioning")
+        .clone();
+    let target = provisioning.target_identity(&ResourceUid::new(UID));
+    let endpoint_name = derive_replica_endpoint_name(&ResourceUid::new(UID), &target);
+    api.fail_exact_lookup(
+        format!("Service/{endpoint_name}"),
+        Some("candidate endpoint lookup unavailable".into()),
+    )
+    .await;
+
+    for expected_failovers in 1..=2 {
+        let mut raw = api.observation().await;
+        let primary = raw
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .unwrap()
+            .identity
+            .clone();
+        let RawAgentObservation::Report(report) = raw
+            .agents
+            .get_mut(&ReplicaObservationKey::new(
+                primary.replica_id,
+                primary.instance_id,
+            ))
+            .unwrap()
+        else {
+            panic!("primary report")
+        };
+        report.reported_fault = proto::FaultType::Permanent as i32;
+        report.healthy = false;
+        raw.now_unix_seconds += 11;
+        api.set_observation(raw).await;
+
+        for _ in 0..120 {
+            let mut raw = api.observation().await;
+            raw.now_unix_seconds += 11;
+            api.set_observation(raw).await;
+            tick(&api).await;
+            let failovers = api
+                .effects()
+                .await
+                .iter()
+                .filter_map(|effect| {
+                    if let EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command)) =
+                        effect
+                        && command.transition_kind == TransitionKind::Failover
+                    {
+                        return Some(command.current_configuration.configuration_id.clone());
+                    }
+                    None
+                })
+                .collect::<BTreeSet<_>>()
+                .len();
+            let status = api.observation().await.set.status.unwrap().authority;
+            assert!(
+                status.provisioning.is_some(),
+                "exact candidate cleanup provenance must remain durable"
+            );
+            if failovers >= expected_failovers
+                && status.transition.is_none()
+                && status
+                    .topology
+                    .as_ref()
+                    .is_some_and(|topology| topology.configuration.primary_id != primary.replica_id)
+            {
+                break;
+            }
+        }
+        let failovers = api
+            .effects()
+            .await
+            .iter()
+            .filter_map(|effect| {
+                if let EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command)) = effect
+                    && command.transition_kind == TransitionKind::Failover
+                {
+                    return Some(command.current_configuration.configuration_id.clone());
+                }
+                None
+            })
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert!(
+            failovers >= expected_failovers,
+            "primary loss {expected_failovers} did not produce another failover command: {:?}",
+            api.observation().await.set.status
+        );
+        if expected_failovers == 1 {
+            let mut converged = api.observation().await;
+            let configuration = converged
+                .set
+                .status
+                .as_ref()
+                .unwrap()
+                .authority
+                .topology
+                .as_ref()
+                .unwrap()
+                .configuration
+                .clone();
+            for member in &configuration.members {
+                let RawAgentObservation::Report(report) = converged
+                    .agents
+                    .get_mut(&ReplicaObservationKey::new(
+                        member.identity.replica_id,
+                        member.identity.instance_id.clone(),
+                    ))
+                    .unwrap()
+                else {
+                    panic!("accepted failover member report")
+                };
+                report.epoch = Some(configuration.epoch.into());
+                report.previous_configuration = None;
+                report.current_configuration = Some(configuration.clone().into());
+                report.role = if member.role == ReplicaRole::Primary {
+                    proto::ReplicaRole::Primary as i32
+                } else {
+                    proto::ReplicaRole::ActiveSecondary as i32
+                };
+                report.write_status = if member.role == ReplicaRole::Primary {
+                    proto::AccessStatus::Granted as i32
+                } else {
+                    proto::AccessStatus::NotPrimary as i32
+                };
+                report.report_sequence += 1;
+            }
+            api.set_observation(converged).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancellation_after_pvc_create_lost_reply_cleans_exact_storage_after_restart() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    api.lose_next_create_reply().await;
+    for _ in 0..10 {
+        tick(&api).await;
+        let raw = api.observation().await;
+        if raw.pvcs.iter().any(|pvc| pvc.name_any() == "db-2-data")
+            && raw.pods.iter().all(|pod| pod.name_any() != "db-2")
+        {
+            let mut cancelled = raw;
+            cancelled.set.spec.replicas = 1;
+            cancelled.set.metadata.generation =
+                Some(cancelled.set.metadata.generation.unwrap_or_default() + 1);
+            let restarted = Arc::new(InMemoryClusterApi::new(cancelled));
+            finish(&restarted, 1).await;
+            let completed = restarted.observation().await;
+            assert!(
+                completed
+                    .pvcs
+                    .iter()
+                    .all(|pvc| pvc.name_any() != "db-2-data")
+            );
+            assert!(completed.pods.iter().any(|pod| pod.name_any() == "db-1"));
+            assert!(
+                completed
+                    .pvcs
+                    .iter()
+                    .any(|pvc| pvc.name_any() == "db-1-data")
+            );
+            return;
+        }
+    }
+    panic!("PVC-only allocation boundary not reached");
+}
+
+#[tokio::test]
+async fn cancellation_after_pod_create_cleans_endpoint_pod_pvc_without_unrelated_deletion() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    for _ in 0..20 {
+        tick(&api).await;
+        let raw = api.observation().await;
+        let before_provisioning = raw
+            .set
+            .status
+            .as_ref()
+            .is_some_and(|status| status.authority.provisioning.is_none());
+        if before_provisioning && raw.pods.iter().any(|pod| pod.name_any() == "db-2") {
+            let mut cancelled = raw;
+            cancelled.set.spec.replicas = 1;
+            cancelled.set.metadata.generation =
+                Some(cancelled.set.metadata.generation.unwrap_or_default() + 1);
+            api.set_observation(cancelled).await;
+            finish(&api, 1).await;
+            let completed = api.observation().await;
+            assert!(completed.pods.iter().all(|pod| pod.name_any() != "db-2"));
+            assert!(
+                completed
+                    .pvcs
+                    .iter()
+                    .all(|pvc| pvc.name_any() != "db-2-data")
+            );
+            assert!(completed.pods.iter().any(|pod| pod.name_any() == "db-1"));
+            assert!(
+                completed
+                    .pvcs
+                    .iter()
+                    .any(|pvc| pvc.name_any() == "db-1-data")
+            );
+            return;
+        }
+    }
+    panic!("Pod-created pre-provisioning boundary not reached");
 }

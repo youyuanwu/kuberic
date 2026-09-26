@@ -249,6 +249,7 @@ impl Model {
             KubernetesChange::PersistStatus { status } => {
                 let old = self.accepted_count();
                 self.snapshot.status = *status;
+                self.refresh_allocation_observation();
                 let new = self.accepted_count();
                 if new != old {
                     assert_eq!(new, old + 1);
@@ -258,6 +259,7 @@ impl Model {
             KubernetesChange::EnsureReplicaScaffolding { replica_ids } => {
                 assert_eq!(replica_ids.len(), 1);
                 self.add_candidate(replica_ids[0]);
+                self.refresh_allocation_observation();
             }
             KubernetesChange::EnsureWriteRoutingService => {
                 self.snapshot.routing.service_present = true;
@@ -274,9 +276,15 @@ impl Model {
                     .status
                     .scale_up_cleanup
                     .as_ref()
-                    .unwrap()
-                    .target
-                    .clone();
+                    .map(|cleanup| cleanup.target.clone())
+                    .or_else(|| {
+                        self.snapshot
+                            .status
+                            .scale_up_allocation
+                            .as_ref()
+                            .map(ScaleUpAllocation::observation_target)
+                    })
+                    .unwrap();
                 let exact = self
                     .snapshot
                     .secondary_scale_down_resources
@@ -293,6 +301,93 @@ impl Model {
             }
             other => panic!("unexpected scale-up model change: {other:?}"),
         }
+    }
+
+    fn refresh_allocation_observation(&mut self) {
+        self.snapshot
+            .secondary_scale_down_resources
+            .retain(|exact| {
+                !exact
+                    .target
+                    .instance_id
+                    .as_str()
+                    .starts_with("scale-up-allocation-")
+            });
+        let Some(allocation) = self.snapshot.status.scale_up_allocation.as_ref() else {
+            return;
+        };
+        let target = allocation.observation_target();
+        let replica_id = allocation.target_replica_id;
+        let kubernetes = self
+            .snapshot
+            .replicas
+            .iter()
+            .find(|(key, observation)| {
+                key.replica_id == replica_id && observation.kubernetes.is_some()
+            })
+            .and_then(|(_, observation)| observation.kubernetes.as_ref());
+        let pod_name = format!("candidate-pod-{replica_id}");
+        let pvc_name = format!("candidate-data-{replica_id}");
+        let (pod_identity, pod) = match (&allocation.pod_uid, kubernetes) {
+            (Some(uid), Some(observed)) if observed.pod_uid.as_ref() == Some(uid) => (
+                CleanupResourceIdentity::Present {
+                    name: pod_name,
+                    uid: uid.to_string(),
+                },
+                ExactResourceObservation::FrozenUidPresent {
+                    resource_version: "1".into(),
+                },
+            ),
+            (None, Some(observed)) if observed.pod_uid.is_some() => (
+                CleanupResourceIdentity::Absent { name: pod_name },
+                ExactResourceObservation::ReplacementPresent {
+                    uid: observed.pod_uid.as_ref().unwrap().to_string(),
+                    resource_version: "1".into(),
+                },
+            ),
+            _ => (
+                CleanupResourceIdentity::Absent { name: pod_name },
+                ExactResourceObservation::NotFound,
+            ),
+        };
+        let (pvc_identity, pvc) = match (&allocation.pvc_uid, kubernetes) {
+            (Some(uid), Some(observed)) if observed.pvc_uid.as_ref() == Some(uid) => (
+                CleanupResourceIdentity::Present {
+                    name: pvc_name,
+                    uid: uid.to_string(),
+                },
+                ExactResourceObservation::FrozenUidPresent {
+                    resource_version: "1".into(),
+                },
+            ),
+            (None, Some(observed)) if observed.pvc_uid.is_some() => (
+                CleanupResourceIdentity::Absent { name: pvc_name },
+                ExactResourceObservation::ReplacementPresent {
+                    uid: observed.pvc_uid.as_ref().unwrap().to_string(),
+                    resource_version: "1".into(),
+                },
+            ),
+            _ => (
+                CleanupResourceIdentity::Absent { name: pvc_name },
+                ExactResourceObservation::NotFound,
+            ),
+        };
+        self.snapshot
+            .secondary_scale_down_resources
+            .push(SecondaryScaleDownResourceObservation {
+                resource_uid: self.snapshot.resource_uid.clone(),
+                target,
+                identity: ReplicaCleanupIdentity {
+                    pod: pod_identity,
+                    pvc: pvc_identity,
+                    endpoint: CleanupResourceIdentity::Absent {
+                        name: format!("candidate-allocation-{replica_id}"),
+                    },
+                },
+                pod,
+                pvc,
+                endpoint: ExactResourceObservation::NotFound,
+            });
     }
 
     fn add_candidate(&mut self, replica_id: ReplicaId) {

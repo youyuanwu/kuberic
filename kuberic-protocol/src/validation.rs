@@ -277,14 +277,19 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
     }
     if snapshot
         .status
-        .scale_up_cleanup
+        .scale_up_allocation
         .as_ref()
-        .is_some_and(|cleanup| {
-            cleanup
-                .provisioning
-                .scale_up()
-                .is_none_or(|scale_up| scale_up.resource_uid != snapshot.resource_uid)
-        })
+        .is_some_and(|allocation| allocation.resource_uid != snapshot.resource_uid)
+        || snapshot
+            .status
+            .scale_up_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| {
+                cleanup
+                    .provisioning
+                    .scale_up()
+                    .is_none_or(|scale_up| scale_up.resource_uid != snapshot.resource_uid)
+            })
         || snapshot
             .status
             .last_scale_up
@@ -1122,6 +1127,44 @@ pub(crate) fn validate_replacement_cleanup(
 
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
+    if let Some(allocation) = &status.scale_up_allocation {
+        validate_scale_up_allocation(allocation)?;
+        let topology = status.topology.as_ref();
+        let policy = status.effective_policy.as_ref();
+        let expected_target = topology.zip(policy).and_then(|(topology, policy)| {
+            policy.replica_set_size.checked_add(1).and_then(|size| {
+                (1..=i64::from(size)).map(ReplicaId::new).find(|candidate| {
+                    topology
+                        .configuration
+                        .members
+                        .iter()
+                        .all(|member| member.identity.replica_id != *candidate)
+                })
+            })
+        });
+        if !status.initialized
+            || topology.is_none_or(|topology| {
+                topology.configuration.configuration_id != allocation.previous_configuration_id
+            })
+            || policy.is_none_or(|policy| {
+                policy.replica_set_size == u32::MAX
+                    || allocation.desired_replicas <= policy.replica_set_size
+            })
+            || expected_target != Some(allocation.target_replica_id)
+            || status.provisioning.is_some()
+            || status.transition.is_some()
+            || status.scale_up_cleanup.is_some()
+            || status.secondary_scale_down_cleanup.is_some()
+            || status.pending_replacement_cleanup.is_some()
+            || status.last_replacement.is_some()
+            || status.primary_failure.is_some()
+            || status.quorum_loss.is_some()
+        {
+            return Err(ValidationError::InvalidScaleUp(
+                "allocation must exclusively bind stable accepted authority",
+            ));
+        }
+    }
     if let Some(operation_id) = &status.scale_up_admission_started {
         let active = status.transition.as_ref().and_then(|transition| {
             transition.scale_up.as_deref().or_else(|| {

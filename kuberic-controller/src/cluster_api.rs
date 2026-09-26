@@ -2335,13 +2335,161 @@ impl ClusterApi for InMemoryClusterApi {
 
     async fn ensure_replacement_scaffolding(
         &self,
-        _observation: &RawObservation,
-        _replica_id: ReplicaId,
+        observation: &RawObservation,
+        replica_id: ReplicaId,
         replacing: &ReplicaIdentity,
     ) -> Result<()> {
-        self.state
-            .lock()
-            .await
+        let uid = observation
+            .set
+            .uid()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let owner = owner_reference(&observation.set)?;
+        let image = effective_replica_image(observation)?;
+        let base = derive_replacement_resource_name(&ResourceUid::new(&uid), replacing);
+        let pod_name = format!("{}-{base}", observation.set.name_any());
+        let pvc_name = format!("{pod_name}-data");
+        let mut state = self.state.lock().await;
+        if state.observation.set.resource_version() != observation.set.resource_version() {
+            return Err(ControllerError::ObservationStale);
+        }
+        if !state
+            .observation
+            .pvcs
+            .iter()
+            .any(|pvc| pvc.name_any() == pvc_name)
+        {
+            let resource_number = state.next_resource_uid;
+            state.next_resource_uid += 1;
+            let mut pvc = replica_pvc_named(&observation.set, replica_id, &uid, &owner, &pvc_name);
+            pvc.metadata.namespace = observation.set.namespace();
+            pvc.metadata.uid = Some(format!(
+                "in-memory-replacement-pvc-{}-{resource_number}",
+                replica_id.value()
+            ));
+            pvc.metadata.resource_version = Some(resource_number.to_string());
+            state.observation.pvcs.push(pvc);
+            state
+                .effects
+                .push(EffectRecord::EnsureReplacement(replacing.clone()));
+            return Ok(());
+        }
+        let pvc = state
+            .observation
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == pvc_name)
+            .cloned()
+            .expect("replacement PVC remains present");
+        let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+        if !state
+            .observation
+            .pods
+            .iter()
+            .any(|pod| pod.name_any() == pod_name)
+        {
+            let resource_number = state.next_resource_uid;
+            state.next_resource_uid += 1;
+            let mut pod = replica_pod_named(
+                &observation.set,
+                replica_id,
+                &uid,
+                &owner,
+                &pod_name,
+                &pvc_name,
+                &pvc_uid,
+                &image,
+            );
+            let pod_uid = format!(
+                "in-memory-replacement-pod-{}-{resource_number}",
+                replica_id.value()
+            );
+            pod.metadata.namespace = observation.set.namespace();
+            pod.metadata.uid = Some(pod_uid.clone());
+            pod.metadata.resource_version = Some(resource_number.to_string());
+            pod.metadata
+                .labels
+                .get_or_insert_default()
+                .insert(INSTANCE_LABEL.to_string(), pod_uid);
+            pod.metadata.annotations.get_or_insert_default().insert(
+                CONTROL_ADDRESS_ANNOTATION.to_string(),
+                "http://127.0.0.1:50051".to_string(),
+            );
+            pod.status = Some(k8s_openapi::api::core::v1::PodStatus {
+                pod_ip: Some("127.0.0.1".to_string()),
+                conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                    type_: "Ready".to_string(),
+                    status: "True".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            state.observation.pods.push(pod);
+            state
+                .effects
+                .push(EffectRecord::EnsureReplacement(replacing.clone()));
+            return Ok(());
+        }
+        let pod = state
+            .observation
+            .pods
+            .iter()
+            .find(|pod| pod.name_any() == pod_name)
+            .cloned()
+            .expect("replacement Pod remains present");
+        let pod_uid = pod.uid().ok_or(ControllerError::ObservationStale)?;
+        let initialization_id = derive_initialization_id(
+            &ResourceUid::new(&uid),
+            replica_id,
+            &PodUid::new(&pod_uid),
+            &PvcUid::new(&pvc_uid),
+        );
+        let target = ReplicaIdentity {
+            replica_id,
+            instance_id: ReplicaInstanceId::new(&pod_uid),
+            agent_generation: derive_agent_generation(&initialization_id),
+        };
+        let endpoint_name = derive_replica_endpoint_name(&ResourceUid::new(&uid), &target);
+        if !state
+            .observation
+            .services
+            .iter()
+            .any(|service| service.name_any() == endpoint_name)
+        {
+            let resource_number = state.next_resource_uid;
+            state.next_resource_uid += 1;
+            state.observation.services.push(Service {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(endpoint_name),
+                    namespace: observation.set.namespace(),
+                    uid: Some(format!(
+                        "in-memory-replacement-endpoint-{}-{resource_number}",
+                        replica_id.value()
+                    )),
+                    resource_version: Some(resource_number.to_string()),
+                    labels: Some(base_labels(&observation.set, Some(replica_id), &uid)),
+                    owner_references: Some(vec![owner]),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    selector: Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)])),
+                    ports: Some(vec![
+                        ServicePort {
+                            name: Some("control".to_string()),
+                            port: CONTROL_PORT,
+                            ..Default::default()
+                        },
+                        ServicePort {
+                            name: Some("replication".to_string()),
+                            port: REPLICATION_PORT,
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        state
             .effects
             .push(EffectRecord::EnsureReplacement(replacing.clone()));
         Ok(())

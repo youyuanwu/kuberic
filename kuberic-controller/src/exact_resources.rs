@@ -21,6 +21,14 @@ pub(crate) fn requests(
         return Vec::new();
     };
     let mut requests = Vec::new();
+    if let Some(allocation) = status.scale_up_allocation.as_ref() {
+        push_request(
+            &mut requests,
+            allocation.observation_target(),
+            scale_up_allocation_identity(raw, allocation),
+            true,
+        );
+    }
     if let Some(intent) = status
         .secondary_scale_down_cleanup
         .as_ref()
@@ -159,9 +167,13 @@ fn scale_up_lifecycle_target(raw: &RawObservation, target: &ReplicaIdentity) -> 
         return false;
     };
     status
-        .scale_up_cleanup
-        .as_deref()
-        .is_some_and(|cleanup| cleanup.target == *target)
+        .scale_up_allocation
+        .as_ref()
+        .is_some_and(|allocation| allocation.observation_target() == *target)
+        || status
+            .scale_up_cleanup
+            .as_deref()
+            .is_some_and(|cleanup| cleanup.target == *target)
         || status
             .provisioning
             .as_ref()
@@ -179,6 +191,42 @@ fn scale_up_lifecycle_target(raw: &RawObservation, target: &ReplicaIdentity) -> 
             .last_scale_up
             .as_deref()
             .is_some_and(|receipt| receipt.intent.target == *target)
+}
+
+fn scale_up_allocation_identity(
+    raw: &RawObservation,
+    allocation: &kuberic_protocol::types::ScaleUpAllocation,
+) -> ReplicaCleanupIdentity {
+    let pod_name = format!(
+        "{}-{}",
+        raw.set.name_any(),
+        allocation.target_replica_id.value()
+    );
+    let pvc_name = format!("{pod_name}-data");
+    let endpoint_name = format!("{pod_name}-allocation");
+    ReplicaCleanupIdentity {
+        pod: allocation.pod_uid.as_ref().map_or_else(
+            || CleanupResourceIdentity::Absent {
+                name: pod_name.clone(),
+            },
+            |uid| CleanupResourceIdentity::Present {
+                name: pod_name.clone(),
+                uid: uid.to_string(),
+            },
+        ),
+        pvc: allocation.pvc_uid.as_ref().map_or_else(
+            || CleanupResourceIdentity::Absent {
+                name: pvc_name.clone(),
+            },
+            |uid| CleanupResourceIdentity::Present {
+                name: pvc_name.clone(),
+                uid: uid.to_string(),
+            },
+        ),
+        endpoint: CleanupResourceIdentity::Absent {
+            name: endpoint_name,
+        },
+    }
 }
 
 fn scale_up_candidate_identity(
@@ -352,6 +400,19 @@ fn protected_by_active_lifecycle(
         .any(|identity| resource_name == Some(name(identity))
             || matches!(identity, CleanupResourceIdentity::Present { uid, .. } if resource_uid == Some(uid.as_str())));
     protected_cleanup
+        || status
+            .scale_up_allocation
+            .as_ref()
+            .is_some_and(|allocation| {
+                let identity = scale_up_allocation_identity(raw, allocation);
+                [&identity.pod, &identity.pvc, &identity.endpoint]
+                    .into_iter()
+                    .any(|identity| {
+                        resource_name == Some(name(identity))
+                            || matches!(identity, CleanupResourceIdentity::Present { uid, .. }
+                                if resource_uid == Some(uid.as_str()))
+                    })
+            })
         || status
             .provisioning
             .as_ref()

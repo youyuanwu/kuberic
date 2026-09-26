@@ -2780,6 +2780,53 @@
                     "nullable": true,
                     "type": "string"
                   },
+                  "scaleUpAllocation": {
+                    "description": "Durable scale-up allocation recorded before any candidate resource is created.",
+                    "nullable": true,
+                    "properties": {
+                      "desiredReplicas": {
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "operationId": {
+                        "type": "string"
+                      },
+                      "podUid": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "previousConfigurationId": {
+                        "type": "string"
+                      },
+                      "pvcUid": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "resourceUid": {
+                        "type": "string"
+                      },
+                      "specGeneration": {
+                        "format": "uint64",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "targetReplicaId": {
+                        "format": "int64",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "desiredReplicas",
+                      "operationId",
+                      "previousConfigurationId",
+                      "resourceUid",
+                      "specGeneration",
+                      "targetReplicaId"
+                    ],
+                    "type": "object"
+                  },
                   "scaleUpCleanup": {
                     "nullable": true,
                     "properties": {

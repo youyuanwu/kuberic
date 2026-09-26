@@ -159,7 +159,7 @@ pub(super) fn fixture(count: u32, desired: u32) -> RawObservation {
     raw
 }
 
-async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
+pub(super) async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
     let mut raw = api.observation().await;
     let target = match command {
         ProtocolCommand::PrepareSecondaryRemoval(c) => c.intent.primary.clone(),

@@ -63,7 +63,6 @@ pub fn validate_scale_up_provisioning_request(scale_up: &ScaleUpProvisioning) ->
         || scale_up.desired_replicas < scale_up.current_policy.replica_set_size
         || scale_up.previous_policy.failover_delay_seconds
             != scale_up.current_policy.failover_delay_seconds
-        || scale_up.target_replica_id.value() != i64::from(scale_up.current_policy.replica_set_size)
         || scale_up
             .previous_configuration
             .members
@@ -79,12 +78,29 @@ pub fn validate_scale_up_provisioning_request(scale_up: &ScaleUpProvisioning) ->
         .iter()
         .map(|member| member.identity.replica_id.value())
         .collect::<BTreeSet<_>>();
-    let expected =
-        (1..=i64::from(scale_up.previous_policy.replica_set_size)).collect::<BTreeSet<_>>();
-    if ids != expected {
+    let expected_target = (1..=i64::from(scale_up.current_policy.replica_set_size))
+        .find(|candidate| !ids.contains(candidate));
+    if expected_target != Some(scale_up.target_replica_id.value()) {
         return Err(invalid(
-            "scale-up requires contiguous cardinality-derived logical IDs",
+            "scale-up target must restore the first missing ordinal",
         ));
+    }
+    Ok(())
+}
+
+pub fn validate_scale_up_allocation(allocation: &ScaleUpAllocation) -> Result {
+    if allocation.resource_uid.is_empty()
+        || allocation.spec_generation == 0
+        || allocation.desired_replicas == 0
+        || allocation.previous_configuration_id.is_empty()
+        || allocation.target_replica_id.value() <= 0
+        || allocation.operation_id.is_empty()
+        || allocation.operation_id != allocation.expected_operation_id()
+        || allocation.pod_uid.as_ref().is_some_and(PodUid::is_empty)
+        || allocation.pvc_uid.as_ref().is_some_and(PvcUid::is_empty)
+        || (allocation.pod_uid.is_some() && allocation.pvc_uid.is_none())
+    {
+        return Err(invalid("invalid durable scale-up allocation"));
     }
     Ok(())
 }
@@ -158,19 +174,18 @@ pub fn validate_scale_up(intent: &ScaleUpIntent) -> Result {
         .iter()
         .map(|member| member.identity.replica_id.value())
         .collect::<BTreeSet<_>>();
-    let expected_previous_ids =
-        (1..=i64::from(intent.previous_policy.replica_set_size)).collect::<BTreeSet<_>>();
+    let expected_target = (1..=i64::from(intent.current_policy.replica_set_size))
+        .find(|candidate| !previous_ids.contains(candidate));
     if intent.primary != primary.identity
         || previous.primary_id != current.primary_id
         || added.len() != 1
         || added[0].identity != intent.target
         || added[0].role != ReplicaRole::ActiveSecondary
-        || intent.target.replica_id.value() != i64::from(intent.current_policy.replica_set_size)
+        || expected_target != Some(intent.target.replica_id.value())
         || previous
             .members
             .iter()
             .any(|member| !current.members.iter().any(|candidate| candidate == member))
-        || previous_ids != expected_previous_ids
     {
         return Err(invalid(
             "target must be the next active secondary and retained authority cannot change",

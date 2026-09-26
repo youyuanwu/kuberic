@@ -413,6 +413,47 @@ impl ScaleUpProvisioning {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Durable scale-up allocation recorded before any candidate resource is created.
+pub struct ScaleUpAllocation {
+    pub resource_uid: ResourceUid,
+    #[schemars(range(min = 1))]
+    pub spec_generation: u64,
+    #[schemars(range(min = 1))]
+    pub desired_replicas: u32,
+    pub previous_configuration_id: ConfigurationId,
+    pub target_replica_id: ReplicaId,
+    pub operation_id: OperationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<PodUid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_uid: Option<PvcUid>,
+}
+
+impl ScaleUpAllocation {
+    pub fn expected_operation_id(&self) -> OperationId {
+        OperationId::new(format!(
+            "scale-up-allocation-{}",
+            digest_parts(&[
+                self.resource_uid.as_str(),
+                &self.spec_generation.to_string(),
+                &self.desired_replicas.to_string(),
+                self.previous_configuration_id.as_str(),
+                &self.target_replica_id.to_string(),
+            ])
+        ))
+    }
+
+    pub fn observation_target(&self) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: self.target_replica_id,
+            instance_id: ReplicaInstanceId::new(self.operation_id.as_str()),
+            agent_generation: AgentGeneration::new(self.operation_id.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProvisioningPurpose {
     pub kind: ProvisioningKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1188,6 +1229,8 @@ pub struct AcceptedStatus {
     #[serde(default)]
     pub effective_policy: Option<EffectivePolicy>,
     pub topology: Option<AcceptedTopology>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up_allocation: Option<ScaleUpAllocation>,
     pub provisioning: Option<ProvisioningIntent>,
     pub transition: Option<TransitionIntent>,
     #[serde(default)]

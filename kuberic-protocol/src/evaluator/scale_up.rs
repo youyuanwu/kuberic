@@ -2,9 +2,9 @@ use super::*;
 use crate::command::ScaleDownResource;
 use crate::observation::{AgentBuildReport, AgentReport, ExactResourceObservation};
 use crate::types::{
-    CleanupResourceIdentity, ProvisioningPurpose, ReplicaId, ScaleUpCleanup,
-    ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence, ScaleUpIntent, ScaleUpProvisioning,
-    ScaleUpReceipt, ScaleUpStage, ScaleUpWitness,
+    CleanupResourceIdentity, PodUid, ProvisioningPurpose, PvcUid, ReplicaId, ScaleUpAllocation,
+    ScaleUpCleanup, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence, ScaleUpIntent,
+    ScaleUpProvisioning, ScaleUpReceipt, ScaleUpStage, ScaleUpWitness,
 };
 use crate::validation::{
     validate_scale_up, validate_scale_up_cleanup, validate_scale_up_failover_evidence,
@@ -713,6 +713,25 @@ pub(super) fn recover_local_acceptance(
             // repair/replacement must arbitrate the committed member failure.
             return None;
         }
+        let pod_authoritatively_absent = cleanup_observation(snapshot, &member.identity)
+            .is_some_and(|exact| {
+                matches!(
+                    &exact.identity.pod,
+                    CleanupResourceIdentity::Present { uid, .. }
+                        if uid == member.identity.instance_id.as_str()
+                ) && matches!(exact.pod, ExactResourceObservation::NotFound)
+            });
+        if pod_authoritatively_absent
+            && accepted
+                .members
+                .iter()
+                .any(|accepted_member| accepted_member.identity == member.identity)
+        {
+            // A committed candidate remains protected by its receipt. Exact Pod
+            // absence is nevertheless accepted-member replacement evidence, not
+            // pre-admission cleanup authority.
+            return None;
+        }
         let Some(report) = report(snapshot, &member.identity) else {
             return Some(wait(
                 snapshot,
@@ -944,7 +963,23 @@ pub(super) fn begin(
             config,
         ));
     };
-    let target_id = ReplicaId::new(i64::from(target_value));
+    let Some(target_id) = (1..=i64::from(target_value))
+        .map(ReplicaId::new)
+        .find(|candidate| {
+            topology
+                .members
+                .iter()
+                .all(|member| member.identity.replica_id != *candidate)
+        })
+    else {
+        return Some(unsafe_plan(
+            status,
+            UnsafeReason::InvalidAcceptedAuthority(
+                "scale-up could not allocate a logical identity outside accepted authority".into(),
+            ),
+            config,
+        ));
+    };
     let unrelated_extra = snapshot.replicas.iter().any(|(key, observation)| {
         let accepted = topology.members.iter().any(|member| {
             member.identity.replica_id == key.replica_id
@@ -964,80 +999,6 @@ pub(super) fn begin(
             config,
         ));
     }
-    let candidates = snapshot
-        .replicas
-        .iter()
-        .filter(|(key, observation)| {
-            key.replica_id == target_id
-                && observation
-                    .kubernetes
-                    .as_ref()
-                    .is_some_and(|kubernetes| kubernetes.has_exact_scaffolding())
-        })
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return Some(Plan::Apply {
-            changes: vec![KubernetesChange::EnsureReplicaScaffolding {
-                replica_ids: vec![target_id],
-            }],
-        });
-    }
-    if candidates.len() != 1 {
-        return Some(unsafe_plan(
-            status,
-            UnsafeReason::ContradictoryReplicaEvidence(
-                "multiple exact scale-up candidate incarnations are present".into(),
-            ),
-            config,
-        ));
-    }
-    let (_, observation) = candidates[0];
-    let kubernetes = observation
-        .kubernetes
-        .as_ref()
-        .expect("candidate filter requires Kubernetes evidence");
-    let Some(pod_uid) = kubernetes.pod_uid.clone() else {
-        unreachable!("candidate filter requires Pod UID")
-    };
-    let Some(pvc_uid) = kubernetes.pvc_uid.clone() else {
-        unreachable!("candidate filter requires PVC UID")
-    };
-    if kubernetes.image.as_deref() != Some(snapshot.desired.image.as_str()) {
-        return Some(wait(
-            snapshot,
-            status,
-            "ScaleUpCandidateImagePending",
-            "provisioning",
-            None,
-            None,
-            "candidate image differs from accepted desired image",
-            config,
-        ));
-    }
-    match &observation.agent {
-        AgentObservation::Uninitialized(_) => {}
-        AgentObservation::Absent | AgentObservation::Unreachable { .. } => {
-            return Some(wait(
-                snapshot,
-                status,
-                "ScaleUpFreshStorePending",
-                "provisioning",
-                None,
-                None,
-                "candidate has not reported fresh uninitialized storage",
-                config,
-            ));
-        }
-        AgentObservation::Report(_) | AgentObservation::Invalid { .. } => {
-            return Some(unsafe_plan(
-                status,
-                UnsafeReason::ContradictoryReplicaEvidence(
-                    "scale-up candidate storage is already initialized or invalid".into(),
-                ),
-                config,
-            ));
-        }
-    }
     let Some(current_policy) =
         EffectivePolicy::fixed(target_value, previous_policy.failover_delay_seconds)
     else {
@@ -1052,26 +1013,389 @@ pub(super) fn begin(
         current_policy,
         target_replica_id: target_id,
     };
-    let mut provisioning = ProvisioningIntent {
-        purpose: ProvisioningPurpose::scale_up(scale_up),
-        pod_uid,
-        pvc_uid,
+    let mut allocation = ScaleUpAllocation {
+        resource_uid: scale_up.resource_uid,
+        spec_generation: scale_up.spec_generation,
+        desired_replicas: scale_up.desired_replicas,
+        previous_configuration_id: scale_up.previous_configuration.configuration_id,
+        target_replica_id: scale_up.target_replica_id,
         operation_id: OperationId::default(),
+        pod_uid: None,
+        pvc_uid: None,
     };
-    provisioning.operation_id = provisioning.expected_operation_id();
-    let target = provisioning.target_identity(&snapshot.resource_uid);
-    let attempt = provisioning.operation_id.clone();
+    allocation.operation_id = allocation.expected_operation_id();
+    let target = allocation.observation_target();
+    let attempt = allocation.operation_id.clone();
     let mut next = status;
-    next.provisioning = Some(provisioning);
+    next.scale_up_allocation = Some(allocation);
     Some(persist(progress_status(
         snapshot,
         next,
-        "ScaleUpProvisioningAccepted",
-        "provisioning",
+        "ScaleUpAllocationAccepted",
+        "allocation",
         Some(&target),
         Some(&attempt),
-        "frozen one exact next-ordinal candidate outside accepted authority",
+        "persisted recoverable candidate allocation before resource creation",
     )))
+}
+
+fn allocation_observation<'a>(
+    snapshot: &'a ObservationSnapshot,
+    allocation: &ScaleUpAllocation,
+) -> Option<&'a crate::observation::SecondaryScaleDownResourceObservation> {
+    secondary_scale_down::resources(snapshot, &allocation.observation_target())
+}
+
+fn allocation_identity(
+    identity: &CleanupResourceIdentity,
+    observed: &ExactResourceObservation,
+) -> Option<String> {
+    match (identity, observed) {
+        (
+            CleanupResourceIdentity::Absent { .. },
+            ExactResourceObservation::ReplacementPresent { uid, .. },
+        ) => Some(uid.clone()),
+        _ => None,
+    }
+}
+
+fn allocation_wait(
+    snapshot: &ObservationSnapshot,
+    allocation: &ScaleUpAllocation,
+    reason: &str,
+    blocking: &str,
+    config: &EvaluationConfig,
+) -> Plan {
+    wait(
+        snapshot,
+        snapshot.status.clone(),
+        reason,
+        "allocation",
+        Some(&allocation.observation_target()),
+        Some(&allocation.operation_id),
+        blocking,
+        config,
+    )
+}
+
+pub(super) fn allocation(
+    snapshot: &ObservationSnapshot,
+    allocation: &ScaleUpAllocation,
+    config: &EvaluationConfig,
+) -> Plan {
+    let target_id = allocation.target_replica_id;
+    let previous = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .expect("validated allocation has accepted topology")
+        .configuration;
+    let previous_policy = snapshot
+        .status
+        .effective_policy
+        .as_ref()
+        .expect("validated allocation has accepted policy");
+    let cancelled = snapshot.desired.replicas <= previous_policy.replica_set_size;
+    let Some(exact) = allocation_observation(snapshot, allocation) else {
+        return allocation_wait(
+            snapshot,
+            allocation,
+            "ScaleUpAllocationObservationPending",
+            "fresh exact allocation lookups are unavailable",
+            config,
+        );
+    };
+    if matches!(
+        exact.endpoint,
+        ExactResourceObservation::LookupFailed { .. }
+    ) || matches!(exact.pod, ExactResourceObservation::LookupFailed { .. })
+        || matches!(exact.pvc, ExactResourceObservation::LookupFailed { .. })
+    {
+        return allocation_wait(
+            snapshot,
+            allocation,
+            "ScaleUpAllocationObservationPending",
+            "fresh exact allocation lookups are unresolved",
+            config,
+        );
+    }
+    let scaffolding = snapshot.scaffolding_observation_for(target_id);
+    let kubernetes = scaffolding.and_then(|observation| observation.kubernetes.as_ref());
+
+    if allocation.pvc_uid.is_none()
+        && let Some(uid) = allocation_identity(&exact.identity.pvc, &exact.pvc)
+    {
+        if kubernetes
+            .and_then(|observed| observed.pvc_uid.as_ref())
+            .map(PvcUid::as_str)
+            != Some(uid.as_str())
+        {
+            return unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::ContradictoryReplicaEvidence(
+                    "scale-up allocation PVC is not the uniquely owned candidate storage".into(),
+                ),
+                config,
+            );
+        }
+        let mut status = snapshot.status.clone();
+        status
+            .scale_up_allocation
+            .as_mut()
+            .expect("active allocation")
+            .pvc_uid = Some(PvcUid::new(uid));
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpAllocationPvcFrozen",
+            "allocation",
+            Some(&allocation.observation_target()),
+            Some(&allocation.operation_id),
+            "persisted exact PVC UID before Pod creation or cleanup",
+        ));
+    }
+
+    if allocation.pvc_uid.is_none() {
+        if !matches!(exact.pvc, ExactResourceObservation::NotFound) {
+            return allocation_wait(
+                snapshot,
+                allocation,
+                "ScaleUpAllocationPvcPending",
+                "candidate PVC identity is not yet durable",
+                config,
+            );
+        }
+        if cancelled {
+            if !matches!(exact.pod, ExactResourceObservation::NotFound)
+                || !matches!(exact.endpoint, ExactResourceObservation::NotFound)
+            {
+                return unsafe_plan(
+                    snapshot.status.clone(),
+                    UnsafeReason::ContradictoryReplicaEvidence(
+                        "scale-up allocation observed Pod or endpoint without PVC provenance"
+                            .into(),
+                    ),
+                    config,
+                );
+            }
+            let mut status = snapshot.status.clone();
+            status.scale_up_allocation = None;
+            return persist(progress_status(
+                snapshot,
+                status,
+                "ScaleUpAllocationCancelled",
+                "cleanup",
+                Some(&allocation.observation_target()),
+                Some(&allocation.operation_id),
+                "cancelled allocation has no retained resources",
+            ));
+        }
+        return Plan::Apply {
+            changes: vec![KubernetesChange::EnsureReplicaScaffolding {
+                replica_ids: vec![target_id],
+            }],
+        };
+    }
+
+    if allocation.pod_uid.is_none()
+        && let Some(uid) = allocation_identity(&exact.identity.pod, &exact.pod)
+    {
+        let expected_pvc = allocation.pvc_uid.as_ref().map(PvcUid::as_str);
+        if kubernetes
+            .and_then(|observed| observed.pod_uid.as_ref())
+            .map(PodUid::as_str)
+            != Some(uid.as_str())
+            || kubernetes
+                .and_then(|observed| observed.pvc_uid.as_ref())
+                .map(PvcUid::as_str)
+                != expected_pvc
+        {
+            return unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::ContradictoryReplicaEvidence(
+                    "scale-up allocation Pod is not uniquely bound to the frozen PVC".into(),
+                ),
+                config,
+            );
+        }
+        if cancelled {
+            let mut status = snapshot.status.clone();
+            status
+                .scale_up_allocation
+                .as_mut()
+                .expect("active allocation")
+                .pod_uid = Some(PodUid::new(uid));
+            return persist(progress_status(
+                snapshot,
+                status,
+                "ScaleUpAllocationPodFrozen",
+                "cleanup",
+                Some(&allocation.observation_target()),
+                Some(&allocation.operation_id),
+                "persisted exact Pod UID before cancellation cleanup",
+            ));
+        }
+        if kubernetes.and_then(|observed| observed.image.as_deref())
+            != Some(snapshot.desired.image.as_str())
+        {
+            return allocation_wait(
+                snapshot,
+                allocation,
+                "ScaleUpCandidateImagePending",
+                "candidate image differs from accepted desired image",
+                config,
+            );
+        }
+        let pod_uid = PodUid::new(uid);
+        let pvc_uid = allocation.pvc_uid.clone().expect("frozen PVC UID");
+        let current_policy = EffectivePolicy::fixed(
+            previous_policy
+                .replica_set_size
+                .checked_add(1)
+                .expect("validated allocation policy can grow"),
+            previous_policy.failover_delay_seconds,
+        )
+        .expect("validated allocation has positive policy");
+        let mut provisioning = ProvisioningIntent {
+            purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+                resource_uid: allocation.resource_uid.clone(),
+                spec_generation: allocation.spec_generation,
+                desired_replicas: allocation.desired_replicas,
+                previous_configuration: previous.clone(),
+                previous_policy: previous_policy.clone(),
+                current_policy,
+                target_replica_id: allocation.target_replica_id,
+            }),
+            pod_uid,
+            pvc_uid,
+            operation_id: OperationId::default(),
+        };
+        provisioning.operation_id = provisioning.expected_operation_id();
+        let target = provisioning.target_identity(&snapshot.resource_uid);
+        let attempt = provisioning.operation_id.clone();
+        let mut status = snapshot.status.clone();
+        status.scale_up_allocation = None;
+        status.provisioning = Some(provisioning);
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpProvisioningAccepted",
+            "provisioning",
+            Some(&target),
+            Some(&attempt),
+            "promoted exact allocated Pod and PVC into provisioning authority",
+        ));
+    }
+
+    if allocation.pod_uid.is_none() {
+        if cancelled {
+            if !matches!(exact.endpoint, ExactResourceObservation::NotFound)
+                || !matches!(exact.pod, ExactResourceObservation::NotFound)
+            {
+                return allocation_wait(
+                    snapshot,
+                    allocation,
+                    "ScaleUpAllocationCleanupPending",
+                    "endpoint and Pod absence must precede PVC cleanup",
+                    config,
+                );
+            }
+            if let Some(change) =
+                cleanup_delete(&exact.identity.pvc, &exact.pvc, ScaleDownResource::Pvc)
+            {
+                return Plan::Apply {
+                    changes: vec![change],
+                };
+            }
+            if matches!(exact.pvc, ExactResourceObservation::NotFound) {
+                let mut status = snapshot.status.clone();
+                status.scale_up_allocation = None;
+                return persist(progress_status(
+                    snapshot,
+                    status,
+                    "ScaleUpAllocationCleanupComplete",
+                    "cleanup",
+                    Some(&allocation.observation_target()),
+                    Some(&allocation.operation_id),
+                    "exact pre-Pod allocation storage is absent",
+                ));
+            }
+            return allocation_wait(
+                snapshot,
+                allocation,
+                "ScaleUpAllocationPvcCleanupPending",
+                "exact PVC cleanup is unresolved",
+                config,
+            );
+        }
+        return Plan::Apply {
+            changes: vec![KubernetesChange::EnsureReplicaScaffolding {
+                replica_ids: vec![target_id],
+            }],
+        };
+    }
+
+    if !cancelled {
+        return unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::InvalidAcceptedAuthority(
+                "completed allocation was not promoted to provisioning".into(),
+            ),
+            config,
+        );
+    }
+    if !matches!(exact.endpoint, ExactResourceObservation::NotFound) {
+        return allocation_wait(
+            snapshot,
+            allocation,
+            "ScaleUpAllocationEndpointCleanupPending",
+            "endpoint absence must precede Pod cleanup",
+            config,
+        );
+    }
+    if !secondary_scale_down::absent(&exact.identity.pod, &exact.pod) {
+        if let Some(change) =
+            cleanup_delete(&exact.identity.pod, &exact.pod, ScaleDownResource::Pod)
+        {
+            return Plan::Apply {
+                changes: vec![change],
+            };
+        }
+        return allocation_wait(
+            snapshot,
+            allocation,
+            "ScaleUpAllocationPodCleanupPending",
+            "exact Pod cleanup is unresolved",
+            config,
+        );
+    }
+    if !secondary_scale_down::absent(&exact.identity.pvc, &exact.pvc) {
+        if let Some(change) =
+            cleanup_delete(&exact.identity.pvc, &exact.pvc, ScaleDownResource::Pvc)
+        {
+            return Plan::Apply {
+                changes: vec![change],
+            };
+        }
+        return allocation_wait(
+            snapshot,
+            allocation,
+            "ScaleUpAllocationPvcCleanupPending",
+            "exact PVC cleanup is unresolved",
+            config,
+        );
+    }
+    let mut status = snapshot.status.clone();
+    status.scale_up_allocation = None;
+    persist(progress_status(
+        snapshot,
+        status,
+        "ScaleUpAllocationCleanupComplete",
+        "cleanup",
+        Some(&allocation.observation_target()),
+        Some(&allocation.operation_id),
+        "exact cancelled allocation is absent",
+    ))
 }
 
 pub(super) fn provisioning(
@@ -1087,7 +1411,6 @@ pub(super) fn provisioning(
         .scale_up_build_id(&snapshot.resource_uid)
         .expect("scale-up provisioning has build ID");
     let previous = &scale_up.previous_configuration;
-    let primary = configuration_primary(previous);
     let status = progress_status(
         snapshot,
         snapshot.status.clone(),
@@ -1103,28 +1426,8 @@ pub(super) fn provisioning(
         .as_ref()
         .expect("validated scale-up provisioning has accepted topology")
         .configuration;
-    if accepted != previous {
-        if let Some(plan) = restore_accepted_service_before_cleanup(
-            snapshot,
-            accepted,
-            &scale_up.previous_policy,
-            &target,
-            &provisioning.operation_id,
-            "cleanup",
-            config,
-        ) {
-            return plan;
-        }
-        return freeze_cleanup(
-            snapshot,
-            provisioning,
-            status,
-            "ScaleUpCleanupPendingAfterFailover",
-            false,
-            config,
-        );
-    }
-    if replica_failed(snapshot, &primary.identity) {
+    let accepted_primary = configuration_primary(accepted);
+    if replica_failed(snapshot, &accepted_primary.identity) {
         return maybe_begin_stable_failover(snapshot, status, config)
             .map(|plan| {
                 contextualize_delegated_wait(
@@ -1148,6 +1451,28 @@ pub(super) fn provisioning(
                 )
             });
     }
+    if accepted != previous {
+        if let Some(plan) = restore_accepted_service_before_cleanup(
+            snapshot,
+            accepted,
+            &scale_up.previous_policy,
+            &target,
+            &provisioning.operation_id,
+            "cleanup",
+            config,
+        ) {
+            return plan;
+        }
+        return freeze_cleanup(
+            snapshot,
+            provisioning,
+            status,
+            "ScaleUpCleanupPendingAfterFailover",
+            false,
+            config,
+        );
+    }
+    let primary = accepted_primary;
     if snapshot.desired.replicas <= scale_up.previous_policy.replica_set_size {
         return freeze_cleanup(
             snapshot,
