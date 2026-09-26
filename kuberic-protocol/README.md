@@ -40,8 +40,8 @@ application progress.
 
 The supported evaluator contract is full-set bootstrap,
 same-cardinality replacement, ordinary failover, planned switchover,
-secondary-only scale-down, and non-destructive quorum loss/recovery. Scale-up,
-primary removal, timed replica dropping, destructive data-loss recovery, and
+secondary-only scale-down, sequential scale-up, and non-destructive quorum
+loss/recovery. Primary removal, timed replica dropping, destructive data-loss recovery, and
 mixed-version negotiation remain fail-closed.
 
 Protocol 6 defines secondary scale-down, with pure evaluation available behind

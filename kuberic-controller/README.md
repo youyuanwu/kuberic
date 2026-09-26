@@ -55,9 +55,10 @@ serialize subsequent operations until exact cleanup completes; label loss,
 finalizers, and ambiguous replies cannot overwrite the obligation or authorize
 deletion of same-name replacement UIDs.
 
-Protocol 6 and agent store schema 2 require a fresh coordinated deployment.
-Scale-up, primary/explicit-target removal, and active-removal cancellation are
-unsupported. There is no maximum write-interruption guarantee.
+Protocol 7 and agent store schema 3 require a fresh coordinated deployment.
+Sequential scale-up is enabled; primary/explicit-target removal and
+active-removal cancellation are unsupported. There is no maximum
+write-interruption guarantee.
 Frozen-primary loss during removal or cleanup can cause indefinite outage;
 there is no overlapping failover even after membership commit.
 See the [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)

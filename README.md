@@ -86,7 +86,8 @@ PVC object deletion has no retention or import path, not a physical-erasure
 guarantee. After admission, frozen-primary loss can block recovery indefinitely.
 Reconfiguration may interrupt writes and connections with no duration guarantee.
 V2 images remain local/CI-only;
-scale-up, primary removal, and the SQLite/PostgreSQL ports remain future work.
+sequential scale-up is enabled, while primary removal and the SQLite/PostgreSQL
+ports remain future work.
 
 ## Continuous Delivery
 

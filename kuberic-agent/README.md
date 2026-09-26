@@ -138,7 +138,7 @@ means a retirement tombstone exists. The JSON field is additive; older diagnosti
 responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
-Use a fresh coordinated protocol-6/schema-2 deployment, not a rolling upgrade.
+Use a fresh coordinated protocol-7/schema-3 deployment, not a rolling upgrade.
 Exact original PVC provenance must be reconstructable before admission; if Pod
 and PVC already disappeared without that provenance, scale-down waits/fails
 closed rather than treating list omission as absence. Unavailable-target support
@@ -147,7 +147,8 @@ has no retention or import path, not a physical storage erasure guarantee.
 Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequential
 cleanup must finish, and every retained member needs its original completed
 current-only witness or fresh completed local acceptance before superseding the
-bounded receipt. Scale-up remains absent. These limits and the explicitly deferred
+bounded receipt. Sequential scale-up uses durable schema-3 build and admission
+authority. These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
 

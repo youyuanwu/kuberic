@@ -71,9 +71,11 @@ Raw application progress is repair evidence only. Protocol version 3
 introduced a separate authority-bound `verifiedReplicationLsn`; protocol
 version 4 additionally binds control commands to the exact observed target
 process session. Version 5 added accepted-spec-generation fencing for preparation
-and retirement. **Protocol version 6** adds secondary removal, independent
+and retirement. Protocol version 6 added secondary removal, independent
 previous/reduced policies, and durable preparation, acceptance, and retirement
-evidence; all level-triggered components must use that exact version.
+evidence. **Protocol version 7** adds sequential scale-up with exact
+allocation, build, admission, completion, and cleanup authority; all
+level-triggered components must use that exact version.
 The current primary revalidates the progress certificate
 before it can contribute remote quorum credit.
 
@@ -146,7 +148,7 @@ The following remain fail-closed and require separate design:
   recovery;
 - automatic switchover target selection, cancellation/retargeting of active
   requests, and node-maintenance orchestration;
-- scale-up, primary removal, explicitly selected removal targets, or
+- primary removal, explicitly selected removal targets, or
   cancellation/retargeting of an active removal;
 - timed dropping of unavailable replicas;
 - PVC authority rebinding to a new Pod UID;
@@ -228,14 +230,15 @@ active intent, cleanup, and conditions together.
 | Unavailable selected secondary | Same target; proceed only with retained evidence and frozen or reconstructable exact cleanup identity |
 | Missing primary or insufficient evidence | Wait fail-closed; no alternate target or automatic failover inside the frozen removal |
 | Count below one | Rejected |
-| Scale-up, primary/explicit-target removal | Unsupported |
+| Scale-up | Sequential one-at-a-time restoration/addition |
+| Primary/explicit-target removal | Unsupported |
 | Changed desired count during removal | Queued for fresh evaluation after cleanup; not cancellation or retargeting |
 
 **Target=min risk:** lowering the desired count also lowers the minimum,
 including permission to remove an unavailable secondary when safe evidence
 exists. A two-member set needs both members for ordinary write quorum; a
-singleton has no replica redundancy or alternate failover primary. Scale-up
-cannot currently restore redundancy after a completed reduction.
+singleton has no replica redundancy or alternate failover primary. Sequential
+scale-up can restore redundancy after a completed reduction.
 
 ### Authority and cleanup
 
@@ -339,11 +342,13 @@ otherwise unrelated failover. These are Kuberic availability limitations, not
 general SF behavior. Independent target/minimum policy, placement-aware selection,
 overlapping recovery, multi-member removal, and durable primary-agent phase
 scheduling are [deferred](../../proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
-Scale-up remains absent and requires a separate protocol.
+Scale-up is sequential and restores the first missing positive logical ordinal
+outside accepted authority before allocating a new highest ordinal.
 
-Protocol 6 and agent store schema 2 require a **fresh coordinated deployment**;
-protocol 5 and schema 1 are rejected, with no migration or mixed-version mode.
-Schema 2 separates immutable initialization provenance from admitted policies.
+Protocol 7 and agent store schema 3 require a **fresh coordinated deployment**;
+protocol 6 and schema 2 are rejected, with no migration or mixed-version mode.
+Schema 3 persists scale-up build and admission authority in addition to the
+schema-2 initialization provenance and admitted policies.
 Retirement-started and terminal tombstone records both prevent application Open
 on restart: a fresh process finishes interrupted retirement without reopening
 the removed application, then reports the exact receipt. Frozen quorum proof
@@ -531,10 +536,10 @@ semantics. Filesystems that cannot provide those semantics, including
 unsupported network-filesystem arrangements, are not valid production
 storage.
 
-The current schema is **2** and accepts only its exact version. The migration hook records
+The current schema is **3** and accepts only its exact version. The migration hook records
 an idempotent current-version migration; it does not upgrade older schemas.
-Schema 1 is rejected without conversion. Use a fresh deployment for protocol 6 /
-schema 2; no rolling upgrade or existing-data migration is provided.
+Schema 2 is rejected without conversion. Use a fresh deployment for protocol 7 /
+schema 3; no rolling upgrade or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 `KUBERIC_CRASH_BOUNDARY` are consumed only by the
@@ -791,9 +796,9 @@ Run all documentation and API checks with:
 scripts/check_level_triggered_documentation.sh
 ```
 
-Classic v1 remains the documented path for existing `kuberic.io/v1` resources,
-scale-up, and the SQLite/PostgreSQL examples. V2 supports explicit planned
-switchover and secondary-only scale-down; no v1 conversion, data import, or
+Classic v1 remains the documented path for existing `kuberic.io/v1` resources
+and the SQLite/PostgreSQL examples. V2 supports explicit planned switchover,
+secondary-only scale-down, and sequential scale-up; no v1 conversion, data import, or
 classic-path removal is implied. The [retirement plan](../../proposal/v1-retirement-plan.md)
 keeps remaining scaling,
 application ports, distribution, deprecation, and removal as separate workstreams.

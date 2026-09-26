@@ -33,11 +33,12 @@ alternate target or replacement. Exact original PVC provenance must be
 reconstructable before admission; otherwise pre-request Pod/PVC disappearance
 waits/fails closed. Unavailable-target support requires frozen or reconstructable
 cleanup identity. Scale-down deletes the removed replica's PVC object, Pod, and peer endpoint after
-authority commit. Scale-up, primary removal, and cancellation are unsupported.
+authority commit. Sequential scale-up is supported; primary removal and active
+removal cancellation are unsupported.
 There is no PVC retention or import path, nor a physical storage erasure promise.
 Frozen-primary loss during removal/cleanup can block service indefinitely.
 Expect HTTP 503/disconnects during convergence, with no interruption-duration
-guarantee. Protocol 6 / store schema 2 require fresh deployment, not data migration.
+guarantee. Protocol 7 / store schema 3 require fresh deployment, not data migration.
 
 After installing into an explicitly owned KinD cluster, run:
 

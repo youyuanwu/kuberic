@@ -133,7 +133,9 @@ cleanup identity. PVC object deletion has no retention or import path, not a
 physical storage erasure guarantee. Frozen-primary loss during removal/cleanup
 can cause indefinite outage. Sequential cleanup and each retained member's
 original completed current-only witness or fresh completed local acceptance
-gate replacement of the bounded receipt. Scale-up remains absent.
+gate replacement of the bounded receipt. Sequential scale-up uses the same
+authority-validated runtime boundary without moving desired policy or cleanup
+authority into the runtime.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither
 desired policy nor Kubernetes deletion authority belongs in the runtime.

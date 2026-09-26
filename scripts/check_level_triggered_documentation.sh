@@ -50,6 +50,32 @@ assert request["properties"]["requestId"]["minLength"] == 1
 assert request["properties"]["targetReplicaId"]["type"] == "integer"
 assert request["properties"]["targetReplicaId"]["minimum"] == 1
 status = properties["status"]["properties"]
+scale_up = status["transition"]["properties"]["scaleUp"]["properties"]
+assert set(scale_up) == {
+    "operationId", "resourceUid", "specGeneration", "desiredReplicas",
+    "previousConfiguration", "currentConfiguration", "previousPolicy", "currentPolicy",
+    "primary", "target", "buildId", "snapshotBoundaryLsn", "catchUpBoundaryLsn",
+}
+allocation_schema = status["scaleUpAllocation"]
+allocation = allocation_schema["properties"]
+assert set(allocation) == {
+    "resourceUid", "specGeneration", "desiredReplicas", "previousConfigurationId",
+    "targetReplicaId", "operationId", "podUid", "pvcUid",
+}
+assert set(allocation_schema["required"]) == {
+    "resourceUid", "specGeneration", "desiredReplicas", "previousConfigurationId",
+    "targetReplicaId", "operationId",
+}
+assert allocation["targetReplicaId"]["minimum"] == 1
+assert set(status["scaleUpCleanup"]["properties"]) == {
+    "provisioning", "target", "resources",
+}
+assert set(status["lastScaleUp"]["properties"]) == {
+    "intent", "acceptedConfiguration", "failoverEvidence", "currentOnlyWriteQuorum",
+}
+for field in ("scaleUpAllocation", "scaleUpCleanup", "lastScaleUp",
+              "scaleUpAdmissionStarted"):
+    assert field not in properties["status"]["required"], f"{field} must remain optional"
 receipt = status["lastSwitchover"]["properties"]
 assert set(receipt) == {
     "requestId", "requestedTargetReplicaId", "acceptedTarget", "resultingPrimary", "outcome"
@@ -126,11 +152,11 @@ assert "PVC object deletion" in sample and "PVC object deletion" in guide_text
 
 protocol = (root / "kuberic-protocol/src/lib.rs").read_text()
 store = (root / "kuberic-agent/src/state.rs").read_text()
-assert re.search(r"pub const PROTOCOL_VERSION: u32 = 6;", protocol)
-assert re.search(r"pub const SCHEMA_VERSION: u32 = 2;", store)
-assert "Protocol version 6" in guide_text and "schema 2" in guide_text
-assert "Protocol version 6" in (root / "kuberic-wire/README.md").read_text()
-assert "Protocol 6" in sample and "schema 2" in sample
+assert re.search(r"pub const PROTOCOL_VERSION: u32 = 7;", protocol)
+assert re.search(r"pub const SCHEMA_VERSION: u32 = 3;", store)
+assert "Protocol version 7" in guide_text and "schema 3" in guide_text
+assert "Protocol version 7" in (root / "kuberic-wire/README.md").read_text()
+assert "Protocol 7" in sample and "schema 3" in sample
 diagnostics = (root / "kuberic-agent/src/process.rs").read_text()
 assert "pub retired: bool" in diagnostics
 assert "state.retired_authority.is_some() || snapshot.retired_authority.is_some()" in diagnostics
@@ -274,4 +300,4 @@ PY
 
 scripts/check_runtime_public_api.sh
 
-echo "Level-triggered links, API examples, scale-down contracts, protocol 6, generated CRD, and runtime API boundaries are current."
+echo "Level-triggered links, API examples, scale-down/scale-up contracts, protocol 7, generated CRD, and runtime API boundaries are current."
