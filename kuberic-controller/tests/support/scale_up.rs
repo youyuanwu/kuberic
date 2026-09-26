@@ -258,27 +258,23 @@ async fn tick(api: &Arc<InMemoryClusterApi>) -> (ReconcileKind, Vec<EffectRecord
     (action.kind, effects)
 }
 
-async fn finish(api: &Arc<InMemoryClusterApi>, desired: u32) -> Vec<String> {
-    let mut reasons = Vec::new();
+async fn finish(api: &Arc<InMemoryClusterApi>, desired: u32) -> Vec<(String, String)> {
+    let mut diagnostics = BTreeMap::new();
     for _ in 0..300 {
         let (kind, _) = tick(api).await;
         let raw = api.observation().await;
         if let Some(status) = &raw.set.status {
-            reasons.extend(
-                status
-                    .authority
-                    .conditions
-                    .iter()
-                    .map(|condition| condition.reason.clone()),
-            );
+            for condition in &status.authority.conditions {
+                if condition.reason.starts_with("ScaleUp") {
+                    diagnostics.insert(condition.reason.clone(), condition.message.clone());
+                }
+            }
             if kind == ReconcileKind::Stable
                 && accepted_count(&raw) == desired
                 && status.authority.provisioning.is_none()
                 && status.authority.transition.is_none()
             {
-                reasons.sort();
-                reasons.dedup();
-                return reasons;
+                return diagnostics.into_iter().collect();
             }
         }
     }
@@ -370,7 +366,7 @@ async fn canonical_candidate_is_created_pvc_before_pod_and_lost_create_replays()
 #[tokio::test]
 async fn controller_converges_sequential_scale_up_through_exact_agent_commands() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(1, 3)));
-    let reasons = finish(&api, 3).await;
+    let diagnostics = finish(&api, 3).await;
     let raw = api.observation().await;
     let status = &raw.set.status.as_ref().unwrap().authority;
     assert_eq!(
@@ -431,6 +427,21 @@ async fn controller_converges_sequential_scale_up_through_exact_agent_commands()
     assert_eq!(initialized, 2);
     assert_eq!(builds, 2);
     assert!(configurations >= 6);
+    for (reason, message) in &diagnostics {
+        for field in [
+            "accepted=",
+            "desired=",
+            "target=",
+            "attempt=",
+            "phase=",
+            "blocking=",
+        ] {
+            assert!(
+                message.contains(field),
+                "{reason} omitted {field}: {message}"
+            );
+        }
+    }
     for reason in [
         "ScaleUpProvisioningAccepted",
         "ScaleUpCopying",
@@ -438,18 +449,113 @@ async fn controller_converges_sequential_scale_up_through_exact_agent_commands()
         "ScaleUpStable",
     ] {
         assert!(
-            reasons.iter().any(|candidate| candidate == reason),
-            "missing controller-visible phase {reason}: {reasons:?}"
+            diagnostics.iter().any(|(candidate, _)| candidate == reason),
+            "missing controller-visible phase {reason}: {diagnostics:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn scale_up_reobserves_status_conflict_and_lost_agent_replies() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let mut conflicted = false;
+    for _ in 0..20 {
+        observe_fresh_candidate(&api).await;
+        let raw = api.observe("tests", "db").await.unwrap();
+        let plan = evaluate(&normalize(raw, BTreeMap::new()).unwrap(), &enabled());
+        if matches!(
+            plan,
+            Plan::Apply { ref changes }
+                if changes.iter().any(|change| {
+                    matches!(
+                        change,
+                        KubernetesChange::PersistStatus { status }
+                            if status.provisioning.is_some()
+                    )
+                })
+        ) {
+            api.conflict_next_status().await;
+            let (kind, effects) = tick(&api).await;
+            assert_eq!(kind, ReconcileKind::ObservationStale);
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !matches!(effect, EffectRecord::Execute(_)))
+            );
+            conflicted = true;
+            break;
+        }
+        tick(&api).await;
+    }
+    assert!(conflicted, "scale-up provisioning status was not reached");
+
+    let mut lost_initialize = false;
+    let mut lost_build = false;
+    let mut lost_configuration = false;
+    for _ in 0..200 {
+        observe_fresh_candidate(&api).await;
+        let raw = api.observe("tests", "db").await.unwrap();
+        let plan = evaluate(&normalize(raw, BTreeMap::new()).unwrap(), &enabled());
+        let inject = match &plan {
+            Plan::Execute {
+                command: ProtocolCommand::InitializeAgentStore(_),
+            } if !lost_initialize => {
+                lost_initialize = true;
+                true
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(_),
+            } if !lost_build => {
+                lost_build = true;
+                true
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.scale_up_evidence.is_some() && !lost_configuration => {
+                lost_configuration = true;
+                true
+            }
+            _ => false,
+        };
+        if inject {
+            api.unavailable_next_execute().await;
+        }
+        let (kind, effects) = tick(&api).await;
+        if inject {
+            assert_eq!(kind, ReconcileKind::Waiting);
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, EffectRecord::Execute(_)))
+            );
+        }
+        if kind == ReconcileKind::Stable && accepted_count(&api.observation().await) == 2 {
+            break;
+        }
+    }
+    assert!(lost_initialize && lost_build && lost_configuration);
+    finish(&api, 2).await;
 }
 
 #[tokio::test]
 async fn cancelled_candidate_cleanup_is_exact_ordered_and_restart_safe() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
     drive_until_cleanup(&api).await;
+    let before_cleanup = api.observation().await;
+    let old_pod_uid = before_cleanup
+        .pods
+        .iter()
+        .find(|pod| pod.name_any() == "db-2")
+        .and_then(ResourceExt::uid)
+        .unwrap();
+    let old_pvc_uid = before_cleanup
+        .pvcs
+        .iter()
+        .find(|pvc| pvc.name_any() == "db-2-data")
+        .and_then(ResourceExt::uid)
+        .unwrap();
     api.lose_next_delete_reply().await;
-    let reasons = finish(&api, 1).await;
+    let diagnostics = finish(&api, 1).await;
     let raw = api.observation().await;
     assert!(raw.pods.iter().all(|pod| pod.name_any() != "db-2"));
     assert!(raw.pvcs.iter().all(|pvc| pvc.name_any() != "db-2-data"));
@@ -471,9 +577,34 @@ async fn cancelled_candidate_cleanup_is_exact_ordered_and_restart_safe() {
         ]
     );
     assert!(
-        reasons
+        diagnostics
             .iter()
-            .any(|reason| reason == "ScaleUpCleanupComplete")
+            .any(|(reason, _)| reason == "ScaleUpCleanupComplete")
+    );
+
+    let mut retry = api.observation().await;
+    retry.set.spec.replicas = 2;
+    retry.set.metadata.generation = Some(retry.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(retry).await;
+    finish(&api, 2).await;
+    let retried = api.observation().await;
+    assert_ne!(
+        retried
+            .pods
+            .iter()
+            .find(|pod| pod.name_any() == "db-2")
+            .and_then(ResourceExt::uid)
+            .unwrap(),
+        old_pod_uid
+    );
+    assert_ne!(
+        retried
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == "db-2-data")
+            .and_then(ResourceExt::uid)
+            .unwrap(),
+        old_pvc_uid
     );
 }
 
@@ -569,29 +700,60 @@ async fn terminating_candidate_blocks_pvc_cleanup_until_exact_pod_absence() {
         .finalizers = Some(vec!["tests/finalizer".into()]);
     api.set_observation(raw).await;
 
+    let mut saw_blocked_pod_delete = false;
     for _ in 0..10 {
-        tick(&api).await;
-        let observed = api.observation().await;
-        if observed.services.iter().all(|service| {
-            service
-                .spec
-                .as_ref()
-                .and_then(|spec| spec.selector.as_ref())
-                .and_then(|selector| selector.get(INSTANCE_LABEL))
-                .map(String::as_str)
-                != candidate_key(&observed)
-                    .as_ref()
-                    .map(|(key, _)| key.instance_id.as_str())
+        let (_, effects) = tick(&api).await;
+        if effects.iter().any(|effect| {
+            matches!(
+                effect,
+                EffectRecord::DeleteScaleDownResource {
+                    resource: ScaleDownResource::Pod,
+                    ..
+                }
+            )
         }) {
-            assert!(
-                observed
-                    .pvcs
-                    .iter()
-                    .any(|pvc| pvc.name_any() == "db-2-data")
-            );
+            saw_blocked_pod_delete = true;
             break;
         }
     }
+    assert!(saw_blocked_pod_delete);
+    let observed = api.observation().await;
+    assert!(observed.pods.iter().any(|pod| pod.name_any() == "db-2"));
+    assert!(
+        observed
+            .pvcs
+            .iter()
+            .any(|pvc| pvc.name_any() == "db-2-data")
+    );
+    assert!(
+        observed
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .scale_up_cleanup
+            .is_some()
+    );
+    let (_, repeated) = tick(&api).await;
+    assert!(repeated.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pod,
+                ..
+            }
+        )
+    }));
+    assert!(repeated.iter().all(|effect| {
+        !matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pvc,
+                ..
+            }
+        )
+    }));
     let mut raw = api.observation().await;
     raw.pods
         .iter_mut()
@@ -666,6 +828,27 @@ async fn stale_cleanup_resource_version_is_reobserved_without_broad_deletion() {
 async fn pending_candidate_cleanup_allows_primary_failover_but_blocks_retry() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
     drive_until_cleanup(&api).await;
+    let cleanup = api
+        .observation()
+        .await
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .scale_up_cleanup
+        .as_deref()
+        .unwrap()
+        .clone();
+    let endpoint_name = match cleanup.resources.endpoint {
+        kuberic_protocol::types::CleanupResourceIdentity::Present { name, .. }
+        | kuberic_protocol::types::CleanupResourceIdentity::Absent { name } => name,
+    };
+    api.fail_exact_lookup(
+        format!("Service/{endpoint_name}"),
+        Some("candidate endpoint lookup unavailable".into()),
+    )
+    .await;
     let before = api.effects().await.len();
     let mut raw = api.observation().await;
     let primary = raw

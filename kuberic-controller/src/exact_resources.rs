@@ -154,6 +154,33 @@ fn scale_up_transition_target(
         })
 }
 
+fn scale_up_lifecycle_target(raw: &RawObservation, target: &ReplicaIdentity) -> bool {
+    let Some(status) = raw.set.status.as_ref().map(|status| &status.authority) else {
+        return false;
+    };
+    status
+        .scale_up_cleanup
+        .as_deref()
+        .is_some_and(|cleanup| cleanup.target == *target)
+        || status
+            .provisioning
+            .as_ref()
+            .filter(|provisioning| provisioning.scale_up().is_some())
+            .is_some_and(|provisioning| {
+                provisioning.target_identity(&ResourceUid::new(raw.set.uid().unwrap_or_default()))
+                    == *target
+            })
+        || status
+            .transition
+            .as_ref()
+            .and_then(scale_up_transition_target)
+            == Some(target)
+        || status
+            .last_scale_up
+            .as_deref()
+            .is_some_and(|receipt| receipt.intent.target == *target)
+}
+
 fn scale_up_candidate_identity(
     raw: &RawObservation,
     target: &ReplicaIdentity,
@@ -351,6 +378,7 @@ pub(crate) fn matches<K: ResourceExt>(identity: &CleanupResourceIdentity, object
 }
 
 pub(crate) fn finish(raw: &mut RawObservation, mut exact: RawScaleDownResources, frozen: bool) {
+    let scale_up_lifecycle = scale_up_lifecycle_target(raw, &exact.target);
     if !frozen && let ExactLookup::Present(service) = &exact.endpoint {
         let owned = service.labels().get(SET_UID_LABEL) == raw.set.metadata.uid.as_ref()
             && service
@@ -392,7 +420,10 @@ pub(crate) fn finish(raw: &mut RawObservation, mut exact: RawScaleDownResources,
             classify(&exact.identity.endpoint, &exact.endpoint),
         ),
     ] {
-        if let ExactResourceObservation::LookupFailed { message } = result {
+        // Scale-up keeps failed exact GETs in the typed lifecycle observation so
+        // cleanup and retry remain blocked, but they must not become a global
+        // observation failure that prevents accepted-primary failover.
+        if !scale_up_lifecycle && let ExactResourceObservation::LookupFailed { message } = result {
             raw.failures.push(RawObservationFailure {
                 source: format!("exact-{kind}/{}", name(identity)),
                 message,
