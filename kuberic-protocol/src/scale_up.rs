@@ -905,7 +905,22 @@ mod tests {
 
     #[test]
     fn representative_scale_up_status_evidence_remains_bounded() {
-        let mut prior_sizes = std::collections::BTreeMap::<&str, usize>::new();
+        const KUBERNETES_CONFIGMAP_DATA_LIMIT: usize = 1_048_576;
+        const RESERVED_OBJECT_HEADROOM: usize = 262_144;
+        const PRODUCTION_STATUS_BUDGET: usize =
+            KUBERNETES_CONFIGMAP_DATA_LIMIT - RESERVED_OBJECT_HEADROOM;
+        const FIXED_VARIANT_ALLOWANCE: usize = 32_768;
+        const PER_MEMBER_ALLOWANCE: usize = 16_384;
+
+        fn within_linear_envelope(count: u32, size: usize) -> std::result::Result<(), String> {
+            let limit = FIXED_VARIANT_ALLOWANCE + count as usize * PER_MEMBER_ALLOWANCE;
+            (size <= limit)
+                .then_some(())
+                .ok_or_else(|| format!("{size} bytes exceeds linear envelope {limit}"))
+        }
+
+        let mut prior_sizes = std::collections::BTreeMap::<&str, (u32, usize)>::new();
+        let mut production_high_water = 0;
         for previous_count in [1_u32, 2, 3, 5, 9, 17] {
             let mut intent = intent(previous_count);
             let provisioning = provisioning(&intent);
@@ -969,6 +984,62 @@ mod tests {
                 }),
                 ..Default::default()
             };
+            let mut allocation = ScaleUpAllocation {
+                resource_uid: intent.resource_uid.clone(),
+                spec_generation: intent.spec_generation,
+                desired_replicas: intent.desired_replicas,
+                previous_configuration_id: intent.previous_configuration.configuration_id.clone(),
+                accepted_configuration_id: intent.previous_configuration.configuration_id.clone(),
+                target_replica_id: intent.target.replica_id,
+                operation_id: OperationId::default(),
+                previous_operation_id: None,
+                scaffolding_requested: false,
+                pod_uid: None,
+                pvc_uid: None,
+                cancellation_started: false,
+            };
+            allocation.operation_id = allocation.expected_operation_id();
+            let allocation_scaffolding = AcceptedStatus {
+                scale_up_allocation: Some(ScaleUpAllocation {
+                    scaffolding_requested: true,
+                    ..allocation.clone()
+                }),
+                ..stable.clone()
+            };
+            let allocation_frozen_pvc = AcceptedStatus {
+                scale_up_allocation: Some(ScaleUpAllocation {
+                    scaffolding_requested: true,
+                    pvc_uid: Some(PvcUid::new(format!(
+                        "scale-up-data-{}-uid",
+                        intent.target.replica_id
+                    ))),
+                    ..allocation.clone()
+                }),
+                ..stable.clone()
+            };
+            let allocation_cancellation = AcceptedStatus {
+                scale_up_allocation: Some(ScaleUpAllocation {
+                    scaffolding_requested: true,
+                    cancellation_started: true,
+                    ..allocation.clone()
+                }),
+                ..stable.clone()
+            };
+            let allocation_retry = AcceptedStatus {
+                scale_up_allocation: Some(ScaleUpAllocation {
+                    operation_id: {
+                        let mut retry = ScaleUpAllocation {
+                            previous_operation_id: Some(allocation.operation_id.clone()),
+                            ..allocation.clone()
+                        };
+                        retry.operation_id = retry.expected_operation_id();
+                        retry.operation_id
+                    },
+                    previous_operation_id: Some(allocation.operation_id.clone()),
+                    ..allocation.clone()
+                }),
+                ..stable.clone()
+            };
             let pc_cc = AcceptedStatus {
                 provisioning: Some(provisioning.clone()),
                 transition: Some(TransitionIntent {
@@ -1001,43 +1072,114 @@ mod tests {
                 last_scale_up: Some(Box::new(receipt.clone())),
                 ..stable.clone()
             };
+            let active_build = AcceptedStatus {
+                provisioning: Some(provisioning.clone()),
+                conditions: vec![StatusCondition {
+                    type_: "Progressing".into(),
+                    status: ConditionStatus::True,
+                    reason: "ScaleUpBuildActive".into(),
+                    message: format!(
+                        "copying {:?} through durable catch-up LSN {}",
+                        target, intent.catch_up_boundary_lsn
+                    ),
+                }],
+                ..stable.clone()
+            };
+            let committed_degraded = AcceptedStatus {
+                conditions: vec![
+                    StatusCondition {
+                        type_: "Ready".into(),
+                        status: ConditionStatus::Unknown,
+                        reason: "ScaleUpCommittedDegraded".into(),
+                        message: format!(
+                            "accepted member {:?} has not reported current-only authority",
+                            intent
+                                .previous_configuration
+                                .members
+                                .last()
+                                .unwrap()
+                                .identity
+                        ),
+                    },
+                    StatusCondition {
+                        type_: "Progressing".into(),
+                        status: ConditionStatus::True,
+                        reason: "ScaleUpCommittedDegraded".into(),
+                        message: "exact late-member local convergence remains pending".into(),
+                    },
+                ],
+                ..committed.clone()
+            };
             let statuses = [
                 ("stable", stable.clone()),
+                ("allocation-scaffolding", allocation_scaffolding),
+                ("allocation-frozen-pvc", allocation_frozen_pvc),
+                ("allocation-cancellation", allocation_cancellation),
+                ("allocation-retry-lineage", allocation_retry),
                 (
-                    "active-build",
+                    "provisioning",
                     AcceptedStatus {
                         provisioning: Some(provisioning.clone()),
                         ..stable.clone()
                     },
                 ),
+                ("active-build", active_build),
                 ("pc-cc", pc_cc),
                 (
                     "cleanup",
                     AcceptedStatus {
                         scale_up_cleanup: Some(Box::new(cleanup)),
-                        ..stable
+                        ..stable.clone()
                     },
                 ),
-                ("committed-degraded", committed.clone()),
+                ("committed-degraded", committed_degraded),
                 ("latest-receipt", committed),
             ];
             for (phase, status) in statuses {
                 crate::validation::validate_status(&status).unwrap();
                 let size = serde_json::to_vec(&status).unwrap().len();
                 let count = previous_count + 1;
-                assert!(
-                    size <= 12_288 + count as usize * 8_192,
-                    "{phase} status at {count} members grew to {size} bytes"
-                );
-                if let Some(previous) = prior_sizes.insert(phase, size) {
+                within_linear_envelope(count, size)
+                    .unwrap_or_else(|error| panic!("{phase} status at {count} members: {error}"));
+                if let Some((previous_count, previous)) = prior_sizes.insert(phase, (count, size)) {
+                    let member_delta = (count - previous_count) as usize;
                     assert!(
-                        size <= previous.saturating_mul(2).saturating_add(8_192),
-                        "{phase} evidence grew multiplicatively: {previous} -> {size} bytes"
+                        size.saturating_sub(previous)
+                            <= member_delta * PER_MEMBER_ALLOWANCE + 4_096,
+                        "{phase} evidence grew faster than its member delta: \
+                         {previous} -> {size} bytes across {member_delta} members"
                     );
                 }
+                production_high_water = production_high_water.max(size);
                 eprintln!("scale-up-status phase={phase} members={count} bytes={size}");
             }
+
+            if previous_count == 17 {
+                let quadratic_counterexample = serde_json::to_vec(&serde_json::json!({
+                    "status": stable,
+                    "membersSquaredEvidence": vec![
+                        receipt.clone();
+                        usize::try_from((previous_count + 1).pow(2)).unwrap()
+                    ],
+                }))
+                .unwrap()
+                .len();
+                assert!(
+                    within_linear_envelope(previous_count + 1, quadratic_counterexample).is_err(),
+                    "members^2 evidence mutation unexpectedly fit the linear envelope"
+                );
+            }
         }
+        assert!(
+            production_high_water <= PRODUCTION_STATUS_BUDGET,
+            "count-18 representative status high-water {production_high_water} leaves less \
+             than {RESERVED_OBJECT_HEADROOM} bytes below the \
+             {KUBERNETES_CONFIGMAP_DATA_LIMIT}-byte object-data policy"
+        );
+        eprintln!(
+            "scale-up-status capacity high-water={production_high_water} \
+             budget={PRODUCTION_STATUS_BUDGET} reserved-headroom={RESERVED_OBJECT_HEADROOM}"
+        );
     }
 
     #[test]
