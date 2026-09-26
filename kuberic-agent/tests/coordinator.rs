@@ -962,11 +962,49 @@ fn apply_evaluator_configuration(
     if command.current_only {
         state.retired_builds.insert(intent.build_id.clone());
     }
-    state.retained_command = Some(RetainedCommandResult {
+    let retained = RetainedCommandResult {
         command: command.clone(),
         role: state.role,
         epoch: state.highest_epoch,
+    };
+    if command.current_only {
+        state.completed_scale_up = Some(Box::new(retained.clone()));
+    }
+    state.retained_command = Some(retained);
+}
+
+fn apply_access_restoration(state: &mut AgentState) {
+    let current = state.current_configuration.clone().unwrap();
+    let identity = state.identity.local_identity.clone();
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new(format!("post-scale-up-access-{}", identity.replica_id)),
+        previous_configuration: None,
+        current_configuration: current.clone(),
+        previous_epoch: None,
+        current_epoch: current.epoch,
+        effective_policy: state.admitted_policy.clone().unwrap(),
+        previous_policy: None,
+        secondary_removal_evidence: None,
+        scale_up_evidence: None,
+        local_replica_id: identity.replica_id,
+        expected_instance_id: identity.instance_id,
+        expected_agent_generation: identity.agent_generation,
+        transition_kind: TransitionKind::Bootstrap,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::Granted,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    let authority = admit_configuration(&command, state).unwrap();
+    assert!(authority.scale_up.is_some());
+    state.retained_command = Some(RetainedCommandResult {
+        command,
+        role: state.role,
+        epoch: state.highest_epoch,
     });
+    assert!(state.completed_scale_up.is_some());
 }
 
 fn step_evaluator_with_agent_admission(
@@ -1497,7 +1535,19 @@ async fn scale_up_candidate_activates_only_after_exact_build_and_retires_it_on_c
 fn evaluator_generated_sequential_scale_up_commands_pass_real_agent_admission() {
     let mut model = scale_up_model::Model::new(1, 3);
     let mut states = evaluator_agent_states(&model);
+    let mut restored_access = false;
     for _ in 0..240 {
+        if model.accepted_count() == 2
+            && model.snapshot.status.transition.is_none()
+            && !restored_access
+        {
+            let primary = states
+                .values_mut()
+                .find(|state| state.role == ReplicaRole::Primary)
+                .unwrap();
+            apply_access_restoration(primary);
+            restored_access = true;
+        }
         step_evaluator_with_agent_admission(&mut model, &mut states);
         if model.accepted_count() == 3
             && model.snapshot.status.transition.is_none()
@@ -1507,6 +1557,7 @@ fn evaluator_generated_sequential_scale_up_commands_pass_real_agent_admission() 
         }
     }
     assert_eq!(model.accepted_history, vec![1, 2, 3]);
+    assert!(restored_access);
     let accepted = &model
         .snapshot
         .status
@@ -1642,6 +1693,7 @@ fn evaluator_generated_carried_failover_commands_pass_real_agent_admission() {
             role: state.role,
             epoch: state.highest_epoch,
         });
+        state.completed_scale_up = state.retained_command.clone().map(Box::new);
     }
     {
         let report = model.report_mut(old_primary.replica_id.value());

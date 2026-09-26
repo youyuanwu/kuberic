@@ -133,6 +133,8 @@ pub struct AgentState {
     #[serde(default)]
     pub retained_command: Option<RetainedCommandResult>,
     #[serde(default)]
+    pub completed_scale_up: Option<Box<RetainedCommandResult>>,
+    #[serde(default)]
     pub scale_up_evidence: Option<Box<ScaleUpConfigurationEvidence>>,
     #[serde(default)]
     pub build_commands: BTreeMap<OperationId, EnsureReplicaBuild>,
@@ -179,6 +181,7 @@ impl AgentState {
             reconfiguration_data: None,
             reconfiguration: None,
             retained_command: None,
+            completed_scale_up: None,
             scale_up_evidence: None,
             build_commands: BTreeMap::new(),
             build_progress: BTreeMap::new(),

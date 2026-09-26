@@ -380,6 +380,24 @@ pub(super) fn cleanup(
     {
         return plan;
     }
+    let accepted = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .expect("validated cleanup has accepted topology")
+        .configuration;
+    if let Some(plan) = restore_accepted_service_before_cleanup(
+        snapshot,
+        accepted,
+        snapshot
+            .status
+            .effective_policy
+            .as_ref()
+            .expect("validated cleanup has policy"),
+        config,
+    ) {
+        return plan;
+    }
     let target = &cleanup.target;
     let Some(exact) = cleanup_observation(snapshot, target) else {
         return wait(
@@ -623,6 +641,31 @@ pub(super) fn recover_local_acceptance(
                 });
         if advanced_to_newer_scale_up {
             continue;
+        }
+        let missed_ordinary_pc_cc = receipt.failover_evidence.is_none()
+            && report.previous_configuration.is_none()
+            && report.current_configuration.as_ref()
+                == Some(&receipt.intent.previous_configuration)
+            && receipt
+                .intent
+                .previous_configuration
+                .members
+                .iter()
+                .any(|previous| {
+                    previous.identity == report.identity && previous.role == report.role
+                });
+        if missed_ordinary_pc_cc {
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
+                    ScaleUpConfigurationEvidence::Admission {
+                        intent: receipt.intent.clone(),
+                    },
+                    &receipt.accepted_configuration,
+                    member,
+                    false,
+                    None,
+                ))),
+            });
         }
         let stale_original_failover_authority = receipt.failover_evidence.is_some()
             && report.scale_up_intent.as_deref() == Some(&receipt.intent)
@@ -960,16 +1003,6 @@ pub(super) fn provisioning(
             config,
         );
     }
-    if snapshot.desired.replicas <= scale_up.previous_policy.replica_set_size {
-        return freeze_cleanup(
-            snapshot,
-            provisioning,
-            status,
-            "ScaleUpCancelledBeforeAdmission",
-            false,
-            config,
-        );
-    }
     if replica_failed(snapshot, &primary.identity) {
         return maybe_begin_stable_failover(snapshot, status, config).unwrap_or_else(|| {
             wait(
@@ -983,6 +1016,16 @@ pub(super) fn provisioning(
                 config,
             )
         });
+    }
+    if snapshot.desired.replicas <= scale_up.previous_policy.replica_set_size {
+        return freeze_cleanup(
+            snapshot,
+            provisioning,
+            status,
+            "ScaleUpCancelledBeforeAdmission",
+            false,
+            config,
+        );
     }
     let Some(observation) = snapshot.observation_for_identity(&target) else {
         return freeze_cleanup(
@@ -1493,7 +1536,41 @@ pub(super) fn transition(
     };
     let admission_started =
         snapshot.status.scale_up_admission_started.as_ref() == Some(&intent.operation_id);
-    if transition.kind == TransitionKind::ScaleUp && replica_failed(snapshot, &intent.primary) {
+    let accepted_primary_failed = replica_failed(snapshot, &intent.primary);
+    if transition.kind == TransitionKind::ScaleUp
+        && !accepted_primary_failed
+        && snapshot
+            .status
+            .primary_failure
+            .as_ref()
+            .is_some_and(|failure| failure.primary == intent.primary)
+    {
+        let mut status = snapshot.status.clone();
+        status.primary_failure = None;
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpPrimaryRecovered",
+            "failover-recovery",
+            Some(&intent.target),
+            Some(&intent.operation_id),
+            "accepted primary recovered before failover allocation",
+        ));
+    }
+    if transition.kind == TransitionKind::ScaleUp
+        && !admission_started
+        && !accepted_primary_failed
+        && let Some(plan) = restore_accepted_service_before_cleanup(
+            snapshot,
+            &intent.previous_configuration,
+            &intent.previous_policy,
+            config,
+        )
+    {
+        return plan;
+    }
+    let mut recovering_primary_failure = false;
+    if transition.kind == TransitionKind::ScaleUp && accepted_primary_failed {
         if !admission_started {
             return maybe_begin_stable_failover(snapshot, snapshot.status.clone(), config)
                 .unwrap_or_else(|| {
@@ -1509,7 +1586,15 @@ pub(super) fn transition(
                     )
                 });
         }
-        return begin_failover(snapshot, transition, intent, config);
+        let previous_witnesses =
+            recovery_witnesses(snapshot, intent, &intent.previous_configuration);
+        let current_witnesses = recovery_witnesses(snapshot, intent, &intent.current_configuration);
+        if previous_witnesses.len() >= intent.previous_policy.read_quorum as usize
+            && current_witnesses.len() >= intent.current_policy.read_quorum as usize
+        {
+            return begin_failover(snapshot, transition, intent, config);
+        }
+        recovering_primary_failure = true;
     }
     if transition.kind == TransitionKind::ScaleUp
         && !admission_started
@@ -1551,7 +1636,7 @@ pub(super) fn transition(
             .chain(std::iter::once(primary))
         {
             let Some(report) = report(snapshot, &member.identity) else {
-                if transition.kind == TransitionKind::Failover {
+                if transition.kind == TransitionKind::Failover || recovering_primary_failure {
                     continue;
                 }
                 if member.identity == intent.target && !admission_started {
@@ -1609,6 +1694,18 @@ pub(super) fn transition(
                     ))),
                 };
             }
+        }
+        if recovering_primary_failure {
+            return wait(
+                snapshot,
+                snapshot.status.clone(),
+                "ScaleUpFailoverEvidencePending",
+                "failover-recovery",
+                Some(&intent.target),
+                Some(&intent.operation_id),
+                "surviving accepted members are installing frozen PC/CC recovery authority",
+                config,
+            );
         }
         let previous_witnesses = quorum_witnesses(
             snapshot,

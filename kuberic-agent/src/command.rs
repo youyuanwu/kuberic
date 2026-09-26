@@ -544,7 +544,7 @@ fn admit_scale_up_configuration(
             && state.current_configuration.as_ref() == Some(&intent.previous_configuration)
             && state.admitted_policy.as_ref() == Some(&intent.previous_policy)
             && state.retired_builds.contains(&existing.intent().build_id)
-            && state.retained_command.as_ref().is_some_and(|retained| {
+            && state.completed_scale_up.as_ref().is_some_and(|retained| {
                 retained.command.current_only
                     && retained.command.scale_up_evidence.as_deref() == Some(existing)
                     && retained.command.current_configuration == intent.previous_configuration

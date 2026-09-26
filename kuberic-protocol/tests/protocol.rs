@@ -8565,13 +8565,309 @@ fn scale_up_diagnostics_republish_exact_desired_count_after_churn() {
 }
 
 #[test]
+fn scale_up_receipt_repairs_member_that_missed_pc_cc_before_next_addition() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 5);
+    while model.snapshot.status.scale_up_admission_started.is_none() {
+        model.step();
+    }
+
+    fn scale_up_admission_fence_recovers_primary_loss_at_every_pc_cc_dispatch_cut() {
+        use scale_up_model::Model;
+        let mut model = Model::new(2, 3);
+        while model.snapshot.status.scale_up_admission_started.is_none() {
+            model.step();
+        }
+
+        fn scale_up_transient_pre_admission_primary_failure_clears_before_fencing() {
+            use scale_up_model::Model;
+            let mut model = Model::new(2, 3);
+            while model.snapshot.status.transition.is_none() {
+                model.step();
+            }
+            assert!(model.snapshot.status.scale_up_admission_started.is_none());
+            model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+            let Plan::Apply { changes } = model.plan() else {
+                panic!("primary failure observation")
+            };
+            for change in changes {
+                if let KubernetesChange::PersistStatus { status } = &change {
+                    kuberic_protocol::validation::validate_status(status).unwrap();
+                }
+                model.apply(change);
+            }
+            assert!(model.snapshot.status.primary_failure.is_some());
+
+            model.report_mut(1).reported_fault = None;
+            model.report_mut(1).write_status = AccessStatus::Granted;
+            let Plan::Apply { changes } = model.plan() else {
+                panic!("primary recovery persistence")
+            };
+            for change in changes {
+                if let KubernetesChange::PersistStatus { status } = &change {
+                    kuberic_protocol::validation::validate_status(status).unwrap();
+                }
+                model.apply(change);
+            }
+            assert!(model.snapshot.status.primary_failure.is_none());
+
+            for _ in 0..4 {
+                let Plan::Apply { changes } = model.plan() else {
+                    panic!("service restoration/fence status")
+                };
+                let mut fenced = false;
+                for change in changes {
+                    if let KubernetesChange::PersistStatus { status } = &change {
+                        kuberic_protocol::validation::validate_status(status).unwrap();
+                        fenced |= status.scale_up_admission_started.is_some();
+                    }
+                    model.apply(change);
+                }
+                if fenced {
+                    break;
+                }
+            }
+            assert!(model.snapshot.status.primary_failure.is_none());
+            assert!(model.snapshot.status.scale_up_admission_started.is_some());
+        }
+
+        fn scale_up_frozen_cleanup_restores_service_before_waiting_for_observations() {
+            use scale_up_model::Model;
+            let mut model = Model::new(3, 4);
+            while model.snapshot.status.provisioning.is_none() {
+                model.step();
+            }
+            model.snapshot.desired.replicas = 3;
+            let Plan::Apply { changes } = model.plan() else {
+                panic!("freeze cancellation cleanup")
+            };
+            for change in changes {
+                model.apply(change);
+            }
+            assert!(model.snapshot.status.scale_up_cleanup.is_some());
+            let exact = model.snapshot.secondary_scale_down_resources.clone();
+            model.snapshot.secondary_scale_down_resources.clear();
+            model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+
+            for _ in 0..100 {
+                match model.plan() {
+                    Plan::Apply { changes } => {
+                        for change in changes {
+                            model.apply(change);
+                        }
+                    }
+                    Plan::Execute { command } => model.execute(command),
+                    Plan::Wait {
+                        reason: WaitReason::FailoverDelay,
+                        status,
+                        ..
+                    } => {
+                        model.apply_wait(status);
+                        model.snapshot.now_unix_seconds += 10;
+                    }
+                    Plan::Wait { status, .. } => model.apply_wait(status),
+                    Plan::Stable { status, .. } => model.snapshot.status = status,
+                    Plan::Unsafe { reason, .. } => {
+                        panic!("frozen cleanup failover unsafe: {reason:?}")
+                    }
+                }
+                let accepted = &model
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration;
+                if model.snapshot.status.transition.is_none()
+                    && accepted.primary_id != ReplicaId::new(1)
+                    && model
+                        .snapshot
+                        .routing
+                        .write_target
+                        .as_ref()
+                        .map(|identity| identity.replica_id)
+                        == Some(accepted.primary_id)
+                {
+                    break;
+                }
+            }
+            let accepted = &model
+                .snapshot
+                .status
+                .topology
+                .as_ref()
+                .unwrap()
+                .configuration;
+            assert_ne!(accepted.primary_id, ReplicaId::new(1));
+            assert_eq!(
+                model
+                    .snapshot
+                    .routing
+                    .write_target
+                    .as_ref()
+                    .map(|identity| identity.replica_id),
+                Some(accepted.primary_id)
+            );
+            assert!(matches!(
+                model.plan(),
+                Plan::Wait { status, .. }
+                    if status.conditions.iter().any(|condition|
+                        condition.reason == "ScaleUpCleanupObservationPending")
+            ));
+            model.snapshot.secondary_scale_down_resources = exact;
+            for _ in 0..8 {
+                match model.plan() {
+                    Plan::Apply { changes } => {
+                        for change in changes {
+                            model.apply(change);
+                        }
+                    }
+                    Plan::Wait { status, .. } => model.apply_wait(status),
+                    other => panic!("frozen cleanup convergence: {other:?}"),
+                }
+                if model.snapshot.status.scale_up_cleanup.is_none() {
+                    break;
+                }
+            }
+            assert!(model.snapshot.status.scale_up_cleanup.is_none());
+        }
+        scale_up_transient_pre_admission_primary_failure_clears_before_fencing();
+        scale_up_frozen_cleanup_restores_service_before_waiting_for_observations();
+        let mut cuts = vec![model.fork()];
+        while cuts.len() < 3 {
+            match model.plan() {
+                Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(command),
+                } if !command.current_only && command.local_replica_id != ReplicaId::new(1) => {
+                    model.execute(ProtocolCommand::EnsureConfiguration(command));
+                    cuts.push(model.fork());
+                }
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        model.apply(change);
+                    }
+                }
+                Plan::Execute { command } => model.execute(command),
+                Plan::Wait { status, .. } => model.apply_wait(status),
+                other => panic!("PC/CC cut setup: {other:?}"),
+            }
+        }
+
+        for (index, mut cut) in cuts.into_iter().enumerate() {
+            cut.report_mut(1).reported_fault = Some(FaultType::Permanent);
+            cut.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+            for _ in 0..30 {
+                match cut.plan() {
+                    Plan::Apply { changes } => {
+                        for change in changes {
+                            cut.apply(change);
+                        }
+                    }
+                    Plan::Execute { command } => cut.execute(command),
+                    Plan::Wait { status, .. } => cut.apply_wait(status),
+                    Plan::Stable { status, .. } => cut.snapshot.status = status,
+                    Plan::Unsafe { reason, .. } => {
+                        panic!("cut {index} became unsafe: {reason:?}")
+                    }
+                }
+                if cut
+                    .snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up_failover.is_some())
+                {
+                    break;
+                }
+            }
+            assert!(
+                cut.snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up_failover.is_some())
+            );
+            assert!(cut.snapshot.status.scale_up_cleanup.is_none());
+        }
+    }
+    scale_up_admission_fence_recovers_primary_loss_at_every_pc_cc_dispatch_cut();
+    let key = model
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report) if report.identity.replica_id == ReplicaId::new(2) => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let saved = model.snapshot.replicas.get(&key).unwrap().clone();
+    model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Absent;
+    for _ in 0..100 {
+        model.step();
+        if model.accepted_count() == 4 && model.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 4);
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    model.snapshot.replicas.insert(key, saved);
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(pc_cc),
+    } = model.plan()
+    else {
+        panic!("returning retained member must receive receipt-backed PC/CC")
+    };
+    assert!(!pc_cc.current_only);
+    assert_eq!(pc_cc.local_replica_id, ReplicaId::new(2));
+    model.execute(ProtocolCommand::EnsureConfiguration(pc_cc));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("returning retained member must receive receipt-backed current-only")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.local_replica_id, ReplicaId::new(2));
+    model.execute(ProtocolCommand::EnsureConfiguration(current_only));
+
+    for _ in 0..20 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("receipt repair unsafe: {reason:?}"),
+        }
+        if model.snapshot.status.provisioning.is_some()
+            || model.snapshot.status.transition.is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        model.snapshot.status.provisioning.is_some() || model.snapshot.status.transition.is_some(),
+        "next sequential addition did not begin after receipt repair"
+    );
+}
+
+#[test]
 fn scale_up_primary_failover_completes_before_deferred_exact_cleanup() {
     use scale_up_model::Model;
     let mut model = Model::new(3, 4);
-    while model.snapshot.status.transition.is_none() {
+    while model.snapshot.status.provisioning.is_none() {
         model.step();
     }
-    assert!(model.snapshot.status.scale_up_admission_started.is_none());
+    model.snapshot.desired.replicas = 3;
     let exact = model.snapshot.secondary_scale_down_resources.clone();
     model.snapshot.secondary_scale_down_resources.clear();
     model.report_mut(1).reported_fault = Some(FaultType::Permanent);
@@ -8908,6 +9204,13 @@ fn scale_up_copy_model_closes_concurrent_writes_across_source_and_candidate_rest
     assert_eq!(candidate.builds[0].durable_lsn, 12);
     assert_eq!(candidate.builds[0].catch_up_boundary_lsn, Some(12));
     assert!(candidate.builds[0].completed);
+    let copied = model
+        .durable_receivers
+        .get(&target.replica_id.value())
+        .unwrap();
+    for lsn in 1..=12 {
+        assert_eq!(copied.get(&lsn), model.durable_source.get(&lsn));
+    }
 
     let before = model.plan();
     assert_eq!(before, model.plan());

@@ -775,6 +775,9 @@ impl AgentStore for SqliteStore {
                     .removal_commands
                     .insert(result.command.operation_id.clone(), result.clone());
             }
+            if result.command.current_only && result.command.scale_up_evidence.is_some() {
+                state.completed_scale_up = Some(Box::new(result.clone()));
+            }
             state.retained_command = Some(result.clone());
             write_agent_state(transaction, &state)?;
             Ok(result)

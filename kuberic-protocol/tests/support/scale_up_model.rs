@@ -18,6 +18,8 @@ pub struct Model {
     pub snapshot: ObservationSnapshot,
     pub accepted_history: Vec<u32>,
     pending_build: Option<PendingBuild>,
+    pub durable_source: BTreeMap<i64, String>,
+    pub durable_receivers: BTreeMap<i64, BTreeMap<i64, String>>,
 }
 
 struct PendingBuild {
@@ -140,6 +142,8 @@ impl Model {
             },
             accepted_history: vec![accepted],
             pending_build: None,
+            durable_source: (1..=10).map(|lsn| (lsn, format!("value-{lsn}"))).collect(),
+            durable_receivers: BTreeMap::new(),
         }
     }
 
@@ -154,6 +158,8 @@ impl Model {
             snapshot,
             accepted_history,
             pending_build: None,
+            durable_source: (1..=10).map(|lsn| (lsn, format!("value-{lsn}"))).collect(),
+            durable_receivers: BTreeMap::new(),
         }
     }
 
@@ -168,6 +174,8 @@ impl Model {
                 catch_up_boundary: pending.catch_up_boundary,
                 phase: pending.phase,
             }),
+            durable_source: self.durable_source.clone(),
+            durable_receivers: self.durable_receivers.clone(),
         }
     }
 
@@ -464,6 +472,17 @@ impl Model {
                     .iter()
                     .find(|member| member.identity == identity)
                     .unwrap();
+                if let Some(evidence) = command.scale_up_evidence.as_deref()
+                    && identity == evidence.intent().target
+                {
+                    let copied = self
+                        .durable_receivers
+                        .get(&identity.replica_id.value())
+                        .expect("candidate durable copied state");
+                    for lsn in 1..=evidence.intent().catch_up_boundary_lsn {
+                        assert_eq!(copied.get(&lsn), self.durable_source.get(&lsn));
+                    }
+                }
                 report.role = member.role;
                 report.read_status = AccessStatus::Granted;
                 report.write_status = if member.role == ReplicaRole::Primary {
@@ -523,6 +542,12 @@ impl Model {
     }
 
     pub fn restart(&mut self, replica_id: i64) {
+        let bytes =
+            serde_json::to_vec(&(self.durable_source.clone(), self.durable_receivers.clone()))
+                .unwrap();
+        let (source, receivers) = serde_json::from_slice(&bytes).unwrap();
+        self.durable_source = source;
+        self.durable_receivers = receivers;
         let report = self.report_mut(replica_id);
         report.process_session_id =
             ProcessSessionId::new(format!("{}-restart", report.process_session_id));
@@ -551,6 +576,10 @@ impl Model {
                 };
                 source.current_progress += 1;
                 source.committed_lsn = source.current_progress;
+                self.durable_source.insert(
+                    source.current_progress,
+                    format!("value-{}", source.current_progress),
+                );
                 source.report_sequence += 1;
                 let AgentObservation::Report(target) = &mut self
                     .snapshot
@@ -578,6 +607,10 @@ impl Model {
                 };
                 source.current_progress = pending.catch_up_boundary;
                 source.committed_lsn = pending.catch_up_boundary;
+                self.durable_source.insert(
+                    pending.catch_up_boundary,
+                    format!("value-{}", pending.catch_up_boundary),
+                );
                 source.builds[0].last_sequence = 2;
                 source.builds[0].durable_lsn = pending.catch_up_boundary;
                 source.builds[0].completed = true;
@@ -602,6 +635,13 @@ impl Model {
                 target.builds[0].completed = true;
                 target.builds[0].catch_up_boundary_lsn = Some(pending.catch_up_boundary);
                 target.report_sequence += 1;
+                self.durable_receivers.insert(
+                    pending.target.replica_id.value(),
+                    self.durable_source
+                        .range(..=pending.catch_up_boundary)
+                        .map(|(lsn, value)| (*lsn, value.clone()))
+                        .collect(),
+                );
                 self.pending_build = None;
             }
             _ => unreachable!(),
