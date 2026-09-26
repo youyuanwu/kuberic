@@ -2175,17 +2175,50 @@ fn begin_failover(
     let current = &intent.current_configuration;
     let previous_witnesses = recovery_witnesses(snapshot, intent, &intent.previous_configuration);
     let current_witnesses = recovery_witnesses(snapshot, intent, current);
-    if previous_witnesses.len() < intent.previous_policy.read_quorum as usize
-        || current_witnesses.len() < intent.current_policy.read_quorum as usize
-    {
+    let previous_required = intent.previous_policy.read_quorum as usize;
+    let current_required = intent.current_policy.read_quorum as usize;
+    let previous_missing = previous_witnesses.len() < previous_required;
+    let current_missing = current_witnesses.len() < current_required;
+    if previous_missing || current_missing {
+        let (reason, blocking) = match (previous_missing, current_missing) {
+            (true, false) => (
+                "ScaleUpPreviousQuorumEvidencePending",
+                format!(
+                    "missing previous configuration read quorum: observed={} required={}; \
+                     current configuration satisfied: observed={} required={current_required}",
+                    previous_witnesses.len(),
+                    previous_required,
+                    current_witnesses.len(),
+                ),
+            ),
+            (false, true) => (
+                "ScaleUpCurrentQuorumEvidencePending",
+                format!(
+                    "previous configuration satisfied: observed={} required={previous_required}; \
+                     missing current configuration read quorum: observed={} required={current_required}",
+                    previous_witnesses.len(),
+                    current_witnesses.len(),
+                ),
+            ),
+            (true, true) => (
+                "ScaleUpDualQuorumEvidencePending",
+                format!(
+                    "missing previous configuration read quorum: observed={} required={previous_required}; \
+                     missing current configuration read quorum: observed={} required={current_required}",
+                    previous_witnesses.len(),
+                    current_witnesses.len(),
+                ),
+            ),
+            (false, false) => unreachable!(),
+        };
         return wait(
             snapshot,
             snapshot.status.clone(),
-            "ScaleUpFailoverEvidencePending",
+            reason,
             "failover-recovery",
             Some(&intent.target),
             Some(&intent.operation_id),
-            "independent previous and current read-quorum witnesses are required",
+            &blocking,
             config,
         );
     }
@@ -2500,16 +2533,7 @@ pub(super) fn transition(
             }
         }
         if recovering_primary_failure {
-            return wait(
-                snapshot,
-                snapshot.status.clone(),
-                "ScaleUpFailoverEvidencePending",
-                "failover-recovery",
-                Some(&intent.target),
-                Some(&intent.operation_id),
-                "surviving accepted members are installing frozen PC/CC recovery authority",
-                config,
-            );
+            return begin_failover(snapshot, transition, intent, config);
         }
         let previous_witnesses = quorum_witnesses(
             snapshot,

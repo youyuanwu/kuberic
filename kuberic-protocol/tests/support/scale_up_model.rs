@@ -389,15 +389,10 @@ impl Model {
                     .as_ref()
                     .expect("persisted accepted policy")
                     .replica_set_size;
-                assert!(
-                    new_epoch >= old_epoch,
-                    "accepted-state persistence rolled epoch back from {old_epoch:?} to {new_epoch:?}"
-                );
-                assert!(
-                    new_policy >= self.accepted_policy_high_water,
-                    "accepted-state persistence rolled policy back from {} to {new_policy}",
-                    self.accepted_policy_high_water
-                );
+                self.validate_accepted_epoch(new_epoch)
+                    .unwrap_or_else(|error| panic!("{error}"));
+                self.validate_accepted_policy(new_policy)
+                    .unwrap_or_else(|error| panic!("{error}"));
                 self.snapshot.status = *status;
                 self.refresh_allocation_observation();
                 self.bind_candidate_provenance();
@@ -581,6 +576,56 @@ impl Model {
             ));
         }
         Ok(())
+    }
+
+    pub fn validate_accepted_epoch(&self, epoch: Epoch) -> Result<(), String> {
+        let high_water = self
+            .accepted_epochs
+            .last()
+            .copied()
+            .expect("accepted epoch high-water");
+        (epoch >= high_water).then_some(()).ok_or_else(|| {
+            format!("accepted-state persistence rolled epoch back from {high_water:?} to {epoch:?}")
+        })
+    }
+
+    pub fn validate_accepted_policy(&self, replica_set_size: u32) -> Result<(), String> {
+        (replica_set_size >= self.accepted_policy_high_water)
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "accepted-state persistence rolled policy back from {} to {replica_set_size}",
+                    self.accepted_policy_high_water
+                )
+            })
+    }
+
+    pub fn validate_exact_candidate_set(&self) -> Result<(), String> {
+        let mut active_targets = BTreeSet::new();
+        if let Some(allocation) = &self.snapshot.status.scale_up_allocation {
+            active_targets.insert(allocation.observation_target());
+        }
+        if let Some(provisioning) = &self.snapshot.status.provisioning
+            && provisioning.scale_up().is_some()
+        {
+            active_targets.insert(provisioning.target_identity(&self.snapshot.resource_uid));
+        }
+        if let Some(transition) = &self.snapshot.status.transition
+            && let Some(intent) = transition.scale_up.as_deref().or_else(|| {
+                transition
+                    .scale_up_failover
+                    .as_deref()
+                    .map(|evidence| &evidence.intent)
+            })
+        {
+            active_targets.insert(intent.target.clone());
+        }
+        if let Some(cleanup) = &self.snapshot.status.scale_up_cleanup {
+            active_targets.insert(cleanup.target.clone());
+        }
+        (active_targets.len() <= 1).then_some(()).ok_or_else(|| {
+            format!("more than one exact scale-up candidate identity is active: {active_targets:?}")
+        })
     }
 
     fn refresh_allocation_observation(&mut self) {
@@ -804,7 +849,10 @@ impl Model {
                     protocol_version: kuberic_protocol::PROTOCOL_VERSION,
                     resource_uid: self.snapshot.resource_uid.clone(),
                     identity: target.clone(),
-                    process_session_id: ProcessSessionId::new("candidate-initialized"),
+                    process_session_id: ProcessSessionId::new(format!(
+                        "candidate-initialized-{}",
+                        target.instance_id
+                    )),
                     report_sequence: 2,
                     role: ReplicaRole::None,
                     read_status: AccessStatus::NotPrimary,
@@ -845,16 +893,63 @@ impl Model {
                         _ => None,
                     })
                     .unwrap();
+                if let Some(expected_session) = command.source_session_id.as_ref() {
+                    let AgentObservation::Report(source) =
+                        &self.snapshot.replicas[&source_key].agent
+                    else {
+                        panic!("build source report")
+                    };
+                    assert_eq!(
+                        &source.process_session_id, expected_session,
+                        "stale build command source session was fenced"
+                    );
+                }
                 let target_key = ReplicaObservationKey::new(
                     command.target.replica_id,
                     command.target.instance_id.clone(),
                 );
-                let snapshot_boundary = match &self.snapshot.replicas[&source_key].agent {
-                    AgentObservation::Report(report) => report.current_progress,
+                assert!(
+                    self.snapshot.replicas.contains_key(&target_key),
+                    "stale build command target incarnation was fenced: {:?}",
+                    command.target
+                );
+                let observed_source_build = match &self.snapshot.replicas[&source_key].agent {
+                    AgentObservation::Report(report) => report
+                        .builds
+                        .iter()
+                        .find(|build| build.build_id == command.operation_id)
+                        .cloned(),
                     _ => unreachable!(),
                 };
-                let catch_up_boundary = snapshot_boundary + 2;
-                let build = AgentBuildReport {
+                let observed_target_build =
+                    self.snapshot
+                        .replicas
+                        .get(&target_key)
+                        .and_then(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => report
+                                .builds
+                                .iter()
+                                .find(|build| build.build_id == command.operation_id)
+                                .cloned(),
+                            _ => None,
+                        });
+                let snapshot_boundary = observed_source_build.as_ref().map_or_else(
+                    || match &self.snapshot.replicas[&source_key].agent {
+                        AgentObservation::Report(report) => report.current_progress,
+                        _ => unreachable!(),
+                    },
+                    |build| build.replication_boundary_lsn,
+                );
+                let catch_up_boundary = observed_source_build
+                    .as_ref()
+                    .and_then(|build| build.catch_up_boundary_lsn)
+                    .or_else(|| {
+                        observed_target_build
+                            .as_ref()
+                            .and_then(|build| build.catch_up_boundary_lsn)
+                    })
+                    .unwrap_or(snapshot_boundary + 2);
+                let build = observed_source_build.unwrap_or(AgentBuildReport {
                     build_id: command.operation_id,
                     target: command.target,
                     last_sequence: 0,
@@ -862,20 +957,38 @@ impl Model {
                     durable_lsn: snapshot_boundary,
                     completed: false,
                     catch_up_boundary_lsn: None,
+                });
+                let phase = if observed_target_build
+                    .as_ref()
+                    .is_some_and(|target| target.completed)
+                {
+                    return;
+                } else if build.completed {
+                    2
+                } else if observed_target_build.is_some() {
+                    1
+                } else {
+                    0
                 };
                 let AgentObservation::Report(source) =
                     &mut self.snapshot.replicas.get_mut(&source_key).unwrap().agent
                 else {
                     panic!("build source report")
                 };
-                source.builds = vec![build.clone()];
+                if !source
+                    .builds
+                    .iter()
+                    .any(|observed| observed.build_id == build.build_id)
+                {
+                    source.builds = vec![build.clone()];
+                }
                 source.report_sequence += 1;
                 self.pending_build = Some(PendingBuild {
                     build,
                     source: source_key,
                     target: target_key,
                     catch_up_boundary,
-                    phase: 0,
+                    phase,
                 });
             }
             ProtocolCommand::EnsureConfiguration(command) => {
@@ -884,6 +997,27 @@ impl Model {
                     instance_id: command.expected_instance_id.clone(),
                     agent_generation: command.expected_agent_generation.clone(),
                 };
+                let boundary = command.scale_up_evidence.as_deref().map_or_else(
+                    || {
+                        self.snapshot
+                            .replicas
+                            .get(&ReplicaObservationKey::new(
+                                identity.replica_id,
+                                identity.instance_id.clone(),
+                            ))
+                            .and_then(|observation| match &observation.agent {
+                                AgentObservation::Report(report) => Some(report.current_progress),
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    },
+                    |evidence| evidence.intent().catch_up_boundary_lsn,
+                );
+                let durable_lsn = self
+                    .validate_exact_durable_history(&identity, boundary)
+                    .unwrap_or_else(|error| {
+                        panic!("configuration requires exact complete durable history: {error}")
+                    });
                 let observation = self
                     .snapshot
                     .replicas
@@ -901,25 +1035,11 @@ impl Model {
                     .iter()
                     .find(|member| member.identity == identity)
                     .unwrap();
-                if let Some(evidence) = command.scale_up_evidence.as_deref()
-                    && identity == evidence.intent().target
-                {
-                    let copied = self
-                        .durable_receivers
-                        .get(&identity.replica_id.value())
-                        .expect("candidate durable copied state");
-                    for lsn in 1..=evidence.intent().catch_up_boundary_lsn {
-                        assert_eq!(copied.get(&lsn), self.durable_source.get(&lsn));
-                    }
-                }
                 // Configuration only installs authority. It must never synthesize
                 // application history. Every progress claim below is derived from
-                // bytes already durably applied to this exact incarnation.
-                let durable_lsn = self
-                    .durable_incarnations
-                    .get(identity.instance_id.as_str())
-                    .and_then(|history| history.keys().next_back().copied())
-                    .unwrap_or_default();
+                // the contiguous, byte-exact history already durably applied to
+                // this exact incarnation. Logical receiver bookkeeping is not
+                // admissible evidence.
                 report.role = member.role;
                 report.read_status = AccessStatus::Granted;
                 report.write_status = if member.role == ReplicaRole::Primary {
@@ -930,17 +1050,6 @@ impl Model {
                 report.epoch = command.current_epoch;
                 report.previous_configuration = command.previous_configuration.clone();
                 report.current_configuration = Some(command.current_configuration.clone());
-                let boundary = command
-                    .scale_up_evidence
-                    .as_deref()
-                    .map_or(report.current_progress, |evidence| {
-                        evidence.intent().catch_up_boundary_lsn
-                    });
-                assert!(
-                    durable_lsn >= boundary,
-                    "configuration cannot repair missing durable history for {identity:?}: \
-                     durable={durable_lsn}, required={boundary}"
-                );
                 report.current_progress = durable_lsn;
                 report.verified_replication_lsn = Some(durable_lsn);
                 report.committed_lsn = durable_lsn;
@@ -984,6 +1093,36 @@ impl Model {
             .unwrap()
     }
 
+    pub fn restore_report_with_replication_catch_up(
+        &mut self,
+        key: &ReplicaObservationKey,
+        mut report: Box<AgentReport>,
+    ) {
+        let history = self
+            .durable_incarnations
+            .entry(report.identity.instance_id.to_string())
+            .or_default();
+        for (lsn, value) in &self.durable_source {
+            history.insert(*lsn, value.clone());
+        }
+        let progress = self
+            .validate_exact_durable_history(
+                &report.identity,
+                self.durable_source
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .unwrap_or_default(),
+            )
+            .expect("restored retained member exact catch-up");
+        report.current_progress = progress;
+        report.committed_lsn = progress;
+        report.verified_replication_lsn = Some(progress);
+        report.current_configuration_quorum_progress = progress;
+        report.report_sequence += 1;
+        self.snapshot.replicas.get_mut(key).unwrap().agent = AgentObservation::Report(report);
+    }
+
     pub fn accepted_identities(&self) -> Vec<ReplicaIdentity> {
         self.snapshot
             .status
@@ -1002,6 +1141,66 @@ impl Model {
             .get_mut(identity.instance_id.as_str())
             .expect("modeled durable incarnation")
             .remove(&lsn);
+    }
+
+    pub fn replace_durable_value(
+        &mut self,
+        identity: &ReplicaIdentity,
+        lsn: i64,
+        value: impl Into<String>,
+    ) {
+        self.durable_incarnations
+            .get_mut(identity.instance_id.as_str())
+            .expect("modeled durable incarnation")
+            .insert(lsn, value.into());
+    }
+
+    pub fn validate_exact_durable_history(
+        &self,
+        identity: &ReplicaIdentity,
+        boundary: i64,
+    ) -> Result<i64, String> {
+        let history = self
+            .durable_incarnations
+            .get(identity.instance_id.as_str())
+            .ok_or_else(|| format!("exact durable history missing for {identity:?}"))?;
+        for lsn in 1..=boundary {
+            let expected = self.durable_source.get(&lsn).ok_or_else(|| {
+                format!("source durable history has an interior gap at LSN {lsn}")
+            })?;
+            match history.get(&lsn) {
+                None => {
+                    return Err(format!(
+                        "exact durable history for {identity:?} has an interior gap at LSN {lsn}"
+                    ));
+                }
+                Some(actual) if actual != expected => {
+                    return Err(format!(
+                        "exact durable history for {identity:?} has payload corruption at LSN \
+                         {lsn}: expected={expected:?} actual={actual:?}"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        let mut contiguous: i64 = 0;
+        while let Some(next) = contiguous.checked_add(1) {
+            let (Some(expected), Some(actual)) =
+                (self.durable_source.get(&next), history.get(&next))
+            else {
+                break;
+            };
+            if actual != expected {
+                break;
+            }
+            contiguous = next;
+        }
+        Ok(contiguous)
+    }
+
+    pub fn has_pending_build(&self) -> bool {
+        self.pending_build.is_some()
     }
 
     pub fn restart(&mut self, replica_id: i64) {
@@ -1043,6 +1242,10 @@ impl Model {
                 },
             )
             .collect();
+        // The asynchronous executor is process-local. A restart may retain only
+        // durable application bytes and observed reports; a later command
+        // reconstructs execution from that evidence.
+        self.pending_build = None;
         let report = self.report_mut(replica_id);
         report.process_session_id =
             ProcessSessionId::new(format!("{}-restart", report.process_session_id));
@@ -1055,6 +1258,86 @@ impl Model {
     }
 
     fn advance_async_build(&mut self) {
+        if self.pending_build.is_none() {
+            let active_build_id = self
+                .snapshot
+                .status
+                .transition
+                .as_ref()
+                .and_then(|transition| {
+                    transition
+                        .scale_up
+                        .as_deref()
+                        .map(|intent| intent.build_id.clone())
+                })
+                .or_else(|| {
+                    self.snapshot
+                        .status
+                        .provisioning
+                        .as_ref()
+                        .and_then(|provisioning| {
+                            provisioning.scale_up_build_id(&self.snapshot.resource_uid)
+                        })
+                });
+            let observed = self
+                .snapshot
+                .replicas
+                .iter()
+                .find_map(|(source_key, observation)| {
+                    let active_build_id = active_build_id.as_ref()?;
+                    let AgentObservation::Report(source) = &observation.agent else {
+                        return None;
+                    };
+                    let build = source
+                        .builds
+                        .iter()
+                        .find(|build| &build.build_id == active_build_id)?
+                        .clone();
+                    let target_key = ReplicaObservationKey::new(
+                        build.target.replica_id,
+                        build.target.instance_id.clone(),
+                    );
+                    if !self.snapshot.replicas.contains_key(&target_key) {
+                        return None;
+                    }
+                    let target_build =
+                        self.snapshot
+                            .replicas
+                            .get(&target_key)
+                            .and_then(|observation| match &observation.agent {
+                                AgentObservation::Report(report) => report
+                                    .builds
+                                    .iter()
+                                    .find(|target| target.build_id == build.build_id)
+                                    .cloned(),
+                                _ => None,
+                            });
+                    let phase = if target_build.as_ref().is_some_and(|target| target.completed) {
+                        return None;
+                    } else if build.completed {
+                        2
+                    } else if target_build.is_some() {
+                        1
+                    } else {
+                        0
+                    };
+                    Some(PendingBuild {
+                        catch_up_boundary: build
+                            .catch_up_boundary_lsn
+                            .or_else(|| {
+                                target_build
+                                    .as_ref()
+                                    .and_then(|target| target.catch_up_boundary_lsn)
+                            })
+                            .unwrap_or(build.replication_boundary_lsn + 2),
+                        build,
+                        source: source_key.clone(),
+                        target: target_key,
+                        phase,
+                    })
+                });
+            self.pending_build = observed;
+        }
         let Some(pending) = self.pending_build.as_mut() else {
             return;
         };
@@ -1250,20 +1533,25 @@ impl Model {
         }
         let lsn = self.durable_source.keys().next_back().copied().unwrap_or(0) + 1;
         let value = format!("ack-{case}-{step}-{lsn}");
-        let delivered = current
+        let applied = current
             .members
             .iter()
             .filter_map(|member| {
                 (!dropped.contains(&member.identity))
                     .then(|| {
-                        self.exact_installed_report(&member.identity, previous.as_ref(), &current)
+                        self.snapshot.replicas.values().find_map(|observation| {
+                            let AgentObservation::Report(report) = &observation.agent else {
+                                return None;
+                            };
+                            (report.identity == member.identity && report.healthy)
+                                .then_some(report.as_ref())
+                        })
                     })
                     .flatten()
-                    .filter(|report| report.healthy)
                     .map(|report| (member.identity.clone(), report.process_session_id.clone()))
             })
             .collect::<Vec<_>>();
-        for (identity, _) in &delivered {
+        for (identity, _) in &applied {
             self.durable_incarnations
                 .entry(identity.instance_id.to_string())
                 .or_default()
@@ -1291,6 +1579,14 @@ impl Model {
                 report.report_sequence += 1;
             }
         }
+        let delivered = applied
+            .iter()
+            .filter(|(identity, _)| {
+                self.exact_installed_report(identity, previous.as_ref(), &current)
+                    .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         // A completed copy stream may continue carrying ordered operations to
         // the unadmitted IdleSecondary. This is explicit durable delivery, but
         // it contributes no PC/CC acknowledgement credit until that exact
@@ -1490,6 +1786,7 @@ impl Model {
     }
 
     pub fn assert_safety_invariants(&mut self) {
+        self.validate_exact_candidate_set().unwrap();
         validate_status(&self.snapshot.status).unwrap();
         let accepted = &self
             .snapshot
@@ -1549,7 +1846,7 @@ impl Model {
         }
         assert!(
             active_targets.len() <= 1,
-            "more than one scale-up candidate is active: {active_targets:?}"
+            "more than one exact scale-up candidate identity is active: {active_targets:?}"
         );
 
         for observation in self.snapshot.replicas.values() {

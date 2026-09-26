@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, ScaleDownResource};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
@@ -33,6 +34,148 @@ fn scale_up_model_is_level_triggered_sequential_and_restart_deterministic() {
     }
     assert_eq!(model.accepted_history, vec![1, 2, 3]);
     assert_eq!(model.accepted_count(), 3);
+}
+
+#[test]
+fn restart_drops_volatile_build_execution_and_fences_queued_old_reports() {
+    let mut model = scale_up_model::Model::new(1, 2);
+    let source_id = loop {
+        let plan = model.plan();
+        model.step();
+        if model.has_pending_build() {
+            let Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } = plan
+            else {
+                continue;
+            };
+            break command.local_replica_id.value();
+        }
+    };
+    let (source_key, queued_report) = model
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report)
+                if report.identity.replica_id == ReplicaId::new(source_id) =>
+            {
+                Some((key.clone(), report.clone()))
+            }
+            _ => None,
+        })
+        .unwrap();
+    model.restart(source_id);
+    assert!(
+        !model.has_pending_build(),
+        "restart retained process-local build execution"
+    );
+    let AgentObservation::Report(restarted_report) = &model.snapshot.replicas[&source_key].agent
+    else {
+        unreachable!()
+    };
+    assert_ne!(
+        restarted_report.process_session_id,
+        queued_report.process_session_id
+    );
+
+    let mut delayed = model.snapshot.clone();
+    delayed.previous_report_watermarks.insert(
+        source_key.clone(),
+        ReportWatermark {
+            process_session_id: restarted_report.process_session_id.clone(),
+            report_sequence: restarted_report.report_sequence,
+        },
+    );
+    let AgentObservation::Report(delayed_report) =
+        &mut delayed.replicas.get_mut(&source_key).unwrap().agent
+    else {
+        unreachable!()
+    };
+    delayed_report.process_session_id = queued_report.process_session_id.clone();
+    delayed_report.report_sequence = queued_report.report_sequence;
+    let accepted = delayed.status.topology.clone();
+    let plan = evaluate(&delayed, &scale_up_model::config());
+    match plan {
+        Plan::Wait { status, .. } | Plan::Unsafe { status, .. } => {
+            assert_eq!(status.topology, accepted);
+        }
+        Plan::Apply { changes } => assert!(changes.iter().all(|change| {
+            matches!(
+                change,
+                KubernetesChange::PersistStatus { status } if status.topology == accepted
+            )
+        })),
+        other => panic!("queued old-session report escaped its fence: {other:?}"),
+    }
+
+    model.run(160);
+    assert_eq!(model.accepted_count(), 2);
+}
+
+#[test]
+fn queued_old_build_command_is_fenced_after_candidate_session_changes() {
+    let mut model = scale_up_model::Model::new(1, 2);
+    let queued = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => break ProtocolCommand::EnsureReplicaBuild(command),
+            _ => {
+                model.step();
+            }
+        }
+    };
+    let ProtocolCommand::EnsureReplicaBuild(old) = &queued else {
+        unreachable!()
+    };
+    let old_target = old.target.clone();
+    let old_session = model
+        .snapshot
+        .replicas
+        .get(&ReplicaObservationKey::new(
+            old_target.replica_id,
+            old_target.instance_id.clone(),
+        ))
+        .and_then(|observation| match &observation.agent {
+            AgentObservation::Report(report) => Some(report.process_session_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    model.snapshot.desired.replicas = 1;
+    model.snapshot.desired.generation += 1;
+    model.run(160);
+    model.snapshot.desired.replicas = 2;
+    model.snapshot.desired.generation += 1;
+    let fresh = loop {
+        model.step();
+        if let Some(report) = model.snapshot.replicas.values().find_map(|observation| {
+            let AgentObservation::Report(report) = &observation.agent else {
+                return None;
+            };
+            (report.identity.replica_id == old_target.replica_id && report.identity != old_target)
+                .then_some(report.clone())
+        }) {
+            break report;
+        }
+    };
+    assert_ne!(fresh.process_session_id, old_session);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.execute(queued);
+    }))
+    .expect_err("old candidate command survived fresh-incarnation fencing");
+    let panic = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        panic.contains("stale build command target incarnation was fenced"),
+        "queued command failed at the wrong assertion: {panic}"
+    );
+    model.run(160);
+    assert_eq!(model.accepted_count(), 2);
 }
 
 #[derive(Clone, Copy)]
@@ -120,14 +263,34 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
          reproduce with KUBERIC_MODEL_SEED={configured_seed} KUBERIC_MODEL_CASES={cases}"
     );
     let mut coverage = BTreeMap::<&'static str, u64>::new();
+    let mut run_fingerprints = BTreeSet::new();
+    let mut run_coverages = Vec::new();
 
     for run in 0..runs {
         let seed = configured_seed.wrapping_add((run as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let mut rng = ModelRng(seed);
+        let class_offset = rng.index(12);
+        let mut run_coverage = BTreeMap::<&'static str, u64>::new();
+        let mut run_trace = Vec::new();
+        macro_rules! cover {
+            ($label:literal) => {{
+                *coverage.entry($label).or_default() += 1;
+                *run_coverage.entry($label).or_default() += 1;
+            }};
+        }
         for case in 0..cases {
-            let accepted = if case % 3 == 0 { 2 } else { 1 };
-            let additions = if case % 2 == 0 { 2 } else { 1 };
+            let schedule_class = (usize::try_from(case).unwrap() + class_offset) % 12;
+            let accepted = 1 + u32::try_from(rng.index(3)).unwrap();
+            let additions = if schedule_class == 10 || rng.index(2) == 0 {
+                2
+            } else {
+                1
+            };
             let desired = accepted + additions;
+            let write_period = 3 + u64::try_from(rng.index(5)).unwrap();
+            let write_offset = u64::try_from(rng.index(write_period as usize)).unwrap();
+            let restart_period = 6 + u64::try_from(rng.index(5)).unwrap();
+            let stale_period = 9 + u64::try_from(rng.index(5)).unwrap();
             let mut model = scale_up_model::Model::new(accepted, desired);
             let mut cancellation_requested = false;
             let mut cancellation_completed = false;
@@ -159,17 +322,20 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                 }
                 if let Some((restore_at, key, report)) = late_member_restore.take() {
                     if step >= restore_at {
-                        model.snapshot.replicas.get_mut(&key).unwrap().agent =
-                            AgentObservation::Report(report);
+                        model.restore_report_with_replication_catch_up(&key, report);
                     } else {
                         late_member_restore = Some((restore_at, key, report));
                     }
                 }
-                if step % 5 == 0 && scale_up_model_writable(&model) {
-                    model.acknowledge_write(case + run as u64 * cases, step);
-                    *coverage.entry("write-varied-times").or_default() += 1;
+                if step % write_period == write_offset && scale_up_model_writable(&model) {
+                    let lsn = model.acknowledge_write(case + run as u64 * cases, step);
+                    assert!(
+                        model.durable_source.contains_key(&lsn),
+                        "acknowledged write was not durably recorded"
+                    );
+                    cover!("write-varied-times");
                 }
-                if step % 7 == 0 {
+                if step % restart_period == 0 {
                     let ids = model
                         .snapshot
                         .replicas
@@ -182,18 +348,20 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                         })
                         .collect::<Vec<_>>();
                     if !ids.is_empty() {
-                        model.restart(ids[rng.index(ids.len())]);
-                        *coverage
-                            .entry("restart-drops-volatile-session")
-                            .or_default() += 1;
+                        let id = ids[rng.index(ids.len())];
+                        let previous_session = model.report_mut(id).process_session_id.clone();
+                        model.restart(id);
+                        assert!(!model.has_pending_build());
+                        assert_ne!(model.report_mut(id).process_session_id, previous_session);
+                        cover!("restart-drops-volatile-session");
                     }
                 }
-                if step % 11 == 0 {
+                if step % stale_period == 0 {
                     assert_stale_report_cannot_advance(&model);
-                    *coverage.entry("obsolete-session-report").or_default() += 1;
+                    cover!("obsolete-session-report");
                 }
 
-                if case % 12 == 1
+                if schedule_class == 1
                     && !candidate_failure_injected
                     && model.snapshot.status.provisioning.is_some()
                     && model.snapshot.status.transition.is_none()
@@ -222,10 +390,11 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                 {
                     report.reported_fault = Some(FaultType::Permanent);
                     report.report_sequence += 1;
+                    assert_eq!(report.reported_fault, Some(FaultType::Permanent));
                     candidate_failure_injected = true;
-                    *coverage.entry("candidate-failure-retry").or_default() += 1;
+                    cover!("candidate-failure-retry");
                 }
-                if case % 12 == 3
+                if schedule_class == 3
                     && !participant_unavailability_injected
                     && participant_restore.is_none()
                     && model.snapshot.status.provisioning.is_some()
@@ -254,10 +423,14 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     };
                     participant_restore = Some((step + 1, key.clone(), saved));
                     participant_unavailability_injected = true;
-                    *coverage.entry("participant-unavailability").or_default() += 1;
+                    assert!(matches!(
+                        observation.agent,
+                        AgentObservation::Unreachable { .. }
+                    ));
+                    cover!("participant-unavailability");
                 }
 
-                if case % 4 == 0
+                if matches!(schedule_class, 0 | 4 | 8)
                     && !cancellation_requested
                     && model.snapshot.status.transition.is_none()
                     && model.snapshot.status.provisioning.is_some()
@@ -271,7 +444,8 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     model.snapshot.desired.replicas = model.accepted_count();
                     model.snapshot.desired.generation += 1;
                     cancellation_requested = true;
-                    *coverage.entry("desired-churn-cancel").or_default() += 1;
+                    assert_eq!(model.snapshot.desired.replicas, model.accepted_count());
+                    cover!("desired-churn-cancel");
                 } else if cancellation_requested
                     && !cancellation_completed
                     && model.snapshot.status.scale_up_cleanup.is_none()
@@ -281,7 +455,8 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     model.snapshot.desired.replicas = desired;
                     model.snapshot.desired.generation += 1;
                     cancellation_completed = true;
-                    *coverage.entry("fresh-incarnation-retry").or_default() += 1;
+                    assert_eq!(model.snapshot.desired.replicas, desired);
+                    cover!("fresh-incarnation-retry");
                 }
 
                 if !cleanup_variant_injected
@@ -300,18 +475,26 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                                 .is_some_and(|cleanup| cleanup.target == exact.target)
                         })
                 {
-                    match case % 12 {
+                    match schedule_class {
                         0 => {
                             exact.endpoint =
                                 kuberic_protocol::observation::ExactResourceObservation::NotFound;
-                            *coverage.entry("cleanup-404").or_default() += 1;
+                            assert!(matches!(
+                                exact.endpoint,
+                                kuberic_protocol::observation::ExactResourceObservation::NotFound
+                            ));
+                            cover!("cleanup-404");
                         }
                         4 => {
                             exact.endpoint = kuberic_protocol::observation::ExactResourceObservation::ReplacementPresent {
                                 uid: "different-endpoint-uid".into(),
                                 resource_version: "replacement-rv".into(),
                             };
-                            *coverage.entry("cleanup-different-uid").or_default() += 1;
+                            assert!(matches!(
+                                exact.endpoint,
+                                kuberic_protocol::observation::ExactResourceObservation::ReplacementPresent { .. }
+                            ));
+                            cover!("cleanup-different-uid");
                         }
                         8 => {
                             let saved = exact.clone();
@@ -319,7 +502,11 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                                 message: "scheduled cleanup conflict".into(),
                             };
                             cleanup_conflict_restore = Some((step + 1, index, saved));
-                            *coverage.entry("cleanup-conflict-retry").or_default() += 1;
+                            assert!(matches!(
+                                exact.endpoint,
+                                kuberic_protocol::observation::ExactResourceObservation::LookupFailed { .. }
+                            ));
+                            cover!("cleanup-conflict-retry");
                         }
                         _ => {}
                     }
@@ -342,9 +529,11 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                         model.snapshot.replicas.get_mut(&key).unwrap().agent =
                             AgentObservation::Absent;
                         late_member_injected = true;
-                        *coverage
-                            .entry("late-retained-member-sequential-addition")
-                            .or_default() += 1;
+                        assert_eq!(
+                            model.snapshot.status.last_scale_up.as_deref(),
+                            Some(receipt)
+                        );
+                        cover!("late-retained-member-sequential-addition");
                     }
                 }
 
@@ -355,21 +544,14 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     model.accepted_count(),
                     model.snapshot.desired.replicas
                 ));
-                if model.snapshot.status.provisioning.is_some() {
-                    *coverage.entry("candidate-provisioning").or_default() += 1;
-                }
-                if model.snapshot.status.scale_up_cleanup.is_some() {
-                    *coverage.entry("exact-candidate-cleanup").or_default() += 1;
-                }
-                if model
+                let observed_provisioning = model.snapshot.status.provisioning.is_some();
+                let observed_cleanup = model.snapshot.status.scale_up_cleanup.is_some();
+                let observed_pc_cc = model
                     .snapshot
                     .status
                     .transition
                     .as_ref()
-                    .is_some_and(|transition| transition.scale_up.is_some())
-                {
-                    *coverage.entry("pc-cc-authority").or_default() += 1;
-                }
+                    .is_some_and(|transition| transition.scale_up.is_some());
                 assert_eq!(
                     plan,
                     evaluate(&replay, &scale_up_model::config()),
@@ -384,8 +566,9 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                         .is_some_and(|transition| transition.scale_up.is_some())
                     && model.snapshot.status.scale_up_admission_started.is_some();
                 if skip_for_delayed_authority {
+                    assert_eq!(plan, model.plan());
                     delayed_authority = true;
-                    *coverage.entry("delayed-authority-delivery").or_default() += 1;
+                    cover!("delayed-authority-delivery");
                     continue;
                 }
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.step())).is_err()
@@ -395,6 +578,15 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                          full replay trace:\n{}",
                         replay_trace.join("\n")
                     );
+                }
+                if observed_provisioning {
+                    cover!("candidate-provisioning");
+                }
+                if observed_cleanup {
+                    cover!("exact-candidate-cleanup");
+                }
+                if observed_pc_cc {
+                    cover!("pc-cc-authority");
                 }
                 if model.accepted_count() == desired
                     && model.snapshot.status.transition.is_none()
@@ -436,11 +628,28 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
             model.assert_acknowledged_write_oracle();
             model.assert_safety_invariants();
             if additions == 2 {
-                *coverage
-                    .entry("sequential-additions-late-receipt")
-                    .or_default() += 1;
+                cover!("sequential-additions-late-receipt");
             }
+            run_trace.extend(replay_trace);
         }
+        let mut hasher = DefaultHasher::new();
+        run_trace.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        assert!(
+            run_fingerprints.insert(fingerprint) || runs == 1,
+            "different seeds produced the same replay trace fingerprint {fingerprint:#x}"
+        );
+        println!(
+            "scale-up-model run-seed={seed:#018x} trace={fingerprint:#018x} \
+             event-coverage={run_coverage:?}"
+        );
+        run_coverages.push(run_coverage);
+    }
+    if runs > 1 {
+        assert!(
+            run_coverages.windows(2).any(|pair| pair[0] != pair[1]),
+            "different seeds produced identical behavioral coverage counts: {run_coverages:?}"
+        );
     }
     for required in [
         "write-varied-times",
@@ -602,40 +811,92 @@ fn acknowledged_write_requires_independent_durable_pc_and_cc_quorums() {
 }
 
 #[test]
-fn configuration_and_terminal_reads_detect_missing_durable_history() {
-    let mut configuration = scale_up_model::Model::new(2, 3);
-    let (command, target, boundary) = loop {
-        match configuration.plan() {
-            Plan::Execute {
-                command: ProtocolCommand::EnsureConfiguration(command),
-            } if command
-                .scale_up_evidence
-                .as_deref()
-                .is_some_and(|evidence| {
-                    command.local_replica_id == evidence.intent().target.replica_id
-                }) =>
-            {
-                let intent = command.scale_up_evidence.as_deref().unwrap().intent();
-                let target = intent.target.clone();
-                let boundary = intent.catch_up_boundary_lsn;
-                break (
-                    ProtocolCommand::EnsureConfiguration(command),
-                    target,
-                    boundary,
-                );
-            }
-            _ => {
-                configuration.step();
+fn configuration_requires_contiguous_byte_exact_incarnation_history() {
+    fn candidate_configuration_cut()
+    -> (scale_up_model::Model, ProtocolCommand, ReplicaIdentity, i64) {
+        let mut model = scale_up_model::Model::new(2, 3);
+        loop {
+            match model.plan() {
+                Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(command),
+                } if command
+                    .scale_up_evidence
+                    .as_deref()
+                    .is_some_and(|evidence| {
+                        command.local_replica_id == evidence.intent().target.replica_id
+                    }) =>
+                {
+                    let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+                    let target = intent.target.clone();
+                    let boundary = intent.catch_up_boundary_lsn;
+                    return (
+                        model,
+                        ProtocolCommand::EnsureConfiguration(command),
+                        target,
+                        boundary,
+                    );
+                }
+                _ => {
+                    model.step();
+                }
             }
         }
-    };
-    configuration.remove_durable_value(&target, boundary);
+    }
+
+    let (mut valid, command, target, boundary) = candidate_configuration_cut();
+    let exact_progress = valid
+        .validate_exact_durable_history(&target, boundary)
+        .expect("valid copied history");
+    assert!(exact_progress >= boundary);
+    valid.execute(command);
+    assert_eq!(
+        valid.report_mut(target.replica_id.value()).current_progress,
+        exact_progress
+    );
+
+    let (mut interior_gap, _, target, boundary) = candidate_configuration_cut();
+    let missing = boundary - 1;
+    interior_gap.remove_durable_value(&target, missing);
+    assert_eq!(
+        interior_gap
+            .validate_exact_durable_history(&target, boundary)
+            .unwrap_err(),
+        format!("exact durable history for {target:?} has an interior gap at LSN {missing}")
+    );
+
+    let (mut corruption, _, target, boundary) = candidate_configuration_cut();
+    let corrupt_lsn = boundary - 1;
+    corruption.replace_durable_value(&target, corrupt_lsn, "corrupt-payload");
+    let error = corruption
+        .validate_exact_durable_history(&target, boundary)
+        .unwrap_err();
     assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            configuration.execute(command);
-        }))
-        .is_err(),
-        "authority installation repaired missing application bytes"
+        error.contains(&format!("payload corruption at LSN {corrupt_lsn}"))
+            && error.contains("actual=\"corrupt-payload\""),
+        "wrong payload assertion: {error}"
+    );
+
+    let (mut final_gap, command, target, boundary) = candidate_configuration_cut();
+    final_gap.remove_durable_value(&target, boundary);
+    assert_eq!(
+        final_gap
+            .validate_exact_durable_history(&target, boundary)
+            .unwrap_err(),
+        format!("exact durable history for {target:?} has an interior gap at LSN {boundary}")
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        final_gap.execute(command);
+    }))
+    .expect_err("authority installation accepted a missing final boundary");
+    let panic = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+    assert!(
+        panic.contains("configuration requires exact complete durable history")
+            && panic.contains(&format!("interior gap at LSN {boundary}")),
+        "configuration failed at the wrong assertion: {panic}"
     );
 
     let mut terminal = scale_up_model::Model::new(3, 3);
@@ -654,8 +915,30 @@ fn configuration_and_terminal_reads_detect_missing_durable_history() {
 
 #[test]
 fn insufficient_scale_up_failover_witness_masks_block_precisely() {
-    for missing in ["previous", "current"] {
-        let mut model = scale_up_model::Model::new(2, 3);
+    struct Scenario {
+        accepted: u32,
+        desired: u32,
+        missing: &'static str,
+        reason: &'static str,
+        expected_fragment: &'static str,
+    }
+    for scenario in [
+        Scenario {
+            accepted: 3,
+            desired: 4,
+            missing: "previous",
+            reason: "ScaleUpPreviousQuorumEvidencePending",
+            expected_fragment: "missing previous configuration read quorum: observed=1 required=2; current configuration satisfied: observed=2 required=2",
+        },
+        Scenario {
+            accepted: 2,
+            desired: 3,
+            missing: "current",
+            reason: "ScaleUpCurrentQuorumEvidencePending",
+            expected_fragment: "previous configuration satisfied: observed=1 required=1; missing current configuration read quorum: observed=1 required=2",
+        },
+    ] {
+        let mut model = scale_up_model::Model::new(scenario.accepted, scenario.desired);
         drive_exact_scale_up_pc_cc(&mut model);
         let intent = model
             .snapshot
@@ -668,30 +951,42 @@ fn insufficient_scale_up_failover_witness_masks_block_precisely() {
             .unwrap()
             .clone();
         let (failed_primary, _) = fail_model_primary(&mut model);
-        let unavailable = if missing == "previous" {
-            intent
+        if scenario.missing == "previous" {
+            let unavailable = intent
                 .previous_configuration
                 .members
                 .iter()
-                .find(|member| member.identity != failed_primary)
+                .filter(|member| member.identity != failed_primary)
+                .nth(1)
                 .unwrap()
                 .identity
-                .clone()
+                .clone();
+            model
+                .snapshot
+                .replicas
+                .get_mut(&ReplicaObservationKey::new(
+                    unavailable.replica_id,
+                    unavailable.instance_id.clone(),
+                ))
+                .unwrap()
+                .agent = AgentObservation::Absent;
         } else {
-            intent.target.clone()
-        };
-        model
-            .snapshot
-            .replicas
-            .get_mut(&ReplicaObservationKey::new(
-                unavailable.replica_id,
-                unavailable.instance_id.clone(),
-            ))
-            .unwrap()
-            .agent = AgentObservation::Absent;
+            model
+                .snapshot
+                .replicas
+                .get_mut(&ReplicaObservationKey::new(
+                    intent.target.replica_id,
+                    intent.target.instance_id.clone(),
+                ))
+                .unwrap()
+                .agent = AgentObservation::Absent;
+        }
         let plan = model.plan();
         let Plan::Wait { reason, status, .. } = plan else {
-            panic!("{missing} witness loss was not safely blocked: {plan:?}");
+            panic!(
+                "{} witness loss was not safely blocked: {plan:?}",
+                scenario.missing
+            );
         };
         assert_eq!(reason, kuberic_protocol::plan::WaitReason::ActiveTransition);
         let condition = status
@@ -699,34 +994,57 @@ fn insufficient_scale_up_failover_witness_masks_block_precisely() {
             .iter()
             .find(|condition| condition.type_ == "Progressing")
             .unwrap();
-        assert_eq!(condition.reason, "ScaleUpFailoverEvidencePending");
-        assert!(condition.message.contains("failover-recovery"));
-        assert!(condition.message.contains("blocking="));
+        assert_eq!(condition.reason, scenario.reason);
+        assert!(
+            condition.message.contains("phase=failover-recovery")
+                && condition.message.contains(scenario.expected_fragment),
+            "{} deficit was misclassified: {}",
+            scenario.missing,
+            condition.message
+        );
     }
 }
 
 #[test]
 fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
-    let mut epoch = scale_up_model::Model::new(2, 2);
-    let mut rolled_back = epoch.snapshot.status.clone();
-    let accepted = rolled_back.topology.as_ref().unwrap().configuration.clone();
-    rolled_back.topology = Some(AcceptedTopology {
-        configuration: ConfigurationDescriptor::new(
-            Epoch::default(),
-            accepted.primary_id,
-            accepted.members,
-            accepted.write_quorum,
-        ),
-    });
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            epoch.apply(KubernetesChange::PersistStatus {
-                status: Box::new(rolled_back),
-            });
-        }))
-        .is_err(),
-        "accepted epoch rollback escaped the high-water invariant"
+    let epoch = scale_up_model::Model::new(2, 2);
+    let accepted_epoch = epoch
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .epoch;
+    epoch
+        .validate_accepted_epoch(accepted_epoch)
+        .expect("valid epoch baseline");
+    assert_eq!(
+        epoch
+            .validate_accepted_epoch(Epoch::new(
+                accepted_epoch.data_loss_number,
+                accepted_epoch.configuration_number - 1,
+            ))
+            .unwrap_err(),
+        format!(
+            "accepted-state persistence rolled epoch back from {accepted_epoch:?} to {:?}",
+            Epoch::new(
+                accepted_epoch.data_loss_number,
+                accepted_epoch.configuration_number - 1
+            )
+        )
     );
+    validate_status(&epoch.snapshot.status).expect("epoch mutation control baseline stays valid");
+
+    let policy = scale_up_model::Model::new(3, 3);
+    policy
+        .validate_accepted_policy(3)
+        .expect("valid policy baseline");
+    assert_eq!(
+        policy.validate_accepted_policy(2).unwrap_err(),
+        "accepted-state persistence rolled policy back from 3 to 2"
+    );
+    validate_status(&policy.snapshot.status).expect("policy mutation control baseline stays valid");
 
     let mut cleanup = scale_up_model::Model::new(1, 2);
     let delete = loop {
@@ -768,6 +1086,18 @@ fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
     else {
         unreachable!()
     };
+    let target = cleanup
+        .snapshot
+        .status
+        .scale_up_cleanup
+        .as_ref()
+        .unwrap()
+        .target
+        .clone();
+    let name = match &delete {
+        KubernetesChange::DeleteScaleDownResource { name, .. } => name.clone(),
+        _ => unreachable!(),
+    };
     for mutation in [
         KubernetesChange::DeleteScaleDownResource {
             resource: *resource,
@@ -794,7 +1124,23 @@ fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
             resource_version: "wrong-resource-version".into(),
         },
     ] {
-        assert!(cleanup.validate_deletion_change(&mutation).is_err());
+        let KubernetesChange::DeleteScaleDownResource {
+            name: actual_name,
+            uid: actual_uid,
+            resource_version: actual_resource_version,
+            ..
+        } = &mutation
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            cleanup.validate_deletion_change(&mutation).unwrap_err(),
+            format!(
+                "deletion identity/version mismatch for {target:?}: expected \
+                 {name}/{uid}@{resource_version}, got \
+                 {actual_name}/{actual_uid}@{actual_resource_version}"
+            )
+        );
     }
     cleanup
         .snapshot
@@ -804,12 +1150,22 @@ fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
         .unwrap()
         .provisioning
         .operation_id = OperationId::new("wrong-allocation-provenance");
-    assert!(cleanup.validate_deletion_change(&delete).is_err());
+    let provenance_error = cleanup.validate_deletion_change(&delete).unwrap_err();
+    assert!(
+        provenance_error.starts_with(
+            "deletion allocation provenance mismatch: expected \
+             wrong-allocation-provenance"
+        ),
+        "wrong invariant rejected provenance mutation: {provenance_error}"
+    );
 
     let mut duplicate = scale_up_model::Model::new(1, 2);
     while duplicate.snapshot.status.provisioning.is_none() {
         duplicate.step();
     }
+    duplicate
+        .validate_exact_candidate_set()
+        .expect("valid exact candidate baseline");
     let provisioning = duplicate.snapshot.status.provisioning.clone().unwrap();
     let mut allocation = duplicate
         .snapshot
@@ -837,12 +1193,10 @@ fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
         });
     allocation.pod_uid = Some(PodUid::new("duplicate-incarnation"));
     duplicate.snapshot.status.scale_up_allocation = Some(allocation);
+    let duplicate_error = duplicate.validate_exact_candidate_set().unwrap_err();
     assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            duplicate.assert_safety_invariants();
-        }))
-        .is_err(),
-        "two exact incarnations of one logical candidate were counted as one"
+        duplicate_error.starts_with("more than one exact scale-up candidate identity is active:"),
+        "wrong invariant rejected duplicate exact identities: {duplicate_error}"
     );
 }
 
