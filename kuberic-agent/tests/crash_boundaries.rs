@@ -1735,6 +1735,7 @@ fn scale_up_candidate_cut_exit_code(cut: &str) -> i32 {
 struct ScaleUpSourceCutSpec {
     cut: &'static str,
     stage: Option<CoordinatorStage>,
+    effect_sequence: Option<u64>,
     applied_lsn: i64,
     candidate_committed_lsn: i64,
     authority_crossed: bool,
@@ -1746,6 +1747,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "pc-cc-authority-before",
         stage: Some(CoordinatorStage::AdmitAuthority),
+        effect_sequence: Some(1),
         applied_lsn: 1,
         candidate_committed_lsn: 1,
         authority_crossed: false,
@@ -1755,6 +1757,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "pc-cc-authority-after",
         stage: Some(CoordinatorStage::AdmitAuthority),
+        effect_sequence: Some(1),
         applied_lsn: 1,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1764,6 +1767,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "pc-cc-access-before",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(2),
         applied_lsn: 1,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1773,6 +1777,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "pc-cc-access-after",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(2),
         applied_lsn: 1,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1782,6 +1787,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "current-only-authority-before",
         stage: Some(CoordinatorStage::AdmitAuthority),
+        effect_sequence: Some(3),
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: false,
@@ -1791,6 +1797,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "current-only-authority-after",
         stage: Some(CoordinatorStage::AdmitAuthority),
+        effect_sequence: Some(3),
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1800,6 +1807,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "current-only-access-before",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(4),
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1809,6 +1817,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "current-only-access-after",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(4),
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1818,6 +1827,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "build-retirement-before",
         stage: Some(CoordinatorStage::RetireBuild),
+        effect_sequence: Some(5),
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1827,6 +1837,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "build-retirement-after",
         stage: Some(CoordinatorStage::RetireBuild),
+        effect_sequence: Some(5),
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1836,6 +1847,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "completion-before",
         stage: Some(CoordinatorStage::Complete),
+        effect_sequence: None,
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1845,6 +1857,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
     ScaleUpSourceCutSpec {
         cut: "completion-after",
         stage: None,
+        effect_sequence: None,
         applied_lsn: 2,
         candidate_committed_lsn: 1,
         authority_crossed: true,
@@ -1857,6 +1870,7 @@ const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
 struct ScaleUpCandidateCutSpec {
     cut: &'static str,
     stage: Option<CoordinatorStage>,
+    effect_sequence: Option<u64>,
     authority_crossed: bool,
     role: ReplicaRole,
     read_status: AccessStatus,
@@ -1870,6 +1884,7 @@ struct ScaleUpCandidateCutSpec {
 const PC_CANDIDATE_BASE: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
     cut: "",
     stage: Some(CoordinatorStage::AdmitAuthority),
+    effect_sequence: Some(2),
     authority_crossed: false,
     role: ReplicaRole::IdleSecondary,
     read_status: AccessStatus::NotPrimary,
@@ -1882,6 +1897,7 @@ const PC_CANDIDATE_BASE: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
 
 const PC_CANDIDATE_PENDING: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
     stage: Some(CoordinatorStage::ReplicatorRole),
+    effect_sequence: Some(6),
     authority_crossed: true,
     read_status: AccessStatus::ReconfigurationPending,
     write_status: AccessStatus::ReconfigurationPending,
@@ -1902,6 +1918,7 @@ const PC_CANDIDATE_GRANTED: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
 const CURRENT_CANDIDATE_BASE: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
     cut: "",
     stage: Some(CoordinatorStage::AdmitAuthority),
+    effect_sequence: Some(9),
     authority_crossed: false,
     role: ReplicaRole::ActiveSecondary,
     read_status: AccessStatus::Granted,
@@ -1914,6 +1931,7 @@ const CURRENT_CANDIDATE_BASE: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec 
 
 const CURRENT_CANDIDATE_PENDING: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
     stage: Some(CoordinatorStage::ReplicatorRole),
+    effect_sequence: Some(13),
     authority_crossed: true,
     read_status: AccessStatus::ReconfigurationPending,
     write_status: AccessStatus::ReconfigurationPending,
@@ -1948,22 +1966,26 @@ const SCALE_UP_CANDIDATE_CUT_SPECS: &[ScaleUpCandidateCutSpec] = &[
     ScaleUpCandidateCutSpec {
         cut: "candidate-pc-cc-application-role-before",
         stage: Some(CoordinatorStage::ApplicationRole),
+        effect_sequence: Some(7),
         ..PC_CANDIDATE_PENDING
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-pc-cc-application-role-after",
         stage: Some(CoordinatorStage::ApplicationRole),
+        effect_sequence: Some(7),
         role: ReplicaRole::ActiveSecondary,
         ..PC_CANDIDATE_PENDING
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-pc-cc-access-before",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(8),
         ..PC_CANDIDATE_ACTIVE_PENDING
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-pc-cc-access-after",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(8),
         read_status: AccessStatus::Granted,
         write_status: AccessStatus::NotPrimary,
         ..PC_CANDIDATE_ACTIVE_PENDING
@@ -1971,11 +1993,13 @@ const SCALE_UP_CANDIDATE_CUT_SPECS: &[ScaleUpCandidateCutSpec] = &[
     ScaleUpCandidateCutSpec {
         cut: "candidate-pc-cc-completion-before",
         stage: Some(CoordinatorStage::Complete),
+        effect_sequence: None,
         ..PC_CANDIDATE_GRANTED
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-pc-cc-completion-after",
         stage: None,
+        effect_sequence: None,
         command_completed: true,
         ..PC_CANDIDATE_GRANTED
     },
@@ -2001,21 +2025,25 @@ const SCALE_UP_CANDIDATE_CUT_SPECS: &[ScaleUpCandidateCutSpec] = &[
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-application-role-before",
         stage: Some(CoordinatorStage::ApplicationRole),
+        effect_sequence: Some(14),
         ..CURRENT_CANDIDATE_PENDING
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-application-role-after",
         stage: Some(CoordinatorStage::ApplicationRole),
+        effect_sequence: Some(14),
         ..CURRENT_CANDIDATE_PENDING
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-access-before",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(15),
         ..CURRENT_CANDIDATE_PENDING
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-access-after",
         stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(15),
         read_status: AccessStatus::Granted,
         write_status: AccessStatus::NotPrimary,
         ..CURRENT_CANDIDATE_PENDING
@@ -2023,23 +2051,27 @@ const SCALE_UP_CANDIDATE_CUT_SPECS: &[ScaleUpCandidateCutSpec] = &[
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-build-retirement-before",
         stage: Some(CoordinatorStage::RetireBuild),
+        effect_sequence: Some(16),
         ..CURRENT_CANDIDATE_GRANTED
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-build-retirement-after",
         stage: Some(CoordinatorStage::RetireBuild),
+        effect_sequence: Some(16),
         build_retired: true,
         ..CURRENT_CANDIDATE_GRANTED
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-completion-before",
         stage: Some(CoordinatorStage::Complete),
+        effect_sequence: None,
         build_retired: true,
         ..CURRENT_CANDIDATE_GRANTED
     },
     ScaleUpCandidateCutSpec {
         cut: "candidate-current-only-completion-after",
         stage: None,
+        effect_sequence: None,
         build_retired: true,
         command_completed: true,
         ..CURRENT_CANDIDATE_GRANTED
@@ -2050,6 +2082,7 @@ const SCALE_UP_CANDIDATE_CUT_SPECS: &[ScaleUpCandidateCutSpec] = &[
 struct ScaleUpFailoverCutSpec {
     cut: &'static str,
     source_stage: Option<CoordinatorStage>,
+    effect_sequence: Option<u64>,
     source_failover_authority: bool,
     source_verified_lsn: i64,
     candidate_stage: Option<CoordinatorStage>,
@@ -2063,6 +2096,7 @@ struct ScaleUpFailoverCutSpec {
 const FAILOVER_SOURCE_BASE: ScaleUpFailoverCutSpec = ScaleUpFailoverCutSpec {
     cut: "",
     source_stage: None,
+    effect_sequence: None,
     source_failover_authority: false,
     source_verified_lsn: 9,
     candidate_stage: None,
@@ -2075,6 +2109,7 @@ const FAILOVER_SOURCE_BASE: ScaleUpFailoverCutSpec = ScaleUpFailoverCutSpec {
 
 const FAILOVER_CANDIDATE_BASE: ScaleUpFailoverCutSpec = ScaleUpFailoverCutSpec {
     candidate_stage: Some(CoordinatorStage::AdmitAuthority),
+    effect_sequence: Some(1),
     candidate_failover_authority: false,
     candidate_completed: false,
     ..FAILOVER_SOURCE_BASE
@@ -2084,6 +2119,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "authority-after",
         source_stage: Some(CoordinatorStage::AdmitAuthority),
+        effect_sequence: Some(1),
         source_failover_authority: true,
         source_verified_lsn: 0,
         ..FAILOVER_SOURCE_BASE
@@ -2109,6 +2145,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-failover-prefix-before",
         candidate_stage: Some(CoordinatorStage::FailoverPrefix),
+        effect_sequence: Some(2),
         candidate_failover_authority: true,
         candidate_verified_lsn: 0,
         candidate_read_status: AccessStatus::ReconfigurationPending,
@@ -2118,6 +2155,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-failover-prefix-after",
         candidate_stage: Some(CoordinatorStage::FailoverPrefix),
+        effect_sequence: Some(2),
         candidate_failover_authority: true,
         candidate_read_status: AccessStatus::ReconfigurationPending,
         candidate_write_status: AccessStatus::ReconfigurationPending,
@@ -2126,6 +2164,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-replicator-role-before",
         candidate_stage: Some(CoordinatorStage::ReplicatorRole),
+        effect_sequence: Some(4),
         candidate_failover_authority: true,
         candidate_read_status: AccessStatus::ReconfigurationPending,
         candidate_write_status: AccessStatus::ReconfigurationPending,
@@ -2134,6 +2173,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-replicator-role-after",
         candidate_stage: Some(CoordinatorStage::ReplicatorRole),
+        effect_sequence: Some(4),
         candidate_failover_authority: true,
         candidate_read_status: AccessStatus::ReconfigurationPending,
         candidate_write_status: AccessStatus::ReconfigurationPending,
@@ -2142,6 +2182,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-application-role-before",
         candidate_stage: Some(CoordinatorStage::ApplicationRole),
+        effect_sequence: Some(5),
         candidate_failover_authority: true,
         candidate_read_status: AccessStatus::ReconfigurationPending,
         candidate_write_status: AccessStatus::ReconfigurationPending,
@@ -2150,6 +2191,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-application-role-after",
         candidate_stage: Some(CoordinatorStage::ApplicationRole),
+        effect_sequence: Some(5),
         candidate_failover_authority: true,
         candidate_read_status: AccessStatus::ReconfigurationPending,
         candidate_write_status: AccessStatus::ReconfigurationPending,
@@ -2158,6 +2200,7 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-access-before",
         candidate_stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(8),
         candidate_failover_authority: true,
         candidate_read_status: AccessStatus::ReconfigurationPending,
         candidate_write_status: AccessStatus::ReconfigurationPending,
@@ -2166,18 +2209,21 @@ const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
     ScaleUpFailoverCutSpec {
         cut: "candidate-access-after",
         candidate_stage: Some(CoordinatorStage::Activate),
+        effect_sequence: Some(8),
         candidate_failover_authority: true,
         ..FAILOVER_CANDIDATE_BASE
     },
     ScaleUpFailoverCutSpec {
         cut: "candidate-completion-before",
         candidate_stage: Some(CoordinatorStage::Complete),
+        effect_sequence: None,
         candidate_failover_authority: true,
         ..FAILOVER_CANDIDATE_BASE
     },
     ScaleUpFailoverCutSpec {
         cut: "candidate-completion-after",
         candidate_stage: None,
+        effect_sequence: None,
         candidate_failover_authority: true,
         candidate_completed: true,
         ..FAILOVER_CANDIDATE_BASE
@@ -2291,6 +2337,7 @@ fn expand_scale_up_failover_cuts() -> Vec<ExpandedScaleUpCut<ScaleUpFailoverCutS
         .unwrap();
     let authority_before = ScaleUpFailoverCutSpec {
         source_stage: Some(CoordinatorStage::AdmitAuthority),
+        effect_sequence: Some(1),
         ..FAILOVER_SOURCE_BASE
     };
     for stage in ScaleUpEffectCutStage::ALL {
@@ -2461,6 +2508,7 @@ fn assert_scale_up_effect_cut_oracle(
     cut: &str,
     state: &AgentState,
     command: &EnsureConfiguration,
+    expected_effect_sequence: u64,
     runtime_role_before: ReplicaRole,
     runtime_role_after: ReplicaRole,
     runtime_read_after: AccessStatus,
@@ -2489,8 +2537,8 @@ fn assert_scale_up_effect_cut_oracle(
                 "{cut}: pending effect action"
             );
             assert_eq!(
-                state.next_effect_sequence, pending.effect.sequence,
-                "{cut}: incomplete effect advanced the durable sequence"
+                pending.effect.sequence, expected_effect_sequence,
+                "{cut}: pending effect sequence"
             );
         }
         (None, None) => {}
@@ -2507,9 +2555,12 @@ fn assert_scale_up_effect_cut_oracle(
         let retained = retained_current.expect("completed effect retained exact result");
         assert_eq!(retained.effect.action, expected_action, "{cut}");
         assert_eq!(
-            state.next_effect_sequence,
-            retained.effect.sequence + 1,
-            "{cut}: completed effect did not advance sequence"
+            retained.effect.sequence, expected_effect_sequence,
+            "{cut}: retained effect sequence"
+        );
+        assert_eq!(
+            retained.result.sequence, expected_effect_sequence,
+            "{cut}: retained result sequence"
         );
     } else {
         assert!(
@@ -2517,76 +2568,40 @@ fn assert_scale_up_effect_cut_oracle(
             "{cut}: current effect was retained before complete_effect"
         );
     }
-
-    let marker = load_scale_up_effect_marker(&scale_up_effect_marker_path(path));
-    if !cut_stage.runtime_applied() {
-        assert!(
-            marker.is_none(),
-            "{cut}: runtime marker crossed intent-only cut"
-        );
-        return;
-    }
-    let marker = marker.expect("real runtime effect marker");
     assert_eq!(
-        marker.effect.operation_id, expected_operation_id,
-        "{cut}: marker effect identity"
-    );
-    assert_eq!(
-        marker.effect.action, expected_action,
-        "{cut}: marker action tag/payload"
-    );
-    assert_eq!(
-        marker.result.operation_id, marker.effect.operation_id,
-        "{cut}: marker result operation"
-    );
-    assert_eq!(
-        marker.result.sequence, marker.effect.sequence,
-        "{cut}: marker result sequence"
-    );
-    assert_eq!(
-        marker.result.postcondition.role, runtime_role_after,
-        "{cut}: effect-side role"
-    );
-    assert_eq!(
-        marker.result.postcondition.read_status, runtime_read_after,
-        "{cut}: effect-side read status"
-    );
-    assert_eq!(
-        marker.result.postcondition.write_status, runtime_write_after,
-        "{cut}: effect-side write status"
-    );
-    if let Some(expected) = runtime_verified_lsn_after {
-        assert_eq!(
-            marker.result.postcondition.verified_replication_lsn,
-            Some(expected),
-            "{cut}: effect-side verified progress"
-        );
-    }
-
-    let expected_transition = match tag {
-        ScaleUpEffectTag::ReplicatorRole => Some(RoleTransition {
-            completed_role: runtime_role_before,
-            target_role: scale_up_command_role(command),
-            replicator_completed: true,
-            epoch_completed: scale_up_command_role(command) != ReplicaRole::Primary,
-            application_completed: false,
-        }),
-        _ => None,
-    };
-    assert_eq!(
-        marker.result.postcondition.role_transition, expected_transition,
-        "{cut}: exact role-transition postcondition"
+        state.next_effect_sequence,
+        expected_effect_sequence + u64::from(cut_stage == ScaleUpEffectCutStage::EffectCompleted),
+        "{cut}: exact next effect sequence"
     );
 
-    if cut_stage == ScaleUpEffectCutStage::EffectCompleted {
-        assert_eq!(
-            state
-                .retained_result
-                .as_ref()
-                .map(|retained| &retained.result),
-            Some(&marker.result),
-            "{cut}: retained result differs from real runtime postcondition"
-        );
+    if cut_stage != ScaleUpEffectCutStage::EffectCompleted {
+        match (
+            expected_effect_sequence.checked_sub(1),
+            state.retained_result.as_ref(),
+        ) {
+            (Some(0) | None, None) => {}
+            (Some(expected_predecessor_sequence), Some(retained)) => {
+                assert_eq!(
+                    retained.effect.sequence, expected_predecessor_sequence,
+                    "{cut}: retained predecessor effect sequence"
+                );
+                assert_eq!(
+                    retained.result.sequence, expected_predecessor_sequence,
+                    "{cut}: retained predecessor result sequence"
+                );
+                assert_eq!(
+                    retained.operation_id, retained.effect.operation_id,
+                    "{cut}: retained predecessor effect identity"
+                );
+                assert_eq!(
+                    retained.operation_id, retained.result.operation_id,
+                    "{cut}: retained predecessor result identity"
+                );
+            }
+            (expected, actual) => panic!(
+                "{cut}: retained predecessor presence mismatch: expected sequence {expected:?}, actual {actual:?}"
+            ),
+        }
     }
 
     if tag == ScaleUpEffectTag::ReplicatorRole
@@ -2653,6 +2668,81 @@ fn assert_scale_up_effect_cut_oracle(
                 application_completed: false,
             }),
             "{cut}: retained split-role flags"
+        );
+    }
+
+    let marker = load_scale_up_effect_marker(&scale_up_effect_marker_path(path));
+    if !cut_stage.runtime_applied() {
+        assert!(
+            marker.is_none(),
+            "{cut}: runtime marker crossed intent-only cut"
+        );
+        return;
+    }
+    let marker = marker.expect("real runtime effect marker");
+    assert_eq!(
+        marker.effect.operation_id, expected_operation_id,
+        "{cut}: marker effect identity"
+    );
+    assert_eq!(
+        marker.effect.action, expected_action,
+        "{cut}: marker action tag/payload"
+    );
+    assert_eq!(
+        marker.effect.sequence, expected_effect_sequence,
+        "{cut}: marker effect sequence"
+    );
+    assert_eq!(
+        marker.result.operation_id, marker.effect.operation_id,
+        "{cut}: marker result operation"
+    );
+    assert_eq!(
+        marker.result.sequence, expected_effect_sequence,
+        "{cut}: marker result sequence"
+    );
+    assert_eq!(
+        marker.result.postcondition.role, runtime_role_after,
+        "{cut}: effect-side role"
+    );
+    assert_eq!(
+        marker.result.postcondition.read_status, runtime_read_after,
+        "{cut}: effect-side read status"
+    );
+    assert_eq!(
+        marker.result.postcondition.write_status, runtime_write_after,
+        "{cut}: effect-side write status"
+    );
+    if let Some(expected) = runtime_verified_lsn_after {
+        assert_eq!(
+            marker.result.postcondition.verified_replication_lsn,
+            Some(expected),
+            "{cut}: effect-side verified progress"
+        );
+    }
+
+    let expected_transition = match tag {
+        ScaleUpEffectTag::ReplicatorRole => Some(RoleTransition {
+            completed_role: runtime_role_before,
+            target_role: scale_up_command_role(command),
+            replicator_completed: true,
+            epoch_completed: scale_up_command_role(command) != ReplicaRole::Primary,
+            application_completed: false,
+        }),
+        _ => None,
+    };
+    assert_eq!(
+        marker.result.postcondition.role_transition, expected_transition,
+        "{cut}: exact role-transition postcondition"
+    );
+
+    if cut_stage == ScaleUpEffectCutStage::EffectCompleted {
+        assert_eq!(
+            state
+                .retained_result
+                .as_ref()
+                .map(|retained| &retained.result),
+            Some(&marker.result),
+            "{cut}: retained result differs from real runtime postcondition"
         );
     }
 }
@@ -3165,7 +3255,13 @@ async fn open_real_scale_up_owners(
     )
 }
 
-async fn ensure_scale_up_store_cut(path: &Path, cut: &str, after: bool, terminate: bool) {
+async fn ensure_scale_up_store_cut(
+    path: &Path,
+    cut: &str,
+    after: bool,
+    terminate: bool,
+    prove_post_recovery_write: bool,
+) {
     if !terminate {
         eprintln!("scale-up-real-recovery cut={cut} stage=open-owners");
     }
@@ -3184,10 +3280,6 @@ async fn ensure_scale_up_store_cut(path: &Path, cut: &str, after: bool, terminat
     if cut == "store-initialization" && terminate && after {
         std::process::exit(scale_up_store_cut_exit_code(cut, after));
     }
-    if cut == "store-initialization" && !terminate {
-        return;
-    }
-
     if candidate_store
         .load_build(&expected_build.build_id)
         .await
@@ -3214,23 +3306,23 @@ async fn ensure_scale_up_store_cut(path: &Path, cut: &str, after: bool, terminat
             std::process::exit(scale_up_store_cut_exit_code(cut, after));
         }
     } else {
+        let retained_build_effect = candidate_store
+            .load_state()
+            .await
+            .unwrap()
+            .retained_result
+            .expect("durable candidate build-admission result")
+            .effect;
+        assert_eq!(
+            retained_build_effect.action,
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(expected_build.clone())),
+            "{cut}: retained candidate build admission"
+        );
         candidate_runtime
-            .apply_effect(RuntimeEffect {
-                operation_id: OperationId::new("restore-real-candidate-build"),
-                sequence: candidate_store
-                    .load_state()
-                    .await
-                    .unwrap()
-                    .next_effect_sequence,
-                action: RuntimeEffectAction::AdmitBuildAuthority(Box::new(expected_build.clone())),
-            })
+            .apply_effect(retained_build_effect)
             .await
             .unwrap();
     }
-    if cut == "build-authority-admission" && !terminate {
-        return;
-    }
-
     if cut == "snapshot-boundary-persistence" && terminate && !after {
         std::process::exit(scale_up_store_cut_exit_code(cut, after));
     }
@@ -3351,6 +3443,118 @@ async fn ensure_scale_up_store_cut(path: &Path, cut: &str, after: bool, terminat
             .await
             .unwrap()
     );
+
+    if !prove_post_recovery_write {
+        return;
+    }
+
+    let (_, command, _) = scale_up_crash_fixture(false);
+    let candidate_command = scale_up_command_for_candidate(&command);
+    Coordinator::new(candidate_store.clone(), candidate_runtime.clone())
+        .ensure_configuration(candidate_command)
+        .await
+        .unwrap();
+    run_scale_up_source_configuration(
+        source_store.clone(),
+        source_runtime.clone(),
+        candidate_runtime.clone(),
+        command.clone(),
+        None,
+        scale_up_effect_marker_path(path),
+    )
+    .await;
+
+    let source_state = source_store.load_state().await.unwrap();
+    let candidate_state = candidate_store.load_state().await.unwrap();
+    for (owner, state) in [("source", &source_state), ("candidate", &candidate_state)] {
+        assert!(
+            state.reconfiguration.is_none() && state.pending_effect.is_none(),
+            "{cut}: recovered {owner} retained incomplete configuration work"
+        );
+        assert_eq!(
+            state.current_configuration.as_ref(),
+            Some(&command.current_configuration),
+            "{cut}: recovered {owner} configuration"
+        );
+    }
+    assert_eq!(source_state.role, ReplicaRole::Primary, "{cut}");
+    assert_eq!(source_state.read_status, AccessStatus::Granted, "{cut}");
+    assert_eq!(source_state.write_status, AccessStatus::Granted, "{cut}");
+    assert_eq!(candidate_state.role, ReplicaRole::ActiveSecondary, "{cut}");
+    assert_eq!(candidate_state.read_status, AccessStatus::Granted, "{cut}");
+    assert_eq!(
+        candidate_state.write_status,
+        AccessStatus::NotPrimary,
+        "{cut}"
+    );
+
+    let source_authority = source_store
+        .load()
+        .await
+        .unwrap()
+        .expect("recovered source authority");
+    let candidate_authority = candidate_store
+        .load()
+        .await
+        .unwrap()
+        .expect("recovered candidate authority");
+    for (owner, authority) in [
+        ("source", &source_authority),
+        ("candidate", &candidate_authority),
+    ] {
+        assert_eq!(
+            authority.current_configuration, command.current_configuration,
+            "{cut}: recovered {owner} authority configuration"
+        );
+        assert_eq!(
+            authority.scale_up, command.scale_up_evidence,
+            "{cut}: recovered {owner} authority scale-up evidence"
+        );
+    }
+    assert_eq!(
+        exact_verified_lsn(&source_store, &source_authority).await,
+        2,
+        "{cut}: recovered source verified LSN"
+    );
+    assert_eq!(
+        exact_verified_lsn(&candidate_store, &candidate_authority).await,
+        2,
+        "{cut}: recovered candidate verified LSN"
+    );
+
+    let expected_write_bytes = format!(
+        "actual-candidate-runtime-acknowledgement-{}",
+        command.operation_id
+    )
+    .into_bytes();
+    let source_history = durable_application_history(&crash_application_path(path));
+    let candidate_history =
+        durable_application_history(&scale_up_candidate_root(path).join("application.json"));
+    assert_eq!(
+        source_history,
+        expected_scale_up_application_history(2, 2),
+        "{cut}: exact recovered source write history"
+    );
+    assert_eq!(
+        candidate_history,
+        expected_scale_up_application_history(2, 1),
+        "{cut}: exact recovered candidate write history"
+    );
+    assert_eq!(
+        source_history.operations.get(&2),
+        Some(&expected_write_bytes),
+        "{cut}: source next-LSN write bytes"
+    );
+    assert_eq!(
+        candidate_history.operations.get(&2),
+        Some(&expected_write_bytes),
+        "{cut}: candidate next-LSN write bytes"
+    );
+    eprintln!(
+        "scale-up-store-write-proof cut={cut} side={} lsn=2 bytes={}",
+        if after { "after" } else { "before" },
+        String::from_utf8_lossy(&expected_write_bytes)
+    );
 }
 
 async fn reconstruct_scale_up_configuration_runtime(
@@ -3418,6 +3622,7 @@ async fn execute_scale_up_configuration_cut_legacy(path: &Path, cut: &str, termi
         Box::pin(ensure_scale_up_store_cut(
             path,
             "source-progress-persistence",
+            false,
             false,
             false,
         ))
@@ -3864,7 +4069,7 @@ async fn run_scale_up_source_configuration(
 async fn execute_scale_up_configuration_cut(path: &Path, cut: &str, terminate: bool) {
     eprintln!("scale-up-production cut={cut} stage=start");
     if !path.is_file() {
-        ensure_scale_up_store_cut(path, "source-progress-persistence", false, false).await;
+        ensure_scale_up_store_cut(path, "source-progress-persistence", false, false, false).await;
     }
     let current_only = cut.starts_with("current-only")
         || cut.starts_with("build-retirement")
@@ -4473,7 +4678,7 @@ fn normalized_scale_up_candidate_cut(cut: &str) -> &str {
 async fn execute_scale_up_candidate_configuration_cut(path: &Path, cut: &str, terminate: bool) {
     let current_only = cut.starts_with("candidate-current-only-");
     if !path.is_file() {
-        ensure_scale_up_store_cut(path, "source-progress-persistence", false, false).await;
+        ensure_scale_up_store_cut(path, "source-progress-persistence", false, false, false).await;
     }
     let (
         source_store,
@@ -5336,7 +5541,24 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
 
                 // Recovery starts only after the parent has inspected the
                 // interrupted durable side of the cut.
-                ensure_scale_up_store_cut(&path, cut, after, false).await;
+                std::thread::Builder::new()
+                    .name(format!(
+                        "scale-up-store-recovery-{cut}-{}",
+                        if after { "after" } else { "before" }
+                    ))
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn({
+                        let path = path.clone();
+                        let cut = cut.to_owned();
+                        move || {
+                            tokio::runtime::Runtime::new().unwrap().block_on(
+                                ensure_scale_up_store_cut(&path, &cut, after, false, true),
+                            );
+                        }
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap();
                 let store = SqliteStore::open_existing(&path, None).unwrap();
                 match cut {
                     "store-initialization" => {
@@ -5383,6 +5605,7 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
     }
 
     for expanded in expand_scale_up_source_cuts() {
+        let expected_effect_sequence = expanded.before_spec.effect_sequence;
         let effect_stage = expanded.effect_stage;
         let runtime_spec = expanded.runtime_spec;
         let spec = expanded.spec;
@@ -5441,6 +5664,7 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                 &cut,
                 &interrupted_state,
                 &command,
+                expected_effect_sequence.expect("source material effect sequence"),
                 ReplicaRole::Primary,
                 ReplicaRole::Primary,
                 AccessStatus::Granted,
@@ -5711,6 +5935,9 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                 &cut,
                 &interrupted_state,
                 &candidate_command,
+                before_spec
+                    .effect_sequence
+                    .expect("candidate material effect sequence"),
                 before_spec.role,
                 runtime_spec.role,
                 runtime_spec.read_status,
@@ -5927,12 +6154,24 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
 
     for (cut, mutation) in [
         (
+            "candidate-pc-cc-replicator-role-after-intent",
+            "missing-predecessor",
+        ),
+        (
             "candidate-pc-cc-replicator-role-after-runtime",
             "missing-marker",
         ),
         (
+            "candidate-pc-cc-replicator-role-after-runtime",
+            "mismatched-marker-effect-sequence",
+        ),
+        (
             "candidate-pc-cc-replicator-role-after-applied",
             "wrong-pending-stage",
+        ),
+        (
+            "candidate-pc-cc-replicator-role-after-applied",
+            "mismatched-marker-result-sequence",
         ),
         (
             "candidate-current-only-application-role-after-complete",
@@ -5956,12 +6195,28 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
             .block_on(store.load_state())
             .unwrap();
         match mutation {
+            "missing-predecessor" => {
+                state.retained_result = None;
+                overwrite_agent_state(&candidate_path, &state);
+            }
             "missing-marker" => {
                 std::fs::remove_file(scale_up_effect_marker_path(&candidate_path)).unwrap();
+            }
+            "mismatched-marker-effect-sequence" => {
+                let marker_path = scale_up_effect_marker_path(&candidate_path);
+                let mut marker = load_scale_up_effect_marker(&marker_path).expect("runtime marker");
+                marker.effect.sequence += 1;
+                persist_scale_up_effect_marker(&marker_path, &marker);
             }
             "wrong-pending-stage" => {
                 state.pending_effect.as_mut().unwrap().stage = EffectStage::IntentCommitted;
                 overwrite_agent_state(&candidate_path, &state);
+            }
+            "mismatched-marker-result-sequence" => {
+                let marker_path = scale_up_effect_marker_path(&candidate_path);
+                let mut marker = load_scale_up_effect_marker(&marker_path).expect("applied marker");
+                marker.result.sequence += 1;
+                persist_scale_up_effect_marker(&marker_path, &marker);
             }
             "missing-retained-result" => {
                 state.retained_result = None;
@@ -5984,6 +6239,10 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
                     cut,
                     &mutated,
                     &candidate_command,
+                    expanded
+                        .before_spec
+                        .effect_sequence
+                        .expect("negative-control material effect sequence"),
                     expanded.before_spec.role,
                     expanded.runtime_spec.role,
                     expanded.runtime_spec.read_status,
@@ -5996,6 +6255,79 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
             "{cut}: {mutation} mutation reached recovery-owner opening"
         );
     }
+
+    let boundary = "candidate-application-role-after-intent";
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "scale_up_failover_crash_writer_process",
+        ])
+        .env("KUBERIC_SCALE_UP_FAILOVER_PATH", &path)
+        .env("KUBERIC_SCALE_UP_FAILOVER_BOUNDARY", boundary)
+        .output()
+        .unwrap();
+    assert_exact_scale_up_exit(
+        output.status,
+        scale_up_failover_cut_exit_code(boundary),
+        &format!("{boundary}: {}", String::from_utf8_lossy(&output.stderr)),
+    );
+    let candidate_path = scale_up_failover_witness_store_path(&path);
+    let expanded = expand_scale_up_failover_cuts()
+        .into_iter()
+        .find(|spec| spec.cut == boundary)
+        .unwrap();
+    let (_, command) = scale_up_failover_crash_fixture();
+    let store = SqliteStore::open_existing(&candidate_path, None).unwrap();
+    let mut state = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(store.load_state())
+        .unwrap();
+    let retained = state
+        .retained_result
+        .as_mut()
+        .expect("application-role intent retains replicator-role predecessor");
+    retained
+        .result
+        .postcondition
+        .role_transition
+        .as_mut()
+        .expect("replicator-role predecessor transition")
+        .application_completed = true;
+    overwrite_agent_state(&candidate_path, &state);
+    let mutated = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(
+            SqliteStore::open_existing(&candidate_path, None)
+                .unwrap()
+                .load_state(),
+        )
+        .unwrap();
+    let candidate_command =
+        scale_up_failover_command_for_identity(&command, mutated.identity.local_identity.clone());
+    let rejected_before_recovery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_scale_up_effect_cut_oracle(
+            &candidate_path,
+            boundary,
+            &mutated,
+            &candidate_command,
+            expanded
+                .before_spec
+                .effect_sequence
+                .expect("failover negative-control effect sequence"),
+            ReplicaRole::ActiveSecondary,
+            ReplicaRole::ActiveSecondary,
+            expanded.runtime_spec.candidate_read_status,
+            expanded.runtime_spec.candidate_write_status,
+            Some(expanded.runtime_spec.candidate_verified_lsn),
+        );
+    }));
+    assert!(
+        rejected_before_recovery.is_err(),
+        "{boundary}: wrong-transition-flags mutation reached recovery-owner opening"
+    );
 }
 
 #[test]
@@ -6015,6 +6347,7 @@ fn scale_up_store_cut_writer_process() {
             &cut,
             side == "after",
             true,
+            false,
         ));
 }
 
@@ -6118,6 +6451,7 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
     }
 
     for expanded in expand_scale_up_failover_cuts() {
+        let expected_effect_sequence = expanded.before_spec.effect_sequence;
         let effect_stage = expanded.effect_stage;
         let runtime_spec = expanded.runtime_spec;
         let spec = expanded.spec;
@@ -6287,6 +6621,7 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
                         &boundary,
                         &candidate_state,
                         &candidate_command,
+                        expected_effect_sequence.expect("failover candidate effect sequence"),
                         ReplicaRole::ActiveSecondary,
                         ReplicaRole::ActiveSecondary,
                         runtime_spec.candidate_read_status,
@@ -6299,6 +6634,7 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
                         &boundary,
                         &durable,
                         &command,
+                        expected_effect_sequence.expect("failover source effect sequence"),
                         ReplicaRole::ActiveSecondary,
                         ReplicaRole::ActiveSecondary,
                         AccessStatus::ReconfigurationPending,
