@@ -2044,7 +2044,7 @@ fn persisted_scale_up_authority_waits_without_dispatch_and_binds_resource_uid() 
             switchover: None,
             secondary_scale_down: None,
             secondary_removal_evidence: None,
-            scale_up: Some(Box::new(intent)),
+            scale_up: Some(Box::new(intent.clone())),
             scale_up_failover: None,
         }),
         ..Default::default()
@@ -2057,9 +2057,112 @@ fn persisted_scale_up_authority_waits_without_dispatch_and_binds_resource_uid() 
         }
     ));
 
+    let mut different_attempt = intent.clone();
+    different_attempt.build_id = OperationId::new("different-build");
+    different_attempt.operation_id = different_attempt.expected_operation_id();
+    let retained_operation_id = different_attempt.command_operation_id(
+        kuberic_protocol::types::ScaleUpStage::PreviousCurrent,
+        &different_attempt.primary,
+        &different_attempt.current_configuration,
+    );
+    snapshot.replicas.insert(
+        observation_key(1, "pod-1"),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Report(Box::new(AgentReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: snapshot.resource_uid.clone(),
+                identity: different_attempt.primary.clone(),
+                process_session_id: ProcessSessionId::new("session"),
+                report_sequence: 1,
+                role: ReplicaRole::Primary,
+                read_status: AccessStatus::Granted,
+                write_status: AccessStatus::Granted,
+                healthy: true,
+                epoch: different_attempt.current_configuration.epoch,
+                previous_configuration: Some(different_attempt.previous_configuration.clone()),
+                current_configuration: Some(different_attempt.current_configuration.clone()),
+                current_progress: 0,
+                verified_replication_lsn: Some(0),
+                committed_lsn: 0,
+                retained_operation_id: Some(retained_operation_id),
+                scale_up_intent: Some(Box::new(different_attempt)),
+                ..Default::default()
+            })),
+        },
+    );
+    assert!(kuberic_protocol::validation::validate_snapshot(&snapshot).is_err());
+    snapshot.replicas.clear();
+
     snapshot.resource_uid = ResourceUid::new("other");
     assert!(matches!(
         evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+}
+
+#[test]
+fn secondary_removal_rejects_mixed_scale_up_transition_evidence() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|model| {
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.kind == TransitionKind::SecondaryScaleDown)
+    });
+
+    let previous_policy = EffectivePolicy::fixed(1, 10).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 10).unwrap();
+    let primary = identity(1, "pod-1", "generation-1");
+    let target = identity(2, "pod-2", "generation-2");
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut scale_up = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: model.snapshot.resource_uid.clone(),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous,
+        current_configuration: current,
+        previous_policy,
+        current_policy,
+        primary,
+        target,
+        build_id: OperationId::new("build"),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 0,
+    };
+    scale_up.operation_id = scale_up.expected_operation_id();
+    model.snapshot.status.transition.as_mut().unwrap().scale_up = Some(Box::new(scale_up));
+
+    assert!(kuberic_protocol::validation::validate_status(&model.snapshot.status).is_err());
+    assert!(matches!(
+        evaluate(&model.snapshot, &scale_down_model::config()),
         Plan::Unsafe { .. }
     ));
 }

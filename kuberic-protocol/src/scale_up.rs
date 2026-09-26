@@ -101,6 +101,10 @@ pub fn validate_scale_up(intent: &ScaleUpIntent) -> Result {
         || intent.spec_generation == 0
         || intent.desired_replicas == 0
         || intent.build_id.is_empty()
+        || intent.primary.instance_id.is_empty()
+        || intent.primary.agent_generation.is_empty()
+        || intent.target.instance_id.is_empty()
+        || intent.target.agent_generation.is_empty()
         || intent.snapshot_boundary_lsn < 0
         || intent.catch_up_boundary_lsn < intent.snapshot_boundary_lsn
         || intent.operation_id != intent.expected_operation_id()
@@ -602,6 +606,33 @@ mod tests {
                     continue;
                 }
             }
+            invalid.operation_id = invalid.expected_operation_id();
+            assert!(validate_scale_up(&invalid).is_err(), "mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn canonical_scale_up_rejects_empty_candidate_incarnation() {
+        for mutation in 0..2 {
+            let mut invalid = intent(2);
+            if mutation == 0 {
+                invalid.target.instance_id = ReplicaInstanceId::default();
+            } else {
+                invalid.target.agent_generation = AgentGeneration::default();
+            }
+            let target = invalid
+                .current_configuration
+                .members
+                .iter_mut()
+                .find(|member| member.identity.replica_id == invalid.target.replica_id)
+                .unwrap();
+            target.identity = invalid.target.clone();
+            invalid.current_configuration = ConfigurationDescriptor::new(
+                invalid.current_configuration.epoch,
+                invalid.current_configuration.primary_id,
+                invalid.current_configuration.members,
+                invalid.current_policy.write_quorum,
+            );
             invalid.operation_id = invalid.expected_operation_id();
             assert!(validate_scale_up(&invalid).is_err(), "mutation {mutation}");
         }

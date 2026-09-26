@@ -149,7 +149,7 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             .transition
             .as_ref()
             .is_some_and(|transition| {
-                transition.kind == TransitionKind::ScaleUp || transition.scale_up_failover.is_some()
+                transition.scale_up.is_some() || transition.scale_up_failover.is_some()
             })
         || snapshot.replicas.values().any(|replica| {
             matches!(
@@ -2176,7 +2176,7 @@ fn evaluate_transition(
     if transition.kind == TransitionKind::PlannedSwitchover {
         return evaluate_switchover(snapshot, transition, config);
     }
-    if transition.kind == TransitionKind::ScaleUp || transition.scale_up_failover.is_some() {
+    if transition.scale_up.is_some() || transition.scale_up_failover.is_some() {
         let status = snapshot
             .status
             .clone()

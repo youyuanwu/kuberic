@@ -452,6 +452,32 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                 if let Some(current) = &report.current_configuration {
                     validate_configuration(current, None)?;
                 }
+                if let Some(reported) = report.scale_up_intent.as_deref() {
+                    let authorized = snapshot
+                        .status
+                        .transition
+                        .as_ref()
+                        .and_then(|transition| {
+                            transition.scale_up.as_deref().or_else(|| {
+                                transition
+                                    .scale_up_failover
+                                    .as_deref()
+                                    .map(|evidence| &evidence.intent)
+                            })
+                        })
+                        .or_else(|| {
+                            snapshot
+                                .status
+                                .last_scale_up
+                                .as_deref()
+                                .map(|receipt| &receipt.intent)
+                        });
+                    if authorized != Some(reported) {
+                        return Err(ValidationError::InvalidScaleUp(
+                            "reported scale-up attempt differs from persisted authority",
+                        ));
+                    }
+                }
                 validate_report_internal(report)?;
                 validate_report_authority(snapshot, report)?;
                 if report.role == ReplicaRole::Primary
@@ -484,7 +510,7 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
     Ok(())
 }
 
-pub(crate) fn validate_report_internal(
+pub fn validate_report_internal(
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
     validate_secondary_removal_report(report)?;
@@ -1343,6 +1369,8 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 || transition.build_id.is_some()
                 || transition.repair.is_some()
                 || transition.election_lsn.is_some()
+                || transition.scale_up.is_some()
+                || transition.scale_up_failover.is_some()
                 || status.primary_failure.is_some()
             {
                 return Err(ValidationError::InvalidSecondaryScaleDown(

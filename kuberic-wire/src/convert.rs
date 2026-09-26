@@ -374,7 +374,7 @@ pub fn normalize_agent_status_report(
                     .transpose()?,
                 retired_replica: report.retired_replica.map(TryInto::try_into).transpose()?,
             };
-            kuberic_protocol::validation::validate_secondary_removal_report(&report)
+            kuberic_protocol::validation::validate_report_internal(&report)
                 .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             Ok(AgentObservation::Report(Box::new(report)))
         }

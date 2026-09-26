@@ -776,11 +776,32 @@ mod tests {
             replica_id: intent.primary.replica_id.value(),
             read_status: proto::AccessStatus::Granted as i32,
             verified_replication_lsn: Some(0),
-            scale_up_intent: Some(intent.into()),
+            scale_up_intent: Some(intent.clone().into()),
             ..Default::default()
         };
         let result = crate::validate_agent_status_report(&report);
         assert!(result.is_ok(), "{result:?}");
+        let mut wrong_resource = report.clone();
+        wrong_resource.resource_uid = "other".into();
+        assert!(crate::validate_agent_status_report(&wrong_resource).is_err());
+
+        let mut unrelated = report.clone();
+        let mut members = intent.current_configuration.members.clone();
+        members.push(ConfigurationMember {
+            identity: identity(3),
+            role: ReplicaRole::ActiveSecondary,
+        });
+        unrelated.current_configuration = Some(
+            ConfigurationDescriptor::new(
+                intent.current_configuration.epoch,
+                intent.current_configuration.primary_id,
+                members,
+                2,
+            )
+            .into(),
+        );
+        assert!(crate::validate_agent_status_report(&unrelated).is_err());
+
         let mut missing = report;
         missing.scale_up_intent = None;
         assert!(crate::validate_agent_status_report(&missing).is_err());
