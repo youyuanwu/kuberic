@@ -910,9 +910,6 @@ fn apply_evaluator_configuration(
                     &intent.current_configuration
                 })
             );
-            if !command.current_only {
-                assert!(state.previous_configuration.is_none());
-            }
         }
         let build = state.build_commands.get(&intent.build_id).unwrap();
         let authority = build.authority.as_ref().unwrap();
@@ -1014,6 +1011,11 @@ fn step_evaluator_with_agent_admission(
     match model.plan() {
         Plan::Apply { changes } => {
             for change in changes {
+                if let kuberic_protocol::command::KubernetesChange::PersistStatus { status } =
+                    &change
+                {
+                    kuberic_protocol::validation::validate_status(status).unwrap();
+                }
                 model.apply(change);
             }
         }
@@ -1736,6 +1738,144 @@ fn evaluator_generated_carried_failover_commands_pass_real_agent_admission() {
     let recovered = states.get(&old_primary.replica_id.value()).unwrap();
     assert_eq!(recovered.current_configuration.as_ref(), Some(&accepted));
     assert!(recovered.previous_configuration.is_none());
+}
+
+#[test]
+fn evaluator_returning_member_gets_pc_cc_before_current_only_via_real_admission() {
+    let mut model = scale_up_model::Model::new(3, 4);
+    let mut states = evaluator_agent_states(&model);
+    while model.snapshot.status.scale_up_admission_started.is_none() {
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+    }
+    let key = model
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report) if report.identity.replica_id == ReplicaId::new(2) => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let saved = model.snapshot.replicas.get(&key).unwrap().clone();
+    model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Absent;
+    loop {
+        let another_current_only = model.snapshot.replicas.values().any(|observation| {
+            matches!(&observation.agent,
+                AgentObservation::Report(report)
+                    if report.identity.replica_id != ReplicaId::new(2)
+                        && report.previous_configuration.is_none()
+                        && report.scale_up_intent.is_some())
+        });
+        if another_current_only {
+            break;
+        }
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+    }
+    assert_eq!(model.accepted_count(), 3);
+    model.snapshot.replicas.insert(key, saved);
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(pc_cc),
+    } = model.plan()
+    else {
+        panic!("returning retained member must receive PC/CC before commitment")
+    };
+    assert_eq!(pc_cc.local_replica_id, ReplicaId::new(2));
+    assert!(!pc_cc.current_only);
+    apply_evaluator_configuration(&mut states, &pc_cc);
+    model.execute(ProtocolCommand::EnsureConfiguration(pc_cc));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("returning retained member must receive current-only after PC/CC")
+    };
+    assert_eq!(current_only.local_replica_id, ReplicaId::new(2));
+    assert!(current_only.current_only);
+    apply_evaluator_configuration(&mut states, &current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(current_only));
+
+    for _ in 0..80 {
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+        if model.accepted_count() == 4 && model.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 4);
+    assert!(model.snapshot.status.transition.is_none());
+}
+
+#[test]
+fn evaluator_zero_dispatch_failover_recovers_original_primary_via_real_admission() {
+    let mut model = scale_up_model::Model::new(2, 3);
+    let mut states = evaluator_agent_states(&model);
+    while model.snapshot.status.scale_up_admission_started.is_none() {
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+    }
+    let key = model
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report) if report.identity.replica_id == ReplicaId::new(1) => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let original_report = model.snapshot.replicas.get(&key).unwrap().clone();
+    model.report_mut(1).reported_fault = Some(kuberic_protocol::types::FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    for _ in 0..160 {
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+        if model.accepted_count() == 3 && model.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 3);
+    model.snapshot.replicas.insert(key, original_report);
+
+    let mut corrections = 0;
+    for _ in 0..20 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    if let kuberic_protocol::command::KubernetesChange::PersistStatus { status } =
+                        &change
+                    {
+                        kuberic_protocol::validation::validate_status(status).unwrap();
+                    }
+                    model.apply(change);
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.local_replica_id == ReplicaId::new(1) => {
+                apply_evaluator_configuration(&mut states, &command);
+                model.execute(ProtocolCommand::EnsureConfiguration(command));
+                corrections += 1;
+                if corrections == 2 {
+                    break;
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("zero-dispatch late-primary recovery stalled: {other:?}"),
+        }
+    }
+    assert_eq!(corrections, 2);
+    let accepted = &model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    let state = states.get(&1).unwrap();
+    assert_eq!(state.current_configuration.as_ref(), Some(accepted));
+    assert!(state.previous_configuration.is_none());
 }
 
 #[test]

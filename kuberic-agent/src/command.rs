@@ -588,7 +588,17 @@ fn admit_scale_up_configuration(
             == Some(&intent.current_configuration)
             && (state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
                 || state.previous_configuration.is_none());
-        original_failover_basis = original_attempt_installed;
+        let original_authority_failover = !command.current_only
+            && state.previous_configuration.is_none()
+            && state.current_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.highest_epoch == intent.previous_configuration.epoch
+            && state.admitted_policy.as_ref() == Some(&intent.previous_policy)
+            && intent
+                .previous_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == *identity && member.role == state.role);
+        original_failover_basis = original_attempt_installed || original_authority_failover;
         let first_failover_admission = !command.current_only && original_attempt_installed;
         historical_failover_current_only = command.current_only
             && original_attempt_installed
@@ -610,6 +620,7 @@ fn admit_scale_up_configuration(
         exact_failover_progression = exact_installed_failover;
         if !has_new_primary_witness
             || (!first_failover_admission
+                && !original_authority_failover
                 && !historical_failover_current_only
                 && !(exact_installed_failover && (command.current_only || persisted_exact_replay)))
         {

@@ -8648,6 +8648,36 @@ fn scale_up_receipt_repairs_member_that_missed_pc_cc_before_next_addition() {
             assert!(model.snapshot.status.scale_up_cleanup.is_some());
             let exact = model.snapshot.secondary_scale_down_resources.clone();
             model.snapshot.secondary_scale_down_resources.clear();
+            for replica_id in [2, 3] {
+                model.report_mut(replica_id).healthy = false;
+                model.report_mut(replica_id).reported_fault = Some(FaultType::Transient);
+            }
+            let Plan::Wait { status, .. } = model.plan() else {
+                panic!("cleanup quorum diagnostics")
+            };
+            let condition = status
+                .conditions
+                .iter()
+                .find(|condition| condition.reason == "ScaleUpFailoverWriteQuorumPending")
+                .unwrap();
+            for field in [
+                "accepted=3",
+                "desired=3",
+                "target=4@",
+                "attempt=",
+                "phase=cleanup",
+                "blocking=",
+            ] {
+                assert!(
+                    condition.message.contains(field),
+                    "{field}: {}",
+                    condition.message
+                );
+            }
+            for replica_id in [2, 3] {
+                model.report_mut(replica_id).healthy = true;
+                model.report_mut(replica_id).reported_fault = None;
+            }
             model.report_mut(1).reported_fault = Some(FaultType::Permanent);
             model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
 

@@ -212,6 +212,9 @@ fn restore_accepted_service_before_cleanup(
     snapshot: &ObservationSnapshot,
     accepted: &ConfigurationDescriptor,
     policy: &EffectivePolicy,
+    target: &ReplicaIdentity,
+    attempt: &OperationId,
+    phase: &str,
     config: &EvaluationConfig,
 ) -> Option<Plan> {
     let primary = configuration_primary(accepted);
@@ -230,9 +233,13 @@ fn restore_accepted_service_before_cleanup(
     let Some(primary_report) = primary_report else {
         return Some(Plan::Wait {
             reason: WaitReason::AwaitingStableEvidence,
-            status: waiting_status(
+            status: progress_status(
+                snapshot,
                 snapshot.status.clone(),
                 "ScaleUpFailoverPrimaryPending",
+                phase,
+                Some(target),
+                Some(attempt),
                 "Accepted failover primary must attest exact authority before cleanup",
             ),
             requeue_after_seconds: config.wait_requeue_seconds,
@@ -241,9 +248,13 @@ fn restore_accepted_service_before_cleanup(
     if reports.len() < accepted.write_quorum as usize {
         return Some(Plan::Wait {
             reason: WaitReason::QuorumLoss,
-            status: waiting_status(
+            status: progress_status(
+                snapshot,
                 snapshot.status.clone(),
                 "ScaleUpFailoverWriteQuorumPending",
+                phase,
+                Some(target),
+                Some(attempt),
                 "Accepted failover write quorum must recover before candidate cleanup",
             ),
             requeue_after_seconds: config.wait_requeue_seconds,
@@ -394,6 +405,9 @@ pub(super) fn cleanup(
             .effective_policy
             .as_ref()
             .expect("validated cleanup has policy"),
+        &cleanup.target,
+        &cleanup.provisioning.operation_id,
+        "cleanup",
         config,
     ) {
         return plan;
@@ -581,6 +595,9 @@ pub(super) fn recover_local_acceptance(
             snapshot,
             accepted,
             snapshot.status.effective_policy.as_ref()?,
+            &receipt.intent.target,
+            &receipt.intent.operation_id,
+            "local-convergence",
             config,
         )
     {
@@ -641,6 +658,29 @@ pub(super) fn recover_local_acceptance(
                 });
         if advanced_to_newer_scale_up {
             continue;
+        }
+        let missed_failover_expansion = receipt.failover_evidence.is_some()
+            && report.previous_configuration.is_none()
+            && report.current_configuration.as_ref()
+                == Some(&receipt.intent.previous_configuration)
+            && receipt
+                .intent
+                .previous_configuration
+                .members
+                .iter()
+                .any(|previous| {
+                    previous.identity == report.identity && previous.role == report.role
+                });
+        if missed_failover_expansion {
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
+                    evidence.clone(),
+                    &receipt.accepted_configuration,
+                    member,
+                    false,
+                    failover_safe_lsn,
+                ))),
+            });
         }
         let missed_ordinary_pc_cc = receipt.failover_evidence.is_none()
             && report.previous_configuration.is_none()
@@ -990,6 +1030,9 @@ pub(super) fn provisioning(
             snapshot,
             accepted,
             &scale_up.previous_policy,
+            &target,
+            &provisioning.operation_id,
+            "cleanup",
             config,
         ) {
             return plan;
@@ -1345,6 +1388,30 @@ fn exact_current_only_report(
             .is_some_and(|lsn| lsn >= intent.catch_up_boundary_lsn)
 }
 
+fn needs_scale_up_pc_cc(
+    report: &AgentReport,
+    member: &ConfigurationMember,
+    intent: &ScaleUpIntent,
+) -> bool {
+    let retained_previous = report.previous_configuration.is_none()
+        && report.current_configuration.as_ref() == Some(&intent.previous_configuration)
+        && intent
+            .previous_configuration
+            .members
+            .iter()
+            .any(|previous| {
+                previous.identity == report.identity
+                    && previous.identity == member.identity
+                    && previous.role == report.role
+            });
+    let idle_candidate = member.identity == intent.target
+        && report.identity == intent.target
+        && report.role == ReplicaRole::IdleSecondary
+        && report.previous_configuration.is_none()
+        && report.current_configuration.is_none();
+    retained_previous || idle_candidate
+}
+
 fn quorum_witnesses(
     snapshot: &ObservationSnapshot,
     intent: &ScaleUpIntent,
@@ -1564,6 +1631,9 @@ pub(super) fn transition(
             snapshot,
             &intent.previous_configuration,
             &intent.previous_policy,
+            &intent.target,
+            &intent.operation_id,
+            "failover-recovery",
             config,
         )
     {
@@ -1789,6 +1859,17 @@ pub(super) fn transition(
         let Some(report) = report(snapshot, &member.identity) else {
             continue;
         };
+        if needs_scale_up_pc_cc(report, member, intent) {
+            return Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
+                    evidence.clone(),
+                    current,
+                    member,
+                    false,
+                    transition.election_lsn,
+                ))),
+            };
+        }
         let operation_id =
             intent.command_operation_id(ScaleUpStage::CurrentOnly, &member.identity, current);
         if !exact_current_only_report(report, intent, current)
