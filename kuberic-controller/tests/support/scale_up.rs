@@ -1003,3 +1003,41 @@ async fn accepted_repair_and_explicit_switchover_outrank_scale_up() {
     }
     panic!("explicit switchover did not outrank scale-up");
 }
+
+#[tokio::test]
+async fn completion_receipt_does_not_block_exact_pod_safety_fencing() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    finish(&api, 3).await;
+    let raw = api.observation().await;
+    assert!(
+        raw.set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .last_scale_up
+            .is_some()
+    );
+    let original_pvcs = raw.pvcs.clone();
+    let pod = raw
+        .pods
+        .iter()
+        .find(|pod| pod.labels().get(REPLICA_ID_LABEL).map(String::as_str) == Some("3"))
+        .unwrap();
+    let name = pod.name_any();
+    let uid = PodUid::new(pod.uid().unwrap());
+    api.delete_exact_pod(&raw, &name, &uid).await.unwrap();
+
+    let after = api.observation().await;
+    assert_eq!(after.pvcs, original_pvcs);
+    assert!(
+        after
+            .pods
+            .iter()
+            .all(|pod| pod.uid().as_deref() != Some(uid.as_str()))
+    );
+    assert!(api.effects().await.iter().any(|effect| matches!(
+        effect,
+        EffectRecord::DeleteExactPod { pod_uid, .. } if pod_uid == &uid
+    )));
+}

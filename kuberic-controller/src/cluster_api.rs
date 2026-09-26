@@ -690,7 +690,11 @@ where
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
-        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+        if crate::exact_resources::protected_from_exact_pod_fence(
+            observation,
+            Some(pod_name),
+            Some(pod_uid.as_str()),
+        ) {
             return Err(ControllerError::ObservationStale);
         }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
@@ -2401,7 +2405,11 @@ impl ClusterApi for InMemoryClusterApi {
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
-        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+        if crate::exact_resources::protected_from_exact_pod_fence(
+            observation,
+            Some(pod_name),
+            Some(pod_uid.as_str()),
+        ) {
             return Err(ControllerError::ObservationStale);
         }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
@@ -2750,6 +2758,9 @@ fn exact_pod_delete_params(
     pod_name: &str,
     pod_uid: &PodUid,
 ) -> Result<DeleteParams> {
+    // Pod-only safety fencing is distinct from generic candidate cleanup. The
+    // executor already selected this effect from the immutable plan; fence the
+    // exact observed incarnation while retaining its PVC and receipt evidence.
     let pod = observation
         .pods
         .iter()

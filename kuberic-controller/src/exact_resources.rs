@@ -309,6 +309,36 @@ pub(crate) fn protected(
     resource_name: Option<&str>,
     resource_uid: Option<&str>,
 ) -> bool {
+    protected_by_active_lifecycle(raw, resource_name, resource_uid)
+        || raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.last_scale_up.as_deref())
+            .is_some_and(|receipt| {
+                scale_up_target_protected(
+                    raw,
+                    &receipt.intent.target,
+                    None,
+                    resource_name,
+                    resource_uid,
+                )
+            })
+}
+
+pub(crate) fn protected_from_exact_pod_fence(
+    raw: &RawObservation,
+    resource_name: Option<&str>,
+    resource_uid: Option<&str>,
+) -> bool {
+    protected_by_active_lifecycle(raw, resource_name, resource_uid)
+}
+
+fn protected_by_active_lifecycle(
+    raw: &RawObservation,
+    resource_name: Option<&str>,
+    resource_uid: Option<&str>,
+) -> bool {
     let Some(status) = raw.set.status.as_ref().map(|s| &s.authority) else {
         return false;
     };
@@ -344,15 +374,6 @@ pub(crate) fn protected(
             .is_some_and(|target| {
                 scale_up_target_protected(raw, target, None, resource_name, resource_uid)
             })
-        || status.last_scale_up.as_deref().is_some_and(|receipt| {
-            scale_up_target_protected(
-                raw,
-                &receipt.intent.target,
-                None,
-                resource_name,
-                resource_uid,
-            )
-        })
 }
 
 fn scale_up_target_protected(
