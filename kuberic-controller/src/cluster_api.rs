@@ -1799,7 +1799,7 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
     proto::EnsureConfigurationCommand {
         previous_policy: command.previous_policy.map(Into::into),
         secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
-        scale_up_evidence: command.scale_up_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(|evidence| (*evidence).into()),
         operation_id: command.operation_id.to_string(),
         previous_configuration: command.previous_configuration.map(Into::into),
         current_configuration: Some(command.current_configuration.into()),

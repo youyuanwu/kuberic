@@ -128,17 +128,17 @@
                       },
                       "readQuorum": {
                         "format": "uint32",
-                        "minimum": 0.0,
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "replicaSetSize": {
                         "format": "uint32",
-                        "minimum": 0.0,
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "writeQuorum": {
                         "format": "uint32",
-                        "minimum": 0.0,
+                        "minimum": 1.0,
                         "type": "integer"
                       }
                     },
@@ -321,6 +321,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -354,10 +355,12 @@
                               "properties": {
                                 "configurationNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 },
                                 "dataLossNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 }
                               },
@@ -378,6 +381,7 @@
                                 },
                                 "replicaId": {
                                   "format": "int64",
+                                  "minimum": 1.0,
                                   "type": "integer"
                                 }
                               },
@@ -474,10 +478,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -499,6 +505,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -546,17 +553,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -587,10 +594,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -612,6 +621,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -659,17 +669,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -692,6 +702,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -726,6 +737,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -776,10 +788,12 @@
                               "properties": {
                                 "configurationNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 },
                                 "dataLossNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 }
                               },
@@ -800,6 +814,7 @@
                                 },
                                 "replicaId": {
                                   "format": "int64",
+                                  "minimum": 1.0,
                                   "type": "integer"
                                 }
                               },
@@ -1049,10 +1064,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -1074,6 +1091,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -1121,17 +1139,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -1162,10 +1180,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -1187,6 +1207,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -1234,17 +1255,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -1267,6 +1288,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -1296,6 +1318,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -1354,10 +1377,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -1378,6 +1403,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -1464,10 +1490,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -1488,6 +1516,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -1591,6 +1620,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1616,6 +1646,7 @@
                       },
                       "requestedTargetReplicaId": {
                         "format": "int64",
+                        "minimum": 1.0,
                         "type": "integer"
                       },
                       "resultingPrimary": {
@@ -1630,6 +1661,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1822,6 +1854,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1854,6 +1887,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -1906,6 +1940,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -1929,17 +1964,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -1967,10 +2002,12 @@
                                     "properties": {
                                       "configurationNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       },
                                       "dataLossNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       }
                                     },
@@ -1992,6 +2029,7 @@
                                         },
                                         "replicaId": {
                                           "format": "int64",
+                                          "minimum": 1.0,
                                           "type": "integer"
                                         },
                                         "role": {
@@ -2039,17 +2077,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -2071,6 +2109,7 @@
                               },
                               "targetReplicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -2148,6 +2187,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -2171,17 +2211,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2209,10 +2249,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -2234,6 +2276,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -2281,17 +2324,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2313,6 +2356,7 @@
                                   },
                                   "targetReplicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -2507,6 +2551,7 @@
                           },
                           "replicaId": {
                             "format": "int64",
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -2540,10 +2585,12 @@
                               "properties": {
                                 "configurationNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 },
                                 "dataLossNumber": {
                                   "format": "int64",
+                                  "minimum": 0.0,
                                   "type": "integer"
                                 }
                               },
@@ -2564,6 +2611,7 @@
                                 },
                                 "replicaId": {
                                   "format": "int64",
+                                  "minimum": 1.0,
                                   "type": "integer"
                                 }
                               },
@@ -2813,10 +2861,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -2838,6 +2888,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -2885,17 +2936,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -2926,10 +2977,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -2951,6 +3004,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -2998,17 +3052,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3031,6 +3085,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3060,6 +3115,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3118,10 +3174,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3142,6 +3200,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3228,10 +3287,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3252,6 +3313,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -3344,10 +3406,12 @@
                             "properties": {
                               "configurationNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               },
                               "dataLossNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               }
                             },
@@ -3522,10 +3586,12 @@
                                     "properties": {
                                       "configurationNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       },
                                       "dataLossNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3547,6 +3613,7 @@
                                         },
                                         "replicaId": {
                                           "format": "int64",
+                                          "minimum": 1.0,
                                           "type": "integer"
                                         },
                                         "role": {
@@ -3594,17 +3661,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -3635,10 +3702,12 @@
                                     "properties": {
                                       "configurationNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       },
                                       "dataLossNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       }
                                     },
@@ -3660,6 +3729,7 @@
                                         },
                                         "replicaId": {
                                           "format": "int64",
+                                          "minimum": 1.0,
                                           "type": "integer"
                                         },
                                         "role": {
@@ -3707,17 +3777,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -3740,6 +3810,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -3769,6 +3840,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -3873,10 +3945,12 @@
                         "properties": {
                           "configurationNumber": {
                             "format": "int64",
+                            "minimum": 0.0,
                             "type": "integer"
                           },
                           "dataLossNumber": {
                             "format": "int64",
+                            "minimum": 0.0,
                             "type": "integer"
                           }
                         },
@@ -3898,6 +3972,7 @@
                             },
                             "replicaId": {
                               "format": "int64",
+                              "minimum": 1.0,
                               "type": "integer"
                             },
                             "role": {
@@ -3954,10 +4029,12 @@
                             "properties": {
                               "configurationNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               },
                               "dataLossNumber": {
                                 "format": "int64",
+                                "minimum": 0.0,
                                 "type": "integer"
                               }
                             },
@@ -3979,6 +4056,7 @@
                                 },
                                 "replicaId": {
                                   "format": "int64",
+                                  "minimum": 1.0,
                                   "type": "integer"
                                 },
                                 "role": {
@@ -4026,17 +4104,17 @@
                           },
                           "readQuorum": {
                             "format": "uint32",
-                            "minimum": 0.0,
+                            "minimum": 1.0,
                             "type": "integer"
                           },
                           "replicaSetSize": {
                             "format": "uint32",
-                            "minimum": 0.0,
+                            "minimum": 1.0,
                             "type": "integer"
                           },
                           "writeQuorum": {
                             "format": "uint32",
-                            "minimum": 0.0,
+                            "minimum": 1.0,
                             "type": "integer"
                           }
                         },
@@ -4086,6 +4164,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4126,10 +4205,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4151,6 +4232,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -4198,17 +4280,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4239,10 +4321,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4264,6 +4348,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -4311,17 +4396,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4344,6 +4429,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4378,6 +4464,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -4420,10 +4507,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -4444,6 +4533,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -4540,10 +4630,12 @@
                                     "properties": {
                                       "configurationNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       },
                                       "dataLossNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       }
                                     },
@@ -4565,6 +4657,7 @@
                                         },
                                         "replicaId": {
                                           "format": "int64",
+                                          "minimum": 1.0,
                                           "type": "integer"
                                         },
                                         "role": {
@@ -4612,17 +4705,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4653,10 +4746,12 @@
                                     "properties": {
                                       "configurationNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       },
                                       "dataLossNumber": {
                                         "format": "int64",
+                                        "minimum": 0.0,
                                         "type": "integer"
                                       }
                                     },
@@ -4678,6 +4773,7 @@
                                         },
                                         "replicaId": {
                                           "format": "int64",
+                                          "minimum": 1.0,
                                           "type": "integer"
                                         },
                                         "role": {
@@ -4725,17 +4821,17 @@
                                   },
                                   "readQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "replicaSetSize": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   },
                                   "writeQuorum": {
                                     "format": "uint32",
-                                    "minimum": 0.0,
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4758,6 +4854,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4792,6 +4889,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -4831,10 +4929,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -4855,6 +4955,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -5113,10 +5214,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -5138,6 +5241,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -5185,17 +5289,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -5226,10 +5330,12 @@
                                         "properties": {
                                           "configurationNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           },
                                           "dataLossNumber": {
                                             "format": "int64",
+                                            "minimum": 0.0,
                                             "type": "integer"
                                           }
                                         },
@@ -5251,6 +5357,7 @@
                                             },
                                             "replicaId": {
                                               "format": "int64",
+                                              "minimum": 1.0,
                                               "type": "integer"
                                             },
                                             "role": {
@@ -5298,17 +5405,17 @@
                                       },
                                       "readQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "replicaSetSize": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       },
                                       "writeQuorum": {
                                         "format": "uint32",
-                                        "minimum": 0.0,
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -5331,6 +5438,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -5360,6 +5468,7 @@
                                       },
                                       "replicaId": {
                                         "format": "int64",
+                                        "minimum": 1.0,
                                         "type": "integer"
                                       }
                                     },
@@ -5418,10 +5527,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -5442,6 +5553,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -5528,10 +5640,12 @@
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     },
                                     "dataLossNumber": {
                                       "format": "int64",
+                                      "minimum": 0.0,
                                       "type": "integer"
                                     }
                                   },
@@ -5552,6 +5666,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     }
                                   },
@@ -5799,10 +5914,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -5824,6 +5941,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -5871,17 +5989,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -5912,10 +6030,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -5937,6 +6057,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -5984,17 +6105,17 @@
                               },
                               "readQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "replicaSetSize": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               },
                               "writeQuorum": {
                                 "format": "uint32",
-                                "minimum": 0.0,
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -6017,6 +6138,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -6046,6 +6168,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -6109,6 +6232,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -6127,10 +6251,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -6151,6 +6277,7 @@
                                   },
                                   "replicaId": {
                                     "format": "int64",
+                                    "minimum": 1.0,
                                     "type": "integer"
                                   }
                                 },
@@ -6193,10 +6320,12 @@
                                 "properties": {
                                   "configurationNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   },
                                   "dataLossNumber": {
                                     "format": "int64",
+                                    "minimum": 0.0,
                                     "type": "integer"
                                   }
                                 },
@@ -6218,6 +6347,7 @@
                                     },
                                     "replicaId": {
                                       "format": "int64",
+                                      "minimum": 1.0,
                                       "type": "integer"
                                     },
                                     "role": {
@@ -6275,6 +6405,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },
@@ -6296,6 +6427,7 @@
                               },
                               "replicaId": {
                                 "format": "int64",
+                                "minimum": 1.0,
                                 "type": "integer"
                               }
                             },

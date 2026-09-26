@@ -163,6 +163,12 @@ mod tests {
         }
         assert_eq!(intent["snapshotBoundaryLsn"]["minimum"], 0.0);
         assert_eq!(intent["catchUpBoundaryLsn"]["minimum"], 0.0);
+        assert_eq!(intent["target"]["properties"]["replicaId"]["minimum"], 1.0);
+        for policy in ["previousPolicy", "currentPolicy"] {
+            for field in ["replicaSetSize", "writeQuorum", "readQuorum"] {
+                assert_eq!(intent[policy]["properties"][field]["minimum"], 1.0);
+            }
+        }
         assert!(status.get("scaleUpCleanup").is_some());
         assert!(status.get("lastScaleUp").is_some());
 
@@ -176,8 +182,12 @@ mod tests {
                 .get("targetReplicaId")
                 .is_some()
         );
+        assert_eq!(
+            provisioning["scaleUp"]["properties"]["targetReplicaId"]["minimum"],
+            1.0
+        );
 
-        let generated = serde_json::to_vec(&KubericSet::crd()).unwrap();
+        let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
         assert!(
             generated.len() < 350_000,
             "generated CRD unexpectedly grew to {} bytes",

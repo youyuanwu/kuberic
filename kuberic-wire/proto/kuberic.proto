@@ -145,6 +145,7 @@ message AgentStatusReport {
   SecondaryRemovalEvidence secondary_removal_evidence = 34;
   ReplicaRetirementReport retired_replica = 35;
   SecondaryScaleDownCleanup accepted_secondary_removal = 36;
+  ScaleUpIntent scale_up_intent = 37;
 }
 
 message InitializeAgentStoreCommand {
@@ -263,6 +264,17 @@ message ScaleUpConfigurationEvidence {
     ScaleUpIntent admission = 1;
     ScaleUpFailoverEvidence failover = 2;
   }
+}
+
+message ScaleUpCleanup {
+  ProvisioningIntent provisioning = 1;
+  ReplicaIdentity target = 2;
+  ReplicaCleanupIdentity resources = 3;
+}
+
+message ScaleUpReceipt {
+  ScaleUpIntent intent = 1;
+  repeated ScaleUpWitness current_only_write_quorum = 2;
 }
 
 message CleanupResourceIdentity {

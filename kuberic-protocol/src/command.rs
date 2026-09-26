@@ -46,7 +46,7 @@ pub struct EnsureConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_removal_evidence: Option<crate::types::SecondaryRemovalEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale_up_evidence: Option<crate::types::ScaleUpConfigurationEvidence>,
+    pub scale_up_evidence: Option<Box<crate::types::ScaleUpConfigurationEvidence>>,
     pub local_replica_id: ReplicaId,
     pub expected_instance_id: ReplicaInstanceId,
     pub expected_agent_generation: AgentGeneration,
@@ -231,4 +231,18 @@ pub enum ScaleDownResource {
 #[serde(rename_all = "camelCase")]
 pub enum SafetyChange {
     RemoveWriteRouting,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_command_keeps_large_transition_evidence_off_stack() {
+        assert!(
+            std::mem::size_of::<EnsureConfiguration>() < 2_048,
+            "EnsureConfiguration grew to {} bytes",
+            std::mem::size_of::<EnsureConfiguration>()
+        );
+    }
 }

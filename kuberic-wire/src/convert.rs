@@ -12,8 +12,8 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId,
-    PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
+    PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningKind, ProvisioningPurpose, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
     SwitchoverRequestId, TransitionKind, derive_agent_generation,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
@@ -176,6 +176,7 @@ pub fn normalize_agent_status_report(
                 || report.secondary_removal_evidence.is_some()
                 || report.retired_replica.is_some()
                 || report.accepted_secondary_removal.is_some()
+                || report.scale_up_intent.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
@@ -319,13 +320,21 @@ pub fn normalize_agent_status_report(
                 role,
                 read_status,
                 write_status,
-                report.secondary_removal_evidence.is_some(),
+                ReportConfigurationEvidence {
+                    secondary_removal: report.secondary_removal_evidence.is_some(),
+                    scale_up: report.scale_up_intent.is_some(),
+                },
             )?;
             let report = AgentReport {
                 accepted_secondary_removal: report
                     .accepted_secondary_removal
                     .map(TryInto::try_into)
                     .transpose()?,
+                scale_up_intent: report
+                    .scale_up_intent
+                    .map(TryInto::try_into)
+                    .transpose()?
+                    .map(Box::new),
                 protocol_version: report.protocol_version,
                 resource_uid: ResourceUid::new(report.resource_uid),
                 identity,
@@ -387,6 +396,7 @@ pub fn normalize_agent_status_report(
                 || report.secondary_removal_evidence.is_some()
                 || report.retired_replica.is_some()
                 || report.accepted_secondary_removal.is_some()
+                || report.scale_up_intent.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "unsafe storage report contains untrusted authority".to_string(),
@@ -1626,6 +1636,31 @@ pub(crate) fn provisioning_from_proto(
     Ok(intent)
 }
 
+pub(crate) fn provisioning_to_proto(provisioning: ProvisioningIntent) -> proto::ProvisioningIntent {
+    use proto::provisioning_intent::Purpose;
+    proto::ProvisioningIntent {
+        purpose: Some(match provisioning.purpose.kind {
+            ProvisioningKind::Replacement => Purpose::Replaces(
+                provisioning
+                    .purpose
+                    .replaces
+                    .expect("validated replacement provisioning")
+                    .into(),
+            ),
+            ProvisioningKind::ScaleUp => Purpose::ScaleUp(
+                provisioning
+                    .purpose
+                    .scale_up
+                    .expect("validated scale-up provisioning")
+                    .into(),
+            ),
+        }),
+        pod_uid: provisioning.pod_uid.to_string(),
+        pvc_uid: provisioning.pvc_uid.to_string(),
+        operation_id: provisioning.operation_id.to_string(),
+    }
+}
+
 pub(crate) fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
     match role {
         ReplicaRole::Primary => proto::ReplicaRole::Primary,
@@ -1687,6 +1722,12 @@ pub(crate) fn access_status_from_proto(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReportConfigurationEvidence {
+    secondary_removal: bool,
+    scale_up: bool,
+}
+
 fn validate_report_configurations(
     epoch: Epoch,
     previous: Option<&ConfigurationDescriptor>,
@@ -1694,7 +1735,7 @@ fn validate_report_configurations(
     role: ReplicaRole,
     read_status: AccessStatus,
     write_status: AccessStatus,
-    secondary_removal: bool,
+    evidence: ReportConfigurationEvidence,
 ) -> Result<(), WireError> {
     if previous.is_some() && current.is_none() {
         return Err(WireError::InvalidAuthority(
@@ -1721,7 +1762,8 @@ fn validate_report_configurations(
             .collect::<BTreeSet<_>>();
         if previous.epoch.data_loss_number != current.epoch.data_loss_number
             || previous.epoch.configuration_number >= current.epoch.configuration_number
-            || (!secondary_removal
+            || (!evidence.secondary_removal
+                && !evidence.scale_up
                 && (previous_ids != current_ids || previous.write_quorum != current.write_quorum))
         {
             return Err(WireError::InvalidAuthority(

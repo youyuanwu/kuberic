@@ -137,6 +137,39 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             changes: vec![KubernetesChange::EnsureReplicaSupport],
         };
     }
+    if snapshot.status.scale_up_cleanup.is_some()
+        || snapshot.status.last_scale_up.is_some()
+        || snapshot
+            .status
+            .provisioning
+            .as_ref()
+            .is_some_and(|provisioning| provisioning.scale_up().is_some())
+        || snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| {
+                transition.kind == TransitionKind::ScaleUp || transition.scale_up_failover.is_some()
+            })
+        || snapshot.replicas.values().any(|replica| {
+            matches!(
+                &replica.agent,
+                AgentObservation::Report(report) if report.scale_up_intent.is_some()
+            )
+        })
+    {
+        return Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            status: snapshot
+                .status
+                .clone()
+                .with_condition(progressing_condition(
+                    "ScaleUpAuthorityPendingImplementation",
+                    "Persisted scale-up authority is valid but execution remains disabled",
+                )),
+            requeue_after_seconds: config.stable_resync_seconds,
+        };
+    }
 
     if let Some(plan) = secondary_scale_down::recover_local_acceptance(snapshot, config) {
         return plan;
@@ -2142,6 +2175,20 @@ fn evaluate_transition(
     }
     if transition.kind == TransitionKind::PlannedSwitchover {
         return evaluate_switchover(snapshot, transition, config);
+    }
+    if transition.kind == TransitionKind::ScaleUp || transition.scale_up_failover.is_some() {
+        let status = snapshot
+            .status
+            .clone()
+            .with_condition(progressing_condition(
+                "ScaleUpAuthorityPendingImplementation",
+                "Persisted scale-up authority is valid but execution remains disabled",
+            ));
+        return Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            status,
+            requeue_after_seconds: config.stable_resync_seconds,
+        };
     }
     let mut status = transition_status(snapshot.status.clone());
     let (_, unsupported) = desired_spec_state(

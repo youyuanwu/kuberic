@@ -1779,9 +1779,9 @@ use kuberic_protocol::types::{
     PlannedSwitchoverOutcome, PlannedSwitchoverReceipt, PlannedSwitchoverRequest,
     PlannedSwitchoverResolution, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
     PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole,
-    ResourceUid, SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind,
-    derive_agent_generation, derive_initialization_id, derive_switchover_preparation_operation_id,
-    derive_transition_id,
+    ResourceUid, ScaleUpIntent, SwitchoverHandoff, SwitchoverRequestId, TransitionIntent,
+    TransitionKind, derive_agent_generation, derive_initialization_id,
+    derive_switchover_preparation_operation_id, derive_transition_id,
 };
 use kuberic_protocol::validation::{
     ValidationError, validate_configuration, validate_status, validate_transition_relationship,
@@ -1976,6 +1976,92 @@ fn empty_snapshot(replicas: u32) -> ObservationSnapshot {
         observation_failures: Vec::new(),
         now_unix_seconds: 100,
     }
+}
+
+#[test]
+fn persisted_scale_up_authority_waits_without_dispatch_and_binds_resource_uid() {
+    let previous_policy = EffectivePolicy::fixed(1, 10).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 10).unwrap();
+    let primary = identity(1, "pod-1", "generation-1");
+    let target = identity(2, "pod-2", "generation-2");
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: ResourceUid::new("resource-uid"),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: previous_policy.clone(),
+        current_policy: current_policy.clone(),
+        primary,
+        target,
+        build_id: OperationId::new("build"),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 0,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let mut snapshot = empty_snapshot(2);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(previous_policy),
+        topology: Some(AcceptedTopology {
+            configuration: previous,
+        }),
+        transition: Some(TransitionIntent {
+            transition_id: intent.transition_id(TransitionKind::ScaleUp, &current),
+            kind: TransitionKind::ScaleUp,
+            spec_generation: intent.spec_generation,
+            effective_policy: current_policy,
+            previous_configuration_id: Some(intent.previous_configuration.configuration_id.clone()),
+            current_configuration: current,
+            election_lsn: None,
+            build_id: Some(intent.build_id.clone()),
+            repair: None,
+            switchover: None,
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
+            scale_up: Some(Box::new(intent)),
+            scale_up_failover: None,
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            ..
+        }
+    ));
+
+    snapshot.resource_uid = ResourceUid::new("other");
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
 }
 
 fn scaffolded_snapshot() -> ObservationSnapshot {

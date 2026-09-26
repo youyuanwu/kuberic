@@ -28,7 +28,7 @@ fn removal_ensure(
         effective_policy: Some(command.effective_policy.into()),
         previous_policy: command.previous_policy.map(Into::into),
         secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
-        scale_up_evidence: command.scale_up_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(|evidence| (*evidence).into()),
         local_replica_id: command.local_replica_id.value(),
         expected_instance_id: command.expected_instance_id.to_string(),
         expected_agent_generation: command.expected_agent_generation.to_string(),
@@ -169,7 +169,7 @@ fn accepted_removal_commit_rejects_mutated_certificates_and_envelopes() {
 fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
     use kuberic_wire::proto::execute_command_request::Command;
     let intent = scale_down_fixture::intent(&[1, 2], 1);
-    for mutation in 0..17 {
+    for mutation in 0..18 {
         let mut command = removal_ensure(&intent, false);
         match mutation {
             0 => command.previous_policy = None,
@@ -211,6 +211,7 @@ fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
                     .unwrap()
                     .desired_replicas = 0
             }
+            16 => command.scale_up_evidence = Some(proto::ScaleUpConfigurationEvidence::default()),
             _ => {
                 command
                     .secondary_removal_evidence

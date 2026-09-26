@@ -76,7 +76,7 @@ string_id!(SwitchoverRequestId);
     Default,
 )]
 #[serde(transparent)]
-pub struct ReplicaId(i64);
+pub struct ReplicaId(#[schemars(range(min = 1))] i64);
 
 impl ReplicaId {
     pub const fn new(value: i64) -> Self {
@@ -111,7 +111,9 @@ impl fmt::Display for ReplicaId {
 #[serde(rename_all = "camelCase")]
 /// Monotonic replication authority version, ordered by data loss then configuration.
 pub struct Epoch {
+    #[schemars(range(min = 0))]
     pub data_loss_number: i64,
+    #[schemars(range(min = 0))]
     pub configuration_number: i64,
 }
 
@@ -347,8 +349,11 @@ impl ConfigurationDescriptor {
 #[serde(rename_all = "camelCase")]
 /// Fixed replica-set size and majority quorum values frozen for an operation.
 pub struct EffectivePolicy {
+    #[schemars(range(min = 1))]
     pub replica_set_size: u32,
+    #[schemars(range(min = 1))]
     pub write_quorum: u32,
+    #[schemars(range(min = 1))]
     pub read_quorum: u32,
     pub failover_delay_seconds: u64,
 }
@@ -389,6 +394,21 @@ pub struct ScaleUpProvisioning {
     pub previous_policy: EffectivePolicy,
     pub current_policy: EffectivePolicy,
     pub target_replica_id: ReplicaId,
+}
+
+impl ScaleUpProvisioning {
+    pub fn next_configuration_epoch(&self) -> Option<Epoch> {
+        self.previous_configuration
+            .epoch
+            .configuration_number
+            .checked_add(1)
+            .map(|configuration_number| {
+                Epoch::new(
+                    self.previous_configuration.epoch.data_loss_number,
+                    configuration_number,
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -510,6 +530,21 @@ impl ProvisioningIntent {
                 ))
             }
         }
+    }
+
+    pub fn scale_up_build_id(&self, resource_uid: &ResourceUid) -> Option<OperationId> {
+        self.scale_up().map(|_| {
+            let target = self.target_identity(resource_uid);
+            OperationId::new(format!(
+                "scale-up-build-{}",
+                digest_parts(&[
+                    self.operation_id.as_str(),
+                    &target.replica_id.to_string(),
+                    target.instance_id.as_str(),
+                    target.agent_generation.as_str(),
+                ])
+            ))
+        })
     }
 }
 
@@ -701,9 +736,9 @@ pub struct TransitionIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_removal_evidence: Option<SecondaryRemovalEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale_up: Option<ScaleUpIntent>,
+    pub scale_up: Option<Box<ScaleUpIntent>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale_up_failover: Option<ScaleUpFailoverEvidence>,
+    pub scale_up_failover: Option<Box<ScaleUpFailoverEvidence>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -785,6 +820,7 @@ impl ScaleUpIntent {
         &self,
         stage: ScaleUpStage,
         target: &ReplicaIdentity,
+        authority: &ConfigurationDescriptor,
     ) -> OperationId {
         OperationId::new(format!(
             "scale-up-command-{}",
@@ -794,6 +830,22 @@ impl ScaleUpIntent {
                 &target.replica_id.to_string(),
                 target.instance_id.as_str(),
                 target.agent_generation.as_str(),
+                authority.configuration_id.as_str(),
+            ])
+        ))
+    }
+
+    pub fn transition_id(
+        &self,
+        kind: TransitionKind,
+        authority: &ConfigurationDescriptor,
+    ) -> TransitionId {
+        TransitionId::new(format!(
+            "scale-up-transition-{}",
+            digest_parts(&[
+                self.operation_id.as_str(),
+                kind.as_tag(),
+                authority.configuration_id.as_str(),
             ])
         ))
     }
@@ -1151,9 +1203,9 @@ pub struct AcceptedStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_secondary_removal: Option<SecondaryRemovalReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale_up_cleanup: Option<ScaleUpCleanup>,
+    pub scale_up_cleanup: Option<Box<ScaleUpCleanup>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_scale_up: Option<ScaleUpReceipt>,
+    pub last_scale_up: Option<Box<ScaleUpReceipt>>,
     pub conditions: Vec<StatusCondition>,
 }
 

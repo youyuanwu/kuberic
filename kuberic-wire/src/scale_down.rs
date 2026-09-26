@@ -189,6 +189,7 @@ pub(crate) fn configuration_from_proto(
         || !value.retire_build_ids.is_empty()
         || value.switchover_handoff.is_some()
         || !value.retire_switchover_preparation_ids.is_empty()
+        || value.scale_up_evidence.is_some()
     {
         return Err(WireError::InvalidAuthority(
             "removal cannot carry write grants or unrelated retirements".into(),

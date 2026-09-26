@@ -105,6 +105,8 @@ pub struct AgentReport {
     pub retired_replica: Option<crate::types::ReplicaRetirementReport>,
     #[serde(default)]
     pub accepted_secondary_removal: Option<crate::types::SecondaryScaleDownCleanup>,
+    #[serde(default)]
+    pub scale_up_intent: Option<Box<crate::types::ScaleUpIntent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +161,7 @@ impl Default for AgentReport {
             secondary_removal_evidence: None,
             retired_replica: None,
             accepted_secondary_removal: None,
+            scale_up_intent: None,
         }
     }
 }
