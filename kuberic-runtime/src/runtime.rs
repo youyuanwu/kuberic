@@ -911,7 +911,8 @@ impl DefaultReplicatorInner {
         let replication_progress = self
             .load_replication_progress_with_handoff(&authority)
             .await?;
-        self.configure_admitted_authority(&authority, current_progress, false)
+        let preserve_scale_up_access = restores_same_primary_scale_up_access(&authority);
+        self.configure_admitted_authority(&authority, current_progress, preserve_scale_up_access)
             .await?;
         self.replicator
             .lock()
@@ -2464,6 +2465,13 @@ impl DefaultReplicatorInner {
                     (state.read_status, state.write_status)
                 };
                 let existing_authority = self.state.read().await.authority.clone();
+                if matches!(
+                    authority.scale_up.as_deref(),
+                    Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover { .. })
+                ) && existing_authority.is_none()
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
                 let authority_changed = existing_authority.as_ref() != Some(&authority);
                 let preserve_scale_up_access =
                     existing_authority.as_ref().is_some_and(|existing| {
@@ -3219,7 +3227,7 @@ impl DefaultReplicatorInner {
             preserve_write_access,
         )?;
         if authority.local_role() == ReplicaRole::Primary {
-            let completed_builds = self
+            let mut completed_builds = self
                 .state
                 .read()
                 .await
@@ -3230,6 +3238,18 @@ impl DefaultReplicatorInner {
                         .map(|lsn| (build.progress.authority.target.clone(), lsn))
                 })
                 .collect::<Vec<_>>();
+            if let Some(evidence) = authority.scale_up.as_deref()
+                && let Some(progress) = self
+                    .build_progress_store
+                    .load_build_progress(&evidence.intent().build_id)
+                    .await?
+                && let Some(lsn) = completed_build_handoff_lsn(&progress, authority)
+                && !completed_builds
+                    .iter()
+                    .any(|(identity, _)| identity == &progress.authority.target)
+            {
+                completed_builds.push((progress.authority.target.clone(), lsn));
+            }
             let mut replicator = self.replicator.lock().await;
             for (identity, progress) in completed_builds {
                 replicator.record_build_handoff_progress(identity, progress)?;
@@ -3362,6 +3382,24 @@ impl DefaultReplicatorInner {
                 fence: authority.fence(),
                 verified_lsn: 0,
             });
+        if let Some(evidence) = authority.scale_up.as_deref()
+            && evidence.intent().target == self.identity
+            && let Some(build) = self
+                .build_progress_store
+                .load_build_progress(&evidence.intent().build_id)
+                .await?
+            && build.completed
+            && build.authority.source == evidence.intent().primary
+            && build.authority.target == evidence.intent().target
+            && build.authority.current_configuration == evidence.intent().previous_configuration
+            && build.authority.replication_boundary_lsn == evidence.intent().snapshot_boundary_lsn
+            && build.catch_up_boundary_lsn == Some(evidence.intent().catch_up_boundary_lsn)
+            && build.durable_lsn >= evidence.intent().catch_up_boundary_lsn
+        {
+            progress.verified_lsn = progress
+                .verified_lsn
+                .max(evidence.intent().catch_up_boundary_lsn);
+        }
         if authority.previous_configuration.is_none()
             && let Some(configuration_progress) = self
                 .replication_progress_store
@@ -3778,12 +3816,18 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &AdmittedAuthority) 
                     == build.current_configuration.configuration_id
         }
         BuildAuthorityKind::Provisioning => {
-            authority
+            (authority
                 .previous_configuration
                 .as_ref()
                 .is_some_and(|previous| {
                     previous.configuration_id == build.current_configuration.configuration_id
                 })
+                || (authority.previous_configuration.is_none()
+                    && authority.scale_up.as_deref().is_some_and(|evidence| {
+                        evidence.intent().previous_configuration == build.current_configuration
+                            && evidence.intent().current_configuration
+                                == authority.current_configuration
+                    })))
                 && authority.scale_up.as_deref().is_none_or(|evidence| {
                     let intent = evidence.intent();
                     intent.build_id == build.build_id
@@ -3836,6 +3880,17 @@ fn preserves_same_primary_scale_up_access(
     ) && existing.primary_identity() == next.primary_identity()
         && next.local_identity == *next.primary_identity()
         && existing.local_identity == next.local_identity
+}
+
+fn restores_same_primary_scale_up_access(authority: &AdmittedAuthority) -> bool {
+    matches!(
+        authority.scale_up.as_deref(),
+        Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { intent })
+            if intent.primary == authority.local_identity
+                && authority.primary_identity() == &authority.local_identity
+                && intent.previous_configuration.primary_id
+                    == intent.current_configuration.primary_id
+    )
 }
 
 fn build_postcondition(value: BuildProgress) -> BuildPostcondition {
