@@ -1653,6 +1653,7 @@ pub(super) fn invalid_candidate_binding(
         || report.pod_uid.as_str() != key.instance_id.as_str()
         || report.pvc_uid != *frozen_pvc_uid
         || report.process_session_id.is_empty()
+        || report.report_sequence == 0
     {
         return false;
     }
@@ -1670,17 +1671,18 @@ pub(super) fn invalid_candidate_binding(
         ) => uid == key.instance_id.as_str(),
         _ => false,
     };
-    let ExactResourceObservation::ReplacementPresent {
-        uid: live_pvc_uid, ..
-    } = &exact.pvc
-    else {
-        return false;
+    let frozen_pvc_is_authoritatively_absent = match &exact.pvc {
+        ExactResourceObservation::NotFound => true,
+        ExactResourceObservation::ReplacementPresent {
+            uid: live_pvc_uid, ..
+        } => live_pvc_uid != report.pvc_uid.as_str(),
+        ExactResourceObservation::FrozenUidPresent { .. }
+        | ExactResourceObservation::LookupFailed { .. } => false,
     };
     pod_matches
-        && live_pvc_uid != report.pvc_uid.as_str()
+        && frozen_pvc_is_authoritatively_absent
         && exact.pod_allocation_operation_id.as_ref() == Some(&allocation.operation_id)
         && exact.pod_matches_allocation_metadata
-        && exact.pvc_allocation_operation_id.as_ref() == Some(&allocation.operation_id)
 }
 
 pub(super) fn provisioning(

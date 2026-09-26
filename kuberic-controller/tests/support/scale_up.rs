@@ -2523,182 +2523,317 @@ async fn production_pod_effect_revalidates_live_pvc_before_create() {
 
 #[tokio::test]
 async fn residual_pvc_replace_after_live_get_is_candidate_local() {
-    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
-    let allocation = active_pvc_only_allocation(&api).await;
-    let frozen_pvc_uid = allocation.pvc_uid.as_ref().unwrap().clone();
-    let replacement_uid = "replacement-after-live-get";
-    let raced_pod_uid = "raced-candidate-pod";
-    let mut raced = api.observation().await;
-    let pvc = raced
-        .pvcs
-        .iter_mut()
-        .find(|pvc| pvc.name_any() == "db-2-data")
-        .unwrap();
-    let candidate_owner_references = pvc.metadata.owner_references.clone();
-    pvc.metadata.uid = Some(replacement_uid.into());
-    pvc.metadata.resource_version = Some("replacement-after-live-get-rv".into());
-    let mut pod = raced
-        .pods
-        .iter()
-        .find(|pod| pod.name_any() == "db-1")
-        .unwrap()
-        .clone();
-    pod.metadata.name = Some("db-2".into());
-    pod.metadata.uid = Some(raced_pod_uid.into());
-    pod.metadata.resource_version = Some("raced-candidate-pod-rv".into());
-    pod.metadata.owner_references = candidate_owner_references;
-    pod.metadata
-        .labels
-        .get_or_insert_default()
-        .insert(REPLICA_ID_LABEL.into(), "2".into());
-    pod.metadata
-        .labels
-        .get_or_insert_default()
-        .insert(INSTANCE_LABEL.into(), raced_pod_uid.into());
-    pod.metadata.annotations.get_or_insert_default().insert(
-        SCALE_UP_ALLOCATION_ANNOTATION.into(),
-        allocation.operation_id.to_string(),
-    );
-    let spec = pod.spec.as_mut().unwrap();
-    spec.volumes
-        .as_mut()
-        .unwrap()
-        .iter_mut()
-        .find_map(|volume| volume.persistent_volume_claim.as_mut())
-        .unwrap()
-        .claim_name = "db-2-data".into();
-    set_configured_pvc_uid(&mut pod, frozen_pvc_uid.as_str());
-    raced.pods.push(pod);
-    let raced_key =
-        ReplicaObservationKey::new(ReplicaId::new(2), ReplicaInstanceId::new(raced_pod_uid));
-    raced.agents.insert(
-        raced_key,
-        RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
-            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-            resource_uid: UID.to_string(),
-            process_session_id: "agent-started-before-controller-recovery".into(),
-            report_sequence: 1,
-            storage_state: proto::AgentStorageState::Uninitialized as i32,
-            pod_uid: raced_pod_uid.into(),
-            pvc_uid: frozen_pvc_uid.to_string(),
-            healthy: true,
-            replica_id: 2,
-            ..Default::default()
-        })),
-    );
-    api.set_observation(raced).await;
-    let recovered_raw = api.observe("tests", "db").await.unwrap();
-    let recovered_snapshot = normalize(recovered_raw, BTreeMap::new()).unwrap();
-    let recovered_plan = evaluate(&recovered_snapshot, &enabled());
-    assert!(
-        !matches!(recovered_plan, Plan::Unsafe { .. }),
-        "startup report with the Pod's frozen PVC UID must enter candidate-local arbitration: {recovered_plan:?}; exact={:?}; replicas={:?}",
-        recovered_snapshot.secondary_scale_down_resources,
-        recovered_snapshot.replicas,
-    );
-    let mut accepted_invalid = recovered_snapshot.clone();
-    accepted_invalid
-        .replicas
-        .get_mut(&ReplicaObservationKey::new(
-            ReplicaId::new(1),
-            ReplicaInstanceId::new("pod-uid-1"),
-        ))
-        .unwrap()
-        .agent = AgentObservation::Invalid {
-        message: "accepted member remains globally fenced".into(),
-        uninitialized_report: None,
-    };
-    assert!(matches!(
-        evaluate(&accepted_invalid, &enabled()),
-        Plan::Unsafe {
-            ref safety_changes,
-            ..
-        } if safety_changes == &[SafetyChange::RemoveWriteRouting]
-    ));
-    let effects_start = api.effects().await.len();
-
-    for _ in 0..12 {
-        let (kind, effects) = tick(&api).await;
-        assert_ne!(kind, ReconcileKind::Unsafe);
-        assert!(
-            effects
-                .iter()
-                .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
-        );
-    }
-    let blocked = api.observation().await;
-    assert!(
-        blocked
+    for case in ["current", "missing", "empty", "malformed", "stale"] {
+        let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+        let allocation = active_pvc_only_allocation(&api).await;
+        let frozen_pvc_uid = allocation.pvc_uid.as_ref().unwrap().clone();
+        let replacement_uid = format!("replacement-after-live-get-{case}");
+        let raced_pod_uid = "raced-candidate-pod";
+        let mut raced = api.observation().await;
+        let pvc = raced
+            .pvcs
+            .iter_mut()
+            .find(|pvc| pvc.name_any() == "db-2-data")
+            .unwrap();
+        let candidate_owner_references = pvc.metadata.owner_references.clone();
+        pvc.metadata.uid = Some(replacement_uid.clone());
+        pvc.metadata.resource_version = Some(format!("replacement-after-live-get-{case}-rv"));
+        let replacement_pvc_operation = match case {
+            "current" => Some(allocation.operation_id.as_str()),
+            "missing" => None,
+            "empty" => Some(""),
+            "malformed" => Some("not an operation id"),
+            "stale" => Some("stale-allocation-operation"),
+            _ => unreachable!(),
+        };
+        match replacement_pvc_operation {
+            Some(operation) => {
+                pvc.metadata
+                    .annotations
+                    .get_or_insert_default()
+                    .insert(SCALE_UP_ALLOCATION_ANNOTATION.into(), operation.into());
+            }
+            None => {
+                pvc.metadata
+                    .annotations
+                    .get_or_insert_default()
+                    .remove(SCALE_UP_ALLOCATION_ANNOTATION);
+            }
+        }
+        let mut pod = raced
             .pods
             .iter()
-            .all(|pod| pod.uid().as_deref() != Some(raced_pod_uid))
-    );
-    assert!(blocked.pvcs.iter().any(|pvc| {
-        pvc.name_any() == "db-2-data" && pvc.uid().as_deref() == Some(replacement_uid)
-    }));
-    assert!(api.effects().await[effects_start..].iter().all(|effect| {
-        !matches!(
-            effect,
-            EffectRecord::DeleteScaleDownResource {
-                resource: ScaleDownResource::Pvc,
-                uid,
-                ..
-            } if uid == replacement_uid
-        ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
-    }));
-    assert!(api.effects().await[effects_start..].iter().any(|effect| {
-        matches!(
-            effect,
-            EffectRecord::DeleteScaleDownResource {
-                resource: ScaleDownResource::Pod,
-                uid,
-                ..
-            } if uid == raced_pod_uid
-        )
-    }));
-    let expected_primary = blocked
-        .set
-        .status
-        .as_ref()
-        .and_then(|status| status.authority.topology.as_ref())
-        .and_then(|topology| {
-            topology
-                .configuration
-                .members
-                .iter()
-                .find(|member| member.role == ReplicaRole::Primary)
-        })
-        .map(|member| member.identity.clone());
-    assert_eq!(
-        normalize(blocked.clone(), BTreeMap::new())
+            .find(|pod| pod.name_any() == "db-1")
             .unwrap()
-            .routing
-            .write_target,
-        expected_primary
-    );
+            .clone();
+        pod.metadata.name = Some("db-2".into());
+        pod.metadata.uid = Some(raced_pod_uid.into());
+        pod.metadata.resource_version = Some("raced-candidate-pod-rv".into());
+        pod.metadata.owner_references = candidate_owner_references;
+        pod.metadata
+            .labels
+            .get_or_insert_default()
+            .insert(REPLICA_ID_LABEL.into(), "2".into());
+        pod.metadata
+            .labels
+            .get_or_insert_default()
+            .insert(INSTANCE_LABEL.into(), raced_pod_uid.into());
+        pod.metadata.annotations.get_or_insert_default().insert(
+            SCALE_UP_ALLOCATION_ANNOTATION.into(),
+            allocation.operation_id.to_string(),
+        );
+        let spec = pod.spec.as_mut().unwrap();
+        spec.volumes
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find_map(|volume| volume.persistent_volume_claim.as_mut())
+            .unwrap()
+            .claim_name = "db-2-data".into();
+        set_configured_pvc_uid(&mut pod, frozen_pvc_uid.as_str());
+        raced.pods.push(pod);
+        let raced_key =
+            ReplicaObservationKey::new(ReplicaId::new(2), ReplicaInstanceId::new(raced_pod_uid));
+        raced.agents.insert(
+            raced_key.clone(),
+            RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: UID.to_string(),
+                process_session_id: "agent-started-before-controller-recovery".into(),
+                report_sequence: 1,
+                storage_state: proto::AgentStorageState::Uninitialized as i32,
+                pod_uid: raced_pod_uid.into(),
+                pvc_uid: frozen_pvc_uid.to_string(),
+                healthy: true,
+                replica_id: 2,
+                ..Default::default()
+            })),
+        );
 
-    let mut available = blocked;
-    available
-        .pvcs
-        .retain(|pvc| pvc.uid().as_deref() != Some(replacement_uid));
-    api.set_observation(available).await;
-    finish(&api, 2).await;
-    let completed = api.observation().await;
-    let receipt = completed
-        .set
-        .status
-        .as_ref()
-        .and_then(|status| status.authority.last_scale_up.as_ref())
-        .expect("fresh scale-up retry converged");
-    assert_ne!(
-        receipt.intent.target.instance_id.as_str(),
-        raced_pod_uid,
-        "the cleaned candidate must not be admitted"
-    );
-    assert!(completed.pvcs.iter().all(|pvc| {
-        pvc.uid().as_deref() != Some(replacement_uid)
-            && pvc.uid().as_deref() != Some(frozen_pvc_uid.as_str())
-    }));
+        let mut wrong_pod_provenance = raced.clone();
+        wrong_pod_provenance
+            .pods
+            .iter_mut()
+            .find(|pod| pod.uid().as_deref() == Some(raced_pod_uid))
+            .unwrap()
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                SCALE_UP_ALLOCATION_ANNOTATION.into(),
+                "stale-pod-allocation-operation".into(),
+            );
+        let mut wrong_owner = raced.clone();
+        wrong_owner
+            .pods
+            .iter_mut()
+            .find(|pod| pod.uid().as_deref() == Some(raced_pod_uid))
+            .unwrap()
+            .metadata
+            .owner_references = None;
+        let mut wrong_session = raced.clone();
+        let RawAgentObservation::Report(report) = wrong_session.agents.get_mut(&raced_key).unwrap()
+        else {
+            unreachable!();
+        };
+        report.process_session_id.clear();
+        let mut zero_report_sequence = raced.clone();
+        let RawAgentObservation::Report(report) =
+            zero_report_sequence.agents.get_mut(&raced_key).unwrap()
+        else {
+            unreachable!();
+        };
+        report.report_sequence = 0;
+        for (control, raw) in [
+            ("wrong Pod allocation provenance", wrong_pod_provenance),
+            ("wrong Pod owner", wrong_owner),
+            ("empty agent process session", wrong_session),
+            ("zero agent report sequence", zero_report_sequence),
+        ] {
+            let control_api = InMemoryClusterApi::new(raw);
+            let observed = control_api.observe("tests", "db").await.unwrap();
+            let snapshot = normalize(observed, BTreeMap::new()).unwrap();
+            assert!(
+                matches!(
+                    evaluate(&snapshot, &enabled()),
+                    Plan::Unsafe {
+                        ref safety_changes,
+                        ..
+                    } if safety_changes == &[SafetyChange::RemoveWriteRouting]
+                ),
+                "{case}: {control} must not authorize candidate-local cleanup"
+            );
+        }
+        let mut absent_frozen_pvc = raced.clone();
+        absent_frozen_pvc
+            .pvcs
+            .retain(|pvc| pvc.name_any() != "db-2-data");
+        let absent_api = InMemoryClusterApi::new(absent_frozen_pvc);
+        let absent_snapshot = normalize(
+            absent_api.observe("tests", "db").await.unwrap(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(
+            !matches!(evaluate(&absent_snapshot, &enabled()), Plan::Unsafe { .. }),
+            "{case}: authoritative frozen PVC absence must retain independently proven candidate-local cleanup"
+        );
+
+        api.set_observation(raced).await;
+        let recovered_raw = api.observe("tests", "db").await.unwrap();
+        let recovered_snapshot = normalize(recovered_raw, BTreeMap::new()).unwrap();
+        let recovered_plan = evaluate(&recovered_snapshot, &enabled());
+        assert!(
+            !matches!(recovered_plan, Plan::Unsafe { .. }),
+            "{case}: startup report with the Pod's frozen PVC UID must enter candidate-local arbitration regardless of replacement PVC metadata: {recovered_plan:?}; exact={:?}; replicas={:?}",
+            recovered_snapshot.secondary_scale_down_resources,
+            recovered_snapshot.replicas,
+        );
+        let mut accepted_invalid = recovered_snapshot.clone();
+        accepted_invalid
+            .replicas
+            .get_mut(&ReplicaObservationKey::new(
+                ReplicaId::new(1),
+                ReplicaInstanceId::new("pod-uid-1"),
+            ))
+            .unwrap()
+            .agent = AgentObservation::Invalid {
+            message: "accepted member remains globally fenced".into(),
+            uninitialized_report: None,
+        };
+        assert!(
+            matches!(
+                evaluate(&accepted_invalid, &enabled()),
+                Plan::Unsafe {
+                    ref safety_changes,
+                    ..
+                } if safety_changes == &[SafetyChange::RemoveWriteRouting]
+            ),
+            "{case}"
+        );
+        let effects_start = api.effects().await.len();
+
+        for _ in 0..12 {
+            let (kind, effects) = tick(&api).await;
+            assert_ne!(kind, ReconcileKind::Unsafe, "{case}");
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting)),
+                "{case}: {effects:?}"
+            );
+        }
+        let blocked = api.observation().await;
+        let waiting_retry = blocked
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .expect("fresh allocation waits for the canonical PVC name");
+        assert_ne!(
+            waiting_retry.operation_id, allocation.operation_id,
+            "{case}"
+        );
+        assert!(waiting_retry.pvc_uid.is_none(), "{case}");
+        assert!(waiting_retry.pod_uid.is_none(), "{case}");
+        assert!(
+            blocked
+                .pods
+                .iter()
+                .all(|pod| pod.uid().as_deref() != Some(raced_pod_uid)),
+            "{case}"
+        );
+        assert!(
+            blocked.pvcs.iter().any(|pvc| {
+                pvc.name_any() == "db-2-data"
+                    && pvc.uid().as_deref() == Some(replacement_uid.as_str())
+            }),
+            "{case}"
+        );
+        assert!(
+            api.effects().await[effects_start..].iter().all(|effect| {
+                !matches!(
+                    effect,
+                    EffectRecord::DeleteScaleDownResource {
+                        resource: ScaleDownResource::Pvc,
+                        uid,
+                        ..
+                    } if uid == &replacement_uid
+                ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
+            }),
+            "{case}"
+        );
+        assert!(
+            api.effects().await[effects_start..]
+                .iter()
+                .all(|effect| match effect {
+                    EffectRecord::DeleteScaleDownResource { resource, uid, .. } =>
+                        *resource == ScaleDownResource::Pod && uid == raced_pod_uid,
+                    _ => true,
+                }),
+            "{case}: cleanup may delete only the independently proven candidate Pod"
+        );
+        assert!(
+            api.effects().await[effects_start..].iter().any(|effect| {
+                matches!(
+                    effect,
+                    EffectRecord::DeleteScaleDownResource {
+                        resource: ScaleDownResource::Pod,
+                        uid,
+                        ..
+                    } if uid == raced_pod_uid
+                )
+            }),
+            "{case}"
+        );
+        let expected_primary = blocked
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.topology.as_ref())
+            .and_then(|topology| {
+                topology
+                    .configuration
+                    .members
+                    .iter()
+                    .find(|member| member.role == ReplicaRole::Primary)
+            })
+            .map(|member| member.identity.clone());
+        assert_eq!(
+            normalize(blocked.clone(), BTreeMap::new())
+                .unwrap()
+                .routing
+                .write_target,
+            expected_primary,
+            "{case}"
+        );
+
+        let mut available = blocked;
+        available
+            .pvcs
+            .retain(|pvc| pvc.uid().as_deref() != Some(replacement_uid.as_str()));
+        api.set_observation(available).await;
+        finish(&api, 2).await;
+        let completed = api.observation().await;
+        let receipt = completed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.last_scale_up.as_ref())
+            .expect("fresh scale-up retry converged");
+        assert_ne!(
+            receipt.intent.target.instance_id.as_str(),
+            raced_pod_uid,
+            "{case}: the cleaned candidate must not be admitted"
+        );
+        assert!(
+            completed.pvcs.iter().all(|pvc| {
+                pvc.uid().as_deref() != Some(replacement_uid.as_str())
+                    && pvc.uid().as_deref() != Some(frozen_pvc_uid.as_str())
+            }),
+            "{case}"
+        );
+    }
 }
 
 #[tokio::test]
