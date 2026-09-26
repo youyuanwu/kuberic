@@ -97,6 +97,10 @@ pub fn validate_scale_up_allocation(allocation: &ScaleUpAllocation) -> Result {
         || allocation.target_replica_id.value() <= 0
         || allocation.operation_id.is_empty()
         || allocation.operation_id != allocation.expected_operation_id()
+        || allocation
+            .previous_operation_id
+            .as_ref()
+            .is_some_and(|previous| previous.is_empty() || previous == &allocation.operation_id)
         || allocation.pod_uid.as_ref().is_some_and(PodUid::is_empty)
         || allocation.pvc_uid.as_ref().is_some_and(PvcUid::is_empty)
         || (allocation.pod_uid.is_some() && allocation.pvc_uid.is_none())

@@ -180,6 +180,8 @@ mod tests {
             "acceptedConfigurationId",
             "targetReplicaId",
             "operationId",
+            "previousOperationId",
+            "scaffoldingRequested",
             "podUid",
             "pvcUid",
             "cancellationStarted",

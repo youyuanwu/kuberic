@@ -2806,12 +2806,20 @@
                       "previousConfigurationId": {
                         "type": "string"
                       },
+                      "previousOperationId": {
+                        "nullable": true,
+                        "type": "string"
+                      },
                       "pvcUid": {
                         "nullable": true,
                         "type": "string"
                       },
                       "resourceUid": {
                         "type": "string"
+                      },
+                      "scaffoldingRequested": {
+                        "default": false,
+                        "type": "boolean"
                       },
                       "specGeneration": {
                         "format": "uint64",

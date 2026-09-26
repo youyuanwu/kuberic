@@ -1021,6 +1021,8 @@ pub(super) fn begin(
         accepted_configuration_id: scale_up.previous_configuration.configuration_id,
         target_replica_id: scale_up.target_replica_id,
         operation_id: OperationId::default(),
+        previous_operation_id: None,
+        scaffolding_requested: false,
         pod_uid: None,
         pvc_uid: None,
         cancellation_started: false,
@@ -1078,6 +1080,50 @@ fn allocation_wait(
         blocking,
         config,
     )
+}
+
+fn retry_or_complete_allocation_cleanup(
+    snapshot: &ObservationSnapshot,
+    allocation: &ScaleUpAllocation,
+    mut status: AcceptedStatus,
+) -> Plan {
+    let previous_policy = status
+        .effective_policy
+        .as_ref()
+        .expect("validated allocation cleanup has accepted policy");
+    if snapshot.desired.replicas > previous_policy.replica_set_size {
+        let mut retry = allocation.clone();
+        retry.previous_configuration_id = retry.accepted_configuration_id.clone();
+        retry.previous_operation_id = Some(allocation.operation_id.clone());
+        retry.operation_id = OperationId::default();
+        retry.scaffolding_requested = false;
+        retry.pod_uid = None;
+        retry.pvc_uid = None;
+        retry.cancellation_started = false;
+        retry.operation_id = retry.expected_operation_id();
+        let target = retry.observation_target();
+        let attempt = retry.operation_id.clone();
+        status.scale_up_allocation = Some(retry);
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpAllocationRetryAccepted",
+            "allocation",
+            Some(&target),
+            Some(&attempt),
+            "began a fresh allocation after exact prior-attempt cleanup",
+        ));
+    }
+    status.scale_up_allocation = None;
+    persist(progress_status(
+        snapshot,
+        status,
+        "ScaleUpAllocationCleanupComplete",
+        "cleanup",
+        Some(&allocation.observation_target()),
+        Some(&allocation.operation_id),
+        "exact cancelled allocation is absent",
+    ))
 }
 
 pub(super) fn allocation(
@@ -1154,12 +1200,42 @@ pub(super) fn allocation(
             config,
         );
     }
+    if !cancelled
+        && allocation.pvc_uid.is_some()
+        && allocation.pod_uid.is_none()
+        && secondary_scale_down::absent(&exact.identity.pvc, &exact.pvc)
+    {
+        let mut status = snapshot.status.clone();
+        status
+            .scale_up_allocation
+            .as_mut()
+            .expect("active allocation")
+            .cancellation_started = true;
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpAllocationStorageLost",
+            "cleanup",
+            Some(&allocation.observation_target()),
+            Some(&allocation.operation_id),
+            "authoritative frozen PVC absence or replacement abandoned the exact allocation",
+        ));
+    }
     let scaffolding = snapshot.scaffolding_observation_for(target_id);
     let kubernetes = scaffolding.and_then(|observation| observation.kubernetes.as_ref());
 
     if allocation.pvc_uid.is_none()
         && let Some(uid) = allocation_identity(&exact.identity.pvc, &exact.pvc)
     {
+        if !allocation.scaffolding_requested {
+            return allocation_wait(
+                snapshot,
+                allocation,
+                "ScaleUpAllocationNameOccupied",
+                "same-name PVC is unrelated to this allocation operation",
+                config,
+            );
+        }
         if kubernetes
             .and_then(|observed| observed.pvc_uid.as_ref())
             .map(PvcUid::as_str)
@@ -1223,6 +1299,23 @@ pub(super) fn allocation(
                 Some(&allocation.observation_target()),
                 Some(&allocation.operation_id),
                 "cancelled allocation has no retained resources",
+            ));
+        }
+        if !allocation.scaffolding_requested {
+            let mut status = snapshot.status.clone();
+            status
+                .scale_up_allocation
+                .as_mut()
+                .expect("active allocation")
+                .scaffolding_requested = true;
+            return persist(progress_status(
+                snapshot,
+                status,
+                "ScaleUpAllocationScaffoldingAuthorized",
+                "allocation",
+                Some(&allocation.observation_target()),
+                Some(&allocation.operation_id),
+                "persisted exact-name absence before requesting candidate scaffolding",
             ));
         }
         return Plan::Apply {
@@ -1343,17 +1436,11 @@ pub(super) fn allocation(
                 };
             }
             if secondary_scale_down::absent(&exact.identity.pvc, &exact.pvc) {
-                let mut status = snapshot.status.clone();
-                status.scale_up_allocation = None;
-                return persist(progress_status(
+                return retry_or_complete_allocation_cleanup(
                     snapshot,
-                    status,
-                    "ScaleUpAllocationCleanupComplete",
-                    "cleanup",
-                    Some(&allocation.observation_target()),
-                    Some(&allocation.operation_id),
-                    "exact pre-Pod allocation storage is absent",
-                ));
+                    allocation,
+                    snapshot.status.clone(),
+                );
             }
             return allocation_wait(
                 snapshot,
@@ -1420,17 +1507,7 @@ pub(super) fn allocation(
             config,
         );
     }
-    let mut status = snapshot.status.clone();
-    status.scale_up_allocation = None;
-    persist(progress_status(
-        snapshot,
-        status,
-        "ScaleUpAllocationCleanupComplete",
-        "cleanup",
-        Some(&allocation.observation_target()),
-        Some(&allocation.operation_id),
-        "exact cancelled allocation is absent",
-    ))
+    retry_or_complete_allocation_cleanup(snapshot, allocation, snapshot.status.clone())
 }
 
 pub(super) fn provisioning(

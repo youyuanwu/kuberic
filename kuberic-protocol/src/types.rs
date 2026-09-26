@@ -425,6 +425,10 @@ pub struct ScaleUpAllocation {
     pub target_replica_id: ReplicaId,
     pub operation_id: OperationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_operation_id: Option<OperationId>,
+    #[serde(default)]
+    pub scaffolding_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<PodUid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pvc_uid: Option<PvcUid>,
@@ -434,16 +438,20 @@ pub struct ScaleUpAllocation {
 
 impl ScaleUpAllocation {
     pub fn expected_operation_id(&self) -> OperationId {
-        OperationId::new(format!(
-            "scale-up-allocation-{}",
-            digest_parts(&[
-                self.resource_uid.as_str(),
-                &self.spec_generation.to_string(),
-                &self.desired_replicas.to_string(),
-                self.previous_configuration_id.as_str(),
-                &self.target_replica_id.to_string(),
-            ])
-        ))
+        let spec_generation = self.spec_generation.to_string();
+        let desired_replicas = self.desired_replicas.to_string();
+        let target_replica_id = self.target_replica_id.to_string();
+        let mut parts = vec![
+            self.resource_uid.as_str(),
+            spec_generation.as_str(),
+            desired_replicas.as_str(),
+            self.previous_configuration_id.as_str(),
+            target_replica_id.as_str(),
+        ];
+        if let Some(previous_operation_id) = &self.previous_operation_id {
+            parts.push(previous_operation_id.as_str());
+        }
+        OperationId::new(format!("scale-up-allocation-{}", digest_parts(&parts)))
     }
 
     pub fn observation_target(&self) -> ReplicaIdentity {

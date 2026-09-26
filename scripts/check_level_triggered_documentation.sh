@@ -61,7 +61,7 @@ allocation = allocation_schema["properties"]
 assert set(allocation) == {
     "resourceUid", "specGeneration", "desiredReplicas", "previousConfigurationId",
     "acceptedConfigurationId", "targetReplicaId", "operationId", "podUid", "pvcUid",
-    "cancellationStarted",
+    "previousOperationId", "scaffoldingRequested", "cancellationStarted",
 }
 assert set(allocation_schema["required"]) == {
     "resourceUid", "specGeneration", "desiredReplicas", "previousConfigurationId",
