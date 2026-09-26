@@ -74,6 +74,7 @@ fn removal_runtime(state: &AgentState) -> Arc<FakeRuntime> {
             previous_configuration: state.previous_configuration.clone(),
             current_configuration: state.current_configuration.clone().unwrap(),
             switchover_handoff: None,
+            scale_up: None,
             secondary_removal: state.secondary_removal_evidence.clone(),
         });
         snapshot.prepared_secondary_removal = state.prepared_secondary_removal.clone();
@@ -646,6 +647,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
                         last_sequence: 0,
                         durable_lsn: 0,
                         completed: false,
+                        catch_up_boundary_lsn: None,
                     });
             }
             RuntimeEffectAction::BuildReplica {
@@ -667,6 +669,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
                         last_sequence: 1,
                         durable_lsn: current_progress,
                         completed: true,
+                        catch_up_boundary_lsn: None,
                     });
             }
             RuntimeEffectAction::RetireBuild(_) => {}
@@ -981,6 +984,7 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
         runtime_state.write_status = AccessStatus::Granted;
         runtime_state.current_progress = 7;
         runtime_state.authority = Some(AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: source.clone(),
             transition_kind: None,
@@ -1031,6 +1035,7 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
         runtime_state.write_status = AccessStatus::Granted;
         runtime_state.current_progress = 7;
         runtime_state.authority = Some(AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: command.source.clone(),
             transition_kind: None,
@@ -1284,6 +1289,7 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
             runtime_state.write_status = AccessStatus::ReconfigurationPending;
             runtime_state.current_progress = 7;
             runtime_state.authority = Some(AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: local.clone(),
                 transition_kind: None,
@@ -1729,6 +1735,7 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
         state.read_status = AccessStatus::Granted;
         state.write_status = AccessStatus::NotPrimary;
         state.authority = Some(AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: local.clone(),
             transition_kind: None,
@@ -2030,6 +2037,7 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
         let mut runtime_state = runtime.state.lock().unwrap();
         runtime_state.role = ReplicaRole::Primary;
         runtime_state.authority = Some(AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: local.clone(),
             transition_kind: Some(TransitionKind::Replacement),

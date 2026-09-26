@@ -158,6 +158,7 @@ fn build_report(
                 last_sequence: build.last_sequence,
                 durable_lsn: build.durable_lsn,
                 completed: build.completed,
+                catch_up_boundary_lsn: build.catch_up_boundary_lsn,
             })
             .collect(),
         prepared_switchover: state.prepared_switchover.map(Into::into),

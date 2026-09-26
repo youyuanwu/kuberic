@@ -117,6 +117,8 @@ pub struct AgentBuildReport {
     pub last_sequence: u64,
     pub durable_lsn: i64,
     pub completed: bool,
+    #[serde(default)]
+    pub catch_up_boundary_lsn: Option<i64>,
 }
 
 fn default_access_status() -> AccessStatus {

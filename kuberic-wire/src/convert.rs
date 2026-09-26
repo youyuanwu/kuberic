@@ -68,6 +68,7 @@ pub struct CopyEnvelope {
     pub lsn: i64,
     pub committed_lsn: i64,
     pub replication_boundary_lsn: i64,
+    pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
     pub snapshot_chunk: bool,
     pub data: Vec<u8>,
@@ -83,6 +84,7 @@ pub struct CopyAcknowledgement {
     pub sequence: u64,
     pub durable_lsn: i64,
     pub replication_boundary_lsn: i64,
+    pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
     pub snapshot_chunk: bool,
 }
@@ -278,6 +280,9 @@ pub fn normalize_agent_status_report(
                 .map(|build| {
                     if build.build_id.is_empty()
                         || build.durable_lsn < 0
+                        || build
+                            .catch_up_boundary_lsn
+                            .is_some_and(|boundary| boundary < 0)
                         || !build_ids.insert(build.build_id.clone())
                     {
                         return Err(WireError::InvalidAuthority(
@@ -293,6 +298,7 @@ pub fn normalize_agent_status_report(
                         last_sequence: build.last_sequence,
                         durable_lsn: build.durable_lsn,
                         completed: build.completed,
+                        catch_up_boundary_lsn: build.catch_up_boundary_lsn,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1274,6 +1280,10 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
     if item.sequence == 0
         || item.replication_boundary_lsn < 0
         || item.committed_lsn < 0
+        || item.final_item != item.catch_up_boundary_lsn.is_some()
+        || item
+            .catch_up_boundary_lsn
+            .is_some_and(|boundary| boundary < item.replication_boundary_lsn)
         || if item.final_item {
             item.lsn != item.replication_boundary_lsn
                 || item.committed_lsn > item.replication_boundary_lsn
@@ -1299,6 +1309,7 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
         lsn: item.lsn,
         committed_lsn: item.committed_lsn,
         replication_boundary_lsn: item.replication_boundary_lsn,
+        catch_up_boundary_lsn: item.catch_up_boundary_lsn,
         final_item: item.final_item,
         snapshot_chunk: item.snapshot_chunk,
         data: item.data,
@@ -1328,6 +1339,10 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
     if ack.sequence == 0
         || ack.durable_lsn < 0
         || ack.replication_boundary_lsn < 0
+        || ack.final_item != ack.catch_up_boundary_lsn.is_some()
+        || ack
+            .catch_up_boundary_lsn
+            .is_some_and(|boundary| boundary < ack.replication_boundary_lsn)
         || (ack.final_item
             && (ack.snapshot_chunk || ack.durable_lsn != ack.replication_boundary_lsn))
         || (ack.snapshot_chunk && (ack.final_item || ack.durable_lsn != 0))
@@ -1345,6 +1360,7 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
         sequence: ack.sequence,
         durable_lsn: ack.durable_lsn,
         replication_boundary_lsn: ack.replication_boundary_lsn,
+        catch_up_boundary_lsn: ack.catch_up_boundary_lsn,
         final_item: ack.final_item,
         snapshot_chunk: ack.snapshot_chunk,
     })

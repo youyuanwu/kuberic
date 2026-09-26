@@ -1048,13 +1048,26 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         sequence: 3,
         durable_lsn: 2,
         replication_boundary_lsn: 2,
+        catch_up_boundary_lsn: Some(2),
         final_item: true,
         snapshot_chunk: false,
         ..Default::default()
     };
     assert!(validate_copy_ack(&final_ack).is_ok());
+    let mut missing_catch_up_boundary = final_ack.clone();
+    missing_catch_up_boundary.catch_up_boundary_lsn = None;
+    assert!(matches!(
+        validate_copy_ack(&missing_catch_up_boundary),
+        Err(WireError::InvalidAuthority(_))
+    ));
 
     let mut missing_target = item;
+    let mut premature_boundary = missing_target.clone();
+    premature_boundary.catch_up_boundary_lsn = Some(2);
+    assert!(matches!(
+        validate_copy_item(&premature_boundary),
+        Err(WireError::InvalidAuthority(_))
+    ));
     missing_target.receiver = None;
     assert!(matches!(
         validate_copy_item(&missing_target),

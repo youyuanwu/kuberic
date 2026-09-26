@@ -31,6 +31,9 @@ impl QuorumTracker {
     pub fn configure(&mut self, authority: AdmittedAuthority, local_progress: Lsn) -> Result<()> {
         authority.validate()?;
         let same_fence = self.authority.as_ref() == Some(&authority);
+        let current_only_completion = self.authority.as_ref().is_some_and(|existing| {
+            authority.scale_up.is_some() && authority.is_current_only_completion_of(existing)
+        });
         if self.authority.is_some() && !same_fence {
             for (_, senders) in std::mem::take(&mut self.pending) {
                 for sender in senders {
@@ -39,10 +42,12 @@ impl QuorumTracker {
                     )));
                 }
             }
-            self.progress.clear();
-            self.verified.clear();
-            self.witnesses.clear();
-            self.live_commits.clear();
+            if !current_only_completion {
+                self.progress.clear();
+                self.verified.clear();
+                self.witnesses.clear();
+                self.live_commits.clear();
+            }
         }
         let members = authority_members(&authority);
         self.sessions
@@ -56,9 +61,15 @@ impl QuorumTracker {
         self.highest_lsn = self.highest_lsn.max(local_progress);
         if !same_fence {
             self.catch_up_boundary = authority
-                .secondary_removal
-                .as_ref()
-                .map(|e| e.preparation.boundary_lsn)
+                .scale_up
+                .as_deref()
+                .map(|evidence| evidence.intent().catch_up_boundary_lsn)
+                .or_else(|| {
+                    authority
+                        .secondary_removal
+                        .as_ref()
+                        .map(|e| e.preparation.boundary_lsn)
+                })
                 .or_else(|| {
                     authority.previous_configuration.as_ref().map(|_| {
                         authority
@@ -577,6 +588,9 @@ fn authority_members(authority: &AdmittedAuthority) -> BTreeSet<ReplicaIdentity>
 }
 
 fn derive_must_catch_up(authority: &AdmittedAuthority) -> BTreeSet<ReplicaIdentity> {
+    if let Some(evidence) = authority.scale_up.as_deref() {
+        return BTreeSet::from([evidence.intent().target.clone()]);
+    }
     let Some(previous) = authority.previous_configuration.as_ref() else {
         return BTreeSet::new();
     };
@@ -648,6 +662,87 @@ mod removal_fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuberic_protocol::types::{
+        EffectivePolicy, Epoch, ReplicaId, ScaleUpConfigurationEvidence, ScaleUpIntent,
+        TransitionKind,
+    };
+
+    fn scale_up_authority() -> (AdmittedAuthority, ReplicaIdentity) {
+        let primary = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: kuberic_protocol::types::ReplicaInstanceId::new("primary"),
+            agent_generation: kuberic_protocol::types::AgentGeneration::new("primary-gen"),
+        };
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: kuberic_protocol::types::ReplicaInstanceId::new("target"),
+            agent_generation: kuberic_protocol::types::AgentGeneration::new("target-gen"),
+        };
+        let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+        let previous = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            primary.replica_id,
+            vec![kuberic_protocol::types::ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            previous_policy.write_quorum,
+        );
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            primary.replica_id,
+            vec![
+                kuberic_protocol::types::ConfigurationMember {
+                    identity: primary.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                kuberic_protocol::types::ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            current_policy.write_quorum,
+        );
+        let mut intent = ScaleUpIntent {
+            operation_id: OperationId::default(),
+            resource_uid: kuberic_protocol::types::ResourceUid::new("set"),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            current_configuration: current.clone(),
+            previous_policy,
+            current_policy,
+            primary: primary.clone(),
+            target: target.clone(),
+            build_id: OperationId::new("build"),
+            snapshot_boundary_lsn: 0,
+            catch_up_boundary_lsn: 2,
+        };
+        intent.operation_id = intent.expected_operation_id();
+        (
+            AdmittedAuthority {
+                local_identity: primary,
+                transition_kind: Some(TransitionKind::ScaleUp),
+                previous_configuration: Some(previous),
+                current_configuration: current,
+                switchover_handoff: None,
+                secondary_removal: None,
+                scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+            },
+            target,
+        )
+    }
+
+    #[test]
+    fn scale_up_requires_the_exact_candidate_through_the_frozen_boundary() {
+        let (authority, target) = scale_up_authority();
+        let mut tracker = QuorumTracker::default();
+        tracker.configure(authority, 2).unwrap();
+        assert!(!tracker.catch_up_complete());
+        tracker.record_build_handoff_progress(target, 2).unwrap();
+        assert!(tracker.catch_up_complete());
+    }
 
     #[test]
     fn late_member_uses_live_committed_primary_progress_not_a_transition_certificate() {
@@ -661,6 +756,7 @@ mod tests {
             current_configuration: intent.current_configuration.clone(),
             switchover_handoff: None,
             secondary_removal: Some(committed.evidence.clone()),
+            scale_up: None,
         };
         let mut fresh = committed.current_only_write_quorum[0].clone();
         fresh.process_session_id = ProcessSessionId::new("primary-restarted");
@@ -773,6 +869,7 @@ mod tests {
             current_configuration: intent.current_configuration.clone(),
             switchover_handoff: None,
             secondary_removal: Some(removal_fixture::evidence(&intent)),
+            scale_up: None,
         };
         let mut tracker = QuorumTracker::default();
         tracker.configure(authority, 10).unwrap();

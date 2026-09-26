@@ -143,6 +143,7 @@ impl SwitchoverRecoveryRuntime {
         snapshot.current_configuration_quorum_progress = 7;
         snapshot.catch_up_complete = true;
         snapshot.authority = Some(AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: state.identity.local_identity.clone(),
             transition_kind: state
@@ -914,6 +915,7 @@ fn switchover_authority() -> AdmittedAuthority {
         agent_generation: AgentGeneration::new("generation-2"),
     };
     AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: source.clone(),
         transition_kind: None,
@@ -1592,6 +1594,7 @@ fn local_write_recovery_writer_process() {
         let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
         store
             .admit(&AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: switchover_storage_identity().local_identity,
                 transition_kind: None,
@@ -1931,6 +1934,7 @@ fn real_handoff_configuration_writer_process() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (state, command) = real_handoff_fixture(&scenario);
         let authority = AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: state.identity.local_identity.clone(),
             transition_kind: state
@@ -2237,6 +2241,7 @@ fn real_switchover_preparation_writer_process() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let authority = AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: switchover_storage_identity().local_identity,
             transition_kind: None,

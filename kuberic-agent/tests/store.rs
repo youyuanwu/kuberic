@@ -21,8 +21,9 @@ use kuberic_protocol::types::{
     TransitionIntent, TransitionKind, derive_agent_generation, derive_initialization_id,
 };
 use kuberic_runtime_internal::authority::{
-    AdmittedAuthority, AuthorityFence, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
-    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+    AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
+    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
+    LocalWritePhase, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{
     RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
@@ -97,6 +98,7 @@ fn pending_acceptance_fixture() -> (
                 previous_configuration: None,
                 current_configuration: intent.current_configuration,
                 switchover_handoff: None,
+                scale_up: None,
                 secondary_removal: Some(committed.evidence.clone()),
             }),
             prepared_secondary_removal: None,
@@ -388,6 +390,7 @@ async fn durable_retirement_rejects_active_authority_and_mutated_tombstones() {
         previous_configuration: None,
         current_configuration: intent.previous_configuration.clone(),
         switchover_handoff: None,
+        scale_up: None,
         secondary_removal: None,
     };
     store.admit(&active).await.unwrap();
@@ -593,6 +596,49 @@ fn fresh_replacement_store_requires_matching_provisioning_intent() {
 }
 
 #[tokio::test]
+async fn durable_build_catch_up_boundary_is_write_once() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (command, observed, transition) = bootstrap_fixture();
+    let storage_identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let store =
+        SqliteStore::create_authorized(&path, AgentState::new(storage_identity.clone())).unwrap();
+    let authority = BuildAuthority {
+        build_id: OperationId::new("boundary-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: storage_identity.local_identity.clone(),
+        target: identity(2, "target", "target-generation"),
+        current_configuration: transition.current_configuration,
+        replication_boundary_lsn: 0,
+    };
+    store.admit_build(&authority).await.unwrap();
+    let progress = DurableBuildProgress {
+        authority,
+        last_sequence: 1,
+        durable_lsn: 0,
+        completed: true,
+        catch_up_boundary_lsn: Some(2),
+    };
+    store.record_build_progress(&progress).await.unwrap();
+
+    let mut advanced = progress.clone();
+    advanced.last_sequence = 2;
+    advanced.durable_lsn = 2;
+    store.record_build_progress(&advanced).await.unwrap();
+
+    let mut changed = advanced.clone();
+    changed.catch_up_boundary_lsn = Some(3);
+    assert!(store.record_build_progress(&changed).await.is_err());
+    changed.catch_up_boundary_lsn = None;
+    assert!(store.record_build_progress(&changed).await.is_err());
+}
+
+#[tokio::test]
 async fn sqlite_store_reopens_with_identity_authority_and_progress() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
@@ -607,6 +653,7 @@ async fn sqlite_store_reopens_with_identity_authority_and_progress() {
     let store = SqliteStore::create_authorized(&path, state).unwrap();
 
     let authority = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: storage_identity.local_identity.clone(),
         transition_kind: Some(TransitionKind::Bootstrap),
@@ -806,6 +853,7 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
     )
     .unwrap();
     let authority = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: storage_identity.local_identity.clone(),
         transition_kind: Some(TransitionKind::Bootstrap),

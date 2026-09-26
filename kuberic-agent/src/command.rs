@@ -290,6 +290,7 @@ fn admit_configuration_with_replay(
         }
         return Ok(AdmittedAuthority {
             secondary_removal: None,
+            scale_up: None,
             local_identity: identity.clone(),
             transition_kind: None,
             previous_configuration: None,
@@ -486,6 +487,7 @@ fn admit_configuration_with_replay(
         secondary_removal: is_access_only_configuration(command, state)
             .then(|| state.secondary_removal_evidence.clone())
             .flatten(),
+        scale_up: None,
         local_identity: identity.clone(),
         transition_kind: (!command.current_only && !is_access_only_configuration(command, state))
             .then_some(command.transition_kind),

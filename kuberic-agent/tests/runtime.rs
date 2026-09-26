@@ -9,7 +9,8 @@ use kuberic_agent::hosting::{OutboundReplication, PodRuntime, PreparedCopy, Runt
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, FaultType,
     LoadMetric, OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    SwitchoverHandoff, SwitchoverRequestId, TransitionKind,
+    ResourceUid, ScaleUpConfigurationEvidence, ScaleUpIntent, SwitchoverHandoff,
+    SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::application::{
     ClientWrite, CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext,
@@ -98,6 +99,7 @@ async fn open_removal_member<S: kuberic_runtime_internal::authority::AuthoritySt
             previous_configuration: None,
             current_configuration: intent.previous_configuration.clone(),
             switchover_handoff: None,
+            scale_up: None,
             secondary_removal: None,
         })),
         RuntimeEffectAction::ChangeRole(if primary {
@@ -349,6 +351,7 @@ async fn converge_removal_with_peer_restart(
         previous_configuration: Some(intent.previous_configuration.clone()),
         current_configuration: intent.current_configuration.clone(),
         switchover_handoff: None,
+        scale_up: None,
         secondary_removal: Some(evidence.clone()),
     };
     recovery_action(
@@ -730,6 +733,7 @@ async fn historical_removal_acceptance_requires_exact_verified_local_boundary() 
         previous_configuration: Some(intent.previous_configuration.clone()),
         current_configuration: intent.current_configuration.clone(),
         switchover_handoff: None,
+        scale_up: None,
         secondary_removal: Some(evidence.clone()),
     };
     runtime
@@ -1681,6 +1685,7 @@ async fn secondary_removal_preparations_advance_only_after_the_previous_commit()
             singleton.current_configuration.members.clone(),
             1,
         ),
+        scale_up: None,
         secondary_removal: None,
         ..singleton
     };
@@ -2047,10 +2052,22 @@ impl BuildProgressStore for MemoryAuthorityStore {
                 "injected build progress failure".to_string(),
             ));
         }
-        self.build_progress
-            .lock()
-            .unwrap()
-            .insert(progress.authority.build_id.clone(), progress.clone());
+        let mut builds = self.build_progress.lock().unwrap();
+        if builds
+            .get(&progress.authority.build_id)
+            .is_some_and(|existing| {
+                progress.last_sequence < existing.last_sequence
+                    || progress.durable_lsn < existing.durable_lsn
+                    || (existing.completed && !progress.completed)
+                    || existing.catch_up_boundary_lsn.is_some()
+                        && progress.catch_up_boundary_lsn != existing.catch_up_boundary_lsn
+            })
+        {
+            return Err(ContractError::AuthorityMismatch(
+                "test store rejected regressing build progress".into(),
+            ));
+        }
+        builds.insert(progress.authority.build_id.clone(), progress.clone());
         Ok(())
     }
 }
@@ -3722,6 +3739,7 @@ async fn newer_primary_authority_stays_write_closed_until_epoch_stage_completes(
     let application = Arc::new(TestApplication::default());
     let runtime = open_primary(application.clone(), vec![local.clone()]).await;
     let newer = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: local.clone(),
         transition_kind: None,
@@ -4333,6 +4351,7 @@ fn authority(local: ReplicaIdentity, members: Vec<ReplicaIdentity>) -> AdmittedA
         write_quorum,
     );
     AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: local,
         transition_kind: None,
@@ -5111,6 +5130,7 @@ async fn failover_does_not_inherit_previous_primary_verification_credit() {
         .apply_effect(effect(
             2,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: local,
                 transition_kind: Some(TransitionKind::Failover),
@@ -5369,6 +5389,7 @@ async fn failed_or_cancelled_secondary_epoch_admission_stays_write_fenced() {
         2,
     );
     let demoted_authority = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: old_primary.clone(),
         transition_kind: Some(TransitionKind::Failover),
@@ -5922,6 +5943,7 @@ async fn switchover_recovery_commits_different_writes_after_restoration_compensa
                 for action in [
                     RuntimeEffectAction::Open(OpenMode::Existing),
                     RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                        scale_up: None,
                         secondary_removal: None,
                         local_identity: identities[index].clone(),
                         transition_kind: None,
@@ -6015,6 +6037,7 @@ async fn switchover_recovery_commits_different_writes_after_restoration_compensa
                                 &runtimes[index],
                                 &mut sequences[index],
                                 RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                                    scale_up: None,
                                     secondary_removal: None,
                                     local_identity: identities[index].clone(),
                                     transition_kind: (!current_only)
@@ -6415,6 +6438,7 @@ async fn switchover_drain_serializes_durable_boundaries_and_delayed_direct_clien
             .apply_effect(effect(
                 6,
                 RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                    scale_up: None,
                     secondary_removal: None,
                     local_identity: source,
                     transition_kind: Some(TransitionKind::PlannedSwitchover),
@@ -6720,6 +6744,10 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
     assert_eq!(prepared.authority.replication_boundary_lsn, 1);
     let items = copy_through_final(&mut prepared).await;
     assert_eq!(items.len(), 3);
+    assert_eq!(
+        items.last().unwrap().catch_up_boundary_lsn,
+        Some(prepared.authority.replication_boundary_lsn)
+    );
     let live_write = source_runtime
         .data_plane()
         .begin_write(ClientWrite {
@@ -6921,8 +6949,15 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
         snapshot.iter().filter(|item| item.snapshot_chunk).count(),
         2
     );
+    let final_item = snapshot.iter().find(|item| item.final_item).unwrap();
+    assert_eq!(final_item.catch_up_boundary_lsn, Some(2));
+    assert_eq!(
+        runtime.snapshot().await.builds[0].catch_up_boundary_lsn,
+        Some(2)
+    );
     let live = next_copy_item(&mut prepared).await;
     assert_eq!(live.lsn, 2);
+    assert_eq!(live.catch_up_boundary_lsn, None);
     assert!(!live.snapshot_chunk);
     assert!(!live.final_item);
 }
@@ -7178,6 +7213,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         2,
     );
     let new_source_authority = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: source.clone(),
         transition_kind: Some(TransitionKind::Replacement),
@@ -7228,6 +7264,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .apply_effect(effect(
             2,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: secondary.clone(),
                 ..new_source_authority.clone()
@@ -7300,6 +7337,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .apply_effect(effect(
             6,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: replacement.clone(),
                 transition_kind: None,
@@ -7318,6 +7356,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .apply_effect(effect(
             6,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: source,
                 transition_kind: None,
@@ -7471,6 +7510,10 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         .unwrap();
     assert_eq!(first.authority.replication_boundary_lsn, 0);
     let _ = copy_through_final(&mut first).await;
+    assert_eq!(
+        runtime.snapshot().await.builds[0].catch_up_boundary_lsn,
+        Some(0)
+    );
     runtime
         .data_plane()
         .begin_write(ClientWrite {
@@ -7519,6 +7562,10 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         .unwrap();
     assert_eq!(resumed.authority.replication_boundary_lsn, 0);
     let _ = copy_through_final(&mut resumed).await;
+    assert_eq!(
+        restarted.snapshot().await.builds[0].catch_up_boundary_lsn,
+        Some(0)
+    );
     let resumed_operation = next_copy_item(&mut resumed).await;
     assert_eq!(resumed_operation.lsn, 1);
     assert!(!resumed_operation.final_item);
@@ -7599,6 +7646,7 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
             sequence: final_item.sequence,
             durable_lsn: final_item.replication_boundary_lsn,
             replication_boundary_lsn: final_item.replication_boundary_lsn,
+            catch_up_boundary_lsn: final_item.catch_up_boundary_lsn,
             final_item: true,
             snapshot_chunk: false,
             ..Default::default()
@@ -7756,7 +7804,165 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .await
         .unwrap();
     assert!(final_ack.final_item);
-    assert!(after_final_crash.snapshot().await.builds[0].completed);
+    assert_eq!(final_ack.catch_up_boundary_lsn, Some(1));
+    let recovered = after_final_crash.snapshot().await;
+    assert!(recovered.builds[0].completed);
+    assert_eq!(recovered.builds[0].catch_up_boundary_lsn, Some(1));
+}
+
+#[tokio::test]
+async fn completed_scale_up_copy_seeds_exact_candidate_progress_for_pc_cc() {
+    let source = identity(1, "scale-up-source");
+    let candidate = identity(2, "scale-up-candidate");
+    let previous_authority = authority(source.clone(), vec![source.clone()]);
+    let source_application = Arc::new(TestApplication::default());
+    source_application.seed_operation(1, Bytes::from_static(b"one"));
+    let source_runtime = PodRuntime::new(
+        source.clone(),
+        source_application,
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    source_runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    source_runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(previous_authority.clone())),
+        ))
+        .await
+        .unwrap();
+    source_runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    let mut prepared = prepare_copy_authorized(
+        &source_runtime,
+        PrepareCopyRequest {
+            build_id: OperationId::new("scale-up-build"),
+            target: candidate.clone(),
+            configuration: BuildConfiguration::Current,
+            copy_context: empty_copy_context(),
+        },
+    )
+    .await
+    .unwrap();
+    let items = copy_through_final(&mut prepared).await;
+    assert_eq!(items.last().unwrap().catch_up_boundary_lsn, Some(1));
+
+    let target_runtime = PodRuntime::new(
+        candidate.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    target_runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    target_runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+        ))
+        .await
+        .unwrap();
+    target_runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(prepared.authority.clone())),
+        ))
+        .await
+        .unwrap();
+    for item in items {
+        let acknowledgement = target_runtime
+            .data_plane()
+            .receive_copy_item(item)
+            .await
+            .unwrap();
+        source_runtime
+            .data_plane()
+            .accept_copy_acknowledgement(acknowledgement)
+            .await
+            .unwrap();
+    }
+
+    let previous_policy = kuberic_protocol::types::EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = kuberic_protocol::types::EffectivePolicy::fixed(2, 30).unwrap();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        source.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: candidate.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: ResourceUid::new("set"),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous_authority.current_configuration.clone(),
+        current_configuration: current.clone(),
+        previous_policy,
+        current_policy,
+        primary: source.clone(),
+        target: candidate.clone(),
+        build_id: prepared.authority.build_id.clone(),
+        snapshot_boundary_lsn: prepared.authority.replication_boundary_lsn,
+        catch_up_boundary_lsn: 1,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let source_authority = AdmittedAuthority {
+        scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+        secondary_removal: None,
+        local_identity: source.clone(),
+        transition_kind: Some(TransitionKind::ScaleUp),
+        previous_configuration: Some(previous_authority.current_configuration),
+        current_configuration: current,
+        switchover_handoff: None,
+    };
+    let target_authority = AdmittedAuthority {
+        local_identity: candidate,
+        ..source_authority.clone()
+    };
+    target_runtime
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::AdmitAuthority(Box::new(target_authority)),
+        ))
+        .await
+        .unwrap();
+    target_runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        target_runtime.snapshot().await.verified_replication_lsn,
+        Some(1)
+    );
+
+    source_runtime
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::AdmitAuthority(Box::new(source_authority)),
+        ))
+        .await
+        .unwrap();
+    assert!(source_runtime.snapshot().await.catch_up_complete);
 }
 
 #[tokio::test]
@@ -7804,6 +8010,7 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
         2,
     );
     let admitted = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: primary.clone(),
         transition_kind: Some(TransitionKind::Replacement),
@@ -7915,6 +8122,221 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
 }
 
 #[tokio::test]
+async fn scale_up_runtime_requires_the_built_candidate_through_the_frozen_boundary() {
+    let primary = identity(1, "primary");
+    let candidate = identity(2, "candidate");
+    let previous_policy = kuberic_protocol::types::EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = kuberic_protocol::types::EffectivePolicy::fixed(2, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: candidate.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: ResourceUid::new("set"),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy,
+        current_policy,
+        primary: primary.clone(),
+        target: candidate.clone(),
+        build_id: OperationId::new("build"),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 2,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let admitted = AdmittedAuthority {
+        scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+        secondary_removal: None,
+        local_identity: primary.clone(),
+        transition_kind: Some(TransitionKind::ScaleUp),
+        previous_configuration: Some(previous),
+        current_configuration: current,
+        switchover_handoff: None,
+    };
+    let application = Arc::new(TestApplication::default());
+    application.seed_progress(2);
+    let runtime = PodRuntime::new(
+        primary,
+        application,
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    let waiting = runtime.snapshot().await;
+    assert_eq!(waiting.catch_up_boundary, Some(2));
+    assert!(!waiting.catch_up_complete);
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&admitted, candidate.clone(), 2))
+        .await
+        .unwrap();
+    assert!(runtime.snapshot().await.catch_up_complete);
+    let mut completed = admitted;
+    completed.previous_configuration = None;
+    completed.transition_kind = None;
+    runtime
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::AdmitAuthority(Box::new(completed)),
+        ))
+        .await
+        .unwrap();
+    assert!(runtime.snapshot().await.catch_up_complete);
+}
+
+#[tokio::test]
+async fn same_primary_scale_up_preserves_granted_access_and_fences_old_completions() {
+    let primary = identity(1, "primary");
+    let secondary = identity(2, "secondary");
+    let candidate = identity(3, "candidate");
+    let previous_authority = authority(primary.clone(), vec![primary.clone(), secondary.clone()]);
+    let previous_policy = kuberic_protocol::types::EffectivePolicy::fixed(2, 30).unwrap();
+    let current_policy = kuberic_protocol::types::EffectivePolicy::fixed(3, 30).unwrap();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: secondary,
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: candidate.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: ResourceUid::new("set"),
+        spec_generation: 2,
+        desired_replicas: 3,
+        previous_configuration: previous_authority.current_configuration.clone(),
+        current_configuration: current.clone(),
+        previous_policy,
+        current_policy,
+        primary: primary.clone(),
+        target: candidate,
+        build_id: OperationId::new("build"),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 0,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let scale_up = AdmittedAuthority {
+        scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+        secondary_removal: None,
+        local_identity: primary.clone(),
+        transition_kind: Some(TransitionKind::ScaleUp),
+        previous_configuration: Some(previous_authority.current_configuration.clone()),
+        current_configuration: current,
+        switchover_handoff: None,
+    };
+    let runtime = PodRuntime::new(
+        primary,
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(previous_authority)),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        ))
+        .await
+        .unwrap();
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("old-authority-write"),
+            data: Bytes::from_static(b"old"),
+        })
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::AdmitAuthority(Box::new(scale_up)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    let old_completion = pending.committed().await;
+    assert!(
+        matches!(old_completion, Err(RuntimeError::AuthorityMismatch(_))),
+        "{old_completion:?}"
+    );
+    let next = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("new-authority-write"),
+            data: Bytes::from_static(b"new"),
+        })
+        .await;
+    assert!(matches!(next, Err(RuntimeError::LocalWritePending(_))));
+}
+
+#[tokio::test]
 async fn planned_handoff_roles_converge_closed_and_catchup_uses_certified_boundary() {
     for compensate in [false, true] {
         planned_handoff_role_recovery(compensate).await;
@@ -7978,6 +8400,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         let application = Arc::new(TestApplication::default());
         application.seed_progress(if index == 1 { 9 } else { 7 });
         let authority = AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: identity.clone(),
             transition_kind: None,
@@ -8046,6 +8469,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
     for index in [0, 2, 1] {
         let runtime = &runtimes[index];
         let authority = AdmittedAuthority {
+            scale_up: None,
             secondary_removal: None,
             local_identity: identities[index].clone(),
             transition_kind: Some(TransitionKind::PlannedSwitchover),
@@ -8140,6 +8564,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
             .apply_effect(effect(
                 sequences[index],
                 RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                    scale_up: None,
                     secondary_removal: None,
                     local_identity: identities[index].clone(),
                     transition_kind: None,
@@ -8162,6 +8587,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         for index in [1, 2, 0] {
             let runtime = &runtimes[index];
             let authority = AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: identities[index].clone(),
                 transition_kind: Some(TransitionKind::PlannedSwitchover),
@@ -8381,6 +8807,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
     let target_application = Arc::new(TestApplication::default());
     target_application.seed_progress(9);
     let requested_authority = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: target.clone(),
         transition_kind: Some(TransitionKind::PlannedSwitchover),
@@ -8449,6 +8876,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         .apply_effect(effect(
             1,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: target.clone(),
                 transition_kind: None,
@@ -8509,6 +8937,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         .apply_effect(effect(
             2,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: source.clone(),
                 transition_kind: Some(TransitionKind::PlannedSwitchover),
@@ -8584,6 +9013,7 @@ async fn runtime_exposes_derived_must_catch_up_evidence() {
         2,
     );
     let admitted = AdmittedAuthority {
+        scale_up: None,
         secondary_removal: None,
         local_identity: new_primary.clone(),
         transition_kind: Some(TransitionKind::Failover),

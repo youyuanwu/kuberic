@@ -290,6 +290,7 @@ async fn writer() {
         previous_configuration: None,
         current_configuration: intent.previous_configuration.clone(),
         switchover_handoff: None,
+        scale_up: None,
         secondary_removal: None,
     };
     store.admit(&authority).await.unwrap();

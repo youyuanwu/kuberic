@@ -806,6 +806,7 @@ fn validate_acceptance_conversion(
             .clone(),
         switchover_handoff: None,
         secondary_removal: Some(command.committed.evidence.clone()),
+        scale_up: None,
     };
     let progress: Option<ReplicationProgress> = load_json_optional(
         transaction,
@@ -1378,6 +1379,8 @@ impl BuildProgressStore for SqliteStore {
                 progress.last_sequence < existing.last_sequence
                     || progress.durable_lsn < existing.durable_lsn
                     || (existing.completed && !progress.completed)
+                    || existing.catch_up_boundary_lsn.is_some()
+                        && progress.catch_up_boundary_lsn != existing.catch_up_boundary_lsn
             }) {
                 return Err(ContractError::AuthorityMismatch(
                     "build progress regressed".into(),

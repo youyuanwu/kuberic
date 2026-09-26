@@ -5664,6 +5664,7 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
             last_sequence: 1,
             durable_lsn: 20,
             completed: true,
+            catch_up_boundary_lsn: None,
         };
         snapshot.replicas.insert(
             ReplicaObservationKey::new(
@@ -6593,6 +6594,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
             last_sequence: 1,
             durable_lsn: 5,
             completed: true,
+            catch_up_boundary_lsn: None,
         };
         snapshot.replicas.insert(
             ReplicaObservationKey::new(primary.replica_id, primary.instance_id.clone()),

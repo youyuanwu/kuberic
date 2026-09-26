@@ -95,6 +95,7 @@ async fn secondary_removal_rpc_replay() {
                 previous_configuration: None,
                 current_configuration: intent.previous_configuration.clone(),
                 switchover_handoff: None,
+                scale_up: None,
                 secondary_removal: None,
             })
             .await
@@ -396,6 +397,7 @@ async fn secondary_removal_contracts_are_rejected_without_durable_mutation() {
         );
         assert!(
             AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: local.clone(),
                 transition_kind: Some(kuberic_protocol::types::TransitionKind::SecondaryScaleDown),
@@ -1408,6 +1410,7 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
         let persisted = store.load_state().await.unwrap();
         store
             .admit(&AdmittedAuthority {
+                scale_up: None,
                 secondary_removal: None,
                 local_identity: local.clone(),
                 transition_kind: persisted

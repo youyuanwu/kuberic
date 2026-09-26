@@ -668,7 +668,7 @@ impl DefaultReplicatorInner {
         self.replicator
             .lock()
             .await
-            .admit_authority(authority, progress)?;
+            .admit_authority(authority, progress, false)?;
         self.changed.notify_waiters();
         Ok(())
     }
@@ -911,7 +911,7 @@ impl DefaultReplicatorInner {
         let replication_progress = self
             .load_replication_progress_with_handoff(&authority)
             .await?;
-        self.configure_admitted_authority(&authority, current_progress)
+        self.configure_admitted_authority(&authority, current_progress, false)
             .await?;
         self.replicator
             .lock()
@@ -1295,6 +1295,7 @@ impl DefaultReplicatorInner {
                 last_sequence: 0,
                 durable_lsn: 0,
                 completed: false,
+                catch_up_boundary_lsn: None,
             });
         if build_progress.authority != build_authority {
             return Err(RuntimeError::AuthorityMismatch(
@@ -1517,7 +1518,10 @@ impl DefaultReplicatorInner {
         }
 
         self.check_delivery_generation(generation)?;
-        let final_item = copy_final_item(authority, sequence, committed_lsn);
+        let catch_up_boundary_lsn = self
+            .freeze_build_catch_up_boundary(authority, generation, &initial_operations)
+            .await?;
+        let final_item = copy_final_item(authority, sequence, committed_lsn, catch_up_boundary_lsn);
         {
             let mut state = self.state.write().await;
             let build = state
@@ -1580,6 +1584,86 @@ impl DefaultReplicatorInner {
             }
         }
         Ok(())
+    }
+
+    async fn freeze_build_catch_up_boundary(
+        &self,
+        authority: &BuildAuthority,
+        generation: u64,
+        initial_operations: &BTreeMap<i64, Operation>,
+    ) -> Result<i64> {
+        let _delivery = self.delivery_lock.lock().await;
+        let _effect = self.effect_lock.lock().await;
+        self.check_delivery_generation(generation)?;
+        let state = self.state.read().await;
+        let build = state
+            .outbound_builds
+            .get(&authority.build_id)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        if build.generation != generation || build.progress.authority != *authority {
+            return Err(RuntimeError::AuthorityMismatch(
+                "catch-up boundary belongs to a different build generation".into(),
+            ));
+        }
+        let boundary = build.progress.catch_up_boundary_lsn.unwrap_or_else(|| {
+            state
+                .current_progress
+                .max(authority.replication_boundary_lsn)
+        });
+        let mut available = initial_operations
+            .keys()
+            .chain(build.pending_operations.keys())
+            .copied()
+            .filter(|lsn| *lsn > authority.replication_boundary_lsn && *lsn <= boundary)
+            .collect::<BTreeSet<_>>();
+        drop(state);
+        let mut expected = authority.replication_boundary_lsn.checked_add(1);
+        while let Some(lsn) = expected.filter(|lsn| *lsn <= boundary) {
+            if !available.remove(&lsn) {
+                return Err(RuntimeError::InvalidReplication(
+                    "post-enumeration operations do not close the catch-up boundary".into(),
+                ));
+            }
+            expected = lsn.checked_add(1);
+        }
+
+        let mut state = self.state.write().await;
+        let build = state
+            .outbound_builds
+            .get_mut(&authority.build_id)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        if build.generation != generation || build.progress.authority != *authority {
+            return Err(RuntimeError::AuthorityMismatch(
+                "catch-up boundary belongs to a different build generation".into(),
+            ));
+        }
+        if build
+            .progress
+            .catch_up_boundary_lsn
+            .is_some_and(|existing| existing != boundary)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "catch-up boundary changed for an immutable build".into(),
+            ));
+        }
+        let mut progress = build.progress.clone();
+        progress.catch_up_boundary_lsn = Some(boundary);
+        drop(state);
+        self.build_progress_store
+            .record_build_progress(&progress)
+            .await?;
+        let mut state = self.state.write().await;
+        let build = state
+            .outbound_builds
+            .get_mut(&authority.build_id)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        if build.generation != generation || build.progress.authority != *authority {
+            return Err(RuntimeError::AuthorityMismatch(
+                "build changed before catch-up boundary persistence".into(),
+            ));
+        }
+        build.progress = progress;
+        Ok(boundary)
     }
 
     async fn record_emitted_copy_item(
@@ -1679,6 +1763,17 @@ impl DefaultReplicatorInner {
         {
             return Err(RuntimeError::AuthorityMismatch(
                 "copy acknowledgement does not match the active build".to_string(),
+            ));
+        }
+        if acknowledgement.final_item != acknowledgement.catch_up_boundary_lsn.is_some()
+            || acknowledgement.catch_up_boundary_lsn
+                != acknowledgement
+                    .final_item
+                    .then_some(build.progress.catch_up_boundary_lsn)
+                    .flatten()
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "copy acknowledgement has different catch-up authority".into(),
             ));
         }
         let emitted = build
@@ -1818,6 +1913,11 @@ impl DefaultReplicatorInner {
                         "duplicate final copy marker preceded completion".to_string(),
                     ));
                 }
+                if progress.catch_up_boundary_lsn != envelope.catch_up_boundary_lsn {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "duplicate final marker changed the catch-up boundary".into(),
+                    ));
+                }
                 envelope.replication_boundary_lsn
             } else {
                 let operation = Operation {
@@ -1856,6 +1956,7 @@ impl DefaultReplicatorInner {
                     last_sequence: envelope.sequence,
                     durable_lsn: progress.durable_lsn,
                     completed: false,
+                    catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
                 };
                 self.check_delivery_generation(delivery_generation)?;
                 self.build_progress_store
@@ -1869,6 +1970,19 @@ impl DefaultReplicatorInner {
                     .insert(envelope.build_id.clone(), updated);
                 progress.durable_lsn
             } else if envelope.final_item {
+                let catch_up_boundary_lsn = envelope.catch_up_boundary_lsn.ok_or_else(|| {
+                    RuntimeError::AuthorityMismatch(
+                        "final copy marker omitted the catch-up boundary".into(),
+                    )
+                })?;
+                if progress
+                    .catch_up_boundary_lsn
+                    .is_some_and(|existing| existing != catch_up_boundary_lsn)
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "final copy marker changed the catch-up boundary".into(),
+                    ));
+                }
                 let durable = self
                     .service_streams()
                     .await?
@@ -1894,6 +2008,7 @@ impl DefaultReplicatorInner {
                     last_sequence: envelope.sequence,
                     durable_lsn: envelope.replication_boundary_lsn,
                     completed: true,
+                    catch_up_boundary_lsn: envelope.catch_up_boundary_lsn,
                 };
                 self.check_delivery_generation(delivery_generation)?;
                 self.build_progress_store
@@ -1909,6 +2024,11 @@ impl DefaultReplicatorInner {
                 if !progress.completed {
                     return Err(RuntimeError::InvalidReplication(
                         "live build replication arrived before snapshot completion".to_string(),
+                    ));
+                }
+                if progress.catch_up_boundary_lsn.is_none() {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "live build replication lacks a frozen catch-up boundary".into(),
                     ));
                 }
                 if envelope.lsn != progress.durable_lsn + 1 {
@@ -1948,6 +2068,7 @@ impl DefaultReplicatorInner {
                     last_sequence: envelope.sequence,
                     durable_lsn: envelope.lsn,
                     completed: progress.completed,
+                    catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
                 };
                 self.check_delivery_generation(delivery_generation)?;
                 self.build_progress_store
@@ -1971,6 +2092,7 @@ impl DefaultReplicatorInner {
             sequence: envelope.sequence,
             durable_lsn,
             replication_boundary_lsn: envelope.replication_boundary_lsn,
+            catch_up_boundary_lsn: envelope.catch_up_boundary_lsn,
             final_item: envelope.final_item,
             snapshot_chunk: envelope.snapshot_chunk,
         })
@@ -2341,8 +2463,12 @@ impl DefaultReplicatorInner {
                     let state = self.state.read().await;
                     (state.read_status, state.write_status)
                 };
-                let authority_changed =
-                    self.state.read().await.authority.as_ref() != Some(&authority);
+                let existing_authority = self.state.read().await.authority.clone();
+                let authority_changed = existing_authority.as_ref() != Some(&authority);
+                let preserve_scale_up_access =
+                    existing_authority.as_ref().is_some_and(|existing| {
+                        preserves_same_primary_scale_up_access(existing, &authority)
+                    });
                 if authority_changed {
                     if self
                         .state
@@ -2361,6 +2487,11 @@ impl DefaultReplicatorInner {
                             "authority changed without a newer epoch".into(),
                         ));
                     }
+                    if !preserve_scale_up_access {
+                        let mut state = self.state.write().await;
+                        state.read_status = AccessStatus::ReconfigurationPending;
+                        state.write_status = AccessStatus::ReconfigurationPending;
+                    }
                     {
                         let mut state = self.state.write().await;
                         if authority.secondary_removal.is_none()
@@ -2372,11 +2503,11 @@ impl DefaultReplicatorInner {
                             state.prepared_secondary_removal = None;
                             state.removal_in_progress = None;
                         }
-                        state.read_status = AccessStatus::ReconfigurationPending;
-                        state.write_status = AccessStatus::ReconfigurationPending;
                     }
                     self.fence_generation.fetch_add(1, Ordering::AcqRel);
-                    self.replicator.lock().await.fence_client_writes();
+                    if !preserve_scale_up_access {
+                        self.replicator.lock().await.fence_client_writes();
+                    }
                     self.changed.notify_waiters();
                     self.state.write().await.accepted_secondary_removal = None;
                 }
@@ -2408,8 +2539,12 @@ impl DefaultReplicatorInner {
                 let replication_progress = self
                     .load_replication_progress_with_handoff(&authority)
                     .await?;
-                self.configure_admitted_authority(&authority, current_progress)
-                    .await?;
+                self.configure_admitted_authority(
+                    &authority,
+                    current_progress,
+                    preserve_scale_up_access,
+                )
+                .await?;
                 self.replicator
                     .lock()
                     .await
@@ -2426,7 +2561,7 @@ impl DefaultReplicatorInner {
                     state.pending_evictions.insert(target);
                 }
                 let mut state = self.state.write().await;
-                if !authority_changed {
+                if !authority_changed || preserve_scale_up_access {
                     state.read_status = prior_access.0;
                     state.write_status = prior_access.1;
                 }
@@ -2508,6 +2643,7 @@ impl DefaultReplicatorInner {
                         last_sequence: 0,
                         durable_lsn: 0,
                         completed: false,
+                        catch_up_boundary_lsn: None,
                     });
                 if progress.authority != authority {
                     return Err(RuntimeError::AuthorityMismatch(
@@ -3075,11 +3211,13 @@ impl DefaultReplicatorInner {
         &self,
         authority: &AdmittedAuthority,
         progress: i64,
+        preserve_write_access: bool,
     ) -> Result<()> {
-        self.replicator
-            .lock()
-            .await
-            .admit_authority(authority.clone(), progress)?;
+        self.replicator.lock().await.admit_authority(
+            authority.clone(),
+            progress,
+            preserve_write_access,
+        )?;
         if authority.local_role() == ReplicaRole::Primary {
             let completed_builds = self
                 .state
@@ -3087,22 +3225,9 @@ impl DefaultReplicatorInner {
                 .await
                 .outbound_builds
                 .values()
-                .filter(|build| {
-                    build.progress.completed
-                        && authority
-                            .current_configuration
-                            .members
-                            .iter()
-                            .any(|member| {
-                                member.identity == build.progress.authority.target
-                                    && build_handoff_matches(&build.progress.authority, authority)
-                            })
-                })
-                .map(|build| {
-                    (
-                        build.progress.authority.target.clone(),
-                        build.progress.durable_lsn,
-                    )
+                .filter_map(|build| {
+                    completed_build_handoff_lsn(&build.progress, authority)
+                        .map(|lsn| (build.progress.authority.target.clone(), lsn))
                 })
                 .collect::<Vec<_>>();
             let mut replicator = self.replicator.lock().await;
@@ -3330,10 +3455,8 @@ impl DefaultReplicatorInner {
             .await
             .builds
             .values()
-            .filter(|build| build.completed)
             .filter(|build| build.authority.target == self.identity)
-            .filter(|build| build_handoff_matches(&build.authority, authority))
-            .map(|build| build.durable_lsn)
+            .filter_map(|build| completed_build_handoff_lsn(build, authority))
             .max();
         if let Some(handoff_lsn) = handoff_lsn
             && handoff_lsn > progress.verified_lsn
@@ -3572,13 +3695,19 @@ fn copy_snapshot_item(authority: &BuildAuthority, sequence: u64, data: Bytes) ->
         lsn: 0,
         committed_lsn: 0,
         replication_boundary_lsn: authority.replication_boundary_lsn,
+        catch_up_boundary_lsn: None,
         final_item: false,
         data,
         snapshot_chunk: true,
     }
 }
 
-fn copy_final_item(authority: &BuildAuthority, sequence: u64, committed_lsn: i64) -> CopyItem {
+fn copy_final_item(
+    authority: &BuildAuthority,
+    sequence: u64,
+    committed_lsn: i64,
+    catch_up_boundary_lsn: i64,
+) -> CopyItem {
     CopyItem {
         build_id: authority.build_id.clone(),
         sender: authority.source.clone(),
@@ -3589,6 +3718,7 @@ fn copy_final_item(authority: &BuildAuthority, sequence: u64, committed_lsn: i64
         lsn: authority.replication_boundary_lsn,
         committed_lsn: committed_lsn.min(authority.replication_boundary_lsn),
         replication_boundary_lsn: authority.replication_boundary_lsn,
+        catch_up_boundary_lsn: Some(catch_up_boundary_lsn),
         final_item: true,
         data: Bytes::new(),
         snapshot_chunk: false,
@@ -3610,6 +3740,7 @@ fn copy_operation_item(
         lsn: operation.lsn,
         committed_lsn: operation.committed_lsn.min(operation.lsn),
         replication_boundary_lsn: authority.replication_boundary_lsn,
+        catch_up_boundary_lsn: None,
         final_item: false,
         data: operation.data.clone(),
         snapshot_chunk: false,
@@ -3640,7 +3771,16 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &AdmittedAuthority) 
                 .is_some_and(|previous| {
                     previous.configuration_id == build.current_configuration.configuration_id
                 })
+                && authority.scale_up.as_deref().is_none_or(|evidence| {
+                    let intent = evidence.intent();
+                    intent.build_id == build.build_id
+                        && intent.primary == build.source
+                        && intent.target == build.target
+                        && intent.snapshot_boundary_lsn == build.replication_boundary_lsn
+                        && intent.previous_configuration == build.current_configuration
+                })
         }
+
         BuildAuthorityKind::Failover => {
             authority.transition_kind == Some(kuberic_protocol::types::TransitionKind::Failover)
                 && authority.previous_configuration.is_some()
@@ -3650,12 +3790,48 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &AdmittedAuthority) 
     }
 }
 
+fn completed_build_handoff_lsn(
+    progress: &BuildProgress,
+    authority: &AdmittedAuthority,
+) -> Option<i64> {
+    if !progress.completed || !build_handoff_matches(&progress.authority, authority) {
+        return None;
+    }
+    let required = authority.scale_up.as_deref().map_or(
+        progress
+            .catch_up_boundary_lsn
+            .unwrap_or(progress.authority.replication_boundary_lsn),
+        |evidence| evidence.intent().catch_up_boundary_lsn,
+    );
+    let boundary_matches = if authority.scale_up.is_some() {
+        progress.catch_up_boundary_lsn == Some(required)
+    } else {
+        progress
+            .catch_up_boundary_lsn
+            .is_none_or(|boundary| boundary == required)
+    };
+    (boundary_matches && progress.durable_lsn >= required).then_some(progress.durable_lsn)
+}
+
+fn preserves_same_primary_scale_up_access(
+    existing: &AdmittedAuthority,
+    next: &AdmittedAuthority,
+) -> bool {
+    matches!(
+        next.scale_up.as_deref(),
+        Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
+    ) && existing.primary_identity() == next.primary_identity()
+        && next.local_identity == *next.primary_identity()
+        && existing.local_identity == next.local_identity
+}
+
 fn build_postcondition(value: BuildProgress) -> BuildPostcondition {
     BuildPostcondition {
         authority: value.authority,
         last_sequence: value.last_sequence,
         durable_lsn: value.durable_lsn,
         completed: value.completed,
+        catch_up_boundary_lsn: value.catch_up_boundary_lsn,
     }
 }
 

@@ -67,6 +67,7 @@ pub struct ReplicaBuildDiagnostics {
     pub target_instance: String,
     pub durable_lsn: i64,
     pub completed: bool,
+    pub catch_up_boundary_lsn: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -118,6 +119,7 @@ impl ReplicaHandle {
                     target_instance: build.authority.target.instance_id.to_string(),
                     durable_lsn: build.durable_lsn,
                     completed: build.completed,
+                    catch_up_boundary_lsn: build.catch_up_boundary_lsn,
                 })
                 .collect(),
         })

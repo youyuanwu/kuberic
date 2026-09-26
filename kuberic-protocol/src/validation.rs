@@ -519,6 +519,22 @@ pub fn validate_report_internal(
             "report cannot combine scale-up and removal evidence",
         ));
     }
+    let mut build_ids = BTreeSet::new();
+    if report.builds.iter().any(|build| {
+        build.build_id.is_empty()
+            || build.target.replica_id.value() <= 0
+            || build.target.instance_id.is_empty()
+            || build.target.agent_generation.is_empty()
+            || build.durable_lsn < 0
+            || build
+                .catch_up_boundary_lsn
+                .is_some_and(|boundary| boundary < 0)
+            || !build_ids.insert(build.build_id.clone())
+    }) {
+        return Err(ValidationError::InvalidReplicaReportAuthority(
+            report.identity.replica_id.value(),
+        ));
+    }
     if let Some(intent) = report.scale_up_intent.as_deref() {
         validate_scale_up(intent)?;
         let current =

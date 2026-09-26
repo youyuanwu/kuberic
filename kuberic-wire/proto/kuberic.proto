@@ -57,6 +57,7 @@ message BuildStatus {
   uint64 last_sequence = 3;
   int64 durable_lsn = 4;
   bool completed = 5;
+  optional int64 catch_up_boundary_lsn = 6;
 }
 
 message SwitchoverHandoff {
