@@ -480,9 +480,16 @@ impl Model {
                     ScaleDownResource::Pod => exact.pod = ExactResourceObservation::NotFound,
                     ScaleDownResource::Pvc => exact.pvc = ExactResourceObservation::NotFound,
                 }
-                let fully_absent = matches!(exact.endpoint, ExactResourceObservation::NotFound)
-                    && matches!(exact.pod, ExactResourceObservation::NotFound)
-                    && matches!(exact.pvc, ExactResourceObservation::NotFound);
+                let target_absent = |observed: &ExactResourceObservation| {
+                    matches!(
+                        observed,
+                        ExactResourceObservation::NotFound
+                            | ExactResourceObservation::ReplacementPresent { .. }
+                    )
+                };
+                let fully_absent = target_absent(&exact.endpoint)
+                    && target_absent(&exact.pod)
+                    && target_absent(&exact.pvc);
                 if fully_absent {
                     self.snapshot.replicas.remove(&ReplicaObservationKey::new(
                         target.replica_id,

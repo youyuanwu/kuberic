@@ -9,7 +9,7 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverOutcome,
+    ConfigurationMember, EffectivePolicy, Epoch, FaultType, OperationId, PlannedSwitchoverOutcome,
     PlannedSwitchoverRequest, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
     PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpStage,
     SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind, derive_transition_id,
@@ -133,8 +133,38 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
             let mut cancellation_completed = false;
             let mut cancelled_incarnation = None;
             let mut replay_trace = Vec::new();
+            let mut candidate_failure_injected = false;
+            let mut participant_restore = None;
+            let mut participant_unavailability_injected = false;
+            let mut cleanup_variant_injected = false;
+            let mut cleanup_conflict_restore = None;
+            let mut delayed_authority = false;
+            let mut late_member_restore = None;
+            let mut late_member_injected = false;
 
             for step in 0..480_u64 {
+                if let Some((restore_at, key, agent)) = participant_restore.take() {
+                    if step >= restore_at {
+                        model.snapshot.replicas.get_mut(&key).unwrap().agent = agent;
+                    } else {
+                        participant_restore = Some((restore_at, key, agent));
+                    }
+                }
+                if let Some((restore_at, index, observation)) = cleanup_conflict_restore.take() {
+                    if step >= restore_at {
+                        model.snapshot.secondary_scale_down_resources[index] = observation;
+                    } else {
+                        cleanup_conflict_restore = Some((restore_at, index, observation));
+                    }
+                }
+                if let Some((restore_at, key, report)) = late_member_restore.take() {
+                    if step >= restore_at {
+                        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+                            AgentObservation::Report(report);
+                    } else {
+                        late_member_restore = Some((restore_at, key, report));
+                    }
+                }
                 if step % 5 == 0 && scale_up_model_writable(&model) {
                     model.acknowledge_write(case + run as u64 * cases, step);
                     *coverage.entry("write-varied-times").or_default() += 1;
@@ -161,6 +191,70 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                 if step % 11 == 0 {
                     assert_stale_report_cannot_advance(&model);
                     *coverage.entry("obsolete-session-report").or_default() += 1;
+                }
+
+                if case % 12 == 1
+                    && !candidate_failure_injected
+                    && model.snapshot.status.provisioning.is_some()
+                    && model.snapshot.status.transition.is_none()
+                    && let Some(report) =
+                        model
+                            .snapshot
+                            .replicas
+                            .values_mut()
+                            .find_map(|observation| match &mut observation.agent {
+                                AgentObservation::Report(report)
+                                    if !model
+                                        .snapshot
+                                        .status
+                                        .topology
+                                        .as_ref()
+                                        .unwrap()
+                                        .configuration
+                                        .members
+                                        .iter()
+                                        .any(|member| member.identity == report.identity) =>
+                                {
+                                    Some(report)
+                                }
+                                _ => None,
+                            })
+                {
+                    report.reported_fault = Some(FaultType::Permanent);
+                    report.report_sequence += 1;
+                    candidate_failure_injected = true;
+                    *coverage.entry("candidate-failure-retry").or_default() += 1;
+                }
+                if case % 12 == 3
+                    && !participant_unavailability_injected
+                    && participant_restore.is_none()
+                    && model.snapshot.status.provisioning.is_some()
+                    && let Some((key, observation)) =
+                        model.snapshot.replicas.iter_mut().find(|(_, observation)| {
+                            matches!(
+                                &observation.agent,
+                                AgentObservation::Report(report)
+                                    if report.role == ReplicaRole::ActiveSecondary
+                                        && model
+                                            .snapshot
+                                            .status
+                                            .topology
+                                            .as_ref()
+                                            .unwrap()
+                                            .configuration
+                                            .members
+                                            .iter()
+                                            .any(|member| member.identity == report.identity)
+                            )
+                        })
+                {
+                    let saved = observation.agent.clone();
+                    observation.agent = AgentObservation::Unreachable {
+                        message: "scheduled participant outage".into(),
+                    };
+                    participant_restore = Some((step + 1, key.clone(), saved));
+                    participant_unavailability_injected = true;
+                    *coverage.entry("participant-unavailability").or_default() += 1;
                 }
 
                 if case % 4 == 0
@@ -190,6 +284,70 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     *coverage.entry("fresh-incarnation-retry").or_default() += 1;
                 }
 
+                if !cleanup_variant_injected
+                    && model.snapshot.status.scale_up_cleanup.is_some()
+                    && let Some((index, exact)) = model
+                        .snapshot
+                        .secondary_scale_down_resources
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, exact)| {
+                            model
+                                .snapshot
+                                .status
+                                .scale_up_cleanup
+                                .as_ref()
+                                .is_some_and(|cleanup| cleanup.target == exact.target)
+                        })
+                {
+                    match case % 12 {
+                        0 => {
+                            exact.endpoint =
+                                kuberic_protocol::observation::ExactResourceObservation::NotFound;
+                            *coverage.entry("cleanup-404").or_default() += 1;
+                        }
+                        4 => {
+                            exact.endpoint = kuberic_protocol::observation::ExactResourceObservation::ReplacementPresent {
+                                uid: "different-endpoint-uid".into(),
+                                resource_version: "replacement-rv".into(),
+                            };
+                            *coverage.entry("cleanup-different-uid").or_default() += 1;
+                        }
+                        8 => {
+                            let saved = exact.clone();
+                            exact.endpoint = kuberic_protocol::observation::ExactResourceObservation::LookupFailed {
+                                message: "scheduled cleanup conflict".into(),
+                            };
+                            cleanup_conflict_restore = Some((step + 1, index, saved));
+                            *coverage.entry("cleanup-conflict-retry").or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                    cleanup_variant_injected = true;
+                }
+
+                if additions == 2
+                    && !late_member_injected
+                    && model.accepted_count() == accepted + 1
+                    && model.snapshot.status.transition.is_none()
+                    && let Some(receipt) = model.snapshot.status.last_scale_up.as_deref()
+                {
+                    let target = receipt.intent.target.clone();
+                    let key =
+                        ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+                    if let AgentObservation::Report(report) =
+                        &model.snapshot.replicas.get(&key).unwrap().agent
+                    {
+                        late_member_restore = Some((step + 2, key.clone(), report.clone()));
+                        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+                            AgentObservation::Absent;
+                        late_member_injected = true;
+                        *coverage
+                            .entry("late-retained-member-sequential-addition")
+                            .or_default() += 1;
+                    }
+                }
+
                 let replay = model.snapshot.clone();
                 let plan = model.plan();
                 replay_trace.push(format!(
@@ -217,6 +375,19 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     evaluate(&replay, &scale_up_model::config()),
                     "seed={seed:#x} case={case} step={step}"
                 );
+                let skip_for_delayed_authority = !delayed_authority
+                    && model
+                        .snapshot
+                        .status
+                        .transition
+                        .as_ref()
+                        .is_some_and(|transition| transition.scale_up.is_some())
+                    && model.snapshot.status.scale_up_admission_started.is_some();
+                if skip_for_delayed_authority {
+                    delayed_authority = true;
+                    *coverage.entry("delayed-authority-delivery").or_default() += 1;
+                    continue;
+                }
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.step())).is_err()
                 {
                     panic!(
@@ -281,6 +452,13 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
         "exact-candidate-cleanup",
         "pc-cc-authority",
         "sequential-additions-late-receipt",
+        "candidate-failure-retry",
+        "participant-unavailability",
+        "cleanup-404",
+        "cleanup-different-uid",
+        "cleanup-conflict-retry",
+        "delayed-authority-delivery",
+        "late-retained-member-sequential-addition",
     ] {
         assert!(
             coverage.get(required).copied().unwrap_or_default() > 0,
