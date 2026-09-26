@@ -702,7 +702,11 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
             };
         }
     }
-    status = status.with_condition(ready_condition());
+    status = if let Some(receipt) = status.last_scale_up.as_deref().cloned() {
+        status.with_condition(scale_up::stable_condition(snapshot, &receipt))
+    } else {
+        status.with_condition(ready_condition())
+    };
     Plan::Stable {
         status,
         requeue_after_seconds: config.stable_resync_seconds,

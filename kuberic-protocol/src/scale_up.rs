@@ -236,25 +236,72 @@ fn validate_witnesses(
     Ok(())
 }
 
+fn validate_recovery_witnesses(
+    intent: &ScaleUpIntent,
+    eligible_members: &ConfigurationDescriptor,
+    witnesses: &[ScaleUpWitness],
+    quorum: u32,
+) -> Result {
+    let mut identities = BTreeSet::new();
+    for witness in witnesses {
+        let current_member = intent
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == witness.identity);
+        let stage = match witness.previous_configuration_id.as_ref() {
+            Some(previous) if previous == &intent.previous_configuration.configuration_id => {
+                ScaleUpStage::PreviousCurrent
+            }
+            None => ScaleUpStage::CurrentOnly,
+            _ => return Err(invalid("invalid exact scale-up recovery witness")),
+        };
+        if witness.resource_uid != intent.resource_uid
+            || witness.process_session_id.is_empty()
+            || witness.report_sequence == 0
+            || !eligible_members
+                .members
+                .iter()
+                .any(|member| member.identity == witness.identity)
+            || current_member.is_none_or(|member| member.role != witness.role)
+            || !identities.insert(witness.identity.clone())
+            || witness.epoch != intent.current_configuration.epoch
+            || witness.current_configuration_id != intent.current_configuration.configuration_id
+            || witness.verified_replication_lsn < intent.catch_up_boundary_lsn
+            || witness.pending_operation_id.is_some()
+            || (witness.write_status == AccessStatus::Granted && witness.identity != intent.primary)
+            || (stage == ScaleUpStage::CurrentOnly
+                && witness.identity == intent.primary
+                && witness.write_status != AccessStatus::Granted)
+            || witness.retained_operation_id.as_ref()
+                != Some(&intent.command_operation_id(
+                    stage,
+                    &witness.identity,
+                    &intent.current_configuration,
+                ))
+        {
+            return Err(invalid("invalid exact scale-up recovery witness"));
+        }
+    }
+    if identities.len() < quorum as usize {
+        return Err(invalid("insufficient scale-up recovery witnesses"));
+    }
+    Ok(())
+}
+
 pub fn validate_scale_up_failover_evidence(evidence: &ScaleUpFailoverEvidence) -> Result {
     validate_scale_up(&evidence.intent)?;
-    validate_witnesses(
+    validate_recovery_witnesses(
         &evidence.intent,
-        &evidence.intent.current_configuration,
         &evidence.intent.previous_configuration,
         &evidence.previous_read_quorum,
         evidence.intent.previous_policy.read_quorum,
-        true,
-        None,
     )?;
-    validate_witnesses(
+    validate_recovery_witnesses(
         &evidence.intent,
-        &evidence.intent.current_configuration,
         &evidence.intent.current_configuration,
         &evidence.current_read_quorum,
         evidence.intent.current_policy.read_quorum,
-        true,
-        None,
     )
 }
 

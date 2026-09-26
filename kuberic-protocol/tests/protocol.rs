@@ -7516,6 +7516,12 @@ fn scale_up_cancellation_and_failed_build_freeze_exact_cleanup() {
     let status = status.expect("cleanup status");
     assert!(status.provisioning.is_none());
     assert!(status.scale_up_cleanup.is_some());
+    assert!(status.conditions.iter().any(|condition| {
+        condition.reason == "ScaleUpCancelledBeforeAdmission"
+            && condition.message.contains("phase=cleanup")
+            && condition.message.contains("accepted=1")
+            && condition.message.contains("desired=1")
+    }));
     assert_eq!(
         status
             .topology
@@ -7652,6 +7658,10 @@ fn scale_up_primary_loss_before_and_after_pc_cc_follow_distinct_paths() {
             .as_ref()
             .is_some_and(|transition| transition.scale_up_failover.is_some())
     );
+    assert!(status.conditions.iter().any(|condition| {
+        condition.reason == "ScaleUpFailoverPersisted"
+            && condition.message.contains("phase=failover-recovery")
+    }));
     after.snapshot.status = status;
     for _ in 0..40 {
         match after.plan() {
@@ -7716,7 +7726,10 @@ fn scale_up_commits_degraded_without_candidate_and_blocks_the_next_addition() {
     assert!(model.snapshot.status.scale_up_cleanup.is_none());
     assert!(model.snapshot.status.last_scale_up.is_some());
     assert!(matches!(model.plan(), Plan::Wait { status, .. }
-        if status.conditions.iter().any(|condition| condition.reason == "ScaleUpCommittedDegraded")));
+    if status.conditions.iter().any(|condition| {
+        condition.reason == "ScaleUpCommittedDegraded"
+            && condition.message.contains("phase=local-convergence")
+    })));
 
     let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
     let target = receipt.intent.target.clone();
@@ -7725,7 +7738,7 @@ fn scale_up_commits_degraded_without_candidate_and_blocks_the_next_addition() {
         AgentObservation::Report(Box::new(AgentReport {
             protocol_version: kuberic_protocol::PROTOCOL_VERSION,
             resource_uid: model.snapshot.resource_uid.clone(),
-            identity: target,
+            identity: target.clone(),
             process_session_id: ProcessSessionId::new("candidate-returned"),
             report_sequence: 10,
             role: ReplicaRole::ActiveSecondary,
@@ -7910,4 +7923,389 @@ fn scale_up_late_retained_member_blocks_receipt_supersession() {
                 evidence.intent() == &receipt.intent)
     ));
     assert!(model.snapshot.status.provisioning.is_none());
+}
+
+#[test]
+fn scale_up_failover_accepts_mixed_pc_cc_and_current_only_recovery_witnesses() {
+    use scale_up_model::Model;
+    for accepted in [2, 3] {
+        let mut model = Model::new(accepted, accepted + 1);
+        let mut boundaries = 0;
+        for _ in 0..120 {
+            match model.plan() {
+                Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(command),
+                } if command.current_only => {
+                    model.execute(ProtocolCommand::EnsureConfiguration(command));
+                    boundaries += 1;
+                    let mut failed = Model {
+                        snapshot: model.snapshot.clone(),
+                        accepted_history: model.accepted_history.clone(),
+                    };
+                    let primary_id = failed
+                        .snapshot
+                        .status
+                        .transition
+                        .as_ref()
+                        .unwrap()
+                        .scale_up
+                        .as_deref()
+                        .unwrap()
+                        .primary
+                        .replica_id;
+                    failed.report_mut(primary_id.value()).reported_fault =
+                        Some(FaultType::Permanent);
+                    failed.report_mut(primary_id.value()).write_status =
+                        AccessStatus::ReconfigurationPending;
+                    let Plan::Apply { changes } = failed.plan() else {
+                        panic!(
+                            "accepted={accepted} boundary={boundaries} stalled: {:?}",
+                            failed.plan()
+                        );
+                    };
+                    let status = changes.into_iter().find_map(|change| match change {
+                        KubernetesChange::PersistStatus { status } => Some(*status),
+                        _ => None,
+                    });
+                    let transition = status
+                        .as_ref()
+                        .and_then(|status| status.transition.as_ref())
+                        .expect("carried failover transition");
+                    assert!(transition.scale_up_failover.is_some());
+                }
+                Plan::Execute { command } => model.execute(command),
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        model.apply(change);
+                    }
+                }
+                Plan::Wait { status, .. } => model.snapshot.status = status,
+                Plan::Stable { status, .. } => {
+                    model.snapshot.status = status;
+                    break;
+                }
+                Plan::Unsafe { reason, .. } => panic!("unexpected unsafe plan: {reason:?}"),
+            }
+            if model.accepted_count() == accepted + 1 {
+                break;
+            }
+        }
+        assert_eq!(boundaries, accepted + 1);
+    }
+}
+
+#[test]
+fn scale_up_primary_failover_precedes_unsettled_receipt_recovery() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 4);
+    for _ in 0..120 {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only && command.local_replica_id == ReplicaId::new(4) => {
+                model.remove_candidate_report();
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.snapshot.status = status,
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("unexpected unsafe plan: {reason:?}"),
+        }
+        if model.accepted_count() == 4 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 4);
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    model.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("primary failure must outrank receipt recovery");
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    model.snapshot.now_unix_seconds += 10;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("sufficient surviving read quorum must allocate failover");
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.kind == TransitionKind::Failover)
+    );
+    let mut failover_command = None;
+    for _ in 0..4 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.transition_kind == TransitionKind::Failover => {
+                failover_command = Some(command);
+                break;
+            }
+            other => panic!("receipt recovery preempted failover: {other:?}"),
+        }
+    }
+    assert!(failover_command.is_some());
+    assert!(model.snapshot.status.last_scale_up.is_some());
+}
+
+#[test]
+fn scale_up_reports_explicit_quorum_loss_during_pc_cc() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 4);
+    loop {
+        let pc_cc_complete = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                intent.current_configuration.members.iter().all(|member| {
+                    model
+                        .snapshot
+                        .observation_for_identity(&member.identity)
+                        .and_then(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => Some(report),
+                            _ => None,
+                        })
+                        .is_some_and(|report| {
+                            report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration)
+                        })
+                })
+            });
+        if pc_cc_complete {
+            break;
+        }
+        model.step();
+    }
+    for replica_id in [2, 3] {
+        let report = model.report_mut(replica_id);
+        report.healthy = false;
+        report.reported_fault = Some(FaultType::Transient);
+    }
+    assert!(matches!(
+        model.plan(),
+        Plan::Wait {
+            reason: WaitReason::QuorumLoss,
+            status,
+            ..
+        } if status.conditions.iter().any(|condition| {
+            condition.reason == "ScaleUpDualQuorumUnavailable"
+                && condition.message.contains("phase=pc-cc")
+                && condition.message.contains("accepted=3")
+                && condition.message.contains("desired=4")
+        })
+    ));
+}
+
+#[test]
+fn scale_up_diagnostics_cover_every_externally_visible_phase() {
+    use scale_up_model::Model;
+
+    fn assert_phase(status: &AcceptedStatus, reason: &str, phase: &str) {
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.reason == reason)
+            .unwrap_or_else(|| panic!("missing {reason}: {:?}", status.conditions));
+        for field in ["accepted=", "desired=", "target=", "attempt=", "blocking="] {
+            assert!(condition.message.contains(field), "{reason}: {field}");
+        }
+        assert!(
+            condition.message.contains(&format!("phase={phase}")),
+            "{reason}: {}",
+            condition.message
+        );
+    }
+
+    let mut model = Model::new(2, 3);
+    while model.snapshot.status.provisioning.is_none() {
+        model.step();
+    }
+    assert_phase(
+        &model.snapshot.status,
+        "ScaleUpProvisioningAccepted",
+        "provisioning",
+    );
+
+    let ProtocolCommand::InitializeAgentStore(command) = (match model.plan() {
+        Plan::Execute { command } => command,
+        other => panic!("initialization phase: {other:?}"),
+    }) else {
+        panic!("initialization command")
+    };
+    model.execute(ProtocolCommand::InitializeAgentStore(command));
+    let primary = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members[0]
+        .identity
+        .clone();
+    model.snapshot.observation_for_identity(&primary).unwrap();
+    model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            primary.replica_id,
+            primary.instance_id.clone(),
+        ))
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap()
+        .peer_endpoint_ready = false;
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("copying diagnostic")
+    };
+    assert_phase(&status, "ScaleUpSourceUnavailable", "copying");
+    model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            primary.replica_id,
+            primary.instance_id,
+        ))
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap()
+        .peer_endpoint_ready = true;
+
+    let ProtocolCommand::EnsureReplicaBuild(command) = (match model.plan() {
+        Plan::Execute { command } => command,
+        other => panic!("build phase: {other:?}"),
+    }) else {
+        panic!("build command")
+    };
+    model.execute(ProtocolCommand::EnsureReplicaBuild(command));
+    for observation in model.snapshot.replicas.values_mut() {
+        if let AgentObservation::Report(report) = &mut observation.agent
+            && !report.builds.is_empty()
+        {
+            report.builds[0].catch_up_boundary_lsn = None;
+        }
+    }
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("catch-up diagnostic")
+    };
+    assert_phase(&status, "ScaleUpBoundaryPending", "catch-up");
+    for observation in model.snapshot.replicas.values_mut() {
+        if let AgentObservation::Report(report) = &mut observation.agent
+            && !report.builds.is_empty()
+        {
+            report.builds[0].catch_up_boundary_lsn = Some(10);
+        }
+    }
+
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("PC/CC persistence")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    let ProtocolCommand::EnsureConfiguration(command) = (match model.plan() {
+        Plan::Execute { command } => command,
+        other => panic!("PC/CC command: {other:?}"),
+    }) else {
+        panic!("configuration command")
+    };
+    let target = ReplicaIdentity {
+        replica_id: command.local_replica_id,
+        instance_id: command.expected_instance_id.clone(),
+        agent_generation: command.expected_agent_generation.clone(),
+    };
+    let AgentObservation::Report(report) = &mut model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            target.replica_id,
+            target.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent
+    else {
+        panic!("PC/CC target report")
+    };
+    report.pending_operation_id = Some(command.operation_id);
+    report.report_sequence += 1;
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("PC/CC pending diagnostic")
+    };
+    assert_phase(&status, "ScaleUpCommandPending", "pc-cc");
+
+    let mut current_only = Model::new(2, 3);
+    loop {
+        match current_only.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only => {
+                current_only.execute(ProtocolCommand::EnsureConfiguration(command));
+                break;
+            }
+            Plan::Execute { command } => current_only.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    current_only.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => current_only.snapshot.status = status,
+            other => panic!("current-only setup: {other:?}"),
+        }
+    }
+    let completed_id = current_only
+        .snapshot
+        .replicas
+        .values()
+        .filter_map(|observation| match &observation.agent {
+            AgentObservation::Report(report) if report.previous_configuration.is_none() => {
+                Some(report.identity.replica_id)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap();
+    for observation in current_only.snapshot.replicas.values_mut() {
+        if let AgentObservation::Report(report) = &mut observation.agent
+            && report.identity.replica_id != completed_id
+        {
+            report.pending_operation_id = Some(OperationId::new("held-current-only"));
+        }
+    }
+    let Plan::Wait { status, .. } = current_only.plan() else {
+        panic!("current-only diagnostic: {:?}", current_only.plan())
+    };
+    assert_phase(&status, "ScaleUpCurrentOnlyQuorumPending", "current-only");
+
+    let mut stable = Model::new(1, 2);
+    stable.run(80);
+    let Plan::Stable { status, .. } = stable.plan() else {
+        panic!("stable phase")
+    };
+    assert_phase(&status, "ScaleUpStable", "stable");
 }

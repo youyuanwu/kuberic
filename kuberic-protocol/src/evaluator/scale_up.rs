@@ -54,6 +54,24 @@ fn progress_status(
     )
 }
 
+pub(super) fn stable_condition(
+    snapshot: &ObservationSnapshot,
+    receipt: &ScaleUpReceipt,
+) -> StatusCondition {
+    let (accepted, desired) = counts(snapshot);
+    StatusCondition {
+        type_: "Ready".into(),
+        status: ConditionStatus::True,
+        reason: "ScaleUpStable".into(),
+        message: format!(
+            "accepted={accepted} desired={desired} target={}@{} attempt={} phase=stable blocking=none",
+            receipt.intent.target.replica_id,
+            receipt.intent.target.instance_id,
+            receipt.intent.operation_id
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wait(
     snapshot: &ObservationSnapshot,
@@ -68,6 +86,32 @@ fn wait(
     Plan::Wait {
         reason: WaitReason::ActiveTransition,
         status: progress_status(snapshot, status, reason, phase, target, attempt, blocking),
+        requeue_after_seconds: config.wait_requeue_seconds,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quorum_wait(
+    snapshot: &ObservationSnapshot,
+    status: AcceptedStatus,
+    reason: &str,
+    phase: &str,
+    target: &ReplicaIdentity,
+    attempt: &OperationId,
+    blocking: &str,
+    config: &EvaluationConfig,
+) -> Plan {
+    Plan::Wait {
+        reason: WaitReason::QuorumLoss,
+        status: progress_status(
+            snapshot,
+            status,
+            reason,
+            phase,
+            Some(target),
+            Some(attempt),
+            blocking,
+        ),
         requeue_after_seconds: config.wait_requeue_seconds,
     }
 }
@@ -380,10 +424,13 @@ pub(super) fn recover_local_acceptance(
     config: &EvaluationConfig,
 ) -> Option<Plan> {
     let receipt = snapshot.status.last_scale_up.as_deref()?;
+    let accepted = &snapshot.status.topology.as_ref()?.configuration;
+    if replica_failed(snapshot, &configuration_primary(accepted).identity) {
+        return None;
+    }
     if prior_receipt_settled(snapshot, receipt) {
         return None;
     }
-    let accepted = &snapshot.status.topology.as_ref()?.configuration;
     let evidence = receipt.failover_evidence.as_ref().map_or_else(
         || ScaleUpConfigurationEvidence::Admission {
             intent: receipt.intent.clone(),
@@ -867,7 +914,7 @@ pub(super) fn provisioning(
                     snapshot,
                     status,
                     "ScaleUpBoundaryPending",
-                    "copying",
+                    "catch-up",
                     Some(&target),
                     Some(&build_id),
                     "post-enumeration catch-up boundary is not frozen",
@@ -1047,6 +1094,33 @@ fn quorum_witnesses(
         .collect()
 }
 
+fn recovery_witnesses(
+    snapshot: &ObservationSnapshot,
+    intent: &ScaleUpIntent,
+    eligible: &ConfigurationDescriptor,
+) -> Vec<ScaleUpWitness> {
+    eligible
+        .members
+        .iter()
+        .filter_map(|member| {
+            let report = report(snapshot, &member.identity)?;
+            let stage = if exact_pc_cc_report(report, intent, &intent.current_configuration) {
+                ScaleUpStage::PreviousCurrent
+            } else if exact_current_only_report(report, intent, &intent.current_configuration) {
+                ScaleUpStage::CurrentOnly
+            } else {
+                return None;
+            };
+            let operation_id =
+                intent.command_operation_id(stage, &member.identity, &intent.current_configuration);
+            (report.pending_operation_id.is_none()
+                && report.retained_operation_id.as_ref() == Some(&operation_id))
+            .then(|| witness(report))
+            .flatten()
+        })
+        .collect()
+}
+
 fn begin_failover(
     snapshot: &ObservationSnapshot,
     transition: &TransitionIntent,
@@ -1054,20 +1128,8 @@ fn begin_failover(
     config: &EvaluationConfig,
 ) -> Plan {
     let current = &intent.current_configuration;
-    let previous_witnesses = quorum_witnesses(
-        snapshot,
-        intent,
-        current,
-        &intent.previous_configuration,
-        ScaleUpStage::PreviousCurrent,
-    );
-    let current_witnesses = quorum_witnesses(
-        snapshot,
-        intent,
-        current,
-        current,
-        ScaleUpStage::PreviousCurrent,
-    );
+    let previous_witnesses = recovery_witnesses(snapshot, intent, &intent.previous_configuration);
+    let current_witnesses = recovery_witnesses(snapshot, intent, current);
     if previous_witnesses.len() < intent.previous_policy.read_quorum as usize
         || current_witnesses.len() < intent.current_policy.read_quorum as usize
     {
@@ -1241,6 +1303,9 @@ pub(super) fn transition(
                         config,
                     );
                 }
+                if member.identity != primary.identity {
+                    continue;
+                }
                 return wait(
                     snapshot,
                     snapshot.status.clone(),
@@ -1319,9 +1384,19 @@ pub(super) fn transition(
         };
         if previous_witnesses.len() < previous_quorum as usize
             || current_witnesses.len() < current_quorum as usize
-            || !candidate_ready
-            || !primary_ready
         {
+            return quorum_wait(
+                snapshot,
+                snapshot.status.clone(),
+                "ScaleUpDualQuorumUnavailable",
+                "pc-cc",
+                &intent.target,
+                &intent.operation_id,
+                "previous and current configuration quorum evidence is insufficient",
+                config,
+            );
+        }
+        if !candidate_ready || !primary_ready {
             return wait(
                 snapshot,
                 snapshot.status.clone(),
