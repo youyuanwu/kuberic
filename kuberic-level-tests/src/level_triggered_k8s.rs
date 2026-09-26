@@ -11,6 +11,24 @@ struct NetworkPartition {
     rules: Vec<(String, Vec<String>)>,
 }
 
+impl NetworkPartition {
+    fn heal(mut self) -> Result<()> {
+        for (node, rule) in self.rules.drain(..).rev() {
+            let output = Command::new("docker")
+                .args(["exec", &node, "iptables", "-D", "FORWARD"])
+                .args(&rule)
+                .output()
+                .context("removing replica network partition")?;
+            ensure!(
+                output.status.success(),
+                "cannot heal replica partition on {node}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+}
+
 struct ReplicaSuspension {
     node: String,
     pid: i64,
@@ -215,6 +233,78 @@ fn stop_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Res
             String::from_utf8_lossy(&stopped.stderr)
         );
     }
+    Ok(())
+}
+
+fn kill_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Result<()> {
+    let pod = pod_for_replica(kubeconfig, context, replica_id)?;
+    let node = kubectl(
+        kubeconfig,
+        context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            &pod,
+            "-o",
+            "jsonpath={.spec.nodeName}",
+        ],
+    )?
+    .trim()
+    .to_string();
+    let container = Command::new("docker")
+        .args([
+            "exec",
+            &node,
+            "crictl",
+            "ps",
+            "--label",
+            &format!("io.kubernetes.pod.name={pod}"),
+            "-q",
+        ])
+        .output()
+        .context("resolving exact replica container for forced restart")?;
+    ensure!(
+        container.status.success(),
+        "cannot resolve replica {replica_id} container: {}",
+        String::from_utf8_lossy(&container.stderr)
+    );
+    let containers = String::from_utf8(container.stdout)?;
+    let container_id = containers
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("running replica container")?;
+    ensure!(
+        containers
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            == 1,
+        "expected one exact replica container, observed {containers:?}"
+    );
+    let inspection = Command::new("docker")
+        .args(["exec", &node, "crictl", "inspect", container_id])
+        .output()
+        .context("inspecting exact replica container for forced restart")?;
+    ensure!(
+        inspection.status.success(),
+        "cannot inspect replica {replica_id} container: {}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let inspection: Value = serde_json::from_slice(&inspection.stdout)?;
+    let pid = inspection["info"]["pid"]
+        .as_i64()
+        .context("exact replica host PID")?;
+    let killed = Command::new("docker")
+        .args(["exec", &node, "kill", "-KILL", &pid.to_string()])
+        .output()
+        .context("force-restarting exact replica process")?;
+    ensure!(
+        killed.status.success(),
+        "cannot force-restart replica {replica_id}: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
     Ok(())
 }
 
@@ -1857,6 +1947,14 @@ fn scale_ready(cluster: &SwitchoverCluster, count: usize, deadline: Instant) -> 
 }
 
 fn reset_scale_set(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
+    reset_scale_set_with_delay(cluster, count, 30)
+}
+
+fn reset_scale_set_with_delay(
+    cluster: &SwitchoverCluster,
+    count: usize,
+    failover_delay_seconds: u64,
+) -> Result<()> {
     cluster.kubectl(&[
         "-n",
         "default",
@@ -1891,7 +1989,8 @@ fn reset_scale_set(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
     let object = json!({
         "apiVersion":"operator.kuberic.io/v1alpha1", "kind":"KubericSet",
         "metadata":{"name":"kvstore2","namespace":"default"},
-        "spec":{"replicas":count,"image":"localhost/kvstore2:level-triggered-v1","failoverDelaySeconds":30}
+        "spec":{"replicas":count,"image":"localhost/kvstore2:level-triggered-v1",
+            "failoverDelaySeconds":failover_delay_seconds}
     });
     let mut child = OwnedChild(
         cluster
@@ -1909,7 +2008,7 @@ fn reset_scale_set(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
         .write_all(object.to_string().as_bytes())?;
     ensure!(
         child.0.wait()?.success(),
-        "create fresh scale-down set failed"
+        "create fresh level-triggered set failed"
     );
     scale_ready(cluster, count, Instant::now() + Duration::from_secs(180))?;
     Ok(())
@@ -2559,10 +2658,7 @@ impl LiveStepper {
                 kuberic_controller::normalize::normalize(raw.clone(), Default::default())?;
             let plan = kuberic_protocol::evaluator::evaluate(
                 &snapshot,
-                &kuberic_protocol::evaluator::EvaluationConfig {
-                    enable_secondary_scale_down: true,
-                    ..Default::default()
-                },
+                &kuberic_controller::production_evaluation_config(30, 5, 30),
             );
             let result =
                 kuberic_controller::executor::execute_plan(&api, &raw, &snapshot, plan.clone())
@@ -3304,6 +3400,1423 @@ fn scale_down_selectors_are_exact_ignored_and_in_all() {
         );
     }
     assert!(recipes.contains("-- --ignored --exact --nocapture"));
+}
+
+struct CollectionWatch {
+    _process: OwnedChild,
+    events: Receiver<Value>,
+}
+
+impl CollectionWatch {
+    fn start(cluster: &SwitchoverCluster, resource: &str) -> Result<Self> {
+        let mut process = OwnedChild(
+            Command::new("kubectl")
+                .args([
+                    "--kubeconfig",
+                    &cluster.kubeconfig,
+                    "--context",
+                    &cluster.context,
+                    "-n",
+                    "default",
+                    "get",
+                    resource,
+                    "-l",
+                    "operator.kuberic.io/set-name=kvstore2",
+                    "--watch",
+                    "--output-watch-events",
+                    "-o",
+                    "json",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()?,
+        );
+        let stdout = process.0.stdout.take().context("collection watch stdout")?;
+        let (send, events) = channel();
+        std::thread::spawn(move || {
+            for event in serde_json::Deserializer::from_reader(stdout).into_iter::<Value>() {
+                let Ok(event) = event else { break };
+                if send.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            _process: process,
+            events,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResourceCreation {
+    name: String,
+    uid: String,
+    resource_version: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ScaleUpCommit {
+    count: usize,
+    target: i64,
+    resource_version: u64,
+}
+
+fn resource_version(object: &Value) -> Result<u64> {
+    object["metadata"]["resourceVersion"]
+        .as_str()
+        .context("resourceVersion")?
+        .parse()
+        .context("numeric resourceVersion")
+}
+
+fn replica_label(object: &Value) -> Option<i64> {
+    object["metadata"]["labels"]["operator.kuberic.io/replica-id"]
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+fn scale_up_progress_condition(object: &Value) -> Option<&Value> {
+    object["status"]["conditions"]
+        .as_array()?
+        .iter()
+        .find(|condition| {
+            condition["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("ScaleUp"))
+        })
+}
+
+fn assert_scale_up_condition_context(object: &Value) -> Result<()> {
+    let Some(condition) = scale_up_progress_condition(object) else {
+        return Ok(());
+    };
+    let reason = condition["reason"].as_str().context("scale-up reason")?;
+    let message = condition["message"]
+        .as_str()
+        .context("scale-up condition message")?;
+    for field in [
+        "accepted=",
+        "desired=",
+        "target=",
+        "attempt=",
+        "phase=",
+        "blocking=",
+    ] {
+        ensure!(
+            message.contains(field),
+            "{reason} omitted {field} diagnostic context: {message}"
+        );
+    }
+    Ok(())
+}
+
+fn check_expansion(before: &Value, after: &Value) -> Result<i64> {
+    let old = before["members"]
+        .as_array()
+        .context("old topology members")?;
+    let new = after["members"]
+        .as_array()
+        .context("new topology members")?;
+    ensure!(
+        new.len() == old.len() + 1,
+        "scale-up did not add exactly one member: {} -> {}",
+        old.len(),
+        new.len()
+    );
+    for member in old {
+        ensure!(
+            new.iter().any(|candidate| candidate == member),
+            "scale-up changed retained exact member: {member}"
+        );
+    }
+    let added = new
+        .iter()
+        .find(|member| old.iter().all(|retained| retained != *member))
+        .context("new exact member")?;
+    ensure!(
+        added["role"] == "activeSecondary",
+        "new member was not an ActiveSecondary: {added}"
+    );
+    ensure!(
+        before["primaryId"] == after["primaryId"],
+        "healthy scale-up changed primary"
+    );
+    ensure!(
+        before["epoch"]["dataLossNumber"] == after["epoch"]["dataLossNumber"],
+        "healthy scale-up changed data-loss epoch"
+    );
+    ensure!(
+        after["epoch"]["configurationNumber"].as_i64()
+            == before["epoch"]["configurationNumber"]
+                .as_i64()
+                .map(|number| number + 1),
+        "scale-up did not advance exactly one configuration epoch"
+    );
+    ensure!(
+        after["writeQuorum"].as_u64() == Some((new.len() / 2 + 1) as u64),
+        "expanded topology has the wrong majority write quorum"
+    );
+    let expected = (1..=new.len() as i64)
+        .find(|candidate| {
+            old.iter()
+                .all(|member| member["replicaId"].as_i64() != Some(*candidate))
+        })
+        .context("next cardinality-derived logical ID")?;
+    ensure!(
+        added["replicaId"].as_i64() == Some(expected),
+        "scale-up added the wrong logical ID: expected {expected}, got {added}"
+    );
+    Ok(expected)
+}
+
+fn exact_member(status: &Value, replica_id: i64) -> Result<&Value> {
+    status["status"]["topology"]["members"]
+        .as_array()
+        .context("accepted topology members")?
+        .iter()
+        .find(|member| member["replicaId"].as_i64() == Some(replica_id))
+        .with_context(|| format!("accepted member {replica_id}"))
+}
+
+fn exact_replica_resources(
+    cluster: &SwitchoverCluster,
+    replica_id: i64,
+) -> Result<Vec<ScaleResource>> {
+    let pod_name = pod_for_replica(&cluster.kubeconfig, &cluster.context, replica_id)?;
+    let pod: Value = serde_json::from_str(
+        &cluster.kubectl(&["-n", "default", "get", "pod", &pod_name, "-o", "json"])?,
+    )?;
+    let pvc_name = pod["spec"]["volumes"]
+        .as_array()
+        .context("candidate volumes")?
+        .iter()
+        .find_map(|volume| volume["persistentVolumeClaim"]["claimName"].as_str())
+        .context("candidate PVC name")?;
+    let pvc: Value = serde_json::from_str(
+        &cluster.kubectl(&["-n", "default", "get", "pvc", pvc_name, "-o", "json"])?,
+    )?;
+    let services: Value = serde_json::from_str(
+        &cluster.kubectl(&["-n", "default", "get", "services", "-o", "json"])?,
+    )?;
+    let endpoint = services["items"]
+        .as_array()
+        .context("Service list")?
+        .iter()
+        .find(|service| {
+            service["metadata"]["name"] != "kvstore2-write"
+                && routing_instance(service) == pod["metadata"]["uid"].as_str()
+        })
+        .context("exact candidate peer Service")?
+        .clone();
+    Ok(vec![
+        ScaleResource {
+            kind: "service",
+            object: endpoint,
+        },
+        ScaleResource {
+            kind: "pod",
+            object: pod,
+        },
+        ScaleResource {
+            kind: "pvc",
+            object: pvc,
+        },
+    ])
+}
+
+struct ScaleUpCase<'a> {
+    cluster: &'a SwitchoverCluster,
+    start: Value,
+    accepted: Value,
+    primary: Value,
+    writer: DirectClient,
+    status: KubeWatch,
+    pods: CollectionWatch,
+    pvcs: CollectionWatch,
+    pod_creations: std::collections::BTreeMap<i64, ResourceCreation>,
+    pvc_creations: std::collections::BTreeMap<i64, ResourceCreation>,
+    commits: Vec<ScaleUpCommit>,
+    phase_reasons: std::collections::BTreeSet<String>,
+    phase_writes: std::collections::BTreeSet<(i64, &'static str)>,
+    acknowledged: Vec<(String, String)>,
+    started: Instant,
+    deadline: Instant,
+}
+
+impl<'a> ScaleUpCase<'a> {
+    fn new(cluster: &'a SwitchoverCluster, count: usize) -> Result<Self> {
+        let start = scale_ready(cluster, count, Instant::now() + Duration::from_secs(180))?;
+        let primary = start["status"]["topology"]["members"]
+            .as_array()
+            .context("starting members")?
+            .iter()
+            .find(|member| member["role"] == "primary")
+            .context("starting primary")?
+            .clone();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(900);
+        let writer = DirectClient::connect(cluster, &cluster.pod(&primary)?, deadline)?;
+        let status = KubeWatch::start(cluster, "kubericset", "kvstore2")?;
+        let pods = CollectionWatch::start(cluster, "pods")?;
+        let pvcs = CollectionWatch::start(cluster, "persistentvolumeclaims")?;
+        let mut case = Self {
+            cluster,
+            accepted: start["status"]["topology"].clone(),
+            start,
+            primary,
+            writer,
+            status,
+            pods,
+            pvcs,
+            pod_creations: Default::default(),
+            pvc_creations: Default::default(),
+            commits: Vec::new(),
+            phase_reasons: Default::default(),
+            phase_writes: Default::default(),
+            acknowledged: Vec::new(),
+            started,
+            deadline,
+        };
+        for suffix in ["seed-a", "seed-b", "seed-c"] {
+            case.write(suffix)?;
+        }
+        Ok(case)
+    }
+
+    fn submit(&self, count: usize) -> Result<()> {
+        self.cluster.kubectl(&[
+            "-n",
+            "default",
+            "patch",
+            "kubericset",
+            "kvstore2",
+            "--type=merge",
+            "-p",
+            &json!({"spec":{"replicas":count}}).to_string(),
+        ])?;
+        Ok(())
+    }
+
+    fn write(&mut self, phase: &str) -> Result<()> {
+        let key = format!(
+            "scale-up-{}-{phase}-{}",
+            self.start["metadata"]["uid"].as_str().context("set UID")?,
+            self.acknowledged.len()
+        );
+        let value = format!("acknowledged-{key}");
+        let (code, body) = self.writer.request("PUT", &format!("/kv/{key}"), &value)?;
+        ensure!(
+            code == 200,
+            "healthy same-primary scale-up write failed during {phase}: HTTP {code} {body}"
+        );
+        self.acknowledged.push((key, value));
+        Ok(())
+    }
+
+    fn record_resource_events(
+        events: &Receiver<Value>,
+        destination: &mut std::collections::BTreeMap<i64, ResourceCreation>,
+    ) -> Result<()> {
+        for event in events.try_iter() {
+            ensure!(event["type"] != "ERROR", "resource watch failed: {event}");
+            let object = &event["object"];
+            let Some(replica_id) = replica_label(object) else {
+                continue;
+            };
+            if event["type"] == "ADDED" {
+                destination.entry(replica_id).or_insert(ResourceCreation {
+                    name: object["metadata"]["name"]
+                        .as_str()
+                        .context("resource name")?
+                        .to_string(),
+                    uid: object["metadata"]["uid"]
+                        .as_str()
+                        .context("resource UID")?
+                        .to_string(),
+                    resource_version: resource_version(object)?,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn process_status(&mut self, object: &Value) -> Result<()> {
+        ensure!(
+            !object["status"]["conditions"]
+                .as_array()
+                .is_some_and(|conditions| conditions.iter().any(|condition| {
+                    condition["type"] == "Unsafe" && condition["status"] == "true"
+                })),
+            "scale-up entered Unsafe: {}",
+            object["status"]["conditions"]
+        );
+        assert_scale_up_condition_context(object)?;
+        if let Some(condition) = scale_up_progress_condition(object)
+            && let Some(reason) = condition["reason"].as_str()
+        {
+            self.phase_reasons.insert(reason.to_string());
+        }
+        let topology = &object["status"]["topology"];
+        if topology.is_object() && topology != &self.accepted {
+            let target = check_expansion(&self.accepted, topology)?;
+            let count = topology["members"]
+                .as_array()
+                .context("expanded members")?
+                .len();
+            self.commits.push(ScaleUpCommit {
+                count,
+                target,
+                resource_version: resource_version(object)?,
+            });
+            self.accepted = topology.clone();
+            eprintln!(
+                "scale-up accepted target={target}, count={count}, epoch={}, elapsed={:?}",
+                topology["epoch"],
+                self.started.elapsed()
+            );
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self) -> Result<Value> {
+        Self::record_resource_events(&self.pods.events, &mut self.pod_creations)?;
+        Self::record_resource_events(&self.pvcs.events, &mut self.pvc_creations)?;
+        let events = self.status.events.try_iter().collect::<Vec<_>>();
+        for event in events {
+            ensure!(event["type"] != "ERROR", "status watch failed: {event}");
+            self.process_status(&event["object"])?;
+            self.maybe_write_in_live_phase(&event["object"])?;
+        }
+        let current = self.cluster.status()?;
+        self.process_status(&current)?;
+        self.maybe_write_in_live_phase(&current)?;
+        Ok(current)
+    }
+
+    fn maybe_write_in_live_phase(&mut self, status: &Value) -> Result<()> {
+        let target = self.accepted["members"]
+            .as_array()
+            .context("accepted members")?
+            .len() as i64
+            + 1;
+        let reason = scale_up_progress_condition(status)
+            .and_then(|condition| condition["reason"].as_str())
+            .unwrap_or_default();
+        if matches!(
+            reason,
+            "ScaleUpCopying"
+                | "ScaleUpBoundaryPropagationPending"
+                | "ScaleUpBoundaryPending"
+                | "ScaleUpCatchUpPending"
+        ) && self.phase_writes.insert((target, "copy"))
+        {
+            self.write(&format!("copy-target-{target}"))?;
+        }
+        if status["status"]["transition"]["scaleUp"].is_object()
+            && self.phase_writes.insert((target, "admission"))
+        {
+            self.write(&format!("admission-target-{target}"))?;
+        }
+        Ok(())
+    }
+
+    fn stable_at(&self, status: &Value, count: usize) -> bool {
+        status_ready(status)
+            && status["status"]["transition"].is_null()
+            && status["status"]["provisioning"].is_null()
+            && status["status"]["scaleUpAllocation"].is_null()
+            && status["status"]["scaleUpCleanup"].is_null()
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == count)
+    }
+
+    fn wait_for_count(&mut self, count: usize) -> Result<Value> {
+        loop {
+            let status = self.observe()?;
+            if self.stable_at(&status, count) {
+                let stable = scale_ready(self.cluster, count, self.deadline)?;
+                self.process_status(&stable)?;
+                return Ok(stable);
+            }
+            poll(self.deadline, &format!("stable scale-up to {count}"))?;
+        }
+    }
+
+    fn assert_resource_order(&self, replica_id: i64) -> Result<()> {
+        let pvc = self
+            .pvc_creations
+            .get(&replica_id)
+            .with_context(|| format!("PVC creation for replica {replica_id}"))?;
+        let pod = self
+            .pod_creations
+            .get(&replica_id)
+            .with_context(|| format!("Pod creation for replica {replica_id}"))?;
+        ensure!(
+            pvc.resource_version < pod.resource_version,
+            "candidate Pod was not observed after its PVC: pvc={pvc:?}, pod={pod:?}"
+        );
+        ensure!(
+            pvc.name == format!("kvstore2-{replica_id}-data")
+                && pod.name == format!("kvstore2-{replica_id}"),
+            "candidate did not use canonical ordinal names: pvc={pvc:?}, pod={pod:?}"
+        );
+        ensure!(
+            pvc.uid != pod.uid,
+            "Pod and PVC unexpectedly shared an identity"
+        );
+        Ok(())
+    }
+
+    fn verify_final(&mut self, status: &Value, count: usize) -> Result<()> {
+        let topology = &status["status"]["topology"];
+        ensure!(
+            status["status"]["effectivePolicy"]["replicaSetSize"].as_u64() == Some(count as u64)
+                && status["status"]["effectivePolicy"]["writeQuorum"].as_u64()
+                    == Some((count / 2 + 1) as u64),
+            "accepted policy did not expand to majority policy: {}",
+            status["status"]["effectivePolicy"]
+        );
+        ensure!(
+            topology_primary_id(status) == self.primary["replicaId"].as_i64(),
+            "healthy scale-up changed the exact primary"
+        );
+        let service: Value = serde_json::from_str(&self.cluster.kubectl(&[
+            "-n",
+            "default",
+            "get",
+            "service",
+            "kvstore2-write",
+            "-o",
+            "json",
+        ])?)?;
+        ensure!(
+            routing_instance(&service) == self.primary["instanceId"].as_str(),
+            "write Service did not route to the exact accepted primary"
+        );
+        let configuration = &topology["configurationId"];
+        let committed = self.writer.report()?["committedLsn"]
+            .as_i64()
+            .context("committed LSN")?;
+        for member in topology["members"].as_array().context("final members")? {
+            let report = self.cluster.report(member)?;
+            ensure!(
+                identity(&report) == identity(member)
+                    && report["currentConfiguration"] == *configuration
+                    && report["previousConfiguration"].is_null()
+                    && report["pendingOperation"].is_null()
+                    && report["currentProgress"]
+                        .as_i64()
+                        .is_some_and(|progress| progress >= committed),
+                "member lacked exact stable acknowledged prefix: {report}"
+            );
+            ensure!(
+                report["role"]
+                    == if member["role"] == "primary" {
+                        "Primary"
+                    } else {
+                        "ActiveSecondary"
+                    },
+                "application role did not match accepted topology: {report}"
+            );
+        }
+        for (key, expected) in &self.acknowledged {
+            let (code, value) = self.writer.request("GET", &format!("/kv/{key}"), "")?;
+            ensure!(
+                code == 200 && value == *expected,
+                "lost acknowledged value {key}: HTTP {code} {value}"
+            );
+        }
+        ensure!(
+            status["status"]["lastScaleUp"].is_object(),
+            "stable scale-up omitted its bounded completion receipt"
+        );
+        assert_scale_up_condition_context(status)?;
+        eprintln!(
+            "scale-up stable count={count}, commits={:?}, writes={}, phases={:?}, elapsed={:?}",
+            self.commits,
+            self.acknowledged.len(),
+            self.phase_reasons,
+            self.started.elapsed()
+        );
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn scale_up() -> Result<()> {
+    run_switchover(|cluster| {
+        reset_scale_set_with_delay(cluster, 1, 3)?;
+        let mut case = ScaleUpCase::new(cluster, 1)?;
+        case.submit(2)?;
+        let two = case.wait_for_count(2)?;
+        case.assert_resource_order(2)?;
+        case.verify_final(&two, 2)?;
+        case.submit(3)?;
+        let three = case.wait_for_count(3)?;
+        case.assert_resource_order(3)?;
+        case.verify_final(&three, 3)?;
+        ensure!(
+            case.commits
+                .iter()
+                .map(|commit| (commit.count, commit.target))
+                .collect::<Vec<_>>()
+                == vec![(2, 2), (3, 3)],
+            "healthy scale-up skipped or reordered additions: {:?}",
+            case.commits
+        );
+        for target in [2, 3] {
+            ensure!(
+                case.phase_writes.contains(&(target, "copy"))
+                    && case.phase_writes.contains(&(target, "admission")),
+                "target {target} lacked acknowledged writes during copy and admission: {:?}",
+                case.phase_writes
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn scale_up_multi() -> Result<()> {
+    run_switchover(|cluster| {
+        reset_scale_set_with_delay(cluster, 1, 3)?;
+        let mut case = ScaleUpCase::new(cluster, 1)?;
+        case.submit(3)?;
+        let stable = case.wait_for_count(3)?;
+        case.assert_resource_order(2)?;
+        case.assert_resource_order(3)?;
+        case.verify_final(&stable, 3)?;
+        ensure!(
+            case.commits
+                .iter()
+                .map(|commit| (commit.count, commit.target))
+                .collect::<Vec<_>>()
+                == vec![(2, 2), (3, 3)],
+            "1->3 did not commit one exact candidate at a time: {:?}",
+            case.commits
+        );
+        let first_commit = case.commits[0].resource_version;
+        let second_pvc = case.pvc_creations.get(&3).context("replica 3 PVC")?;
+        let second_pod = case.pod_creations.get(&3).context("replica 3 Pod")?;
+        ensure!(
+            second_pvc.resource_version > first_commit
+                && second_pod.resource_version > first_commit,
+            "replica 3 resources appeared before replica 2 membership committed: \
+             first_commit={first_commit}, pvc={second_pvc:?}, pod={second_pod:?}"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
+    let recipes = include_str!("../../justfile");
+    let workflow = include_str!("../../.github/workflows/level-triggered-CI.yml");
+    for (selector, test) in [
+        ("scale-up", "scale_up"),
+        ("scale-up-multi", "scale_up_multi"),
+        ("scale-up-adversarial", "scale_up_adversarial"),
+    ] {
+        assert!(recipes.contains(&format!(
+            "{selector}) test_name=\"level_triggered_k8s::{test}\""
+        )));
+        assert!(
+            recipes
+                .lines()
+                .any(|line| line.contains("expanded+=(") && line.contains(selector))
+        );
+    }
+    assert!(recipes.contains("expanded+=(scale-up scale-up-multi scale-up-adversarial)"));
+    assert!(recipes.contains("-- --ignored --exact --nocapture"));
+    assert!(workflow.contains("just level-triggered-kind-test scale-up"));
+    assert!(workflow.contains("just level-triggered-kind-test all"));
+    assert!(workflow.contains("test_reconciler_scale_up -- --exact"));
+    assert!(workflow.contains("test_scale_up_replays_writes_buffered_during_copy -- --exact"));
+}
+
+fn scale_up_stage(plan: &kuberic_protocol::plan::Plan) -> Option<String> {
+    use kuberic_protocol::{
+        command::{KubernetesChange, ProtocolCommand},
+        plan::Plan,
+    };
+    match plan {
+        Plan::Execute { command } => match command {
+            ProtocolCommand::InitializeAgentStore(command)
+                if command
+                    .provisioning
+                    .as_ref()
+                    .is_some_and(|provisioning| provisioning.scale_up().is_some()) =>
+            {
+                Some("initialize".into())
+            }
+            ProtocolCommand::EnsureReplicaBuild(_) => Some("build".into()),
+            ProtocolCommand::EnsureConfiguration(command)
+                if command.scale_up_evidence.is_some() =>
+            {
+                Some(format!(
+                    "{}-{}",
+                    if command.current_only {
+                        "current-only"
+                    } else {
+                        "pc-cc"
+                    },
+                    command.local_replica_id
+                ))
+            }
+            _ => None,
+        },
+        Plan::Apply { changes } => changes.iter().find_map(|change| match change {
+            KubernetesChange::EnsureReplicaScaffolding { replica_ids } => Some(format!(
+                "scaffolding-{}",
+                replica_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            KubernetesChange::DeleteScaleDownResource { resource, .. } => {
+                Some(format!("delete-{resource:?}"))
+            }
+            KubernetesChange::PersistStatus { status } => status
+                .conditions
+                .iter()
+                .find(|condition| {
+                    condition
+                        .reason
+                        .strip_prefix("ScaleUp")
+                        .is_some_and(|suffix| !suffix.is_empty())
+                })
+                .map(|condition| format!("status-{}", condition.reason)),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn manual_live_step(cluster: &SwitchoverCluster, deadline: Instant) -> Result<LiveStep> {
+    loop {
+        let error = match LiveStepper::new(cluster).and_then(|stepper| stepper.step(cluster)) {
+            Ok(step) => return Ok(step),
+            Err(error) => error,
+        };
+        ensure!(
+            Instant::now() < deadline,
+            "manual live controller could not take a step; last error: {:#}",
+            error
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn wait_controller_ready(cluster: &SwitchoverCluster, deadline: Instant) -> Result<()> {
+    loop {
+        let deployment: Value = serde_json::from_str(&cluster.kubectl(&[
+            "-n",
+            "kuberic-system",
+            "get",
+            "deployment",
+            "kuberic-controller",
+            "-o",
+            "json",
+        ])?)?;
+        if deployment["status"]["observedGeneration"] == deployment["metadata"]["generation"]
+            && deployment["status"]["updatedReplicas"] == 1
+            && deployment["status"]["availableReplicas"] == 1
+            && deployment["status"]["replicas"] == 1
+        {
+            return Ok(());
+        }
+        poll(deadline, "controller deployment availability")?;
+    }
+}
+
+fn patch_replicas(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
+    cluster.kubectl(&[
+        "-n",
+        "default",
+        "patch",
+        "kubericset",
+        "kvstore2",
+        "--type=merge",
+        "-p",
+        &json!({"spec":{"replicas":count}}).to_string(),
+    ])?;
+    Ok(())
+}
+
+fn wait_process_session_change(
+    cluster: &SwitchoverCluster,
+    replica_id: i64,
+    previous: &Value,
+    deadline: Instant,
+) -> Result<Value> {
+    loop {
+        if let Ok(report) = replica_diagnostics(&cluster.kubeconfig, &cluster.context, replica_id)
+            && report["processSession"] != *previous
+        {
+            return Ok(report);
+        }
+        poll(
+            deadline,
+            &format!("replica {replica_id} process-session restart"),
+        )?;
+    }
+}
+
+fn write_direct(
+    client: &mut DirectClient,
+    acknowledged: &mut Vec<(String, String)>,
+    label: &str,
+) -> Result<()> {
+    let key = format!("scale-up-adversarial-{label}-{}", acknowledged.len());
+    let value = format!("acknowledged-{key}");
+    let (code, body) = client.request("PUT", &format!("/kv/{key}"), &value)?;
+    ensure!(code == 200, "write {label} failed: HTTP {code} {body}");
+    acknowledged.push((key, value));
+    Ok(())
+}
+
+fn verify_acknowledged(
+    cluster: &SwitchoverCluster,
+    status: &Value,
+    acknowledged: &[(String, String)],
+    deadline: Instant,
+) -> Result<()> {
+    let primary = status["status"]["topology"]["members"]
+        .as_array()
+        .context("accepted members")?
+        .iter()
+        .find(|member| member["role"] == "primary")
+        .context("accepted primary")?;
+    let mut client = DirectClient::connect(cluster, &cluster.pod(primary)?, deadline)?;
+    for (key, expected) in acknowledged {
+        let (code, value) = client.request("GET", &format!("/kv/{key}"), "")?;
+        ensure!(
+            code == 200 && value == *expected,
+            "lost acknowledged value {key}: HTTP {code} {value}"
+        );
+    }
+    Ok(())
+}
+
+fn create_same_name_endpoint(
+    cluster: &SwitchoverCluster,
+    original: &ScaleResource,
+) -> Result<Value> {
+    let replacement = json!({
+        "apiVersion":"v1",
+        "kind":"Service",
+        "metadata":{
+            "name":original.name(),
+            "namespace":"default",
+            "ownerReferences":original.object["metadata"]["ownerReferences"],
+            "labels":{"kuberic-test":"same-name-resource-fence"}
+        },
+        "spec":{
+            "ports":[{"name":"unrelated","port":12345,"targetPort":12345}],
+            "selector":{"kuberic-test":"same-name-resource-fence"}
+        }
+    });
+    let mut child = OwnedChild(
+        cluster
+            .command()
+            .args(["create", "-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()?,
+    );
+    child
+        .0
+        .stdin
+        .take()
+        .context("replacement Service stdin")?
+        .write_all(replacement.to_string().as_bytes())?;
+    ensure!(
+        child.0.wait()?.success(),
+        "same-name endpoint creation failed"
+    );
+    Ok(serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        original.name(),
+        "-o",
+        "json",
+    ])?)?)
+}
+
+fn scale_up_cancellation_failure_and_retry(
+    cluster: &SwitchoverCluster,
+) -> Result<Vec<(String, String)>> {
+    reset_scale_set_with_delay(cluster, 1, 3)?;
+    let start = scale_ready(cluster, 1, Instant::now() + Duration::from_secs(180))?;
+    let primary = exact_member(
+        &start,
+        topology_primary_id(&start).context("singleton primary")?,
+    )?
+    .clone();
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let mut writer = DirectClient::connect(cluster, &cluster.pod(&primary)?, deadline)?;
+    let mut acknowledged = Vec::new();
+    write_direct(&mut writer, &mut acknowledged, "before-cancellation")?;
+
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 2)?;
+    let mut stages = std::collections::BTreeSet::new();
+    loop {
+        let step = manual_live_step(cluster, deadline)?;
+        if let Some(stage) = scale_up_stage(&step.plan) {
+            stages.insert(stage);
+        }
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["transition"]["scaleUp"].is_object()
+            && status["status"]["scaleUpAdmissionStarted"].is_null()
+        {
+            break;
+        }
+        poll(deadline, "pre-PC scale-up cancellation boundary")?;
+    }
+    let old = exact_replica_resources(cluster, 2)?;
+    let old_uids = old
+        .iter()
+        .map(|resource| (resource.kind, resource.uid().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let endpoint = old
+        .iter()
+        .find(|resource| resource.kind == "service")
+        .context("candidate endpoint")?
+        .clone();
+    patch_replicas(cluster, 1)?;
+    let mut replacement = None;
+    loop {
+        let step = manual_live_step(cluster, deadline)?;
+        if let Some(stage) = scale_up_stage(&step.plan) {
+            stages.insert(stage.clone());
+            if stage == "delete-Endpoint" && replacement.is_none() {
+                ensure!(
+                    endpoint.get(cluster)?.is_none(),
+                    "frozen endpoint delete did not complete"
+                );
+                let object = create_same_name_endpoint(cluster, &endpoint)?;
+                ensure!(
+                    object["metadata"]["uid"].as_str() != Some(endpoint.uid()),
+                    "same-name endpoint reused the frozen UID"
+                );
+                replacement = Some(object);
+            }
+        }
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["scaleUpAllocation"].is_null()
+            && status["status"]["scaleUpCleanup"].is_null()
+            && status["status"]["provisioning"].is_null()
+            && status["status"]["transition"].is_null()
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == 1)
+        {
+            break;
+        }
+        poll(deadline, "exact pre-PC cancellation cleanup")?;
+    }
+    let replacement = replacement.context("same-name endpoint race was not exercised")?;
+    let live: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        endpoint.name(),
+        "-o",
+        "json",
+    ])?)?;
+    ensure!(
+        live["metadata"]["uid"] == replacement["metadata"]["uid"],
+        "cleanup deleted a different-UID same-name endpoint"
+    );
+    cluster.kubectl(&[
+        "-n",
+        "default",
+        "delete",
+        "service",
+        endpoint.name(),
+        "--wait=true",
+        "--timeout=60s",
+    ])?;
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+
+    patch_replicas(cluster, 2)?;
+    let stable = scale_ready(cluster, 2, deadline)?;
+    let fresh = exact_replica_resources(cluster, 2)?;
+    for resource in &fresh {
+        if let Some(old_uid) = old_uids.get(resource.kind) {
+            ensure!(
+                resource.uid() != old_uid,
+                "retry reused frozen {} UID {}",
+                resource.kind,
+                old_uid
+            );
+        }
+    }
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+
+    // Delete an initialized, unadmitted candidate and require exact cleanup plus
+    // a fresh automatic retry rather than partial-PVC adoption.
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 3)?;
+    let failed = loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["provisioning"]["purpose"]["scaleUp"].is_object()
+            && status["status"]["transition"].is_null()
+            && let Ok(resources) = exact_replica_resources(cluster, 3)
+        {
+            break resources;
+        }
+        poll(
+            deadline,
+            "unadmitted candidate before injected disappearance",
+        )?;
+    };
+    let failed_uids = failed
+        .iter()
+        .map(|resource| (resource.kind, resource.uid().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let failed_member = json!({
+        "replicaId":3,
+        "instanceId":failed.iter().find(|resource| resource.kind == "pod").unwrap().uid(),
+        "agentGeneration":"unadmitted"
+    });
+    cluster.delete_exact_pod(&failed_member)?;
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+    let stable = scale_ready(cluster, 3, deadline)?;
+    let retry = exact_replica_resources(cluster, 3)?;
+    for resource in &retry {
+        if let Some(old_uid) = failed_uids.get(resource.kind) {
+            ensure!(
+                resource.uid() != old_uid,
+                "failed-candidate retry reused {} UID {}",
+                resource.kind,
+                old_uid
+            );
+        }
+    }
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+    ensure!(
+        stages.contains("delete-Endpoint")
+            && stages.contains("delete-Pod")
+            && stages.contains("delete-Pvc"),
+        "cancellation did not exercise ordered endpoint/Pod/PVC cleanup: {stages:?}"
+    );
+    eprintln!("scale-up cancellation/failure cleanup and fresh retry PASS: stages={stages:?}");
+    Ok(acknowledged)
+}
+
+fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(String, String)>> {
+    reset_scale_set_with_delay(cluster, 3, 3)?;
+    let start = scale_ready(cluster, 3, Instant::now() + Duration::from_secs(180))?;
+    let old_primary_id = topology_primary_id(&start).context("starting primary")?;
+    let old_primary = exact_member(&start, old_primary_id)?.clone();
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let mut writer = DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
+    let mut acknowledged = Vec::new();
+    write_direct(
+        &mut writer,
+        &mut acknowledged,
+        "before-pre-admission-failover",
+    )?;
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 4)?;
+    let mut partition = None;
+    let mut candidate_restarted = false;
+    let mut old_candidate = None;
+    loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        let reason = scale_up_progress_condition(&status)
+            .and_then(|condition| condition["reason"].as_str())
+            .unwrap_or_default();
+        if reason == "ScaleUpCopying" && partition.is_none() && !candidate_restarted {
+            old_candidate = Some(exact_replica_resources(cluster, 4)?);
+            partition = Some(cluster.partition_replication(4)?);
+        }
+        if status["status"]["transition"]["scaleUp"].is_object()
+            && status["status"]["scaleUpAdmissionStarted"].is_null()
+            && candidate_restarted
+        {
+            break;
+        }
+        let step = manual_live_step(cluster, deadline)?;
+        if scale_up_stage(&step.plan).as_deref() == Some("build")
+            && partition.is_some()
+            && !candidate_restarted
+        {
+            write_direct(&mut writer, &mut acknowledged, "during-blocked-copy")?;
+            let candidate_session = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 4)?
+                ["processSession"]
+                .clone();
+            kill_replica_process(&cluster.kubeconfig, &cluster.context, 4)?;
+            wait_process_session_change(cluster, 4, &candidate_session, deadline)?;
+            // Do not restart the accepted source while its outbound copy channel
+            // is deliberately partitioned: source startup reconstructs and
+            // retries that durable channel before exposing the application API.
+            partition
+                .take()
+                .context("copy partition disappeared before healing")?
+                .heal()?;
+            let source_session = writer.report()?["processSession"].clone();
+            kill_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+            wait_process_session_change(cluster, old_primary_id, &source_session, deadline)?;
+            check_old_session_response(writer.request(
+                "PUT",
+                "/kv/stale-copy-source-session",
+                "forbidden",
+            ))?;
+            writer = DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
+            write_direct(&mut writer, &mut acknowledged, "after-copy-restarts")?;
+            candidate_restarted = true;
+        }
+        poll(deadline, "restarted copy through pre-admission boundary")?;
+    }
+    let old_candidate = old_candidate.context("copy partition boundary was not exercised")?;
+    let old_uids = old_candidate
+        .iter()
+        .map(|resource| (resource.kind, resource.uid().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let suspension =
+        suspend_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+    let new_primary = loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if topology_primary_id(&status).is_some_and(|primary| primary != old_primary_id)
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == 3)
+        {
+            break topology_primary_id(&status).unwrap();
+        }
+        poll(deadline, "ordinary failover before scale-up admission")?;
+    };
+    // Hold the newer desired increase while the unavailable former primary
+    // returns and is corrected to the accepted failover epoch. Otherwise a
+    // fresh scale-up transition would make that intentionally stale report
+    // invalid before ordinary accepted-authority repair can run.
+    patch_replicas(cluster, 3)?;
+    drop(suspension);
+    loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        let accepted = &status["status"]["topology"]["configurationId"];
+        let converged = status["status"]["transition"].is_null()
+            && status["status"]["provisioning"].is_null()
+            && status["status"]["scaleUpAllocation"].is_null()
+            && status["status"]["scaleUpCleanup"].is_null()
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| {
+                    members.iter().all(|member| {
+                        cluster.report(member).is_ok_and(|report| {
+                            report["currentConfiguration"] == *accepted
+                                && report["previousConfiguration"].is_null()
+                                && report["pendingOperation"].is_null()
+                        })
+                    })
+                });
+        if converged {
+            break;
+        }
+        poll(
+            deadline,
+            "former-primary correction before fresh scale-up retry",
+        )?;
+    }
+    patch_replicas(cluster, 4)?;
+    let fresh = loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["provisioning"]["purpose"]["scaleUp"].is_object()
+            && status["status"]["transition"].is_null()
+            && let Ok(resources) = exact_replica_resources(cluster, 4)
+        {
+            break resources;
+        }
+        poll(deadline, "fresh post-failover scale-up retry provisioning")?;
+    };
+    for resource in &fresh {
+        if let Some(old_uid) = old_uids.get(resource.kind) {
+            ensure!(
+                resource.uid() != old_uid,
+                "pre-admission failover retry reused {} UID {}",
+                resource.kind,
+                old_uid
+            );
+        }
+    }
+    // The retry has proven a fresh incarnation. Return the desired count to the
+    // accepted failover topology before PC/CC so this subcase terminates in a
+    // stable service state without conflating it with the separate post-PC case.
+    patch_replicas(cluster, 3)?;
+    loop {
+        manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if status["status"]["transition"].is_null()
+            && status["status"]["provisioning"].is_null()
+            && status["status"]["scaleUpAllocation"].is_null()
+            && status["status"]["scaleUpCleanup"].is_null()
+            && status["status"]["topology"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == 3)
+        {
+            break;
+        }
+        poll(deadline, "fresh retry cancellation after failover proof")?;
+    }
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+    let stable = scale_ready(cluster, 3, deadline)?;
+    ensure!(
+        topology_primary_id(&stable) == Some(new_primary),
+        "retry cancellation changed the accepted failover primary"
+    );
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up pre-admission failover/restart PASS: primary {old_primary_id}->{new_primary}"
+    );
+    Ok(acknowledged)
+}
+
+fn scale_up_post_admission_recovery_and_replacement(
+    cluster: &SwitchoverCluster,
+) -> Result<Vec<(String, String)>> {
+    reset_scale_set_with_delay(cluster, 2, 3)?;
+    let start = scale_ready(cluster, 2, Instant::now() + Duration::from_secs(180))?;
+    let old_primary_id = topology_primary_id(&start).context("starting primary")?;
+    let old_primary = exact_member(&start, old_primary_id)?.clone();
+    let retained_secondary = start["status"]["topology"]["members"]
+        .as_array()
+        .context("starting members")?
+        .iter()
+        .find(|member| member["replicaId"].as_i64() != Some(old_primary_id))
+        .context("retained secondary")?
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let mut writer = DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
+    let mut acknowledged = Vec::new();
+    write_direct(&mut writer, &mut acknowledged, "before-post-pc-failover")?;
+    let pause = ControllerPause::new(cluster)?;
+    patch_replicas(cluster, 3)?;
+    let candidate_before = loop {
+        let step = manual_live_step(cluster, deadline)?;
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        let transition = &status["status"]["transition"]["scaleUp"];
+        if transition.is_object()
+            && status["status"]["scaleUpAdmissionStarted"].is_string()
+            && let Ok(candidate) = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 3)
+            && let Ok(retained) = cluster.report(&retained_secondary)
+            && let Ok(primary) = cluster.report(&old_primary)
+        {
+            let current = transition["currentConfiguration"]["configurationId"].clone();
+            let previous = transition["previousConfiguration"]["configurationId"].clone();
+            if candidate["previousConfiguration"] == previous
+                && candidate["currentConfiguration"] == current
+                && retained["previousConfiguration"] == previous
+                && retained["currentConfiguration"] == current
+                && primary["previousConfiguration"] == previous
+                && primary["currentConfiguration"] == current
+                && primary["pendingOperation"].is_null()
+            {
+                ensure!(
+                    scale_up_stage(&step.plan).is_some() || candidate["pendingOperation"].is_null(),
+                    "PC/CC boundary did not settle"
+                );
+                break candidate;
+            }
+        }
+        poll(
+            deadline,
+            "durable expanded PC/CC on candidate and retained secondary",
+        )?;
+    };
+    write_direct(&mut writer, &mut acknowledged, "during-pc-cc-admission")?;
+    let candidate_session = candidate_before["processSession"].clone();
+    kill_replica_process(&cluster.kubeconfig, &cluster.context, 3)?;
+    let candidate_after = wait_process_session_change(cluster, 3, &candidate_session, deadline)?;
+    ensure!(
+        candidate_after["previousConfiguration"] == candidate_before["previousConfiguration"]
+            && candidate_after["currentConfiguration"] == candidate_before["currentConfiguration"],
+        "candidate restart lost admitted PC/CC authority"
+    );
+    drop(pause);
+    wait_controller_ready(cluster, deadline)?;
+    let stable = scale_ready(cluster, 3, deadline)?;
+    ensure!(
+        topology_primary_id(&stable) == Some(old_primary_id),
+        "participant/controller recovery unexpectedly changed the healthy primary"
+    );
+    verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
+
+    let added_before = exact_member(&stable, 3)?.clone();
+    let old_resources = exact_replica_resources(cluster, 3)?;
+    cluster.delete_exact_pod(&added_before)?;
+    let replaced = loop {
+        let status = scale_ready(cluster, 3, deadline)?;
+        let member = exact_member(&status, 3)?;
+        if member["instanceId"] != added_before["instanceId"] {
+            break status;
+        }
+        poll(
+            deadline,
+            "post-completion replacement of the scaled-up member",
+        )?;
+    };
+    let fresh_resources = exact_replica_resources(cluster, 3)?;
+    for resource in &fresh_resources {
+        if let Some(old) = old_resources.iter().find(|old| old.kind == resource.kind) {
+            ensure!(
+                resource.uid() != old.uid(),
+                "post-completion replacement reused {} UID {}",
+                resource.kind,
+                old.uid()
+            );
+        }
+    }
+    verify_acknowledged(cluster, &replaced, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up post-PC candidate/controller recovery and member replacement PASS: \
+         primary={old_primary_id}"
+    );
+    Ok(acknowledged)
+}
+
+fn scale_down_then_restore_non_contiguous(cluster: &SwitchoverCluster) -> Result<()> {
+    reset_scale_set_with_delay(cluster, 3, 3)?;
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let stable = scale_ready(cluster, 3, deadline)?;
+    let primary = stable["status"]["topology"]["members"]
+        .as_array()
+        .context("restoration starting members")?
+        .iter()
+        .find(|member| member["role"] == "primary")
+        .context("restoration starting primary")?
+        .clone();
+    let mut writer = DirectClient::connect(cluster, &cluster.pod(&primary)?, deadline)?;
+    let mut acknowledged = Vec::new();
+    write_direct(
+        &mut writer,
+        &mut acknowledged,
+        "before-non-contiguous-restoration",
+    )?;
+    let target = exact_member(&stable, 3)?.clone();
+    if topology_primary_id(&stable) != Some(3) {
+        let request = format!(
+            "scale-up-restoration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        cluster.kubectl(&[
+            "-n",
+            "default",
+            "patch",
+            "kubericset",
+            "kvstore2",
+            "--type=merge",
+            "-p",
+            &json!({"spec":{"switchover":{"requestId":request,"targetReplicaId":3}}}).to_string(),
+        ])?;
+        loop {
+            let status = cluster.status()?;
+            if status_ready(&status)
+                && topology_primary_id(&status) == Some(3)
+                && status["status"]["lastSwitchover"]["requestId"] == request
+            {
+                break;
+            }
+            poll(
+                deadline,
+                "planned primary placement for non-contiguous restoration",
+            )?;
+        }
+        cluster.kubectl(&[
+            "-n",
+            "default",
+            "patch",
+            "kubericset",
+            "kvstore2",
+            "--type=merge",
+            "-p",
+            r#"{"spec":{"switchover":null}}"#,
+        ])?;
+        scale_ready(cluster, 3, deadline)?;
+    }
+    let old_two = exact_replica_resources(cluster, 2)?;
+    patch_replicas(cluster, 2)?;
+    let reduced = scale_ready(cluster, 2, deadline)?;
+    let ids = reduced["status"]["topology"]["members"]
+        .as_array()
+        .context("reduced members")?
+        .iter()
+        .map(|member| member["replicaId"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    ensure!(
+        ids == vec![1, 3],
+        "scale-down did not create the planned non-contiguous accepted topology: {ids:?}"
+    );
+    ensure!(
+        topology_primary_id(&reduced) == Some(3),
+        "scale-down changed the placed primary"
+    );
+    patch_replicas(cluster, 3)?;
+    let restored = scale_ready(cluster, 3, deadline)?;
+    let restored_two = exact_member(&restored, 2)?;
+    ensure!(
+        restored_two["role"] == "activeSecondary",
+        "restored gap was not admitted as an ActiveSecondary"
+    );
+    let fresh_two = exact_replica_resources(cluster, 2)?;
+    for resource in &fresh_two {
+        let old = old_two
+            .iter()
+            .find(|old| old.kind == resource.kind)
+            .context("old ordinal-2 resource")?;
+        ensure!(
+            resource.uid() != old.uid(),
+            "scale-down->scale-up restoration reused {} UID {}",
+            resource.kind,
+            old.uid()
+        );
+    }
+    ensure!(
+        target["replicaId"] == 3,
+        "restoration setup lost the exact primary target"
+    );
+    verify_acknowledged(cluster, &restored, &acknowledged, deadline)?;
+    eprintln!("scale-down->scale-up non-contiguous restoration PASS: [1,3] -> [1,2,3]");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn scale_up_adversarial() -> Result<()> {
+    run_switchover(|cluster| {
+        scale_up_cancellation_failure_and_retry(cluster)?;
+        scale_up_pre_admission_failover(cluster)?;
+        scale_up_post_admission_recovery_and_replacement(cluster)?;
+        scale_down_then_restore_non_contiguous(cluster)
+    })
 }
 
 #[test]

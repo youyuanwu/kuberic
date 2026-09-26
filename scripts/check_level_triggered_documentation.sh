@@ -169,16 +169,26 @@ recipes = (root / "justfile").read_text()
 workflow = (root / ".github/workflows/level-triggered-CI.yml").read_text()
 live_tests = (root / "kuberic-level-tests/src/level_triggered_k8s.rs").read_text()
 matrix = re.search(r"expanded\+=\(([^)]+)\)", recipes).group(1).split()
-for selector, test in (("scale-down", "scale_down"),
-                       ("scale-down-adversarial", "scale_down_adversarial")):
+for selector, test in (
+    ("scale-down", "scale_down"),
+    ("scale-down-adversarial", "scale_down_adversarial"),
+    ("scale-up", "scale_up"),
+    ("scale-up-multi", "scale_up_multi"),
+    ("scale-up-adversarial", "scale_up_adversarial"),
+):
     assert selector in matrix
     assert f'{selector}) test_name="level_triggered_k8s::{test}"' in recipes
     assert re.search(rf"fn {test}\(", live_tests)
-    for document in (guide, root / "examples/kvstore2/README.md",
-                     root / "docs/features/kuberic/testing.md"):
-        assert f"just level-triggered-kind-test {selector}" in document.read_text()
+    if selector.startswith("scale-down"):
+        for document in (guide, root / "examples/kvstore2/README.md",
+                         root / "docs/features/kuberic/testing.md"):
+            assert f"just level-triggered-kind-test {selector}" in document.read_text()
 assert "just level-triggered-kind-test scale-down" in workflow
 assert "just level-triggered-kind-test all" in workflow
+assert "just level-triggered-kind-test scale-up" in workflow
+assert "cargo test -p kvstore --test reconciler test_reconciler_scale_up -- --exact" in workflow
+assert "test_scale_up_replays_writes_buffered_during_copy -- --exact" in workflow
+assert "expanded+=(scale-up scale-up-multi scale-up-adversarial)" in recipes
 
 documents = [
     root / "README.md",
