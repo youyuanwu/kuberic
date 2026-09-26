@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api,
         EvaluationConfig {
             enable_secondary_scale_down: true,
+            allow_scale_up: false,
             supported_protocol_version: kuberic_protocol::PROTOCOL_VERSION,
             stable_resync_seconds: config.stable_resync_seconds,
             wait_requeue_seconds: config.wait_requeue_seconds,

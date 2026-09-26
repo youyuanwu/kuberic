@@ -58,6 +58,7 @@ message BuildStatus {
   int64 durable_lsn = 4;
   bool completed = 5;
   optional int64 catch_up_boundary_lsn = 6;
+  int64 replication_boundary_lsn = 7;
 }
 
 message SwitchoverHandoff {
@@ -276,6 +277,8 @@ message ScaleUpCleanup {
 message ScaleUpReceipt {
   ScaleUpIntent intent = 1;
   repeated ScaleUpWitness current_only_write_quorum = 2;
+  Configuration accepted_configuration = 3;
+  ScaleUpFailoverEvidence failover_evidence = 4;
 }
 
 message CleanupResourceIdentity {

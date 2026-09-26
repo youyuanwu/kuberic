@@ -156,6 +156,7 @@ fn build_report(
                 build_id: build.authority.build_id.to_string(),
                 target: Some(build.authority.target.into()),
                 last_sequence: build.last_sequence,
+                replication_boundary_lsn: build.authority.replication_boundary_lsn,
                 durable_lsn: build.durable_lsn,
                 completed: build.completed,
                 catch_up_boundary_lsn: build.catch_up_boundary_lsn,

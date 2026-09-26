@@ -181,16 +181,16 @@ pub fn validate_scale_up(intent: &ScaleUpIntent) -> Result {
 
 fn validate_witnesses(
     intent: &ScaleUpIntent,
+    reported_authority: &ConfigurationDescriptor,
     eligible_members: &ConfigurationDescriptor,
     witnesses: &[ScaleUpWitness],
     quorum: u32,
     previous_current: bool,
-    require_primary: bool,
+    required_primary: Option<&ReplicaIdentity>,
 ) -> Result {
     let mut identities = BTreeSet::new();
     for witness in witnesses {
-        let current_member = intent
-            .current_configuration
+        let current_member = reported_authority
             .members
             .iter()
             .find(|member| member.identity == witness.identity);
@@ -203,15 +203,16 @@ fn validate_witnesses(
                 .any(|member| member.identity == witness.identity)
             || current_member.is_none_or(|member| member.role != witness.role)
             || !identities.insert(witness.identity.clone())
-            || witness.epoch != intent.current_configuration.epoch
+            || witness.epoch != reported_authority.epoch
             || witness.previous_configuration_id.as_ref()
                 != previous_current.then_some(&intent.previous_configuration.configuration_id)
-            || witness.current_configuration_id != intent.current_configuration.configuration_id
+            || witness.current_configuration_id != reported_authority.configuration_id
             || witness.verified_replication_lsn < intent.catch_up_boundary_lsn
             || witness.pending_operation_id.is_some()
-            || (witness.write_status == AccessStatus::Granted && witness.identity != intent.primary)
+            || (witness.write_status == AccessStatus::Granted
+                && required_primary != Some(&witness.identity))
             || (!previous_current
-                && witness.identity == intent.primary
+                && required_primary == Some(&witness.identity)
                 && witness.write_status != AccessStatus::Granted)
             || witness.retained_operation_id.as_ref()
                 != Some(&intent.command_operation_id(
@@ -221,14 +222,14 @@ fn validate_witnesses(
                         ScaleUpStage::CurrentOnly
                     },
                     &witness.identity,
-                    &intent.current_configuration,
+                    reported_authority,
                 ))
         {
             return Err(invalid("invalid exact scale-up quorum witness"));
         }
     }
     if identities.len() < quorum as usize
-        || (require_primary && !identities.contains(&intent.primary))
+        || required_primary.is_some_and(|primary| !identities.contains(primary))
     {
         return Err(invalid("insufficient scale-up quorum witnesses"));
     }
@@ -239,19 +240,21 @@ pub fn validate_scale_up_failover_evidence(evidence: &ScaleUpFailoverEvidence) -
     validate_scale_up(&evidence.intent)?;
     validate_witnesses(
         &evidence.intent,
+        &evidence.intent.current_configuration,
         &evidence.intent.previous_configuration,
         &evidence.previous_read_quorum,
         evidence.intent.previous_policy.read_quorum,
         true,
-        false,
+        None,
     )?;
     validate_witnesses(
         &evidence.intent,
         &evidence.intent.current_configuration,
+        &evidence.intent.current_configuration,
         &evidence.current_read_quorum,
         evidence.intent.current_policy.read_quorum,
         true,
-        false,
+        None,
     )
 }
 
@@ -325,13 +328,39 @@ pub fn validate_scale_up_cleanup(cleanup: &ScaleUpCleanup) -> Result {
 
 pub fn validate_scale_up_receipt(receipt: &ScaleUpReceipt) -> Result {
     validate_scale_up(&receipt.intent)?;
+    let primary = receipt
+        .accepted_configuration
+        .members
+        .iter()
+        .find(|member| {
+            member.identity.replica_id == receipt.accepted_configuration.primary_id
+                && member.role == ReplicaRole::Primary
+        })
+        .ok_or_else(|| invalid("receipt accepted configuration has no primary"))?;
+    if let Some(evidence) = &receipt.failover_evidence {
+        if evidence.intent != receipt.intent {
+            return Err(invalid(
+                "receipt failover evidence belongs to another attempt",
+            ));
+        }
+        validate_scale_up_failover_transition(
+            evidence,
+            &receipt.accepted_configuration,
+            &receipt.intent.current_policy,
+        )?;
+    } else if receipt.accepted_configuration != receipt.intent.current_configuration {
+        return Err(invalid(
+            "ordinary receipt accepted configuration differs from scale-up intent",
+        ));
+    }
     validate_witnesses(
         &receipt.intent,
-        &receipt.intent.current_configuration,
+        &receipt.accepted_configuration,
+        &receipt.accepted_configuration,
         &receipt.current_only_write_quorum,
         receipt.intent.current_policy.write_quorum,
         false,
-        true,
+        Some(&primary.identity),
     )
 }
 
@@ -809,6 +838,8 @@ mod tests {
         let intent = intent(3);
         let provisioning = provisioning(&intent);
         let receipt = ScaleUpReceipt {
+            accepted_configuration: intent.current_configuration.clone(),
+            failover_evidence: None,
             current_only_write_quorum: intent
                 .current_configuration
                 .members
@@ -894,6 +925,8 @@ mod tests {
     fn receipt_witnesses_are_bound_to_the_exact_build_attempt() {
         let intent = intent(2);
         let mut receipt = ScaleUpReceipt {
+            accepted_configuration: intent.current_configuration.clone(),
+            failover_evidence: None,
             current_only_write_quorum: intent
                 .current_configuration
                 .members

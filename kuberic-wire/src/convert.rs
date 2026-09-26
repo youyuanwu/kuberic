@@ -279,6 +279,7 @@ pub fn normalize_agent_status_report(
                 .into_iter()
                 .map(|build| {
                     if build.build_id.is_empty()
+                        || build.replication_boundary_lsn < 0
                         || build.durable_lsn < 0
                         || build
                             .catch_up_boundary_lsn
@@ -296,6 +297,7 @@ pub fn normalize_agent_status_report(
                             .ok_or(WireError::MissingField("build_status.target"))?
                             .try_into()?,
                         last_sequence: build.last_sequence,
+                        replication_boundary_lsn: build.replication_boundary_lsn,
                         durable_lsn: build.durable_lsn,
                         completed: build.completed,
                         catch_up_boundary_lsn: build.catch_up_boundary_lsn,

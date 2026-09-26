@@ -19,12 +19,15 @@ use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
 
 mod replacement_cleanup;
+mod scale_up;
 mod secondary_scale_down;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluationConfig {
     /// Requires exact-resource observation, session-fenced dispatch, and cleanup effects.
     pub enable_secondary_scale_down: bool,
+    /// Pure evaluator support only. Production remains disabled until Phase 5 wiring is complete.
+    pub allow_scale_up: bool,
     pub supported_protocol_version: u32,
     pub stable_resync_seconds: u64,
     pub wait_requeue_seconds: u64,
@@ -35,6 +38,7 @@ impl Default for EvaluationConfig {
     fn default() -> Self {
         Self {
             enable_secondary_scale_down: false,
+            allow_scale_up: false,
             supported_protocol_version: crate::PROTOCOL_VERSION,
             stable_resync_seconds: 30,
             wait_requeue_seconds: 5,
@@ -137,7 +141,7 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             changes: vec![KubernetesChange::EnsureReplicaSupport],
         };
     }
-    if snapshot.status.scale_up_cleanup.is_some()
+    let scale_up_authority_present = snapshot.status.scale_up_cleanup.is_some()
         || snapshot.status.last_scale_up.is_some()
         || snapshot
             .status
@@ -156,8 +160,8 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
                 &replica.agent,
                 AgentObservation::Report(report) if report.scale_up_intent.is_some()
             )
-        })
-    {
+        });
+    if !config.allow_scale_up && scale_up_authority_present {
         return Plan::Wait {
             reason: WaitReason::ActiveTransition,
             status: snapshot
@@ -171,6 +175,12 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         };
     }
 
+    if config.allow_scale_up
+        && let Some(plan) = scale_up::recover_local_acceptance(snapshot, config)
+    {
+        return plan;
+    }
+
     if let Some(plan) = secondary_scale_down::recover_local_acceptance(snapshot, config) {
         return plan;
     }
@@ -180,6 +190,11 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     }
 
     if let Some(transition) = &snapshot.status.transition {
+        if config.allow_scale_up
+            && (transition.scale_up.is_some() || transition.scale_up_failover.is_some())
+        {
+            return scale_up::transition(snapshot, transition, config);
+        }
         if matches!(
             transition.kind,
             TransitionKind::Replacement | TransitionKind::Failover
@@ -199,10 +214,19 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     }
 
     if let Some(provisioning) = &snapshot.status.provisioning {
+        if config.allow_scale_up && provisioning.scale_up().is_some() {
+            return scale_up::provisioning(snapshot, provisioning, config);
+        }
         if snapshot.status.pending_replacement_cleanup.is_none() {
             return replacement_cleanup::waiting(snapshot, config);
         }
         return evaluate_provisioning(snapshot, provisioning, config);
+    }
+
+    if config.allow_scale_up
+        && let Some(cleanup) = &snapshot.status.scale_up_cleanup
+    {
+        return scale_up::cleanup(snapshot, cleanup, config);
     }
 
     if let Some(cleanup) = &snapshot.status.secondary_scale_down_cleanup {
@@ -237,13 +261,20 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         .expect("validated initialized status has effective policy");
     let (spec_fully_observed, unsupported) = desired_spec_state(snapshot, configuration, policy);
     if let Some(mut condition) = unsupported {
-        if config.enable_secondary_scale_down
+        let enabled_scale_up_count_drift = config.allow_scale_up
+            && condition.reason == "ReplicaCountImmutable"
+            && snapshot.desired.replicas > policy.replica_set_size;
+        if enabled_scale_up_count_drift {
+            status = status.without_condition("UnsupportedSpec");
+        } else if config.enable_secondary_scale_down
             && condition.reason == "ReplicaCountImmutable"
             && snapshot.desired.replicas > policy.replica_set_size
         {
             condition.reason = "ScaleUpUnsupported".into();
+            status = status.with_condition(condition);
+        } else {
+            status = status.with_condition(condition);
         }
-        status = status.with_condition(condition);
     } else if spec_fully_observed {
         status.observed_generation = snapshot.desired.generation;
     }
@@ -474,6 +505,11 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
 
     if status.pending_replacement_cleanup.is_some() {
         return replacement_cleanup::waiting(snapshot, config);
+    }
+    if config.allow_scale_up
+        && let Some(plan) = scale_up::begin(snapshot, status.clone(), config)
+    {
+        return plan;
     }
     status = status.without_condition("UnmanagedReplicaResources");
     if let Some(extra) = snapshot.replicas.iter().find_map(|(key, observation)| {

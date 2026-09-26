@@ -297,6 +297,8 @@ impl From<ScaleUpReceipt> for proto::ScaleUpReceipt {
     fn from(value: ScaleUpReceipt) -> Self {
         Self {
             intent: Some(value.intent.into()),
+            accepted_configuration: Some(value.accepted_configuration.into()),
+            failover_evidence: value.failover_evidence.map(Into::into),
             current_only_write_quorum: value
                 .current_only_write_quorum
                 .into_iter()
@@ -312,6 +314,12 @@ impl TryFrom<proto::ScaleUpReceipt> for ScaleUpReceipt {
     fn try_from(value: proto::ScaleUpReceipt) -> Result<Self, Self::Error> {
         let receipt = Self {
             intent: required(value.intent, "scale_up_receipt.intent")?.try_into()?,
+            accepted_configuration: required(
+                value.accepted_configuration,
+                "scale_up_receipt.accepted_configuration",
+            )?
+            .try_into()?,
+            failover_evidence: value.failover_evidence.map(TryInto::try_into).transpose()?,
             current_only_write_quorum: value
                 .current_only_write_quorum
                 .into_iter()
@@ -743,6 +751,8 @@ mod tests {
         assert_eq!(ScaleUpCleanup::try_from(wire).unwrap(), cleanup);
 
         let receipt = ScaleUpReceipt {
+            accepted_configuration: intent.current_configuration.clone(),
+            failover_evidence: None,
             current_only_write_quorum: vec![
                 witness(&intent, intent.primary.clone(), false, 2),
                 witness(&intent, intent.target.clone(), false, 3),

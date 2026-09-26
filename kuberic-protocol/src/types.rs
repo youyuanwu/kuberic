@@ -924,6 +924,9 @@ pub struct ScaleUpCleanup {
 /// One bounded completed-addition proof retained for late local convergence.
 pub struct ScaleUpReceipt {
     pub intent: ScaleUpIntent,
+    pub accepted_configuration: ConfigurationDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover_evidence: Option<ScaleUpFailoverEvidence>,
     pub current_only_write_quorum: Vec<ScaleUpWitness>,
 }
 

@@ -6,6 +6,10 @@ use scale_down_model::fixture as scale_down_fixture;
 #[path = "support/scale_down_model.rs"]
 mod scale_down_model;
 
+#[allow(dead_code)]
+#[path = "support/scale_up_model.rs"]
+mod scale_up_model;
+
 #[test]
 fn scale_down_commit_boundary_rejects_generated_primary_evidence_corruption() {
     use scale_down_model::Model;
@@ -1775,7 +1779,7 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::plan::{Plan, UnsafeReason, WaitReason};
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverIntent,
+    ConfigurationMember, EffectivePolicy, Epoch, FaultType, OperationId, PlannedSwitchoverIntent,
     PlannedSwitchoverOutcome, PlannedSwitchoverReceipt, PlannedSwitchoverRequest,
     PlannedSwitchoverResolution, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
     PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole,
@@ -5662,6 +5666,7 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
             build_id: first_repair.operation_id.clone(),
             target: first_target.clone(),
             last_sequence: 1,
+            replication_boundary_lsn: 0,
             durable_lsn: 20,
             completed: true,
             catch_up_boundary_lsn: None,
@@ -6592,6 +6597,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
             build_id: provisioning.operation_id.clone(),
             target: target.clone(),
             last_sequence: 1,
+            replication_boundary_lsn: 0,
             durable_lsn: 5,
             completed: true,
             catch_up_boundary_lsn: None,
@@ -7472,4 +7478,436 @@ fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
     let transition = transition.expect("superseded transition");
     assert_ne!(transition.current_configuration.members[1].identity, old);
     assert_eq!(transition.current_configuration.epoch, Epoch::new(0, 2));
+}
+
+#[test]
+fn scale_up_converges_sequentially_for_supported_cardinalities() {
+    use scale_up_model::Model;
+    for (accepted, desired) in [(1, 2), (2, 3), (3, 4)] {
+        let mut model = Model::new(accepted, desired);
+        model.run(80);
+        assert_eq!(model.accepted_count(), desired);
+        assert_eq!(model.accepted_history, vec![accepted, desired]);
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.status.provisioning.is_none());
+        assert!(model.snapshot.status.last_scale_up.is_some());
+    }
+
+    let mut sequential = Model::new(1, 3);
+    sequential.run(160);
+    assert_eq!(sequential.accepted_history, vec![1, 2, 3]);
+}
+
+#[test]
+fn scale_up_cancellation_and_failed_build_freeze_exact_cleanup() {
+    use scale_up_model::Model;
+    let mut cancelled = Model::new(1, 2);
+    while cancelled.snapshot.status.provisioning.is_none() {
+        cancelled.step();
+    }
+    cancelled.snapshot.desired.replicas = 1;
+    let Plan::Apply { changes } = cancelled.plan() else {
+        panic!("cancellation must persist exact cleanup");
+    };
+    let status = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(*status),
+        _ => None,
+    });
+    let status = status.expect("cleanup status");
+    assert!(status.provisioning.is_none());
+    assert!(status.scale_up_cleanup.is_some());
+    assert_eq!(
+        status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .len(),
+        1
+    );
+
+    let mut failed = Model::new(2, 3);
+    while failed.snapshot.status.provisioning.is_none() {
+        failed.step();
+    }
+    let target = failed
+        .snapshot
+        .status
+        .provisioning
+        .as_ref()
+        .unwrap()
+        .target_identity(&failed.snapshot.resource_uid);
+    let observation = failed
+        .snapshot
+        .observation_for_identity(&target)
+        .cloned()
+        .unwrap();
+    let mut report = AgentReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: failed.snapshot.resource_uid.clone(),
+        identity: target.clone(),
+        process_session_id: ProcessSessionId::new("failed-candidate"),
+        report_sequence: 2,
+        role: ReplicaRole::IdleSecondary,
+        healthy: false,
+        reported_fault: Some(FaultType::Permanent),
+        ..Default::default()
+    };
+    report.write_status = AccessStatus::NotPrimary;
+    failed
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            target.replica_id,
+            target.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Report(Box::new(report));
+    assert!(observation.kubernetes.is_some());
+    assert!(matches!(
+        failed.plan(),
+        Plan::Apply { changes }
+            if changes.iter().any(|change| matches!(
+                change,
+                KubernetesChange::PersistStatus { status }
+                    if status.scale_up_cleanup.is_some()
+            ))
+    ));
+}
+
+#[test]
+fn scale_up_primary_loss_before_and_after_pc_cc_follow_distinct_paths() {
+    use scale_up_model::Model;
+    let mut before = Model::new(2, 3);
+    while before.snapshot.status.provisioning.is_none() {
+        before.step();
+    }
+    let primary = before
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .primary_id;
+    before.report_mut(primary.value()).reported_fault = Some(FaultType::Permanent);
+    assert!(matches!(
+        before.plan(),
+        Plan::Apply { changes }
+            if changes.iter().any(|change| matches!(
+                change,
+                KubernetesChange::PersistStatus { status }
+                    if status.scale_up_cleanup.is_some()
+                        && status.primary_failure.is_some()
+            ))
+    ));
+
+    let mut after = Model::new(2, 3);
+    loop {
+        let plan = after.plan();
+        let pc_cc_primary_installed = after
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                after
+                    .snapshot
+                    .observation_for_identity(&intent.primary)
+                    .and_then(|observation| match &observation.agent {
+                        AgentObservation::Report(report) => Some(report),
+                        _ => None,
+                    })
+                    .is_some_and(|report| report.previous_configuration.is_some())
+            });
+        if pc_cc_primary_installed {
+            break;
+        }
+        match plan {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    after.apply(change);
+                }
+            }
+            Plan::Execute { command } => after.execute(command),
+            other => panic!("unexpected pre-PC/CC plan: {other:?}"),
+        }
+    }
+    after.report_mut(1).reported_fault = Some(FaultType::Permanent);
+    after.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    let Plan::Apply { changes } = after.plan() else {
+        panic!("post-PC/CC primary loss must persist carried failover");
+    };
+    let status = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(*status),
+        _ => None,
+    });
+    let status = status.expect("failover status");
+    assert!(status.scale_up_cleanup.is_none());
+    assert!(
+        status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up_failover.is_some())
+    );
+    after.snapshot.status = status;
+    for _ in 0..40 {
+        match after.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    after.apply(change);
+                }
+            }
+            Plan::Execute { command } => after.execute(command),
+            Plan::Wait { status, .. } => after.snapshot.status = status,
+            Plan::Stable { status, .. } => after.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("carried failover became unsafe: {reason:?}"),
+        }
+        if after.accepted_count() == 3 && after.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(after.accepted_count(), 3, "{:?}", after.plan());
+    assert!(after.snapshot.status.transition.is_none());
+}
+
+#[test]
+fn scale_up_commits_degraded_without_candidate_and_blocks_the_next_addition() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 4);
+    let mut candidate_current_only = None;
+    for _ in 0..100 {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only
+                && command.local_replica_id
+                    == model
+                        .snapshot
+                        .status
+                        .transition
+                        .as_ref()
+                        .and_then(|transition| transition.scale_up.as_deref())
+                        .unwrap()
+                        .target
+                        .replica_id =>
+            {
+                candidate_current_only =
+                    Some(ProtocolCommand::EnsureConfiguration(command.clone()));
+                model.remove_candidate_report();
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.snapshot.status = status,
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("unexpected unsafe plan: {reason:?}"),
+        }
+        if model.accepted_count() == 3 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 3);
+    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+    assert!(model.snapshot.status.last_scale_up.is_some());
+    assert!(matches!(model.plan(), Plan::Wait { status, .. }
+        if status.conditions.iter().any(|condition| condition.reason == "ScaleUpCommittedDegraded")));
+
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let target = receipt.intent.target.clone();
+    let key = ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+    model.snapshot.replicas.get_mut(&key).unwrap().agent =
+        AgentObservation::Report(Box::new(AgentReport {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: model.snapshot.resource_uid.clone(),
+            identity: target,
+            process_session_id: ProcessSessionId::new("candidate-returned"),
+            report_sequence: 10,
+            role: ReplicaRole::ActiveSecondary,
+            read_status: AccessStatus::Granted,
+            write_status: AccessStatus::NotPrimary,
+            healthy: true,
+            epoch: receipt.intent.current_configuration.epoch,
+            previous_configuration: Some(receipt.intent.previous_configuration.clone()),
+            current_configuration: Some(receipt.intent.current_configuration.clone()),
+            current_progress: 10,
+            verified_replication_lsn: Some(10),
+            committed_lsn: 10,
+            scale_up_intent: Some(Box::new(receipt.intent.clone())),
+            ..Default::default()
+        }));
+    model.execute(candidate_current_only.expect("candidate correction command"));
+    assert!(!matches!(model.plan(), Plan::Wait { status, .. }
+        if status.conditions.iter().any(|condition| condition.reason == "ScaleUpCommittedDegraded")));
+}
+
+#[test]
+fn scale_up_restores_next_ordinal_with_fresh_deterministic_identity() {
+    use scale_up_model::Model;
+    let mut first = Model::new(2, 3);
+    let mut replay = Model::new(2, 3);
+    while first.snapshot.status.provisioning.is_none() {
+        first.step();
+        replay.step();
+    }
+    let left = first.snapshot.status.provisioning.as_ref().unwrap();
+    let right = replay.snapshot.status.provisioning.as_ref().unwrap();
+    assert_eq!(left, right);
+    assert_eq!(left.replica_id(), ReplicaId::new(3));
+    assert_eq!(
+        left.target_identity(&first.snapshot.resource_uid)
+            .instance_id,
+        ReplicaInstanceId::new("candidate-pod-3")
+    );
+    assert_ne!(
+        left.target_identity(&first.snapshot.resource_uid)
+            .agent_generation,
+        AgentGeneration::new("accepted-generation-3")
+    );
+}
+
+#[test]
+fn scale_up_desired_reduction_after_pc_cc_finishes_frozen_authority() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    loop {
+        let started = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                model.snapshot.replicas.values().any(|observation| {
+                    matches!(&observation.agent,
+                        AgentObservation::Report(report)
+                            if report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration))
+                })
+            });
+        if started {
+            break;
+        }
+        model.step();
+    }
+    model.snapshot.desired.replicas = 2;
+    for _ in 0..40 {
+        model.step();
+        if model.accepted_count() == 3 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 3);
+    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+}
+
+#[test]
+fn scale_up_rejects_mutated_source_receiver_boundaries_and_reports_diagnostics() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    while model.snapshot.status.provisioning.is_none() {
+        model.step();
+    }
+    let condition = model
+        .snapshot
+        .status
+        .conditions
+        .iter()
+        .find(|condition| condition.reason == "ScaleUpProvisioningAccepted")
+        .unwrap();
+    for field in ["accepted=1", "desired=2", "phase=provisioning", "attempt="] {
+        assert!(
+            condition.message.contains(field),
+            "{field}: {}",
+            condition.message
+        );
+    }
+    loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => {
+                model.execute(ProtocolCommand::EnsureReplicaBuild(command));
+                break;
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            other => panic!("unexpected build preparation plan: {other:?}"),
+        }
+    }
+    let target = model
+        .snapshot
+        .status
+        .provisioning
+        .as_ref()
+        .unwrap()
+        .target_identity(&model.snapshot.resource_uid);
+    let AgentObservation::Report(target_report) = &mut model
+        .snapshot
+        .observation_for_identity(&target)
+        .cloned()
+        .unwrap()
+        .agent
+    else {
+        unreachable!()
+    };
+    let mut broken = (**target_report).clone();
+    broken.builds[0].replication_boundary_lsn += 1;
+    model
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            target.replica_id,
+            target.instance_id,
+        ))
+        .unwrap()
+        .agent = AgentObservation::Report(Box::new(broken));
+    assert!(matches!(
+        model.plan(),
+        Plan::Unsafe {
+            reason: UnsafeReason::ContradictoryReplicaEvidence(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scale_up_late_retained_member_blocks_receipt_supersession() {
+    use scale_up_model::Model;
+    let mut model = Model::new(1, 2);
+    model.run(80);
+    model.snapshot.desired.replicas = 3;
+    model.snapshot.desired.generation += 1;
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let retained = receipt.intent.primary.clone();
+    let report = model.report_mut(retained.replica_id.value());
+    report.previous_configuration = Some(receipt.intent.previous_configuration.clone());
+    report.current_configuration = Some(receipt.intent.current_configuration.clone());
+    report.epoch = receipt.intent.current_configuration.epoch;
+    report.retained_operation_id = Some(receipt.intent.command_operation_id(
+        kuberic_protocol::types::ScaleUpStage::PreviousCurrent,
+        &retained,
+        &receipt.intent.current_configuration,
+    ));
+    assert!(matches!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command)
+        } if command.current_only
+            && command.local_replica_id == retained.replica_id
+            && command.scale_up_evidence.as_ref().is_some_and(|evidence|
+                evidence.intent() == &receipt.intent)
+    ));
+    assert!(model.snapshot.status.provisioning.is_none());
 }

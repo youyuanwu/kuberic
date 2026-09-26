@@ -16,6 +16,25 @@ use kuberic_protocol::types::{
 };
 use kuberic_protocol::validation::{ValidationError, validate_snapshot, validate_status};
 
+#[allow(dead_code)]
+#[path = "support/scale_up_model.rs"]
+mod scale_up_model;
+
+#[test]
+fn scale_up_model_is_level_triggered_sequential_and_restart_deterministic() {
+    let mut model = scale_up_model::Model::new(1, 3);
+    for _ in 0..160 {
+        let replayed = model.snapshot.clone();
+        let first = model.plan();
+        assert_eq!(first, evaluate(&replayed, &scale_up_model::config()));
+        if model.step() && model.accepted_count() == 3 {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_history, vec![1, 2, 3]);
+    assert_eq!(model.accepted_count(), 3);
+}
+
 fn identity(replica_id: i64, incarnation: u64) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(replica_id),

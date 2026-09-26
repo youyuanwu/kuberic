@@ -453,26 +453,20 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                     validate_configuration(current, None)?;
                 }
                 if let Some(reported) = report.scale_up_intent.as_deref() {
-                    let authorized = snapshot
-                        .status
-                        .transition
-                        .as_ref()
-                        .and_then(|transition| {
-                            transition.scale_up.as_deref().or_else(|| {
-                                transition
-                                    .scale_up_failover
-                                    .as_deref()
-                                    .map(|evidence| &evidence.intent)
-                            })
-                        })
-                        .or_else(|| {
-                            snapshot
-                                .status
-                                .last_scale_up
+                    let active = snapshot.status.transition.as_ref().and_then(|transition| {
+                        transition.scale_up.as_deref().or_else(|| {
+                            transition
+                                .scale_up_failover
                                 .as_deref()
-                                .map(|receipt| &receipt.intent)
-                        });
-                    if authorized != Some(reported) {
+                                .map(|evidence| &evidence.intent)
+                        })
+                    });
+                    let completed = snapshot
+                        .status
+                        .last_scale_up
+                        .as_deref()
+                        .map(|receipt| &receipt.intent);
+                    if active != Some(reported) && completed != Some(reported) {
                         return Err(ValidationError::InvalidScaleUp(
                             "reported scale-up attempt differs from persisted authority",
                         ));
@@ -525,6 +519,7 @@ pub fn validate_report_internal(
             || build.target.replica_id.value() <= 0
             || build.target.instance_id.is_empty()
             || build.target.agent_generation.is_empty()
+            || build.replication_boundary_lsn < 0
             || build.durable_lsn < 0
             || build
                 .catch_up_boundary_lsn
@@ -822,8 +817,8 @@ fn validate_report_authority(
             "preparation differs from frozen admission boundary",
         ));
     }
-    let provisioning =
-        snapshot.status.provisioning.as_ref().is_some_and(|intent| {
+    let provisioning = snapshot.status.transition.is_none()
+        && snapshot.status.provisioning.as_ref().is_some_and(|intent| {
             intent.target_identity(&snapshot.resource_uid) == report.identity
         });
     if provisioning {
@@ -1235,9 +1230,9 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     if let Some(receipt) = &status.last_scale_up {
         validate_scale_up_receipt(receipt)?;
         if status.topology.as_ref().is_none_or(|topology| {
-            topology.configuration.epoch < receipt.intent.current_configuration.epoch
-                || (topology.configuration.epoch == receipt.intent.current_configuration.epoch
-                    && (topology.configuration != receipt.intent.current_configuration
+            topology.configuration.epoch < receipt.accepted_configuration.epoch
+                || (topology.configuration.epoch == receipt.accepted_configuration.epoch
+                    && (topology.configuration != receipt.accepted_configuration
                         || status.effective_policy.as_ref()
                             != Some(&receipt.intent.current_policy)))
         }) {
@@ -1283,8 +1278,33 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     if let Some(policy) = &status.effective_policy {
         validate_policy(policy)?;
     }
-    if status.provisioning.is_some() && status.transition.is_some() {
-        return Err(ValidationError::ProvisioningAndTransition);
+    if let (Some(provisioning), Some(transition)) =
+        (status.provisioning.as_ref(), status.transition.as_ref())
+    {
+        let intent = transition.scale_up.as_deref().or_else(|| {
+            transition
+                .scale_up_failover
+                .as_deref()
+                .map(|evidence| &evidence.intent)
+        });
+        let retained_scale_up_provenance = intent.is_some_and(|intent| {
+            provisioning.scale_up().is_some_and(|frozen| {
+                frozen.resource_uid == intent.resource_uid
+                    && frozen.spec_generation == intent.spec_generation
+                    && frozen.desired_replicas == intent.desired_replicas
+                    && frozen.previous_configuration == intent.previous_configuration
+                    && frozen.previous_policy == intent.previous_policy
+                    && frozen.current_policy == intent.current_policy
+                    && provisioning.target_identity(&intent.resource_uid) == intent.target
+                    && provisioning
+                        .scale_up_build_id(&intent.resource_uid)
+                        .as_ref()
+                        == Some(&intent.build_id)
+            })
+        });
+        if !retained_scale_up_provenance {
+            return Err(ValidationError::ProvisioningAndTransition);
+        }
     }
     if status.provisioning.is_some() && (!status.initialized || status.topology.is_none()) {
         return Err(ValidationError::ProvisioningWithoutTopology);

@@ -115,6 +115,7 @@ pub struct AgentBuildReport {
     pub build_id: OperationId,
     pub target: ReplicaIdentity,
     pub last_sequence: u64,
+    pub replication_boundary_lsn: i64,
     pub durable_lsn: i64,
     pub completed: bool,
     #[serde(default)]
