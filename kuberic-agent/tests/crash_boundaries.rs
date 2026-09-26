@@ -14,7 +14,7 @@ use kuberic_agent::coordinator::Coordinator;
 use kuberic_agent::hosting::{OutboundReplication, PodRuntime};
 use kuberic_agent::recovery::{RecoveryDecision, inspect_recovery, recover_pending};
 use kuberic_agent::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
-use kuberic_agent::service::SessionRegistry;
+use kuberic_agent::service::{AgentService, SessionRegistry};
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{
     AgentState, CoordinatorStage, EffectStage, SCHEMA_VERSION, StorageIdentity,
@@ -40,7 +40,7 @@ use kuberic_runtime::replicator::{DefaultReplicatorFactory, Replicator, Replicat
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
-    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+    DurableBuildProgress, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{
     OpenMode, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
@@ -281,10 +281,10 @@ impl RuntimeEffectExecutor for ScaleUpFailoverRuntime {
 fn scale_up_runtime_effect_boundary(action: &RuntimeEffectAction) -> Option<&'static str> {
     match action {
         RuntimeEffectAction::AdmitAuthority(_) => Some("authority"),
-        RuntimeEffectAction::SetAccessStatus {
-            read: AccessStatus::Granted,
-            write: AccessStatus::Granted,
-        } => Some("access"),
+        RuntimeEffectAction::AuthorizeFailoverPrefix(_) => Some("failover-prefix"),
+        RuntimeEffectAction::ChangeReplicatorRole(_) => Some("replicator-role"),
+        RuntimeEffectAction::ChangeApplicationRole(_) => Some("application-role"),
+        RuntimeEffectAction::SetAccessStatus { .. } => Some("access"),
         RuntimeEffectAction::RetireBuild(_) => Some("build-retirement"),
         _ => None,
     }
@@ -1165,7 +1165,7 @@ fn scale_up_crash_fixture(current_only: bool) -> (AgentState, EnsureConfiguratio
     };
     let mut intent = ScaleUpIntent {
         operation_id: OperationId::default(),
-        resource_uid,
+        resource_uid: resource_uid.clone(),
         spec_generation: 2,
         desired_replicas: 2,
         previous_configuration: previous.clone(),
@@ -1270,7 +1270,7 @@ fn scale_up_candidate_provisioning(intent: &ScaleUpIntent) -> ProvisioningIntent
 }
 
 fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
-    let identities = (1..=3)
+    let mut identities = (1..=3)
         .map(|id| ReplicaIdentity {
             replica_id: ReplicaId::new(id),
             instance_id: ReplicaInstanceId::new(format!("failover-pod-{id}")),
@@ -1294,6 +1294,23 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
         ],
         previous_policy.write_quorum,
     );
+    let resource_uid = ResourceUid::new("resource-1");
+    let mut candidate_provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 3,
+            previous_configuration: previous.clone(),
+            previous_policy: previous_policy.clone(),
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(3),
+        }),
+        pod_uid: PodUid::new("failover-pod-3"),
+        pvc_uid: PvcUid::new("scale-up-cut-candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    candidate_provisioning.operation_id = candidate_provisioning.expected_operation_id();
+    identities[2] = candidate_provisioning.target_identity(&resource_uid);
     let expanded = ConfigurationDescriptor::new(
         Epoch::new(0, 2),
         identities[0].replica_id,
@@ -1315,7 +1332,7 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
     );
     let mut intent = ScaleUpIntent {
         operation_id: OperationId::default(),
-        resource_uid: ResourceUid::new("resource-1"),
+        resource_uid: resource_uid.clone(),
         spec_generation: 2,
         desired_replicas: 3,
         previous_configuration: previous.clone(),
@@ -1324,7 +1341,9 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
         current_policy: current_policy.clone(),
         primary: identities[0].clone(),
         target: identities[2].clone(),
-        build_id: OperationId::new("scale-up-failover-crash-build"),
+        build_id: candidate_provisioning
+            .scale_up_build_id(&resource_uid)
+            .unwrap(),
         snapshot_boundary_lsn: 4,
         catch_up_boundary_lsn: 9,
     };
@@ -1521,6 +1540,513 @@ fn scale_up_configuration_cut_exit_code(cut: &str) -> i32 {
     180 + i32::try_from(index).unwrap()
 }
 
+fn scale_up_failover_cut_exit_code(cut: &str) -> i32 {
+    let index = [
+        "authority-after",
+        "completion-after",
+        "candidate-authority-before",
+        "candidate-authority-after",
+        "candidate-failover-prefix-before",
+        "candidate-failover-prefix-after",
+        "candidate-replicator-role-before",
+        "candidate-replicator-role-after",
+        "candidate-application-role-before",
+        "candidate-application-role-after",
+        "candidate-access-before",
+        "candidate-access-after",
+        "candidate-completion-before",
+        "candidate-completion-after",
+    ]
+    .iter()
+    .position(|candidate| *candidate == cut)
+    .unwrap_or_else(|| panic!("unknown scale-up failover cut {cut}"));
+    194 + i32::try_from(index).unwrap()
+}
+
+fn scale_up_candidate_cut_exit_code(cut: &str) -> i32 {
+    let index = [
+        "candidate-pc-cc-authority-before",
+        "candidate-pc-cc-authority-after",
+        "candidate-pc-cc-replicator-role-before",
+        "candidate-pc-cc-replicator-role-after",
+        "candidate-pc-cc-application-role-before",
+        "candidate-pc-cc-application-role-after",
+        "candidate-pc-cc-access-before",
+        "candidate-pc-cc-access-after",
+        "candidate-pc-cc-completion-before",
+        "candidate-pc-cc-completion-after",
+        "candidate-current-only-authority-before",
+        "candidate-current-only-authority-after",
+        "candidate-current-only-replicator-role-before",
+        "candidate-current-only-replicator-role-after",
+        "candidate-current-only-application-role-before",
+        "candidate-current-only-application-role-after",
+        "candidate-current-only-access-before",
+        "candidate-current-only-access-after",
+        "candidate-current-only-build-retirement-before",
+        "candidate-current-only-build-retirement-after",
+        "candidate-current-only-completion-before",
+        "candidate-current-only-completion-after",
+    ]
+    .iter()
+    .position(|candidate| *candidate == cut)
+    .unwrap_or_else(|| panic!("unknown scale-up candidate cut {cut}"));
+    220 + i32::try_from(index).unwrap()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScaleUpSourceCutSpec {
+    cut: &'static str,
+    stage: Option<CoordinatorStage>,
+    applied_lsn: i64,
+    candidate_committed_lsn: i64,
+    authority_crossed: bool,
+    build_retired: bool,
+    command_completed: bool,
+}
+
+const SCALE_UP_SOURCE_CUT_SPECS: &[ScaleUpSourceCutSpec] = &[
+    ScaleUpSourceCutSpec {
+        cut: "pc-cc-authority-before",
+        stage: Some(CoordinatorStage::AdmitAuthority),
+        applied_lsn: 1,
+        candidate_committed_lsn: 1,
+        authority_crossed: false,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "pc-cc-authority-after",
+        stage: Some(CoordinatorStage::AdmitAuthority),
+        applied_lsn: 1,
+        candidate_committed_lsn: 1,
+        authority_crossed: true,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "pc-cc-access-before",
+        stage: Some(CoordinatorStage::Activate),
+        applied_lsn: 1,
+        candidate_committed_lsn: 1,
+        authority_crossed: true,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "pc-cc-access-after",
+        stage: Some(CoordinatorStage::Activate),
+        applied_lsn: 2,
+        candidate_committed_lsn: 1,
+        authority_crossed: true,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "current-only-authority-before",
+        stage: Some(CoordinatorStage::AdmitAuthority),
+        applied_lsn: 2,
+        candidate_committed_lsn: 1,
+        authority_crossed: false,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "current-only-authority-after",
+        stage: Some(CoordinatorStage::AdmitAuthority),
+        applied_lsn: 2,
+        candidate_committed_lsn: 1,
+        authority_crossed: true,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "current-only-access-before",
+        stage: Some(CoordinatorStage::Activate),
+        applied_lsn: 2,
+        candidate_committed_lsn: 1,
+        authority_crossed: true,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "current-only-access-after",
+        stage: Some(CoordinatorStage::Activate),
+        applied_lsn: 3,
+        candidate_committed_lsn: 2,
+        authority_crossed: true,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "build-retirement-before",
+        stage: Some(CoordinatorStage::RetireBuild),
+        applied_lsn: 3,
+        candidate_committed_lsn: 2,
+        authority_crossed: true,
+        build_retired: false,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "build-retirement-after",
+        stage: Some(CoordinatorStage::RetireBuild),
+        applied_lsn: 3,
+        candidate_committed_lsn: 2,
+        authority_crossed: true,
+        build_retired: true,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "completion-before",
+        stage: Some(CoordinatorStage::Complete),
+        applied_lsn: 3,
+        candidate_committed_lsn: 2,
+        authority_crossed: true,
+        build_retired: true,
+        command_completed: false,
+    },
+    ScaleUpSourceCutSpec {
+        cut: "completion-after",
+        stage: None,
+        applied_lsn: 3,
+        candidate_committed_lsn: 2,
+        authority_crossed: true,
+        build_retired: true,
+        command_completed: true,
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct ScaleUpCandidateCutSpec {
+    cut: &'static str,
+    stage: Option<CoordinatorStage>,
+    authority_crossed: bool,
+    role: ReplicaRole,
+    read_status: AccessStatus,
+    write_status: AccessStatus,
+    applied_lsn: i64,
+    committed_lsn: i64,
+    build_retired: bool,
+    command_completed: bool,
+}
+
+const PC_CANDIDATE_BASE: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
+    cut: "",
+    stage: Some(CoordinatorStage::AdmitAuthority),
+    authority_crossed: false,
+    role: ReplicaRole::IdleSecondary,
+    read_status: AccessStatus::NotPrimary,
+    write_status: AccessStatus::ReconfigurationPending,
+    applied_lsn: 1,
+    committed_lsn: 1,
+    build_retired: false,
+    command_completed: false,
+};
+
+const PC_CANDIDATE_PENDING: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
+    stage: Some(CoordinatorStage::ReplicatorRole),
+    authority_crossed: true,
+    read_status: AccessStatus::ReconfigurationPending,
+    write_status: AccessStatus::ReconfigurationPending,
+    ..PC_CANDIDATE_BASE
+};
+
+const PC_CANDIDATE_ACTIVE_PENDING: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
+    role: ReplicaRole::ActiveSecondary,
+    ..PC_CANDIDATE_PENDING
+};
+
+const PC_CANDIDATE_GRANTED: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
+    read_status: AccessStatus::Granted,
+    write_status: AccessStatus::NotPrimary,
+    ..PC_CANDIDATE_ACTIVE_PENDING
+};
+
+const CURRENT_CANDIDATE_BASE: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
+    cut: "",
+    stage: Some(CoordinatorStage::AdmitAuthority),
+    authority_crossed: false,
+    role: ReplicaRole::ActiveSecondary,
+    read_status: AccessStatus::Granted,
+    write_status: AccessStatus::NotPrimary,
+    applied_lsn: 2,
+    committed_lsn: 1,
+    build_retired: false,
+    command_completed: false,
+};
+
+const CURRENT_CANDIDATE_PENDING: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
+    stage: Some(CoordinatorStage::ReplicatorRole),
+    authority_crossed: true,
+    read_status: AccessStatus::ReconfigurationPending,
+    write_status: AccessStatus::ReconfigurationPending,
+    ..CURRENT_CANDIDATE_BASE
+};
+
+const CURRENT_CANDIDATE_GRANTED: ScaleUpCandidateCutSpec = ScaleUpCandidateCutSpec {
+    read_status: AccessStatus::Granted,
+    write_status: AccessStatus::NotPrimary,
+    ..CURRENT_CANDIDATE_PENDING
+};
+
+const SCALE_UP_CANDIDATE_CUT_SPECS: &[ScaleUpCandidateCutSpec] = &[
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-authority-before",
+        ..PC_CANDIDATE_BASE
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-authority-after",
+        authority_crossed: true,
+        read_status: AccessStatus::ReconfigurationPending,
+        ..PC_CANDIDATE_BASE
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-replicator-role-before",
+        ..PC_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-replicator-role-after",
+        ..PC_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-application-role-before",
+        stage: Some(CoordinatorStage::ApplicationRole),
+        ..PC_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-application-role-after",
+        stage: Some(CoordinatorStage::ApplicationRole),
+        role: ReplicaRole::ActiveSecondary,
+        ..PC_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-access-before",
+        stage: Some(CoordinatorStage::Activate),
+        ..PC_CANDIDATE_ACTIVE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-access-after",
+        stage: Some(CoordinatorStage::Activate),
+        read_status: AccessStatus::Granted,
+        write_status: AccessStatus::NotPrimary,
+        ..PC_CANDIDATE_ACTIVE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-completion-before",
+        stage: Some(CoordinatorStage::Complete),
+        ..PC_CANDIDATE_GRANTED
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-pc-cc-completion-after",
+        stage: None,
+        command_completed: true,
+        ..PC_CANDIDATE_GRANTED
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-authority-before",
+        ..CURRENT_CANDIDATE_BASE
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-authority-after",
+        authority_crossed: true,
+        read_status: AccessStatus::ReconfigurationPending,
+        write_status: AccessStatus::ReconfigurationPending,
+        ..CURRENT_CANDIDATE_BASE
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-replicator-role-before",
+        ..CURRENT_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-replicator-role-after",
+        ..CURRENT_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-application-role-before",
+        stage: Some(CoordinatorStage::ApplicationRole),
+        ..CURRENT_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-application-role-after",
+        stage: Some(CoordinatorStage::ApplicationRole),
+        ..CURRENT_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-access-before",
+        stage: Some(CoordinatorStage::Activate),
+        ..CURRENT_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-access-after",
+        stage: Some(CoordinatorStage::Activate),
+        read_status: AccessStatus::Granted,
+        write_status: AccessStatus::NotPrimary,
+        ..CURRENT_CANDIDATE_PENDING
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-build-retirement-before",
+        stage: Some(CoordinatorStage::RetireBuild),
+        ..CURRENT_CANDIDATE_GRANTED
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-build-retirement-after",
+        stage: Some(CoordinatorStage::RetireBuild),
+        build_retired: true,
+        ..CURRENT_CANDIDATE_GRANTED
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-completion-before",
+        stage: Some(CoordinatorStage::Complete),
+        build_retired: true,
+        ..CURRENT_CANDIDATE_GRANTED
+    },
+    ScaleUpCandidateCutSpec {
+        cut: "candidate-current-only-completion-after",
+        stage: None,
+        build_retired: true,
+        command_completed: true,
+        ..CURRENT_CANDIDATE_GRANTED
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct ScaleUpFailoverCutSpec {
+    cut: &'static str,
+    source_stage: Option<CoordinatorStage>,
+    source_failover_authority: bool,
+    source_verified_lsn: i64,
+    candidate_stage: Option<CoordinatorStage>,
+    candidate_failover_authority: bool,
+    candidate_verified_lsn: i64,
+    candidate_read_status: AccessStatus,
+    candidate_write_status: AccessStatus,
+    candidate_completed: bool,
+}
+
+const FAILOVER_SOURCE_BASE: ScaleUpFailoverCutSpec = ScaleUpFailoverCutSpec {
+    cut: "",
+    source_stage: None,
+    source_failover_authority: false,
+    source_verified_lsn: 9,
+    candidate_stage: None,
+    candidate_failover_authority: true,
+    candidate_verified_lsn: 9,
+    candidate_read_status: AccessStatus::Granted,
+    candidate_write_status: AccessStatus::NotPrimary,
+    candidate_completed: true,
+};
+
+const FAILOVER_CANDIDATE_BASE: ScaleUpFailoverCutSpec = ScaleUpFailoverCutSpec {
+    candidate_stage: Some(CoordinatorStage::AdmitAuthority),
+    candidate_failover_authority: false,
+    candidate_completed: false,
+    ..FAILOVER_SOURCE_BASE
+};
+
+const SCALE_UP_FAILOVER_CUT_SPECS: &[ScaleUpFailoverCutSpec] = &[
+    ScaleUpFailoverCutSpec {
+        cut: "authority-after",
+        source_stage: Some(CoordinatorStage::AdmitAuthority),
+        source_failover_authority: true,
+        source_verified_lsn: 0,
+        ..FAILOVER_SOURCE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "completion-after",
+        source_failover_authority: true,
+        source_verified_lsn: 9,
+        ..FAILOVER_SOURCE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-authority-before",
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-authority-after",
+        candidate_failover_authority: true,
+        candidate_verified_lsn: 0,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-failover-prefix-before",
+        candidate_stage: Some(CoordinatorStage::FailoverPrefix),
+        candidate_failover_authority: true,
+        candidate_verified_lsn: 0,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-failover-prefix-after",
+        candidate_stage: Some(CoordinatorStage::FailoverPrefix),
+        candidate_failover_authority: true,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-replicator-role-before",
+        candidate_stage: Some(CoordinatorStage::ReplicatorRole),
+        candidate_failover_authority: true,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-replicator-role-after",
+        candidate_stage: Some(CoordinatorStage::ReplicatorRole),
+        candidate_failover_authority: true,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-application-role-before",
+        candidate_stage: Some(CoordinatorStage::ApplicationRole),
+        candidate_failover_authority: true,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-application-role-after",
+        candidate_stage: Some(CoordinatorStage::ApplicationRole),
+        candidate_failover_authority: true,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-access-before",
+        candidate_stage: Some(CoordinatorStage::Activate),
+        candidate_failover_authority: true,
+        candidate_read_status: AccessStatus::ReconfigurationPending,
+        candidate_write_status: AccessStatus::ReconfigurationPending,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-access-after",
+        candidate_stage: Some(CoordinatorStage::Activate),
+        candidate_failover_authority: true,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-completion-before",
+        candidate_stage: Some(CoordinatorStage::Complete),
+        candidate_failover_authority: true,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+    ScaleUpFailoverCutSpec {
+        cut: "candidate-completion-after",
+        candidate_stage: None,
+        candidate_failover_authority: true,
+        candidate_completed: true,
+        ..FAILOVER_CANDIDATE_BASE
+    },
+];
+
 fn assert_exact_scale_up_exit(status: std::process::ExitStatus, expected: i32, label: &str) {
     assert_eq!(status.code(), Some(expected), "{label}: wrong exit code");
     #[cfg(unix)]
@@ -1530,7 +2056,7 @@ fn assert_exact_scale_up_exit(status: std::process::ExitStatus, expected: i32, l
 }
 
 fn is_scale_up_cut_exit_code(code: Option<i32>) -> bool {
-    matches!(code, Some(160..=169 | 180..=195))
+    matches!(code, Some(160..=169 | 180..=207 | 220..=241))
 }
 
 #[test]
@@ -1767,10 +2293,99 @@ fn replica_authority_table_bytes(path: &Path) -> Option<Vec<u8>> {
         .map(String::into_bytes)
 }
 
-fn durable_application_history_bytes(path: &Path) -> Vec<u8> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DurableApplicationHistory {
+    applied_lsn: i64,
+    committed_lsn: i64,
+    operations: BTreeMap<i64, Vec<u8>>,
+}
+
+fn durable_application_history(path: &Path) -> DurableApplicationHistory {
     let raw = std::fs::read(path).expect("durable application file");
     let persisted: CrashPersistedState = serde_json::from_slice(&raw).unwrap();
-    serde_json::to_vec(&persisted.operations).unwrap()
+    DurableApplicationHistory {
+        applied_lsn: persisted.applied_lsn,
+        committed_lsn: persisted.committed_lsn,
+        operations: persisted.operations,
+    }
+}
+
+fn durable_application_history_bytes(path: &Path) -> Vec<u8> {
+    serde_json::to_vec(&durable_application_history(path)).unwrap()
+}
+
+fn expected_scale_up_application_history(
+    applied_lsn: i64,
+    committed_lsn: i64,
+) -> DurableApplicationHistory {
+    let mut operations = BTreeMap::from([(1, seeded_operation().data.to_vec())]);
+    if applied_lsn >= 2 {
+        let (_, pc_cc, _) = scale_up_crash_fixture(false);
+        operations.insert(
+            2,
+            format!(
+                "actual-candidate-runtime-acknowledgement-{}",
+                pc_cc.operation_id
+            )
+            .into_bytes(),
+        );
+    }
+    if applied_lsn >= 3 {
+        let (_, current_only, _) = scale_up_crash_fixture(true);
+        operations.insert(
+            3,
+            format!(
+                "actual-candidate-runtime-acknowledgement-{}",
+                current_only.operation_id
+            )
+            .into_bytes(),
+        );
+    }
+    DurableApplicationHistory {
+        applied_lsn,
+        committed_lsn,
+        operations,
+    }
+}
+
+fn expected_scale_up_failover_history(
+    applied_lsn: i64,
+    committed_lsn: i64,
+    post_recovery: Option<(&str, i64)>,
+) -> DurableApplicationHistory {
+    let mut operations = (1..=9)
+        .map(|lsn| {
+            let operation = scale_up_failover_operation(lsn);
+            (lsn, operation.data.to_vec())
+        })
+        .collect::<BTreeMap<_, _>>();
+    if let Some((boundary, lsn)) = post_recovery {
+        operations.insert(
+            lsn,
+            format!("scale-up-failover-post-recovery-bytes-{boundary}").into_bytes(),
+        );
+    }
+    DurableApplicationHistory {
+        applied_lsn,
+        committed_lsn,
+        operations,
+    }
+}
+
+async fn exact_verified_lsn(store: &SqliteStore, authority: &AdmittedAuthority) -> i64 {
+    store
+        .load_replication_progress(&authority.fence())
+        .await
+        .unwrap()
+        .or(store
+            .load_configuration_progress(
+                authority.current_configuration.epoch,
+                &authority.current_configuration.configuration_id,
+            )
+            .await
+            .unwrap())
+        .expect("exact durable replication progress")
+        .verified_lsn
 }
 
 async fn open_real_scale_up_owners(
@@ -1887,20 +2502,38 @@ async fn open_real_scale_up_owners(
         candidate_store.clone(),
     ));
     let candidate_state = candidate_store.load_state().await.unwrap();
-    candidate_runtime
-        .reconstruct(
-            if new_candidate {
-                OpenMode::New
-            } else {
-                OpenMode::Existing
-            },
-            candidate_state.role,
-            candidate_state.read_status,
-            candidate_state.write_status,
-            None,
+    if new_candidate {
+        candidate_runtime
+            .reconstruct(
+                OpenMode::New,
+                candidate_state.role,
+                candidate_state.read_status,
+                candidate_state.write_status,
+                None,
+            )
+            .await
+            .unwrap();
+    } else if candidate_state.reconfiguration.is_some() {
+        let service = AgentService::new(
+            candidate_store.clone(),
+            candidate_runtime.clone(),
+            candidate_runtime.clone(),
+            "test-token",
         )
-        .await
         .unwrap();
+        Box::pin(service.reconstruct_runtime()).await.unwrap();
+    } else {
+        candidate_runtime
+            .reconstruct(
+                OpenMode::Existing,
+                candidate_state.role,
+                candidate_state.read_status,
+                candidate_state.write_status,
+                None,
+            )
+            .await
+            .unwrap();
+    }
     (
         source_store,
         source_runtime,
@@ -2801,22 +3434,185 @@ async fn open_scale_up_failover_owner(
         application.clone(),
         store.clone(),
     ));
-    let reconstruction = runtime
-        .reconstruct(
-            OpenMode::Existing,
-            state.role,
-            state.read_status,
-            state.write_status,
-            None,
+    let needs_split_role_recovery = state.retained_result.as_ref().is_some_and(|retained| {
+        matches!(
+            retained.effect.action,
+            RuntimeEffectAction::ChangeReplicatorRole(_)
+                | RuntimeEffectAction::UpdateEpoch
+                | RuntimeEffectAction::ChangeApplicationRole(_)
         )
-        .await;
-    if let Err(error) = reconstruction {
-        assert!(
-            matches!(error, RuntimeError::ReconfigurationPending),
-            "unexpected failover owner reconstruction error: {error:?}"
-        );
+    });
+    if needs_split_role_recovery {
+        let service = AgentService::new(
+            store.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            "test-token",
+        )
+        .unwrap();
+        Box::pin(service.reconstruct_runtime()).await.unwrap();
+    } else {
+        let reconstruction = runtime
+            .reconstruct(
+                OpenMode::Existing,
+                state.role,
+                state.read_status,
+                state.write_status,
+                None,
+            )
+            .await;
+        if let Err(error) = reconstruction {
+            assert!(
+                matches!(error, RuntimeError::ReconfigurationPending),
+                "unexpected failover owner reconstruction error: {error:?}"
+            );
+        }
     }
     (store, runtime, application)
+}
+
+async fn deliver_scale_up_failover_operation(
+    source: &Arc<PodRuntime>,
+    peers: &[Arc<PodRuntime>],
+    operation: &Operation,
+) {
+    let authority = source
+        .snapshot()
+        .await
+        .authority
+        .expect("recovered failover authority");
+    for peer in peers {
+        let item = kuberic_wire::proto::ReplicationItem {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            sender: Some(authority.local_identity.clone().into()),
+            receiver: Some(peer.snapshot().await.identity.into()),
+            epoch: Some(authority.current_configuration.epoch.into()),
+            previous_configuration_id: authority
+                .previous_configuration
+                .as_ref()
+                .map_or_else(String::new, |previous| {
+                    previous.configuration_id.to_string()
+                }),
+            current_configuration_id: authority.current_configuration.configuration_id.to_string(),
+            lsn: operation.lsn,
+            committed_lsn: operation.committed_lsn,
+            data: operation.data.to_vec(),
+            ..Default::default()
+        };
+        let acknowledgement = peer
+            .data_plane()
+            .receive_replication(item)
+            .await
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
+        source
+            .data_plane()
+            .accept_acknowledgement(acknowledgement)
+            .await
+            .unwrap();
+    }
+}
+
+async fn complete_scale_up_failover_startup(
+    store: Arc<SqliteStore>,
+    runtime: Arc<PodRuntime>,
+    peers: &[Arc<PodRuntime>],
+) {
+    let state = store.load_state().await.unwrap();
+    let snapshot = runtime.snapshot().await;
+    if snapshot.write_status == AccessStatus::ReconfigurationPending
+        && state.role == ReplicaRole::Primary
+    {
+        assert_eq!(snapshot.role, ReplicaRole::Primary);
+        assert_eq!(
+            snapshot.authority.as_ref().map(|authority| {
+                (
+                    authority.current_configuration.clone(),
+                    authority.scale_up.clone(),
+                )
+            }),
+            Some((
+                state.current_configuration.clone().unwrap(),
+                state.scale_up_evidence.clone(),
+            )),
+            "write-closed startup did not reconstruct the durable failover authority"
+        );
+        deliver_scale_up_failover_operation(&runtime, peers, &scale_up_failover_operation(9)).await;
+        AgentService::new(store, runtime.clone(), runtime.clone(), "test-token")
+            .unwrap()
+            .reconstruct_runtime()
+            .await
+            .unwrap();
+    }
+    if state.reconfiguration.is_none() {
+        let recovered = runtime.snapshot().await;
+        assert_eq!(recovered.role, state.role);
+        assert_eq!(recovered.read_status, state.read_status);
+        assert_eq!(recovered.write_status, state.write_status);
+        assert_eq!(
+            recovered
+                .authority
+                .as_ref()
+                .map(|authority| &authority.current_configuration),
+            state.current_configuration.as_ref()
+        );
+    }
+}
+
+async fn commit_post_recovery_failover_write(
+    source: &Arc<PodRuntime>,
+    peers: &[Arc<PodRuntime>],
+    boundary: &str,
+) -> Operation {
+    let data = Bytes::from(format!("scale-up-failover-post-recovery-bytes-{boundary}"));
+    let pending = source
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new(format!("scale-up-failover-post-recovery-{boundary}")),
+            data: data.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending.lsn, 10, "{boundary}: recovery write LSN");
+    assert_eq!(
+        pending.replication_items.len(),
+        peers.len(),
+        "{boundary}: every recovered failover participant must receive the new write"
+    );
+    for item in pending.replication_items.clone() {
+        let receiver = item.receiver.clone();
+        let mut matching_peer = None;
+        for peer in peers {
+            if receiver == Some(peer.snapshot().await.identity.into()) {
+                matching_peer = Some(peer);
+                break;
+            }
+        }
+        let peer = matching_peer
+            .unwrap_or_else(|| panic!("{boundary}: no runtime for replication receiver"));
+        let acknowledgement = peer
+            .data_plane()
+            .receive_replication(item)
+            .await
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
+        source
+            .data_plane()
+            .accept_acknowledgement(acknowledgement)
+            .await
+            .unwrap();
+    }
+    let committed = pending.committed().await.unwrap();
+    assert_eq!(committed.committed_lsn, 10, "{boundary}");
+    Operation {
+        lsn: 10,
+        committed_lsn: 10,
+        data,
+    }
 }
 
 async fn execute_scale_up_failover_cut(path: &Path, boundary: &str, terminate: bool) {
@@ -2853,37 +3649,52 @@ async fn execute_scale_up_failover_cut(path: &Path, boundary: &str, terminate: b
         witness_state.role = ReplicaRole::ActiveSecondary;
         witness_state.read_status = AccessStatus::Granted;
         witness_state.write_status = AccessStatus::NotPrimary;
+        witness_state.scale_up_initialization = Some(scale_up_candidate_provisioning(
+            source_command
+                .scale_up_evidence
+                .as_deref()
+                .expect("failover scale-up evidence")
+                .intent(),
+        ));
+        let intent = source_command
+            .scale_up_evidence
+            .as_deref()
+            .expect("failover scale-up evidence")
+            .intent();
+        let build = BuildAuthority {
+            build_id: intent.build_id.clone(),
+            kind: BuildAuthorityKind::Provisioning,
+            source: intent.primary.clone(),
+            target: intent.target.clone(),
+            current_configuration: intent.previous_configuration.clone(),
+            replication_boundary_lsn: intent.snapshot_boundary_lsn,
+        };
+        witness_state.build_commands.insert(
+            build.build_id.clone(),
+            kuberic_protocol::command::EnsureReplicaBuild {
+                operation_id: build.build_id.clone(),
+                local_replica_id: intent.target.replica_id,
+                expected_instance_id: intent.target.instance_id.clone(),
+                expected_agent_generation: intent.target.agent_generation.clone(),
+                target: intent.target.clone(),
+                authority: Some(build.clone()),
+                source_session_id: Some(ProcessSessionId::new("failover-build-source-session")),
+            },
+        );
+        witness_state.build_progress.insert(
+            build.build_id.clone(),
+            DurableBuildProgress {
+                authority: build,
+                last_sequence: 9,
+                durable_lsn: 9,
+                completed: true,
+                catch_up_boundary_lsn: Some(9),
+            },
+        );
         initialize_scale_up_failover_owner(&witness_path, &witness_application_path, witness_state)
             .await;
-        let (witness_store, witness_runtime, _) =
-            open_scale_up_failover_owner(&witness_path, &witness_application_path).await;
-        let witness_authority = AdmittedAuthority {
-            local_identity: witness_identity,
-            transition_kind: Some(TransitionKind::Failover),
-            previous_configuration: source_command.previous_configuration.clone(),
-            current_configuration: source_command.current_configuration.clone(),
-            switchover_handoff: None,
-            secondary_removal: None,
-            scale_up: source_command.scale_up_evidence.clone(),
-        };
-        witness_runtime
-            .apply_effect(RuntimeEffect {
-                operation_id: OperationId::new("failover-witness-authority"),
-                sequence: 1,
-                action: RuntimeEffectAction::AdmitAuthority(Box::new(witness_authority.clone())),
-            })
-            .await
-            .unwrap();
-        witness_store
-            .record_replication_progress(&ReplicationProgress {
-                fence: witness_authority.fence(),
-                verified_lsn: 9,
-            })
-            .await
-            .unwrap();
-        witness_runtime.abort();
     }
-    let (peer_store, peer_runtime, _) =
+    let (peer_store, peer_runtime, peer_application) =
         open_scale_up_failover_owner(&peer_path, &peer_application_path).await;
     let (_, peer_command) = scale_up_failover_peer_fixture();
     Coordinator::new(peer_store.clone(), peer_runtime.clone())
@@ -2891,27 +3702,49 @@ async fn execute_scale_up_failover_cut(path: &Path, boundary: &str, terminate: b
         .await
         .unwrap();
     eprintln!("scale-up-failover cut={boundary} stage=peer-complete");
-    let (_, witness_runtime, _) =
+    let (witness_store, witness_runtime, witness_application) =
         open_scale_up_failover_owner(&witness_path, &witness_application_path).await;
+    let witness_identity = witness_store.identity().await.unwrap().local_identity;
+    let witness_command = scale_up_failover_command_for_identity(
+        &scale_up_failover_crash_fixture().1,
+        witness_identity,
+    );
+    let candidate_boundary = boundary.strip_prefix("candidate-");
+    let witness_coordinator_store = Arc::new(ScaleUpProductionCutStore {
+        inner: witness_store.clone(),
+        cut: if terminate {
+            candidate_boundary.map(str::to_owned)
+        } else {
+            None
+        },
+        exit_code: scale_up_failover_cut_exit_code(boundary),
+    });
+    Coordinator::new(witness_coordinator_store, witness_runtime.clone())
+        .ensure_configuration(witness_command)
+        .await
+        .unwrap();
+    eprintln!("scale-up-failover cut={boundary} stage=candidate-complete");
 
     let (source_store, source_runtime, source_application) =
         open_scale_up_failover_owner(path, &crash_application_path(path)).await;
+    let failover_peers = vec![peer_runtime.clone(), witness_runtime.clone()];
+    complete_scale_up_failover_startup(
+        source_store.clone(),
+        source_runtime.clone(),
+        &failover_peers,
+    )
+    .await;
     let (_, source_command) = scale_up_failover_crash_fixture();
     let executor = Arc::new(ScaleUpFailoverRuntime {
         runtime: source_runtime.clone(),
-        peers: vec![peer_runtime.clone(), witness_runtime],
+        peers: failover_peers.clone(),
         acknowledgement_sent: std::sync::atomic::AtomicBool::new(false),
         durable_operation: scale_up_failover_operation(9),
     });
-    let exit_code = if boundary == "authority-after" {
-        194
-    } else {
-        195
-    };
     let store = Arc::new(ScaleUpProductionCutStore {
         inner: source_store.clone(),
-        cut: terminate.then(|| boundary.to_owned()),
-        exit_code,
+        cut: (terminate && candidate_boundary.is_none()).then(|| boundary.to_owned()),
+        exit_code: scale_up_failover_cut_exit_code(boundary),
     });
     let completed = Coordinator::new(store, executor)
         .ensure_configuration(source_command.clone())
@@ -2924,125 +3757,150 @@ async fn execute_scale_up_failover_cut(path: &Path, boundary: &str, terminate: b
     assert_eq!(source.role, ReplicaRole::Primary);
     assert_eq!(source.read_status, AccessStatus::Granted);
     assert_eq!(source.write_status, AccessStatus::Granted);
+    let runtime = source_runtime.snapshot().await;
+    assert_eq!(runtime.role, ReplicaRole::Primary);
+    assert_eq!(runtime.read_status, AccessStatus::Granted);
+    assert_eq!(runtime.write_status, AccessStatus::Granted);
     assert_eq!(
-        source_application.state.lock().unwrap().operations,
-        (1..=9)
-            .map(|lsn| {
-                let operation = scale_up_failover_operation(lsn);
-                (lsn, operation.data.to_vec())
-            })
-            .collect()
+        runtime.authority,
+        source_store.load().await.unwrap(),
+        "{boundary}: runtime and durable failover authority diverged"
     );
+    let post_recovery =
+        commit_post_recovery_failover_write(&source_runtime, &failover_peers, boundary).await;
+    let expected_operations = (1..=9)
+        .map(|lsn| {
+            let operation = scale_up_failover_operation(lsn);
+            (lsn, operation.data.to_vec())
+        })
+        .chain(std::iter::once((
+            post_recovery.lsn,
+            post_recovery.data.to_vec(),
+        )))
+        .collect::<BTreeMap<_, _>>();
+    for (owner, application) in [
+        ("source", source_application),
+        ("peer", peer_application),
+        ("candidate", witness_application),
+    ] {
+        let durable = application.state.lock().unwrap().clone();
+        assert_eq!(
+            durable.operations, expected_operations,
+            "{boundary}: {owner} did not retain exact post-recovery write bytes"
+        );
+        assert_eq!(durable.applied_lsn, 10, "{boundary}: {owner} applied LSN");
+        assert_eq!(
+            durable.committed_lsn,
+            if owner == "source" { 10 } else { 9 },
+            "{boundary}: {owner} committed LSN"
+        );
+    }
+    for (owner, store) in [
+        ("source", source_store),
+        ("peer", peer_store),
+        ("candidate", witness_store),
+    ] {
+        let authority = store.load().await.unwrap().expect("failover authority");
+        assert_eq!(
+            store
+                .load_replication_progress(&authority.fence())
+                .await
+                .unwrap()
+                .expect("failover progress")
+                .verified_lsn,
+            10,
+            "{boundary}: {owner} verified LSN"
+        );
+    }
 }
 
-async fn execute_real_active_secondary_cut(path: &Path, after: bool, terminate: bool) {
-    let (_, command, build) = scale_up_crash_fixture(false);
-    let evidence = command.scale_up_evidence.clone().unwrap();
-    let intent = evidence.intent().clone();
-    let candidate = intent.target.clone();
+fn normalized_scale_up_candidate_cut(cut: &str) -> &str {
+    cut.strip_prefix("candidate-pc-cc-")
+        .or_else(|| cut.strip_prefix("candidate-current-only-"))
+        .unwrap_or(cut)
+}
+
+async fn execute_scale_up_candidate_configuration_cut(path: &Path, cut: &str, terminate: bool) {
+    let current_only = cut.starts_with("candidate-current-only-");
     if !path.is_file() {
         ensure_scale_up_store_cut(path, "source-progress-persistence", false, false).await;
     }
-    let candidate_path = scale_up_candidate_store_path(path);
-    let store = Arc::new(SqliteStore::open_existing(&candidate_path, None).unwrap());
-    let durable = store.load_state().await.unwrap();
-    let application = Arc::new(CrashState::open(
-        scale_up_candidate_root(path).join("application.json"),
-    ));
-    let seed = seeded_operation();
-    assert!(
-        application.verify_applied(&seed).await.unwrap(),
-        "ActiveSecondary recovery must observe actual copied bytes before replay"
-    );
-    assert_eq!(
-        application.durable_progress().await.unwrap().committed_lsn,
-        intent.catch_up_boundary_lsn
-    );
-    let runtime = Arc::new(PodRuntime::new(
-        candidate,
-        application.clone(),
-        store.clone(),
-    ));
-    runtime
-        .reconstruct(
-            OpenMode::Existing,
-            durable.role,
-            durable.read_status,
-            durable.write_status,
-            None,
-        )
-        .await
-        .unwrap();
-    let authority = AdmittedAuthority {
-        local_identity: intent.target.clone(),
-        transition_kind: Some(TransitionKind::ScaleUp),
-        previous_configuration: Some(intent.previous_configuration.clone()),
-        current_configuration: intent.current_configuration.clone(),
-        switchover_handoff: None,
-        secondary_removal: None,
-        scale_up: Some(evidence),
-    };
-    if store.load().await.unwrap().as_ref() != Some(&authority) {
-        let state = store.load_state().await.unwrap();
-        RuntimeAdapter::new(store.clone(), runtime.clone())
-            .execute(RuntimeEffect {
-                operation_id: OperationId::new("active-secondary-admit-scale-up"),
-                sequence: state.next_effect_sequence,
-                action: RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
-            })
-            .await
-            .unwrap();
-    }
-    assert_eq!(
-        store
-            .load_build_progress(&build.build_id)
+    let (
+        source_store,
+        source_runtime,
+        _source_application,
+        candidate_store,
+        candidate_runtime,
+        candidate_application,
+        build,
+    ) = open_real_scale_up_owners(path, false).await;
+    let (_, pc_cc_command, _) = scale_up_crash_fixture(false);
+    if current_only {
+        if candidate_store
+            .load_state()
             .await
             .unwrap()
-            .expect("actual candidate copy progress")
-            .durable_lsn,
-        intent.catch_up_boundary_lsn
-    );
-    let effect = RuntimeEffect {
-        operation_id: OperationId::new("scale-up-active-secondary-role"),
-        sequence: store.load_state().await.unwrap().next_effect_sequence,
-        action: RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
-    };
-    let executor = Arc::new(CrashAfterRealEffect {
-        runtime: runtime.clone(),
-        boundary: terminate.then(|| {
-            if after {
-                "after-active-secondary-role"
-            } else {
-                "before-active-secondary-role"
-            }
-            .to_string()
-        }),
-        exit_code: if after { 193 } else { 192 },
+            .current_configuration
+            .as_ref()
+            != Some(&pc_cc_command.current_configuration)
+        {
+            let candidate_pc_cc = scale_up_command_for_candidate(&pc_cc_command);
+            Coordinator::new(candidate_store.clone(), candidate_runtime.clone())
+                .ensure_configuration(candidate_pc_cc)
+                .await
+                .unwrap();
+        }
+        if source_store
+            .load_state()
+            .await
+            .unwrap()
+            .current_configuration
+            .as_ref()
+            != Some(&pc_cc_command.current_configuration)
+        {
+            run_scale_up_source_configuration(
+                source_store,
+                source_runtime,
+                candidate_runtime.clone(),
+                pc_cc_command,
+                None,
+            )
+            .await;
+        }
+    }
+    let (_, command, _) = scale_up_crash_fixture(current_only);
+    let candidate_command = scale_up_command_for_candidate(&command);
+    let store = Arc::new(ScaleUpProductionCutStore {
+        inner: candidate_store.clone(),
+        cut: terminate.then(|| normalized_scale_up_candidate_cut(cut).to_owned()),
+        exit_code: scale_up_candidate_cut_exit_code(cut),
     });
-    RuntimeAdapter::new(store.clone(), executor)
-        .execute(effect)
+    Coordinator::new(store, candidate_runtime.clone())
+        .ensure_configuration(candidate_command.clone())
         .await
         .unwrap();
-    let access = RuntimeEffect {
-        operation_id: OperationId::new("scale-up-active-secondary-access"),
-        sequence: store.load_state().await.unwrap().next_effect_sequence,
-        action: RuntimeEffectAction::SetAccessStatus {
-            read: AccessStatus::Granted,
-            write: AccessStatus::NotPrimary,
-        },
-    };
-    RuntimeAdapter::new(store.clone(), runtime.clone())
-        .execute(access)
-        .await
-        .unwrap();
-    let durable = store.load_state().await.unwrap();
-    assert_eq!(durable.role, ReplicaRole::ActiveSecondary);
-    assert_eq!(durable.write_status, AccessStatus::NotPrimary);
-    assert!(durable.pending_effect.is_none());
+    let durable = candidate_store.load_state().await.unwrap();
+    let runtime = candidate_runtime.snapshot().await;
+    assert!(durable.reconfiguration.is_none() && durable.pending_effect.is_none());
     assert_eq!(
-        application.durable_progress().await.unwrap().committed_lsn,
-        1
+        durable.current_configuration,
+        Some(command.current_configuration)
     );
+    assert_eq!(durable.role, ReplicaRole::ActiveSecondary);
+    assert_eq!(durable.read_status, AccessStatus::Granted);
+    assert_eq!(durable.write_status, AccessStatus::NotPrimary);
+    assert_eq!(runtime.role, ReplicaRole::ActiveSecondary);
+    assert_eq!(runtime.read_status, AccessStatus::Granted);
+    assert_eq!(runtime.write_status, AccessStatus::NotPrimary);
+    assert_eq!(runtime.authority, candidate_store.load().await.unwrap());
+    assert_eq!(
+        durable.retired_builds.contains(&build.build_id),
+        current_only
+    );
+    let expected_lsn = if current_only { 2 } else { 1 };
+    let progress = candidate_application.durable_progress().await.unwrap();
+    assert_eq!(progress.applied_lsn, expected_lsn, "{cut}");
+    assert_eq!(progress.committed_lsn, 1, "{cut}");
 }
 
 fn real_configuration_command() -> EnsureConfiguration {
@@ -3827,21 +4685,8 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
         }
     }
 
-    let configuration_cuts = [
-        "pc-cc-authority-before",
-        "pc-cc-authority-after",
-        "pc-cc-access-before",
-        "pc-cc-access-after",
-        "current-only-authority-before",
-        "current-only-authority-after",
-        "current-only-access-before",
-        "current-only-access-after",
-        "build-retirement-before",
-        "build-retirement-after",
-        "completion-before",
-        "completion-after",
-    ];
-    for cut in configuration_cuts {
+    for spec in SCALE_UP_SOURCE_CUT_SPECS {
+        let cut = spec.cut;
         eprintln!("scale-up-crash-cut cut={cut}");
         let directory = tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
@@ -3871,28 +4716,12 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
             AccessStatus::Granted,
             "{cut}: same-primary durable cut intentionally closed healthy writes"
         );
-        let expected_stage = match cut {
-            "pc-cc-authority-before"
-            | "current-only-authority-before"
-            | "pc-cc-authority-after"
-            | "current-only-authority-after" => Some(CoordinatorStage::AdmitAuthority),
-            "pc-cc-access-before"
-            | "current-only-access-before"
-            | "pc-cc-access-after"
-            | "current-only-access-after" => Some(CoordinatorStage::Activate),
-            "build-retirement-before" | "build-retirement-after" => {
-                Some(CoordinatorStage::RetireBuild)
-            }
-            "completion-before" => Some(CoordinatorStage::Complete),
-            "completion-after" => None,
-            _ => unreachable!(),
-        };
         assert_eq!(
             interrupted_state
                 .reconfiguration
                 .as_ref()
                 .map(|record| record.stage),
-            expected_stage,
+            spec.stage,
             "{cut}: interrupted coordinator stage"
         );
         assert!(
@@ -3944,13 +4773,13 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                         .await
                         .unwrap())
                     .expect("candidate durable replication progress");
-                assert!(
-                    source_progress.verified_lsn >= 1,
-                    "{cut}: source durable progress lost acknowledged application bytes"
+                assert_eq!(
+                    source_progress.verified_lsn, spec.applied_lsn,
+                    "{cut}: exact source verified LSN"
                 );
-                assert!(
-                    candidate_progress.verified_lsn >= 1,
-                    "{cut}: candidate durable progress lost copied application bytes"
+                assert_eq!(
+                    candidate_progress.verified_lsn, spec.applied_lsn,
+                    "{cut}: exact candidate verified LSN"
                 );
                 (source_authority, candidate_authority, candidate_state)
             });
@@ -3985,15 +4814,21 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
         );
         assert_eq!(
             durable_application_history_bytes(&crash_application_path(&path)),
-            durable_application_history_bytes(
-                &scale_up_candidate_root(&path).join("application.json")
-            ),
-            "{cut}: source and candidate durable application bytes diverged before replay"
+            serde_json::to_vec(&expected_scale_up_application_history(
+                spec.applied_lsn,
+                spec.applied_lsn
+            ))
+            .unwrap(),
+            "{cut}: exact source durable application history"
         );
-        let source_crossed_authority = !cut.ends_with("authority-before");
+        assert_eq!(
+            durable_application_history(&scale_up_candidate_root(&path).join("application.json")),
+            expected_scale_up_application_history(spec.applied_lsn, spec.candidate_committed_lsn),
+            "{cut}: exact candidate durable application history"
+        );
         assert_eq!(
             source_authority.previous_configuration,
-            if source_crossed_authority {
+            if spec.authority_crossed {
                 command.previous_configuration.clone()
             } else if command.current_only {
                 Some(
@@ -4009,6 +4844,19 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                 None
             },
             "{cut}: source replica_authority table crossed the wrong side of the cut"
+        );
+        assert_eq!(
+            interrupted_state.retired_builds.contains(&build.build_id),
+            spec.build_retired,
+            "{cut}: exact source build-retirement side"
+        );
+        assert_eq!(
+            interrupted_state
+                .retained_command
+                .as_ref()
+                .is_some_and(|retained| retained.command == command),
+            spec.command_completed,
+            "{cut}: exact source completion side"
         );
         if cut.ends_with("-after") {
             match cut {
@@ -4093,11 +4941,9 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
             .unwrap();
     }
 
-    for after in [false, true] {
-        eprintln!(
-            "scale-up-crash-cut cut=active-secondary side={}",
-            if after { "after" } else { "before" }
-        );
+    for spec in SCALE_UP_CANDIDATE_CUT_SPECS {
+        let cut = spec.cut;
+        eprintln!("scale-up-crash-cut cut={cut}");
         let directory = tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let output = Command::new(env::current_exe().unwrap())
@@ -4107,20 +4953,13 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                 "scale_up_active_secondary_cut_writer_process",
             ])
             .env("KUBERIC_SCALE_UP_ACTIVE_SECONDARY_PATH", &path)
-            .env(
-                "KUBERIC_SCALE_UP_ACTIVE_SECONDARY_SIDE",
-                if after { "after" } else { "before" },
-            )
+            .env("KUBERIC_SCALE_UP_ACTIVE_SECONDARY_SIDE", cut)
             .output()
             .unwrap();
         assert_exact_scale_up_exit(
             output.status,
-            if after { 193 } else { 192 },
-            &format!(
-                "active-secondary {}: {}",
-                if after { "after" } else { "before" },
-                String::from_utf8_lossy(&output.stderr)
-            ),
+            scale_up_candidate_cut_exit_code(cut),
+            &format!("{cut}: {}", String::from_utf8_lossy(&output.stderr)),
         );
         let candidate_path = scale_up_candidate_store_path(&path);
         let interrupted = SqliteStore::open_existing(&candidate_path, None).unwrap();
@@ -4128,30 +4967,125 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
             .unwrap()
             .block_on(interrupted.load_state())
             .unwrap();
-        assert_eq!(interrupted_state.role, ReplicaRole::IdleSecondary);
+        assert_eq!(
+            interrupted_state
+                .reconfiguration
+                .as_ref()
+                .map(|record| record.stage),
+            spec.stage,
+            "{cut}: candidate durable journal stage"
+        );
         assert!(
-            interrupted_state.pending_effect.is_some(),
-            "ActiveSecondary cut did not persist pending role effect"
+            interrupted_state.pending_effect.is_none(),
+            "{cut}: candidate cut left an ambiguous pending effect"
         );
-        let interrupted_application =
-            CrashState::open(scale_up_candidate_root(&path).join("application.json"));
-        let application_state = interrupted_application.state.lock().unwrap().clone();
+        assert_eq!(interrupted_state.role, spec.role, "{cut}: candidate role");
         assert_eq!(
-            application_state.last_role,
-            Some(if after {
-                ReplicaRole::ActiveSecondary
-            } else {
-                ReplicaRole::IdleSecondary
-            }),
-            "ActiveSecondary application side was not distinguished before recovery"
+            interrupted_state.read_status, spec.read_status,
+            "{cut}: candidate read access"
         );
         assert_eq!(
-            application_state.operations.get(&1).map(Vec::as_slice),
-            Some(b"acknowledged-before-crash".as_slice())
+            interrupted_state.write_status, spec.write_status,
+            "{cut}: candidate write access"
         );
-        tokio::runtime::Runtime::new()
+        let current_only = cut.starts_with("candidate-current-only-");
+        let (_, command, build) = scale_up_crash_fixture(current_only);
+        let candidate_command = scale_up_command_for_candidate(&command);
+        assert_eq!(
+            interrupted_state.retired_builds.contains(&build.build_id),
+            spec.build_retired,
+            "{cut}: exact candidate build-retirement side"
+        );
+        assert_eq!(
+            interrupted_state
+                .retained_command
+                .as_ref()
+                .is_some_and(|retained| retained.command == candidate_command),
+            spec.command_completed,
+            "{cut}: exact candidate completion side"
+        );
+        let inspection = tokio::runtime::Runtime::new().unwrap();
+        inspection.block_on(async {
+            let authority = interrupted.load().await.unwrap();
+            if authority.is_none() {
+                assert!(
+                    !current_only && !spec.authority_crossed,
+                    "{cut}: only pre-PC/CC admission may lack replica authority"
+                );
+                let progress = interrupted
+                    .load_build_progress(&build.build_id)
+                    .await
+                    .unwrap()
+                    .expect("candidate durable build progress");
+                assert_eq!(progress.durable_lsn, spec.applied_lsn, "{cut}");
+                assert_eq!(
+                    progress.catch_up_boundary_lsn,
+                    Some(spec.applied_lsn),
+                    "{cut}"
+                );
+                return;
+            }
+            let authority = authority.unwrap();
+            assert_eq!(
+                exact_verified_lsn(&interrupted, &authority).await,
+                spec.applied_lsn,
+                "{cut}: exact candidate verified LSN"
+            );
+            assert_eq!(
+                authority.previous_configuration,
+                if spec.authority_crossed {
+                    candidate_command.previous_configuration.clone()
+                } else if current_only {
+                    Some(
+                        candidate_command
+                            .scale_up_evidence
+                            .as_deref()
+                            .unwrap()
+                            .intent()
+                            .previous_configuration
+                            .clone(),
+                    )
+                } else {
+                    None
+                },
+                "{cut}: candidate authority crossed wrong side"
+            );
+        });
+        assert_eq!(
+            durable_application_history(&scale_up_candidate_root(&path).join("application.json")),
+            expected_scale_up_application_history(spec.applied_lsn, spec.committed_lsn),
+            "{cut}: exact candidate application history"
+        );
+        let source_committed_lsn = spec.applied_lsn;
+        assert_eq!(
+            durable_application_history(&crash_application_path(&path)),
+            expected_scale_up_application_history(spec.applied_lsn, source_committed_lsn),
+            "{cut}: exact source application history"
+        );
+        if cut.contains("-application-role-") {
+            let application =
+                CrashState::open(scale_up_candidate_root(&path).join("application.json"));
+            assert_eq!(
+                application.state.lock().unwrap().last_role,
+                Some(spec.role),
+                "{cut}: candidate application-role side"
+            );
+        }
+        std::thread::Builder::new()
+            .name(format!("scale-up-candidate-recovery-{cut}"))
+            .stack_size(16 * 1024 * 1024)
+            .spawn({
+                let path = path.clone();
+                let cut = cut.to_owned();
+                move || {
+                    tokio::runtime::Runtime::new().unwrap().block_on(
+                        execute_scale_up_candidate_configuration_cut(&path, &cut, false),
+                    );
+                }
+            })
             .unwrap()
-            .block_on(execute_real_active_secondary_cut(&path, after, false));
+            .join()
+            .unwrap();
     }
 }
 
@@ -4185,10 +5119,51 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
     ] {
         assert!(exact_codes.insert(scale_up_configuration_cut_exit_code(cut)));
     }
-    for code in [192, 193, 194, 195] {
-        assert!(exact_codes.insert(code));
+    for cut in [
+        "authority-after",
+        "completion-after",
+        "candidate-authority-before",
+        "candidate-authority-after",
+        "candidate-failover-prefix-before",
+        "candidate-failover-prefix-after",
+        "candidate-replicator-role-before",
+        "candidate-replicator-role-after",
+        "candidate-application-role-before",
+        "candidate-application-role-after",
+        "candidate-access-before",
+        "candidate-access-after",
+        "candidate-completion-before",
+        "candidate-completion-after",
+    ] {
+        assert!(exact_codes.insert(scale_up_failover_cut_exit_code(cut)));
     }
-    assert_eq!(exact_codes.len(), 26);
+    for cut in [
+        "candidate-pc-cc-authority-before",
+        "candidate-pc-cc-authority-after",
+        "candidate-pc-cc-replicator-role-before",
+        "candidate-pc-cc-replicator-role-after",
+        "candidate-pc-cc-application-role-before",
+        "candidate-pc-cc-application-role-after",
+        "candidate-pc-cc-access-before",
+        "candidate-pc-cc-access-after",
+        "candidate-pc-cc-completion-before",
+        "candidate-pc-cc-completion-after",
+        "candidate-current-only-authority-before",
+        "candidate-current-only-authority-after",
+        "candidate-current-only-replicator-role-before",
+        "candidate-current-only-replicator-role-after",
+        "candidate-current-only-application-role-before",
+        "candidate-current-only-application-role-after",
+        "candidate-current-only-access-before",
+        "candidate-current-only-access-after",
+        "candidate-current-only-build-retirement-before",
+        "candidate-current-only-build-retirement-after",
+        "candidate-current-only-completion-before",
+        "candidate-current-only-completion-after",
+    ] {
+        assert!(exact_codes.insert(scale_up_candidate_cut_exit_code(cut)));
+    }
+    assert_eq!(exact_codes.len(), 58);
 
     for helper in [
         "scale_up_store_cut_writer_process",
@@ -4297,19 +5272,23 @@ fn scale_up_configuration_cut_writer_process() {
 #[test]
 #[ignore = "helper process for scale_up_exact_cut_matrix_survives_real_process_restart"]
 fn scale_up_active_secondary_cut_writer_process() {
-    let (Ok(path), Ok(side)) = (
+    let (Ok(path), Ok(cut)) = (
         env::var("KUBERIC_SCALE_UP_ACTIVE_SECONDARY_PATH"),
         env::var("KUBERIC_SCALE_UP_ACTIVE_SECONDARY_SIDE"),
     ) else {
         panic!("scale-up ActiveSecondary cut helper requires parent-provided path and side");
     };
-    tokio::runtime::Runtime::new()
+    std::thread::Builder::new()
+        .name("scale-up-candidate-cut".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                execute_scale_up_candidate_configuration_cut(Path::new(&path), &cut, true),
+            );
+        })
         .unwrap()
-        .block_on(execute_real_active_secondary_cut(
-            Path::new(&path),
-            side == "after",
-            true,
-        ));
+        .join()
+        .unwrap();
 }
 
 #[test]
@@ -4363,7 +5342,8 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
         });
     }
 
-    for boundary in ["authority-after", "completion-after"] {
+    for spec in SCALE_UP_FAILOVER_CUT_SPECS {
+        let boundary = spec.cut;
         let directory = tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let output = Command::new(env::current_exe().unwrap())
@@ -4378,21 +5358,25 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
             .unwrap();
         assert_exact_scale_up_exit(
             output.status,
-            if boundary == "authority-after" {
-                194
-            } else {
-                195
-            },
+            scale_up_failover_cut_exit_code(boundary),
             &format!("{boundary}: {}", String::from_utf8_lossy(&output.stderr)),
         );
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
             let peer_path = scale_up_failover_peer_store_path(&path);
             let peer_store = Arc::new(SqliteStore::open_existing(&peer_path, None).unwrap());
+            let candidate_path = scale_up_failover_witness_store_path(&path);
+            let candidate_store =
+                Arc::new(SqliteStore::open_existing(&candidate_path, None).unwrap());
             let (_, command) = scale_up_failover_crash_fixture();
             let durable = store.load_state().await.unwrap();
             let authority = store.load().await.unwrap().expect("source authority");
             let peer_authority = peer_store.load().await.unwrap().expect("peer authority");
+            let candidate_authority = candidate_store
+                .load()
+                .await
+                .unwrap()
+                .expect("candidate authority");
             assert_eq!(
                 serde_json::from_slice::<AdmittedAuthority>(
                     &replica_authority_table_bytes(&path).unwrap()
@@ -4408,14 +5392,65 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
                 peer_authority
             );
             assert_eq!(
-                authority.current_configuration,
-                command.current_configuration
+                serde_json::from_slice::<AdmittedAuthority>(
+                    &replica_authority_table_bytes(&candidate_path).unwrap()
+                )
+                .unwrap(),
+                candidate_authority
             );
-            assert_eq!(authority.scale_up, command.scale_up_evidence);
+            let initial_authority =
+                scale_up_failover_initial_authority(&scale_up_failover_crash_fixture().0);
             assert_eq!(
-                durable_application_history_bytes(&crash_application_path(&path)),
-                durable_application_history_bytes(&scale_up_failover_peer_application_path(&path)),
-                "{boundary}: failover owners disagreed on byte-exact application history"
+                authority,
+                if spec.source_failover_authority {
+                    AdmittedAuthority {
+                        local_identity: authority.local_identity.clone(),
+                        transition_kind: Some(TransitionKind::Failover),
+                        previous_configuration: command.previous_configuration.clone(),
+                        current_configuration: command.current_configuration.clone(),
+                        switchover_handoff: None,
+                        secondary_removal: None,
+                        scale_up: command.scale_up_evidence.clone(),
+                    }
+                } else {
+                    initial_authority
+                },
+                "{boundary}: exact interrupted source authority"
+            );
+            let expected_candidate_authority = if spec.candidate_failover_authority {
+                AdmittedAuthority {
+                    local_identity: candidate_authority.local_identity.clone(),
+                    transition_kind: Some(TransitionKind::Failover),
+                    previous_configuration: command.previous_configuration.clone(),
+                    current_configuration: command.current_configuration.clone(),
+                    switchover_handoff: None,
+                    secondary_removal: None,
+                    scale_up: command.scale_up_evidence.clone(),
+                }
+            } else {
+                AdmittedAuthority {
+                    local_identity: candidate_authority.local_identity.clone(),
+                    ..scale_up_failover_initial_authority(&scale_up_failover_crash_fixture().0)
+                }
+            };
+            assert_eq!(
+                candidate_authority, expected_candidate_authority,
+                "{boundary}: exact interrupted candidate authority"
+            );
+            assert_eq!(
+                durable_application_history(&crash_application_path(&path)),
+                expected_scale_up_failover_history(9, 9, None),
+                "{boundary}: exact source failover history"
+            );
+            assert_eq!(
+                durable_application_history(&scale_up_failover_peer_application_path(&path)),
+                expected_scale_up_failover_history(9, 9, None),
+                "{boundary}: exact peer failover history"
+            );
+            assert_eq!(
+                durable_application_history(&scale_up_failover_witness_application_path(&path)),
+                expected_scale_up_failover_history(9, 9, None),
+                "{boundary}: exact candidate failover history"
             );
             let source_progress = store
                 .load_replication_progress(&authority.fence())
@@ -4428,33 +5463,55 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
                 .unwrap()
                 .expect("peer failover progress");
             assert_eq!(
-                source_progress.verified_lsn,
-                if boundary == "authority-after" { 0 } else { 9 },
+                source_progress.verified_lsn, spec.source_verified_lsn,
                 "{boundary}: source durable failover prefix crossed the wrong side of the cut"
             );
             assert_eq!(peer_progress.verified_lsn, 9);
+            assert_eq!(
+                exact_verified_lsn(&candidate_store, &candidate_authority).await,
+                spec.candidate_verified_lsn,
+                "{boundary}: exact candidate failover prefix progress"
+            );
             let peer_state = peer_store.load_state().await.unwrap();
             assert_eq!(peer_state.role, ReplicaRole::ActiveSecondary);
             assert_eq!(peer_state.read_status, AccessStatus::Granted);
             assert_eq!(peer_state.write_status, AccessStatus::NotPrimary);
-            if boundary == "authority-after" {
-                assert!(durable.reconfiguration.is_some());
-                assert!(durable.pending_effect.is_none());
-                assert_eq!(
-                    durable.current_configuration,
-                    Some(command.current_configuration.clone())
-                );
-                assert_eq!(durable.scale_up_evidence, command.scale_up_evidence);
-            } else {
-                assert!(durable.reconfiguration.is_none());
-                assert_eq!(
-                    durable
-                        .retained_command
-                        .as_ref()
-                        .map(|retained| &retained.command),
-                    Some(&command)
-                );
-            }
+            assert_eq!(
+                durable.reconfiguration.as_ref().map(|record| record.stage),
+                spec.source_stage,
+                "{boundary}: exact source journal stage"
+            );
+            let candidate_state = candidate_store.load_state().await.unwrap();
+            assert_eq!(
+                candidate_state
+                    .reconfiguration
+                    .as_ref()
+                    .map(|record| record.stage),
+                spec.candidate_stage,
+                "{boundary}: exact candidate journal stage"
+            );
+            assert_eq!(
+                candidate_state.read_status, spec.candidate_read_status,
+                "{boundary}: candidate read access"
+            );
+            assert_eq!(
+                candidate_state.write_status, spec.candidate_write_status,
+                "{boundary}: candidate write access"
+            );
+            let candidate_command = scale_up_failover_command_for_identity(
+                &command,
+                candidate_state.identity.local_identity.clone(),
+            );
+            assert_eq!(
+                candidate_state
+                    .retained_command
+                    .as_ref()
+                    .is_some_and(|retained| retained.command == candidate_command),
+                spec.candidate_completed,
+                "{boundary}: exact candidate completion side"
+            );
+            assert!(durable.pending_effect.is_none());
+            assert!(candidate_state.pending_effect.is_none());
         });
         std::thread::Builder::new()
             .name(format!("scale-up-failover-recovery-{boundary}"))
@@ -4473,15 +5530,57 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
             .unwrap();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+            let peer_path = scale_up_failover_peer_store_path(&path);
+            let peer_store = Arc::new(SqliteStore::open_existing(&peer_path, None).unwrap());
+            let candidate_path = scale_up_failover_witness_store_path(&path);
+            let candidate_store =
+                Arc::new(SqliteStore::open_existing(&candidate_path, None).unwrap());
             let (_, command) = scale_up_failover_crash_fixture();
             let recovered = store.load_state().await.unwrap();
             assert!(recovered.reconfiguration.is_none());
             assert!(recovered.pending_effect.is_none());
             assert_eq!(
                 recovered.current_configuration,
-                Some(command.current_configuration)
+                Some(command.current_configuration.clone())
             );
             assert_eq!(recovered.role, ReplicaRole::Primary);
+            assert_eq!(recovered.read_status, AccessStatus::Granted);
+            assert_eq!(recovered.write_status, AccessStatus::Granted);
+            for (owner, owner_store) in [
+                ("source", store.as_ref()),
+                ("peer", peer_store.as_ref()),
+                ("candidate", candidate_store.as_ref()),
+            ] {
+                let authority = owner_store
+                    .load()
+                    .await
+                    .unwrap()
+                    .expect("recovered failover authority");
+                assert_eq!(
+                    authority.current_configuration, command.current_configuration,
+                    "{boundary}: {owner} recovered wrong authority"
+                );
+                assert_eq!(
+                    exact_verified_lsn(owner_store, &authority).await,
+                    10,
+                    "{boundary}: {owner} did not verify the post-recovery write"
+                );
+            }
+            assert_eq!(
+                durable_application_history(&crash_application_path(&path)),
+                expected_scale_up_failover_history(10, 10, Some((boundary, 10))),
+                "{boundary}: exact recovered source history"
+            );
+            assert_eq!(
+                durable_application_history(&scale_up_failover_peer_application_path(&path)),
+                expected_scale_up_failover_history(10, 9, Some((boundary, 10))),
+                "{boundary}: exact recovered peer history"
+            );
+            assert_eq!(
+                durable_application_history(&scale_up_failover_witness_application_path(&path)),
+                expected_scale_up_failover_history(10, 9, Some((boundary, 10))),
+                "{boundary}: exact recovered candidate history"
+            );
             let evidence = command
                 .scale_up_evidence
                 .as_deref()
