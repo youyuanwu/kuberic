@@ -1110,6 +1110,85 @@ mod tests {
                 ],
                 ..committed.clone()
             };
+            let failover_members = intent
+                .current_configuration
+                .members
+                .iter()
+                .map(|member| ConfigurationMember {
+                    identity: member.identity.clone(),
+                    role: if member.identity == intent.target {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect();
+            let failover = ConfigurationDescriptor::new(
+                Epoch::new(
+                    intent.current_configuration.epoch.data_loss_number,
+                    intent.current_configuration.epoch.configuration_number + 1,
+                ),
+                intent.target.replica_id,
+                failover_members,
+                intent.current_policy.write_quorum,
+            );
+            let previous_read_quorum = intent
+                .previous_configuration
+                .members
+                .iter()
+                .take(intent.previous_policy.read_quorum as usize)
+                .enumerate()
+                .map(|(index, member)| {
+                    witness(&intent, member.identity.clone(), true, index as u64 + 20)
+                })
+                .collect();
+            let current_read_quorum = std::iter::once(intent.target.clone())
+                .chain(
+                    intent
+                        .current_configuration
+                        .members
+                        .iter()
+                        .filter(|member| member.identity != intent.target)
+                        .map(|member| member.identity.clone()),
+                )
+                .take(intent.current_policy.read_quorum as usize)
+                .enumerate()
+                .map(|(index, identity)| witness(&intent, identity, true, index as u64 + 40))
+                .collect();
+            let failover_evidence = ScaleUpFailoverEvidence {
+                intent: intent.clone(),
+                previous_read_quorum,
+                current_read_quorum,
+            };
+            validate_scale_up_failover_transition(
+                &failover_evidence,
+                &failover,
+                &intent.current_policy,
+            )
+            .unwrap();
+            let carried_failover = AcceptedStatus {
+                provisioning: Some(provisioning.clone()),
+                transition: Some(TransitionIntent {
+                    transition_id: intent.transition_id(TransitionKind::Failover, &failover),
+                    kind: TransitionKind::Failover,
+                    spec_generation: intent.spec_generation,
+                    effective_policy: intent.current_policy.clone(),
+                    previous_configuration_id: Some(
+                        intent.previous_configuration.configuration_id.clone(),
+                    ),
+                    current_configuration: failover,
+                    election_lsn: Some(intent.catch_up_boundary_lsn),
+                    build_id: Some(intent.build_id.clone()),
+                    repair: None,
+                    switchover: None,
+                    secondary_scale_down: None,
+                    secondary_removal_evidence: None,
+                    scale_up: None,
+                    scale_up_failover: Some(Box::new(failover_evidence)),
+                }),
+                scale_up_admission_started: Some(intent.operation_id.clone()),
+                ..stable.clone()
+            };
             let statuses = [
                 ("stable", stable.clone()),
                 ("allocation-scaffolding", allocation_scaffolding),
@@ -1125,6 +1204,7 @@ mod tests {
                 ),
                 ("active-build", active_build),
                 ("pc-cc", pc_cc),
+                ("carried-failover", carried_failover),
                 (
                     "cleanup",
                     AcceptedStatus {
