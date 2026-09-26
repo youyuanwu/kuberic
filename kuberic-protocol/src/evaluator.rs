@@ -506,18 +506,16 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
     if status.pending_replacement_cleanup.is_some() {
         return replacement_cleanup::waiting(snapshot, config);
     }
-    if config.allow_scale_up
-        && let Some(plan) = scale_up::begin(snapshot, status.clone(), config)
-    {
-        return plan;
-    }
     status = status.without_condition("UnmanagedReplicaResources");
     if let Some(extra) = snapshot.replicas.iter().find_map(|(key, observation)| {
         let accepted = configuration.members.iter().any(|member| {
             member.identity.replica_id == key.replica_id
                 && member.identity.instance_id == key.instance_id
         });
-        (!accepted)
+        let pending_scale_up_candidate = config.allow_scale_up
+            && snapshot.desired.replicas > policy.replica_set_size
+            && i64::from(policy.replica_set_size.saturating_add(1)) == key.replica_id.value();
+        (!accepted && !pending_scale_up_candidate)
             .then_some(observation.kubernetes.as_ref())
             .flatten()
     }) {
@@ -701,6 +699,11 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 ],
             };
         }
+    }
+    if config.allow_scale_up
+        && let Some(plan) = scale_up::begin(snapshot, status.clone(), config)
+    {
+        return plan;
     }
     status = if let Some(receipt) = status.last_scale_up.as_deref().cloned() {
         status.with_condition(scale_up::stable_condition(snapshot, &receipt))

@@ -245,12 +245,13 @@ impl Model {
     }
 
     fn add_candidate(&mut self, replica_id: ReplicaId) {
-        if self
-            .snapshot
-            .replicas
-            .keys()
-            .any(|key| key.replica_id == replica_id)
-        {
+        if self.snapshot.replicas.iter().any(|(key, observation)| {
+            key.replica_id == replica_id
+                && observation
+                    .kubernetes
+                    .as_ref()
+                    .is_some_and(KubernetesReplicaObservation::has_exact_scaffolding)
+        }) {
             return;
         }
         let pod_uid = PodUid::new(format!("candidate-pod-{replica_id}"));
@@ -374,15 +375,19 @@ impl Model {
                     command.target.replica_id,
                     command.target.instance_id.clone(),
                 );
-                let boundary = 10;
+                let snapshot_boundary = match &self.snapshot.replicas[&source_key].agent {
+                    AgentObservation::Report(report) => report.current_progress,
+                    _ => unreachable!(),
+                };
+                let catch_up_boundary = snapshot_boundary + 2;
                 let build = AgentBuildReport {
                     build_id: command.operation_id,
                     target: command.target,
                     last_sequence: 3,
-                    replication_boundary_lsn: boundary,
-                    durable_lsn: boundary,
+                    replication_boundary_lsn: snapshot_boundary,
+                    durable_lsn: catch_up_boundary,
                     completed: true,
-                    catch_up_boundary_lsn: Some(boundary),
+                    catch_up_boundary_lsn: Some(catch_up_boundary),
                 };
                 for key in [source_key, target_key] {
                     let AgentObservation::Report(report) =
@@ -391,10 +396,10 @@ impl Model {
                         panic!("build participant report")
                     };
                     report.builds = vec![build.clone()];
+                    report.current_progress = catch_up_boundary;
+                    report.committed_lsn = catch_up_boundary;
                     if key.replica_id != command.local_replica_id {
                         report.role = ReplicaRole::IdleSecondary;
-                        report.current_progress = boundary;
-                        report.committed_lsn = boundary;
                     }
                     report.report_sequence += 1;
                 }
@@ -432,17 +437,33 @@ impl Model {
                 report.epoch = command.current_epoch;
                 report.previous_configuration = command.previous_configuration.clone();
                 report.current_configuration = Some(command.current_configuration.clone());
-                report.current_progress = 10;
-                report.verified_replication_lsn = Some(10);
-                report.committed_lsn = 10;
-                report.current_configuration_quorum_progress = 10;
-                report.catch_up_boundary = Some(10);
+                let boundary = command
+                    .scale_up_evidence
+                    .as_deref()
+                    .map_or(report.current_progress, |evidence| {
+                        evidence.intent().catch_up_boundary_lsn
+                    });
+                report.current_progress = report.current_progress.max(boundary);
+                report.verified_replication_lsn = Some(boundary);
+                report.committed_lsn = report.committed_lsn.max(boundary);
+                report.current_configuration_quorum_progress = boundary;
+                report.catch_up_boundary = Some(boundary);
                 report.catch_up_complete = true;
+                if command.transition_kind == TransitionKind::Failover {
+                    report.deactivation_epoch = Some(command.current_epoch);
+                    report.deactivated_lsn = Some(boundary);
+                }
                 report.pending_operation_id = None;
                 report.retained_operation_id = Some(command.operation_id);
                 report.scale_up_intent = command
                     .scale_up_evidence
                     .map(|evidence| Box::new(evidence.intent().clone()));
+                if report.scale_up_intent.is_some() {
+                    report.prepared_secondary_removal = None;
+                    report.secondary_removal_evidence = None;
+                    report.retired_replica = None;
+                    report.accepted_secondary_removal = None;
+                }
                 report.report_sequence += 1;
             }
             other => panic!("unexpected scale-up command: {other:?}"),
@@ -462,6 +483,13 @@ impl Model {
                 _ => None,
             })
             .unwrap()
+    }
+
+    pub fn restart(&mut self, replica_id: i64) {
+        let report = self.report_mut(replica_id);
+        report.process_session_id =
+            ProcessSessionId::new(format!("{}-restart", report.process_session_id));
+        report.report_sequence = 1;
     }
 
     pub fn remove_candidate_report(&mut self) {

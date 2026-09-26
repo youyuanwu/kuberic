@@ -994,13 +994,33 @@ mod tests {
 
     #[test]
     fn active_transition_binds_accepted_and_expanded_authority() {
-        let intent = intent(2);
+        let mut intent = intent(2);
+        let provisioning = provisioning(&intent);
+        let target = provisioning.target_identity(&intent.resource_uid);
+        intent.target = target.clone();
+        let mut members = intent.current_configuration.members.clone();
+        members
+            .iter_mut()
+            .find(|member| member.identity.replica_id == target.replica_id)
+            .unwrap()
+            .identity = target.clone();
+        intent.current_configuration = ConfigurationDescriptor::new(
+            intent.current_configuration.epoch,
+            intent.current_configuration.primary_id,
+            members,
+            intent.current_policy.write_quorum,
+        );
+        intent.build_id = provisioning
+            .scale_up_build_id(&intent.resource_uid)
+            .unwrap();
+        intent.operation_id = intent.expected_operation_id();
         let status = AcceptedStatus {
             initialized: true,
             effective_policy: Some(intent.previous_policy.clone()),
             topology: Some(AcceptedTopology {
                 configuration: intent.previous_configuration.clone(),
             }),
+            provisioning: Some(provisioning),
             transition: Some(TransitionIntent {
                 transition_id: intent
                     .transition_id(TransitionKind::ScaleUp, &intent.current_configuration),
@@ -1134,9 +1154,12 @@ mod tests {
             expanded_members,
             intent.current_policy.write_quorum,
         );
+        intent.build_id = provisioning
+            .scale_up_build_id(&intent.resource_uid)
+            .unwrap();
         intent.operation_id = intent.expected_operation_id();
         let cleanup = ScaleUpCleanup {
-            provisioning,
+            provisioning: provisioning.clone(),
             target: candidate.clone(),
             resources: ReplicaCleanupIdentity {
                 pod: CleanupResourceIdentity::Present {
@@ -1183,6 +1206,7 @@ mod tests {
             topology: Some(AcceptedTopology {
                 configuration: intent.previous_configuration.clone(),
             }),
+            provisioning: Some(provisioning.clone()),
             transition: Some(TransitionIntent {
                 transition_id: intent.transition_id(TransitionKind::Failover, &failover),
                 kind: TransitionKind::Failover,

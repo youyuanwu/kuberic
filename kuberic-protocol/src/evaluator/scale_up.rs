@@ -19,10 +19,9 @@ fn persist(status: AcceptedStatus) -> Plan {
     }
 }
 
-fn counts(snapshot: &ObservationSnapshot) -> (u32, u32) {
+fn counts(snapshot: &ObservationSnapshot, status: &AcceptedStatus) -> (u32, u32) {
     (
-        snapshot
-            .status
+        status
             .effective_policy
             .as_ref()
             .map_or(0, |policy| policy.replica_set_size),
@@ -39,7 +38,7 @@ fn progress_status(
     attempt: Option<&OperationId>,
     blocking: &str,
 ) -> AcceptedStatus {
-    let (accepted, desired) = counts(snapshot);
+    let (accepted, desired) = counts(snapshot, &status);
     let target = target.map_or_else(
         || "none".to_string(),
         |identity| format!("{}@{}", identity.replica_id, identity.instance_id),
@@ -54,11 +53,41 @@ fn progress_status(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn publish_phase_if_changed(
+    snapshot: &ObservationSnapshot,
+    status: &AcceptedStatus,
+    reason: &str,
+    phase: &str,
+    target: Option<&ReplicaIdentity>,
+    attempt: Option<&OperationId>,
+    blocking: &str,
+) -> Option<Plan> {
+    let current = status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "Progressing");
+    if current.is_some_and(|condition| {
+        condition.reason == reason && condition.message.contains(&format!("phase={phase}"))
+    }) {
+        return None;
+    }
+    Some(persist(progress_status(
+        snapshot,
+        status.clone(),
+        reason,
+        phase,
+        target,
+        attempt,
+        blocking,
+    )))
+}
+
 pub(super) fn stable_condition(
     snapshot: &ObservationSnapshot,
     receipt: &ScaleUpReceipt,
 ) -> StatusCondition {
-    let (accepted, desired) = counts(snapshot);
+    let (accepted, desired) = counts(snapshot, &snapshot.status);
     StatusCondition {
         type_: "Ready".into(),
         status: ConditionStatus::True,
@@ -134,26 +163,47 @@ fn build<'a>(
         .find(|build| &build.build_id == build_id && &build.target == target)
 }
 
+enum BuildPair<'a> {
+    Missing,
+    Propagating,
+    Exact(&'a AgentBuildReport, &'a AgentBuildReport),
+}
+
 fn exact_build_pair<'a>(
     source: &'a AgentReport,
     target: &'a AgentReport,
     build_id: &OperationId,
     target_identity: &ReplicaIdentity,
-) -> Result<Option<(&'a AgentBuildReport, &'a AgentBuildReport)>, &'static str> {
+) -> Result<BuildPair<'a>, &'static str> {
     let source_build = build(source, build_id, target_identity);
     let target_build = build(target, build_id, target_identity);
     let (Some(source_build), Some(target_build)) = (source_build, target_build) else {
-        return Ok(None);
+        return Ok(if source_build.is_some() || target_build.is_some() {
+            BuildPair::Propagating
+        } else {
+            BuildPair::Missing
+        });
     };
-    if source_build.replication_boundary_lsn != target_build.replication_boundary_lsn
-        || source_build.catch_up_boundary_lsn != target_build.catch_up_boundary_lsn
-        || source_build
-            .catch_up_boundary_lsn
-            .is_some_and(|boundary| boundary < source_build.replication_boundary_lsn)
+    if source_build.replication_boundary_lsn != target_build.replication_boundary_lsn {
+        return Err("source and receiver report conflicting immutable snapshot boundaries");
+    }
+    match (
+        source_build.catch_up_boundary_lsn,
+        target_build.catch_up_boundary_lsn,
+    ) {
+        (Some(source), Some(target)) if source != target => {
+            return Err("source and receiver report conflicting frozen catch-up boundaries");
+        }
+        (Some(_), None) | (None, Some(_)) => return Ok(BuildPair::Propagating),
+        _ => {}
+    }
+    if source_build
+        .catch_up_boundary_lsn
+        .is_some_and(|boundary| boundary < source_build.replication_boundary_lsn)
     {
         return Err("source and receiver report conflicting immutable build boundaries");
     }
-    Ok(Some((source_build, target_build)))
+    Ok(BuildPair::Exact(source_build, target_build))
 }
 
 fn cleanup_observation<'a>(
@@ -161,6 +211,83 @@ fn cleanup_observation<'a>(
     target: &ReplicaIdentity,
 ) -> Option<&'a crate::observation::SecondaryScaleDownResourceObservation> {
     secondary_scale_down::resources(snapshot, target)
+}
+
+fn restore_accepted_service_before_cleanup(
+    snapshot: &ObservationSnapshot,
+    accepted: &ConfigurationDescriptor,
+    policy: &EffectivePolicy,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    let primary = configuration_primary(accepted);
+    let reports = accepted
+        .members
+        .iter()
+        .filter_map(|member| {
+            let report = report(snapshot, &member.identity)?;
+            stable_member_report(report, member, accepted).then_some(report)
+        })
+        .collect::<Vec<_>>();
+    let primary_report = reports
+        .iter()
+        .copied()
+        .find(|report| report.identity == primary.identity);
+    let Some(primary_report) = primary_report else {
+        return Some(Plan::Wait {
+            reason: WaitReason::AwaitingStableEvidence,
+            status: waiting_status(
+                snapshot.status.clone(),
+                "ScaleUpFailoverPrimaryPending",
+                "Accepted failover primary must attest exact authority before cleanup",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        });
+    };
+    if reports.len() < accepted.write_quorum as usize {
+        return Some(Plan::Wait {
+            reason: WaitReason::QuorumLoss,
+            status: waiting_status(
+                snapshot.status.clone(),
+                "ScaleUpFailoverWriteQuorumPending",
+                "Accepted failover write quorum must recover before candidate cleanup",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        });
+    }
+    if primary_report.write_status != AccessStatus::Granted {
+        return Some(Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(Box::new(ensure_configuration_command(
+                accepted,
+                primary,
+                policy,
+                OperationId::new(format!(
+                    "scale-up-failover:{}:grant-write",
+                    accepted.configuration_id
+                )),
+                AccessStatus::Granted,
+                false,
+            ))),
+        });
+    }
+    if !snapshot.routing.service_present {
+        return Some(Plan::Apply {
+            changes: vec![KubernetesChange::EnsureWriteRoutingService],
+        });
+    }
+    if snapshot.routing.write_target.as_ref() != Some(&primary.identity)
+        || snapshot.routing.unresolved_write_target
+    {
+        let mut changes = Vec::new();
+        if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+            changes.push(KubernetesChange::RemoveWriteRouting);
+        } else {
+            changes.push(KubernetesChange::PublishWriteRouting {
+                primary: primary.identity.clone(),
+            });
+        }
+        return Some(Plan::Apply { changes });
+    }
+    None
 }
 
 fn freeze_cleanup(
@@ -439,6 +566,26 @@ pub(super) fn recover_local_acceptance(
             evidence: evidence.clone(),
         },
     );
+    let failover_safe_lsn = receipt
+        .failover_evidence
+        .as_ref()
+        .and_then(|_| {
+            receipt
+                .current_only_write_quorum
+                .iter()
+                .find_map(|witness| {
+                    (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
+                        .then_some(witness.verified_replication_lsn)
+                })
+        })
+        .or_else(|| {
+            receipt.failover_evidence.as_ref().and_then(|evidence| {
+                evidence.current_read_quorum.iter().find_map(|witness| {
+                    (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
+                        .then_some(witness.verified_replication_lsn)
+                })
+            })
+        });
     for member in &receipt.accepted_configuration.members {
         let Some(report) = report(snapshot, &member.identity) else {
             return Some(wait(
@@ -475,7 +622,7 @@ pub(super) fn recover_local_acceptance(
                     &receipt.accepted_configuration,
                     member,
                     true,
-                    None,
+                    failover_safe_lsn,
                 ))),
             });
         }
@@ -759,6 +906,30 @@ pub(super) fn provisioning(
         Some(&provisioning.operation_id),
         "candidate initialization, endpoint, or build evidence is incomplete",
     );
+    let accepted = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .expect("validated scale-up provisioning has accepted topology")
+        .configuration;
+    if accepted != previous {
+        if let Some(plan) = restore_accepted_service_before_cleanup(
+            snapshot,
+            accepted,
+            &scale_up.previous_policy,
+            config,
+        ) {
+            return plan;
+        }
+        return freeze_cleanup(
+            snapshot,
+            provisioning,
+            status,
+            "ScaleUpCleanupPendingAfterFailover",
+            false,
+            config,
+        );
+    }
     if snapshot.desired.replicas <= scale_up.previous_policy.replica_set_size {
         return freeze_cleanup(
             snapshot,
@@ -770,26 +941,18 @@ pub(super) fn provisioning(
         );
     }
     if replica_failed(snapshot, &primary.identity) {
-        let mut failed = status;
-        failed.primary_failure = Some(PrimaryFailureObservation {
-            primary: primary.identity.clone(),
-            started_at_unix_seconds: snapshot
-                .status
-                .primary_failure
-                .as_ref()
-                .filter(|failure| failure.primary == primary.identity)
-                .map_or(snapshot.now_unix_seconds, |failure| {
-                    failure.started_at_unix_seconds
-                }),
+        return maybe_begin_stable_failover(snapshot, status, config).unwrap_or_else(|| {
+            wait(
+                snapshot,
+                snapshot.status.clone(),
+                "ScaleUpFailoverArbitrationPending",
+                "failover-recovery",
+                Some(&target),
+                Some(&provisioning.operation_id),
+                "accepted primary failure arbitration is pending",
+                config,
+            )
         });
-        return freeze_cleanup(
-            snapshot,
-            provisioning,
-            failed,
-            "ScaleUpAbandonedForFailover",
-            true,
-            config,
-        );
     }
     let Some(observation) = snapshot.observation_for_identity(&target) else {
         return freeze_cleanup(
@@ -896,18 +1059,49 @@ pub(super) fn provisioning(
                     );
                 }
             };
-            let Some((source_build, target_build)) = pair else {
-                return Plan::Execute {
-                    command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
-                        operation_id: build_id,
-                        local_replica_id: primary.identity.replica_id,
-                        expected_instance_id: primary.identity.instance_id.clone(),
-                        expected_agent_generation: primary.identity.agent_generation.clone(),
-                        target,
-                        authority: None,
-                        source_session_id: None,
-                    })),
-                };
+            let (source_build, target_build) = match pair {
+                BuildPair::Missing => {
+                    if let Some(plan) = publish_phase_if_changed(
+                        snapshot,
+                        &snapshot.status,
+                        "ScaleUpCopying",
+                        "copying",
+                        Some(&target),
+                        Some(&build_id),
+                        "source and receiver build progress has not been observed",
+                    ) {
+                        return plan;
+                    }
+                    return Plan::Execute {
+                        command: ProtocolCommand::EnsureReplicaBuild(Box::new(
+                            EnsureReplicaBuild {
+                                operation_id: build_id,
+                                local_replica_id: primary.identity.replica_id,
+                                expected_instance_id: primary.identity.instance_id.clone(),
+                                expected_agent_generation: primary
+                                    .identity
+                                    .agent_generation
+                                    .clone(),
+                                target,
+                                authority: None,
+                                source_session_id: None,
+                            },
+                        )),
+                    };
+                }
+                BuildPair::Propagating => {
+                    return wait(
+                        snapshot,
+                        status,
+                        "ScaleUpBoundaryPropagationPending",
+                        "catch-up",
+                        Some(&target),
+                        Some(&build_id),
+                        "source and receiver have not both observed the frozen boundary",
+                        config,
+                    );
+                }
+                BuildPair::Exact(source_build, target_build) => (source_build, target_build),
             };
             let Some(catch_up_boundary) = source_build.catch_up_boundary_lsn else {
                 return wait(
@@ -927,6 +1121,17 @@ pub(super) fn provisioning(
                 || source_build.durable_lsn < catch_up_boundary
                 || target_build.durable_lsn < catch_up_boundary
             {
+                if let Some(plan) = publish_phase_if_changed(
+                    snapshot,
+                    &snapshot.status,
+                    "ScaleUpCatchUpPending",
+                    "catch-up",
+                    Some(&target),
+                    Some(&build_id),
+                    "receiver durable progress has not reached the frozen catch-up boundary",
+                ) {
+                    return plan;
+                }
                 return Plan::Execute {
                     command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
                         operation_id: build_id,
@@ -1207,7 +1412,7 @@ fn begin_failover(
         scale_up_failover: Some(Box::new(evidence)),
     });
     status.primary_failure = None;
-    persist(progress_status(
+    let status = progress_status(
         snapshot,
         status,
         "ScaleUpFailoverPersisted",
@@ -1215,7 +1420,15 @@ fn begin_failover(
         Some(&intent.target),
         Some(&intent.operation_id),
         "preserved original PC and expanded CC with independent recovery evidence",
-    ))
+    );
+    let mut changes = Vec::new();
+    if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+        changes.push(KubernetesChange::RemoveWriteRouting);
+    }
+    changes.push(KubernetesChange::PersistStatus {
+        status: Box::new(status),
+    });
+    Plan::Apply { changes }
 }
 
 pub(super) fn transition(
@@ -1239,11 +1452,15 @@ pub(super) fn transition(
         .expect("scale-up transition branch");
     let intent = evidence.intent();
     let current = &transition.current_configuration;
-    let provisioning = snapshot
-        .status
-        .provisioning
-        .as_ref()
-        .expect("validated scale-up transition retains provisioning provenance");
+    let Some(provisioning) = snapshot.status.provisioning.as_ref() else {
+        return unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::InvalidAcceptedAuthority(
+                "active scale-up transition lacks exact provisioning provenance".into(),
+            ),
+            config,
+        );
+    };
     let pc_cc_started = current.members.iter().any(|member| {
         report(snapshot, &member.identity).is_some_and(|report| {
             exact_pc_cc_report(report, intent, current)
@@ -1408,6 +1625,18 @@ pub(super) fn transition(
                 config,
             );
         }
+    }
+
+    if let Some(plan) = publish_phase_if_changed(
+        snapshot,
+        &snapshot.status,
+        "ScaleUpCurrentOnlyInstalling",
+        "current-only",
+        Some(&intent.target),
+        Some(&intent.operation_id),
+        "installing expanded current-only authority one exact member at a time",
+    ) {
+        return plan;
     }
 
     for member in current

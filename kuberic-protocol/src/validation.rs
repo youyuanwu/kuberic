@@ -334,8 +334,12 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                     .ok_or(ValidationError::InvalidScaleUp(
                         "missing scale-up provisioning payload",
                     ))?;
+                let accepted_authority_matches = topology.configuration.epoch
+                    >= scale_up.previous_configuration.epoch
+                    && exact_identities(&topology.configuration)
+                        == exact_identities(&scale_up.previous_configuration);
                 if scale_up.resource_uid != snapshot.resource_uid
-                    || scale_up.previous_configuration != topology.configuration
+                    || !accepted_authority_matches
                     || snapshot.status.effective_policy.as_ref() != Some(&scale_up.previous_policy)
                 {
                     return Err(ValidationError::InvalidScaleUp(
@@ -1278,6 +1282,14 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     if let Some(policy) = &status.effective_policy {
         validate_policy(policy)?;
     }
+    if status.transition.as_ref().is_some_and(|transition| {
+        transition.scale_up.is_some() || transition.scale_up_failover.is_some()
+    }) && status.provisioning.is_none()
+    {
+        return Err(ValidationError::InvalidScaleUp(
+            "active scale-up transition requires exact provisioning provenance",
+        ));
+    }
     if let (Some(provisioning), Some(transition)) =
         (status.provisioning.as_ref(), status.transition.as_ref())
     {
@@ -1302,7 +1314,23 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                         == Some(&intent.build_id)
             })
         });
-        if !retained_scale_up_provenance {
+        let deferred_cleanup_during_failover = provisioning.scale_up().is_some_and(|frozen| {
+            transition.kind == TransitionKind::Failover
+                && transition.scale_up.is_none()
+                && transition.scale_up_failover.is_none()
+                && transition.effective_policy == frozen.previous_policy
+                && transition.current_configuration.epoch > frozen.previous_configuration.epoch
+                && exact_identities(&transition.current_configuration)
+                    == exact_identities(&frozen.previous_configuration)
+                && !transition
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|member| {
+                        member.identity == provisioning.target_identity(&frozen.resource_uid)
+                    })
+        });
+        if !retained_scale_up_provenance && !deferred_cleanup_during_failover {
             return Err(ValidationError::ProvisioningAndTransition);
         }
     }
@@ -1312,11 +1340,12 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     if let Some(provisioning) = &status.provisioning {
         validate_scale_up_provisioning(provisioning)?;
         if let Some(scale_up) = provisioning.scale_up() {
-            if status
-                .topology
-                .as_ref()
-                .map(|topology| &topology.configuration)
-                != Some(&scale_up.previous_configuration)
+            let accepted_authority_matches = status.topology.as_ref().is_some_and(|topology| {
+                topology.configuration.epoch >= scale_up.previous_configuration.epoch
+                    && exact_identities(&topology.configuration)
+                        == exact_identities(&scale_up.previous_configuration)
+            });
+            if !accepted_authority_matches
                 || status.effective_policy.as_ref() != Some(&scale_up.previous_policy)
                 || status.scale_up_cleanup.is_some()
             {
