@@ -9303,3 +9303,87 @@ fn scale_up_copy_model_closes_concurrent_writes_across_source_and_candidate_rest
     model.run(80);
     assert_eq!(model.accepted_count(), 2);
 }
+
+#[test]
+fn scale_up_permanent_candidate_failure_before_fence_freezes_cleanup() {
+    use scale_up_model::Model;
+    let mut model = Model::new(3, 4);
+    while model.snapshot.status.transition.is_none() {
+        model.step();
+    }
+    assert!(model.snapshot.status.scale_up_admission_started.is_none());
+    model.report_mut(4).healthy = false;
+    model.report_mut(4).reported_fault = Some(FaultType::Permanent);
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("permanent pre-admission candidate failure must freeze cleanup")
+    };
+    let status = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(*status),
+        _ => None,
+    });
+    let status = status.expect("cleanup status");
+    assert!(status.scale_up_cleanup.is_some());
+    assert!(status.scale_up_admission_started.is_none());
+    assert!(status.transition.is_none());
+    assert_eq!(
+        status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn scale_up_provisioning_and_prefence_failover_delays_keep_context() {
+    use scale_up_model::Model;
+    for transition_persisted in [false, true] {
+        let mut model = Model::new(3, 4);
+        if transition_persisted {
+            while model.snapshot.status.transition.is_none() {
+                model.step();
+            }
+            assert!(model.snapshot.status.scale_up_admission_started.is_none());
+        } else {
+            while model.snapshot.status.provisioning.is_none() {
+                model.step();
+            }
+        }
+        for replica_id in [1, 3] {
+            model.report_mut(replica_id).healthy = false;
+            model.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(replica_id).write_status = AccessStatus::ReconfigurationPending;
+        }
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("persist primary failure")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        let Plan::Wait { status, .. } = model.plan() else {
+            panic!("contextual failover delay")
+        };
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.reason == "FailoverDelay")
+            .unwrap();
+        for field in [
+            "accepted=3",
+            "desired=4",
+            "target=4@",
+            "attempt=",
+            "phase=failover-recovery",
+            "blocking=",
+        ] {
+            assert!(
+                condition.message.contains(field),
+                "transition={transition_persisted} {field}: {}",
+                condition.message
+            );
+        }
+    }
+}

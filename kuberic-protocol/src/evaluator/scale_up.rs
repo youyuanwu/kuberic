@@ -1095,18 +1095,28 @@ pub(super) fn provisioning(
         );
     }
     if replica_failed(snapshot, &primary.identity) {
-        return maybe_begin_stable_failover(snapshot, status, config).unwrap_or_else(|| {
-            wait(
-                snapshot,
-                snapshot.status.clone(),
-                "ScaleUpFailoverArbitrationPending",
-                "failover-recovery",
-                Some(&target),
-                Some(&provisioning.operation_id),
-                "accepted primary failure arbitration is pending",
-                config,
-            )
-        });
+        return maybe_begin_stable_failover(snapshot, status, config)
+            .map(|plan| {
+                contextualize_delegated_wait(
+                    snapshot,
+                    plan,
+                    &target,
+                    &provisioning.operation_id,
+                    "failover-recovery",
+                )
+            })
+            .unwrap_or_else(|| {
+                wait(
+                    snapshot,
+                    snapshot.status.clone(),
+                    "ScaleUpFailoverArbitrationPending",
+                    "failover-recovery",
+                    Some(&target),
+                    Some(&provisioning.operation_id),
+                    "accepted primary failure arbitration is pending",
+                    config,
+                )
+            });
     }
     if snapshot.desired.replicas <= scale_up.previous_policy.replica_set_size {
         return freeze_cleanup(
@@ -1691,6 +1701,15 @@ pub(super) fn transition(
     if transition.kind == TransitionKind::ScaleUp && accepted_primary_failed {
         if !admission_started {
             return maybe_begin_stable_failover(snapshot, snapshot.status.clone(), config)
+                .map(|plan| {
+                    contextualize_delegated_wait(
+                        snapshot,
+                        plan,
+                        &intent.target,
+                        &intent.operation_id,
+                        "failover-recovery",
+                    )
+                })
                 .unwrap_or_else(|| {
                     wait(
                         snapshot,
@@ -1726,6 +1745,31 @@ pub(super) fn transition(
             false,
             config,
         );
+    }
+    if transition.kind == TransitionKind::ScaleUp && !admission_started {
+        let candidate_failed = snapshot
+            .observation_for_identity(&intent.target)
+            .is_none_or(|observation| {
+                matches!(
+                    &observation.agent,
+                    AgentObservation::Absent | AgentObservation::Invalid { .. }
+                ) || matches!(
+                    &observation.agent,
+                    AgentObservation::Report(report)
+                        if report.reported_fault == Some(crate::types::FaultType::Permanent)
+                            || !report.healthy
+                )
+            });
+        if candidate_failed {
+            return freeze_cleanup(
+                snapshot,
+                provisioning,
+                snapshot.status.clone(),
+                "ScaleUpCandidateFailedBeforeAdmission",
+                false,
+                config,
+            );
+        }
     }
     if transition.kind == TransitionKind::ScaleUp && !admission_started {
         let mut status = snapshot.status.clone();
