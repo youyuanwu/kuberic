@@ -9347,6 +9347,130 @@ fn scale_up_provisioning_and_prefence_failover_delays_keep_context() {
                 model.step();
             }
 
+            #[allow(dead_code)]
+            fn assert_scale_up_receipt_allows_full_replacement(replica_id: i64) {
+                use scale_up_model::Model as ScaleUpModel;
+                let mut scale_up = ScaleUpModel::new(2, 3);
+                scale_up.run(120);
+                let receipt = scale_up.snapshot.status.last_scale_up.clone().unwrap();
+                let old = scale_up
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == ReplicaId::new(replica_id))
+                    .unwrap()
+                    .identity
+                    .clone();
+                if !scale_up
+                    .snapshot
+                    .secondary_scale_down_resources
+                    .iter()
+                    .any(|resources| resources.target == old)
+                {
+                    scale_up
+                        .snapshot
+                        .secondary_scale_down_resources
+                        .push(replacement_resources(&scale_up.snapshot.resource_uid, &old));
+                }
+                scale_up.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
+                scale_up.report_mut(replica_id).healthy = false;
+
+                let mut replacement = scale_down_model::Model {
+                    snapshot: scale_up.snapshot,
+                    commands: Vec::new(),
+                    removed: Vec::new(),
+                    deletes: Vec::new(),
+                    inflight: BTreeMap::new(),
+                    applied_effects: BTreeMap::new(),
+                };
+                replacement
+                    .until(|model| model.snapshot.status.pending_replacement_cleanup.is_some());
+                replacement.controller_restart();
+                let frozen = replacement
+                    .snapshot
+                    .status
+                    .pending_replacement_cleanup
+                    .clone()
+                    .unwrap();
+                assert_eq!(frozen.target, old);
+
+                let failed_key = replacement
+                    .snapshot
+                    .replicas
+                    .iter()
+                    .find_map(|(key, observation)| match &observation.agent {
+                        AgentObservation::Report(report) if report.identity == old => {
+                            Some(key.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                replacement
+                    .snapshot
+                    .replicas
+                    .get_mut(&failed_key)
+                    .unwrap()
+                    .agent = AgentObservation::Absent;
+
+                let mut without_guard = replacement.snapshot.clone();
+                without_guard.status.pending_replacement_cleanup = None;
+                assert!(matches!(
+                    evaluate(&without_guard, &scale_up_model::config()),
+                    Plan::Wait { status, .. }
+                        if status.conditions.iter().any(|condition|
+                            condition.reason == "ScaleUpCommittedDegraded")
+                ));
+
+                replacement.finish();
+                let accepted = &replacement
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration;
+                let fresh = accepted
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == old.replica_id)
+                    .unwrap();
+                assert_ne!(fresh.identity, old);
+                assert_eq!(replacement.deletes.len(), 3);
+                assert!(
+                    replacement
+                        .commands
+                        .iter()
+                        .filter(|command| matches!(
+                            command,
+                            ProtocolCommand::EnsureConfiguration(_)
+                        ))
+                        .count()
+                        >= 2
+                );
+                assert!(replacement.commands.iter().any(|command| matches!(
+                    command,
+                    ProtocolCommand::EnsureConfiguration(command)
+                        if command.current_only && !command.retire_build_ids.is_empty()
+                )));
+                assert_eq!(replacement.snapshot.status.last_scale_up, Some(receipt));
+                assert!(matches!(replacement.plan(), Plan::Stable { .. }));
+            }
+
+            #[allow(dead_code)]
+            fn scale_up_new_member_permanent_failure_completes_replacement() {
+                assert_scale_up_receipt_allows_full_replacement(3);
+            }
+
+            #[allow(dead_code)]
+            fn scale_up_retained_secondary_permanent_failure_completes_replacement() {
+                assert_scale_up_receipt_allows_full_replacement(2);
+            }
+
             fn scale_up_receipt_yields_to_permanent_accepted_member_replacement() {
                 use scale_up_model::Model;
                 for replica_id in [2, 3] {
