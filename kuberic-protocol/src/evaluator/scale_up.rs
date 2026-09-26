@@ -381,6 +381,48 @@ fn cleanup_delete(
     })
 }
 
+fn contextualize_delegated_wait(
+    snapshot: &ObservationSnapshot,
+    plan: Plan,
+    target: &ReplicaIdentity,
+    attempt: &OperationId,
+    phase: &str,
+) -> Plan {
+    let Plan::Wait {
+        reason,
+        status,
+        requeue_after_seconds,
+    } = plan
+    else {
+        return plan;
+    };
+    let condition = status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "Progressing");
+    let diagnostic_reason = condition.map_or_else(
+        || "ScaleUpRecoveryPending".to_string(),
+        |condition| condition.reason.clone(),
+    );
+    let blocking = condition.map_or_else(
+        || "delegated accepted-authority recovery is pending".to_string(),
+        |condition| condition.message.clone(),
+    );
+    Plan::Wait {
+        reason,
+        status: progress_status(
+            snapshot,
+            status,
+            &diagnostic_reason,
+            phase,
+            Some(target),
+            Some(attempt),
+            &blocking,
+        ),
+        requeue_after_seconds,
+    }
+}
+
 pub(super) fn cleanup(
     snapshot: &ObservationSnapshot,
     cleanup: &ScaleUpCleanup,
@@ -389,7 +431,13 @@ pub(super) fn cleanup(
     if snapshot.status.transition.is_none()
         && let Some(plan) = maybe_begin_stable_failover(snapshot, snapshot.status.clone(), config)
     {
-        return plan;
+        return contextualize_delegated_wait(
+            snapshot,
+            plan,
+            &cleanup.target,
+            &cleanup.provisioning.operation_id,
+            "failover-recovery",
+        );
     }
     let accepted = &snapshot
         .status

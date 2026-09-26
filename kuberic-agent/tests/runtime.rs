@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::env;
+use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -8597,14 +8600,47 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
 
 #[test]
 fn evaluator_scale_up_command_uses_reopened_sqlite_copy_and_preserves_live_write() {
+    if env::var("KUBERIC_SQLITE_SCALE_UP_WRITER").as_deref() == Ok("1") {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(evaluator_scale_up_sqlite_trace());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "evaluator_scale_up_command_uses_reopened_sqlite_copy_and_preserves_live_write",
+        ])
+        .env("KUBERIC_SQLITE_SCALE_UP_WRITER", "1")
+        .env("KUBERIC_SQLITE_SCALE_UP_ROOT", directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(evaluator_scale_up_sqlite_trace());
+        .spawn({
+            let root = directory.path().to_path_buf();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(verify_persisted_scale_up_after_process_exit(&root));
+            }
         })
         .unwrap()
         .join()
@@ -8614,6 +8650,11 @@ fn evaluator_scale_up_command_uses_reopened_sqlite_copy_and_preserves_live_write
 type PersistedApplicationState = (Vec<(i64, i64, Vec<u8>)>, i64, i64);
 
 async fn evaluator_scale_up_sqlite_trace() {
+    let root = std::path::PathBuf::from(env::var("KUBERIC_SQLITE_SCALE_UP_ROOT").unwrap());
+    let source_root = root.join("source");
+    let target_root = root.join("target");
+    std::fs::create_dir_all(&source_root).unwrap();
+    std::fs::create_dir_all(&target_root).unwrap();
     let resource_uid = ResourceUid::new("sqlite-evaluator-scale-up");
     let source = identity(1, "sqlite-source");
     let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
@@ -8645,8 +8686,7 @@ async fn evaluator_scale_up_sqlite_trace() {
     let target = provisioning.target_identity(&resource_uid);
     let build_id = provisioning.scale_up_build_id(&resource_uid).unwrap();
 
-    let source_directory = tempfile::tempdir().unwrap();
-    let source_path = SqliteStore::metadata_database_path(source_directory.path());
+    let source_path = SqliteStore::metadata_database_path(&source_root);
     let mut source_state = AgentState::new(StorageIdentity {
         schema_version: SCHEMA_VERSION,
         resource_uid: resource_uid.clone(),
@@ -8675,8 +8715,7 @@ async fn evaluator_scale_up_sqlite_trace() {
     };
     source_store.admit(&previous_authority).await.unwrap();
 
-    let target_directory = tempfile::tempdir().unwrap();
-    let target_path = SqliteStore::metadata_database_path(target_directory.path());
+    let target_path = SqliteStore::metadata_database_path(&target_root);
     let mut target_state = AgentState::new(StorageIdentity {
         schema_version: SCHEMA_VERSION,
         resource_uid: resource_uid.clone(),
@@ -8835,7 +8874,7 @@ async fn evaluator_scale_up_sqlite_trace() {
             .await
             .unwrap();
     }
-    let application_path = target_directory.path().join("application-state.json");
+    let application_path = target_root.join("application-state.json");
     let persisted_operations = target_application
         .applied
         .lock()
@@ -9016,6 +9055,11 @@ async fn evaluator_scale_up_sqlite_trace() {
         panic!("completed durable copy must produce evaluator configuration command")
     };
     assert_eq!(target_command.local_replica_id, target.replica_id);
+    std::fs::write(
+        root.join("configuration-command.json"),
+        serde_json::to_vec(target_command.as_ref()).unwrap(),
+    )
+    .unwrap();
     assert!(kuberic_agent::command::admit_configuration(&target_command, &before_copy).is_err());
     target_runtime
         .apply_effect(effect(4, RuntimeEffectAction::Close))
@@ -9097,6 +9141,58 @@ async fn evaluator_scale_up_sqlite_trace() {
             .get(&2)
             .unwrap()
             .data,
+        Bytes::from_static(b"live-value")
+    );
+}
+
+async fn verify_persisted_scale_up_after_process_exit(root: &Path) {
+    let target_root = root.join("target");
+    let target_path = SqliteStore::metadata_database_path(&target_root);
+    let command: EnsureConfiguration =
+        serde_json::from_slice(&std::fs::read(root.join("configuration-command.json")).unwrap())
+            .unwrap();
+    let (persisted_operations, applied_lsn, committed_lsn): PersistedApplicationState =
+        serde_json::from_slice(&std::fs::read(target_root.join("application-state.json")).unwrap())
+            .unwrap();
+    let application = Arc::new(TestApplication::default());
+    {
+        let mut applied = application.applied.lock().unwrap();
+        for (lsn, committed_lsn, data) in persisted_operations {
+            applied.insert(
+                lsn,
+                Operation {
+                    lsn,
+                    committed_lsn,
+                    data: Bytes::from(data),
+                },
+            );
+        }
+        *application.progress.lock().unwrap() = DurableApplicationProgress {
+            applied_lsn,
+            committed_lsn,
+        };
+    }
+    let store = Arc::new(SqliteStore::open_existing(&target_path, None).unwrap());
+    let identity = store.identity().await.unwrap().local_identity;
+    let runtime = Arc::new(PodRuntime::new(
+        identity,
+        application.clone(),
+        store.clone(),
+    ));
+    let service =
+        AgentService::new(store.clone(), runtime.clone(), runtime.clone(), "token").unwrap();
+    service.reconstruct_runtime().await.unwrap();
+    Coordinator::new(store.clone(), runtime)
+        .ensure_configuration(command)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load_state().await.unwrap().role,
+        ReplicaRole::ActiveSecondary
+    );
+    assert_eq!(application.durable_progress().await.unwrap().applied_lsn, 2);
+    assert_eq!(
+        application.applied.lock().unwrap().get(&2).unwrap().data,
         Bytes::from_static(b"live-value")
     );
 }

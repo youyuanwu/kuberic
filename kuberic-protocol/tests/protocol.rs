@@ -8418,6 +8418,56 @@ fn scale_up_transition_without_provisioning_provenance_is_rejected_without_panic
     while model.snapshot.status.transition.is_none() {
         model.step();
     }
+
+    fn scale_up_frozen_cleanup_failover_delay_keeps_full_context() {
+        use scale_up_model::Model;
+        let mut model = Model::new(3, 4);
+        while model.snapshot.status.provisioning.is_none() {
+            model.step();
+        }
+        model.snapshot.desired.replicas = 3;
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("freeze cleanup")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        model.snapshot.secondary_scale_down_resources.clear();
+        for replica_id in [1, 3] {
+            model.report_mut(replica_id).healthy = false;
+            model.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
+            model.report_mut(replica_id).write_status = AccessStatus::ReconfigurationPending;
+        }
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("persist primary failure")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        let Plan::Wait { status, .. } = model.plan() else {
+            panic!("failover delay")
+        };
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.reason == "FailoverDelay")
+            .unwrap();
+        for field in [
+            "accepted=3",
+            "desired=3",
+            "target=4@",
+            "attempt=scale-up-provisioning-",
+            "phase=failover-recovery",
+            "blocking=",
+        ] {
+            assert!(
+                condition.message.contains(field),
+                "{field}: {}",
+                condition.message
+            );
+        }
+    }
+    scale_up_frozen_cleanup_failover_delay_keeps_full_context();
     model.snapshot.status.provisioning = None;
     assert!(kuberic_protocol::validation::validate_snapshot(&model.snapshot).is_err());
     assert!(matches!(
