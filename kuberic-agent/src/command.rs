@@ -4,7 +4,9 @@ use kuberic_protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
 };
 use kuberic_protocol::types::{AccessStatus, ReplicaRole, TransitionKind};
-use kuberic_protocol::validation::validate_transition_relationship;
+use kuberic_protocol::validation::{
+    validate_scale_up_configuration, validate_transition_relationship,
+};
 use kuberic_runtime_internal::authority::AdmittedAuthority;
 
 use crate::provisioning::{
@@ -171,6 +173,9 @@ fn admit_configuration_with_replay(
         return Err(AgentError::CommandRejected(
             "prepared removal may only roll forward".into(),
         ));
+    }
+    if command.scale_up_evidence.is_some() || command.transition_kind == TransitionKind::ScaleUp {
+        return admit_scale_up_configuration(command, state, persisted_exact_replay);
     }
     if command.secondary_removal_evidence.is_some()
         || command
@@ -487,7 +492,9 @@ fn admit_configuration_with_replay(
         secondary_removal: is_access_only_configuration(command, state)
             .then(|| state.secondary_removal_evidence.clone())
             .flatten(),
-        scale_up: None,
+        scale_up: is_access_only_configuration(command, state)
+            .then(|| state.scale_up_evidence.clone())
+            .flatten(),
         local_identity: identity.clone(),
         transition_kind: (!command.current_only && !is_access_only_configuration(command, state))
             .then_some(command.transition_kind),
@@ -508,6 +515,174 @@ fn admit_configuration_with_replay(
     Ok(admitted)
 }
 
+fn admit_scale_up_configuration(
+    command: &EnsureConfiguration,
+    state: &AgentState,
+    persisted_exact_replay: bool,
+) -> Result<AdmittedAuthority> {
+    validate_scale_up_configuration(command)
+        .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+    let evidence = command
+        .scale_up_evidence
+        .as_ref()
+        .expect("validated scale-up command has evidence");
+    let intent = evidence.intent();
+    let identity = &state.identity.local_identity;
+    if intent.resource_uid != state.identity.resource_uid
+        || command.local_replica_id != identity.replica_id
+        || command.expected_instance_id != identity.instance_id
+        || command.expected_agent_generation != identity.agent_generation
+        || command.current_epoch < state.highest_epoch
+    {
+        return Err(AgentError::CommandRejected(
+            "scale-up command target or epoch differs from durable identity".into(),
+        ));
+    }
+    if let Some(existing) = state.scale_up_evidence.as_deref()
+        && existing.intent() != intent
+    {
+        return Err(AgentError::CommandRejected(
+            "scale-up command conflicts with durable attempt authority".into(),
+        ));
+    }
+    if let kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover { evidence } =
+        evidence.as_ref()
+    {
+        let new_primary = command
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| {
+                member.identity.replica_id == command.current_configuration.primary_id
+                    && member.role == ReplicaRole::Primary
+            })
+            .expect("validated failover configuration has one primary");
+        if state.scale_up_evidence.is_none()
+            || state.previous_configuration.as_ref() != Some(&intent.previous_configuration)
+            || state.current_configuration.as_ref() != Some(&intent.current_configuration)
+            || !evidence
+                .current_read_quorum
+                .iter()
+                .any(|witness| witness.identity == new_primary.identity)
+        {
+            return Err(AgentError::CommandRejected(
+                "carried scale-up failover lacks durable PC/CC authority or a new-primary witness"
+                    .into(),
+            ));
+        }
+    }
+    if *identity == intent.target {
+        let provisioning = state.scale_up_initialization.as_ref().ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate lacks durable scale-up initialization authority".into(),
+            )
+        })?;
+        let initialized = provisioning.scale_up().ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate initialization is not tagged for scale-up".into(),
+            )
+        })?;
+        if initialized.resource_uid != intent.resource_uid
+            || initialized.spec_generation != intent.spec_generation
+            || initialized.desired_replicas != intent.desired_replicas
+            || initialized.previous_configuration != intent.previous_configuration
+            || initialized.previous_policy != intent.previous_policy
+            || initialized.current_policy != intent.current_policy
+            || provisioning.target_identity(&intent.resource_uid) != intent.target
+            || provisioning
+                .scale_up_build_id(&intent.resource_uid)
+                .as_ref()
+                != Some(&intent.build_id)
+        {
+            return Err(AgentError::CommandRejected(
+                "candidate authority differs from durable scale-up initialization".into(),
+            ));
+        }
+        let build = state.build_commands.get(&intent.build_id).ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate has not durably admitted the exact scale-up build".into(),
+            )
+        })?;
+        if state.retired_builds.contains(&intent.build_id)
+            || build.target != intent.target
+            || build.authority.as_ref().is_none_or(|authority| {
+                authority.build_id != intent.build_id
+                    || authority.source != intent.primary
+                    || authority.target != intent.target
+                    || authority.current_configuration != intent.previous_configuration
+                    || authority.replication_boundary_lsn != intent.snapshot_boundary_lsn
+            })
+        {
+            return Err(AgentError::CommandRejected(
+                "candidate build authority differs from scale-up admission".into(),
+            ));
+        }
+    }
+
+    let completed_current_only_replay = persisted_exact_replay
+        && command.current_only
+        && state.current_configuration.as_ref() == Some(&command.current_configuration)
+        && state.previous_configuration.is_none();
+    if command.current_only {
+        if !completed_current_only_replay
+            && (state.current_configuration.as_ref() != Some(&command.current_configuration)
+                || state.previous_configuration.as_ref() != Some(&intent.previous_configuration))
+        {
+            return Err(AgentError::CommandRejected(
+                "scale-up current-only completion lacks durable PC/CC authority".into(),
+            ));
+        }
+    } else {
+        let prior_member = intent
+            .previous_configuration
+            .members
+            .iter()
+            .any(|member| member.identity == *identity);
+        let same_attempt_replay = state.current_configuration.as_ref()
+            == Some(&command.current_configuration)
+            && state.previous_configuration.as_ref() == Some(&intent.previous_configuration);
+        let admission_start = prior_member
+            && state.current_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.previous_configuration.is_none();
+        let candidate_start = *identity == intent.target
+            && state.current_configuration.is_none()
+            && state.previous_configuration.is_none();
+        let carried_failover = matches!(
+            evidence.as_ref(),
+            kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover { .. }
+        ) && state.current_configuration.as_ref().is_some_and(
+            |configuration| {
+                configuration == &intent.current_configuration
+                    || configuration == &command.current_configuration
+            },
+        );
+        if !same_attempt_replay && !admission_start && !candidate_start && !carried_failover {
+            return Err(AgentError::CommandRejected(
+                "scale-up PC/CC command does not extend durable accepted authority".into(),
+            ));
+        }
+    }
+
+    let admitted = AdmittedAuthority {
+        secondary_removal: None,
+        scale_up: Some(evidence.clone()),
+        local_identity: identity.clone(),
+        transition_kind: (!command.current_only).then_some(command.transition_kind),
+        previous_configuration: command.previous_configuration.clone(),
+        current_configuration: command.current_configuration.clone(),
+        switchover_handoff: None,
+    };
+    admitted
+        .validate()
+        .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+    if admitted.local_role() == ReplicaRole::None {
+        return Err(AgentError::CommandRejected(
+            "scale-up authority does not assign the local replica".into(),
+        ));
+    }
+    Ok(admitted)
+}
+
 pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<()> {
     if state.retired_authority.is_some() || state.removal_pending() {
         return Err(AgentError::CommandRejected(
@@ -515,6 +690,11 @@ pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<(
         ));
     }
     let identity = &state.identity.local_identity;
+    if state.retired_builds.contains(&command.operation_id) {
+        return Err(AgentError::CommandRejected(
+            "retired build authority cannot be reopened".into(),
+        ));
+    }
     if command.operation_id.is_empty()
         || command.local_replica_id != identity.replica_id
         || command.expected_instance_id != identity.instance_id
@@ -531,7 +711,10 @@ pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<(
         if authority.build_id != command.operation_id
             || authority.target != command.target
             || authority.target != *identity
-            || command.source_session_id.is_none()
+            || command
+                .source_session_id
+                .as_ref()
+                .is_none_or(|session| session.is_empty())
         {
             return Err(AgentError::CommandRejected(
                 "target build command differs from admitted build authority".into(),

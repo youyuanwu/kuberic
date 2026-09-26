@@ -12,13 +12,14 @@ use kuberic_agent::state::{EffectStage, PendingEffect, RetainedResult};
 use kuberic_agent::store::AgentStore;
 use kuberic_agent::store::BeginEffect;
 use kuberic_protocol::command::AcceptSecondaryRemovalCommit;
-use kuberic_protocol::command::{EnsureConfiguration, InitializeAgentStore};
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore};
 use kuberic_protocol::types::{AccessStatus, SecondaryRemovalStage};
 use kuberic_protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
-    OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRole, ResourceUid, SwitchoverHandoff, SwitchoverRequestId, TransitionId,
-    TransitionIntent, TransitionKind, derive_agent_generation, derive_initialization_id,
+    OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpProvisioning,
+    SwitchoverHandoff, SwitchoverRequestId, TransitionId, TransitionIntent, TransitionKind,
+    derive_agent_generation, derive_initialization_id,
 };
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
@@ -327,7 +328,7 @@ async fn pending_acceptance_conversion_rejects_mutation_and_incompatible_durable
 }
 
 #[tokio::test]
-async fn schema_one_is_rejected_without_migration_or_provenance_changes() {
+async fn schema_two_is_rejected_without_migration_or_provenance_changes() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let (command, observed, transition) = bootstrap_fixture();
@@ -338,25 +339,25 @@ async fn schema_one_is_rejected_without_migration_or_provenance_changes() {
     )
     .unwrap();
     let store = SqliteStore::create_authorized(&path, AgentState::new(identity.clone())).unwrap();
-    assert!(store.migrate_schema(1, 2).await.is_err());
+    assert!(store.migrate_schema(2, 3).await.is_err());
     drop(store);
     let connection = Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 1).unwrap();
+    connection.pragma_update(None, "user_version", 2).unwrap();
     let original: String = connection
         .query_row("SELECT state_json FROM agent_state", [], |r| r.get(0))
         .unwrap();
     assert!(matches!(
         SqliteStore::open_existing(&path, None),
         Err(AgentError::SchemaMismatch {
-            expected: 2,
-            observed: 1
+            expected: 3,
+            observed: 2
         })
     ));
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         connection
@@ -593,6 +594,152 @@ fn fresh_replacement_store_requires_matching_provisioning_intent() {
         InitializationAuthority::Replacement(&provisioning),
     )
     .unwrap();
+}
+
+fn scale_up_initialization_fixture() -> (
+    InitializeAgentStore,
+    ObservedStorageIdentity,
+    ProvisioningIntent,
+) {
+    let resource_uid = ResourceUid::new("scale-up-set");
+    let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let primary = identity(1, "primary-pod", "primary-generation");
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary,
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy,
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("candidate-pod"),
+        pvc_uid: PvcUid::new("candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let command = InitializeAgentStore {
+        initialization_id: provisioning.initialization_id(&resource_uid),
+        resource_uid: resource_uid.clone(),
+        local_replica_id: target.replica_id,
+        expected_instance_id: target.instance_id.clone(),
+        expected_pod_uid: provisioning.pod_uid.clone(),
+        expected_pvc_uid: provisioning.pvc_uid.clone(),
+        assigned_agent_generation: target.agent_generation,
+        effective_policy: current_policy,
+        bootstrap_configuration: previous,
+        provisioning: Some(provisioning.clone()),
+    };
+    let observed = ObservedStorageIdentity {
+        resource_uid,
+        pod_uid: command.expected_pod_uid.clone(),
+        pvc_uid: command.expected_pvc_uid.clone(),
+        instance_id: command.expected_instance_id.clone(),
+    };
+    (command, observed, provisioning)
+}
+
+#[test]
+fn fresh_scale_up_store_requires_exact_frozen_authority() {
+    let (command, observed, provisioning) = scale_up_initialization_fixture();
+    let identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::ScaleUp(&provisioning),
+    )
+    .unwrap();
+    assert_eq!(identity.schema_version, 3);
+
+    for mutation in 0..6 {
+        let mut stale = command.clone();
+        match mutation {
+            0 => stale.expected_pod_uid = PodUid::new("reused-pod"),
+            1 => stale.expected_pvc_uid = PvcUid::new("reused-pvc"),
+            2 => stale.local_replica_id = ReplicaId::new(3),
+            3 => stale.effective_policy = EffectivePolicy::fixed(3, 30).unwrap(),
+            4 => stale.bootstrap_configuration.epoch = Epoch::new(0, 2),
+            _ => stale.assigned_agent_generation = AgentGeneration::new("retired-generation"),
+        }
+        assert!(matches!(
+            authorize_initialization(
+                &stale,
+                &observed,
+                InitializationAuthority::ScaleUp(&provisioning)
+            ),
+            Err(AgentError::InitializationNotAuthorized(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn scale_up_build_journal_replays_current_session_and_fences_retirement() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (initialize, observed, provisioning) = scale_up_initialization_fixture();
+    let identity = authorize_initialization(
+        &initialize,
+        &observed,
+        InitializationAuthority::ScaleUp(&provisioning),
+    )
+    .unwrap();
+    let mut state = AgentState::new(identity.clone());
+    state.scale_up_initialization = Some(provisioning.clone());
+    let store = SqliteStore::create_authorized(&path, state).unwrap();
+    let source = initialize.bootstrap_configuration.members[0]
+        .identity
+        .clone();
+    let authority = BuildAuthority {
+        build_id: provisioning
+            .scale_up_build_id(&initialize.resource_uid)
+            .unwrap(),
+        kind: BuildAuthorityKind::Provisioning,
+        source,
+        target: identity.local_identity.clone(),
+        current_configuration: initialize.bootstrap_configuration.clone(),
+        replication_boundary_lsn: 7,
+    };
+    let mut command = EnsureReplicaBuild {
+        operation_id: authority.build_id.clone(),
+        local_replica_id: identity.local_identity.replica_id,
+        expected_instance_id: identity.local_identity.instance_id.clone(),
+        expected_agent_generation: identity.local_identity.agent_generation.clone(),
+        target: identity.local_identity.clone(),
+        authority: Some(authority),
+        source_session_id: Some(kuberic_protocol::types::ProcessSessionId::new("source-1")),
+    };
+    store.journal_build(&command).await.unwrap();
+    command.source_session_id = Some(kuberic_protocol::types::ProcessSessionId::new("source-2"));
+    store.journal_build(&command).await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open_existing(&path, Some(&identity)).unwrap();
+    assert_eq!(
+        reopened
+            .load_state()
+            .await
+            .unwrap()
+            .build_commands
+            .get(&command.operation_id),
+        Some(&command)
+    );
+    let mut retired = reopened.load_state().await.unwrap();
+    retired.retired_builds.insert(command.operation_id.clone());
+    drop(reopened);
+    let replacement_path = directory.path().join("retired-agent.db");
+    let retired_store = SqliteStore::create_authorized(&replacement_path, retired).unwrap();
+    assert!(retired_store.journal_build(&command).await.is_err());
 }
 
 #[tokio::test]

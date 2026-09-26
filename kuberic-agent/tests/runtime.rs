@@ -6,10 +6,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use kuberic_agent::hosting::{OutboundReplication, PodRuntime, PreparedCopy, RuntimeControlPlane};
+use kuberic_agent::service::AgentService;
+use kuberic_agent::sqlite_store::SqliteStore;
+use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_protocol::types::{
-    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, FaultType,
-    LoadMetric, OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ResourceUid, ScaleUpConfigurationEvidence, ScaleUpIntent, SwitchoverHandoff,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+    Epoch, FaultType, LoadMetric, OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose,
+    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+    ScaleUpConfigurationEvidence, ScaleUpIntent, ScaleUpProvisioning, SwitchoverHandoff,
     SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::application::{
@@ -125,6 +129,141 @@ async fn open_removal_member<S: kuberic_runtime_internal::authority::AuthoritySt
             .unwrap();
     }
     runtime
+}
+
+#[tokio::test]
+async fn scale_up_receiver_replays_immutable_build_progress_without_reusing_source_session() {
+    let source = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("source-pod"),
+        agent_generation: AgentGeneration::new("source-generation"),
+    };
+    let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![ConfigurationMember {
+            identity: source.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let resource_uid = ResourceUid::new("scale-up-set");
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy,
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("candidate-pod"),
+        pvc_uid: PvcUid::new("candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let build_id = provisioning.scale_up_build_id(&resource_uid).unwrap();
+    let authority = BuildAuthority {
+        build_id: build_id.clone(),
+        kind: BuildAuthorityKind::Provisioning,
+        source: source.clone(),
+        target: target.clone(),
+        current_configuration: previous,
+        replication_boundary_lsn: 4,
+    };
+    let command = kuberic_protocol::command::EnsureReplicaBuild {
+        operation_id: build_id.clone(),
+        local_replica_id: target.replica_id,
+        expected_instance_id: target.instance_id.clone(),
+        expected_agent_generation: target.agent_generation.clone(),
+        target: target.clone(),
+        authority: Some(authority.clone()),
+        source_session_id: Some(kuberic_protocol::types::ProcessSessionId::new(
+            "retired-source-session",
+        )),
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: resource_uid.clone(),
+        pod_uid: provisioning.pod_uid.clone(),
+        pvc_uid: provisioning.pvc_uid.clone(),
+        initialization_id: provisioning.initialization_id(&resource_uid),
+        local_identity: target.clone(),
+        effective_policy: current_policy,
+    });
+    state.scale_up_initialization = Some(provisioning);
+    state.role = ReplicaRole::IdleSecondary;
+    state.build_commands.insert(build_id.clone(), command);
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    store.admit_build(&authority).await.unwrap();
+    store
+        .record_build_progress(&DurableBuildProgress {
+            authority: authority.clone(),
+            last_sequence: 8,
+            durable_lsn: 9,
+            completed: true,
+            catch_up_boundary_lsn: Some(9),
+        })
+        .await
+        .unwrap();
+
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(PodRuntime::new(target.clone(), application, store.clone()));
+    let service =
+        AgentService::new(store.clone(), runtime.clone(), runtime.clone(), "token").unwrap();
+    service.reconstruct_runtime().await.unwrap();
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.role, ReplicaRole::IdleSecondary);
+    assert_eq!(snapshot.builds.len(), 1);
+    assert_eq!(snapshot.builds[0].authority, authority);
+    assert_eq!(snapshot.builds[0].durable_lsn, 9);
+    assert_eq!(snapshot.builds[0].catch_up_boundary_lsn, Some(9));
+    assert!(
+        service
+            .sessions()
+            .validate_peer(
+                &source,
+                "retired-source-session",
+                service.sessions().local_session().as_str()
+            )
+            .await
+            .is_err()
+    );
+    service
+        .sessions()
+        .register_peer(
+            source.clone(),
+            kuberic_protocol::types::ProcessSessionId::new("current-source-session"),
+        )
+        .await;
+    assert!(
+        service
+            .sessions()
+            .validate_peer(
+                &source,
+                "retired-source-session",
+                service.sessions().local_session().as_str()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .sessions()
+            .validate_peer(
+                &source,
+                "current-source-session",
+                service.sessions().local_session().as_str()
+            )
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]

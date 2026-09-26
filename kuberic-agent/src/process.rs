@@ -53,10 +53,16 @@ pub struct ReplicaDiagnostics {
     pub previous_configuration: Option<String>,
     pub current_configuration: Option<String>,
     pub current_progress: i64,
+    pub verified_replication_lsn: Option<i64>,
     pub committed_lsn: i64,
+    pub read_status: String,
     pub write_status: String,
+    pub catch_up_boundary_lsn: Option<i64>,
+    pub catch_up_complete: bool,
+    pub scale_up_operation: Option<String>,
     pub retired: bool,
     pub pending_operation: Option<String>,
+    pub blocking: Option<String>,
     pub builds: Vec<ReplicaBuildDiagnostics>,
 }
 
@@ -98,8 +104,16 @@ impl ReplicaHandle {
                 .current_configuration
                 .map(|configuration| configuration.configuration_id.to_string()),
             current_progress: snapshot.current_progress,
+            verified_replication_lsn: snapshot.verified_replication_lsn,
             committed_lsn: snapshot.committed_lsn,
+            read_status: format!("{:?}", snapshot.read_status),
             write_status: format!("{:?}", snapshot.write_status),
+            catch_up_boundary_lsn: snapshot.catch_up_boundary,
+            catch_up_complete: snapshot.catch_up_complete,
+            scale_up_operation: state
+                .scale_up_evidence
+                .as_deref()
+                .map(|evidence| evidence.intent().operation_id.to_string()),
             retired: state.retired_authority.is_some() || snapshot.retired_authority.is_some(),
             pending_operation: state
                 .reconfiguration
@@ -110,6 +124,20 @@ impl ReplicaHandle {
                         .pending_effect
                         .as_ref()
                         .map(|pending| pending.effect.operation_id.to_string())
+                }),
+            blocking: state
+                .reconfiguration
+                .as_ref()
+                .map(|record| {
+                    format!(
+                        "configuration:{:?}:{}",
+                        record.stage, record.command.operation_id
+                    )
+                })
+                .or_else(|| {
+                    state.pending_effect.as_ref().map(|pending| {
+                        format!("effect:{:?}:{}", pending.stage, pending.effect.operation_id)
+                    })
                 }),
             builds: snapshot
                 .builds

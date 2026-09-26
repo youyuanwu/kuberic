@@ -166,7 +166,9 @@ fn build_report(
         secondary_removal_evidence: state.secondary_removal_evidence.map(Into::into),
         retired_replica: state.retired_authority.map(|r| r.report.into()),
         accepted_secondary_removal: state.accepted_secondary_removal.map(Into::into),
-        scale_up_intent: None,
+        scale_up_intent: state
+            .scale_up_evidence
+            .map(|evidence| evidence.intent().clone().into()),
     }
 }
 
@@ -178,6 +180,7 @@ fn snapshot_matches_state(
         Some(authority) => {
             authority.previous_configuration == state.previous_configuration
                 && Some(&authority.current_configuration) == state.current_configuration.as_ref()
+                && authority.scale_up == state.scale_up_evidence
         }
         None => state.previous_configuration.is_none() && state.current_configuration.is_none(),
     };

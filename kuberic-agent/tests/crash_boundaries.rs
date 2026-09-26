@@ -22,7 +22,8 @@ use kuberic_protocol::command::{EnsureConfiguration, PrepareSwitchover};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
     Epoch, InitializationId, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverRequestId, TransitionKind,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, ScaleUpIntent,
+    ScaleUpStage, SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext, Operation,
@@ -32,11 +33,12 @@ use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
 use kuberic_runtime::replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings};
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
 use kuberic_runtime_internal::authority::{
-    AdmittedAuthority, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+    AdmittedAuthority, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
+    DurableBuildProgress, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{
-    OpenMode, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
-    RuntimeSnapshot,
+    BuildPostcondition, OpenMode, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult,
+    RuntimePostcondition, RuntimeSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
@@ -54,6 +56,91 @@ struct CancelledRuntime;
 struct CrashAfterRealEffect {
     runtime: Arc<PodRuntime>,
     boundary: Option<String>,
+}
+
+struct ScaleUpCrashRuntime {
+    state: Mutex<RuntimePostcondition>,
+    crash_after: Option<&'static str>,
+}
+
+impl ScaleUpCrashRuntime {
+    fn new(state: &AgentState, crash_after: Option<&'static str>) -> Self {
+        let mut postcondition = result().postcondition;
+        postcondition.open = true;
+        postcondition.role = state.role;
+        postcondition.read_status = state.read_status;
+        postcondition.write_status = state.write_status;
+        postcondition.current_progress = 9;
+        postcondition.verified_replication_lsn = Some(9);
+        postcondition.committed_lsn = 9;
+        postcondition.current_configuration_quorum_progress = 9;
+        postcondition.catch_up_complete = true;
+        postcondition.authority =
+            state
+                .current_configuration
+                .as_ref()
+                .map(|current| AdmittedAuthority {
+                    local_identity: state.identity.local_identity.clone(),
+                    transition_kind: state
+                        .previous_configuration
+                        .as_ref()
+                        .map(|_| TransitionKind::ScaleUp),
+                    previous_configuration: state.previous_configuration.clone(),
+                    current_configuration: current.clone(),
+                    switchover_handoff: None,
+                    secondary_removal: None,
+                    scale_up: state.scale_up_evidence.clone(),
+                });
+        postcondition.builds = state
+            .build_commands
+            .values()
+            .filter_map(|command| command.authority.clone())
+            .map(|authority| BuildPostcondition {
+                durable_lsn: 9,
+                completed: true,
+                catch_up_boundary_lsn: Some(9),
+                last_sequence: 2,
+                authority,
+            })
+            .collect();
+        Self {
+            state: Mutex::new(postcondition),
+            crash_after,
+        }
+    }
+}
+
+#[async_trait]
+impl RuntimeEffectExecutor for ScaleUpCrashRuntime {
+    async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        let mut state = self.state.lock().unwrap();
+        let boundary = match effect.action {
+            RuntimeEffectAction::AdmitAuthority(authority) => {
+                state.authority = Some(*authority);
+                "admission"
+            }
+            RuntimeEffectAction::SetAccessStatus { read, write } => {
+                state.read_status = read;
+                state.write_status = write;
+                "access"
+            }
+            RuntimeEffectAction::RetireBuild(build_id) => {
+                state
+                    .builds
+                    .retain(|build| build.authority.build_id != build_id);
+                "retirement"
+            }
+            action => panic!("unexpected scale-up recovery effect {action:?}"),
+        };
+        if self.crash_after == Some(boundary) {
+            std::process::exit(0);
+        }
+        Ok(RuntimeEffectResult {
+            operation_id: effect.operation_id,
+            sequence: effect.sequence,
+            postcondition: state.clone(),
+        })
+    }
 }
 
 #[async_trait]
@@ -679,6 +766,129 @@ fn single_storage_identity() -> StorageIdentity {
     }
 }
 
+fn scale_up_crash_fixture(current_only: bool) -> (AgentState, EnsureConfiguration, BuildAuthority) {
+    let primary = single_storage_identity().local_identity;
+    let candidate = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("scale-up-candidate"),
+        agent_generation: AgentGeneration::new("scale-up-candidate-generation"),
+    };
+    let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: candidate.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let build = BuildAuthority {
+        build_id: OperationId::new("scale-up-crash-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: primary.clone(),
+        target: candidate.clone(),
+        current_configuration: previous.clone(),
+        replication_boundary_lsn: 4,
+    };
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: ResourceUid::new("resource-1"),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: previous_policy.clone(),
+        current_policy: current_policy.clone(),
+        primary: primary.clone(),
+        target: candidate.clone(),
+        build_id: build.build_id.clone(),
+        snapshot_boundary_lsn: 4,
+        catch_up_boundary_lsn: 9,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let evidence = ScaleUpConfigurationEvidence::Admission {
+        intent: intent.clone(),
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        effective_policy: previous_policy.clone(),
+        ..single_storage_identity()
+    });
+    state.admitted_policy = Some(if current_only {
+        current_policy.clone()
+    } else {
+        previous_policy.clone()
+    });
+    state.current_configuration = Some(if current_only {
+        current.clone()
+    } else {
+        previous.clone()
+    });
+    state.previous_configuration = current_only.then(|| previous.clone());
+    state.highest_epoch = state.current_configuration.as_ref().unwrap().epoch;
+    state.role = ReplicaRole::Primary;
+    state.read_status = AccessStatus::Granted;
+    state.write_status = AccessStatus::Granted;
+    state.scale_up_evidence = current_only.then(|| Box::new(evidence.clone()));
+    state.build_commands.insert(
+        build.build_id.clone(),
+        kuberic_protocol::command::EnsureReplicaBuild {
+            operation_id: build.build_id.clone(),
+            local_replica_id: primary.replica_id,
+            expected_instance_id: primary.instance_id.clone(),
+            expected_agent_generation: primary.agent_generation.clone(),
+            target: candidate,
+            authority: None,
+            source_session_id: None,
+        },
+    );
+    let stage = if current_only {
+        ScaleUpStage::CurrentOnly
+    } else {
+        ScaleUpStage::PreviousCurrent
+    };
+    let command = EnsureConfiguration {
+        operation_id: intent.command_operation_id(stage, &primary, &current),
+        previous_configuration: (!current_only).then_some(previous.clone()),
+        current_configuration: current.clone(),
+        previous_epoch: (!current_only).then_some(previous.epoch),
+        current_epoch: current.epoch,
+        effective_policy: current_policy,
+        previous_policy: Some(previous_policy),
+        secondary_removal_evidence: None,
+        scale_up_evidence: Some(Box::new(evidence)),
+        local_replica_id: primary.replica_id,
+        expected_instance_id: primary.instance_id,
+        expected_agent_generation: primary.agent_generation,
+        transition_kind: TransitionKind::ScaleUp,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::Granted,
+        current_only,
+        retire_build_ids: current_only
+            .then_some(vec![build.build_id.clone()])
+            .unwrap_or_default(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    (state, command, build)
+}
+
 fn real_configuration_command() -> EnsureConfiguration {
     let identity = single_storage_identity().local_identity;
     let policy = EffectivePolicy::fixed(1, 30).unwrap();
@@ -1272,6 +1482,128 @@ fn switchover_recovery_boundaries_survive_process_termination() {
             }
         });
     }
+}
+
+#[test]
+fn scale_up_durable_boundaries_survive_real_subprocess_termination() {
+    for boundary in [
+        "boundary-capture",
+        "pc-cc-install",
+        "current-only-install",
+        "build-retirement",
+        "completion-persistence",
+    ] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "scale_up_crash_writer_process"])
+            .env("KUBERIC_SCALE_UP_CRASH_PATH", &path)
+            .env("KUBERIC_SCALE_UP_CRASH_BOUNDARY", boundary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{boundary}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+            let current_only = boundary != "pc-cc-install" && boundary != "boundary-capture";
+            let (_, command, build) = scale_up_crash_fixture(current_only);
+            let progress = store
+                .load_build_progress(&build.build_id)
+                .await
+                .unwrap()
+                .expect("frozen build progress");
+            assert_eq!(progress.catch_up_boundary_lsn, Some(9));
+            assert_eq!(progress.durable_lsn, 9);
+            if boundary == "boundary-capture" {
+                let mut changed = progress;
+                changed.catch_up_boundary_lsn = Some(10);
+                assert!(store.record_build_progress(&changed).await.is_err());
+                return;
+            }
+            let state = store.load_state().await.unwrap();
+            assert_eq!(state.write_status, AccessStatus::Granted);
+            let runtime = Arc::new(ScaleUpCrashRuntime::new(&state, None));
+            let completed = Coordinator::new(store.clone(), runtime)
+                .ensure_configuration(command.clone())
+                .await
+                .unwrap();
+            assert_eq!(completed.command, command);
+            let recovered = store.load_state().await.unwrap();
+            assert!(recovered.pending_effect.is_none());
+            assert!(recovered.reconfiguration.is_none());
+            assert_eq!(recovered.read_status, AccessStatus::Granted);
+            assert_eq!(recovered.write_status, AccessStatus::Granted);
+            assert_eq!(
+                recovered.current_configuration,
+                Some(command.current_configuration.clone())
+            );
+            assert_eq!(
+                recovered.previous_configuration,
+                (!current_only).then(|| {
+                    command
+                        .previous_configuration
+                        .clone()
+                        .expect("PC/CC command has previous")
+                })
+            );
+            assert!(
+                recovered
+                    .scale_up_commands
+                    .contains_key(&command.operation_id)
+            );
+            assert_eq!(
+                recovered.retired_builds.contains(&build.build_id),
+                current_only
+            );
+        });
+    }
+}
+
+#[test]
+#[ignore = "helper process for scale_up_durable_boundaries_survive_real_subprocess_termination"]
+fn scale_up_crash_writer_process() {
+    let (Ok(path), Ok(boundary)) = (
+        env::var("KUBERIC_SCALE_UP_CRASH_PATH"),
+        env::var("KUBERIC_SCALE_UP_CRASH_BOUNDARY"),
+    ) else {
+        return;
+    };
+    let current_only = boundary != "pc-cc-install" && boundary != "boundary-capture";
+    let (state, command, build) = scale_up_crash_fixture(current_only);
+    let store = Arc::new(SqliteStore::create_authorized(path, state.clone()).unwrap());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        store.admit_build(&build).await.unwrap();
+        store
+            .record_build_progress(&DurableBuildProgress {
+                authority: build,
+                last_sequence: 2,
+                durable_lsn: 9,
+                completed: true,
+                catch_up_boundary_lsn: Some(9),
+            })
+            .await
+            .unwrap();
+        if boundary == "boundary-capture" {
+            return;
+        }
+        let crash_after = match boundary.as_str() {
+            "pc-cc-install" | "current-only-install" => Some("admission"),
+            "build-retirement" => Some("retirement"),
+            "completion-persistence" => None,
+            _ => panic!("unknown scale-up crash boundary {boundary}"),
+        };
+        Coordinator::new(
+            store,
+            Arc::new(ScaleUpCrashRuntime::new(&state, crash_after)),
+        )
+        .ensure_configuration(command)
+        .await
+        .unwrap();
+    });
+    std::process::exit(0);
 }
 
 #[test]
