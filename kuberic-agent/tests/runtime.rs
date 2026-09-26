@@ -13,12 +13,19 @@ use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, CoordinatorStage, SCHEMA_VERSION, StorageIdentity};
 use kuberic_agent::store::AgentStore;
 use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
+use kuberic_protocol::observation::{
+    AgentBuildReport, AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation,
+    ObservationSnapshot, ReplicaObservation, ReplicaObservationKey, RoutingObservation,
+};
+use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::{
-    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
-    Epoch, FaultType, InitializationId, LoadMetric, OperationId, PodUid, ProcessSessionId,
-    ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, ScaleUpIntent, ScaleUpProvisioning,
-    SwitchoverHandoff, SwitchoverRequestId, TransitionKind,
+    AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
+    ConfigurationMember, EffectivePolicy, Epoch, FaultType, InitializationId, LoadMetric,
+    OperationId, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+    ScaleUpConfigurationEvidence, ScaleUpIntent, ScaleUpProvisioning, SwitchoverHandoff,
+    SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::application::{
     ClientWrite, CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext,
@@ -8586,6 +8593,438 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
     .unwrap()
     .unwrap();
     drop(pending_after_configuration);
+}
+
+#[test]
+fn evaluator_scale_up_command_uses_reopened_sqlite_copy_and_preserves_live_write() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(evaluator_scale_up_sqlite_trace());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn evaluator_scale_up_sqlite_trace() {
+    let resource_uid = ResourceUid::new("sqlite-evaluator-scale-up");
+    let source = identity(1, "sqlite-source");
+    let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![ConfigurationMember {
+            identity: source.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy: previous_policy.clone(),
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("sqlite-target"),
+        pvc_uid: PvcUid::new("sqlite-target-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let build_id = provisioning.scale_up_build_id(&resource_uid).unwrap();
+
+    let source_directory = tempfile::tempdir().unwrap();
+    let source_path = SqliteStore::metadata_database_path(source_directory.path());
+    let mut source_state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: resource_uid.clone(),
+        pod_uid: PodUid::new(source.instance_id.as_str()),
+        pvc_uid: PvcUid::new("sqlite-source-pvc"),
+        initialization_id: InitializationId::new("sqlite-source-init"),
+        local_identity: source.clone(),
+        effective_policy: previous_policy.clone(),
+    });
+    source_state.admitted_policy = Some(previous_policy.clone());
+    source_state.highest_epoch = previous.epoch;
+    source_state.current_configuration = Some(previous.clone());
+    source_state.role = ReplicaRole::Primary;
+    source_state.read_status = AccessStatus::Granted;
+    source_state.write_status = AccessStatus::Granted;
+    let source_store =
+        Arc::new(SqliteStore::create_authorized(&source_path, source_state).unwrap());
+    let previous_authority = AdmittedAuthority {
+        local_identity: source.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: previous.clone(),
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    };
+    source_store.admit(&previous_authority).await.unwrap();
+
+    let target_directory = tempfile::tempdir().unwrap();
+    let target_path = SqliteStore::metadata_database_path(target_directory.path());
+    let mut target_state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: resource_uid.clone(),
+        pod_uid: provisioning.pod_uid.clone(),
+        pvc_uid: provisioning.pvc_uid.clone(),
+        initialization_id: provisioning.initialization_id(&resource_uid),
+        local_identity: target.clone(),
+        effective_policy: current_policy.clone(),
+    });
+    target_state.scale_up_initialization = Some(provisioning.clone());
+    target_state.role = ReplicaRole::IdleSecondary;
+    let target_store =
+        Arc::new(SqliteStore::create_authorized(&target_path, target_state).unwrap());
+
+    let source_application = Arc::new(TestApplication::default());
+    source_application.seed_operation(1, Bytes::from_static(b"seed"));
+    source_application
+        .pause_copy_enumeration
+        .store(true, Ordering::SeqCst);
+    let source_runtime = Arc::new(PodRuntime::new(
+        source.clone(),
+        source_application.clone(),
+        source_store.clone(),
+    ));
+    for (sequence, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(previous_authority)),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        source_runtime
+            .apply_effect(effect(sequence as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let mut prepared = prepare_copy_authorized(
+        &source_runtime,
+        PrepareCopyRequest {
+            build_id: build_id.clone(),
+            target: target.clone(),
+            configuration: BuildConfiguration::Current,
+            copy_context: empty_copy_context(),
+        },
+    )
+    .await
+    .unwrap();
+    source_application.copy_enumeration_notify.notified().await;
+    let live_write = source_runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("write-during-sqlite-copy"),
+            data: Bytes::from_static(b"live-value"),
+        })
+        .await
+        .unwrap();
+    live_write.committed().await.unwrap();
+    source_application
+        .pause_copy_enumeration
+        .store(false, Ordering::SeqCst);
+    source_application
+        .resume_copy_enumeration_notify
+        .notify_waiters();
+    let snapshot_items = copy_through_final(&mut prepared).await;
+    let live_item = next_copy_item(&mut prepared).await;
+    assert_eq!(live_item.lsn, 2);
+
+    let target_application = Arc::new(TestApplication::default());
+    let target_runtime = Arc::new(PodRuntime::new(
+        target.clone(),
+        target_application.clone(),
+        target_store.clone(),
+    ));
+    target_runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    target_runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+        ))
+        .await
+        .unwrap();
+    target_runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(prepared.authority.clone())),
+        ))
+        .await
+        .unwrap();
+    target_store
+        .journal_build(&kuberic_protocol::command::EnsureReplicaBuild {
+            operation_id: build_id.clone(),
+            local_replica_id: target.replica_id,
+            expected_instance_id: target.instance_id.clone(),
+            expected_agent_generation: target.agent_generation.clone(),
+            target: target.clone(),
+            authority: Some(prepared.authority.clone()),
+            source_session_id: Some(ProcessSessionId::new("sqlite-source-session")),
+        })
+        .await
+        .unwrap();
+
+    let catch_up_boundary = snapshot_items
+        .iter()
+        .find_map(|item| item.catch_up_boundary_lsn)
+        .unwrap();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        source.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: resource_uid.clone(),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: previous_policy.clone(),
+        current_policy: current_policy.clone(),
+        primary: source.clone(),
+        target: target.clone(),
+        build_id: build_id.clone(),
+        snapshot_boundary_lsn: prepared.authority.replication_boundary_lsn,
+        catch_up_boundary_lsn: catch_up_boundary,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let before_copy = target_store.load_state().await.unwrap();
+
+    for item in snapshot_items.into_iter().chain(std::iter::once(live_item)) {
+        let acknowledgement = target_runtime
+            .data_plane()
+            .receive_copy_item(item)
+            .await
+            .unwrap();
+        source_runtime
+            .data_plane()
+            .accept_copy_acknowledgement(acknowledgement)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        target_application
+            .durable_progress()
+            .await
+            .unwrap()
+            .applied_lsn,
+        2
+    );
+    let source_snapshot = source_runtime.snapshot().await;
+    let target_snapshot = target_runtime.snapshot().await;
+    let report_builds = |snapshot: &kuberic_runtime_internal::effects::RuntimeSnapshot| {
+        snapshot
+            .builds
+            .iter()
+            .map(|build| AgentBuildReport {
+                build_id: build.authority.build_id.clone(),
+                target: build.authority.target.clone(),
+                last_sequence: build.last_sequence,
+                replication_boundary_lsn: build.authority.replication_boundary_lsn,
+                durable_lsn: build.durable_lsn,
+                completed: build.completed,
+                catch_up_boundary_lsn: build.catch_up_boundary_lsn,
+            })
+            .collect::<Vec<_>>()
+    };
+    let transition = kuberic_protocol::types::TransitionIntent {
+        transition_id: intent.transition_id(TransitionKind::ScaleUp, &current),
+        kind: TransitionKind::ScaleUp,
+        spec_generation: intent.spec_generation,
+        effective_policy: current_policy.clone(),
+        previous_configuration_id: Some(previous.configuration_id.clone()),
+        current_configuration: current.clone(),
+        election_lsn: None,
+        build_id: Some(build_id.clone()),
+        repair: None,
+        switchover: None,
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
+        scale_up: Some(Box::new(intent.clone())),
+        scale_up_failover: None,
+    };
+    let snapshot = ObservationSnapshot {
+        resource_uid: resource_uid.clone(),
+        resource_version: "1".into(),
+        desired: DesiredState {
+            generation: 2,
+            replicas: 2,
+            image: "example:v1".into(),
+            failover_delay_seconds: 30,
+            switchover: None,
+        },
+        status: AcceptedStatus {
+            initialized: true,
+            observed_generation: 1,
+            effective_policy: Some(previous_policy.clone()),
+            topology: Some(AcceptedTopology {
+                configuration: previous.clone(),
+            }),
+            provisioning: Some(provisioning.clone()),
+            transition: Some(transition),
+            scale_up_admission_started: Some(intent.operation_id.clone()),
+            ..Default::default()
+        },
+        replicas: BTreeMap::from([
+            (
+                ReplicaObservationKey::new(source.replica_id, source.instance_id.clone()),
+                ReplicaObservation {
+                    kubernetes: Some(KubernetesReplicaObservation {
+                        replica_id: source.replica_id,
+                        pod_name: source.instance_id.to_string(),
+                        pod_uid: Some(PodUid::new(source.instance_id.as_str())),
+                        pvc_name: "sqlite-source-data".into(),
+                        pvc_uid: Some(PvcUid::new("sqlite-source-pvc")),
+                        image: Some("example:v1".into()),
+                        pod_ready: true,
+                        peer_endpoint_ready: true,
+                    }),
+                    agent: AgentObservation::Report(Box::new(AgentReport {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        resource_uid: resource_uid.clone(),
+                        identity: source.clone(),
+                        process_session_id: ProcessSessionId::new("source-report"),
+                        report_sequence: 1,
+                        role: ReplicaRole::Primary,
+                        read_status: AccessStatus::Granted,
+                        write_status: AccessStatus::Granted,
+                        healthy: true,
+                        epoch: previous.epoch,
+                        previous_configuration: None,
+                        current_configuration: Some(previous.clone()),
+                        current_progress: source_snapshot.current_progress,
+                        verified_replication_lsn: source_snapshot.verified_replication_lsn,
+                        committed_lsn: source_snapshot.committed_lsn,
+                        builds: report_builds(&source_snapshot),
+                        ..Default::default()
+                    })),
+                },
+            ),
+            (
+                ReplicaObservationKey::new(target.replica_id, target.instance_id.clone()),
+                ReplicaObservation {
+                    kubernetes: Some(KubernetesReplicaObservation {
+                        replica_id: target.replica_id,
+                        pod_name: target.instance_id.to_string(),
+                        pod_uid: Some(provisioning.pod_uid.clone()),
+                        pvc_name: "sqlite-target-data".into(),
+                        pvc_uid: Some(provisioning.pvc_uid.clone()),
+                        image: Some("example:v1".into()),
+                        pod_ready: true,
+                        peer_endpoint_ready: true,
+                    }),
+                    agent: AgentObservation::Report(Box::new(AgentReport {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        resource_uid: resource_uid.clone(),
+                        identity: target.clone(),
+                        process_session_id: ProcessSessionId::new("target-report"),
+                        report_sequence: 1,
+                        role: ReplicaRole::IdleSecondary,
+                        read_status: AccessStatus::NotPrimary,
+                        write_status: AccessStatus::NotPrimary,
+                        healthy: true,
+                        epoch: Epoch::default(),
+                        current_progress: target_snapshot.current_progress,
+                        verified_replication_lsn: None,
+                        committed_lsn: target_snapshot.committed_lsn,
+                        builds: report_builds(&target_snapshot),
+                        ..Default::default()
+                    })),
+                },
+            ),
+        ]),
+        secondary_scale_down_resources: Vec::new(),
+        previous_report_watermarks: BTreeMap::new(),
+        durable_storage_evidence: true,
+        supporting_resources_ready: true,
+        routing: RoutingObservation {
+            service_present: true,
+            unresolved_write_target: false,
+            write_target: Some(source.clone()),
+        },
+        observation_failures: Vec::new(),
+        now_unix_seconds: 100,
+    };
+    let Plan::Execute {
+        command: kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(target_command),
+    } = evaluate(
+        &snapshot,
+        &EvaluationConfig {
+            allow_scale_up: true,
+            ..Default::default()
+        },
+    )
+    else {
+        panic!("completed durable copy must produce evaluator configuration command")
+    };
+    assert_eq!(target_command.local_replica_id, target.replica_id);
+    assert!(kuberic_agent::command::admit_configuration(&target_command, &before_copy).is_err());
+    drop(target_runtime);
+    drop(target_store);
+
+    let reopened_store = Arc::new(SqliteStore::open_existing(&target_path, None).unwrap());
+    let reopened_runtime = Arc::new(PodRuntime::new(
+        target.clone(),
+        target_application.clone(),
+        reopened_store.clone(),
+    ));
+    let service = AgentService::new(
+        reopened_store.clone(),
+        reopened_runtime.clone(),
+        reopened_runtime.clone(),
+        "token",
+    )
+    .unwrap();
+    service.reconstruct_runtime().await.unwrap();
+    let reopened_state = reopened_store.load_state().await.unwrap();
+    assert!(kuberic_agent::command::admit_configuration(&target_command, &reopened_state).is_ok());
+    Coordinator::new(reopened_store.clone(), reopened_runtime.clone())
+        .ensure_configuration(*target_command)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened_store.load_state().await.unwrap().role,
+        ReplicaRole::ActiveSecondary
+    );
+    assert_eq!(
+        target_application
+            .durable_progress()
+            .await
+            .unwrap()
+            .applied_lsn,
+        2
+    );
 }
 
 #[tokio::test]
