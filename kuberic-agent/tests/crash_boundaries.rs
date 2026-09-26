@@ -187,10 +187,19 @@ impl RuntimeEffectExecutor for CrashAfterRealEffect {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         let boundary = match &effect.action {
             RuntimeEffectAction::AdmitAuthority(_) => "authority",
+            RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary) => {
+                "active-secondary-role"
+            }
             RuntimeEffectAction::ChangeApplicationRole(_) => "application-role",
             RuntimeEffectAction::SetAccessStatus { .. } => "access",
+            RuntimeEffectAction::RetireBuild(_) => "build-retirement",
             _ => "",
         };
+        let before_boundary = format!("before-{boundary}");
+        let after_boundary = format!("after-{boundary}");
+        if self.boundary.as_deref() == Some(before_boundary.as_str()) {
+            std::process::exit(73);
+        }
         if matches!(effect.action, RuntimeEffectAction::WaitForCatchup) {
             let snapshot = self.runtime.snapshot().await;
             let authority = snapshot.authority.unwrap();
@@ -223,7 +232,9 @@ impl RuntimeEffectExecutor for CrashAfterRealEffect {
                 .await?;
         }
         let result = self.runtime.apply_effect(effect).await?;
-        if self.boundary.as_deref() == Some(boundary) {
+        if self.boundary.as_deref() == Some(boundary)
+            || self.boundary.as_deref() == Some(after_boundary.as_str())
+        {
             // Exit before RuntimeAdapter records the result or advances the stage.
             std::process::exit(73);
         }
@@ -1086,6 +1097,398 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
     (state, command)
 }
 
+async fn ensure_scale_up_store_cut(path: &Path, cut: &str, after: bool, terminate: bool) {
+    let (state, _, build) = scale_up_crash_fixture(false);
+    if cut == "store-initialization" && terminate && !after {
+        std::process::exit(73);
+    }
+    let store = if path.is_file() {
+        Arc::new(SqliteStore::open_existing(path, None).unwrap())
+    } else {
+        Arc::new(SqliteStore::create_authorized(path, state).unwrap())
+    };
+    if cut == "store-initialization" {
+        if terminate && after {
+            std::process::exit(73);
+        }
+        return;
+    }
+
+    if store.load_build(&build.build_id).await.unwrap().is_none() {
+        if cut == "build-authority-admission" && terminate && !after {
+            std::process::exit(73);
+        }
+        store.admit_build(&build).await.unwrap();
+        if cut == "build-authority-admission" {
+            if terminate && after {
+                std::process::exit(73);
+            }
+            return;
+        }
+    }
+    if cut == "build-authority-admission" {
+        return;
+    }
+
+    let progress = match cut {
+        "snapshot-boundary-persistence" => DurableBuildProgress {
+            authority: build,
+            last_sequence: 0,
+            durable_lsn: 4,
+            completed: false,
+            catch_up_boundary_lsn: Some(9),
+        },
+        "source-progress-persistence" => DurableBuildProgress {
+            authority: build,
+            last_sequence: 1,
+            durable_lsn: 7,
+            completed: false,
+            catch_up_boundary_lsn: Some(9),
+        },
+        "target-progress-persistence" => DurableBuildProgress {
+            authority: build,
+            last_sequence: 2,
+            durable_lsn: 9,
+            completed: true,
+            catch_up_boundary_lsn: Some(9),
+        },
+        other => panic!("unknown scale-up store cut {other}"),
+    };
+    if terminate && !after {
+        std::process::exit(73);
+    }
+    store.record_build_progress(&progress).await.unwrap();
+    if terminate && after {
+        std::process::exit(73);
+    }
+}
+
+async fn execute_scale_up_configuration_cut(path: &Path, cut: &str, terminate: bool) {
+    let current_only = cut.starts_with("current-only")
+        || cut.starts_with("build-retirement")
+        || cut.starts_with("completion");
+    let (initial, command, build) = scale_up_crash_fixture(current_only);
+    let store = if path.is_file() {
+        Arc::new(SqliteStore::open_existing(path, None).unwrap())
+    } else {
+        let store = Arc::new(SqliteStore::create_authorized(path, initial.clone()).unwrap());
+        store.admit_build(&build).await.unwrap();
+        store
+            .record_build_progress(&DurableBuildProgress {
+                authority: build.clone(),
+                last_sequence: 2,
+                durable_lsn: 9,
+                completed: true,
+                catch_up_boundary_lsn: Some(9),
+            })
+            .await
+            .unwrap();
+        let application = CrashState::open(crash_application_path(path));
+        application.apply(seeded_operation()).await.unwrap();
+        store
+    };
+
+    let stop_before = match cut {
+        "pc-cc-authority-before" | "current-only-authority-before" => {
+            Some(CoordinatorStage::AdmitAuthority)
+        }
+        "pc-cc-access-before" | "current-only-access-before" => Some(CoordinatorStage::Activate),
+        "build-retirement-before" => Some(CoordinatorStage::RetireBuild),
+        "completion-before" => Some(CoordinatorStage::Complete),
+        _ => None,
+    };
+    if let Some(stop_before) = stop_before
+        && store.load_state().await.unwrap().reconfiguration.is_none()
+    {
+        store.begin_configuration(&command).await.unwrap();
+        loop {
+            let state = store.load_state().await.unwrap();
+            let record = state.reconfiguration.clone().unwrap();
+            if record.stage == stop_before {
+                break;
+            }
+            let runtime = Arc::new(ScaleUpCrashRuntime::new(&state, None));
+            let adapter = RuntimeAdapter::new(store.clone(), runtime);
+            match record.stage {
+                CoordinatorStage::AdmitAuthority => {
+                    let authority = admit_configuration(&command, &state).unwrap();
+                    adapter
+                        .execute(RuntimeEffect {
+                            operation_id: OperationId::new(format!(
+                                "{}:admit-authority",
+                                command.operation_id
+                            )),
+                            sequence: state.next_effect_sequence,
+                            action: RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+                        })
+                        .await
+                        .unwrap();
+                    store
+                        .advance_configuration(
+                            &command.operation_id,
+                            CoordinatorStage::AdmitAuthority,
+                            CoordinatorStage::Activate,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                CoordinatorStage::Activate => {
+                    adapter
+                        .execute(RuntimeEffect {
+                            operation_id: OperationId::new(format!(
+                                "{}:activate",
+                                command.operation_id
+                            )),
+                            sequence: state.next_effect_sequence,
+                            action: RuntimeEffectAction::SetAccessStatus {
+                                read: AccessStatus::Granted,
+                                write: AccessStatus::Granted,
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    store
+                        .advance_configuration(
+                            &command.operation_id,
+                            CoordinatorStage::Activate,
+                            if current_only {
+                                CoordinatorStage::RetireBuild
+                            } else {
+                                CoordinatorStage::Complete
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                CoordinatorStage::RetireBuild => {
+                    adapter
+                        .execute(RuntimeEffect {
+                            operation_id: OperationId::new(format!(
+                                "{}:retire-build-0",
+                                command.operation_id
+                            )),
+                            sequence: state.next_effect_sequence,
+                            action: RuntimeEffectAction::RetireBuild(build.build_id.clone()),
+                        })
+                        .await
+                        .unwrap();
+                    store
+                        .advance_configuration(
+                            &command.operation_id,
+                            CoordinatorStage::RetireBuild,
+                            CoordinatorStage::Complete,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                other => panic!("{cut}: unexpected preparatory stage {other:?}"),
+            }
+        }
+        if terminate {
+            std::process::exit(73);
+        }
+    }
+
+    if terminate {
+        if cut == "completion-after" {
+            Coordinator::new(
+                store.clone(),
+                Arc::new(ScaleUpCrashRuntime::new(
+                    &store.load_state().await.unwrap(),
+                    None,
+                )),
+            )
+            .ensure_configuration(command.clone())
+            .await
+            .unwrap();
+            std::process::exit(73);
+        }
+        let crash_after = match cut {
+            "pc-cc-authority-after" | "current-only-authority-after" => "admission",
+            "pc-cc-access-after" | "current-only-access-after" => "access",
+            "build-retirement-after" => "retirement",
+            other => panic!("unknown scale-up configuration cut {other}"),
+        };
+        Coordinator::new(
+            store.clone(),
+            Arc::new(ScaleUpCrashRuntime::new(
+                &store.load_state().await.unwrap(),
+                Some(crash_after),
+            )),
+        )
+        .ensure_configuration(command.clone())
+        .await
+        .unwrap();
+    } else {
+        Coordinator::new(
+            store.clone(),
+            Arc::new(ScaleUpCrashRuntime::new(
+                &store.load_state().await.unwrap(),
+                None,
+            )),
+        )
+        .ensure_configuration(command.clone())
+        .await
+        .unwrap_or_else(|error| panic!("{cut}: {error:?}"));
+    }
+    let durable = store.load_state().await.unwrap();
+    assert!(durable.pending_effect.is_none(), "{cut}");
+    assert!(durable.reconfiguration.is_none(), "{cut}");
+    assert_eq!(durable.write_status, AccessStatus::Granted, "{cut}");
+    assert_eq!(
+        durable.current_configuration,
+        Some(command.current_configuration),
+        "{cut}"
+    );
+    assert_eq!(
+        durable.retired_builds.contains(&build.build_id),
+        current_only,
+        "{cut}"
+    );
+    let application = CrashState::open(crash_application_path(path));
+    let persisted = application.durable_progress().await.unwrap();
+    assert_eq!(persisted.committed_lsn, 1, "{cut}");
+    assert!(
+        application
+            .verify_applied(&seeded_operation())
+            .await
+            .unwrap(),
+        "{cut}"
+    );
+}
+
+async fn execute_real_active_secondary_cut(path: &Path, after: bool, terminate: bool) {
+    let (_, command, build) = scale_up_crash_fixture(false);
+    let evidence = command.scale_up_evidence.clone().unwrap();
+    let intent = evidence.intent().clone();
+    let candidate = intent.target.clone();
+    let store = if path.is_file() {
+        Arc::new(SqliteStore::open_existing(path, None).unwrap())
+    } else {
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: intent.resource_uid.clone(),
+            pod_uid: PodUid::new(candidate.instance_id.as_str()),
+            pvc_uid: PvcUid::new("active-secondary-pvc"),
+            initialization_id: InitializationId::new("active-secondary-initialization"),
+            local_identity: candidate.clone(),
+            effective_policy: intent.current_policy.clone(),
+        });
+        state.admitted_policy = Some(intent.current_policy.clone());
+        state.previous_policy = Some(intent.previous_policy.clone());
+        state.highest_epoch = intent.current_configuration.epoch;
+        state.previous_configuration = Some(intent.previous_configuration.clone());
+        state.current_configuration = Some(intent.current_configuration.clone());
+        state.scale_up_evidence = Some(evidence.clone());
+        state.role = ReplicaRole::IdleSecondary;
+        state.build_commands.insert(
+            build.build_id.clone(),
+            kuberic_protocol::command::EnsureReplicaBuild {
+                operation_id: build.build_id.clone(),
+                local_replica_id: candidate.replica_id,
+                expected_instance_id: candidate.instance_id.clone(),
+                expected_agent_generation: candidate.agent_generation.clone(),
+                target: candidate.clone(),
+                authority: Some(build.clone()),
+                source_session_id: Some(ProcessSessionId::new("active-secondary-source")),
+            },
+        );
+        let store = Arc::new(SqliteStore::create_authorized(path, state).unwrap());
+        store
+            .admit(&AdmittedAuthority {
+                local_identity: candidate.clone(),
+                transition_kind: Some(TransitionKind::ScaleUp),
+                previous_configuration: Some(intent.previous_configuration.clone()),
+                current_configuration: intent.current_configuration.clone(),
+                switchover_handoff: None,
+                secondary_removal: None,
+                scale_up: Some(evidence.clone()),
+            })
+            .await
+            .unwrap();
+        store.admit_build(&build).await.unwrap();
+        store
+            .record_build_progress(&DurableBuildProgress {
+                authority: build,
+                last_sequence: 2,
+                durable_lsn: intent.catch_up_boundary_lsn,
+                completed: true,
+                catch_up_boundary_lsn: Some(intent.catch_up_boundary_lsn),
+            })
+            .await
+            .unwrap();
+        store
+    };
+    let durable = store.load_state().await.unwrap();
+    let application = Arc::new(CrashState::open(crash_application_path(path)));
+    application
+        .apply(Operation {
+            lsn: 1,
+            committed_lsn: 1,
+            data: Bytes::from_static(b"acknowledged-before-active-secondary"),
+        })
+        .await
+        .unwrap();
+    let runtime = Arc::new(PodRuntime::new(
+        candidate,
+        application.clone(),
+        store.clone(),
+    ));
+    runtime
+        .reconstruct(
+            OpenMode::Existing,
+            durable.role,
+            durable.read_status,
+            durable.write_status,
+            None,
+        )
+        .await
+        .unwrap();
+    let effect = RuntimeEffect {
+        operation_id: OperationId::new("scale-up-active-secondary-role"),
+        sequence: store.load_state().await.unwrap().next_effect_sequence,
+        action: RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+    };
+    let executor = Arc::new(CrashAfterRealEffect {
+        runtime: runtime.clone(),
+        boundary: terminate.then(|| {
+            if after {
+                "after-active-secondary-role"
+            } else {
+                "before-active-secondary-role"
+            }
+            .to_string()
+        }),
+    });
+    RuntimeAdapter::new(store.clone(), executor)
+        .execute(effect)
+        .await
+        .unwrap();
+    let access = RuntimeEffect {
+        operation_id: OperationId::new("scale-up-active-secondary-access"),
+        sequence: store.load_state().await.unwrap().next_effect_sequence,
+        action: RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::NotPrimary,
+        },
+    };
+    RuntimeAdapter::new(store.clone(), runtime.clone())
+        .execute(access)
+        .await
+        .unwrap();
+    let durable = store.load_state().await.unwrap();
+    assert_eq!(durable.role, ReplicaRole::ActiveSecondary);
+    assert_eq!(durable.write_status, AccessStatus::NotPrimary);
+    assert!(durable.pending_effect.is_none());
+    assert_eq!(
+        application.durable_progress().await.unwrap().committed_lsn,
+        1
+    );
+}
+
 fn real_configuration_command() -> EnsureConfiguration {
     let identity = single_storage_identity().local_identity;
     let policy = EffectivePolicy::fixed(1, 30).unwrap();
@@ -1679,6 +2082,233 @@ fn switchover_recovery_boundaries_survive_process_termination() {
             }
         });
     }
+}
+
+#[test]
+fn scale_up_exact_cut_matrix_survives_real_process_restart() {
+    let store_cuts = [
+        "store-initialization",
+        "build-authority-admission",
+        "snapshot-boundary-persistence",
+        "source-progress-persistence",
+        "target-progress-persistence",
+    ];
+    for cut in store_cuts {
+        for after in [false, true] {
+            eprintln!(
+                "scale-up-crash-cut cut={cut} side={}",
+                if after { "after" } else { "before" }
+            );
+            let directory = tempdir().unwrap();
+            let path = SqliteStore::metadata_database_path(directory.path());
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "scale_up_store_cut_writer_process"])
+                .env("KUBERIC_SCALE_UP_STORE_CUT_PATH", &path)
+                .env("KUBERIC_SCALE_UP_STORE_CUT", cut)
+                .env(
+                    "KUBERIC_SCALE_UP_STORE_CUT_SIDE",
+                    if after { "after" } else { "before" },
+                )
+                .output()
+                .unwrap();
+            let expected_exit = if cut.ends_with("-after") && cut != "completion-after" {
+                0
+            } else {
+                73
+            };
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "{cut} {}: {}",
+                if after { "after" } else { "before" },
+                String::from_utf8_lossy(&output.stderr)
+            );
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                ensure_scale_up_store_cut(&path, cut, after, false).await;
+                let store = SqliteStore::open_existing(&path, None).unwrap();
+                let (_, _, build) = scale_up_crash_fixture(false);
+                match cut {
+                    "store-initialization" => {
+                        assert_eq!(
+                            store.identity().await.unwrap().schema_version,
+                            SCHEMA_VERSION
+                        );
+                    }
+                    "build-authority-admission" => {
+                        assert_eq!(
+                            store.load_build(&build.build_id).await.unwrap(),
+                            Some(build)
+                        );
+                    }
+                    _ => {
+                        let progress = store
+                            .load_build_progress(&build.build_id)
+                            .await
+                            .unwrap()
+                            .expect("durable build progress");
+                        assert_eq!(progress.authority, build);
+                        assert_eq!(progress.catch_up_boundary_lsn, Some(9));
+                        let expected = match cut {
+                            "snapshot-boundary-persistence" => (0, 4, false),
+                            "source-progress-persistence" => (1, 7, false),
+                            "target-progress-persistence" => (2, 9, true),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            (
+                                progress.last_sequence,
+                                progress.durable_lsn,
+                                progress.completed
+                            ),
+                            expected
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    let configuration_cuts = [
+        "pc-cc-authority-before",
+        "pc-cc-authority-after",
+        "pc-cc-access-before",
+        "pc-cc-access-after",
+        "current-only-authority-before",
+        "current-only-authority-after",
+        "current-only-access-before",
+        "current-only-access-after",
+        "build-retirement-before",
+        "build-retirement-after",
+        "completion-before",
+        "completion-after",
+    ];
+    for cut in configuration_cuts {
+        eprintln!("scale-up-crash-cut cut={cut}");
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "scale_up_configuration_cut_writer_process",
+            ])
+            .env("KUBERIC_SCALE_UP_CONFIGURATION_CUT_PATH", &path)
+            .env("KUBERIC_SCALE_UP_CONFIGURATION_CUT", cut)
+            .output()
+            .unwrap();
+        let expected_exit = if cut.ends_with("-after") && cut != "completion-after" {
+            0
+        } else {
+            73
+        };
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{cut}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let interrupted = SqliteStore::open_existing(&path, None).unwrap();
+        assert_eq!(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(interrupted.load_state())
+                .unwrap()
+                .write_status,
+            AccessStatus::Granted,
+            "{cut}: same-primary durable cut intentionally closed healthy writes"
+        );
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_scale_up_configuration_cut(&path, cut, false));
+    }
+
+    for after in [false, true] {
+        eprintln!(
+            "scale-up-crash-cut cut=active-secondary side={}",
+            if after { "after" } else { "before" }
+        );
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "scale_up_active_secondary_cut_writer_process",
+            ])
+            .env("KUBERIC_SCALE_UP_ACTIVE_SECONDARY_PATH", &path)
+            .env(
+                "KUBERIC_SCALE_UP_ACTIVE_SECONDARY_SIDE",
+                if after { "after" } else { "before" },
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "active-secondary {}: {}",
+            if after { "after" } else { "before" },
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_real_active_secondary_cut(&path, after, false));
+    }
+}
+
+#[test]
+#[ignore = "helper process for scale_up_exact_cut_matrix_survives_real_process_restart"]
+fn scale_up_store_cut_writer_process() {
+    let (Ok(path), Ok(cut), Ok(side)) = (
+        env::var("KUBERIC_SCALE_UP_STORE_CUT_PATH"),
+        env::var("KUBERIC_SCALE_UP_STORE_CUT"),
+        env::var("KUBERIC_SCALE_UP_STORE_CUT_SIDE"),
+    ) else {
+        return;
+    };
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(ensure_scale_up_store_cut(
+            Path::new(&path),
+            &cut,
+            side == "after",
+            true,
+        ));
+}
+
+#[test]
+#[ignore = "helper process for scale_up_exact_cut_matrix_survives_real_process_restart"]
+fn scale_up_configuration_cut_writer_process() {
+    let (Ok(path), Ok(cut)) = (
+        env::var("KUBERIC_SCALE_UP_CONFIGURATION_CUT_PATH"),
+        env::var("KUBERIC_SCALE_UP_CONFIGURATION_CUT"),
+    ) else {
+        return;
+    };
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(execute_scale_up_configuration_cut(
+            Path::new(&path),
+            &cut,
+            true,
+        ));
+}
+
+#[test]
+#[ignore = "helper process for scale_up_exact_cut_matrix_survives_real_process_restart"]
+fn scale_up_active_secondary_cut_writer_process() {
+    let (Ok(path), Ok(side)) = (
+        env::var("KUBERIC_SCALE_UP_ACTIVE_SECONDARY_PATH"),
+        env::var("KUBERIC_SCALE_UP_ACTIVE_SECONDARY_SIDE"),
+    ) else {
+        return;
+    };
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(execute_real_active_secondary_cut(
+            Path::new(&path),
+            side == "after",
+            true,
+        ));
 }
 
 #[test]

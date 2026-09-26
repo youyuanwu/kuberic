@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, ScaleDownResource};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::*;
 use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::*;
+use kuberic_protocol::validation::validate_status;
 
 pub fn config() -> EvaluationConfig {
     EvaluationConfig {
@@ -20,6 +21,12 @@ pub struct Model {
     pending_build: Option<PendingBuild>,
     pub durable_source: BTreeMap<i64, String>,
     pub durable_receivers: BTreeMap<i64, BTreeMap<i64, String>>,
+    pub acknowledged_writes: BTreeMap<i64, String>,
+    durable_incarnations: BTreeMap<String, BTreeMap<i64, String>>,
+    accepted_epochs: Vec<Epoch>,
+    frozen_boundaries: BTreeMap<OperationId, i64>,
+    committed_incarnations: BTreeSet<String>,
+    next_incarnation: u64,
 }
 
 struct PendingBuild {
@@ -64,6 +71,7 @@ impl Model {
             members.clone(),
             policy.write_quorum,
         );
+        let accepted_epoch = configuration.epoch;
         let replicas = members
             .iter()
             .map(|member| {
@@ -119,6 +127,9 @@ impl Model {
                 )
             })
             .collect();
+        let durable_source = (1..=10)
+            .map(|lsn| (lsn, format!("value-{lsn}")))
+            .collect::<BTreeMap<_, _>>();
         Self {
             snapshot: ObservationSnapshot {
                 resource_uid,
@@ -152,8 +163,25 @@ impl Model {
             },
             accepted_history: vec![accepted],
             pending_build: None,
-            durable_source: (1..=10).map(|lsn| (lsn, format!("value-{lsn}"))).collect(),
+            durable_source: durable_source.clone(),
             durable_receivers: BTreeMap::new(),
+            acknowledged_writes: durable_source.clone(),
+            durable_incarnations: members
+                .iter()
+                .map(|member| {
+                    (
+                        member.identity.instance_id.to_string(),
+                        durable_source.clone(),
+                    )
+                })
+                .collect(),
+            accepted_epochs: vec![accepted_epoch],
+            frozen_boundaries: BTreeMap::new(),
+            committed_incarnations: members
+                .iter()
+                .map(|member| member.identity.instance_id.to_string())
+                .collect(),
+            next_incarnation: 1,
         }
     }
 
@@ -164,12 +192,35 @@ impl Model {
     }
 
     pub fn from_snapshot(snapshot: ObservationSnapshot, accepted_history: Vec<u32>) -> Self {
+        let configuration = &snapshot.status.topology.as_ref().unwrap().configuration;
+        let durable_source = (1..=10)
+            .map(|lsn| (lsn, format!("value-{lsn}")))
+            .collect::<BTreeMap<_, _>>();
         Self {
+            accepted_epochs: vec![configuration.epoch],
+            committed_incarnations: configuration
+                .members
+                .iter()
+                .map(|member| member.identity.instance_id.to_string())
+                .collect(),
+            durable_incarnations: configuration
+                .members
+                .iter()
+                .map(|member| {
+                    (
+                        member.identity.instance_id.to_string(),
+                        durable_source.clone(),
+                    )
+                })
+                .collect(),
             snapshot,
             accepted_history,
             pending_build: None,
-            durable_source: (1..=10).map(|lsn| (lsn, format!("value-{lsn}"))).collect(),
+            durable_source: durable_source.clone(),
             durable_receivers: BTreeMap::new(),
+            acknowledged_writes: durable_source,
+            frozen_boundaries: BTreeMap::new(),
+            next_incarnation: 1,
         }
     }
 
@@ -186,6 +237,12 @@ impl Model {
             }),
             durable_source: self.durable_source.clone(),
             durable_receivers: self.durable_receivers.clone(),
+            acknowledged_writes: self.acknowledged_writes.clone(),
+            durable_incarnations: self.durable_incarnations.clone(),
+            accepted_epochs: self.accepted_epochs.clone(),
+            frozen_boundaries: self.frozen_boundaries.clone(),
+            committed_incarnations: self.committed_incarnations.clone(),
+            next_incarnation: self.next_incarnation,
         }
     }
 
@@ -199,14 +256,17 @@ impl Model {
     }
 
     pub fn step(&mut self) -> bool {
+        self.assert_safety_invariants();
         match self.plan() {
             Plan::Stable { status, .. } => {
                 self.snapshot.status = status;
+                self.assert_safety_invariants();
                 true
             }
             Plan::Wait { status, .. } => {
                 self.snapshot.status = status;
                 self.advance_async_build();
+                self.assert_safety_invariants();
                 false
             }
             Plan::Unsafe { reason, .. } => panic!(
@@ -216,8 +276,18 @@ impl Model {
                     .replicas
                     .values()
                     .filter_map(|observation| match &observation.agent {
-                        AgentObservation::Report(report) =>
-                            Some((report.identity.replica_id, report.scale_up_intent.clone(),)),
+                        AgentObservation::Report(report) => Some((
+                            report.identity.replica_id,
+                            report.role,
+                            report.epoch,
+                            report
+                                .current_configuration
+                                .as_ref()
+                                .map(|configuration| configuration.epoch),
+                            report.current_progress,
+                            report.verified_replication_lsn,
+                            report.scale_up_intent.clone(),
+                        )),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -226,10 +296,12 @@ impl Model {
                 for change in changes {
                     self.apply(change);
                 }
+                self.assert_safety_invariants();
                 false
             }
             Plan::Execute { command } => {
                 self.execute(command);
+                self.assert_safety_invariants();
                 false
             }
         }
@@ -248,12 +320,35 @@ impl Model {
         match change {
             KubernetesChange::PersistStatus { status } => {
                 let old = self.accepted_count();
+                let old_epoch = self
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .epoch;
                 self.snapshot.status = *status;
                 self.refresh_allocation_observation();
                 let new = self.accepted_count();
                 if new != old {
                     assert_eq!(new, old + 1);
                     self.accepted_history.push(new);
+                    let accepted = &self
+                        .snapshot
+                        .status
+                        .topology
+                        .as_ref()
+                        .unwrap()
+                        .configuration;
+                    assert!(accepted.epoch > old_epoch);
+                    self.accepted_epochs.push(accepted.epoch);
+                    self.committed_incarnations.extend(
+                        accepted
+                            .members
+                            .iter()
+                            .map(|member| member.identity.instance_id.to_string()),
+                    );
                 }
             }
             KubernetesChange::EnsureReplicaScaffolding { replica_ids } => {
@@ -297,6 +392,17 @@ impl Model {
                     }
                     ScaleDownResource::Pod => exact.pod = ExactResourceObservation::NotFound,
                     ScaleDownResource::Pvc => exact.pvc = ExactResourceObservation::NotFound,
+                }
+                let fully_absent = matches!(exact.endpoint, ExactResourceObservation::NotFound)
+                    && matches!(exact.pod, ExactResourceObservation::NotFound)
+                    && matches!(exact.pvc, ExactResourceObservation::NotFound);
+                if fully_absent {
+                    self.snapshot.replicas.remove(&ReplicaObservationKey::new(
+                        target.replica_id,
+                        target.instance_id.clone(),
+                    ));
+                    self.durable_incarnations
+                        .remove(target.instance_id.as_str());
                 }
             }
             other => panic!("unexpected scale-up model change: {other:?}"),
@@ -403,8 +509,18 @@ impl Model {
         }) {
             return;
         }
-        let pod_uid = PodUid::new(format!("candidate-pod-{replica_id}"));
-        let pvc_uid = PvcUid::new(format!("candidate-pvc-{replica_id}"));
+        let incarnation = self.next_incarnation;
+        self.next_incarnation += 1;
+        let pod_uid = PodUid::new(if incarnation == 1 {
+            format!("candidate-pod-{replica_id}")
+        } else {
+            format!("candidate-pod-{replica_id}-{incarnation}")
+        });
+        let pvc_uid = PvcUid::new(if incarnation == 1 {
+            format!("candidate-pvc-{replica_id}")
+        } else {
+            format!("candidate-pvc-{replica_id}-{incarnation}")
+        });
         let instance_id = ReplicaInstanceId::new(pod_uid.as_str());
         self.snapshot.replicas.insert(
             ReplicaObservationKey::new(replica_id, instance_id.clone()),
@@ -594,6 +710,14 @@ impl Model {
                         assert_eq!(copied.get(&lsn), self.durable_source.get(&lsn));
                     }
                 }
+                if command.scale_up_evidence.is_some() {
+                    for member in &command.current_configuration.members {
+                        self.durable_incarnations
+                            .entry(member.identity.instance_id.to_string())
+                            .or_default()
+                            .extend(self.durable_source.clone());
+                    }
+                }
                 report.role = member.role;
                 report.read_status = AccessStatus::Granted;
                 report.write_status = if member.role == ReplicaRole::Primary {
@@ -653,12 +777,19 @@ impl Model {
     }
 
     pub fn restart(&mut self, replica_id: i64) {
-        let bytes =
-            serde_json::to_vec(&(self.durable_source.clone(), self.durable_receivers.clone()))
-                .unwrap();
-        let (source, receivers) = serde_json::from_slice(&bytes).unwrap();
+        let bytes = serde_json::to_vec(&(
+            self.durable_source.clone(),
+            self.durable_receivers.clone(),
+            self.acknowledged_writes.clone(),
+            self.durable_incarnations.clone(),
+        ))
+        .unwrap();
+        let (source, receivers, acknowledged, incarnations) =
+            serde_json::from_slice(&bytes).unwrap();
         self.durable_source = source;
         self.durable_receivers = receivers;
+        self.acknowledged_writes = acknowledged;
+        self.durable_incarnations = incarnations;
         let report = self.report_mut(replica_id);
         report.process_session_id =
             ProcessSessionId::new(format!("{}-restart", report.process_session_id));
@@ -716,12 +847,11 @@ impl Model {
                 else {
                     panic!("build source report")
                 };
-                source.current_progress = pending.catch_up_boundary;
-                source.committed_lsn = pending.catch_up_boundary;
-                self.durable_source.insert(
-                    pending.catch_up_boundary,
-                    format!("value-{}", pending.catch_up_boundary),
-                );
+                source.current_progress = source.current_progress.max(pending.catch_up_boundary);
+                source.committed_lsn = source.committed_lsn.max(pending.catch_up_boundary);
+                self.durable_source
+                    .entry(pending.catch_up_boundary)
+                    .or_insert_with(|| format!("value-{}", pending.catch_up_boundary));
                 source.builds[0].last_sequence = 2;
                 source.builds[0].durable_lsn = pending.catch_up_boundary;
                 source.builds[0].completed = true;
@@ -748,6 +878,13 @@ impl Model {
                 target.report_sequence += 1;
                 self.durable_receivers.insert(
                     pending.target.replica_id.value(),
+                    self.durable_source
+                        .range(..=pending.catch_up_boundary)
+                        .map(|(lsn, value)| (*lsn, value.clone()))
+                        .collect(),
+                );
+                self.durable_incarnations.insert(
+                    pending.target.instance_id.to_string(),
                     self.durable_source
                         .range(..=pending.catch_up_boundary)
                         .map(|(lsn, value)| (*lsn, value.clone()))
@@ -783,5 +920,227 @@ impl Model {
             ))
             .unwrap()
             .agent = AgentObservation::Absent;
+    }
+
+    pub fn acknowledge_write(&mut self, case: u64, step: u64) -> i64 {
+        let primary = self
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .unwrap()
+            .identity
+            .clone();
+        let writable = self.snapshot.replicas.values().any(|observation| {
+            matches!(
+                &observation.agent,
+                AgentObservation::Report(report)
+                    if report.identity == primary
+                        && report.write_status == AccessStatus::Granted
+            )
+        });
+        assert!(
+            writable,
+            "model may acknowledge only through the accepted writer"
+        );
+        let lsn = self.durable_source.keys().next_back().copied().unwrap_or(0) + 1;
+        let value = format!("ack-{case}-{step}-{lsn}");
+        self.durable_source.insert(lsn, value.clone());
+        self.acknowledged_writes.insert(lsn, value.clone());
+
+        let authority = self.snapshot.status.transition.as_ref().map_or_else(
+            || {
+                self.snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .clone()
+            },
+            |transition| transition.current_configuration.clone(),
+        );
+        for member in &authority.members {
+            self.durable_incarnations
+                .entry(member.identity.instance_id.to_string())
+                .or_default()
+                .insert(lsn, value.clone());
+            if let Some(report) = self.snapshot.replicas.values_mut().find_map(|observation| {
+                match &mut observation.agent {
+                    AgentObservation::Report(report)
+                        if report.identity == member.identity
+                            && matches!(
+                                report.role,
+                                ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                            ) =>
+                    {
+                        Some(report.as_mut())
+                    }
+                    _ => None,
+                }
+            }) {
+                report.current_progress = report.current_progress.max(lsn);
+                report.committed_lsn = report.committed_lsn.max(lsn);
+                if report.current_configuration.as_ref() == Some(&authority) {
+                    report.verified_replication_lsn =
+                        Some(report.verified_replication_lsn.unwrap_or_default().max(lsn));
+                    report.current_configuration_quorum_progress =
+                        report.current_configuration_quorum_progress.max(lsn);
+                }
+                report.report_sequence += 1;
+            }
+        }
+        lsn
+    }
+
+    pub fn assert_acknowledged_write_oracle(&self) {
+        let status = &self.snapshot.status;
+        let configuration = &status.topology.as_ref().unwrap().configuration;
+        let policy = status.effective_policy.as_ref().unwrap();
+        for (lsn, value) in &self.acknowledged_writes {
+            let recoverable = configuration
+                .members
+                .iter()
+                .filter(|member| {
+                    self.durable_incarnations
+                        .get(member.identity.instance_id.as_str())
+                        .and_then(|history| history.get(lsn))
+                        == Some(value)
+                })
+                .count();
+            assert!(
+                recoverable >= policy.read_quorum as usize,
+                "acknowledged write {lsn}={value:?} is present on only {recoverable} \
+                 accepted members; read quorum is {}",
+                policy.read_quorum
+            );
+        }
+        assert!(
+            configuration.members.len() < usize::BITS as usize,
+            "model recovery-mask width exceeded"
+        );
+        for mask in 0_usize..(1_usize << configuration.members.len()) {
+            if mask.count_ones() < policy.read_quorum {
+                continue;
+            }
+            for (lsn, value) in &self.acknowledged_writes {
+                assert!(
+                    configuration
+                        .members
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| mask & (1 << index) != 0)
+                        .any(|(_, member)| {
+                            self.durable_incarnations
+                                .get(member.identity.instance_id.as_str())
+                                .and_then(|history| history.get(lsn))
+                                == Some(value)
+                        }),
+                    "valid terminal recovery mask {mask:#b} lost acknowledged \
+                     write {lsn}={value:?}"
+                );
+            }
+        }
+    }
+
+    pub fn assert_safety_invariants(&mut self) {
+        validate_status(&self.snapshot.status).unwrap();
+        let accepted = &self
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration;
+        if let Some(previous) = self.accepted_epochs.last() {
+            assert!(
+                accepted.epoch >= *previous,
+                "accepted epoch regressed from {previous:?} to {:?}",
+                accepted.epoch
+            );
+        }
+        let policy = self.snapshot.status.effective_policy.as_ref().unwrap();
+        assert_eq!(
+            accepted.members.len(),
+            policy.replica_set_size as usize,
+            "accepted topology and policy cardinality diverged"
+        );
+
+        let mut active_targets = BTreeSet::new();
+        if let Some(allocation) = &self.snapshot.status.scale_up_allocation {
+            active_targets.insert(allocation.target_replica_id);
+        }
+        if let Some(provisioning) = &self.snapshot.status.provisioning
+            && provisioning.scale_up().is_some()
+        {
+            active_targets.insert(provisioning.replica_id());
+        }
+        if let Some(transition) = &self.snapshot.status.transition
+            && let Some(intent) = transition.scale_up.as_deref().or_else(|| {
+                transition
+                    .scale_up_failover
+                    .as_deref()
+                    .map(|evidence| &evidence.intent)
+            })
+        {
+            active_targets.insert(intent.target.replica_id);
+        }
+        if let Some(cleanup) = &self.snapshot.status.scale_up_cleanup {
+            active_targets.insert(cleanup.target.replica_id);
+            assert!(
+                !accepted
+                    .members
+                    .iter()
+                    .any(|member| member.identity == cleanup.target),
+                "committed member acquired pre-admission cleanup authority"
+            );
+            assert!(
+                !self
+                    .committed_incarnations
+                    .contains(cleanup.target.instance_id.as_str()),
+                "historically committed incarnation acquired candidate cleanup authority"
+            );
+        }
+        assert!(
+            active_targets.len() <= 1,
+            "more than one scale-up candidate is active: {active_targets:?}"
+        );
+
+        for observation in self.snapshot.replicas.values() {
+            let AgentObservation::Report(report) = &observation.agent else {
+                continue;
+            };
+            for build in &report.builds {
+                if let Some(boundary) = build.catch_up_boundary_lsn {
+                    match self.frozen_boundaries.get(&build.build_id) {
+                        Some(existing) => assert_eq!(
+                            *existing, boundary,
+                            "catch-up boundary mutated for {}",
+                            build.build_id
+                        ),
+                        None => {
+                            self.frozen_boundaries
+                                .insert(build.build_id.clone(), boundary);
+                        }
+                    }
+                }
+            }
+            if !accepted
+                .members
+                .iter()
+                .any(|member| member.identity == report.identity)
+            {
+                assert_ne!(
+                    report.write_status,
+                    AccessStatus::Granted,
+                    "unadmitted candidate received write-quorum authority"
+                );
+            }
+        }
     }
 }

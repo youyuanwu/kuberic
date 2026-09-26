@@ -905,89 +905,138 @@ mod tests {
 
     #[test]
     fn representative_scale_up_status_evidence_remains_bounded() {
-        let intent = intent(3);
-        let provisioning = provisioning(&intent);
-        let receipt = ScaleUpReceipt {
-            accepted_configuration: intent.current_configuration.clone(),
-            failover_evidence: None,
-            current_only_write_quorum: intent
-                .current_configuration
-                .members
-                .iter()
-                .take(intent.current_policy.write_quorum as usize)
-                .enumerate()
-                .map(|(index, member)| {
-                    witness(&intent, member.identity.clone(), false, index as u64 + 1)
-                })
-                .collect(),
-            intent,
-        };
-        validate_scale_up_receipt(&receipt).unwrap();
-        let target = provisioning.target_identity(&receipt.intent.resource_uid);
-        let cleanup = ScaleUpCleanup {
-            provisioning: provisioning.clone(),
-            target: target.clone(),
-            resources: ReplicaCleanupIdentity {
-                pod: CleanupResourceIdentity::Present {
-                    name: "db-3".into(),
-                    uid: target.instance_id.to_string(),
-                },
-                pvc: CleanupResourceIdentity::Present {
-                    name: "db-3-data".into(),
-                    uid: provisioning.pvc_uid.to_string(),
-                },
-                endpoint: CleanupResourceIdentity::Present {
-                    name: derive_replica_endpoint_name(&receipt.intent.resource_uid, &target),
-                    uid: "service-4".into(),
-                },
-            },
-        };
-        let statuses = [
-            (
-                "provisioning",
-                AcceptedStatus {
-                    initialized: true,
-                    effective_policy: Some(receipt.intent.previous_policy.clone()),
-                    topology: Some(AcceptedTopology {
-                        configuration: receipt.intent.previous_configuration.clone(),
-                    }),
-                    provisioning: Some(provisioning),
-                    ..Default::default()
-                },
-            ),
-            (
-                "cleanup",
-                AcceptedStatus {
-                    initialized: true,
-                    effective_policy: Some(receipt.intent.previous_policy.clone()),
-                    topology: Some(AcceptedTopology {
-                        configuration: receipt.intent.previous_configuration.clone(),
-                    }),
-                    scale_up_cleanup: Some(Box::new(cleanup)),
-                    ..Default::default()
-                },
-            ),
-            (
-                "receipt",
-                AcceptedStatus {
-                    initialized: true,
-                    effective_policy: Some(receipt.intent.current_policy.clone()),
-                    topology: Some(AcceptedTopology {
-                        configuration: receipt.intent.current_configuration.clone(),
-                    }),
-                    last_scale_up: Some(Box::new(receipt)),
-                    ..Default::default()
-                },
-            ),
-        ];
-        for (label, status) in statuses {
-            crate::validation::validate_status(&status).unwrap();
-            let bytes = serde_json::to_vec(&status).unwrap();
-            assert!(
-                bytes.len() < 32_768,
-                "{label} scale-up status grew to {} bytes",
-                bytes.len()
+        let mut prior_sizes = std::collections::BTreeMap::<&str, usize>::new();
+        for previous_count in [1_u32, 2, 3, 5, 9, 17] {
+            let mut intent = intent(previous_count);
+            let provisioning = provisioning(&intent);
+            let target = provisioning.target_identity(&intent.resource_uid);
+            intent.target = target.clone();
+            let mut expanded_members = intent.current_configuration.members.clone();
+            expanded_members
+                .iter_mut()
+                .find(|member| member.identity.replica_id == target.replica_id)
+                .unwrap()
+                .identity = target.clone();
+            intent.current_configuration = ConfigurationDescriptor::new(
+                intent.current_configuration.epoch,
+                intent.current_configuration.primary_id,
+                expanded_members,
+                intent.current_policy.write_quorum,
             );
+            intent.build_id = provisioning
+                .scale_up_build_id(&intent.resource_uid)
+                .unwrap();
+            intent.operation_id = intent.expected_operation_id();
+            let receipt = ScaleUpReceipt {
+                accepted_configuration: intent.current_configuration.clone(),
+                failover_evidence: None,
+                current_only_write_quorum: intent
+                    .current_configuration
+                    .members
+                    .iter()
+                    .take(intent.current_policy.write_quorum as usize)
+                    .enumerate()
+                    .map(|(index, member)| {
+                        witness(&intent, member.identity.clone(), false, index as u64 + 1)
+                    })
+                    .collect(),
+                intent: intent.clone(),
+            };
+            validate_scale_up_receipt(&receipt).unwrap();
+            let cleanup = ScaleUpCleanup {
+                provisioning: provisioning.clone(),
+                target: target.clone(),
+                resources: ReplicaCleanupIdentity {
+                    pod: CleanupResourceIdentity::Present {
+                        name: format!("db-{}", target.replica_id),
+                        uid: target.instance_id.to_string(),
+                    },
+                    pvc: CleanupResourceIdentity::Present {
+                        name: format!("db-{}-data", target.replica_id),
+                        uid: provisioning.pvc_uid.to_string(),
+                    },
+                    endpoint: CleanupResourceIdentity::Present {
+                        name: derive_replica_endpoint_name(&receipt.intent.resource_uid, &target),
+                        uid: format!("service-{}", target.replica_id),
+                    },
+                },
+            };
+            let stable = AcceptedStatus {
+                initialized: true,
+                effective_policy: Some(intent.previous_policy.clone()),
+                topology: Some(AcceptedTopology {
+                    configuration: intent.previous_configuration.clone(),
+                }),
+                ..Default::default()
+            };
+            let pc_cc = AcceptedStatus {
+                provisioning: Some(provisioning.clone()),
+                transition: Some(TransitionIntent {
+                    transition_id: intent
+                        .transition_id(TransitionKind::ScaleUp, &intent.current_configuration),
+                    kind: TransitionKind::ScaleUp,
+                    spec_generation: intent.spec_generation,
+                    effective_policy: intent.current_policy.clone(),
+                    previous_configuration_id: Some(
+                        intent.previous_configuration.configuration_id.clone(),
+                    ),
+                    current_configuration: intent.current_configuration.clone(),
+                    election_lsn: None,
+                    build_id: Some(intent.build_id.clone()),
+                    repair: None,
+                    switchover: None,
+                    secondary_scale_down: None,
+                    secondary_removal_evidence: None,
+                    scale_up: Some(Box::new(intent.clone())),
+                    scale_up_failover: None,
+                }),
+                scale_up_admission_started: Some(intent.operation_id.clone()),
+                ..stable.clone()
+            };
+            let committed = AcceptedStatus {
+                effective_policy: Some(intent.current_policy.clone()),
+                topology: Some(AcceptedTopology {
+                    configuration: intent.current_configuration.clone(),
+                }),
+                last_scale_up: Some(Box::new(receipt.clone())),
+                ..stable.clone()
+            };
+            let statuses = [
+                ("stable", stable.clone()),
+                (
+                    "active-build",
+                    AcceptedStatus {
+                        provisioning: Some(provisioning.clone()),
+                        ..stable.clone()
+                    },
+                ),
+                ("pc-cc", pc_cc),
+                (
+                    "cleanup",
+                    AcceptedStatus {
+                        scale_up_cleanup: Some(Box::new(cleanup)),
+                        ..stable
+                    },
+                ),
+                ("committed-degraded", committed.clone()),
+                ("latest-receipt", committed),
+            ];
+            for (phase, status) in statuses {
+                crate::validation::validate_status(&status).unwrap();
+                let size = serde_json::to_vec(&status).unwrap().len();
+                let count = previous_count + 1;
+                assert!(
+                    size <= 12_288 + count as usize * 8_192,
+                    "{phase} status at {count} members grew to {size} bytes"
+                );
+                if let Some(previous) = prior_sizes.insert(phase, size) {
+                    assert!(
+                        size <= previous.saturating_mul(2).saturating_add(8_192),
+                        "{phase} evidence grew multiplicatively: {previous} -> {size} bytes"
+                    );
+                }
+                eprintln!("scale-up-status phase={phase} members={count} bytes={size}");
+            }
         }
     }
 

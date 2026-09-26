@@ -1023,6 +1023,75 @@ async fn scale_up_reobserves_status_conflict_and_lost_agent_replies() {
 }
 
 #[tokio::test]
+async fn scale_up_stale_process_session_cannot_advance_and_fresh_session_recovers() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let mut stale_key = None;
+    for _ in 0..100 {
+        tick(&api).await;
+        let raw = api.observation().await;
+        if let Some((key, _)) = candidate_key(&raw)
+            && matches!(raw.agents.get(&key), Some(RawAgentObservation::Report(report))
+                if report.storage_state == proto::AgentStorageState::Initialized as i32)
+        {
+            stale_key = Some(key);
+            break;
+        }
+    }
+    let stale_key = stale_key.expect("initialized scale-up candidate");
+    let reconciler = Reconciler::new(api.clone(), enabled());
+
+    // First accept the current sequence into the reconciler's durable watermark.
+    reconciler.reconcile("tests", "db").await.unwrap();
+    let mut stale = api.observation().await;
+    let RawAgentObservation::Report(report) = stale.agents.get_mut(&stale_key).unwrap() else {
+        panic!("initialized scale-up candidate report")
+    };
+    let accepted_sequence = report.report_sequence;
+    let stale_session = report.process_session_id.clone();
+    report.report_sequence = accepted_sequence.saturating_sub(1);
+    api.set_observation(stale).await;
+    let effects_before = api.effects().await.len();
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Unsafe
+    );
+    assert!(
+        api.effects().await[effects_before..]
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::Execute(_))),
+        "a stale same-session report dispatched scale-up authority"
+    );
+
+    let mut restarted = api.observation().await;
+    for (key, observation) in &mut restarted.agents {
+        if let RawAgentObservation::Report(report) = observation {
+            report.process_session_id = if key == &stale_key {
+                format!("{stale_session}-restart")
+            } else {
+                format!("fresh-session-{}", key.replica_id)
+            };
+            report.report_sequence = 1;
+        }
+    }
+    api.set_observation(restarted).await;
+    let resumed = reconciler.reconcile("tests", "db").await.unwrap();
+    assert_ne!(resumed.kind, ReconcileKind::Unsafe);
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    assert_eq!(accepted_count(&completed), 2);
+    assert!(
+        completed
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .last_scale_up
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn cancelled_candidate_cleanup_is_exact_ordered_and_restart_safe() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
     drive_until_cleanup(&api).await;
