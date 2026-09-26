@@ -9337,6 +9337,349 @@ fn scale_up_permanent_candidate_failure_before_fence_freezes_cleanup() {
     );
 }
 
+fn assert_scale_up_receipt_allows_full_replacement(replica_id: i64) {
+    use kuberic_protocol::command::ScaleDownResource;
+    use kuberic_protocol::observation::{
+        ExactResourceObservation, SecondaryScaleDownResourceObservation,
+    };
+    use kuberic_protocol::types::{
+        CleanupResourceIdentity, ReplicaCleanupIdentity, derive_replica_endpoint_name,
+    };
+    use scale_up_model::Model as ScaleUpModel;
+
+    let mut scale_up = ScaleUpModel::new(2, 3);
+    scale_up.run(120);
+    assert_eq!(scale_up.accepted_history, vec![2, 3]);
+    assert!(matches!(scale_up.plan(), Plan::Stable { .. }));
+    assert!(scale_up.snapshot.status.provisioning.is_none());
+    assert!(scale_up.snapshot.status.transition.is_none());
+    assert!(scale_up.snapshot.status.scale_up_cleanup.is_none());
+    let receipt = scale_up
+        .snapshot
+        .status
+        .last_scale_up
+        .clone()
+        .expect("stable 2->3 receipt");
+    let old = scale_up
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(replica_id))
+        .expect("accepted member")
+        .identity
+        .clone();
+
+    if !scale_up
+        .snapshot
+        .secondary_scale_down_resources
+        .iter()
+        .any(|resources| resources.target == old)
+    {
+        let kubernetes = scale_up
+            .snapshot
+            .observation_for_identity(&old)
+            .and_then(|observation| observation.kubernetes.as_ref())
+            .expect("accepted member Kubernetes provenance")
+            .clone();
+        scale_up.snapshot.secondary_scale_down_resources.push(
+            SecondaryScaleDownResourceObservation {
+                resource_uid: scale_up.snapshot.resource_uid.clone(),
+                target: old.clone(),
+                identity: ReplicaCleanupIdentity {
+                    pod: CleanupResourceIdentity::Present {
+                        name: kubernetes.pod_name,
+                        uid: kubernetes.pod_uid.unwrap().to_string(),
+                    },
+                    pvc: CleanupResourceIdentity::Present {
+                        name: kubernetes.pvc_name,
+                        uid: kubernetes.pvc_uid.unwrap().to_string(),
+                    },
+                    endpoint: CleanupResourceIdentity::Present {
+                        name: derive_replica_endpoint_name(&scale_up.snapshot.resource_uid, &old),
+                        uid: format!("accepted-endpoint-{}", old.replica_id),
+                    },
+                },
+                pod: ExactResourceObservation::NotFound,
+                pvc: ExactResourceObservation::NotFound,
+                endpoint: ExactResourceObservation::NotFound,
+            },
+        );
+    }
+    let exact = scale_up
+        .snapshot
+        .secondary_scale_down_resources
+        .iter_mut()
+        .find(|resources| resources.target == old)
+        .expect("exact old-member resource provenance");
+    exact.endpoint = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "old-endpoint-rv".into(),
+    };
+    exact.pod = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "old-pod-rv".into(),
+    };
+    exact.pvc = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "old-pvc-rv".into(),
+    };
+    let exact = exact.clone();
+    let exact_uid = |identity: &CleanupResourceIdentity| match identity {
+        CleanupResourceIdentity::Present { uid, .. } => uid.clone(),
+        CleanupResourceIdentity::Absent { .. } => {
+            panic!("replacement cleanup must retain exact UID provenance")
+        }
+    };
+    let expected_deletes = vec![
+        (
+            ScaleDownResource::Endpoint,
+            exact_uid(&exact.identity.endpoint),
+        ),
+        (ScaleDownResource::Pod, exact_uid(&exact.identity.pod)),
+        (ScaleDownResource::Pvc, exact_uid(&exact.identity.pvc)),
+    ];
+
+    let failed_report = scale_up.report_mut(replica_id);
+    failed_report.reported_fault = Some(FaultType::Permanent);
+    failed_report.healthy = false;
+    failed_report.report_sequence += 1;
+    let mut replacement = scale_down_model::Model {
+        snapshot: scale_up.snapshot,
+        commands: Vec::new(),
+        removed: Vec::new(),
+        deletes: Vec::new(),
+        inflight: BTreeMap::new(),
+        applied_effects: BTreeMap::new(),
+    };
+
+    for _ in 0..30 {
+        assert!(
+            replacement.snapshot.status.scale_up_cleanup.is_none(),
+            "an admitted member must never enter pre-admission scale-up cleanup"
+        );
+        if replacement
+            .snapshot
+            .status
+            .pending_replacement_cleanup
+            .is_some()
+        {
+            break;
+        }
+        let plan = evaluate(&replacement.snapshot, &scale_up_model::config());
+        assert_eq!(
+            plan,
+            evaluate(&replacement.snapshot, &scale_up_model::config())
+        );
+        replacement.apply(plan);
+    }
+    let frozen = replacement
+        .snapshot
+        .status
+        .pending_replacement_cleanup
+        .clone()
+        .unwrap_or_else(|| {
+            panic!(
+                "evaluator-produced replacement cleanup; final plan: {:?}",
+                evaluate(&replacement.snapshot, &scale_up_model::config())
+            )
+        });
+    assert_eq!(frozen.target, old);
+    assert_eq!(frozen.resources, exact.identity);
+    assert_eq!(
+        replacement.snapshot.status.last_scale_up,
+        Some(receipt.clone())
+    );
+
+    replacement.controller_restart();
+    assert_eq!(
+        replacement.snapshot.status.pending_replacement_cleanup,
+        Some(frozen)
+    );
+    assert_eq!(
+        replacement.snapshot.status.last_scale_up,
+        Some(receipt.clone())
+    );
+
+    let failed_key = replacement
+        .snapshot
+        .replicas
+        .iter()
+        .find_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Report(report) if report.identity == old => Some(key.clone()),
+            _ => None,
+        })
+        .expect("failed member report");
+    replacement
+        .snapshot
+        .replicas
+        .get_mut(&failed_key)
+        .unwrap()
+        .agent = AgentObservation::Absent;
+
+    let mut saw_scaffolding = false;
+    let mut saw_initialization = false;
+    let mut saw_build = false;
+    let mut saw_pc_cc = false;
+    let mut saw_current_only = false;
+    let mut saw_build_retirement = false;
+    let mut saw_stable = false;
+    let mut replacement_build_id = None;
+    for _ in 0..250 {
+        let plan = evaluate(&replacement.snapshot, &scale_up_model::config());
+        assert_eq!(
+            plan,
+            evaluate(&replacement.snapshot, &scale_up_model::config())
+        );
+        assert!(
+            !matches!(&plan, Plan::Wait { status, .. }
+                if status.conditions.iter().any(|condition|
+                    condition.reason == "ScaleUpCommittedDegraded")),
+            "persisted replacement cleanup must prevent a ScaleUpCommittedDegraded deadlock"
+        );
+        match &plan {
+            Plan::Apply { changes } => {
+                saw_scaffolding |= changes.iter().any(|change| {
+                    matches!(change, KubernetesChange::EnsureReplacementScaffolding {
+                        replica_id: target,
+                        replacing,
+                    } if *target == old.replica_id && replacing == &old)
+                });
+            }
+            Plan::Execute { command } => match command {
+                ProtocolCommand::InitializeAgentStore(command) => {
+                    saw_initialization |= command.local_replica_id == old.replica_id;
+                }
+                ProtocolCommand::EnsureReplicaBuild(command) => {
+                    saw_build |= command.target.replica_id == old.replica_id;
+                    replacement_build_id = Some(command.operation_id.clone());
+                }
+                ProtocolCommand::EnsureConfiguration(command)
+                    if command.transition_kind == TransitionKind::Replacement =>
+                {
+                    saw_pc_cc |= !command.current_only;
+                    saw_current_only |= command.current_only;
+                    saw_build_retirement |=
+                        command.current_only && !command.retire_build_ids.is_empty();
+                }
+                _ => {}
+            },
+            Plan::Stable { .. } => saw_stable = true,
+            Plan::Wait { .. } | Plan::Unsafe { .. } => {}
+        }
+        let stable = matches!(plan, Plan::Stable { .. });
+        replacement.apply(plan);
+        assert!(
+            replacement.snapshot.status.scale_up_cleanup.is_none(),
+            "an admitted member must never enter pre-admission scale-up cleanup"
+        );
+        if stable {
+            break;
+        }
+    }
+
+    assert!(saw_scaffolding, "replacement scaffolding decision");
+    assert!(saw_initialization, "replacement initialization decision");
+    assert!(saw_build, "replacement build decision");
+    assert!(saw_pc_cc, "replacement PC/CC configuration decisions");
+    assert!(saw_current_only, "replacement current-only decisions");
+    assert!(
+        saw_build_retirement,
+        "completed replacement build retirement"
+    );
+    assert!(saw_stable, "replacement must converge to Stable");
+    let replacement_build_id = replacement_build_id.expect("replacement build operation");
+    assert_eq!(replacement.deletes, expected_deletes);
+    assert!(
+        replacement
+            .snapshot
+            .status
+            .pending_replacement_cleanup
+            .is_none()
+    );
+    assert!(replacement.snapshot.status.last_replacement.is_none());
+    assert_eq!(replacement.snapshot.status.last_scale_up, Some(receipt));
+
+    let accepted = &replacement
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    let fresh = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == old.replica_id)
+        .expect("fresh accepted incarnation");
+    assert_ne!(fresh.identity, old);
+    assert!(
+        accepted.members.iter().all(|member| member.identity != old),
+        "failed incarnation must be retired from accepted membership"
+    );
+    assert!(
+        !replacement
+            .snapshot
+            .replicas
+            .contains_key(&ReplicaObservationKey::new(
+                old.replica_id,
+                old.instance_id.clone()
+            )),
+        "exact old Pod cleanup must remove the failed process observation"
+    );
+    for member in &accepted.members {
+        let observation = replacement
+            .snapshot
+            .observation_for_identity(&member.identity)
+            .expect("accepted member observation");
+        let AgentObservation::Report(report) = &observation.agent else {
+            panic!("accepted member report")
+        };
+        assert!(report.healthy);
+        assert_eq!(report.role, member.role);
+        assert_eq!(report.previous_configuration, None);
+        assert_eq!(report.current_configuration.as_ref(), Some(accepted));
+        assert_eq!(report.read_status, AccessStatus::Granted);
+        assert!(
+            report
+                .builds
+                .iter()
+                .all(|build| build.build_id != replacement_build_id),
+            "replacement build must be retired from every accepted member"
+        );
+        if member.identity.replica_id == accepted.primary_id {
+            assert_eq!(report.write_status, AccessStatus::Granted);
+        } else {
+            assert_eq!(report.write_status, AccessStatus::NotPrimary);
+        }
+    }
+    assert_eq!(
+        replacement.snapshot.routing.write_target.as_ref(),
+        accepted
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == accepted.primary_id)
+            .map(|member| &member.identity)
+    );
+    assert!(matches!(
+        evaluate(&replacement.snapshot, &scale_up_model::config()),
+        Plan::Stable { .. }
+    ));
+}
+
+#[test]
+fn scale_up_newly_admitted_member_permanently_fails_after_stable_two_to_three_and_replacement_converges()
+ {
+    assert_scale_up_receipt_allows_full_replacement(3);
+}
+
+#[test]
+fn scale_up_retained_secondary_permanently_fails_after_stable_two_to_three_and_replacement_converges()
+ {
+    assert_scale_up_receipt_allows_full_replacement(2);
+}
+
 #[test]
 fn scale_up_provisioning_and_prefence_failover_delays_keep_context() {
     use scale_up_model::Model;
@@ -9346,151 +9689,6 @@ fn scale_up_provisioning_and_prefence_failover_delays_keep_context() {
             while model.snapshot.status.transition.is_none() {
                 model.step();
             }
-
-            #[allow(dead_code)]
-            fn assert_scale_up_receipt_allows_full_replacement(replica_id: i64) {
-                use scale_up_model::Model as ScaleUpModel;
-                let mut scale_up = ScaleUpModel::new(2, 3);
-                scale_up.run(120);
-                let receipt = scale_up.snapshot.status.last_scale_up.clone().unwrap();
-                let old = scale_up
-                    .snapshot
-                    .status
-                    .topology
-                    .as_ref()
-                    .unwrap()
-                    .configuration
-                    .members
-                    .iter()
-                    .find(|member| member.identity.replica_id == ReplicaId::new(replica_id))
-                    .unwrap()
-                    .identity
-                    .clone();
-                if !scale_up
-                    .snapshot
-                    .secondary_scale_down_resources
-                    .iter()
-                    .any(|resources| resources.target == old)
-                {
-                    scale_up
-                        .snapshot
-                        .secondary_scale_down_resources
-                        .push(replacement_resources(&scale_up.snapshot.resource_uid, &old));
-                }
-                scale_up.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
-                scale_up.report_mut(replica_id).healthy = false;
-
-                let mut replacement = scale_down_model::Model {
-                    snapshot: scale_up.snapshot,
-                    commands: Vec::new(),
-                    removed: Vec::new(),
-                    deletes: Vec::new(),
-                    inflight: BTreeMap::new(),
-                    applied_effects: BTreeMap::new(),
-                };
-                replacement
-                    .until(|model| model.snapshot.status.pending_replacement_cleanup.is_some());
-                replacement.controller_restart();
-                let frozen = replacement
-                    .snapshot
-                    .status
-                    .pending_replacement_cleanup
-                    .clone()
-                    .unwrap();
-                assert_eq!(frozen.target, old);
-
-                let failed_key = replacement
-                    .snapshot
-                    .replicas
-                    .iter()
-                    .find_map(|(key, observation)| match &observation.agent {
-                        AgentObservation::Report(report) if report.identity == old => {
-                            Some(key.clone())
-                        }
-                        _ => None,
-                    })
-                    .unwrap();
-                replacement
-                    .snapshot
-                    .replicas
-                    .get_mut(&failed_key)
-                    .unwrap()
-                    .agent = AgentObservation::Absent;
-
-                let mut without_guard = replacement.snapshot.clone();
-                without_guard.status.pending_replacement_cleanup = None;
-                assert!(matches!(
-                    evaluate(&without_guard, &scale_up_model::config()),
-                    Plan::Wait { status, .. }
-                        if status.conditions.iter().any(|condition|
-                            condition.reason == "ScaleUpCommittedDegraded")
-                ));
-
-                replacement.finish();
-                let accepted = &replacement
-                    .snapshot
-                    .status
-                    .topology
-                    .as_ref()
-                    .unwrap()
-                    .configuration;
-                let fresh = accepted
-                    .members
-                    .iter()
-                    .find(|member| member.identity.replica_id == old.replica_id)
-                    .unwrap();
-                assert_ne!(fresh.identity, old);
-                assert_eq!(replacement.deletes.len(), 3);
-                assert!(
-                    replacement
-                        .commands
-                        .iter()
-                        .filter(|command| matches!(
-                            command,
-                            ProtocolCommand::EnsureConfiguration(_)
-                        ))
-                        .count()
-                        >= 2
-                );
-                assert!(replacement.commands.iter().any(|command| matches!(
-                    command,
-                    ProtocolCommand::EnsureConfiguration(command)
-                        if command.current_only && !command.retire_build_ids.is_empty()
-                )));
-                assert_eq!(replacement.snapshot.status.last_scale_up, Some(receipt));
-                assert!(matches!(replacement.plan(), Plan::Stable { .. }));
-            }
-
-            #[allow(dead_code)]
-            fn scale_up_new_member_permanent_failure_completes_replacement() {
-                assert_scale_up_receipt_allows_full_replacement(3);
-            }
-
-            #[allow(dead_code)]
-            fn scale_up_retained_secondary_permanent_failure_completes_replacement() {
-                assert_scale_up_receipt_allows_full_replacement(2);
-            }
-
-            fn scale_up_receipt_yields_to_permanent_accepted_member_replacement() {
-                use scale_up_model::Model;
-                for replica_id in [2, 3] {
-                    let mut model = Model::new(2, 3);
-                    model.run(120);
-                    model.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
-                    model.report_mut(replica_id).healthy = false;
-                    let plan = model.plan();
-                    assert!(!matches!(
-                        &plan,
-                        Plan::Wait { status, .. }
-                            if status.conditions.iter().any(|condition|
-                                condition.reason == "ScaleUpCommittedDegraded")
-                    ));
-                    assert!(matches!(plan, Plan::Apply { .. } | Plan::Wait { .. }));
-                    assert!(model.snapshot.status.last_scale_up.is_some());
-                    assert!(model.snapshot.status.scale_up_cleanup.is_none());
-                }
-            }
-            scale_up_receipt_yields_to_permanent_accepted_member_replacement();
             assert!(model.snapshot.status.scale_up_admission_started.is_none());
         } else {
             while model.snapshot.status.provisioning.is_none() {

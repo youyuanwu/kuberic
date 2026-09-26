@@ -35,17 +35,27 @@ impl Model {
         let resource_uid = ResourceUid::new("scale-up-model");
         let policy = EffectivePolicy::fixed(accepted, 10).unwrap();
         let members = (1..=accepted)
-            .map(|id| ConfigurationMember {
-                identity: ReplicaIdentity {
-                    replica_id: ReplicaId::new(i64::from(id)),
-                    instance_id: ReplicaInstanceId::new(format!("accepted-pod-{id}")),
-                    agent_generation: AgentGeneration::new(format!("accepted-generation-{id}")),
-                },
-                role: if id == 1 {
-                    ReplicaRole::Primary
-                } else {
-                    ReplicaRole::ActiveSecondary
-                },
+            .map(|id| {
+                let replica_id = ReplicaId::new(i64::from(id));
+                let pod_uid = PodUid::new(format!("accepted-pod-{id}"));
+                let pvc_uid = PvcUid::new(format!("accepted-pvc-{id}"));
+                ConfigurationMember {
+                    identity: ReplicaIdentity {
+                        replica_id,
+                        instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+                        agent_generation: derive_agent_generation(&derive_initialization_id(
+                            &resource_uid,
+                            replica_id,
+                            &pod_uid,
+                            &pvc_uid,
+                        )),
+                    },
+                    role: if id == 1 {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                }
             })
             .collect::<Vec<_>>();
         let configuration = ConfigurationDescriptor::new(
