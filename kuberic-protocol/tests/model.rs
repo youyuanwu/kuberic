@@ -257,7 +257,17 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
     let configured_seed = model_env_u64("KUBERIC_MODEL_SEED", RECORDED_SEED);
     let cases = model_env_u64("KUBERIC_MODEL_CASES", RECORDED_CASES);
     let explicit_seed = std::env::var_os("KUBERIC_MODEL_SEED").is_some();
-    let runs = if explicit_seed { 1 } else { 3 };
+    let run_seeds = if explicit_seed {
+        vec![configured_seed]
+    } else {
+        vec![
+            configured_seed,
+            configured_seed.wrapping_add(0x9e37_79b9_7f4a_7c15),
+            configured_seed.wrapping_add(0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2)),
+            72,
+        ]
+    };
+    let runs = run_seeds.len();
     println!(
         "scale-up-model seed={configured_seed:#018x} cases={cases} runs={runs}; \
          reproduce with KUBERIC_MODEL_SEED={configured_seed} KUBERIC_MODEL_CASES={cases}"
@@ -266,8 +276,7 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
     let mut run_fingerprints = BTreeSet::new();
     let mut run_coverages = Vec::new();
 
-    for run in 0..runs {
-        let seed = configured_seed.wrapping_add((run as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    for (run, seed) in run_seeds.into_iter().enumerate() {
         let mut rng = ModelRng(seed);
         let class_offset = rng.index(12);
         let mut run_coverage = BTreeMap::<&'static str, u64>::new();
@@ -280,7 +289,14 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
         }
         for case in 0..cases {
             let schedule_class = (usize::try_from(case).unwrap() + class_offset) % 12;
-            let accepted = 1 + u32::try_from(rng.index(3)).unwrap();
+            // Participant-outage schedules require an accepted ActiveSecondary.
+            // Constrain only that schedule class to an eligible starting topology
+            // instead of crediting coverage for an outage that could not occur.
+            let accepted = if schedule_class == 3 {
+                2 + u32::try_from(rng.index(2)).unwrap()
+            } else {
+                1 + u32::try_from(rng.index(3)).unwrap()
+            };
             let additions = if schedule_class == 10 || rng.index(2) == 0 {
                 2
             } else {
@@ -299,6 +315,7 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
             let mut candidate_failure_injected = false;
             let mut participant_restore = None;
             let mut participant_unavailability_injected = false;
+            let mut participant_unavailability_observed = false;
             let mut cleanup_variant_injected = false;
             let mut cleanup_conflict_restore = None;
             let mut delayed_authority = false;
@@ -427,7 +444,6 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                         observation.agent,
                         AgentObservation::Unreachable { .. }
                     ));
-                    cover!("participant-unavailability");
                 }
 
                 if matches!(schedule_class, 0 | 4 | 8)
@@ -557,6 +573,27 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     evaluate(&replay, &scale_up_model::config()),
                     "seed={seed:#x} case={case} step={step}"
                 );
+                if participant_unavailability_injected
+                    && !participant_unavailability_observed
+                    && replay.replicas.values().any(|observation| {
+                        matches!(observation.agent, AgentObservation::Unreachable { .. })
+                    })
+                {
+                    assert!(
+                        replay
+                            .status
+                            .topology
+                            .as_ref()
+                            .unwrap()
+                            .configuration
+                            .members
+                            .iter()
+                            .any(|member| member.role == ReplicaRole::ActiveSecondary),
+                        "participant outage was not exercised against an eligible accepted topology"
+                    );
+                    participant_unavailability_observed = true;
+                    cover!("participant-unavailability");
+                }
                 let skip_for_delayed_authority = !delayed_authority
                     && model
                         .snapshot
