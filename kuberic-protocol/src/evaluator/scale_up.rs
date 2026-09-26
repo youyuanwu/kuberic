@@ -683,6 +683,17 @@ pub(super) fn recover_local_acceptance(
             })
         });
     for member in &receipt.accepted_configuration.members {
+        if snapshot
+            .status
+            .pending_replacement_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.target == member.identity)
+        {
+            // Exact accepted-member replacement provenance is already durable.
+            // Replacement must no longer depend on the failed process continuing
+            // to report its permanent fault.
+            return None;
+        }
         let permanently_failed = snapshot
             .observation_for_identity(&member.identity)
             .is_some_and(|observation| {

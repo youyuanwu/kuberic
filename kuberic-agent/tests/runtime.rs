@@ -8778,6 +8778,7 @@ async fn evaluator_scale_up_sqlite_trace() {
         .await
         .unwrap();
     live_write.committed().await.unwrap();
+    let source_enumeration_cut = source_runtime.snapshot().await;
     source_application
         .pause_copy_enumeration
         .store(false, Ordering::SeqCst);
@@ -8862,7 +8863,7 @@ async fn evaluator_scale_up_sqlite_trace() {
     intent.operation_id = intent.expected_operation_id();
     let before_copy = target_store.load_state().await.unwrap();
 
-    for item in snapshot_items.into_iter().chain(std::iter::once(live_item)) {
+    for item in snapshot_items {
         let acknowledgement = target_runtime
             .data_plane()
             .receive_copy_item(item)
@@ -8874,6 +8875,18 @@ async fn evaluator_scale_up_sqlite_trace() {
             .await
             .unwrap();
     }
+    let source_receiver_cut = source_runtime.snapshot().await;
+    let target_receiver_cut = target_runtime.snapshot().await;
+    let acknowledgement = target_runtime
+        .data_plane()
+        .receive_copy_item(live_item)
+        .await
+        .unwrap();
+    source_runtime
+        .data_plane()
+        .accept_copy_acknowledgement(acknowledgement)
+        .await
+        .unwrap();
     let application_path = target_root.join("application-state.json");
     let persisted_operations = target_application
         .applied
@@ -9044,37 +9057,65 @@ async fn evaluator_scale_up_sqlite_trace() {
         allow_scale_up: true,
         ..Default::default()
     };
-    for remove_source in [true, false] {
+    for (source_cut, target_cut) in [
+        (&source_enumeration_cut, None),
+        (&source_receiver_cut, Some(&target_receiver_cut)),
+    ] {
         let mut incomplete = snapshot.clone();
-        let replica_id = if remove_source {
-            source.replica_id
-        } else {
-            target.replica_id
-        };
-        let report = incomplete
+        let source_report = incomplete
             .replicas
             .values_mut()
             .find_map(|observation| match &mut observation.agent {
-                AgentObservation::Report(report) if report.identity.replica_id == replica_id => {
+                AgentObservation::Report(report)
+                    if report.identity.replica_id == source.replica_id =>
+                {
                     Some(report)
                 }
                 _ => None,
             })
             .unwrap();
-        report.builds.clear();
-        match evaluate(&incomplete, &config) {
-            Plan::Execute {
-                command: kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(_),
-            } => panic!("incomplete build evidence produced configuration command"),
-            Plan::Apply { changes } => assert!(!changes.iter().any(|change| {
-                matches!(
-                    change,
-                    kuberic_protocol::command::KubernetesChange::PersistStatus { status }
-                        if status.transition.is_some()
-                            || status.scale_up_admission_started.is_some()
-                )
-            })),
-            _ => {}
+        source_report.builds = report_builds(source_cut);
+        source_report.current_progress = source_cut.current_progress;
+        source_report.committed_lsn = source_cut.committed_lsn;
+        let target_report = incomplete
+            .replicas
+            .values_mut()
+            .find_map(|observation| match &mut observation.agent {
+                AgentObservation::Report(report)
+                    if report.identity.replica_id == target.replica_id =>
+                {
+                    Some(report)
+                }
+                _ => None,
+            })
+            .unwrap();
+        target_report.builds = target_cut.map_or_else(Vec::new, report_builds);
+        target_report.current_progress = target_cut.map_or(0, |cut| cut.current_progress);
+        target_report.committed_lsn = target_cut.map_or(0, |cut| cut.committed_lsn);
+        for _ in 0..3 {
+            match evaluate(&incomplete, &config) {
+                Plan::Execute {
+                    command: kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(_),
+                } => panic!("incomplete runtime copy produced configuration command"),
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        if let kuberic_protocol::command::KubernetesChange::PersistStatus {
+                            status,
+                        } = change
+                        {
+                            assert!(status.transition.is_none());
+                            assert!(status.scale_up_admission_started.is_none());
+                            incomplete.status = *status;
+                        }
+                    }
+                }
+                Plan::Wait { status, .. } => {
+                    assert!(status.transition.is_none());
+                    assert!(status.scale_up_admission_started.is_none());
+                    incomplete.status = status;
+                }
+                _ => {}
+            }
         }
     }
     let mut snapshot = snapshot;
