@@ -592,23 +592,6 @@ where
                 })
                 .await?;
         }
-        if let Some(retained) = state.retained_result.as_ref()
-            && let kuberic_runtime_internal::effects::RuntimeEffectAction::AdmitBuildAuthority(
-                authority,
-            ) = &retained.effect.action
-            && !state.retired_builds.contains(&authority.build_id)
-        {
-            self.runtime.apply_effect(retained.effect.clone()).await?;
-        }
-        let build_recovery = self.store.load_state().await?;
-        for command in build_recovery.build_commands.into_values() {
-            if !build_recovery
-                .retired_builds
-                .contains(&command.operation_id)
-            {
-                self.coordinator.ensure_build(command).await?;
-            }
-        }
         let pending_acceptance = state.pending_effect.as_ref().is_some_and(|pending| {
             matches!(pending.effect.action,
                 kuberic_runtime_internal::effects::RuntimeEffectAction::AcceptSecondaryRemovalCommit(_))
@@ -628,6 +611,23 @@ where
                 ))
         {
             return Err(error);
+        }
+        let build_recovery = self.store.load_state().await?;
+        if let Some(retained) = build_recovery.retained_result.as_ref()
+            && let kuberic_runtime_internal::effects::RuntimeEffectAction::AdmitBuildAuthority(
+                authority,
+            ) = &retained.effect.action
+            && !build_recovery.retired_builds.contains(&authority.build_id)
+        {
+            self.runtime.apply_effect(retained.effect.clone()).await?;
+        }
+        for command in build_recovery.build_commands.values().cloned() {
+            if !build_recovery
+                .retired_builds
+                .contains(&command.operation_id)
+            {
+                self.coordinator.ensure_build(command).await?;
+            }
         }
         Ok(())
     }

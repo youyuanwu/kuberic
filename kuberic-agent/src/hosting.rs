@@ -319,8 +319,9 @@ impl PodRuntime {
         if !self.host.snapshot().await.open {
             self.host.open(mode).await?;
         }
-        if self.host.managed().is_ok() {
+        if let Ok(managed) = self.host.managed() {
             self.restore_authority().await?;
+            self.host.sync_access_projection(managed.as_ref()).await;
         }
         if let Some((target_role, epoch_completed, application_completed)) = transition {
             self.host.change_replicator_role(target_role).await?;
