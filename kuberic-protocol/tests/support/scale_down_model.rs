@@ -137,6 +137,7 @@ impl Model {
                     pvc: ExactResourceObservation::FrozenUidPresent {
                         resource_version: "pvc-rv".into(),
                     },
+                    pvc_allocation_operation_id: None,
                     endpoint: ExactResourceObservation::FrozenUidPresent {
                         resource_version: "service-rv".into(),
                     },

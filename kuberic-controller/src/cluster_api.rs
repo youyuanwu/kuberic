@@ -19,7 +19,7 @@ use kuberic_protocol::command::{
 };
 use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
-    AcceptedStatus, EffectivePolicy, PodUid, ProvisioningIntent, PvcUid, ReplicaId,
+    AcceptedStatus, EffectivePolicy, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
     derive_agent_generation, derive_initialization_id, derive_replacement_resource_name,
     derive_replica_endpoint_name,
@@ -30,7 +30,7 @@ use tonic::Code;
 
 use crate::crd::{
     CONTROL_ADDRESS_ANNOTATION, CONTROLLER_NAME, INSTANCE_LABEL, KubericSet, KubericSetStatus,
-    REPLICA_ID_LABEL, SET_UID_LABEL,
+    REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL,
 };
 use crate::observation::{
     ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
@@ -432,6 +432,8 @@ where
         ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await?;
         let image = effective_replica_image(observation)?;
         for replica_id in replica_ids {
+            let allocation_operation_id =
+                scale_up_allocation_operation_id(&observation.set, *replica_id);
             let configured_identity = observation
                 .set
                 .status
@@ -500,12 +502,30 @@ where
                 create_exact(
                     &pvcs,
                     &pvc_name,
-                    &replica_pvc(&observation.set, *replica_id, &uid, &owner),
+                    &replica_pvc(
+                        &observation.set,
+                        *replica_id,
+                        &uid,
+                        &owner,
+                        allocation_operation_id,
+                    ),
                 )
                 .await?;
                 continue;
             };
             let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+            if let Some(operation_id) = allocation_operation_id
+                && (!pvc_matches_allocation(pvc, operation_id)
+                    || observation
+                        .set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                        .and_then(|allocation| allocation.pvc_uid.as_ref())
+                        .is_some_and(|frozen| frozen.as_str() != pvc_uid))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
             if !observation
                 .pods
                 .iter()
@@ -1037,14 +1057,22 @@ fn replica_pvc(
     replica_id: ReplicaId,
     uid: &str,
     owner: &OwnerReference,
+    allocation_operation_id: Option<&OperationId>,
 ) -> PersistentVolumeClaim {
-    replica_pvc_named(
+    let mut pvc = replica_pvc_named(
         set,
         replica_id,
         uid,
         owner,
         &format!("{}-data", replica_name(set, replica_id)),
-    )
+    );
+    if let Some(operation_id) = allocation_operation_id {
+        pvc.metadata.annotations = Some(BTreeMap::from([(
+            SCALE_UP_ALLOCATION_ANNOTATION.to_string(),
+            operation_id.to_string(),
+        )]));
+    }
+    pvc
 }
 
 fn replica_pvc_named(
@@ -1074,6 +1102,30 @@ fn replica_pvc_named(
         }),
         ..Default::default()
     }
+}
+
+fn scale_up_allocation_operation_id(
+    set: &KubericSet,
+    replica_id: ReplicaId,
+) -> Option<&OperationId> {
+    set.status
+        .as_ref()?
+        .authority
+        .scale_up_allocation
+        .as_ref()
+        .filter(|allocation| {
+            allocation.target_replica_id == replica_id
+                && allocation.scaffolding_requested
+                && !allocation.cancellation_started
+        })
+        .map(|allocation| &allocation.operation_id)
+}
+
+fn pvc_matches_allocation(pvc: &PersistentVolumeClaim, operation_id: &OperationId) -> bool {
+    pvc.annotations()
+        .get(SCALE_UP_ALLOCATION_ANNOTATION)
+        .map(String::as_str)
+        == Some(operation_id.as_str())
 }
 
 fn replica_pod(
@@ -2117,6 +2169,8 @@ impl ClusterApi for InMemoryClusterApi {
             return Err(ControllerError::ObservationStale);
         }
         for replica_id in replica_ids {
+            let allocation_operation_id =
+                scale_up_allocation_operation_id(&observation.set, *replica_id);
             let pod_name = replica_name(&observation.set, *replica_id);
             let pvc_name = format!("{pod_name}-data");
             let Some(pvc) = state
@@ -2128,7 +2182,13 @@ impl ClusterApi for InMemoryClusterApi {
             else {
                 let resource_number = state.next_resource_uid;
                 state.next_resource_uid += 1;
-                let mut pvc = replica_pvc(&observation.set, *replica_id, &uid, &owner);
+                let mut pvc = replica_pvc(
+                    &observation.set,
+                    *replica_id,
+                    &uid,
+                    &owner,
+                    allocation_operation_id,
+                );
                 pvc.metadata.namespace = observation.set.namespace();
                 pvc.metadata.uid = Some(format!(
                     "in-memory-pvc-{}-{resource_number}",
@@ -2146,6 +2206,18 @@ impl ClusterApi for InMemoryClusterApi {
                 return Ok(());
             };
             let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+            if let Some(operation_id) = allocation_operation_id
+                && (!pvc_matches_allocation(&pvc, operation_id)
+                    || observation
+                        .set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                        .and_then(|allocation| allocation.pvc_uid.as_ref())
+                        .is_some_and(|frozen| frozen.as_str() != pvc_uid))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
             let Some(pod) = state
                 .observation
                 .pods

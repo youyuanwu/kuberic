@@ -6989,6 +6989,7 @@ fn replacement_resources(
         },
         pod: ExactResourceObservation::NotFound,
         pvc: ExactResourceObservation::NotFound,
+        pvc_allocation_operation_id: None,
         endpoint: ExactResourceObservation::NotFound,
     }
 }
@@ -9406,6 +9407,7 @@ fn assert_scale_up_receipt_allows_full_replacement(replica_id: i64) {
                 },
                 pod: ExactResourceObservation::NotFound,
                 pvc: ExactResourceObservation::NotFound,
+                pvc_allocation_operation_id: None,
                 endpoint: ExactResourceObservation::NotFound,
             },
         );

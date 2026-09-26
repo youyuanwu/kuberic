@@ -386,6 +386,7 @@ impl Model {
                 },
                 pod,
                 pvc,
+                pvc_allocation_operation_id: Some(allocation.operation_id.clone()),
                 endpoint: ExactResourceObservation::NotFound,
             });
     }
@@ -464,6 +465,7 @@ impl Model {
                 pvc: ExactResourceObservation::FrozenUidPresent {
                     resource_version: "1".into(),
                 },
+                pvc_allocation_operation_id: None,
                 endpoint: ExactResourceObservation::FrozenUidPresent {
                     resource_version: "1".into(),
                 },

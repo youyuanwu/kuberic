@@ -15,6 +15,9 @@ successful-write and session-fencing tests, controller exact-resource race tests
 and explicitly owned KinD scenarios. Secondary scale-down covers healthy 3→2,
 2→1 and singleton restart, sequential 5→2, unavailable-target evidence, retirement,
 and exact Pod/PVC/endpoint cleanup without deleting replacement UIDs.
+Scale-up controller races cover durable scaffolding authorization, lost PVC
+create replies, operation-specific PVC creation provenance, same-name
+collisions before UID freeze, and replacement without adoption or deletion.
 
 The scale-down routed-write assertion verifies the exact primary Service selector
 and requires HTTP 200 through `kvstore2-write` before recording an acknowledged

@@ -10,6 +10,8 @@ pub const SET_UID_LABEL: &str = "operator.kuberic.io/set-uid";
 pub const REPLICA_ID_LABEL: &str = "operator.kuberic.io/replica-id";
 pub const INSTANCE_LABEL: &str = "operator.kuberic.io/instance";
 pub const CONTROL_ADDRESS_ANNOTATION: &str = "operator.kuberic.io/control-address";
+pub const SCALE_UP_ALLOCATION_ANNOTATION: &str =
+    "operator.kuberic.io/scale-up-allocation-operation";
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[kube(

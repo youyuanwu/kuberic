@@ -1,5 +1,6 @@
 use super::*;
 use kube::Resource;
+use kuberic_controller::crd::SCALE_UP_ALLOCATION_ANNOTATION;
 use kuberic_protocol::command::{KubernetesChange, ScaleDownResource};
 use kuberic_protocol::types::{AccessStatus, Epoch, TransitionKind};
 use std::collections::BTreeSet;
@@ -466,6 +467,294 @@ async fn canonical_candidate_is_created_pvc_before_pod_and_lost_create_replays()
         pod.spec.as_ref().unwrap().containers[0].image.as_deref(),
         Some("example/db:latest")
     );
+}
+
+async fn authorized_allocation_without_candidate(
+    api: &Arc<InMemoryClusterApi>,
+) -> kuberic_protocol::types::ScaleUpAllocation {
+    for _ in 0..20 {
+        tick(api).await;
+        let raw = api.observation().await;
+        if let Some(allocation) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .filter(|allocation| {
+                allocation.scaffolding_requested
+                    && allocation.pvc_uid.is_none()
+                    && raw.pvcs.iter().all(|pvc| pvc.name_any() != "db-2-data")
+            })
+        {
+            return allocation.clone();
+        }
+    }
+    panic!("scaffolding authorization boundary not reached");
+}
+
+fn unrelated_candidate_pvc(raw: &RawObservation, uid: &str) -> PersistentVolumeClaim {
+    let mut pvc = raw
+        .pvcs
+        .iter()
+        .find(|pvc| pvc.name_any() == "db-1-data")
+        .expect("accepted PVC")
+        .clone();
+    pvc.metadata.name = Some("db-2-data".into());
+    pvc.metadata.uid = Some(uid.into());
+    pvc.metadata.resource_version = Some(format!("{uid}-rv"));
+    pvc.metadata
+        .labels
+        .get_or_insert_default()
+        .insert(REPLICA_ID_LABEL.into(), "2".into());
+    pvc.metadata
+        .annotations
+        .get_or_insert_default()
+        .remove(SCALE_UP_ALLOCATION_ANNOTATION);
+    pvc
+}
+
+#[tokio::test]
+async fn authorized_allocation_never_adopts_or_deletes_unprovenanced_same_name_pvc() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let allocation = authorized_allocation_without_candidate(&api).await;
+    let unrelated_uid = "unrelated-candidate-pvc";
+    let mut raw = api.observation().await;
+    raw.pvcs.push(unrelated_candidate_pvc(&raw, unrelated_uid));
+    api.set_observation(raw).await;
+    let effects_start = api.effects().await.len();
+    let mut frozen_unrelated = false;
+    let mut pod_created = false;
+    let mut unsafe_seen = false;
+
+    for _ in 0..6 {
+        let (kind, _) = tick(&api).await;
+        unsafe_seen |= kind == ReconcileKind::Unsafe;
+        let observed = api.observation().await;
+        frozen_unrelated |= observed.set.status.as_ref().is_some_and(|status| {
+            status
+                .authority
+                .scale_up_allocation
+                .as_ref()
+                .is_some_and(|active| {
+                    active.pvc_uid.as_ref().map(PvcUid::as_str) == Some(unrelated_uid)
+                })
+        });
+        pod_created |= observed.pods.iter().any(|pod| pod.name_any() == "db-2");
+    }
+
+    let mut reduced = api.observation().await;
+    reduced.set.spec.replicas = 1;
+    reduced.set.metadata.generation = Some(reduced.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(reduced).await;
+    for _ in 0..10 {
+        let (kind, _) = tick(&api).await;
+        unsafe_seen |= kind == ReconcileKind::Unsafe;
+        let observed = api.observation().await;
+        frozen_unrelated |= observed.set.status.as_ref().is_some_and(|status| {
+            status
+                .authority
+                .scale_up_allocation
+                .as_ref()
+                .is_some_and(|active| {
+                    active.pvc_uid.as_ref().map(PvcUid::as_str) == Some(unrelated_uid)
+                })
+        });
+        pod_created |= observed.pods.iter().any(|pod| pod.name_any() == "db-2");
+    }
+
+    let blocked = api.observation().await;
+    assert_eq!(allocation.operation_id, allocation.expected_operation_id());
+    assert!(!unsafe_seen);
+    assert!(!frozen_unrelated);
+    assert!(!pod_created);
+    assert!(blocked.pvcs.iter().any(|pvc| {
+        pvc.name_any() == "db-2-data" && pvc.uid().as_deref() == Some(unrelated_uid)
+    }));
+    assert!(api.effects().await[effects_start..].iter().all(|effect| {
+        !matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pvc,
+                uid,
+                ..
+            } if uid == unrelated_uid
+        ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
+    }));
+}
+
+#[tokio::test]
+async fn lost_reply_candidate_replaced_before_uid_freeze_is_abandoned_without_adoption() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    api.lose_next_create_reply().await;
+    let (allocation, created_uid) = loop {
+        let _ = tick(&api).await;
+        let raw = api.observation().await;
+        let Some(allocation) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .filter(|allocation| allocation.scaffolding_requested && allocation.pvc_uid.is_none())
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(pvc) = raw.pvcs.iter().find(|pvc| pvc.name_any() == "db-2-data") else {
+            continue;
+        };
+        let created_uid = pvc.uid().expect("created candidate PVC UID");
+        assert_eq!(
+            pvc.annotations()
+                .get(SCALE_UP_ALLOCATION_ANNOTATION)
+                .map(String::as_str),
+            Some(allocation.operation_id.as_str()),
+        );
+        break (allocation, created_uid);
+    };
+
+    let replacement_uid = "replacement-before-freeze";
+    let mut replaced = api.observation().await;
+    let pvc = replaced
+        .pvcs
+        .iter_mut()
+        .find(|pvc| pvc.name_any() == "db-2-data")
+        .unwrap();
+    pvc.metadata.uid = Some(replacement_uid.into());
+    pvc.metadata.resource_version = Some("replacement-before-freeze-rv".into());
+    pvc.metadata.annotations.get_or_insert_default().insert(
+        SCALE_UP_ALLOCATION_ANNOTATION.into(),
+        "different-allocation".into(),
+    );
+    api.set_observation(replaced).await;
+    let effects_start = api.effects().await.len();
+    let mut replacement_frozen = false;
+    let mut old_attempt_abandoned = false;
+    let mut fresh_attempt_while_occupied = false;
+
+    for _ in 0..10 {
+        let (kind, _) = tick(&api).await;
+        assert_ne!(kind, ReconcileKind::Unsafe);
+        let observed = api.observation().await;
+        if let Some(active) = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+        {
+            replacement_frozen |=
+                active.pvc_uid.as_ref().map(PvcUid::as_str) == Some(replacement_uid);
+            old_attempt_abandoned |=
+                active.operation_id == allocation.operation_id && active.cancellation_started;
+            fresh_attempt_while_occupied |= active.operation_id != allocation.operation_id;
+        }
+    }
+
+    let occupied = api.observation().await;
+    assert!(old_attempt_abandoned);
+    assert!(!replacement_frozen);
+    assert!(!fresh_attempt_while_occupied);
+    assert!(occupied.pods.iter().all(|pod| pod.name_any() != "db-2"));
+    assert!(occupied.pvcs.iter().any(|pvc| {
+        pvc.name_any() == "db-2-data" && pvc.uid().as_deref() == Some(replacement_uid)
+    }));
+    assert!(api.effects().await[effects_start..].iter().all(|effect| {
+        !matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pvc,
+                uid,
+                ..
+            } if uid == replacement_uid || uid == created_uid.as_str()
+        ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
+    }));
+
+    let mut available = occupied;
+    available
+        .pvcs
+        .retain(|pvc| pvc.uid().as_deref() != Some(replacement_uid));
+    api.set_observation(available).await;
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    let pvc = completed
+        .pvcs
+        .iter()
+        .find(|pvc| pvc.name_any() == "db-2-data")
+        .expect("fresh candidate PVC");
+    assert_ne!(pvc.uid().as_deref(), Some(created_uid.as_str()));
+    assert_ne!(pvc.uid().as_deref(), Some(replacement_uid));
+    let fresh_provenance = pvc
+        .annotations()
+        .get(SCALE_UP_ALLOCATION_ANNOTATION)
+        .expect("fresh allocation provenance");
+    assert_ne!(fresh_provenance.as_str(), allocation.operation_id.as_str());
+}
+
+#[tokio::test]
+async fn matching_provenance_lost_reply_is_frozen_and_replayed_idempotently() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    api.lose_next_create_reply().await;
+    let (allocation, pvc_uid) = loop {
+        let _ = tick(&api).await;
+        let raw = api.observation().await;
+        let Some(allocation) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .filter(|allocation| allocation.scaffolding_requested && allocation.pvc_uid.is_none())
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(pvc) = raw.pvcs.iter().find(|pvc| pvc.name_any() == "db-2-data") else {
+            continue;
+        };
+        assert_eq!(
+            pvc.annotations()
+                .get(SCALE_UP_ALLOCATION_ANNOTATION)
+                .map(String::as_str),
+            Some(allocation.operation_id.as_str())
+        );
+        break (allocation, PvcUid::new(pvc.uid().unwrap()));
+    };
+
+    let mut frozen = false;
+    for _ in 0..8 {
+        let (kind, _) = tick(&api).await;
+        assert_ne!(kind, ReconcileKind::Unsafe);
+        frozen |= api
+            .observation()
+            .await
+            .set
+            .status
+            .as_ref()
+            .is_some_and(|status| {
+                status
+                    .authority
+                    .scale_up_allocation
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.operation_id == allocation.operation_id
+                            && active.pvc_uid.as_ref() == Some(&pvc_uid)
+                    })
+            });
+        if frozen
+            && api
+                .observation()
+                .await
+                .pods
+                .iter()
+                .any(|pod| pod.name_any() == "db-2")
+        {
+            break;
+        }
+    }
+    assert!(frozen);
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    assert!(completed.set.status.as_ref().is_some_and(|status| {
+        status.authority.scale_up_allocation.is_none() && status.authority.last_scale_up.is_some()
+    }));
 }
 
 #[tokio::test]

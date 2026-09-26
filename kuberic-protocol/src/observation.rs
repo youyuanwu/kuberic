@@ -195,6 +195,8 @@ pub struct SecondaryScaleDownResourceObservation {
     pub identity: crate::types::ReplicaCleanupIdentity,
     pub pod: ExactResourceObservation,
     pub pvc: ExactResourceObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_allocation_operation_id: Option<OperationId>,
     pub endpoint: ExactResourceObservation,
 }
 

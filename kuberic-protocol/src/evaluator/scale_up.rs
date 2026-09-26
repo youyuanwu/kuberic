@@ -1203,7 +1203,8 @@ pub(super) fn allocation(
     if !cancelled
         && allocation.pvc_uid.is_some()
         && allocation.pod_uid.is_none()
-        && secondary_scale_down::absent(&exact.identity.pvc, &exact.pvc)
+        && (secondary_scale_down::absent(&exact.identity.pvc, &exact.pvc)
+            || exact.pvc_allocation_operation_id.as_ref() != Some(&allocation.operation_id))
     {
         let mut status = snapshot.status.clone();
         status
@@ -1218,7 +1219,7 @@ pub(super) fn allocation(
             "cleanup",
             Some(&allocation.observation_target()),
             Some(&allocation.operation_id),
-            "authoritative frozen PVC absence or replacement abandoned the exact allocation",
+            "authoritative frozen PVC absence, replacement, or provenance loss abandoned the exact allocation",
         ));
     }
     let scaffolding = snapshot.scaffolding_observation_for(target_id);
@@ -1236,16 +1237,35 @@ pub(super) fn allocation(
                 config,
             );
         }
-        if kubernetes
+        let exact_provenance_matches =
+            exact.pvc_allocation_operation_id.as_ref() == Some(&allocation.operation_id);
+        let normalized_uid_matches = kubernetes
             .and_then(|observed| observed.pvc_uid.as_ref())
             .map(PvcUid::as_str)
-            != Some(uid.as_str())
-        {
-            return unsafe_plan(
-                snapshot.status.clone(),
-                UnsafeReason::ContradictoryReplicaEvidence(
-                    "scale-up allocation PVC is not the uniquely owned candidate storage".into(),
-                ),
+            == Some(uid.as_str());
+        if !exact_provenance_matches || !normalized_uid_matches {
+            if !cancelled {
+                let mut status = snapshot.status.clone();
+                status
+                    .scale_up_allocation
+                    .as_mut()
+                    .expect("active allocation")
+                    .cancellation_started = true;
+                return persist(progress_status(
+                    snapshot,
+                    status,
+                    "ScaleUpAllocationNameCollision",
+                    "cleanup",
+                    Some(&allocation.observation_target()),
+                    Some(&allocation.operation_id),
+                    "same-name PVC lacks exact allocation creation provenance; abandoned the attempt without adopting the occupant",
+                ));
+            }
+            return allocation_wait(
+                snapshot,
+                allocation,
+                "ScaleUpAllocationNameOccupied",
+                "same-name PVC is unrelated to this allocation operation",
                 config,
             );
         }
@@ -1289,17 +1309,11 @@ pub(super) fn allocation(
                     config,
                 );
             }
-            let mut status = snapshot.status.clone();
-            status.scale_up_allocation = None;
-            return persist(progress_status(
+            return retry_or_complete_allocation_cleanup(
                 snapshot,
-                status,
-                "ScaleUpAllocationCancelled",
-                "cleanup",
-                Some(&allocation.observation_target()),
-                Some(&allocation.operation_id),
-                "cancelled allocation has no retained resources",
-            ));
+                allocation,
+                snapshot.status.clone(),
+            );
         }
         if !allocation.scaffolding_requested {
             let mut status = snapshot.status.clone();

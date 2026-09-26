@@ -4,12 +4,12 @@ use kuberic_protocol::observation::{
     ExactResourceObservation, ReplicaObservationKey, SecondaryScaleDownResourceObservation,
 };
 use kuberic_protocol::types::{
-    CleanupResourceIdentity, Epoch, PodUid, PvcUid, ReplicaCleanupIdentity, ReplicaIdentity,
-    ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
+    CleanupResourceIdentity, Epoch, OperationId, PodUid, PvcUid, ReplicaCleanupIdentity,
+    ReplicaIdentity, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
     derive_replica_endpoint_name,
 };
 
-use crate::crd::{INSTANCE_LABEL, SET_UID_LABEL};
+use crate::crd::{INSTANCE_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL};
 use crate::observation::{
     ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
 };
@@ -579,6 +579,14 @@ pub(crate) fn normalized(
             identity: r.identity.clone(),
             pod: classify(&r.identity.pod, &r.pod),
             pvc: classify(&r.identity.pvc, &r.pvc),
+            pvc_allocation_operation_id: match &r.pvc {
+                ExactLookup::Present(pvc) => pvc
+                    .annotations()
+                    .get(SCALE_UP_ALLOCATION_ANNOTATION)
+                    .filter(|operation_id| !operation_id.is_empty())
+                    .map(OperationId::new),
+                ExactLookup::NotFound | ExactLookup::Failed(_) => None,
+            },
             endpoint: classify(&r.identity.endpoint, &r.endpoint),
         })
         .collect()

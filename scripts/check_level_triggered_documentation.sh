@@ -140,6 +140,8 @@ request_example = "\n".join(
 )
 guide = root / "docs/features/kuberic/level-triggered-operator.md"
 guide_text = guide.read_text()
+assert "operator.kuberic.io/scale-up-allocation-operation" in guide_text
+assert "same-name PVC with missing or mismatched" in guide_text
 examples = re.findall(r"```yaml\n(.*?)\n```", guide_text, re.DOTALL)
 assert active_sample in examples, "Guide bootstrap example differs from sample"
 assert request_example in examples, "Guide request example differs from opt-in sample"

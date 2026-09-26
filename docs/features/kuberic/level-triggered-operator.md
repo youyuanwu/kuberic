@@ -67,6 +67,15 @@ incarnation cannot inherit old authority. Status, routing labels, command
 responses, and Pod readiness are observations; none is sufficient alone to
 grant replica authority.
 
+Before creating a canonical scale-up PVC, the controller durably authorizes
+scaffolding for one allocation operation. The PVC is created with the
+`operator.kuberic.io/scale-up-allocation-operation` annotation set to that
+exact operation ID. Exact-name observation must return the same creation
+provenance before the evaluator freezes the PVC UID, requests Pod creation, or
+grants exact cleanup authority. A same-name PVC with missing or mismatched
+provenance is a name collision: it is never adopted or deleted, and a fresh
+allocation attempt waits until the canonical name is available.
+
 Raw application progress is repair evidence only. Protocol version 3
 introduced a separate authority-bound `verifiedReplicationLsn`; protocol
 version 4 additionally binds control commands to the exact observed target
