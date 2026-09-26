@@ -4470,6 +4470,7 @@ fn normalized_invalid_agent_evidence_is_unsafe() {
         .unwrap()
         .agent = AgentObservation::Invalid {
         message: "report sequence regressed".to_string(),
+        uninitialized_report: None,
     };
 
     assert!(matches!(
@@ -6988,6 +6989,8 @@ fn replacement_resources(
             },
         },
         pod: ExactResourceObservation::NotFound,
+        pod_allocation_operation_id: None,
+        pod_matches_allocation_metadata: false,
         pvc: ExactResourceObservation::NotFound,
         pvc_allocation_operation_id: None,
         endpoint: ExactResourceObservation::NotFound,
@@ -9406,6 +9409,8 @@ fn assert_scale_up_receipt_allows_full_replacement(replica_id: i64) {
                     },
                 },
                 pod: ExactResourceObservation::NotFound,
+                pod_allocation_operation_id: None,
+                pod_matches_allocation_metadata: false,
                 pvc: ExactResourceObservation::NotFound,
                 pvc_allocation_operation_id: None,
                 endpoint: ExactResourceObservation::NotFound,

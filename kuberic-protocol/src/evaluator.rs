@@ -3286,7 +3286,7 @@ fn evaluate_provisioning(
             status,
             requeue_after_seconds: config.wait_requeue_seconds,
         },
-        AgentObservation::Invalid { message } => unsafe_plan(
+        AgentObservation::Invalid { message, .. } => unsafe_plan(
             status,
             UnsafeReason::ContradictoryReplicaEvidence(message.clone()),
             config,
@@ -4113,9 +4113,12 @@ fn incompatible_protocol_plan(
 
 fn invalid_agent_plan(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Option<Plan> {
     snapshot.replicas.iter().find_map(|(key, observation)| {
-        let AgentObservation::Invalid { message } = &observation.agent else {
+        let AgentObservation::Invalid { message, .. } = &observation.agent else {
             return None;
         };
+        if scale_up::invalid_candidate_binding(snapshot, key, observation) {
+            return None;
+        }
         Some(unsafe_plan(
             snapshot.status.clone(),
             UnsafeReason::ContradictoryReplicaEvidence(format!(

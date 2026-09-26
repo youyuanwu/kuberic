@@ -1394,6 +1394,35 @@ pub(super) fn allocation(
     if allocation.pod_uid.is_none()
         && let Some(uid) = allocation_identity(&exact.identity.pod, &exact.pod)
     {
+        let pod_provenance_matches = allocation.scaffolding_requested
+            && exact.pod_allocation_operation_id.as_ref() == Some(&allocation.operation_id)
+            && exact.pod_matches_allocation_metadata;
+        if !pod_provenance_matches {
+            if !cancelled {
+                let mut status = snapshot.status.clone();
+                status
+                    .scale_up_allocation
+                    .as_mut()
+                    .expect("active allocation")
+                    .cancellation_started = true;
+                return persist(progress_status(
+                    snapshot,
+                    status,
+                    "ScaleUpAllocationPodNameCollision",
+                    "cleanup",
+                    Some(&allocation.observation_target()),
+                    Some(&allocation.operation_id),
+                    "same-name Pod lacks exact allocation creation provenance; abandoned the attempt without adopting the occupant",
+                ));
+            }
+            return allocation_wait(
+                snapshot,
+                allocation,
+                "ScaleUpAllocationPodNameOccupied",
+                "same-name Pod is unrelated to this allocation operation",
+                config,
+            );
+        }
         let expected_pvc = allocation.pvc_uid.as_ref().map(PvcUid::as_str);
         if kubernetes
             .and_then(|observed| observed.pod_uid.as_ref())
@@ -1423,6 +1452,7 @@ pub(super) fn allocation(
                 "candidate Pod did not bind the frozen PVC; persisted exact candidate-local cleanup",
             ));
         }
+
         if cancelled {
             let mut status = snapshot.status.clone();
             status
@@ -1587,6 +1617,72 @@ pub(super) fn allocation(
     retry_or_complete_allocation_cleanup(snapshot, allocation, snapshot.status.clone())
 }
 
+pub(super) fn invalid_candidate_binding(
+    snapshot: &ObservationSnapshot,
+    key: &crate::observation::ReplicaObservationKey,
+    observation: &crate::observation::ReplicaObservation,
+) -> bool {
+    let Some(allocation) = snapshot
+        .status
+        .scale_up_allocation
+        .as_ref()
+        .filter(|allocation| {
+            allocation.scaffolding_requested
+                && allocation.pvc_uid.is_some()
+                && allocation.target_replica_id == key.replica_id
+                && allocation
+                    .pod_uid
+                    .as_ref()
+                    .is_none_or(|pod_uid| pod_uid.as_str() == key.instance_id.as_str())
+        })
+    else {
+        return false;
+    };
+    let AgentObservation::Invalid {
+        uninitialized_report: Some(report),
+        ..
+    } = &observation.agent
+    else {
+        return false;
+    };
+    let Some(frozen_pvc_uid) = allocation.pvc_uid.as_ref() else {
+        return false;
+    };
+    if report.resource_uid != snapshot.resource_uid
+        || report.replica_id != allocation.target_replica_id
+        || report.pod_uid.as_str() != key.instance_id.as_str()
+        || report.pvc_uid != *frozen_pvc_uid
+        || report.process_session_id.is_empty()
+    {
+        return false;
+    }
+    let Some(exact) = allocation_observation(snapshot, allocation) else {
+        return false;
+    };
+    let pod_matches = match (&exact.identity.pod, &exact.pod) {
+        (
+            CleanupResourceIdentity::Absent { .. },
+            ExactResourceObservation::ReplacementPresent { uid, .. },
+        ) => uid == key.instance_id.as_str(),
+        (
+            CleanupResourceIdentity::Present { uid, .. },
+            ExactResourceObservation::FrozenUidPresent { .. },
+        ) => uid == key.instance_id.as_str(),
+        _ => false,
+    };
+    let ExactResourceObservation::ReplacementPresent {
+        uid: live_pvc_uid, ..
+    } = &exact.pvc
+    else {
+        return false;
+    };
+    pod_matches
+        && live_pvc_uid != report.pvc_uid.as_str()
+        && exact.pod_allocation_operation_id.as_ref() == Some(&allocation.operation_id)
+        && exact.pod_matches_allocation_metadata
+        && exact.pvc_allocation_operation_id.as_ref() == Some(&allocation.operation_id)
+}
+
 pub(super) fn provisioning(
     snapshot: &ObservationSnapshot,
     provisioning: &ProvisioningIntent,
@@ -1723,7 +1819,7 @@ pub(super) fn provisioning(
             "candidate agent is unavailable",
             config,
         ),
-        AgentObservation::Invalid { message } => unsafe_plan(
+        AgentObservation::Invalid { message, .. } => unsafe_plan(
             status,
             UnsafeReason::ContradictoryReplicaEvidence(message.clone()),
             config,

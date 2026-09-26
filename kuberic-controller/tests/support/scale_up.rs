@@ -4,7 +4,7 @@ use kube::Resource;
 use kuberic_controller::cluster_api::{GrpcAgentApi, KubeClusterApi};
 use kuberic_controller::crd::{INSTANCE_LABEL, SCALE_UP_ALLOCATION_ANNOTATION};
 use kuberic_controller::executor::execute_plan;
-use kuberic_protocol::command::{KubernetesChange, ScaleDownResource};
+use kuberic_protocol::command::{KubernetesChange, SafetyChange, ScaleDownResource};
 use kuberic_protocol::types::{AccessStatus, Epoch, OperationId, TransitionKind};
 use std::collections::BTreeSet;
 
@@ -33,11 +33,9 @@ fn candidate_key(raw: &RawObservation) -> Option<(ReplicaObservationKey, String)
 }
 
 fn candidate_keys(raw: &RawObservation) -> Vec<(ReplicaObservationKey, String)> {
-    let accepted = raw
-        .set
-        .status
-        .as_ref()
-        .and_then(|status| status.authority.topology.as_ref())
+    let authority = raw.set.status.as_ref().map(|status| &status.authority);
+    let accepted = authority
+        .and_then(|authority| authority.topology.as_ref())
         .map(|topology| &topology.configuration.members);
     raw.pods
         .iter()
@@ -67,19 +65,89 @@ fn candidate_keys(raw: &RawObservation) -> Vec<(ReplicaObservationKey, String)> 
                     volume
                         .persistent_volume_claim
                         .as_ref()
-                        .map(|claim| claim.claim_name.clone())
+                        .map(|claim| claim.claim_name.as_str())
                 })?;
-            let pvc_uid = raw
+            let live_pvc_uid = raw
                 .pvcs
                 .iter()
                 .find(|pvc| pvc.name_any() == pvc_name)?
                 .uid()?;
+            let configured_pvc_uid = pod
+                .spec
+                .as_ref()?
+                .containers
+                .iter()
+                .find(|container| container.name == "application")?
+                .env
+                .as_ref()?
+                .iter()
+                .find(|env| env.name == "KUBERIC_PVC_UID")?
+                .value
+                .clone()?;
+            let active_candidate = authority.is_some_and(|authority| {
+                authority
+                    .scale_up_allocation
+                    .as_ref()
+                    .is_some_and(|allocation| {
+                        allocation.target_replica_id == replica_id
+                            && pod
+                                .annotations()
+                                .get(SCALE_UP_ALLOCATION_ANNOTATION)
+                                .map(String::as_str)
+                                == Some(allocation.operation_id.as_str())
+                    })
+                    || authority
+                        .provisioning
+                        .as_ref()
+                        .is_some_and(|provisioning| provisioning.pod_uid.as_str() == pod_uid)
+                    || authority
+                        .transition
+                        .as_ref()
+                        .and_then(|transition| {
+                            transition
+                                .scale_up
+                                .as_deref()
+                                .map(|intent| &intent.target)
+                                .or_else(|| {
+                                    transition
+                                        .scale_up_failover
+                                        .as_deref()
+                                        .map(|evidence| &evidence.intent.target)
+                                })
+                        })
+                        .is_some_and(|target| target.instance_id.as_str() == pod_uid)
+            });
+            if !active_candidate && configured_pvc_uid != live_pvc_uid {
+                return None;
+            }
             Some((
                 ReplicaObservationKey::new(replica_id, ReplicaInstanceId::new(&pod_uid)),
-                pvc_uid,
+                configured_pvc_uid,
             ))
         })
         .collect()
+}
+
+fn set_configured_pvc_uid(pod: &mut k8s_openapi::api::core::v1::Pod, pvc_uid: &str) {
+    let env = pod
+        .spec
+        .as_mut()
+        .expect("replica Pod spec")
+        .containers
+        .iter_mut()
+        .find(|container| container.name == "application")
+        .expect("application container")
+        .env
+        .get_or_insert_default();
+    if let Some(configured) = env.iter_mut().find(|env| env.name == "KUBERIC_PVC_UID") {
+        configured.value = Some(pvc_uid.to_string());
+    } else {
+        env.push(k8s_openapi::api::core::v1::EnvVar {
+            name: "KUBERIC_PVC_UID".into(),
+            value: Some(pvc_uid.to_string()),
+            ..Default::default()
+        });
+    }
 }
 
 async fn observe_fresh_candidate(api: &InMemoryClusterApi) {
@@ -469,6 +537,26 @@ async fn canonical_candidate_is_created_pvc_before_pod_and_lost_create_replays()
     assert_eq!(
         pod.spec.as_ref().unwrap().containers[0].image.as_deref(),
         Some("example/db:latest")
+    );
+    let allocation = after_pod
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+        .expect("candidate remains in allocation");
+    assert_eq!(
+        pod.annotations()
+            .get(SCALE_UP_ALLOCATION_ANNOTATION)
+            .map(String::as_str),
+        Some(allocation.operation_id.as_str())
+    );
+    assert_eq!(
+        candidate_keys(&after_pod)
+            .into_iter()
+            .find(|(key, _)| key.instance_id.as_str() == pod.uid().unwrap())
+            .map(|(_, pvc_uid)| pvc_uid),
+        allocation.pvc_uid.as_ref().map(ToString::to_string),
+        "the simulated agent report must use the Pod's frozen environment UID"
     );
 }
 
@@ -2446,6 +2534,7 @@ async fn residual_pvc_replace_after_live_get_is_candidate_local() {
         .iter_mut()
         .find(|pvc| pvc.name_any() == "db-2-data")
         .unwrap();
+    let candidate_owner_references = pvc.metadata.owner_references.clone();
     pvc.metadata.uid = Some(replacement_uid.into());
     pvc.metadata.resource_version = Some("replacement-after-live-get-rv".into());
     let mut pod = raced
@@ -2457,6 +2546,7 @@ async fn residual_pvc_replace_after_live_get_is_candidate_local() {
     pod.metadata.name = Some("db-2".into());
     pod.metadata.uid = Some(raced_pod_uid.into());
     pod.metadata.resource_version = Some("raced-candidate-pod-rv".into());
+    pod.metadata.owner_references = candidate_owner_references;
     pod.metadata
         .labels
         .get_or_insert_default()
@@ -2465,6 +2555,10 @@ async fn residual_pvc_replace_after_live_get_is_candidate_local() {
         .labels
         .get_or_insert_default()
         .insert(INSTANCE_LABEL.into(), raced_pod_uid.into());
+    pod.metadata.annotations.get_or_insert_default().insert(
+        SCALE_UP_ALLOCATION_ANNOTATION.into(),
+        allocation.operation_id.to_string(),
+    );
     let spec = pod.spec.as_mut().unwrap();
     spec.volumes
         .as_mut()
@@ -2473,16 +2567,54 @@ async fn residual_pvc_replace_after_live_get_is_candidate_local() {
         .find_map(|volume| volume.persistent_volume_claim.as_mut())
         .unwrap()
         .claim_name = "db-2-data".into();
-    spec.containers[0]
-        .env
-        .get_or_insert_default()
-        .push(k8s_openapi::api::core::v1::EnvVar {
-            name: "KUBERIC_PVC_UID".into(),
-            value: Some(frozen_pvc_uid.to_string()),
-            ..Default::default()
-        });
+    set_configured_pvc_uid(&mut pod, frozen_pvc_uid.as_str());
     raced.pods.push(pod);
+    let raced_key =
+        ReplicaObservationKey::new(ReplicaId::new(2), ReplicaInstanceId::new(raced_pod_uid));
+    raced.agents.insert(
+        raced_key,
+        RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: UID.to_string(),
+            process_session_id: "agent-started-before-controller-recovery".into(),
+            report_sequence: 1,
+            storage_state: proto::AgentStorageState::Uninitialized as i32,
+            pod_uid: raced_pod_uid.into(),
+            pvc_uid: frozen_pvc_uid.to_string(),
+            healthy: true,
+            replica_id: 2,
+            ..Default::default()
+        })),
+    );
     api.set_observation(raced).await;
+    let recovered_raw = api.observe("tests", "db").await.unwrap();
+    let recovered_snapshot = normalize(recovered_raw, BTreeMap::new()).unwrap();
+    let recovered_plan = evaluate(&recovered_snapshot, &enabled());
+    assert!(
+        !matches!(recovered_plan, Plan::Unsafe { .. }),
+        "startup report with the Pod's frozen PVC UID must enter candidate-local arbitration: {recovered_plan:?}; exact={:?}; replicas={:?}",
+        recovered_snapshot.secondary_scale_down_resources,
+        recovered_snapshot.replicas,
+    );
+    let mut accepted_invalid = recovered_snapshot.clone();
+    accepted_invalid
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            ReplicaId::new(1),
+            ReplicaInstanceId::new("pod-uid-1"),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Invalid {
+        message: "accepted member remains globally fenced".into(),
+        uninitialized_report: None,
+    };
+    assert!(matches!(
+        evaluate(&accepted_invalid, &enabled()),
+        Plan::Unsafe {
+            ref safety_changes,
+            ..
+        } if safety_changes == &[SafetyChange::RemoveWriteRouting]
+    ));
     let effects_start = api.effects().await.len();
 
     for _ in 0..12 {
@@ -2514,6 +2646,36 @@ async fn residual_pvc_replace_after_live_get_is_candidate_local() {
             } if uid == replacement_uid
         ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
     }));
+    assert!(api.effects().await[effects_start..].iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pod,
+                uid,
+                ..
+            } if uid == raced_pod_uid
+        )
+    }));
+    let expected_primary = blocked
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.topology.as_ref())
+        .and_then(|topology| {
+            topology
+                .configuration
+                .members
+                .iter()
+                .find(|member| member.role == ReplicaRole::Primary)
+        })
+        .map(|member| member.identity.clone());
+    assert_eq!(
+        normalize(blocked.clone(), BTreeMap::new())
+            .unwrap()
+            .routing
+            .write_target,
+        expected_primary
+    );
 
     let mut available = blocked;
     available
@@ -2521,6 +2683,186 @@ async fn residual_pvc_replace_after_live_get_is_candidate_local() {
         .retain(|pvc| pvc.uid().as_deref() != Some(replacement_uid));
     api.set_observation(available).await;
     finish(&api, 2).await;
+    let completed = api.observation().await;
+    let receipt = completed
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.last_scale_up.as_ref())
+        .expect("fresh scale-up retry converged");
+    assert_ne!(
+        receipt.intent.target.instance_id.as_str(),
+        raced_pod_uid,
+        "the cleaned candidate must not be admitted"
+    );
+    assert!(completed.pvcs.iter().all(|pvc| {
+        pvc.uid().as_deref() != Some(replacement_uid)
+            && pvc.uid().as_deref() != Some(frozen_pvc_uid.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn pvc_only_allocation_never_adopts_same_name_pod_without_exact_provenance() {
+    for (case, provenance) in [
+        ("missing-metadata", None),
+        ("malformed-provenance", Some("")),
+        ("stale-prior-operation", Some("stale-allocation-operation")),
+    ] {
+        let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+        let allocation = active_pvc_only_allocation(&api).await;
+        let frozen_pvc_uid = allocation.pvc_uid.as_ref().unwrap().clone();
+        let occupant_uid = format!("unrelated-{case}");
+        let mut occupied = api.observation().await;
+        let mut occupant = occupied
+            .pods
+            .iter()
+            .find(|pod| pod.name_any() == "db-1")
+            .unwrap()
+            .clone();
+        occupant.metadata.name = Some("db-2".into());
+        occupant.metadata.uid = Some(occupant_uid.clone());
+        occupant.metadata.resource_version = Some(format!("{case}-rv"));
+        let spec = occupant.spec.as_mut().unwrap();
+        spec.volumes
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find_map(|volume| volume.persistent_volume_claim.as_mut())
+            .unwrap()
+            .claim_name = "db-2-data".into();
+        set_configured_pvc_uid(&mut occupant, frozen_pvc_uid.as_str());
+        if case == "missing-metadata" {
+            occupant.metadata.labels = None;
+            occupant.metadata.owner_references = None;
+            occupant.metadata.annotations = None;
+        } else {
+            let labels = occupant.metadata.labels.get_or_insert_default();
+            labels.insert(REPLICA_ID_LABEL.into(), "2".into());
+            labels.insert(INSTANCE_LABEL.into(), occupant_uid.clone());
+            occupant
+                .metadata
+                .annotations
+                .get_or_insert_default()
+                .insert(
+                    SCALE_UP_ALLOCATION_ANNOTATION.into(),
+                    provenance.unwrap().into(),
+                );
+        }
+        occupied.agents.insert(
+            ReplicaObservationKey::new(ReplicaId::new(2), ReplicaInstanceId::new(&occupant_uid)),
+            RawAgentObservation::Absent,
+        );
+        occupied.pods.push(occupant);
+        api.set_observation(occupied).await;
+        let effects_start = api.effects().await.len();
+
+        for _ in 0..8 {
+            let (kind, effects) = tick(&api).await;
+            assert_ne!(kind, ReconcileKind::Unsafe, "{case}");
+            assert!(
+                effects.iter().all(|effect| {
+                    !matches!(
+                        effect,
+                        EffectRecord::RemoveWriteRouting
+                            | EffectRecord::EnsureScaffolding(_)
+                            | EffectRecord::DeleteScaleDownResource {
+                                resource: ScaleDownResource::Pod,
+                                ..
+                            }
+                    )
+                }),
+                "{case}: {effects:?}"
+            );
+        }
+
+        let blocked = api.observation().await;
+        let still_frozen = blocked
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .expect("collision keeps the exact allocation pending");
+        assert_eq!(still_frozen.operation_id, allocation.operation_id, "{case}");
+        assert_eq!(still_frozen.pvc_uid, allocation.pvc_uid, "{case}");
+        assert!(still_frozen.pod_uid.is_none(), "{case}");
+        assert!(still_frozen.cancellation_started, "{case}");
+        assert!(blocked.pods.iter().any(|pod| {
+            pod.name_any() == "db-2" && pod.uid().as_deref() == Some(occupant_uid.as_str())
+        }));
+        assert!(blocked.pvcs.iter().any(|pvc| {
+            pvc.name_any() == "db-2-data" && pvc.uid().as_deref() == Some(frozen_pvc_uid.as_str())
+        }));
+        assert!(api.effects().await[effects_start..].iter().all(|effect| {
+            !matches!(effect, EffectRecord::RemoveWriteRouting)
+                && !matches!(
+                    effect,
+                    EffectRecord::DeleteScaleDownResource {
+                        resource: ScaleDownResource::Pod,
+                        uid,
+                        ..
+                    } if uid == &occupant_uid
+                )
+                && !matches!(
+                    effect,
+                    EffectRecord::DeleteScaleDownResource {
+                        resource: ScaleDownResource::Pvc,
+                        uid,
+                        ..
+                    } if uid == frozen_pvc_uid.as_str()
+                )
+        }));
+        let expected_primary = blocked
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.topology.as_ref())
+            .and_then(|topology| {
+                topology
+                    .configuration
+                    .members
+                    .iter()
+                    .find(|member| member.role == ReplicaRole::Primary)
+            })
+            .map(|member| member.identity.clone());
+        assert_eq!(
+            normalize(blocked.clone(), BTreeMap::new())
+                .unwrap()
+                .routing
+                .write_target,
+            expected_primary,
+            "{case}"
+        );
+
+        let mut available = blocked;
+        available
+            .pods
+            .retain(|pod| pod.uid().as_deref() != Some(occupant_uid.as_str()));
+        available.agents.remove(&ReplicaObservationKey::new(
+            ReplicaId::new(2),
+            ReplicaInstanceId::new(&occupant_uid),
+        ));
+        api.set_observation(available).await;
+        finish(&api, 2).await;
+        let completed = api.observation().await;
+        let receipt = completed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.last_scale_up.as_ref())
+            .expect("fresh legitimate allocation converges after collision clears");
+        assert_ne!(
+            receipt.intent.target.instance_id.as_str(),
+            occupant_uid,
+            "{case}"
+        );
+        assert!(
+            completed
+                .pods
+                .iter()
+                .all(|pod| pod.uid().as_deref() != Some(occupant_uid.as_str())),
+            "{case}"
+        );
+    }
 }
 
 #[tokio::test]

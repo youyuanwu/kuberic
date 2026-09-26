@@ -134,6 +134,8 @@ impl Model {
                     pod: ExactResourceObservation::FrozenUidPresent {
                         resource_version: "pod-rv".into(),
                     },
+                    pod_allocation_operation_id: None,
+                    pod_matches_allocation_metadata: false,
                     pvc: ExactResourceObservation::FrozenUidPresent {
                         resource_version: "pvc-rv".into(),
                     },

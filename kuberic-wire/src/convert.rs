@@ -414,6 +414,7 @@ pub fn normalize_agent_status_report(
             }
             Ok(AgentObservation::Invalid {
                 message: report.storage_error,
+                uninitialized_report: None,
             })
         }
     }

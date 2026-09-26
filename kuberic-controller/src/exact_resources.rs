@@ -1,15 +1,15 @@
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
-use kube::ResourceExt;
+use kube::{Resource, ResourceExt};
 use kuberic_protocol::observation::{
     ExactResourceObservation, ReplicaObservationKey, SecondaryScaleDownResourceObservation,
 };
 use kuberic_protocol::types::{
-    CleanupResourceIdentity, Epoch, OperationId, PodUid, PvcUid, ReplicaCleanupIdentity,
+    CleanupResourceIdentity, Epoch, OperationId, PodUid, PvcUid, ReplicaCleanupIdentity, ReplicaId,
     ReplicaIdentity, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
     derive_replica_endpoint_name,
 };
 
-use crate::crd::{INSTANCE_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL};
+use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL};
 use crate::observation::{
     ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
 };
@@ -345,6 +345,43 @@ fn mounted_pvc(pod: &Pod) -> Option<&str> {
     claims.next().is_none().then_some(name)
 }
 
+pub(crate) fn pod_matches_scale_up_allocation_metadata(
+    set: &crate::crd::KubericSet,
+    pod: &Pod,
+    replica_id: ReplicaId,
+    expected_pvc_uid: Option<&PvcUid>,
+) -> bool {
+    let Some(set_uid) = set.uid().filter(|uid| !uid.is_empty()) else {
+        return false;
+    };
+    let Some(owner) = set.controller_owner_ref(&()) else {
+        return false;
+    };
+    let pod_name = format!("{}-{}", set.name_any(), replica_id.value());
+    let pvc_name = format!("{pod_name}-data");
+    let configured_pvc_uid = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| {
+            spec.containers
+                .iter()
+                .find(|container| container.name == "application")
+        })
+        .and_then(|container| container.env.as_ref())
+        .and_then(|env| env.iter().find(|env| env.name == "KUBERIC_PVC_UID"))
+        .and_then(|env| env.value.as_deref());
+    pod.name_any() == pod_name
+        && pod.labels().get(SET_UID_LABEL).map(String::as_str) == Some(set_uid.as_str())
+        && pod.labels().get(REPLICA_ID_LABEL).map(String::as_str)
+            == Some(replica_id.to_string().as_str())
+        && pod
+            .owner_references()
+            .iter()
+            .any(|candidate| candidate == &owner)
+        && mounted_pvc(pod) == Some(pvc_name.as_str())
+        && expected_pvc_uid.is_some_and(|expected| configured_pvc_uid == Some(expected.as_str()))
+}
+
 pub(crate) fn name(identity: &CleanupResourceIdentity) -> &str {
     match identity {
         CleanupResourceIdentity::Present { name, .. }
@@ -578,6 +615,28 @@ pub(crate) fn normalized(
             target: r.target.clone(),
             identity: r.identity.clone(),
             pod: classify(&r.identity.pod, &r.pod),
+            pod_allocation_operation_id: match &r.pod {
+                ExactLookup::Present(pod) => pod
+                    .annotations()
+                    .get(SCALE_UP_ALLOCATION_ANNOTATION)
+                    .filter(|operation_id| !operation_id.is_empty())
+                    .map(OperationId::new),
+                ExactLookup::NotFound | ExactLookup::Failed(_) => None,
+            },
+            pod_matches_allocation_metadata: match &r.pod {
+                ExactLookup::Present(pod) => pod_matches_scale_up_allocation_metadata(
+                    &raw.set,
+                    pod,
+                    r.target.replica_id,
+                    raw.set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                        .filter(|allocation| allocation.target_replica_id == r.target.replica_id)
+                        .and_then(|allocation| allocation.pvc_uid.as_ref()),
+                ),
+                ExactLookup::NotFound | ExactLookup::Failed(_) => false,
+            },
             pvc: classify(&r.identity.pvc, &r.pvc),
             pvc_allocation_operation_id: match &r.pvc {
                 ExactLookup::Present(pvc) => pvc

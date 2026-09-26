@@ -194,6 +194,10 @@ pub struct SecondaryScaleDownResourceObservation {
     pub target: ReplicaIdentity,
     pub identity: crate::types::ReplicaCleanupIdentity,
     pub pod: ExactResourceObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_allocation_operation_id: Option<OperationId>,
+    #[serde(default)]
+    pub pod_matches_allocation_metadata: bool,
     pub pvc: ExactResourceObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pvc_allocation_operation_id: Option<OperationId>,
@@ -221,8 +225,14 @@ impl ReplicaObservationKey {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum AgentObservation {
     Absent,
-    Unreachable { message: String },
-    Invalid { message: String },
+    Unreachable {
+        message: String,
+    },
+    Invalid {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uninitialized_report: Option<Box<UninitializedAgentObservation>>,
+    },
     Uninitialized(UninitializedAgentObservation),
     Report(Box<AgentReport>),
 }

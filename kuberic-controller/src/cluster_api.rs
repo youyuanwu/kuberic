@@ -557,6 +557,7 @@ where
                         &pvc_name,
                         &pvc_uid,
                         &image,
+                        allocation_operation_id,
                     ),
                 )
                 .await?;
@@ -567,6 +568,22 @@ where
                 .iter()
                 .find(|pod| pod.name_any() == pod_name)
                 .expect("observed existing replica Pod");
+            if let Some(operation_id) = allocation_operation_id
+                && (!pod_matches_allocation(pod, operation_id)
+                    || !crate::exact_resources::pod_matches_scale_up_allocation_metadata(
+                        &observation.set,
+                        pod,
+                        *replica_id,
+                        observation
+                            .set
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                            .and_then(|allocation| allocation.pvc_uid.as_ref()),
+                    ))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
             ensure_exact_peer_endpoint(
                 self.client.clone(),
                 observation,
@@ -635,6 +652,7 @@ where
                     &pvc_name,
                     &pvc_uid,
                     &image,
+                    None,
                 ),
             )
             .await?;
@@ -1143,6 +1161,13 @@ fn pvc_matches_allocation(pvc: &PersistentVolumeClaim, operation_id: &OperationI
         == Some(operation_id.as_str())
 }
 
+fn pod_matches_allocation(pod: &Pod, operation_id: &OperationId) -> bool {
+    pod.annotations()
+        .get(SCALE_UP_ALLOCATION_ANNOTATION)
+        .map(String::as_str)
+        == Some(operation_id.as_str())
+}
+
 async fn authoritative_pvc_for_pod_create(
     pvcs: &Api<PersistentVolumeClaim>,
     observed: &PersistentVolumeClaim,
@@ -1192,6 +1217,7 @@ async fn authoritative_pvc_for_pod_create(
     Ok(live)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replica_pod(
     set: &KubericSet,
     replica_id: ReplicaId,
@@ -1200,6 +1226,7 @@ fn replica_pod(
     pvc_name: &str,
     pvc_uid: &str,
     image: &str,
+    allocation_operation_id: Option<&OperationId>,
 ) -> Pod {
     replica_pod_named(
         set,
@@ -1210,6 +1237,7 @@ fn replica_pod(
         pvc_name,
         pvc_uid,
         image,
+        allocation_operation_id,
     )
 }
 
@@ -1223,13 +1251,21 @@ fn replica_pod_named(
     pvc_name: &str,
     pvc_uid: &str,
     image: &str,
+    allocation_operation_id: Option<&OperationId>,
 ) -> Pod {
     let labels = base_labels(set, Some(replica_id), uid);
+    let annotations = allocation_operation_id.map(|operation_id| {
+        BTreeMap::from([(
+            SCALE_UP_ALLOCATION_ANNOTATION.to_string(),
+            operation_id.to_string(),
+        )])
+    });
     let credential_name = agent_credential_name(set);
     Pod {
         metadata: kube::core::ObjectMeta {
             name: Some(pod_name.to_string()),
             labels: Some(labels),
+            annotations,
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
         },
@@ -2299,6 +2335,7 @@ impl ClusterApi for InMemoryClusterApi {
                     &pvc_name,
                     &pvc_uid,
                     &image,
+                    allocation_operation_id,
                 );
                 pod.metadata.namespace = observation.set.namespace();
                 pod.metadata.uid = Some(format!(
@@ -2330,6 +2367,22 @@ impl ClusterApi for InMemoryClusterApi {
                 return Ok(());
             };
             let pod_uid = pod.uid().ok_or(ControllerError::ObservationStale)?;
+            if let Some(operation_id) = allocation_operation_id
+                && (!pod_matches_allocation(&pod, operation_id)
+                    || !crate::exact_resources::pod_matches_scale_up_allocation_metadata(
+                        &observation.set,
+                        &pod,
+                        *replica_id,
+                        observation
+                            .set
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                            .and_then(|allocation| allocation.pvc_uid.as_ref()),
+                    ))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
             if pod.labels().get(INSTANCE_LABEL).map(String::as_str) != Some(pod_uid.as_str()) {
                 state
                     .observation
@@ -2534,6 +2587,7 @@ impl ClusterApi for InMemoryClusterApi {
                 &pvc_name,
                 &pvc_uid,
                 &image,
+                None,
             );
             let pod_uid = format!(
                 "in-memory-replacement-pod-{}-{resource_number}",
