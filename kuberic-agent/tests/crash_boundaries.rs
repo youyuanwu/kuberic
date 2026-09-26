@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,11 +34,13 @@ use kuberic_runtime::application::{
     OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
+use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
+use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings};
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
-    DurableBuildProgress, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{
     BuildPostcondition, OpenMode, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult,
@@ -74,10 +78,15 @@ impl ScaleUpCrashRuntime {
         postcondition.role = state.role;
         postcondition.read_status = state.read_status;
         postcondition.write_status = state.write_status;
-        postcondition.current_progress = 9;
-        postcondition.verified_replication_lsn = Some(9);
-        postcondition.committed_lsn = 9;
-        postcondition.current_configuration_quorum_progress = 9;
+        let durable_lsn = state
+            .scale_up_evidence
+            .as_deref()
+            .map(|evidence| evidence.intent().catch_up_boundary_lsn)
+            .unwrap_or(9);
+        postcondition.current_progress = durable_lsn;
+        postcondition.verified_replication_lsn = Some(durable_lsn);
+        postcondition.committed_lsn = durable_lsn;
+        postcondition.current_configuration_quorum_progress = durable_lsn;
         postcondition.catch_up_complete = true;
         postcondition.authority =
             state
@@ -100,9 +109,9 @@ impl ScaleUpCrashRuntime {
             .values()
             .filter_map(|command| command.authority.clone())
             .map(|authority| BuildPostcondition {
-                durable_lsn: 9,
+                durable_lsn,
                 completed: true,
-                catch_up_boundary_lsn: Some(9),
+                catch_up_boundary_lsn: Some(durable_lsn),
                 last_sequence: 2,
                 authority,
             })
@@ -112,11 +121,6 @@ impl ScaleUpCrashRuntime {
             crash_after,
             exit_code: 73,
         }
-    }
-
-    fn with_exit_code(mut self, exit_code: i32) -> Self {
-        self.exit_code = exit_code;
-        self
     }
 }
 
@@ -487,6 +491,60 @@ struct CrashState {
     consume_replication: bool,
 }
 
+async fn consume_crash_stream(
+    application: std::sync::Weak<CrashState>,
+    mut stream: OperationStream,
+) {
+    while let Some(operation) = stream.get_operation().await.unwrap() {
+        let Some(application) = application.upgrade() else {
+            return;
+        };
+        let result = match &operation.metadata {
+            OperationMetadata::Replication { lsn, committed_lsn } => {
+                application
+                    .apply(Operation {
+                        lsn: *lsn,
+                        committed_lsn: *committed_lsn,
+                        data: operation.data.clone(),
+                    })
+                    .await
+            }
+            OperationMetadata::Copy { build_id, sequence } => {
+                match application
+                    .apply_copy_chunk(
+                        build_id,
+                        *sequence,
+                        CopyChunk {
+                            data: operation.data.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => application.durable_progress().await,
+                    Err(error) => Err(error),
+                }
+            }
+            OperationMetadata::CopyComplete {
+                build_id,
+                up_to_lsn,
+                committed_lsn,
+            } => {
+                application
+                    .finish_copy(build_id, *up_to_lsn, *committed_lsn)
+                    .await
+            }
+        };
+        match result {
+            Ok(progress) => {
+                let _ = operation.acknowledge(progress);
+            }
+            Err(error) => {
+                let _ = operation.reject(error);
+            }
+        }
+    }
+}
+
 impl CrashState {
     fn open(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
@@ -537,35 +595,14 @@ impl StatefulServiceReplica for CrashState {
         let interfaces = partition
             .create_replicator(self.clone(), Some(ReplicatorSettings::default()))
             .await?;
+        let copy = interfaces.state_replicator().get_copy_stream().await?;
+        tokio::spawn(consume_crash_stream(Arc::downgrade(&self), copy));
         if self.consume_replication {
-            let mut stream = interfaces
+            let stream = interfaces
                 .state_replicator()
                 .get_replication_stream()
                 .await?;
-            let application = Arc::downgrade(&self);
-            tokio::spawn(async move {
-                while let Ok(Some(operation)) = stream.get_operation().await {
-                    let Some(application) = application.upgrade() else {
-                        return;
-                    };
-                    let kuberic_runtime::replicator::stream::OperationMetadata::Replication {
-                        lsn,
-                        committed_lsn,
-                    } = operation.metadata
-                    else {
-                        panic!("expected replication")
-                    };
-                    let ack = application
-                        .apply(Operation {
-                            lsn,
-                            committed_lsn,
-                            data: operation.data.clone(),
-                        })
-                        .await
-                        .unwrap();
-                    operation.acknowledge(ack).unwrap();
-                }
-            });
+            tokio::spawn(consume_crash_stream(Arc::downgrade(&self), stream));
         }
         Ok(interfaces.replicator())
     }
@@ -897,7 +934,7 @@ fn scale_up_crash_fixture(current_only: bool) -> (AgentState, EnsureConfiguratio
         source: primary.clone(),
         target: candidate.clone(),
         current_configuration: previous.clone(),
-        replication_boundary_lsn: 4,
+        replication_boundary_lsn: 1,
     };
     let mut intent = ScaleUpIntent {
         operation_id: OperationId::default(),
@@ -911,8 +948,8 @@ fn scale_up_crash_fixture(current_only: bool) -> (AgentState, EnsureConfiguratio
         primary: primary.clone(),
         target: candidate.clone(),
         build_id: build.build_id.clone(),
-        snapshot_boundary_lsn: 4,
-        catch_up_boundary_lsn: 9,
+        snapshot_boundary_lsn: 1,
+        catch_up_boundary_lsn: 1,
     };
     intent.operation_id = intent.expected_operation_id();
     let evidence = ScaleUpConfigurationEvidence::Admission {
@@ -1148,7 +1185,7 @@ fn scale_up_store_cut_exit_code(cut: &str, after: bool) -> i32 {
         "target-progress-persistence" => 4,
         other => panic!("unknown scale-up store cut {other}"),
     };
-    80 + index * 2 + i32::from(after)
+    160 + index * 2 + i32::from(after)
 }
 
 fn scale_up_configuration_cut_exit_code(cut: &str) -> i32 {
@@ -1169,7 +1206,19 @@ fn scale_up_configuration_cut_exit_code(cut: &str) -> i32 {
     .iter()
     .position(|candidate| *candidate == cut)
     .unwrap_or_else(|| panic!("unknown scale-up configuration cut {cut}"));
-    96 + i32::try_from(index).unwrap()
+    180 + i32::try_from(index).unwrap()
+}
+
+fn assert_exact_scale_up_exit(status: std::process::ExitStatus, expected: i32, label: &str) {
+    assert_eq!(status.code(), Some(expected), "{label}: wrong exit code");
+    #[cfg(unix)]
+    assert_eq!(status.signal(), None, "{label}: terminated by signal");
+    assert_ne!(expected, 101, "{label}: Rust test panic is not a cut");
+    assert_ne!(expected, 134, "{label}: process abort is not a cut");
+}
+
+fn is_scale_up_cut_exit_code(code: Option<i32>) -> bool {
+    matches!(code, Some(160..=169 | 180..=195))
 }
 
 #[test]
@@ -1329,17 +1378,6 @@ fn scale_up_cut_adapter_matches_real_source_and_candidate_runtime_trace() {
         for operation in post_enumeration_operations.iter().cloned() {
             candidate_application.apply(operation).await.unwrap();
         }
-        candidate_store
-            .record_build_progress(&DurableBuildProgress {
-                authority: build.clone(),
-                last_sequence: sequence,
-                durable_lsn: 9,
-                completed: true,
-                catch_up_boundary_lsn: Some(9),
-            })
-            .await
-            .unwrap();
-
         for operation in snapshot_operations
             .iter()
             .chain(post_enumeration_operations.iter())
@@ -1383,253 +1421,740 @@ fn scale_up_cut_adapter_matches_real_source_and_candidate_runtime_trace() {
         assert_eq!(real_result.postcondition.authority, Some(authority));
         assert_eq!(real_result.postcondition.current_progress, 9);
         assert_eq!(
-            candidate_store
-                .load_build_progress(&build.build_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .durable_lsn,
-            9
+            candidate_application.durable_progress().await.unwrap(),
+            DurableApplicationProgress {
+                applied_lsn: 9,
+                committed_lsn: 9,
+            }
         );
     });
 }
 
+fn scale_up_candidate_root(path: &Path) -> PathBuf {
+    path.parent()
+        .expect("scale-up source metadata parent")
+        .join("candidate-owner")
+}
+
+fn scale_up_candidate_store_path(path: &Path) -> PathBuf {
+    SqliteStore::metadata_database_path(&scale_up_candidate_root(path))
+}
+
+async fn open_real_scale_up_owners(
+    path: &Path,
+    terminate_before_initialization: bool,
+) -> (
+    Arc<SqliteStore>,
+    Arc<PodRuntime>,
+    Arc<CrashState>,
+    Arc<SqliteStore>,
+    Arc<PodRuntime>,
+    Arc<CrashState>,
+    BuildAuthority,
+) {
+    let (source_state, command, build) = scale_up_crash_fixture(false);
+    let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+    let new_source = !path.is_file();
+    if new_source && terminate_before_initialization {
+        std::process::exit(scale_up_store_cut_exit_code("store-initialization", false));
+    }
+    let source_store = if new_source {
+        Arc::new(SqliteStore::create_authorized(path, source_state).unwrap())
+    } else {
+        Arc::new(SqliteStore::open_existing(path, None).unwrap())
+    };
+    let source_application = Arc::new(CrashState::open(crash_application_path(path)));
+    if new_source {
+        source_application.apply(seeded_operation()).await.unwrap();
+        source_store
+            .admit(&AdmittedAuthority {
+                local_identity: intent.primary.clone(),
+                transition_kind: None,
+                previous_configuration: None,
+                current_configuration: intent.previous_configuration.clone(),
+                switchover_handoff: None,
+                secondary_removal: None,
+                scale_up: None,
+            })
+            .await
+            .unwrap();
+    }
+    let source_runtime = Arc::new(PodRuntime::new(
+        intent.primary.clone(),
+        source_application.clone(),
+        source_store.clone(),
+    ));
+    let source_state = source_store.load_state().await.unwrap();
+    source_runtime
+        .reconstruct(
+            OpenMode::Existing,
+            source_state.role,
+            source_state.read_status,
+            source_state.write_status,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let candidate_root = scale_up_candidate_root(path);
+    std::fs::create_dir_all(&candidate_root).unwrap();
+    let candidate_path = scale_up_candidate_store_path(path);
+    let new_candidate = !candidate_path.is_file();
+    let candidate_store = if new_candidate {
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: intent.resource_uid.clone(),
+            pod_uid: PodUid::new(intent.target.instance_id.as_str()),
+            pvc_uid: PvcUid::new("scale-up-cut-candidate-pvc"),
+            initialization_id: InitializationId::new("scale-up-cut-candidate-init"),
+            local_identity: intent.target.clone(),
+            effective_policy: intent.current_policy.clone(),
+        });
+        state.role = ReplicaRole::IdleSecondary;
+        state.build_commands.insert(
+            build.build_id.clone(),
+            kuberic_protocol::command::EnsureReplicaBuild {
+                operation_id: build.build_id.clone(),
+                local_replica_id: intent.target.replica_id,
+                expected_instance_id: intent.target.instance_id.clone(),
+                expected_agent_generation: intent.target.agent_generation.clone(),
+                target: intent.target.clone(),
+                authority: Some(build.clone()),
+                source_session_id: Some(ProcessSessionId::new("scale-up-cut-source-session")),
+            },
+        );
+        Arc::new(SqliteStore::create_authorized(&candidate_path, state).unwrap())
+    } else {
+        Arc::new(SqliteStore::open_existing(&candidate_path, None).unwrap())
+    };
+    let candidate_application = Arc::new(CrashState::open(candidate_root.join("application.json")));
+    let candidate_runtime = Arc::new(PodRuntime::new(
+        intent.target.clone(),
+        candidate_application.clone(),
+        candidate_store.clone(),
+    ));
+    let candidate_state = candidate_store.load_state().await.unwrap();
+    candidate_runtime
+        .reconstruct(
+            if new_candidate {
+                OpenMode::New
+            } else {
+                OpenMode::Existing
+            },
+            candidate_state.role,
+            candidate_state.read_status,
+            candidate_state.write_status,
+            None,
+        )
+        .await
+        .unwrap();
+    (
+        source_store,
+        source_runtime,
+        source_application,
+        candidate_store,
+        candidate_runtime,
+        candidate_application,
+        build,
+    )
+}
+
 async fn ensure_scale_up_store_cut(path: &Path, cut: &str, after: bool, terminate: bool) {
-    let (state, _, build) = scale_up_crash_fixture(false);
-    if cut == "store-initialization" && terminate && !after {
+    if !terminate {
+        eprintln!("scale-up-real-recovery cut={cut} stage=open-owners");
+    }
+    let (
+        source_store,
+        source_runtime,
+        source_application,
+        candidate_store,
+        candidate_runtime,
+        candidate_application,
+        expected_build,
+    ) = open_real_scale_up_owners(path, terminate && cut == "store-initialization" && !after).await;
+    if !terminate {
+        eprintln!("scale-up-real-recovery cut={cut} stage=owners-open");
+    }
+    if cut == "store-initialization" && terminate && after {
         std::process::exit(scale_up_store_cut_exit_code(cut, after));
     }
-    let store = if path.is_file() {
-        Arc::new(SqliteStore::open_existing(path, None).unwrap())
-    } else {
-        Arc::new(SqliteStore::create_authorized(path, state).unwrap())
-    };
-    if cut == "store-initialization" {
-        if terminate && after {
-            std::process::exit(scale_up_store_cut_exit_code(cut, after));
-        }
+    if cut == "store-initialization" && !terminate {
         return;
     }
 
-    if store.load_build(&build.build_id).await.unwrap().is_none() {
+    if candidate_store
+        .load_build(&expected_build.build_id)
+        .await
+        .unwrap()
+        .is_none()
+    {
         if cut == "build-authority-admission" && terminate && !after {
             std::process::exit(scale_up_store_cut_exit_code(cut, after));
         }
-        store.admit_build(&build).await.unwrap();
-        if cut == "build-authority-admission" {
-            if terminate && after {
-                std::process::exit(scale_up_store_cut_exit_code(cut, after));
-            }
-            return;
+        let sequence = candidate_store
+            .load_state()
+            .await
+            .unwrap()
+            .next_effect_sequence;
+        RuntimeAdapter::new(candidate_store.clone(), candidate_runtime.clone())
+            .execute(RuntimeEffect {
+                operation_id: OperationId::new("real-candidate-admit-build"),
+                sequence,
+                action: RuntimeEffectAction::AdmitBuildAuthority(Box::new(expected_build.clone())),
+            })
+            .await
+            .unwrap();
+        if cut == "build-authority-admission" && terminate && after {
+            std::process::exit(scale_up_store_cut_exit_code(cut, after));
         }
+    } else {
+        candidate_runtime
+            .apply_effect(RuntimeEffect {
+                operation_id: OperationId::new("restore-real-candidate-build"),
+                sequence: candidate_store
+                    .load_state()
+                    .await
+                    .unwrap()
+                    .next_effect_sequence,
+                action: RuntimeEffectAction::AdmitBuildAuthority(Box::new(expected_build.clone())),
+            })
+            .await
+            .unwrap();
     }
-    if cut == "build-authority-admission" {
+    if cut == "build-authority-admission" && !terminate {
         return;
     }
 
-    let progress = match cut {
-        "snapshot-boundary-persistence" => DurableBuildProgress {
-            authority: build,
-            last_sequence: 0,
-            durable_lsn: 4,
-            completed: false,
-            catch_up_boundary_lsn: Some(9),
-        },
-        "source-progress-persistence" => DurableBuildProgress {
-            authority: build,
-            last_sequence: 1,
-            durable_lsn: 7,
-            completed: false,
-            catch_up_boundary_lsn: Some(9),
-        },
-        "target-progress-persistence" => DurableBuildProgress {
-            authority: build,
-            last_sequence: 2,
-            durable_lsn: 9,
-            completed: true,
-            catch_up_boundary_lsn: Some(9),
-        },
-        other => panic!("unknown scale-up store cut {other}"),
-    };
-    if terminate && !after {
+    if cut == "snapshot-boundary-persistence" && terminate && !after {
         std::process::exit(scale_up_store_cut_exit_code(cut, after));
     }
-    store.record_build_progress(&progress).await.unwrap();
-    if terminate && after {
+    let authority = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        source_runtime.authorize_build(
+            expected_build.build_id.clone(),
+            expected_build.target.clone(),
+            BuildConfiguration::Current,
+        ),
+    )
+    .await
+    .expect("real source build authorization timed out")
+    .unwrap();
+    if !terminate {
+        eprintln!("scale-up-real-recovery cut={cut} stage=build-authorized");
+    }
+    assert_eq!(authority, expected_build);
+    let mut prepared = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        source_runtime
+            .data_plane()
+            .prepare_copy(PrepareCopyRequest {
+                build_id: expected_build.build_id.clone(),
+                target: expected_build.target.clone(),
+                configuration: BuildConfiguration::Current,
+                copy_context: Box::pin(stream::empty()),
+            }),
+    )
+    .await
+    .expect("real source copy preparation timed out")
+    .unwrap();
+    if !terminate {
+        eprintln!("scale-up-real-recovery cut={cut} stage=copy-prepared");
+    }
+    let mut items = Vec::new();
+    while let Some(item) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), prepared.items.next())
+            .await
+            .expect("real scale-up copy item timed out")
+    {
+        let item = item.unwrap();
+        let final_item = item.final_item;
+        items.push(item);
+        if final_item {
+            break;
+        }
+    }
+    if cut == "snapshot-boundary-persistence" && terminate && after {
         std::process::exit(scale_up_store_cut_exit_code(cut, after));
+    }
+
+    for item in items {
+        if item.final_item && cut == "target-progress-persistence" && terminate && !after {
+            std::process::exit(scale_up_store_cut_exit_code(cut, after));
+        }
+        let acknowledgement = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            candidate_runtime
+                .data_plane()
+                .receive_copy_item(item.clone()),
+        )
+        .await
+        .expect("real candidate copy delivery timed out")
+        .unwrap();
+        if item.final_item && cut == "target-progress-persistence" && terminate && after {
+            std::process::exit(scale_up_store_cut_exit_code(cut, after));
+        }
+        if item.final_item && cut == "source-progress-persistence" && terminate && !after {
+            std::process::exit(scale_up_store_cut_exit_code(cut, after));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            source_runtime
+                .data_plane()
+                .accept_copy_acknowledgement(acknowledgement),
+        )
+        .await
+        .expect("real source copy acknowledgement timed out")
+        .unwrap();
+        if item.final_item && cut == "source-progress-persistence" && terminate && after {
+            std::process::exit(scale_up_store_cut_exit_code(cut, after));
+        }
+    }
+
+    let source_progress = source_store
+        .load_build_progress(&expected_build.build_id)
+        .await
+        .unwrap()
+        .expect("real source progress");
+    let target_progress = candidate_store
+        .load_build_progress(&expected_build.build_id)
+        .await
+        .unwrap()
+        .expect("real target progress");
+    assert_eq!(source_progress.catch_up_boundary_lsn, Some(1));
+    assert_eq!(target_progress.catch_up_boundary_lsn, Some(1));
+    assert!(source_progress.completed && target_progress.completed);
+    assert_eq!(
+        source_application
+            .durable_progress()
+            .await
+            .unwrap()
+            .committed_lsn,
+        1
+    );
+    assert_eq!(
+        candidate_application
+            .durable_progress()
+            .await
+            .unwrap()
+            .committed_lsn,
+        1
+    );
+    assert!(
+        candidate_application
+            .verify_applied(&seeded_operation())
+            .await
+            .unwrap()
+    );
+}
+
+async fn reconstruct_scale_up_configuration_runtime(
+    runtime: &Arc<PodRuntime>,
+    state: &AgentState,
+    command: &EnsureConfiguration,
+    cut: &str,
+) {
+    let reconstruction = runtime
+        .reconstruct(
+            OpenMode::Existing,
+            state.role,
+            state.read_status,
+            state.write_status,
+            None,
+        )
+        .await;
+    if let Err(error) = reconstruction {
+        assert!(
+            matches!(error, RuntimeError::ReconfigurationPending),
+            "{cut}: unexpected reconstruction error: {error:?}"
+        );
+        let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(kuberic_wire::proto::ReplicationAck {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                sender: Some(intent.primary.clone().into()),
+                receiver: Some(intent.target.clone().into()),
+                epoch: Some(intent.current_configuration.epoch.into()),
+                previous_configuration_id: state
+                    .previous_configuration
+                    .as_ref()
+                    .map_or_else(String::new, |previous| {
+                        previous.configuration_id.to_string()
+                    }),
+                current_configuration_id: intent.current_configuration.configuration_id.to_string(),
+                received_lsn: intent.catch_up_boundary_lsn,
+                applied_lsn: intent.catch_up_boundary_lsn,
+                committed_lsn: intent.catch_up_boundary_lsn,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        runtime
+            .reconstruct(
+                OpenMode::Existing,
+                state.role,
+                state.read_status,
+                state.write_status,
+                None,
+            )
+            .await
+            .unwrap();
     }
 }
 
 async fn execute_scale_up_configuration_cut(path: &Path, cut: &str, terminate: bool) {
+    eprintln!("scale-up-config cut={cut} stage=start");
     let current_only = cut.starts_with("current-only")
         || cut.starts_with("build-retirement")
         || cut.starts_with("completion");
-    let (initial, command, build) = scale_up_crash_fixture(current_only);
-    let store = if path.is_file() {
-        Arc::new(SqliteStore::open_existing(path, None).unwrap())
-    } else {
-        let store = Arc::new(SqliteStore::create_authorized(path, initial.clone()).unwrap());
-        store.admit_build(&build).await.unwrap();
-        store
-            .record_build_progress(&DurableBuildProgress {
-                authority: build.clone(),
-                last_sequence: 2,
-                durable_lsn: 9,
-                completed: true,
-                catch_up_boundary_lsn: Some(9),
+    if !path.is_file() {
+        Box::pin(ensure_scale_up_store_cut(
+            path,
+            "source-progress-persistence",
+            false,
+            false,
+        ))
+        .await;
+    }
+    eprintln!("scale-up-config cut={cut} stage=copy-ready");
+    let store = Arc::new(SqliteStore::open_existing(path, None).unwrap());
+    let application = Arc::new(CrashState::open(crash_application_path(path)));
+    let (_, pc_cc_command, build) = scale_up_crash_fixture(false);
+    let (_, command, _) = scale_up_crash_fixture(current_only);
+    let mut durable = store.load_state().await.unwrap();
+    let mut runtime = Arc::new(PodRuntime::new(
+        durable.identity.local_identity.clone(),
+        application.clone(),
+        store.clone(),
+    ));
+    let reconstruction = runtime
+        .reconstruct(
+            OpenMode::Existing,
+            durable.role,
+            durable.read_status,
+            durable.write_status,
+            None,
+        )
+        .await;
+    if let Err(error) = reconstruction {
+        assert!(
+            matches!(error, RuntimeError::ReconfigurationPending),
+            "{cut}: unexpected reconstruction error: {error:?}"
+        );
+        let intent = pc_cc_command.scale_up_evidence.as_deref().unwrap().intent();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(kuberic_wire::proto::ReplicationAck {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                sender: Some(intent.primary.clone().into()),
+                receiver: Some(intent.target.clone().into()),
+                epoch: Some(intent.current_configuration.epoch.into()),
+                previous_configuration_id: durable
+                    .previous_configuration
+                    .as_ref()
+                    .map_or_else(String::new, |previous| {
+                        previous.configuration_id.to_string()
+                    }),
+                current_configuration_id: intent.current_configuration.configuration_id.to_string(),
+                received_lsn: intent.catch_up_boundary_lsn,
+                applied_lsn: intent.catch_up_boundary_lsn,
+                committed_lsn: intent.catch_up_boundary_lsn,
+                ..Default::default()
             })
             .await
             .unwrap();
-        let application = CrashState::open(crash_application_path(path));
-        application.apply(seeded_operation()).await.unwrap();
-        store
-    };
-
-    let stop_before = match cut {
-        "pc-cc-authority-before" | "current-only-authority-before" => {
-            Some(CoordinatorStage::AdmitAuthority)
+        let reconstruction = runtime
+            .reconstruct(
+                OpenMode::Existing,
+                durable.role,
+                durable.read_status,
+                durable.write_status,
+                None,
+            )
+            .await;
+        if let Err(error) = reconstruction {
+            assert!(
+                matches!(error, RuntimeError::ReconfigurationPending),
+                "{cut}: unexpected post-PC/CC reconstruction error: {error:?}"
+            );
+            let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+            runtime
+                .data_plane()
+                .accept_acknowledgement(kuberic_wire::proto::ReplicationAck {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    sender: Some(intent.primary.clone().into()),
+                    receiver: Some(intent.target.clone().into()),
+                    epoch: Some(intent.current_configuration.epoch.into()),
+                    previous_configuration_id: durable
+                        .previous_configuration
+                        .as_ref()
+                        .map_or_else(String::new, |previous| {
+                            previous.configuration_id.to_string()
+                        }),
+                    current_configuration_id: intent
+                        .current_configuration
+                        .configuration_id
+                        .to_string(),
+                    received_lsn: intent.catch_up_boundary_lsn,
+                    applied_lsn: intent.catch_up_boundary_lsn,
+                    committed_lsn: intent.catch_up_boundary_lsn,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let reconstruction = runtime
+                .reconstruct(
+                    OpenMode::Existing,
+                    durable.role,
+                    durable.read_status,
+                    durable.write_status,
+                    None,
+                )
+                .await;
+            if let Err(error) = reconstruction {
+                assert!(
+                    matches!(error, RuntimeError::ReconfigurationPending),
+                    "{cut}: unexpected seeded PC/CC reconstruction error: {error:?}"
+                );
+                let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+                runtime
+                    .data_plane()
+                    .accept_acknowledgement(kuberic_wire::proto::ReplicationAck {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        sender: Some(intent.primary.clone().into()),
+                        receiver: Some(intent.target.clone().into()),
+                        epoch: Some(intent.current_configuration.epoch.into()),
+                        previous_configuration_id: durable
+                            .previous_configuration
+                            .as_ref()
+                            .map_or_else(String::new, |previous| {
+                                previous.configuration_id.to_string()
+                            }),
+                        current_configuration_id: intent
+                            .current_configuration
+                            .configuration_id
+                            .to_string(),
+                        received_lsn: intent.catch_up_boundary_lsn,
+                        applied_lsn: intent.catch_up_boundary_lsn,
+                        committed_lsn: intent.catch_up_boundary_lsn,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                runtime
+                    .reconstruct(
+                        OpenMode::Existing,
+                        durable.role,
+                        durable.read_status,
+                        durable.write_status,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
         }
-        "pc-cc-access-before" | "current-only-access-before" => Some(CoordinatorStage::Activate),
-        "build-retirement-before" => Some(CoordinatorStage::RetireBuild),
-        "completion-before" => Some(CoordinatorStage::Complete),
-        _ => None,
-    };
-    if let Some(stop_before) = stop_before
-        && store.load_state().await.unwrap().reconfiguration.is_none()
+    }
+    if current_only
+        && durable.current_configuration != Some(pc_cc_command.current_configuration.clone())
+    {
+        eprintln!("scale-up-config cut={cut} stage=seed-pc-cc");
+        Box::pin(execute_scale_up_configuration_cut(
+            path,
+            "pc-cc-access-after",
+            false,
+        ))
+        .await;
+        eprintln!("scale-up-config cut={cut} stage=pc-cc-seeded");
+        durable = store.load_state().await.unwrap();
+        runtime = Arc::new(PodRuntime::new(
+            durable.identity.local_identity.clone(),
+            application.clone(),
+            store.clone(),
+        ));
+        reconstruct_scale_up_configuration_runtime(&runtime, &durable, &command, cut).await;
+    }
+
+    if store.load_state().await.unwrap().reconfiguration.is_none()
+        && store
+            .load_state()
+            .await
+            .unwrap()
+            .retained_command
+            .as_ref()
+            .is_none_or(|retained| retained.command.operation_id != command.operation_id)
     {
         store.begin_configuration(&command).await.unwrap();
-        loop {
-            let state = store.load_state().await.unwrap();
-            let record = state.reconfiguration.clone().unwrap();
-            if record.stage == stop_before {
-                break;
-            }
-            let runtime = Arc::new(ScaleUpCrashRuntime::new(&state, None));
-            let adapter = RuntimeAdapter::new(store.clone(), runtime);
-            match record.stage {
-                CoordinatorStage::AdmitAuthority => {
+    }
+
+    let (cut_stage, after) = match cut {
+        "pc-cc-authority-before" | "current-only-authority-before" => {
+            (CoordinatorStage::AdmitAuthority, false)
+        }
+        "pc-cc-authority-after" | "current-only-authority-after" => {
+            (CoordinatorStage::AdmitAuthority, true)
+        }
+        "pc-cc-access-before" | "current-only-access-before" => (CoordinatorStage::Activate, false),
+        "pc-cc-access-after" | "current-only-access-after" => (CoordinatorStage::Activate, true),
+        "build-retirement-before" => (CoordinatorStage::RetireBuild, false),
+        "build-retirement-after" => (CoordinatorStage::RetireBuild, true),
+        "completion-before" => (CoordinatorStage::Complete, false),
+        "completion-after" => (CoordinatorStage::Complete, true),
+        other => panic!("unknown scale-up configuration cut {other}"),
+    };
+
+    loop {
+        let state = store.load_state().await.unwrap();
+        let Some(record) = state.reconfiguration.clone() else {
+            break;
+        };
+        if terminate && record.stage == cut_stage && !after {
+            std::process::exit(scale_up_configuration_cut_exit_code(cut));
+        }
+        match record.stage {
+            CoordinatorStage::AdmitAuthority => {
+                let operation_id =
+                    OperationId::new(format!("{}:admit-authority", command.operation_id));
+                let effect = if let Some(retained) = state
+                    .retained_result
+                    .as_ref()
+                    .filter(|retained| retained.operation_id == operation_id)
+                {
+                    retained.effect.clone()
+                } else {
                     let authority = admit_configuration(&command, &state).unwrap();
-                    adapter
-                        .execute(RuntimeEffect {
-                            operation_id: OperationId::new(format!(
-                                "{}:admit-authority",
-                                command.operation_id
-                            )),
-                            sequence: state.next_effect_sequence,
-                            action: RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
-                        })
-                        .await
-                        .unwrap();
-                    store
-                        .advance_configuration(
-                            &command.operation_id,
-                            CoordinatorStage::AdmitAuthority,
-                            CoordinatorStage::Activate,
-                            None,
-                        )
-                        .await
-                        .unwrap();
+                    RuntimeEffect {
+                        operation_id,
+                        sequence: state.next_effect_sequence,
+                        action: RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+                    }
+                };
+                RuntimeAdapter::new(store.clone(), runtime.clone())
+                    .execute(effect)
+                    .await
+                    .unwrap();
+                if terminate && cut_stage == record.stage && after {
+                    std::process::exit(scale_up_configuration_cut_exit_code(cut));
                 }
-                CoordinatorStage::Activate => {
-                    adapter
-                        .execute(RuntimeEffect {
-                            operation_id: OperationId::new(format!(
-                                "{}:activate",
-                                command.operation_id
-                            )),
+                store
+                    .advance_configuration(
+                        &command.operation_id,
+                        record.stage,
+                        CoordinatorStage::Activate,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            CoordinatorStage::Activate => {
+                let evidence = command.scale_up_evidence.as_deref().unwrap();
+                let intent = evidence.intent();
+                runtime
+                    .data_plane()
+                    .accept_acknowledgement(kuberic_wire::proto::ReplicationAck {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        sender: Some(intent.primary.clone().into()),
+                        receiver: Some(intent.target.clone().into()),
+                        epoch: Some(command.current_configuration.epoch.into()),
+                        previous_configuration_id: command
+                            .previous_configuration
+                            .as_ref()
+                            .map_or_else(String::new, |previous| {
+                                previous.configuration_id.to_string()
+                            }),
+                        current_configuration_id: command
+                            .current_configuration
+                            .configuration_id
+                            .to_string(),
+                        received_lsn: intent.catch_up_boundary_lsn,
+                        applied_lsn: intent.catch_up_boundary_lsn,
+                        committed_lsn: intent.catch_up_boundary_lsn,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let operation_id = OperationId::new(format!("{}:activate", command.operation_id));
+                let effect = state
+                    .retained_result
+                    .as_ref()
+                    .filter(|retained| retained.operation_id == operation_id)
+                    .map_or_else(
+                        || RuntimeEffect {
+                            operation_id,
                             sequence: state.next_effect_sequence,
                             action: RuntimeEffectAction::SetAccessStatus {
                                 read: AccessStatus::Granted,
                                 write: AccessStatus::Granted,
                             },
-                        })
-                        .await
-                        .unwrap();
-                    store
-                        .advance_configuration(
-                            &command.operation_id,
-                            CoordinatorStage::Activate,
-                            if current_only {
-                                CoordinatorStage::RetireBuild
-                            } else {
-                                CoordinatorStage::Complete
-                            },
-                            None,
-                        )
-                        .await
-                        .unwrap();
+                        },
+                        |retained| retained.effect.clone(),
+                    );
+                RuntimeAdapter::new(store.clone(), runtime.clone())
+                    .execute(effect)
+                    .await
+                    .unwrap();
+                if terminate && cut_stage == record.stage && after {
+                    std::process::exit(scale_up_configuration_cut_exit_code(cut));
                 }
-                CoordinatorStage::RetireBuild => {
-                    adapter
-                        .execute(RuntimeEffect {
-                            operation_id: OperationId::new(format!(
-                                "{}:retire-build-0",
-                                command.operation_id
-                            )),
+                store
+                    .advance_configuration(
+                        &command.operation_id,
+                        record.stage,
+                        if current_only {
+                            CoordinatorStage::RetireBuild
+                        } else {
+                            CoordinatorStage::Complete
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            CoordinatorStage::RetireBuild => {
+                let operation_id =
+                    OperationId::new(format!("{}:retire-build-0", command.operation_id));
+                let effect = state
+                    .retained_result
+                    .as_ref()
+                    .filter(|retained| retained.operation_id == operation_id)
+                    .map_or_else(
+                        || RuntimeEffect {
+                            operation_id,
                             sequence: state.next_effect_sequence,
                             action: RuntimeEffectAction::RetireBuild(build.build_id.clone()),
-                        })
-                        .await
-                        .unwrap();
-                    store
-                        .advance_configuration(
-                            &command.operation_id,
-                            CoordinatorStage::RetireBuild,
-                            CoordinatorStage::Complete,
-                            None,
-                        )
-                        .await
-                        .unwrap();
+                        },
+                        |retained| retained.effect.clone(),
+                    );
+                RuntimeAdapter::new(store.clone(), runtime.clone())
+                    .execute(effect)
+                    .await
+                    .unwrap();
+                if terminate && cut_stage == record.stage && after {
+                    std::process::exit(scale_up_configuration_cut_exit_code(cut));
                 }
-                other => panic!("{cut}: unexpected preparatory stage {other:?}"),
+                store
+                    .advance_configuration(
+                        &command.operation_id,
+                        record.stage,
+                        CoordinatorStage::Complete,
+                        None,
+                    )
+                    .await
+                    .unwrap();
             }
+            CoordinatorStage::Complete => {
+                if terminate && !after {
+                    std::process::exit(scale_up_configuration_cut_exit_code(cut));
+                }
+                store
+                    .complete_configuration(&command.operation_id)
+                    .await
+                    .unwrap();
+                if terminate && after {
+                    std::process::exit(scale_up_configuration_cut_exit_code(cut));
+                }
+            }
+            other => panic!("{cut}: unexpected same-primary stage {other:?}"),
         }
-        if terminate {
-            std::process::exit(scale_up_configuration_cut_exit_code(cut));
-        }
-    }
-
-    if terminate {
-        if cut == "completion-after" {
-            Coordinator::new(
-                store.clone(),
-                Arc::new(ScaleUpCrashRuntime::new(
-                    &store.load_state().await.unwrap(),
-                    None,
-                )),
-            )
-            .ensure_configuration(command.clone())
-            .await
-            .unwrap();
-            std::process::exit(scale_up_configuration_cut_exit_code(cut));
-        }
-        let crash_after = match cut {
-            "pc-cc-authority-after" | "current-only-authority-after" => "admission",
-            "pc-cc-access-after" | "current-only-access-after" => "access",
-            "build-retirement-after" => "retirement",
-            other => panic!("unknown scale-up configuration cut {other}"),
-        };
-        Coordinator::new(
-            store.clone(),
-            Arc::new(
-                ScaleUpCrashRuntime::new(&store.load_state().await.unwrap(), Some(crash_after))
-                    .with_exit_code(scale_up_configuration_cut_exit_code(cut)),
-            ),
-        )
-        .ensure_configuration(command.clone())
-        .await
-        .unwrap();
-    } else {
-        Coordinator::new(
-            store.clone(),
-            Arc::new(ScaleUpCrashRuntime::new(
-                &store.load_state().await.unwrap(),
-                None,
-            )),
-        )
-        .ensure_configuration(command.clone())
-        .await
-        .unwrap_or_else(|error| panic!("{cut}: {error:?}"));
     }
     let durable = store.load_state().await.unwrap();
     assert!(durable.pending_effect.is_none(), "{cut}");
@@ -1645,7 +2170,6 @@ async fn execute_scale_up_configuration_cut(path: &Path, cut: &str, terminate: b
         current_only,
         "{cut}"
     );
-    let application = CrashState::open(crash_application_path(path));
     let persisted = application.durable_progress().await.unwrap();
     assert_eq!(persisted.committed_lsn, 1, "{cut}");
     assert!(
@@ -1662,83 +2186,24 @@ async fn execute_real_active_secondary_cut(path: &Path, after: bool, terminate: 
     let evidence = command.scale_up_evidence.clone().unwrap();
     let intent = evidence.intent().clone();
     let candidate = intent.target.clone();
-    let newly_created = !path.is_file();
-    let store = if !newly_created {
-        Arc::new(SqliteStore::open_existing(path, None).unwrap())
-    } else {
-        let mut state = AgentState::new(StorageIdentity {
-            schema_version: SCHEMA_VERSION,
-            resource_uid: intent.resource_uid.clone(),
-            pod_uid: PodUid::new(candidate.instance_id.as_str()),
-            pvc_uid: PvcUid::new("active-secondary-pvc"),
-            initialization_id: InitializationId::new("active-secondary-initialization"),
-            local_identity: candidate.clone(),
-            effective_policy: intent.current_policy.clone(),
-        });
-        state.admitted_policy = Some(intent.current_policy.clone());
-        state.previous_policy = Some(intent.previous_policy.clone());
-        state.highest_epoch = intent.current_configuration.epoch;
-        state.previous_configuration = Some(intent.previous_configuration.clone());
-        state.current_configuration = Some(intent.current_configuration.clone());
-        state.scale_up_evidence = Some(evidence.clone());
-        state.role = ReplicaRole::IdleSecondary;
-        state.build_commands.insert(
-            build.build_id.clone(),
-            kuberic_protocol::command::EnsureReplicaBuild {
-                operation_id: build.build_id.clone(),
-                local_replica_id: candidate.replica_id,
-                expected_instance_id: candidate.instance_id.clone(),
-                expected_agent_generation: candidate.agent_generation.clone(),
-                target: candidate.clone(),
-                authority: Some(build.clone()),
-                source_session_id: Some(ProcessSessionId::new("active-secondary-source")),
-            },
-        );
-        let store = Arc::new(SqliteStore::create_authorized(path, state).unwrap());
-        store
-            .admit(&AdmittedAuthority {
-                local_identity: candidate.clone(),
-                transition_kind: Some(TransitionKind::ScaleUp),
-                previous_configuration: Some(intent.previous_configuration.clone()),
-                current_configuration: intent.current_configuration.clone(),
-                switchover_handoff: None,
-                secondary_removal: None,
-                scale_up: Some(evidence.clone()),
-            })
-            .await
-            .unwrap();
-        store.admit_build(&build).await.unwrap();
-        store
-            .record_build_progress(&DurableBuildProgress {
-                authority: build,
-                last_sequence: 2,
-                durable_lsn: intent.catch_up_boundary_lsn,
-                completed: true,
-                catch_up_boundary_lsn: Some(intent.catch_up_boundary_lsn),
-            })
-            .await
-            .unwrap();
-        store
-    };
-    let durable = store.load_state().await.unwrap();
-    let application = Arc::new(CrashState::open(crash_application_path(path)));
-    let seed = Operation {
-        lsn: 1,
-        committed_lsn: 1,
-        data: Bytes::from_static(b"acknowledged-before-active-secondary"),
-    };
-    if newly_created {
-        application.apply(seed.clone()).await.unwrap();
-    } else {
-        assert!(
-            application.verify_applied(&seed).await.unwrap(),
-            "ActiveSecondary recovery must observe existing bytes before replay"
-        );
-        assert_eq!(
-            application.durable_progress().await.unwrap().committed_lsn,
-            1
-        );
+    if !path.is_file() {
+        ensure_scale_up_store_cut(path, "source-progress-persistence", false, false).await;
     }
+    let candidate_path = scale_up_candidate_store_path(path);
+    let store = Arc::new(SqliteStore::open_existing(&candidate_path, None).unwrap());
+    let durable = store.load_state().await.unwrap();
+    let application = Arc::new(CrashState::open(
+        scale_up_candidate_root(path).join("application.json"),
+    ));
+    let seed = seeded_operation();
+    assert!(
+        application.verify_applied(&seed).await.unwrap(),
+        "ActiveSecondary recovery must observe actual copied bytes before replay"
+    );
+    assert_eq!(
+        application.durable_progress().await.unwrap().committed_lsn,
+        intent.catch_up_boundary_lsn
+    );
     let runtime = Arc::new(PodRuntime::new(
         candidate,
         application.clone(),
@@ -1754,6 +2219,35 @@ async fn execute_real_active_secondary_cut(path: &Path, after: bool, terminate: 
         )
         .await
         .unwrap();
+    let authority = AdmittedAuthority {
+        local_identity: intent.target.clone(),
+        transition_kind: Some(TransitionKind::ScaleUp),
+        previous_configuration: Some(intent.previous_configuration.clone()),
+        current_configuration: intent.current_configuration.clone(),
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: Some(evidence),
+    };
+    if store.load().await.unwrap().as_ref() != Some(&authority) {
+        let state = store.load_state().await.unwrap();
+        RuntimeAdapter::new(store.clone(), runtime.clone())
+            .execute(RuntimeEffect {
+                operation_id: OperationId::new("active-secondary-admit-scale-up"),
+                sequence: state.next_effect_sequence,
+                action: RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .load_build_progress(&build.build_id)
+            .await
+            .unwrap()
+            .expect("actual candidate copy progress")
+            .durable_lsn,
+        intent.catch_up_boundary_lsn
+    );
     let effect = RuntimeEffect {
         operation_id: OperationId::new("scale-up-active-secondary-role"),
         sequence: store.load_state().await.unwrap().next_effect_sequence,
@@ -1769,7 +2263,7 @@ async fn execute_real_active_secondary_cut(path: &Path, after: bool, terminate: 
             }
             .to_string()
         }),
-        exit_code: if after { 122 } else { 121 },
+        exit_code: if after { 193 } else { 192 },
     });
     RuntimeAdapter::new(store.clone(), executor)
         .execute(effect)
@@ -2420,12 +2914,14 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                 .output()
                 .unwrap();
             let expected_exit = scale_up_store_cut_exit_code(cut, after);
-            assert_eq!(
-                output.status.code(),
-                Some(expected_exit),
-                "{cut} {}: {}",
-                if after { "after" } else { "before" },
-                String::from_utf8_lossy(&output.stderr)
+            assert_exact_scale_up_exit(
+                output.status,
+                expected_exit,
+                &format!(
+                    "{cut} {}: {}",
+                    if after { "after" } else { "before" },
+                    String::from_utf8_lossy(&output.stderr)
+                ),
             );
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let (_, _, build) = scale_up_crash_fixture(false);
@@ -2437,14 +2933,18 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                         );
                     }
                     "store-initialization" => {
-                        let interrupted = SqliteStore::open_existing(&path, None).unwrap();
+                        let candidate_path = scale_up_candidate_store_path(&path);
+                        let interrupted =
+                            SqliteStore::open_existing(&candidate_path, None).unwrap();
                         assert_eq!(
                             interrupted.identity().await.unwrap().schema_version,
                             SCHEMA_VERSION
                         );
                     }
                     "build-authority-admission" => {
-                        let interrupted = SqliteStore::open_existing(&path, None).unwrap();
+                        let candidate_path = scale_up_candidate_store_path(&path);
+                        let interrupted =
+                            SqliteStore::open_existing(&candidate_path, None).unwrap();
                         assert_eq!(
                             interrupted.load_build(&build.build_id).await.unwrap(),
                             after.then(|| build.clone()),
@@ -2460,11 +2960,15 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                             "authority cut fabricated build progress"
                         );
                     }
-                    _ => {
+                    "snapshot-boundary-persistence" | "source-progress-persistence" => {
                         let interrupted = SqliteStore::open_existing(&path, None).unwrap();
                         assert_eq!(
                             interrupted.load_build(&build.build_id).await.unwrap(),
-                            Some(build.clone())
+                            if cut == "snapshot-boundary-persistence" && !after {
+                                None
+                            } else {
+                                Some(build.clone())
+                            }
                         );
                         let progress = interrupted
                             .load_build_progress(&build.build_id)
@@ -2472,27 +2976,53 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                             .unwrap();
                         if after {
                             let progress = progress.expect("after side persisted progress");
-                            let expected = match cut {
-                                "snapshot-boundary-persistence" => (0, 4, false),
-                                "source-progress-persistence" => (1, 7, false),
-                                "target-progress-persistence" => (2, 9, true),
-                                _ => unreachable!(),
-                            };
+                            assert_eq!(progress.catch_up_boundary_lsn, Some(1));
                             assert_eq!(
-                                (
-                                    progress.last_sequence,
-                                    progress.durable_lsn,
-                                    progress.completed
-                                ),
-                                expected
+                                (progress.durable_lsn, progress.completed),
+                                if cut == "source-progress-persistence" {
+                                    (1, true)
+                                } else {
+                                    (0, false)
+                                }
                             );
                         } else {
                             assert!(
-                                progress.is_none(),
-                                "{cut} before side persisted the cut operation"
+                                progress.as_ref().is_none_or(|progress| {
+                                    progress.catch_up_boundary_lsn.is_none()
+                                        || (cut == "source-progress-persistence"
+                                            && !progress.completed)
+                                }),
+                                "{cut} before side crossed the cut operation: {progress:?}"
                             );
                         }
                     }
+                    "target-progress-persistence" => {
+                        let candidate_path = scale_up_candidate_store_path(&path);
+                        let interrupted =
+                            SqliteStore::open_existing(&candidate_path, None).unwrap();
+                        let progress = interrupted
+                            .load_build_progress(&build.build_id)
+                            .await
+                            .unwrap()
+                            .expect("target snapshot progress");
+                        assert_eq!(progress.completed, after);
+                        assert_eq!(progress.catch_up_boundary_lsn, after.then_some(1));
+                        let application = CrashState::open(
+                            scale_up_candidate_root(&path).join("application.json"),
+                        );
+                        assert_eq!(
+                            application.durable_progress().await.unwrap().committed_lsn,
+                            i64::from(after)
+                        );
+                        assert!(
+                            application
+                                .verify_applied(&seeded_operation())
+                                .await
+                                .unwrap(),
+                            "snapshot bytes must precede the final completion marker"
+                        );
+                    }
+                    _ => unreachable!(),
                 }
 
                 // Recovery starts only after the parent has inspected the
@@ -2507,32 +3037,35 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
                         );
                     }
                     "build-authority-admission" => {
+                        let candidate =
+                            SqliteStore::open_existing(scale_up_candidate_store_path(&path), None)
+                                .unwrap();
                         assert_eq!(
-                            store.load_build(&build.build_id).await.unwrap(),
+                            candidate.load_build(&build.build_id).await.unwrap(),
                             Some(build)
                         );
                     }
                     _ => {
-                        let progress = store
+                        let source_progress = store
                             .load_build_progress(&build.build_id)
                             .await
                             .unwrap()
-                            .expect("durable build progress");
-                        assert_eq!(progress.authority, build);
-                        assert_eq!(progress.catch_up_boundary_lsn, Some(9));
-                        let expected = match cut {
-                            "snapshot-boundary-persistence" => (0, 4, false),
-                            "source-progress-persistence" => (1, 7, false),
-                            "target-progress-persistence" => (2, 9, true),
-                            _ => unreachable!(),
-                        };
-                        assert_eq!(
-                            (
-                                progress.last_sequence,
-                                progress.durable_lsn,
-                                progress.completed
-                            ),
-                            expected
+                            .expect("durable source build progress");
+                        let candidate =
+                            SqliteStore::open_existing(scale_up_candidate_store_path(&path), None)
+                                .unwrap();
+                        let target_progress = candidate
+                            .load_build_progress(&build.build_id)
+                            .await
+                            .unwrap()
+                            .expect("durable target build progress");
+                        assert_eq!(source_progress.authority, build);
+                        assert_eq!(target_progress.authority, build);
+                        assert_eq!(source_progress.catch_up_boundary_lsn, Some(1));
+                        assert_eq!(target_progress.catch_up_boundary_lsn, Some(1));
+                        assert!(
+                            source_progress.completed && target_progress.completed,
+                            "{cut}: actual copy delivery did not complete on recovery"
                         );
                     }
                 }
@@ -2569,11 +3102,10 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
             .output()
             .unwrap();
         let expected_exit = scale_up_configuration_cut_exit_code(cut);
-        assert_eq!(
-            output.status.code(),
-            Some(expected_exit),
-            "{cut}: {}",
-            String::from_utf8_lossy(&output.stderr)
+        assert_exact_scale_up_exit(
+            output.status,
+            expected_exit,
+            &format!("{cut}: {}", String::from_utf8_lossy(&output.stderr)),
         );
         let interrupted = SqliteStore::open_existing(&path, None).unwrap();
         let interrupted_state = tokio::runtime::Runtime::new()
@@ -2609,12 +3141,67 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
             expected_stage,
             "{cut}: interrupted coordinator stage"
         );
-        let after_effect_before_result = cut.ends_with("-after") && cut != "completion-after";
-        assert_eq!(
-            interrupted_state.pending_effect.is_some(),
-            after_effect_before_result,
-            "{cut}: pending effect must distinguish the operation side"
+        assert!(
+            interrupted_state.pending_effect.is_none(),
+            "{cut}: a completed real runtime effect left an ambiguous pending journal"
         );
+        let (_, command, build) = scale_up_crash_fixture(
+            cut.starts_with("current-only")
+                || cut.starts_with("build-retirement")
+                || cut.starts_with("completion"),
+        );
+        if cut.ends_with("-after") {
+            match cut {
+                "pc-cc-authority-after" | "current-only-authority-after" => {
+                    let authority = tokio::runtime::Runtime::new()
+                        .unwrap()
+                        .block_on(interrupted.load())
+                        .expect("durable effect-side authority");
+                    assert_eq!(
+                        authority
+                            .as_ref()
+                            .map(|authority| &authority.current_configuration),
+                        Some(&command.current_configuration),
+                        "{cut}: current-only authority effect was not durable"
+                    );
+                    assert_eq!(
+                        authority.and_then(|authority| authority.scale_up),
+                        command.scale_up_evidence,
+                        "{cut}: durable authority lost scale-up evidence"
+                    );
+                }
+                "pc-cc-access-after" | "current-only-access-after" => {
+                    assert_eq!(interrupted_state.read_status, AccessStatus::Granted);
+                    assert_eq!(interrupted_state.write_status, AccessStatus::Granted);
+                    assert_eq!(
+                        interrupted_state.current_configuration,
+                        Some(command.current_configuration.clone())
+                    );
+                }
+                "build-retirement-after" => {
+                    assert!(interrupted_state.retired_builds.contains(&build.build_id));
+                    assert!(
+                        tokio::runtime::Runtime::new()
+                            .unwrap()
+                            .block_on(interrupted.load_build(&build.build_id))
+                            .unwrap()
+                            .is_none(),
+                        "{cut}: runtime build authority survived retirement"
+                    );
+                }
+                "completion-after" => {
+                    assert!(interrupted_state.reconfiguration.is_none());
+                    assert_eq!(
+                        interrupted_state
+                            .retained_command
+                            .as_ref()
+                            .map(|retained| &retained.command),
+                        Some(&command)
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
         if cut == "completion-after" {
             assert!(
                 interrupted_state.retained_command.is_some(),
@@ -2654,14 +3241,17 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
             )
             .output()
             .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(if after { 122 } else { 121 }),
-            "active-secondary {}: {}",
-            if after { "after" } else { "before" },
-            String::from_utf8_lossy(&output.stderr)
+        assert_exact_scale_up_exit(
+            output.status,
+            if after { 193 } else { 192 },
+            &format!(
+                "active-secondary {}: {}",
+                if after { "after" } else { "before" },
+                String::from_utf8_lossy(&output.stderr)
+            ),
         );
-        let interrupted = SqliteStore::open_existing(&path, None).unwrap();
+        let candidate_path = scale_up_candidate_store_path(&path);
+        let interrupted = SqliteStore::open_existing(&candidate_path, None).unwrap();
         let interrupted_state = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(interrupted.load_state())
@@ -2671,7 +3261,8 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
             interrupted_state.pending_effect.is_some(),
             "ActiveSecondary cut did not persist pending role effect"
         );
-        let interrupted_application = CrashState::open(crash_application_path(&path));
+        let interrupted_application =
+            CrashState::open(scale_up_candidate_root(&path).join("application.json"));
         let application_state = interrupted_application.state.lock().unwrap().clone();
         assert_eq!(
             application_state.last_role,
@@ -2684,7 +3275,7 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
         );
         assert_eq!(
             application_state.operations.get(&1).map(Vec::as_slice),
-            Some(b"acknowledged-before-active-secondary".as_slice())
+            Some(b"acknowledged-before-crash".as_slice())
         );
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -2694,6 +3285,39 @@ fn scale_up_exact_cut_matrix_survives_real_process_restart() {
 
 #[test]
 fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
+    let mut exact_codes = std::collections::BTreeSet::new();
+    for cut in [
+        "store-initialization",
+        "build-authority-admission",
+        "snapshot-boundary-persistence",
+        "source-progress-persistence",
+        "target-progress-persistence",
+    ] {
+        for after in [false, true] {
+            assert!(exact_codes.insert(scale_up_store_cut_exit_code(cut, after)));
+        }
+    }
+    for cut in [
+        "pc-cc-authority-before",
+        "pc-cc-authority-after",
+        "pc-cc-access-before",
+        "pc-cc-access-after",
+        "current-only-authority-before",
+        "current-only-authority-after",
+        "current-only-access-before",
+        "current-only-access-after",
+        "build-retirement-before",
+        "build-retirement-after",
+        "completion-before",
+        "completion-after",
+    ] {
+        assert!(exact_codes.insert(scale_up_configuration_cut_exit_code(cut)));
+    }
+    for code in [192, 193, 194, 195] {
+        assert!(exact_codes.insert(code));
+    }
+    assert_eq!(exact_codes.len(), 26);
+
     for helper in [
         "scale_up_store_cut_writer_process",
         "scale_up_configuration_cut_writer_process",
@@ -2713,9 +3337,14 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
             .env_remove("KUBERIC_SCALE_UP_FAILOVER_BOUNDARY")
             .output()
             .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(101),
+            "{helper} disabled-hook control did not panic conventionally"
+        );
         assert!(
-            !output.status.success(),
-            "{helper} silently skipped its crash hook"
+            !is_scale_up_cut_exit_code(output.status.code()),
+            "{helper} accepted Rust panic code 101 as a crash cut"
         );
         let diagnostic = format!(
             "{}{}",
@@ -2728,6 +3357,16 @@ fn scale_up_crash_helpers_reject_disabled_hooks_and_missing_persistence() {
             diagnostic
         );
     }
+
+    let normal = Command::new(env::current_exe().unwrap())
+        .args(["--exact", "no_such_scale_up_crash_helper"])
+        .output()
+        .unwrap();
+    assert_eq!(normal.status.code(), Some(0));
+    assert!(
+        !is_scale_up_cut_exit_code(normal.status.code()),
+        "normal test-harness completion was accepted as a crash cut"
+    );
 
     let directory = tempdir().unwrap();
     let missing = SqliteStore::metadata_database_path(directory.path());
@@ -2766,13 +3405,21 @@ fn scale_up_configuration_cut_writer_process() {
     ) else {
         panic!("scale-up configuration cut helper requires parent-provided path and cut");
     };
-    tokio::runtime::Runtime::new()
+    std::thread::Builder::new()
+        .name("scale-up-configuration-cut".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(execute_scale_up_configuration_cut(
+                    Path::new(&path),
+                    &cut,
+                    true,
+                ));
+        })
         .unwrap()
-        .block_on(execute_scale_up_configuration_cut(
-            Path::new(&path),
-            &cut,
-            true,
-        ));
+        .join()
+        .unwrap();
 }
 
 #[test]
@@ -2808,15 +3455,14 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
             .env("KUBERIC_SCALE_UP_FAILOVER_BOUNDARY", boundary)
             .output()
             .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(if boundary == "after-authority" {
-                118
+        assert_exact_scale_up_exit(
+            output.status,
+            if boundary == "after-authority" {
+                194
             } else {
-                119
-            }),
-            "{boundary}: {}",
-            String::from_utf8_lossy(&output.stderr)
+                195
+            },
+            &format!("{boundary}: {}", String::from_utf8_lossy(&output.stderr)),
         );
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
@@ -2951,9 +3597,9 @@ fn scale_up_failover_crash_writer_process() {
         }
     });
     std::process::exit(if boundary == "after-authority" {
-        118
+        194
     } else {
-        119
+        195
     });
 }
 
