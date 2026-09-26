@@ -904,44 +904,91 @@ mod tests {
     }
 
     #[test]
-    fn representative_scale_up_status_evidence_remains_bounded() {
-        const PER_MEMBER_ENCODING_JITTER: usize = 512;
-
-        fn delta_bound(samples: &[(u32, usize)]) -> usize {
-            samples
-                .windows(2)
-                .map(|window| {
-                    let member_delta = usize::try_from(window[1].0 - window[0].0).unwrap();
-                    window[1]
-                        .1
-                        .saturating_sub(window[0].1)
-                        .div_ceil(member_delta)
-                })
-                .max()
-                .unwrap_or_default()
-                + PER_MEMBER_ENCODING_JITTER
+    fn representative_scale_up_status_variants_fit_frozen_linear_guards_and_reject_quadratic_mutations()
+     {
+        #[derive(Clone, Copy)]
+        struct FrozenGrowthGuard {
+            phase: &'static str,
+            fixed_bytes: usize,
+            per_member_bytes: usize,
         }
 
-        fn require_linear_deltas(
-            phase: &str,
-            samples: &[(u32, usize)],
-            per_member_bound: usize,
-        ) -> std::result::Result<(), String> {
-            for window in samples.windows(2) {
-                let member_delta = usize::try_from(window[1].0 - window[0].0).unwrap();
-                let byte_delta = window[1].1.saturating_sub(window[0].1);
-                if byte_delta > member_delta * per_member_bound {
-                    return Err(format!(
-                        "{phase} grew by {byte_delta} bytes across {member_delta} members; \
-                         per-member bound is {per_member_bound}"
-                    ));
-                }
-            }
-            Ok(())
+        // These are reviewed regression guards for the current wire contract, not
+        // advertised Kubernetes object limits or supported replica capacities.
+        // The fixed component includes a deliberate encoding margin; the
+        // per-member component is frozen above the largest observed adjacent
+        // fixture delta, including the witness-count steps in receipt variants.
+        const FROZEN_GROWTH_GUARDS: [FrozenGrowthGuard; 12] = [
+            FrozenGrowthGuard {
+                phase: "stable",
+                fixed_bytes: 384,
+                per_member_bytes: 128,
+            },
+            FrozenGrowthGuard {
+                phase: "allocation-scaffolding",
+                fixed_bytes: 768,
+                per_member_bytes: 128,
+            },
+            FrozenGrowthGuard {
+                phase: "allocation-frozen-pvc",
+                fixed_bytes: 800,
+                per_member_bytes: 128,
+            },
+            FrozenGrowthGuard {
+                phase: "allocation-cancellation",
+                fixed_bytes: 768,
+                per_member_bytes: 128,
+            },
+            FrozenGrowthGuard {
+                phase: "allocation-retry-lineage",
+                fixed_bytes: 896,
+                per_member_bytes: 128,
+            },
+            FrozenGrowthGuard {
+                phase: "provisioning",
+                fixed_bytes: 896,
+                per_member_bytes: 224,
+            },
+            FrozenGrowthGuard {
+                phase: "active-build",
+                fixed_bytes: 1_152,
+                per_member_bytes: 224,
+            },
+            FrozenGrowthGuard {
+                phase: "pc-cc",
+                fixed_bytes: 2_688,
+                per_member_bytes: 512,
+            },
+            FrozenGrowthGuard {
+                phase: "carried-failover",
+                fixed_bytes: 2_816,
+                per_member_bytes: 1_152,
+            },
+            FrozenGrowthGuard {
+                phase: "cleanup",
+                fixed_bytes: 1_216,
+                per_member_bytes: 224,
+            },
+            FrozenGrowthGuard {
+                phase: "committed-degraded",
+                fixed_bytes: 2_176,
+                per_member_bytes: 960,
+            },
+            FrozenGrowthGuard {
+                phase: "latest-receipt",
+                fixed_bytes: 1_792,
+                per_member_bytes: 960,
+            },
+        ];
+        const QUADRATIC_MUTATION_SAMPLE_MEMBERS: u32 = 18;
+        const QUADRATIC_BYTES_PER_MEMBER_PAIR: usize = 128;
+
+        fn bound(guard: FrozenGrowthGuard, members: u32) -> usize {
+            guard.fixed_bytes + usize::try_from(members).unwrap() * guard.per_member_bytes
         }
 
         let mut samples = std::collections::BTreeMap::<&str, Vec<(u32, usize)>>::new();
-        let mut quadratic_samples = Vec::new();
+        let mut quadratic_mutations = std::collections::BTreeMap::<&str, usize>::new();
         for previous_count in [1_u32, 2, 3, 5, 9, 17] {
             let mut intent = intent(previous_count);
             let provisioning = provisioning(&intent);
@@ -1242,57 +1289,61 @@ mod tests {
                 let count = previous_count + 1;
                 samples.entry(phase).or_default().push((count, size));
                 eprintln!("scale-up-status phase={phase} members={count} bytes={size}");
+                if count == QUADRATIC_MUTATION_SAMPLE_MEMBERS {
+                    let pair_count = usize::try_from(count).unwrap().pow(2);
+                    let mutated = serde_json::to_vec(&serde_json::json!({
+                        "status": status,
+                        "memberPairEvidence": "x".repeat(
+                            QUADRATIC_BYTES_PER_MEMBER_PAIR * pair_count
+                        ),
+                    }))
+                    .unwrap()
+                    .len();
+                    quadratic_mutations.insert(phase, mutated);
+                }
             }
-
-            let count = previous_count + 1;
-            let evidence_item = witness(&intent, intent.target.clone(), false, 99);
-            let copies_per_member =
-                vec![evidence_item; usize::try_from(count).expect("sample count")];
-            let quadratic_counterexample = serde_json::to_vec(&serde_json::json!({
-                "status": stable,
-                "memberEvidence": vec![
-                    copies_per_member;
-                    usize::try_from(count).expect("sample count")
-                ],
-            }))
-            .unwrap()
-            .len();
-            quadratic_samples.push((count, quadratic_counterexample));
         }
 
-        let mut bounds = std::collections::BTreeMap::new();
-        for (phase, phase_samples) in &samples {
-            let per_member_bound = delta_bound(phase_samples);
-            let fixed_bytes = phase_samples
-                .iter()
-                .map(|(count, size)| {
-                    size.saturating_sub(usize::try_from(*count).unwrap() * per_member_bound)
-                })
-                .max()
-                .unwrap_or_default();
-            require_linear_deltas(phase, phase_samples, per_member_bound).unwrap();
+        assert_eq!(samples.len(), FROZEN_GROWTH_GUARDS.len());
+        assert_eq!(quadratic_mutations.len(), FROZEN_GROWTH_GUARDS.len());
+        for guard in FROZEN_GROWTH_GUARDS {
+            let phase_samples = samples
+                .get(guard.phase)
+                .unwrap_or_else(|| panic!("missing samples for {}", guard.phase));
             for (count, size) in phase_samples {
                 assert!(
-                    *size <= fixed_bytes + usize::try_from(*count).unwrap() * per_member_bound,
-                    "{phase} exceeded its current-fixture fixed + per-member guard"
+                    *size <= bound(guard, *count),
+                    "{} status bytes {} exceeded frozen {} + {}*{} guard",
+                    guard.phase,
+                    size,
+                    guard.fixed_bytes,
+                    guard.per_member_bytes,
+                    count
                 );
             }
-            bounds.insert(*phase, (fixed_bytes, per_member_bound));
-            eprintln!(
-                "scale-up-status guard phase={phase} fixed={fixed_bytes} \
-                 per-member={per_member_bound}"
+            for window in phase_samples.windows(2) {
+                let added_members = usize::try_from(window[1].0 - window[0].0).unwrap();
+                let added_bytes = window[1].1.saturating_sub(window[0].1);
+                assert!(
+                    added_bytes <= added_members * guard.per_member_bytes,
+                    "{} actual field/member addition grew {} bytes across {} members; \
+                     frozen per-member margin is {}",
+                    guard.phase,
+                    added_bytes,
+                    added_members,
+                    guard.per_member_bytes
+                );
+            }
+            let mutated = quadratic_mutations[guard.phase];
+            assert!(
+                mutated > bound(guard, QUADRATIC_MUTATION_SAMPLE_MEMBERS),
+                "{} +{}*N^2 mutation unexpectedly fit frozen linear guard: {} <= {}",
+                guard.phase,
+                QUADRATIC_BYTES_PER_MEMBER_PAIR,
+                mutated,
+                bound(guard, QUADRATIC_MUTATION_SAMPLE_MEMBERS)
             );
         }
-
-        let stable_bound = bounds["stable"].1;
-        let quadratic_error =
-            require_linear_deltas("quadratic-mutation", &quadratic_samples, stable_bound)
-                .expect_err("N copies per member escaped the sampled quadratic slope guard");
-        assert!(
-            quadratic_error.contains("quadratic-mutation grew by")
-                && quadratic_error.contains("per-member bound"),
-            "quadratic mutation failed for the wrong reason: {quadratic_error}"
-        );
     }
 
     #[test]
