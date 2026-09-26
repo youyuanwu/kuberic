@@ -1144,7 +1144,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         });
         if !status.initialized
             || topology.is_none_or(|topology| {
-                topology.configuration.configuration_id != allocation.previous_configuration_id
+                topology.configuration.configuration_id != allocation.accepted_configuration_id
             })
             || policy.is_none_or(|policy| {
                 policy.replica_set_size == u32::MAX
@@ -1152,16 +1152,20 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
             })
             || expected_target != Some(allocation.target_replica_id)
             || status.provisioning.is_some()
-            || status.transition.is_some()
+            || status.transition.as_ref().is_some_and(|transition| {
+                transition.kind != TransitionKind::Failover
+                    || transition.scale_up.is_some()
+                    || transition.scale_up_failover.is_some()
+                    || transition.previous_configuration_id.as_ref()
+                        != Some(&allocation.accepted_configuration_id)
+            })
             || status.scale_up_cleanup.is_some()
             || status.secondary_scale_down_cleanup.is_some()
             || status.pending_replacement_cleanup.is_some()
             || status.last_replacement.is_some()
-            || status.primary_failure.is_some()
-            || status.quorum_loss.is_some()
         {
             return Err(ValidationError::InvalidScaleUp(
-                "allocation must exclusively bind stable accepted authority",
+                "allocation must bind compatible accepted or failover authority",
             ));
         }
     }

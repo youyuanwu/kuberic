@@ -25,74 +25,80 @@ fn accepted_count(raw: &RawObservation) -> u32 {
 }
 
 fn candidate_key(raw: &RawObservation) -> Option<(ReplicaObservationKey, String)> {
+    candidate_keys(raw).into_iter().next()
+}
+
+fn candidate_keys(raw: &RawObservation) -> Vec<(ReplicaObservationKey, String)> {
     let accepted = raw
         .set
         .status
         .as_ref()
         .and_then(|status| status.authority.topology.as_ref())
         .map(|topology| &topology.configuration.members);
-    raw.pods.iter().find_map(|pod| {
-        let replica_id = pod
-            .labels()
-            .get(REPLICA_ID_LABEL)?
-            .parse::<i64>()
-            .ok()
-            .map(ReplicaId::new)?;
-        let pod_uid = pod.uid()?;
-        if accepted.is_some_and(|members| {
-            members.iter().any(|member| {
-                member.identity.replica_id == replica_id
-                    && member.identity.instance_id.as_str() == pod_uid
-            })
-        }) {
-            return None;
-        }
-        let pvc_name = pod
-            .spec
-            .as_ref()?
-            .volumes
-            .as_ref()?
-            .iter()
-            .find_map(|volume| {
-                volume
-                    .persistent_volume_claim
-                    .as_ref()
-                    .map(|claim| claim.claim_name.clone())
-            })?;
-        let pvc_uid = raw
-            .pvcs
-            .iter()
-            .find(|pvc| pvc.name_any() == pvc_name)?
-            .uid()?;
-        Some((
-            ReplicaObservationKey::new(replica_id, ReplicaInstanceId::new(&pod_uid)),
-            pvc_uid,
-        ))
-    })
+    raw.pods
+        .iter()
+        .filter_map(|pod| {
+            let replica_id = pod
+                .labels()
+                .get(REPLICA_ID_LABEL)?
+                .parse::<i64>()
+                .ok()
+                .map(ReplicaId::new)?;
+            let pod_uid = pod.uid()?;
+            if accepted.is_some_and(|members| {
+                members.iter().any(|member| {
+                    member.identity.replica_id == replica_id
+                        && member.identity.instance_id.as_str() == pod_uid
+                })
+            }) {
+                return None;
+            }
+            let pvc_name = pod
+                .spec
+                .as_ref()?
+                .volumes
+                .as_ref()?
+                .iter()
+                .find_map(|volume| {
+                    volume
+                        .persistent_volume_claim
+                        .as_ref()
+                        .map(|claim| claim.claim_name.clone())
+                })?;
+            let pvc_uid = raw
+                .pvcs
+                .iter()
+                .find(|pvc| pvc.name_any() == pvc_name)?
+                .uid()?;
+            Some((
+                ReplicaObservationKey::new(replica_id, ReplicaInstanceId::new(&pod_uid)),
+                pvc_uid,
+            ))
+        })
+        .collect()
 }
 
 async fn observe_fresh_candidate(api: &InMemoryClusterApi) {
     let mut raw = api.observation().await;
-    let Some((key, pvc_uid)) = candidate_key(&raw) else {
-        return;
-    };
-    if raw.agents.contains_key(&key) {
-        return;
+    for (key, pvc_uid) in candidate_keys(&raw) {
+        if raw.agents.contains_key(&key) {
+            continue;
+        }
+        raw.agents.insert(
+            key.clone(),
+            RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: UID.to_string(),
+                process_session_id: format!("fresh-session-{}", key.replica_id),
+                report_sequence: 1,
+                storage_state: proto::AgentStorageState::Uninitialized as i32,
+                pod_uid: key.instance_id.to_string(),
+                pvc_uid,
+                replica_id: key.replica_id.value(),
+                ..Default::default()
+            })),
+        );
     }
-    raw.agents.insert(
-        key.clone(),
-        RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
-            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-            resource_uid: UID.to_string(),
-            process_session_id: format!("fresh-session-{}", key.replica_id),
-            report_sequence: 1,
-            storage_state: proto::AgentStorageState::Uninitialized as i32,
-            pod_uid: key.instance_id.to_string(),
-            pvc_uid,
-            replica_id: key.replica_id.value(),
-            ..Default::default()
-        })),
-    );
     api.set_observation(raw).await;
 }
 
@@ -1016,6 +1022,120 @@ async fn pending_candidate_cleanup_allows_primary_failover_but_blocks_retry() {
 }
 
 #[tokio::test]
+async fn allocation_lookup_failure_allows_primary_failover_and_retains_exact_authority() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(4, 5)));
+    tick(&api).await;
+    let before = api.observation().await;
+    let allocation = before
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .scale_up_allocation
+        .as_ref()
+        .expect("allocation is durable before provisioning")
+        .clone();
+    let old_primary = before
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    api.fail_exact_lookup(
+        "Service/db-5-allocation".into(),
+        Some("candidate allocation endpoint lookup unavailable".into()),
+    )
+    .await;
+
+    let mut failed = before;
+    let RawAgentObservation::Report(report) = failed
+        .agents
+        .get_mut(&ReplicaObservationKey::new(
+            old_primary.replica_id,
+            old_primary.instance_id.clone(),
+        ))
+        .unwrap()
+    else {
+        panic!("primary report")
+    };
+    report.reported_fault = proto::FaultType::Permanent as i32;
+    report.healthy = false;
+    failed.now_unix_seconds += 11;
+    api.set_observation(failed).await;
+
+    for _ in 0..25 {
+        let mut raw = api.observation().await;
+        raw.now_unix_seconds += 11;
+        api.set_observation(raw).await;
+        tick(&api).await;
+    }
+
+    let effects = api.effects().await;
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command))
+                if command.transition_kind == TransitionKind::Failover
+        )
+    }));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, EffectRecord::RemoveWriteRouting))
+    );
+    let converged = api.observation().await;
+    let authority = &converged.set.status.as_ref().unwrap().authority;
+    assert!(authority.transition.is_none(), "{authority:?}");
+    assert_ne!(
+        authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .primary_id,
+        old_primary.replica_id
+    );
+    assert_eq!(
+        authority
+            .scale_up_allocation
+            .as_ref()
+            .map(|retained| &retained.operation_id),
+        Some(&allocation.operation_id)
+    );
+    let accepted_primary = authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap();
+    assert_eq!(
+        converged
+            .services
+            .iter()
+            .find(|service| service.name_any() == "db-write")
+            .and_then(|service| service.spec.as_ref())
+            .and_then(|spec| spec.selector.as_ref())
+            .and_then(|selector| selector.get(INSTANCE_LABEL))
+            .map(String::as_str),
+        Some(accepted_primary.identity.instance_id.as_str())
+    );
+}
+
+#[tokio::test]
 async fn accepted_repair_and_explicit_switchover_outrank_scale_up() {
     let replacement = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
     let mut raw = replacement.observation().await;
@@ -1292,6 +1412,123 @@ async fn committed_candidate_pod_loss_replaces_and_converges_with_receipt_retain
 }
 
 #[tokio::test]
+async fn completion_receipt_yields_to_different_uid_canonical_pod_replacement() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    finish(&api, 3).await;
+    let mut raw = api.observation().await;
+    let old = raw
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == 3)
+        .unwrap()
+        .identity
+        .clone();
+    let old_pvc_uid = raw
+        .pvcs
+        .iter()
+        .find(|pvc| pvc.name_any() == "db-3-data")
+        .and_then(ResourceExt::uid)
+        .unwrap();
+    let mut replacement_pvc = raw
+        .pvcs
+        .iter()
+        .find(|pvc| pvc.name_any() == "db-3-data")
+        .unwrap()
+        .clone();
+    replacement_pvc.metadata.name = Some("db-3-successor-data".into());
+    replacement_pvc.metadata.uid = Some("different-pvc-uid".into());
+    replacement_pvc.metadata.resource_version = Some("different-pvc-rv".into());
+    raw.pvcs.push(replacement_pvc);
+    let pod = raw
+        .pods
+        .iter_mut()
+        .find(|pod| pod.name_any() == "db-3")
+        .unwrap();
+    pod.metadata.uid = Some("different-pod-uid".into());
+    pod.metadata.resource_version = Some("different-pod-rv".into());
+    pod.metadata
+        .labels
+        .get_or_insert_default()
+        .insert(INSTANCE_LABEL.into(), "different-pod-uid".into());
+    pod.spec.as_mut().unwrap().volumes.as_mut().unwrap()[0]
+        .persistent_volume_claim
+        .as_mut()
+        .unwrap()
+        .claim_name = "db-3-successor-data".into();
+    raw.agents.insert(
+        ReplicaObservationKey::new(old.replica_id, old.instance_id.clone()),
+        RawAgentObservation::Unavailable {
+            message: "frozen accepted Pod no longer exists".into(),
+        },
+    );
+    api.set_observation(raw).await;
+
+    finish(&api, 3).await;
+    let completed = api.observation().await;
+    let authority = &completed.set.status.as_ref().unwrap().authority;
+    let member = authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == 3)
+        .unwrap();
+    assert_ne!(member.identity, old);
+    assert_ne!(member.identity.instance_id.as_str(), "different-pod-uid");
+    assert!(authority.last_scale_up.is_some());
+    assert!(authority.pending_replacement_cleanup.is_none());
+    assert!(authority.last_replacement.is_none());
+    assert!(completed.pods.iter().any(|pod| {
+        pod.name_any() == "db-3" && pod.uid().as_deref() == Some("different-pod-uid")
+    }));
+    assert!(
+        completed
+            .pvcs
+            .iter()
+            .any(|pvc| pvc.uid().as_deref() == Some("different-pvc-uid"))
+    );
+    let effects = api.effects().await;
+    let admission = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command))
+                    if command.transition_kind == TransitionKind::Replacement
+            )
+        })
+        .expect("ordinary accepted-member replacement was admitted");
+    let old_storage_cleanup = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                EffectRecord::DeleteScaleDownResource {
+                    resource: ScaleDownResource::Pvc,
+                    uid,
+                    ..
+                } if uid == old_pvc_uid.as_str()
+            )
+        })
+        .expect("orphaned accepted-member storage was eventually cleaned");
+    assert!(
+        admission < old_storage_cleanup,
+        "receipt resources must not grant pre-admission cleanup authority"
+    );
+}
+
+#[tokio::test]
 async fn repeated_primary_loss_outranks_deferred_candidate_cleanup() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(4, 5)));
     for _ in 0..30 {
@@ -1530,4 +1767,239 @@ async fn cancellation_after_pod_create_cleans_endpoint_pod_pvc_without_unrelated
         }
     }
     panic!("Pod-created pre-provisioning boundary not reached");
+}
+
+#[tokio::test]
+async fn pvc_boundary_decrease_increase_finishes_cleanup_before_fresh_attempt() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let old_allocation = loop {
+        tick(&api).await;
+        let raw = api.observation().await;
+        if let Some(allocation) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .filter(|allocation| allocation.pvc_uid.is_some() && allocation.pod_uid.is_none())
+        {
+            break allocation.clone();
+        }
+    };
+    let old_pvc_uid = old_allocation.pvc_uid.as_ref().unwrap().clone();
+    let churn_start = api.effects().await.len();
+    let mut reduced = api.observation().await;
+    reduced.set.spec.replicas = 1;
+    reduced.set.metadata.generation = Some(reduced.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(reduced).await;
+    tick(&api).await;
+    let mut renewed = api.observation().await;
+    renewed.set.spec.replicas = 2;
+    renewed.set.metadata.generation = Some(renewed.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(renewed).await;
+
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    let authority = &completed.set.status.as_ref().unwrap().authority;
+    let receipt = authority.last_scale_up.as_ref().unwrap();
+    assert_ne!(receipt.intent.operation_id, old_allocation.operation_id);
+    assert!(
+        completed
+            .pvcs
+            .iter()
+            .all(|pvc| pvc.uid().as_deref() != Some(old_pvc_uid.as_str()))
+    );
+    assert!(
+        api.effects().await[churn_start..]
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+    );
+}
+
+#[tokio::test]
+async fn pod_boundary_decrease_increase_cleans_old_exact_attempt_before_fresh_attempt() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let mut allocation_before_cancel = None;
+    for _ in 0..20 {
+        tick(&api).await;
+        let raw = api.observation().await;
+        if let Some(allocation) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .filter(|allocation| {
+                allocation.pvc_uid.is_some()
+                    && allocation.pod_uid.is_none()
+                    && raw.pods.iter().any(|pod| pod.name_any() == "db-2")
+            })
+        {
+            allocation_before_cancel = Some(allocation.clone());
+            break;
+        }
+    }
+    let allocation_before_cancel =
+        allocation_before_cancel.expect("Pod-created allocation boundary not reached");
+    let churn_start = api.effects().await.len();
+    let mut reduced = api.observation().await;
+    reduced.set.spec.replicas = 1;
+    reduced.set.metadata.generation = Some(reduced.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(reduced).await;
+    tick(&api).await;
+    tick(&api).await;
+    let frozen = api.observation().await;
+    let old_allocation = frozen
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .scale_up_allocation
+        .as_ref()
+        .expect("cancelled allocation remains durable")
+        .clone();
+    assert_eq!(
+        old_allocation.operation_id,
+        allocation_before_cancel.operation_id
+    );
+    let old_pod_uid = old_allocation
+        .pod_uid
+        .as_ref()
+        .expect("cancellation froze exact Pod UID")
+        .clone();
+    let old_pvc_uid = old_allocation.pvc_uid.as_ref().unwrap().clone();
+    let mut renewed = api.observation().await;
+    renewed.set.spec.replicas = 2;
+    renewed.set.metadata.generation = Some(renewed.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(renewed).await;
+
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    let authority = &completed.set.status.as_ref().unwrap().authority;
+    let member = authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == 2)
+        .unwrap();
+    assert_ne!(member.identity.instance_id.as_str(), old_pod_uid.as_str());
+    assert_ne!(
+        authority
+            .last_scale_up
+            .as_ref()
+            .unwrap()
+            .intent
+            .operation_id,
+        old_allocation.operation_id
+    );
+    assert!(
+        completed
+            .pvcs
+            .iter()
+            .all(|pvc| pvc.uid().as_deref() != Some(old_pvc_uid.as_str()))
+    );
+    assert!(
+        api.effects().await[churn_start..]
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+    );
+}
+
+#[tokio::test]
+async fn pvc_only_cancellation_treats_different_uid_replacement_as_frozen_uid_absence() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let allocation = loop {
+        tick(&api).await;
+        let raw = api.observation().await;
+        if let Some(allocation) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .filter(|allocation| allocation.pvc_uid.is_some() && allocation.pod_uid.is_none())
+        {
+            break allocation.clone();
+        }
+    };
+    let frozen_pvc_uid = allocation.pvc_uid.as_ref().unwrap().clone();
+    let mut raw = api.observation().await;
+    let pvc = raw
+        .pvcs
+        .iter_mut()
+        .find(|pvc| pvc.name_any() == "db-2-data")
+        .unwrap();
+    pvc.metadata.uid = Some("replacement-pvc-uid".into());
+    pvc.metadata.resource_version = Some("replacement-pvc-rv".into());
+    raw.set.spec.replicas = 1;
+    raw.set.metadata.generation = Some(raw.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(raw).await;
+
+    finish(&api, 1).await;
+    let cancelled = api.observation().await;
+    assert!(
+        cancelled
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .scale_up_allocation
+            .is_none()
+    );
+    assert!(cancelled.pvcs.iter().any(|pvc| {
+        pvc.name_any() == "db-2-data" && pvc.uid().as_deref() == Some("replacement-pvc-uid")
+    }));
+    assert!(api.effects().await.iter().all(|effect| {
+        !matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pvc,
+                uid,
+                ..
+            } if uid == "replacement-pvc-uid"
+        )
+    }));
+    assert!(api.effects().await.iter().all(|effect| {
+        !matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pvc,
+                uid,
+                ..
+            } if uid == frozen_pvc_uid.as_str()
+        )
+    }));
+
+    let mut replacement_removed = cancelled;
+    replacement_removed
+        .pvcs
+        .retain(|pvc| pvc.uid().as_deref() != Some("replacement-pvc-uid"));
+    replacement_removed.set.spec.replicas = 2;
+    replacement_removed.set.metadata.generation = Some(
+        replacement_removed
+            .set
+            .metadata
+            .generation
+            .unwrap_or_default()
+            + 1,
+    );
+    api.set_observation(replacement_removed).await;
+    finish(&api, 2).await;
+    assert_ne!(
+        api.observation()
+            .await
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .last_scale_up
+            .as_ref()
+            .unwrap()
+            .intent
+            .operation_id,
+        allocation.operation_id
+    );
 }

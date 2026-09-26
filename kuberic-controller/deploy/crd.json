@@ -2784,6 +2784,13 @@
                     "description": "Durable scale-up allocation recorded before any candidate resource is created.",
                     "nullable": true,
                     "properties": {
+                      "acceptedConfigurationId": {
+                        "type": "string"
+                      },
+                      "cancellationStarted": {
+                        "default": false,
+                        "type": "boolean"
+                      },
                       "desiredReplicas": {
                         "format": "uint32",
                         "minimum": 1.0,
@@ -2818,6 +2825,7 @@
                       }
                     },
                     "required": [
+                      "acceptedConfigurationId",
                       "desiredReplicas",
                       "operationId",
                       "previousConfigurationId",

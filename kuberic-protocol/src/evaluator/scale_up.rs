@@ -719,7 +719,7 @@ pub(super) fn recover_local_acceptance(
                     &exact.identity.pod,
                     CleanupResourceIdentity::Present { uid, .. }
                         if uid == member.identity.instance_id.as_str()
-                ) && matches!(exact.pod, ExactResourceObservation::NotFound)
+                ) && secondary_scale_down::absent(&exact.identity.pod, &exact.pod)
             });
         if pod_authoritatively_absent
             && accepted
@@ -1017,11 +1017,13 @@ pub(super) fn begin(
         resource_uid: scale_up.resource_uid,
         spec_generation: scale_up.spec_generation,
         desired_replicas: scale_up.desired_replicas,
-        previous_configuration_id: scale_up.previous_configuration.configuration_id,
+        previous_configuration_id: scale_up.previous_configuration.configuration_id.clone(),
+        accepted_configuration_id: scale_up.previous_configuration.configuration_id,
         target_replica_id: scale_up.target_replica_id,
         operation_id: OperationId::default(),
         pod_uid: None,
         pvc_uid: None,
+        cancellation_started: false,
     };
     allocation.operation_id = allocation.expected_operation_id();
     let target = allocation.observation_target();
@@ -1095,7 +1097,40 @@ pub(super) fn allocation(
         .effective_policy
         .as_ref()
         .expect("validated allocation has accepted policy");
-    let cancelled = snapshot.desired.replicas <= previous_policy.replica_set_size;
+    if !allocation.cancellation_started
+        && snapshot.desired.replicas <= previous_policy.replica_set_size
+    {
+        let mut status = snapshot.status.clone();
+        status
+            .scale_up_allocation
+            .as_mut()
+            .expect("active allocation")
+            .cancellation_started = true;
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpAllocationCancellationFrozen",
+            "cleanup",
+            Some(&allocation.observation_target()),
+            Some(&allocation.operation_id),
+            "persisted irreversible exact allocation cleanup before observing resources",
+        ));
+    }
+    if let Some(plan) = maybe_begin_stable_failover(snapshot, snapshot.status.clone(), config) {
+        return plan;
+    }
+    if let Some(plan) = restore_accepted_service_before_cleanup(
+        snapshot,
+        previous,
+        previous_policy,
+        &allocation.observation_target(),
+        &allocation.operation_id,
+        "allocation",
+        config,
+    ) {
+        return plan;
+    }
+    let cancelled = allocation.cancellation_started;
     let Some(exact) = allocation_observation(snapshot, allocation) else {
         return allocation_wait(
             snapshot,
@@ -1307,7 +1342,7 @@ pub(super) fn allocation(
                     changes: vec![change],
                 };
             }
-            if matches!(exact.pvc, ExactResourceObservation::NotFound) {
+            if secondary_scale_down::absent(&exact.identity.pvc, &exact.pvc) {
                 let mut status = snapshot.status.clone();
                 status.scale_up_allocation = None;
                 return persist(progress_status(

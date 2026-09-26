@@ -93,6 +93,7 @@ pub fn validate_scale_up_allocation(allocation: &ScaleUpAllocation) -> Result {
         || allocation.spec_generation == 0
         || allocation.desired_replicas == 0
         || allocation.previous_configuration_id.is_empty()
+        || allocation.accepted_configuration_id.is_empty()
         || allocation.target_replica_id.value() <= 0
         || allocation.operation_id.is_empty()
         || allocation.operation_id != allocation.expected_operation_id()

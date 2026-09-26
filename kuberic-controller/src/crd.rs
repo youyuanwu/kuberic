@@ -177,10 +177,12 @@ mod tests {
             "specGeneration",
             "desiredReplicas",
             "previousConfigurationId",
+            "acceptedConfigurationId",
             "targetReplicaId",
             "operationId",
             "podUid",
             "pvcUid",
+            "cancellationStarted",
         ] {
             assert!(allocation.get(field).is_some(), "{field}");
         }

@@ -421,12 +421,15 @@ pub struct ScaleUpAllocation {
     #[schemars(range(min = 1))]
     pub desired_replicas: u32,
     pub previous_configuration_id: ConfigurationId,
+    pub accepted_configuration_id: ConfigurationId,
     pub target_replica_id: ReplicaId,
     pub operation_id: OperationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<PodUid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pvc_uid: Option<PvcUid>,
+    #[serde(default)]
+    pub cancellation_started: bool,
 }
 
 impl ScaleUpAllocation {

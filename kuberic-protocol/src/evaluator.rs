@@ -2794,6 +2794,9 @@ fn evaluate_transition(
                 configuration: current.clone(),
             });
             accepted.transition = None;
+            if let Some(allocation) = accepted.scale_up_allocation.as_mut() {
+                allocation.accepted_configuration_id = current.configuration_id.clone();
+            }
             if retired.is_some() {
                 accepted.last_replacement = accepted.pending_replacement_cleanup.take();
             }
