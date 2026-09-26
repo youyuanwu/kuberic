@@ -17,6 +17,15 @@ pub fn config() -> EvaluationConfig {
 pub struct Model {
     pub snapshot: ObservationSnapshot,
     pub accepted_history: Vec<u32>,
+    pending_build: Option<PendingBuild>,
+}
+
+struct PendingBuild {
+    build: AgentBuildReport,
+    source: ReplicaObservationKey,
+    target: ReplicaObservationKey,
+    catch_up_boundary: i64,
+    phase: u8,
 }
 
 impl Model {
@@ -130,6 +139,7 @@ impl Model {
                 now_unix_seconds: 100,
             },
             accepted_history: vec![accepted],
+            pending_build: None,
         }
     }
 
@@ -137,6 +147,28 @@ impl Model {
         let plan = evaluate(&self.snapshot, &config());
         assert_eq!(plan, evaluate(&self.snapshot, &config()));
         plan
+    }
+
+    pub fn from_snapshot(snapshot: ObservationSnapshot, accepted_history: Vec<u32>) -> Self {
+        Self {
+            snapshot,
+            accepted_history,
+            pending_build: None,
+        }
+    }
+
+    pub fn fork(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            accepted_history: self.accepted_history.clone(),
+            pending_build: self.pending_build.as_ref().map(|pending| PendingBuild {
+                build: pending.build.clone(),
+                source: pending.source.clone(),
+                target: pending.target.clone(),
+                catch_up_boundary: pending.catch_up_boundary,
+                phase: pending.phase,
+            }),
+        }
     }
 
     pub fn accepted_count(&self) -> u32 {
@@ -156,6 +188,7 @@ impl Model {
             }
             Plan::Wait { status, .. } => {
                 self.snapshot.status = status;
+                self.advance_async_build();
                 false
             }
             Plan::Unsafe { reason, .. } => panic!(
@@ -358,6 +391,10 @@ impl Model {
                 }));
             }
             ProtocolCommand::EnsureReplicaBuild(command) => {
+                if self.pending_build.is_some() {
+                    self.advance_async_build();
+                    return;
+                }
                 let source_key = self
                     .snapshot
                     .replicas
@@ -383,26 +420,26 @@ impl Model {
                 let build = AgentBuildReport {
                     build_id: command.operation_id,
                     target: command.target,
-                    last_sequence: 3,
+                    last_sequence: 0,
                     replication_boundary_lsn: snapshot_boundary,
-                    durable_lsn: catch_up_boundary,
-                    completed: true,
-                    catch_up_boundary_lsn: Some(catch_up_boundary),
+                    durable_lsn: snapshot_boundary,
+                    completed: false,
+                    catch_up_boundary_lsn: None,
                 };
-                for key in [source_key, target_key] {
-                    let AgentObservation::Report(report) =
-                        &mut self.snapshot.replicas.get_mut(&key).unwrap().agent
-                    else {
-                        panic!("build participant report")
-                    };
-                    report.builds = vec![build.clone()];
-                    report.current_progress = catch_up_boundary;
-                    report.committed_lsn = catch_up_boundary;
-                    if key.replica_id != command.local_replica_id {
-                        report.role = ReplicaRole::IdleSecondary;
-                    }
-                    report.report_sequence += 1;
-                }
+                let AgentObservation::Report(source) =
+                    &mut self.snapshot.replicas.get_mut(&source_key).unwrap().agent
+                else {
+                    panic!("build source report")
+                };
+                source.builds = vec![build.clone()];
+                source.report_sequence += 1;
+                self.pending_build = Some(PendingBuild {
+                    build,
+                    source: source_key,
+                    target: target_key,
+                    catch_up_boundary,
+                    phase: 0,
+                });
             }
             ProtocolCommand::EnsureConfiguration(command) => {
                 let identity = ReplicaIdentity {
@@ -490,6 +527,85 @@ impl Model {
         report.process_session_id =
             ProcessSessionId::new(format!("{}-restart", report.process_session_id));
         report.report_sequence = 1;
+    }
+
+    pub fn apply_wait(&mut self, status: AcceptedStatus) {
+        self.snapshot.status = status;
+        self.advance_async_build();
+    }
+
+    fn advance_async_build(&mut self) {
+        let Some(pending) = self.pending_build.as_mut() else {
+            return;
+        };
+        match pending.phase {
+            0 => {
+                let AgentObservation::Report(source) = &mut self
+                    .snapshot
+                    .replicas
+                    .get_mut(&pending.source)
+                    .unwrap()
+                    .agent
+                else {
+                    panic!("build source report")
+                };
+                source.current_progress += 1;
+                source.committed_lsn = source.current_progress;
+                source.report_sequence += 1;
+                let AgentObservation::Report(target) = &mut self
+                    .snapshot
+                    .replicas
+                    .get_mut(&pending.target)
+                    .unwrap()
+                    .agent
+                else {
+                    panic!("build target report")
+                };
+                target.role = ReplicaRole::IdleSecondary;
+                target.builds = vec![pending.build.clone()];
+                target.report_sequence += 1;
+                pending.phase = 1;
+            }
+            1 => {
+                let AgentObservation::Report(source) = &mut self
+                    .snapshot
+                    .replicas
+                    .get_mut(&pending.source)
+                    .unwrap()
+                    .agent
+                else {
+                    panic!("build source report")
+                };
+                source.current_progress = pending.catch_up_boundary;
+                source.committed_lsn = pending.catch_up_boundary;
+                source.builds[0].last_sequence = 2;
+                source.builds[0].durable_lsn = pending.catch_up_boundary;
+                source.builds[0].completed = true;
+                source.builds[0].catch_up_boundary_lsn = Some(pending.catch_up_boundary);
+                source.report_sequence += 1;
+                pending.phase = 2;
+            }
+            2 => {
+                let AgentObservation::Report(target) = &mut self
+                    .snapshot
+                    .replicas
+                    .get_mut(&pending.target)
+                    .unwrap()
+                    .agent
+                else {
+                    panic!("build target report")
+                };
+                target.current_progress = pending.catch_up_boundary;
+                target.committed_lsn = pending.catch_up_boundary;
+                target.builds[0].last_sequence = 2;
+                target.builds[0].durable_lsn = pending.catch_up_boundary;
+                target.builds[0].completed = true;
+                target.builds[0].catch_up_boundary_lsn = Some(pending.catch_up_boundary);
+                target.report_sequence += 1;
+                self.pending_build = None;
+            }
+            _ => unreachable!(),
+        }
     }
 
     pub fn remove_candidate_report(&mut self) {

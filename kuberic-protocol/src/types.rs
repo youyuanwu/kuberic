@@ -1209,6 +1209,8 @@ pub struct AcceptedStatus {
     pub scale_up_cleanup: Option<Box<ScaleUpCleanup>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scale_up: Option<Box<ScaleUpReceipt>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up_admission_started: Option<OperationId>,
     pub conditions: Vec<StatusCondition>,
 }
 

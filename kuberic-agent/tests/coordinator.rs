@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -11,7 +12,11 @@ use kuberic_agent::state::{
 };
 use kuberic_agent::store::{AgentStore, BeginConfiguration};
 use kuberic_agent::{AgentError, Result};
-use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, PrepareSwitchover};
+use kuberic_protocol::command::{
+    EnsureConfiguration, EnsureReplicaBuild, PrepareSwitchover, ProtocolCommand,
+};
+use kuberic_protocol::observation::AgentObservation;
+use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
@@ -32,6 +37,10 @@ use tempfile::tempdir;
 #[allow(dead_code)]
 #[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
 mod removal_fixture;
+
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/scale_up_model.rs"]
+mod scale_up_model;
 
 fn removal_state(
     intent: &kuberic_protocol::types::SecondaryScaleDownIntent,
@@ -769,6 +778,225 @@ fn store() -> (tempfile::TempDir, Arc<SqliteStore>) {
     (directory, Arc::new(store))
 }
 
+fn evaluator_agent_states(model: &scale_up_model::Model) -> BTreeMap<i64, AgentState> {
+    let configuration = &model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    let policy = model.snapshot.status.effective_policy.clone().unwrap();
+    configuration
+        .members
+        .iter()
+        .map(|member| {
+            let mut state = AgentState::new(StorageIdentity {
+                schema_version: SCHEMA_VERSION,
+                resource_uid: model.snapshot.resource_uid.clone(),
+                pod_uid: PodUid::new(member.identity.instance_id.as_str()),
+                pvc_uid: PvcUid::new(format!("pvc-{}", member.identity.replica_id)),
+                initialization_id: InitializationId::new(format!(
+                    "init-{}",
+                    member.identity.replica_id
+                )),
+                local_identity: member.identity.clone(),
+                effective_policy: policy.clone(),
+            });
+            state.admitted_policy = Some(policy.clone());
+            state.highest_epoch = configuration.epoch;
+            state.current_configuration = Some(configuration.clone());
+            state.role = member.role;
+            state.read_status = AccessStatus::Granted;
+            state.write_status = if member.role == ReplicaRole::Primary {
+                AccessStatus::Granted
+            } else {
+                AccessStatus::NotPrimary
+            };
+            (member.identity.replica_id.value(), state)
+        })
+        .collect()
+}
+
+fn apply_evaluator_initialization(
+    states: &mut BTreeMap<i64, AgentState>,
+    command: &kuberic_protocol::command::InitializeAgentStore,
+) {
+    let identity = ReplicaIdentity {
+        replica_id: command.local_replica_id,
+        instance_id: command.expected_instance_id.clone(),
+        agent_generation: command.assigned_agent_generation.clone(),
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: command.resource_uid.clone(),
+        pod_uid: command.expected_pod_uid.clone(),
+        pvc_uid: command.expected_pvc_uid.clone(),
+        initialization_id: command.initialization_id.clone(),
+        local_identity: identity,
+        effective_policy: command.effective_policy.clone(),
+    });
+    state.scale_up_initialization = command.provisioning.clone();
+    states.insert(command.local_replica_id.value(), state);
+}
+
+fn apply_evaluator_configuration(
+    states: &mut BTreeMap<i64, AgentState>,
+    command: &EnsureConfiguration,
+) {
+    let state = states
+        .get_mut(&command.local_replica_id.value())
+        .expect("evaluator command target state");
+    let evidence = command
+        .scale_up_evidence
+        .as_deref()
+        .expect("scale-up command evidence");
+    let intent = evidence.intent();
+    if state.identity.local_identity == intent.target
+        && !state.build_commands.contains_key(&intent.build_id)
+    {
+        let authority = BuildAuthority {
+            build_id: intent.build_id.clone(),
+            kind: BuildAuthorityKind::Provisioning,
+            source: intent.primary.clone(),
+            target: intent.target.clone(),
+            current_configuration: intent.previous_configuration.clone(),
+            replication_boundary_lsn: intent.snapshot_boundary_lsn,
+        };
+        state.build_commands.insert(
+            intent.build_id.clone(),
+            EnsureReplicaBuild {
+                operation_id: intent.build_id.clone(),
+                local_replica_id: intent.target.replica_id,
+                expected_instance_id: intent.target.instance_id.clone(),
+                expected_agent_generation: intent.target.agent_generation.clone(),
+                target: intent.target.clone(),
+                authority: Some(authority.clone()),
+                source_session_id: Some(ProcessSessionId::new("evaluator-source-session")),
+            },
+        );
+        state.build_progress.insert(
+            intent.build_id.clone(),
+            kuberic_runtime_internal::authority::DurableBuildProgress {
+                authority,
+                last_sequence: 3,
+                durable_lsn: intent.catch_up_boundary_lsn,
+                completed: true,
+                catch_up_boundary_lsn: Some(intent.catch_up_boundary_lsn),
+            },
+        );
+        state.role = ReplicaRole::IdleSecondary;
+    }
+    if state.identity.local_identity == intent.target {
+        if matches!(evidence, ScaleUpConfigurationEvidence::Failover { .. }) {
+            if command.current_only {
+                assert_eq!(
+                    state.scale_up_evidence.as_deref(),
+                    command.scale_up_evidence.as_deref()
+                );
+            } else {
+                assert!(matches!(
+                    state.scale_up_evidence.as_deref(),
+                    Some(ScaleUpConfigurationEvidence::Admission {
+                        intent: durable_intent
+                    }) if durable_intent == intent
+                ));
+            }
+            assert_eq!(
+                state.current_configuration.as_ref(),
+                Some(if command.current_only {
+                    &command.current_configuration
+                } else {
+                    &intent.current_configuration
+                })
+            );
+            if !command.current_only {
+                assert!(state.previous_configuration.is_none());
+            }
+        }
+        let build = state.build_commands.get(&intent.build_id).unwrap();
+        let authority = build.authority.as_ref().unwrap();
+        let progress = state.build_progress.get(&intent.build_id).unwrap();
+        assert_eq!(build.target, intent.target);
+        assert_eq!(authority.build_id, intent.build_id);
+        assert_eq!(authority.source, intent.primary);
+        assert_eq!(authority.target, intent.target);
+        assert_eq!(
+            authority.current_configuration,
+            intent.previous_configuration
+        );
+        assert_eq!(
+            authority.replication_boundary_lsn,
+            intent.snapshot_boundary_lsn
+        );
+        assert_eq!(progress.authority, *authority);
+        assert!(progress.completed);
+        assert_eq!(
+            progress.catch_up_boundary_lsn,
+            Some(intent.catch_up_boundary_lsn)
+        );
+        assert!(progress.durable_lsn >= intent.catch_up_boundary_lsn);
+    }
+    let authority = admit_configuration(command, state).unwrap_or_else(|error| {
+        panic!(
+            "evaluator-generated command {} rejected for replica {}: {error}",
+            command.operation_id, command.local_replica_id
+        )
+    });
+    state.previous_configuration = authority.previous_configuration.clone();
+    state.current_configuration = Some(authority.current_configuration.clone());
+    state.highest_epoch = authority.current_configuration.epoch;
+    state.scale_up_evidence = authority.scale_up.clone();
+    state.admitted_policy = Some(intent.current_policy.clone());
+    state.previous_policy = authority
+        .previous_configuration
+        .as_ref()
+        .map(|_| intent.previous_policy.clone());
+    state.role = authority.local_role();
+    state.read_status = AccessStatus::Granted;
+    state.write_status = if state.role == ReplicaRole::Primary {
+        command.primary_write_status
+    } else {
+        AccessStatus::NotPrimary
+    };
+    if command.current_only {
+        state.retired_builds.insert(intent.build_id.clone());
+    }
+    state.retained_command = Some(RetainedCommandResult {
+        command: command.clone(),
+        role: state.role,
+        epoch: state.highest_epoch,
+    });
+}
+
+fn step_evaluator_with_agent_admission(
+    model: &mut scale_up_model::Model,
+    states: &mut BTreeMap<i64, AgentState>,
+) {
+    match model.plan() {
+        Plan::Apply { changes } => {
+            for change in changes {
+                model.apply(change);
+            }
+        }
+        Plan::Execute { command } => {
+            match &command {
+                ProtocolCommand::InitializeAgentStore(command) => {
+                    apply_evaluator_initialization(states, command)
+                }
+                ProtocolCommand::EnsureConfiguration(command) => {
+                    apply_evaluator_configuration(states, command)
+                }
+                _ => {}
+            }
+            model.execute(command);
+        }
+        Plan::Wait { status, .. } => model.apply_wait(status),
+        Plan::Stable { status, .. } => model.snapshot.status = status,
+        Plan::Unsafe { reason, .. } => panic!("evaluator admission trace unsafe: {reason:?}"),
+    }
+}
+
 fn scale_up_fixture(current_only: bool) -> (AgentState, EnsureConfiguration, AdmittedAuthority) {
     let primary = identity();
     let candidate = ReplicaIdentity {
@@ -1263,6 +1491,199 @@ async fn scale_up_candidate_activates_only_after_exact_build_and_retires_it_on_c
             .map(|retained| &retained.command),
         Some(&configuration(true))
     );
+}
+
+#[test]
+fn evaluator_generated_sequential_scale_up_commands_pass_real_agent_admission() {
+    let mut model = scale_up_model::Model::new(1, 3);
+    let mut states = evaluator_agent_states(&model);
+    for _ in 0..240 {
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+        if model.accepted_count() == 3
+            && model.snapshot.status.transition.is_none()
+            && matches!(model.plan(), Plan::Stable { .. })
+        {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_history, vec![1, 2, 3]);
+    let accepted = &model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    for member in &accepted.members {
+        let state = states.get(&member.identity.replica_id.value()).unwrap();
+        assert_eq!(state.current_configuration.as_ref(), Some(accepted));
+        assert!(state.previous_configuration.is_none());
+        assert_eq!(state.role, member.role);
+        assert!(
+            state
+                .retained_command
+                .as_ref()
+                .is_some_and(|retained| retained.command.current_only)
+        );
+    }
+}
+
+#[test]
+fn evaluator_generated_carried_failover_commands_pass_real_agent_admission() {
+    let mut model = scale_up_model::Model::new(2, 3);
+    let mut states = evaluator_agent_states(&model);
+    loop {
+        let candidate_current_only = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                model
+                    .snapshot
+                    .observation_for_identity(&intent.target)
+                    .and_then(|observation| match &observation.agent {
+                        AgentObservation::Report(report) => Some(report),
+                        _ => None,
+                    })
+                    .is_some_and(|report| {
+                        report.previous_configuration.is_none()
+                            && report.current_configuration.as_ref()
+                                == Some(&intent.current_configuration)
+                    })
+            });
+        if candidate_current_only {
+            break;
+        }
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+    }
+    model.report_mut(1).reported_fault = Some(kuberic_protocol::types::FaultType::Permanent);
+    model.report_mut(1).write_status = AccessStatus::ReconfigurationPending;
+    for _ in 0..160 {
+        step_evaluator_with_agent_admission(&mut model, &mut states);
+        if model.accepted_count() == 3 && model.snapshot.status.transition.is_none() {
+            break;
+        }
+    }
+    assert_eq!(model.accepted_count(), 3);
+    let receipt = model
+        .snapshot
+        .status
+        .last_scale_up
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(receipt.failover_evidence.is_some());
+    let accepted = receipt.accepted_configuration.clone();
+    for member in accepted
+        .members
+        .iter()
+        .filter(|member| member.identity.replica_id != ReplicaId::new(1))
+    {
+        let state = states.get(&member.identity.replica_id.value()).unwrap();
+        assert_eq!(state.current_configuration.as_ref(), Some(&accepted));
+        assert!(state.previous_configuration.is_none());
+        assert!(matches!(
+            state.scale_up_evidence.as_deref(),
+            Some(ScaleUpConfigurationEvidence::Failover { .. })
+        ));
+    }
+
+    let intent = receipt.intent.clone();
+    let old_primary = intent.primary.clone();
+    let original_member = intent
+        .current_configuration
+        .members
+        .iter()
+        .find(|member| member.identity == old_primary)
+        .unwrap();
+    let original_current_only = EnsureConfiguration {
+        operation_id: intent.command_operation_id(
+            ScaleUpStage::CurrentOnly,
+            &old_primary,
+            &intent.current_configuration,
+        ),
+        previous_configuration: None,
+        current_configuration: intent.current_configuration.clone(),
+        previous_epoch: None,
+        current_epoch: intent.current_configuration.epoch,
+        effective_policy: intent.current_policy.clone(),
+        previous_policy: Some(intent.previous_policy.clone()),
+        secondary_removal_evidence: None,
+        scale_up_evidence: Some(Box::new(ScaleUpConfigurationEvidence::Admission {
+            intent: intent.clone(),
+        })),
+        local_replica_id: old_primary.replica_id,
+        expected_instance_id: old_primary.instance_id.clone(),
+        expected_agent_generation: old_primary.agent_generation.clone(),
+        transition_kind: TransitionKind::ScaleUp,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::Granted,
+        current_only: true,
+        retire_build_ids: vec![intent.build_id.clone()],
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    {
+        let state = states.get_mut(&old_primary.replica_id.value()).unwrap();
+        state.previous_configuration = None;
+        state.current_configuration = Some(intent.current_configuration.clone());
+        state.highest_epoch = intent.current_configuration.epoch;
+        state.scale_up_evidence = original_current_only.scale_up_evidence.clone();
+        state.admitted_policy = Some(intent.current_policy.clone());
+        state.previous_policy = None;
+        state.role = original_member.role;
+        state.read_status = AccessStatus::Granted;
+        state.write_status = AccessStatus::Granted;
+        state.retired_builds.insert(intent.build_id.clone());
+        state.retained_command = Some(RetainedCommandResult {
+            command: original_current_only.clone(),
+            role: state.role,
+            epoch: state.highest_epoch,
+        });
+    }
+    {
+        let report = model.report_mut(old_primary.replica_id.value());
+        report.healthy = true;
+        report.reported_fault = None;
+        report.role = original_member.role;
+        report.read_status = AccessStatus::Granted;
+        report.write_status = AccessStatus::Granted;
+        report.epoch = intent.current_configuration.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(intent.current_configuration.clone());
+        report.verified_replication_lsn = Some(intent.catch_up_boundary_lsn);
+        report.retained_operation_id = Some(original_current_only.operation_id.clone());
+        report.scale_up_intent = Some(Box::new(intent.clone()));
+        report.report_sequence += 1;
+    }
+    let mut corrections = 0;
+    for _ in 0..10 {
+        match model.plan() {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.local_replica_id == old_primary.replica_id => {
+                apply_evaluator_configuration(&mut states, &command);
+                model.execute(ProtocolCommand::EnsureConfiguration(command));
+                corrections += 1;
+                if corrections == 2 {
+                    break;
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("late failover correction stalled: {other:?}"),
+        }
+    }
+    assert_eq!(corrections, 2);
+    let recovered = states.get(&old_primary.replica_id.value()).unwrap();
+    assert_eq!(recovered.current_configuration.as_ref(), Some(&accepted));
+    assert!(recovered.previous_configuration.is_none());
 }
 
 #[test]

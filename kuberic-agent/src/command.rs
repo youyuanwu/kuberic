@@ -538,13 +538,29 @@ fn admit_scale_up_configuration(
             "scale-up command target or epoch differs from durable identity".into(),
         ));
     }
+    let sequential_supersession = state.scale_up_evidence.as_deref().is_some_and(|existing| {
+        existing.intent() != intent
+            && state.previous_configuration.is_none()
+            && state.current_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.admitted_policy.as_ref() == Some(&intent.previous_policy)
+            && state.retired_builds.contains(&existing.intent().build_id)
+            && state.retained_command.as_ref().is_some_and(|retained| {
+                retained.command.current_only
+                    && retained.command.scale_up_evidence.as_deref() == Some(existing)
+                    && retained.command.current_configuration == intent.previous_configuration
+            })
+    });
     if let Some(existing) = state.scale_up_evidence.as_deref()
         && existing.intent() != intent
+        && !sequential_supersession
     {
         return Err(AgentError::CommandRejected(
-            "scale-up command conflicts with durable attempt authority".into(),
+            "scale-up command conflicts with incomplete durable attempt authority".into(),
         ));
     }
+    let mut historical_failover_current_only = false;
+    let mut original_failover_basis = false;
+    let mut exact_failover_progression = false;
     if let kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover { evidence } =
         evidence.as_ref()
     {
@@ -561,17 +577,27 @@ fn admit_scale_up_configuration(
             .current_read_quorum
             .iter()
             .any(|witness| witness.identity == new_primary.identity);
-        let first_failover_admission = !command.current_only
-            && matches!(
-                state.scale_up_evidence.as_deref(),
-                Some(
-                    kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission {
-                        intent: durable_intent
-                    }
-                ) if durable_intent == intent
-            )
-            && state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
-            && state.current_configuration.as_ref() == Some(&intent.current_configuration);
+        let original_attempt_installed = matches!(
+            state.scale_up_evidence.as_deref(),
+            Some(
+                kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission {
+                    intent: durable_intent
+                }
+            ) if durable_intent == intent
+        ) && state.current_configuration.as_ref()
+            == Some(&intent.current_configuration)
+            && (state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+                || state.previous_configuration.is_none());
+        original_failover_basis = original_attempt_installed;
+        let first_failover_admission = !command.current_only && original_attempt_installed;
+        historical_failover_current_only = command.current_only
+            && original_attempt_installed
+            && state.current_configuration.as_ref() != Some(&command.current_configuration);
+        let exact_failover_pc_cc =
+            !command.current_only && state.previous_configuration == command.previous_configuration;
+        let exact_failover_current_only = command.current_only
+            && (state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+                || (persisted_exact_replay && state.previous_configuration.is_none()));
         let exact_installed_failover = state.scale_up_evidence.as_deref()
             == Some(
                 command
@@ -580,12 +606,11 @@ fn admit_scale_up_configuration(
                     .expect("validated evidence"),
             )
             && state.current_configuration.as_ref() == Some(&command.current_configuration)
-            && (state.previous_configuration == command.previous_configuration
-                || (command.current_only
-                    && persisted_exact_replay
-                    && state.previous_configuration.is_none()));
+            && (exact_failover_pc_cc || exact_failover_current_only);
+        exact_failover_progression = exact_installed_failover;
         if !has_new_primary_witness
             || (!first_failover_admission
+                && !historical_failover_current_only
                 && !(exact_installed_failover && (command.current_only || persisted_exact_replay)))
         {
             return Err(AgentError::CommandRejected(
@@ -637,7 +662,10 @@ fn admit_scale_up_configuration(
             )
         })?;
         if (state.retired_builds.contains(&intent.build_id)
-            && !(command.current_only && persisted_exact_replay))
+            && !(command.current_only
+                && (persisted_exact_replay || historical_failover_current_only))
+            && !original_failover_basis
+            && !exact_failover_progression)
             || build.target != intent.target
             || authority.build_id != intent.build_id
             || authority.source != intent.primary
@@ -662,6 +690,7 @@ fn admit_scale_up_configuration(
         && state.previous_configuration.is_none();
     if command.current_only {
         if !completed_current_only_replay
+            && !historical_failover_current_only
             && (state.current_configuration.as_ref() != Some(&command.current_configuration)
                 || state.previous_configuration.as_ref() != Some(&intent.previous_configuration))
         {

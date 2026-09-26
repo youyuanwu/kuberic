@@ -2776,6 +2776,10 @@
                     ],
                     "type": "object"
                   },
+                  "scaleUpAdmissionStarted": {
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "scaleUpCleanup": {
                     "nullable": true,
                     "properties": {

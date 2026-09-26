@@ -63,16 +63,7 @@ fn publish_phase_if_changed(
     attempt: Option<&OperationId>,
     blocking: &str,
 ) -> Option<Plan> {
-    let current = status
-        .conditions
-        .iter()
-        .find(|condition| condition.type_ == "Progressing");
-    if current.is_some_and(|condition| {
-        condition.reason == reason && condition.message.contains(&format!("phase={phase}"))
-    }) {
-        return None;
-    }
-    Some(persist(progress_status(
+    let next = progress_status(
         snapshot,
         status.clone(),
         reason,
@@ -80,7 +71,11 @@ fn publish_phase_if_changed(
         target,
         attempt,
         blocking,
-    )))
+    );
+    if &next == status {
+        return None;
+    }
+    Some(persist(next))
 }
 
 pub(super) fn stable_condition(
@@ -330,6 +325,7 @@ fn freeze_cleanup(
     status.provisioning = None;
     status.transition = None;
     status.scale_up_cleanup = Some(Box::new(cleanup));
+    status.scale_up_admission_started = None;
     status = progress_status(
         snapshot,
         status,
@@ -555,6 +551,23 @@ pub(super) fn recover_local_acceptance(
     if replica_failed(snapshot, &configuration_primary(accepted).identity) {
         return None;
     }
+    let primary = configuration_primary(accepted);
+    let service_needs_restoration = !snapshot.routing.service_present
+        || snapshot.routing.unresolved_write_target
+        || snapshot.routing.write_target.as_ref() != Some(&primary.identity)
+        || report(snapshot, &primary.identity)
+            .is_none_or(|report| report.write_status != AccessStatus::Granted);
+    if snapshot.status.transition.is_none()
+        && service_needs_restoration
+        && let Some(plan) = restore_accepted_service_before_cleanup(
+            snapshot,
+            accepted,
+            snapshot.status.effective_policy.as_ref()?,
+            config,
+        )
+    {
+        return Some(plan);
+    }
     if prior_receipt_settled(snapshot, receipt) {
         return None;
     }
@@ -610,6 +623,23 @@ pub(super) fn recover_local_acceptance(
                 });
         if advanced_to_newer_scale_up {
             continue;
+        }
+        let stale_original_failover_authority = receipt.failover_evidence.is_some()
+            && report.scale_up_intent.as_deref() == Some(&receipt.intent)
+            && report.current_configuration.as_ref() == Some(&receipt.intent.current_configuration)
+            && (report.previous_configuration.as_ref()
+                == Some(&receipt.intent.previous_configuration)
+                || report.previous_configuration.is_none());
+        if stale_original_failover_authority {
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
+                    evidence.clone(),
+                    &receipt.accepted_configuration,
+                    member,
+                    false,
+                    failover_safe_lsn,
+                ))),
+            });
         }
         let historical_pc_cc = report.previous_configuration.as_ref()
             == Some(&receipt.intent.previous_configuration)
@@ -1461,14 +1491,28 @@ pub(super) fn transition(
             config,
         );
     };
-    let pc_cc_started = current.members.iter().any(|member| {
-        report(snapshot, &member.identity).is_some_and(|report| {
-            exact_pc_cc_report(report, intent, current)
-                || exact_current_only_report(report, intent, current)
-        })
-    });
+    let admission_started =
+        snapshot.status.scale_up_admission_started.as_ref() == Some(&intent.operation_id);
+    if transition.kind == TransitionKind::ScaleUp && replica_failed(snapshot, &intent.primary) {
+        if !admission_started {
+            return maybe_begin_stable_failover(snapshot, snapshot.status.clone(), config)
+                .unwrap_or_else(|| {
+                    wait(
+                        snapshot,
+                        snapshot.status.clone(),
+                        "ScaleUpFailoverArbitrationPending",
+                        "failover-recovery",
+                        Some(&intent.target),
+                        Some(&intent.operation_id),
+                        "accepted primary recovery is pending before scale-up admission",
+                        config,
+                    )
+                });
+        }
+        return begin_failover(snapshot, transition, intent, config);
+    }
     if transition.kind == TransitionKind::ScaleUp
-        && !pc_cc_started
+        && !admission_started
         && snapshot.desired.replicas <= intent.previous_policy.replica_set_size
     {
         return freeze_cleanup(
@@ -1480,18 +1524,18 @@ pub(super) fn transition(
             config,
         );
     }
-    if transition.kind == TransitionKind::ScaleUp && replica_failed(snapshot, &intent.primary) {
-        if !pc_cc_started {
-            return freeze_cleanup(
-                snapshot,
-                provisioning,
-                snapshot.status.clone(),
-                "ScaleUpAbandonedForFailover",
-                true,
-                config,
-            );
-        }
-        return begin_failover(snapshot, transition, intent, config);
+    if transition.kind == TransitionKind::ScaleUp && !admission_started {
+        let mut status = snapshot.status.clone();
+        status.scale_up_admission_started = Some(intent.operation_id.clone());
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpAdmissionStarted",
+            "pc-cc",
+            Some(&intent.target),
+            Some(&intent.operation_id),
+            "persisted monotonic admission fence before the first PC/CC command",
+        ));
     }
 
     let primary = configuration_primary(current);
@@ -1510,7 +1554,7 @@ pub(super) fn transition(
                 if transition.kind == TransitionKind::Failover {
                     continue;
                 }
-                if member.identity == intent.target && !pc_cc_started {
+                if member.identity == intent.target && !admission_started {
                     return freeze_cleanup(
                         snapshot,
                         provisioning,
@@ -1711,6 +1755,7 @@ pub(super) fn transition(
         accepted.transition = None;
         accepted.scale_up_cleanup = None;
         accepted.last_scale_up = Some(Box::new(receipt));
+        accepted.scale_up_admission_started = None;
         accepted.primary_failure = None;
         accepted.quorum_loss = None;
         return persist(progress_status(

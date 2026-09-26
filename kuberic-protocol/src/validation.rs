@@ -248,6 +248,21 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
             "resource UID mismatch",
         ));
     }
+    if let Some(operation_id) = &snapshot.status.scale_up_admission_started {
+        let active = snapshot.status.transition.as_ref().and_then(|transition| {
+            transition.scale_up.as_deref().or_else(|| {
+                transition
+                    .scale_up_failover
+                    .as_deref()
+                    .map(|evidence| &evidence.intent)
+            })
+        });
+        if active.is_none_or(|intent| &intent.operation_id != operation_id) {
+            return Err(ValidationError::InvalidScaleUp(
+                "scale-up admission-start fence differs from active authority",
+            ));
+        }
+    }
     if snapshot
         .status
         .last_secondary_removal
@@ -1107,6 +1122,21 @@ pub(crate) fn validate_replacement_cleanup(
 
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
+    if let Some(operation_id) = &status.scale_up_admission_started {
+        let active = status.transition.as_ref().and_then(|transition| {
+            transition.scale_up.as_deref().or_else(|| {
+                transition
+                    .scale_up_failover
+                    .as_deref()
+                    .map(|evidence| &evidence.intent)
+            })
+        });
+        if active.is_none_or(|intent| &intent.operation_id != operation_id) {
+            return Err(ValidationError::InvalidScaleUp(
+                "scale-up admission-start fence differs from active authority",
+            ));
+        }
+    }
     if let Some(cleanup) = &status.pending_replacement_cleanup {
         validate_replacement_cleanup(cleanup)?;
         let topology = status
@@ -1409,7 +1439,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 || transition.secondary_removal_evidence.is_some()
                 || transition.repair.is_some()
                 || transition.election_lsn.is_some()
-                || status.primary_failure.is_some()
+                || (status.primary_failure.is_some() && status.scale_up_admission_started.is_some())
             {
                 return Err(ValidationError::InvalidScaleUp(
                     "transition differs from immutable intent",
