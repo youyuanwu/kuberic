@@ -26,7 +26,7 @@ mod secondary_scale_down;
 pub struct EvaluationConfig {
     /// Requires exact-resource observation, session-fenced dispatch, and cleanup effects.
     pub enable_secondary_scale_down: bool,
-    /// Pure evaluator support only. Production remains disabled until Phase 5 wiring is complete.
+    /// Requires controller provisioning, session-fenced dispatch, and exact candidate cleanup.
     pub allow_scale_up: bool,
     pub supported_protocol_version: u32,
     pub stable_resync_seconds: u64,

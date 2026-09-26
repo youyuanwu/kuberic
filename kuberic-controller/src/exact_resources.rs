@@ -20,16 +20,72 @@ pub(crate) fn requests(
     let Some(status) = raw.set.status.as_ref().map(|s| &s.authority) else {
         return Vec::new();
     };
+    let mut requests = Vec::new();
     if let Some(intent) = status
         .secondary_scale_down_cleanup
         .as_ref()
         .map(|c| &c.evidence.preparation.intent)
         .or_else(|| status.transition.as_ref()?.secondary_scale_down.as_ref())
     {
-        return vec![(intent.target.clone(), intent.cleanup.clone(), true)];
+        push_request(
+            &mut requests,
+            intent.target.clone(),
+            intent.cleanup.clone(),
+            true,
+        );
+    }
+    if let Some(cleanup) = status.scale_up_cleanup.as_deref() {
+        push_request(
+            &mut requests,
+            cleanup.target.clone(),
+            cleanup.resources.clone(),
+            true,
+        );
     }
     if let Some(cleanup) = &status.last_replacement {
-        return vec![(cleanup.target.clone(), cleanup.resources.clone(), true)];
+        push_request(
+            &mut requests,
+            cleanup.target.clone(),
+            cleanup.resources.clone(),
+            true,
+        );
+    }
+    if let Some(provisioning) = status
+        .provisioning
+        .as_ref()
+        .filter(|provisioning| provisioning.scale_up().is_some())
+    {
+        let target =
+            provisioning.target_identity(&ResourceUid::new(raw.set.uid().unwrap_or_default()));
+        push_request(
+            &mut requests,
+            target.clone(),
+            scale_up_candidate_identity(raw, &target, Some(&provisioning.pvc_uid)),
+            false,
+        );
+    }
+    if let Some(target) = status
+        .transition
+        .as_ref()
+        .and_then(scale_up_transition_target)
+    {
+        push_request(
+            &mut requests,
+            target.clone(),
+            candidate(raw, target)
+                .unwrap_or_else(|| scale_up_candidate_identity(raw, target, None)),
+            false,
+        );
+    }
+    if let Some(receipt) = status.last_scale_up.as_deref() {
+        let target = &receipt.intent.target;
+        push_request(
+            &mut requests,
+            target.clone(),
+            candidate(raw, target)
+                .unwrap_or_else(|| scale_up_candidate_identity(raw, target, None)),
+            false,
+        );
     }
     // Admission already captured the identity. Old-resource lookups are not
     // prerequisites for building or accepting the new topology.
@@ -37,10 +93,10 @@ pub(crate) fn requests(
         || status.transition.is_some()
         || status.provisioning.is_some()
     {
-        return Vec::new();
+        return requests;
     }
     let Some(topology) = status.topology.as_ref() else {
-        return Vec::new();
+        return requests;
     };
     let mut targets = if raw.set.spec.replicas > 0
         && (raw.set.spec.replicas as usize) < topology.configuration.members.len()
@@ -64,12 +120,65 @@ pub(crate) fn requests(
             targets.push(member);
         }
     }
-    targets
-        .into_iter()
-        .filter_map(|m| {
-            candidate(raw, &m.identity).map(|identity| (m.identity.clone(), identity, false))
+    for member in targets {
+        if let Some(identity) = candidate(raw, &member.identity) {
+            push_request(&mut requests, member.identity.clone(), identity, false);
+        }
+    }
+    requests
+}
+
+fn push_request(
+    requests: &mut Vec<(ReplicaIdentity, ReplicaCleanupIdentity, bool)>,
+    target: ReplicaIdentity,
+    identity: ReplicaCleanupIdentity,
+    frozen: bool,
+) {
+    if !requests.iter().any(|(existing, _, _)| existing == &target) {
+        requests.push((target, identity, frozen));
+    }
+}
+
+fn scale_up_transition_target(
+    transition: &kuberic_protocol::types::TransitionIntent,
+) -> Option<&ReplicaIdentity> {
+    transition
+        .scale_up
+        .as_deref()
+        .map(|intent| &intent.target)
+        .or_else(|| {
+            transition
+                .scale_up_failover
+                .as_deref()
+                .map(|evidence| &evidence.intent.target)
         })
-        .collect()
+}
+
+fn scale_up_candidate_identity(
+    raw: &RawObservation,
+    target: &ReplicaIdentity,
+    pvc_uid: Option<&PvcUid>,
+) -> ReplicaCleanupIdentity {
+    let pod_name = format!("{}-{}", raw.set.name_any(), target.replica_id.value());
+    let pvc_name = format!("{pod_name}-data");
+    let endpoint_name =
+        derive_replica_endpoint_name(&ResourceUid::new(raw.set.uid().unwrap_or_default()), target);
+    ReplicaCleanupIdentity {
+        pod: CleanupResourceIdentity::Present {
+            name: pod_name,
+            uid: target.instance_id.to_string(),
+        },
+        pvc: match pvc_uid {
+            Some(uid) => CleanupResourceIdentity::Present {
+                name: pvc_name,
+                uid: uid.to_string(),
+            },
+            None => CleanupResourceIdentity::Absent { name: pvc_name },
+        },
+        endpoint: CleanupResourceIdentity::Absent {
+            name: endpoint_name,
+        },
+    }
 }
 
 fn replacement_candidate(raw: &RawObservation, target: &ReplicaIdentity, epoch: Epoch) -> bool {
@@ -176,14 +285,64 @@ pub(crate) fn protected(
     let Some(status) = raw.set.status.as_ref().map(|s| &s.authority) else {
         return false;
     };
-    status.transition.iter().filter_map(|t| t.secondary_scale_down.as_ref())
+    let protected_cleanup = status.transition.iter().filter_map(|t| t.secondary_scale_down.as_ref())
         .chain(status.secondary_scale_down_cleanup.iter().map(|c| &c.evidence.preparation.intent))
         .chain(status.last_secondary_removal.iter().map(|r| &r.evidence.preparation.intent))
         .flat_map(|intent| [&intent.cleanup.pod, &intent.cleanup.pvc, &intent.cleanup.endpoint])
         .chain(status.last_replacement.iter().flat_map(|c| [&c.resources.pod, &c.resources.pvc, &c.resources.endpoint]))
         .chain(status.pending_replacement_cleanup.iter().flat_map(|c| [&c.resources.pod, &c.resources.pvc, &c.resources.endpoint]))
+        .chain(status.scale_up_cleanup.iter().flat_map(|c| [&c.resources.pod, &c.resources.pvc, &c.resources.endpoint]))
         .any(|identity| resource_name == Some(name(identity))
-            || matches!(identity, CleanupResourceIdentity::Present { uid, .. } if resource_uid == Some(uid.as_str())))
+            || matches!(identity, CleanupResourceIdentity::Present { uid, .. } if resource_uid == Some(uid.as_str())));
+    protected_cleanup
+        || status
+            .provisioning
+            .as_ref()
+            .filter(|provisioning| provisioning.scale_up().is_some())
+            .is_some_and(|provisioning| {
+                let target = provisioning
+                    .target_identity(&ResourceUid::new(raw.set.uid().unwrap_or_default()));
+                scale_up_target_protected(
+                    raw,
+                    &target,
+                    Some(&provisioning.pvc_uid),
+                    resource_name,
+                    resource_uid,
+                )
+            })
+        || status
+            .transition
+            .as_ref()
+            .and_then(scale_up_transition_target)
+            .is_some_and(|target| {
+                scale_up_target_protected(raw, target, None, resource_name, resource_uid)
+            })
+        || status.last_scale_up.as_deref().is_some_and(|receipt| {
+            scale_up_target_protected(
+                raw,
+                &receipt.intent.target,
+                None,
+                resource_name,
+                resource_uid,
+            )
+        })
+}
+
+fn scale_up_target_protected(
+    raw: &RawObservation,
+    target: &ReplicaIdentity,
+    pvc_uid: Option<&PvcUid>,
+    resource_name: Option<&str>,
+    resource_uid: Option<&str>,
+) -> bool {
+    let identity = scale_up_candidate_identity(raw, target, pvc_uid);
+    [&identity.pod, &identity.pvc, &identity.endpoint]
+        .into_iter()
+        .any(|identity| {
+            resource_name == Some(name(identity))
+                || matches!(identity, CleanupResourceIdentity::Present { uid, .. }
+                    if resource_uid == Some(uid.as_str()))
+        })
 }
 
 pub(crate) fn matches<K: ResourceExt>(identity: &CleanupResourceIdentity, object: &K) -> bool {

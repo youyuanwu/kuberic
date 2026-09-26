@@ -16,7 +16,9 @@ use kuberic_protocol::types::{
     ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
     SwitchoverRequestId, TransitionKind, derive_agent_generation,
 };
-use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
+use kuberic_protocol::validation::{
+    validate_configuration, validate_scale_up_provisioning, validate_transition_relationship,
+};
 use thiserror::Error;
 
 use crate::proto;
@@ -529,34 +531,66 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 read_quorum: policy.read_quorum,
                 failover_delay_seconds: policy.failover_delay_seconds,
             };
-            validate_transition_relationship(
-                TransitionKind::Bootstrap,
-                None,
-                &bootstrap_configuration,
-                &effective_policy,
-            )
-            .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             let target: ReplicaIdentity = request
                 .target
                 .clone()
                 .ok_or(WireError::MissingField("execute.target"))?
                 .try_into()?;
-            if let Some(provisioning) = command.provisioning.clone() {
-                let provisioning = provisioning_from_proto(provisioning)?;
+            let provisioning = command
+                .provisioning
+                .clone()
+                .map(provisioning_from_proto)
+                .transpose()?;
+            if let Some(provisioning) = provisioning {
                 let resource_uid = ResourceUid::new(&request.resource_uid);
                 if provisioning.target_identity(&resource_uid) != target {
                     return Err(WireError::InvalidAuthority(
-                        "initialize target differs from replacement provisioning".to_string(),
+                        "initialize target differs from exact provisioning".to_string(),
                     ));
+                }
+                if let Some(scale_up) = provisioning.scale_up() {
+                    validate_scale_up_provisioning(&provisioning)
+                        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+                    if bootstrap_configuration != scale_up.previous_configuration
+                        || effective_policy != scale_up.current_policy
+                    {
+                        return Err(WireError::InvalidAuthority(
+                            "initialize authority differs from frozen scale-up provisioning"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    validate_transition_relationship(
+                        TransitionKind::Bootstrap,
+                        None,
+                        &bootstrap_configuration,
+                        &effective_policy,
+                    )
+                    .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
                 }
             } else if !bootstrap_configuration
                 .members
                 .iter()
                 .any(|member| member.identity == target)
             {
+                validate_transition_relationship(
+                    TransitionKind::Bootstrap,
+                    None,
+                    &bootstrap_configuration,
+                    &effective_policy,
+                )
+                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
                 return Err(WireError::InvalidAuthority(
                     "initialize target is not an exact genesis member".to_string(),
                 ));
+            } else {
+                validate_transition_relationship(
+                    TransitionKind::Bootstrap,
+                    None,
+                    &bootstrap_configuration,
+                    &effective_policy,
+                )
+                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             }
             Ok(())
         }

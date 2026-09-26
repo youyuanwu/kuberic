@@ -10,7 +10,7 @@ fn enabled() -> EvaluationConfig {
     }
 }
 
-fn fixture(count: u32, desired: u32) -> RawObservation {
+pub(super) fn fixture(count: u32, desired: u32) -> RawObservation {
     let mut raw = raw(desired);
     raw.set.spec.failover_delay_seconds = 10;
     raw.set.metadata.generation = Some(2);
