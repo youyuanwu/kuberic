@@ -3550,6 +3550,14 @@ impl ManagedReplicator for DefaultReplicatorInner {
                 ..
             } | RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
         );
+        let recover_scale_up_writes = matches!(
+            &action,
+            RuntimeEffectAction::AdmitAuthority(authority)
+                if matches!(
+                    authority.scale_up.as_deref(),
+                    Some(kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
+                )
+        );
         let generation = self.fence_generation.load(Ordering::Acquire);
         if granting {
             self.validate_removal_write_grant().await?;
@@ -3559,19 +3567,24 @@ impl ManagedReplicator for DefaultReplicatorInner {
             // Do not hold effect_lock across the quorum wait: ACKs need that lock.
             self.recover_pending_local_writes().await?;
         }
-        let _guard = self.effect_lock.lock().await;
-        if !matches!(action, RuntimeEffectAction::CompleteRetirement(_)) {
-            self.check_aborted()?;
-            if self.state.read().await.retiring_authority.is_some()
-                && !matches!(action, RuntimeEffectAction::FenceRetirement(_))
-            {
-                return Err(RuntimeError::Closed);
+        {
+            let _guard = self.effect_lock.lock().await;
+            if !matches!(action, RuntimeEffectAction::CompleteRetirement(_)) {
+                self.check_aborted()?;
+                if self.state.read().await.retiring_authority.is_some()
+                    && !matches!(action, RuntimeEffectAction::FenceRetirement(_))
+                {
+                    return Err(RuntimeError::Closed);
+                }
             }
+            if granting && generation != self.fence_generation.load(Ordering::Acquire) {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            self.execute_action(action).await?;
         }
-        if granting && generation != self.fence_generation.load(Ordering::Acquire) {
-            return Err(RuntimeError::OperationCancelled);
+        if recover_scale_up_writes && !self.state.read().await.local_writes.is_empty() {
+            self.recover_pending_local_writes().await?;
         }
-        self.execute_action(action).await?;
         self.changed.notify_waiters();
         Ok(())
     }

@@ -55,3 +55,88 @@ impl StateProvider for KvStateProvider {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use bytes::Bytes;
+    use futures::{StreamExt, stream};
+    use kuberic_runtime::application::Operation;
+    use kuberic_runtime::engine::DurableState;
+
+    use super::*;
+
+    async fn collect_copy(mut copy: OperationDataStream) -> Vec<Bytes> {
+        let mut chunks = Vec::new();
+        while let Some(chunk) = copy.next().await {
+            chunks.push(chunk.unwrap());
+        }
+        chunks
+    }
+
+    #[tokio::test]
+    async fn provider_freezes_copy_before_post_boundary_write_and_replays_identically() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
+        persistence
+            .apply(Operation {
+                lsn: 1,
+                committed_lsn: 0,
+                data: KvPersistence::encode_put("key".into(), "old".into()).unwrap(),
+            })
+            .await
+            .unwrap();
+        persistence.commit(1).await.unwrap();
+        let provider = KvStateProvider::new(persistence.clone());
+        let frozen = provider
+            .get_copy_state(1, Box::pin(stream::empty()))
+            .await
+            .unwrap();
+
+        let post_boundary = Operation {
+            lsn: 2,
+            committed_lsn: 1,
+            data: KvPersistence::encode_put("key".into(), "new".into()).unwrap(),
+        };
+        persistence.apply(post_boundary.clone()).await.unwrap();
+        persistence.commit(2).await.unwrap();
+
+        let first = collect_copy(frozen).await;
+        let second = collect_copy(
+            provider
+                .get_copy_state(1, Box::pin(stream::empty()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first, second);
+        let snapshot: BTreeMap<String, String> = serde_json::from_slice(&first.concat()).unwrap();
+        assert_eq!(snapshot.get("key").map(String::as_str), Some("old"));
+
+        let retained = persistence
+            .get_replication_operations(2, 2)
+            .await
+            .unwrap()
+            .map(|operation| operation.unwrap())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(retained, vec![post_boundary]);
+    }
+
+    #[tokio::test]
+    async fn provider_empty_state_copy_uses_boundary_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
+        let provider = KvStateProvider::new(persistence);
+        let chunks = collect_copy(
+            provider
+                .get_copy_state(0, Box::pin(stream::empty()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let snapshot: BTreeMap<String, String> = serde_json::from_slice(&chunks.concat()).unwrap();
+        assert!(snapshot.is_empty());
+    }
+}

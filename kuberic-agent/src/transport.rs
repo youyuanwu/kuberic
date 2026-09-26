@@ -288,6 +288,8 @@ where
     ) -> Result<()> {
         item.sender_session_id = self.transport.lock().await.local_session().to_string();
         item.receiver_session_id = self.peer_session(&receiver).await?.to_string();
+        let expected_sender_session = item.sender_session_id.clone();
+        let expected_receiver_session = item.receiver_session_id.clone();
         let endpoint = self.resolver.replication_endpoint(&receiver);
         let mut client = tokio::time::timeout(
             self.deadline,
@@ -310,6 +312,15 @@ where
             .ok_or_else(|| {
                 AgentError::SessionRejected("copy peer returned no acknowledgement".into())
             })?;
+        let current_sender_session = self.transport.lock().await.local_session().to_string();
+        let current_receiver_session = self.peer_session(&receiver).await?.to_string();
+        validate_copy_ack_sessions(
+            &acknowledgement,
+            &expected_sender_session,
+            &expected_receiver_session,
+            &current_sender_session,
+            &current_receiver_session,
+        )?;
         let sequence = acknowledgement.sequence;
         self.runtime
             .data_plane()
@@ -321,8 +332,28 @@ where
                 .await
                 .acknowledge_copy(&receiver, sequence)?;
         }
+
         Ok(())
     }
+}
+
+fn validate_copy_ack_sessions(
+    acknowledgement: &proto::CopyAck,
+    expected_sender_session: &str,
+    expected_receiver_session: &str,
+    current_sender_session: &str,
+    current_receiver_session: &str,
+) -> Result<()> {
+    if acknowledgement.sender_session_id != expected_sender_session
+        || acknowledgement.receiver_session_id != expected_receiver_session
+        || current_sender_session != expected_sender_session
+        || current_receiver_session != expected_receiver_session
+    {
+        return Err(AgentError::SessionRejected(
+            "copy acknowledgement belongs to an obsolete process session".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1134,6 +1165,47 @@ mod tests {
     use super::*;
     use kuberic_protocol::types::{AgentGeneration, ConfigurationId, Epoch, ReplicaInstanceId};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn copy_acknowledgement_requires_dispatched_and_current_sessions() {
+        let acknowledgement = proto::CopyAck {
+            sender_session_id: "source-session".into(),
+            receiver_session_id: "target-session".into(),
+            ..Default::default()
+        };
+        assert!(
+            validate_copy_ack_sessions(
+                &acknowledgement,
+                "source-session",
+                "target-session",
+                "source-session",
+                "target-session",
+            )
+            .is_ok()
+        );
+        for mutation in 0..4 {
+            let mut acknowledgement = acknowledgement.clone();
+            let mut current_source = "source-session";
+            let mut current_target = "target-session";
+            match mutation {
+                0 => acknowledgement.sender_session_id = "old-source".into(),
+                1 => acknowledgement.receiver_session_id = "old-target".into(),
+                2 => current_source = "new-source",
+                _ => current_target = "new-target",
+            }
+            assert!(
+                validate_copy_ack_sessions(
+                    &acknowledgement,
+                    "source-session",
+                    "target-session",
+                    current_source,
+                    current_target,
+                )
+                .is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
 
     struct FlakyDispatcher {
         failed_peer_attempts: AtomicUsize,

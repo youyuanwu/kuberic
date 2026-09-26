@@ -7854,10 +7854,12 @@ async fn completed_scale_up_copy_seeds_exact_candidate_progress_for_pc_cc() {
     let items = copy_through_final(&mut prepared).await;
     assert_eq!(items.last().unwrap().catch_up_boundary_lsn, Some(1));
 
+    let target_application = Arc::new(TestApplication::default());
+    let target_store = Arc::new(MemoryAuthorityStore::default());
     let target_runtime = PodRuntime::new(
         candidate.clone(),
-        Arc::new(TestApplication::default()),
-        Arc::new(MemoryAuthorityStore::default()),
+        target_application.clone(),
+        target_store.clone(),
     );
     target_runtime
         .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
@@ -7933,13 +7935,13 @@ async fn completed_scale_up_copy_seeds_exact_candidate_progress_for_pc_cc() {
         switchover_handoff: None,
     };
     let target_authority = AdmittedAuthority {
-        local_identity: candidate,
+        local_identity: candidate.clone(),
         ..source_authority.clone()
     };
     target_runtime
         .apply_effect(effect(
             4,
-            RuntimeEffectAction::AdmitAuthority(Box::new(target_authority)),
+            RuntimeEffectAction::AdmitAuthority(Box::new(target_authority.clone())),
         ))
         .await
         .unwrap();
@@ -7952,6 +7954,44 @@ async fn completed_scale_up_copy_seeds_exact_candidate_progress_for_pc_cc() {
         .unwrap();
     assert_eq!(
         target_runtime.snapshot().await.verified_replication_lsn,
+        Some(1)
+    );
+
+    let restarted_target = PodRuntime::new(candidate, target_application, target_store);
+    restarted_target
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    restarted_target
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+        ))
+        .await
+        .unwrap();
+    restarted_target
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(prepared.authority.clone())),
+        ))
+        .await
+        .unwrap();
+    restarted_target
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::AdmitAuthority(Box::new(target_authority)),
+        ))
+        .await
+        .unwrap();
+    restarted_target
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted_target.snapshot().await.verified_replication_lsn,
         Some(1)
     );
 
@@ -8240,7 +8280,7 @@ async fn same_primary_scale_up_preserves_granted_access_and_fences_old_completio
                 role: ReplicaRole::Primary,
             },
             ConfigurationMember {
-                identity: secondary,
+                identity: secondary.clone(),
                 role: ReplicaRole::ActiveSecondary,
             },
             ConfigurationMember {
@@ -8275,11 +8315,11 @@ async fn same_primary_scale_up_preserves_granted_access_and_fences_old_completio
         current_configuration: current,
         switchover_handoff: None,
     };
-    let runtime = PodRuntime::new(
+    let runtime = Arc::new(PodRuntime::new(
         primary,
         Arc::new(TestApplication::default()),
         Arc::new(MemoryAuthorityStore::default()),
-    );
+    ));
     runtime
         .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
         .await
@@ -8313,13 +8353,33 @@ async fn same_primary_scale_up_preserves_granted_access_and_fences_old_completio
         })
         .await
         .unwrap();
-    runtime
-        .apply_effect(effect(
-            5,
-            RuntimeEffectAction::AdmitAuthority(Box::new(scale_up)),
-        ))
-        .await
-        .unwrap();
+    let admission_runtime = runtime.clone();
+    let admitted = scale_up.clone();
+    let admission = tokio::spawn(async move {
+        admission_runtime
+            .apply_effect(effect(
+                5,
+                RuntimeEffectAction::AdmitAuthority(Box::new(admitted)),
+            ))
+            .await
+    });
+    loop {
+        let Some(OutboundReplication::Replication(item)) =
+            runtime.data_plane().next_outbound().await
+        else {
+            continue;
+        };
+        let receiver: ReplicaIdentity = item.receiver.clone().unwrap().try_into().unwrap();
+        if receiver == secondary {
+            runtime
+                .data_plane()
+                .accept_acknowledgement(acknowledgement(&scale_up, secondary.clone(), item.lsn))
+                .await
+                .unwrap();
+            break;
+        }
+    }
+    admission.await.unwrap().unwrap();
     assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
     let old_completion = pending.committed().await;
     assert!(
@@ -8332,8 +8392,14 @@ async fn same_primary_scale_up_preserves_granted_access_and_fences_old_completio
             operation_id: OperationId::new("new-authority-write"),
             data: Bytes::from_static(b"new"),
         })
-        .await;
-    assert!(matches!(next, Err(RuntimeError::LocalWritePending(_))));
+        .await
+        .unwrap();
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&scale_up, secondary, 2))
+        .await
+        .unwrap();
+    next.committed().await.unwrap();
 }
 
 #[tokio::test]
