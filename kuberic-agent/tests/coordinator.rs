@@ -887,6 +887,137 @@ fn scale_up_fixture(current_only: bool) -> (AgentState, EnsureConfiguration, Adm
     (state, command, authority)
 }
 
+fn candidate_admission_fixture() -> (
+    AgentState,
+    EnsureConfiguration,
+    kuberic_runtime_internal::authority::DurableBuildProgress,
+) {
+    let resource_uid = ResourceUid::new("resource-1");
+    let primary = identity();
+    let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy: previous_policy.clone(),
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("candidate-pod"),
+        pvc_uid: PvcUid::new("candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let candidate = provisioning.target_identity(&resource_uid);
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: candidate.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let authority = BuildAuthority {
+        build_id: provisioning.scale_up_build_id(&resource_uid).unwrap(),
+        kind: BuildAuthorityKind::Provisioning,
+        source: primary.clone(),
+        target: candidate.clone(),
+        current_configuration: previous.clone(),
+        replication_boundary_lsn: 4,
+    };
+    let progress = kuberic_runtime_internal::authority::DurableBuildProgress {
+        authority: authority.clone(),
+        last_sequence: 2,
+        durable_lsn: 9,
+        completed: true,
+        catch_up_boundary_lsn: Some(9),
+    };
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: resource_uid.clone(),
+        spec_generation: 2,
+        desired_replicas: 2,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: previous_policy.clone(),
+        current_policy: current_policy.clone(),
+        primary,
+        target: candidate.clone(),
+        build_id: authority.build_id.clone(),
+        snapshot_boundary_lsn: 4,
+        catch_up_boundary_lsn: 9,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let command = EnsureConfiguration {
+        operation_id: intent.command_operation_id(
+            ScaleUpStage::PreviousCurrent,
+            &candidate,
+            &current,
+        ),
+        previous_configuration: Some(previous.clone()),
+        current_configuration: current,
+        previous_epoch: Some(previous.epoch),
+        current_epoch: Epoch::new(0, 2),
+        effective_policy: current_policy.clone(),
+        previous_policy: Some(previous_policy),
+        secondary_removal_evidence: None,
+        scale_up_evidence: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
+        local_replica_id: candidate.replica_id,
+        expected_instance_id: candidate.instance_id.clone(),
+        expected_agent_generation: candidate.agent_generation.clone(),
+        transition_kind: TransitionKind::ScaleUp,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::Granted,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid,
+        pod_uid: provisioning.pod_uid.clone(),
+        pvc_uid: provisioning.pvc_uid.clone(),
+        initialization_id: provisioning.initialization_id(&ResourceUid::new("resource-1")),
+        local_identity: candidate.clone(),
+        effective_policy: current_policy,
+    });
+    state.scale_up_initialization = Some(provisioning);
+    state.role = ReplicaRole::IdleSecondary;
+    state.build_commands.insert(
+        authority.build_id.clone(),
+        EnsureReplicaBuild {
+            operation_id: authority.build_id.clone(),
+            local_replica_id: candidate.replica_id,
+            expected_instance_id: candidate.instance_id,
+            expected_agent_generation: candidate.agent_generation,
+            target: authority.target.clone(),
+            authority: Some(authority),
+            source_session_id: Some(ProcessSessionId::new("source-session")),
+        },
+    );
+    (state, command, progress)
+}
+
 #[tokio::test]
 async fn scale_up_same_primary_never_runs_the_ordinary_write_fence() {
     let (state, command, previous_authority) = scale_up_fixture(false);
@@ -932,7 +1063,7 @@ async fn scale_up_same_primary_never_runs_the_ordinary_write_fence() {
     assert_eq!(completed.previous_configuration, None);
     assert_eq!(
         completed.current_configuration,
-        Some(current_only.current_configuration)
+        Some(current_only.current_configuration.clone())
     );
     assert_eq!(completed.write_status, AccessStatus::Granted);
     assert!(
@@ -940,7 +1071,13 @@ async fn scale_up_same_primary_never_runs_the_ordinary_write_fence() {
             .retired_builds
             .contains(&OperationId::new("scale-up-build"))
     );
-    assert_eq!(completed.scale_up_commands.len(), 2);
+    assert_eq!(
+        completed
+            .retained_command
+            .as_ref()
+            .map(|retained| &retained.command),
+        Some(&current_only)
+    );
 }
 
 #[tokio::test]
@@ -1117,9 +1254,51 @@ async fn scale_up_candidate_activates_only_after_exact_build_and_retires_it_on_c
     let completed = store.load_state().await.unwrap();
     assert_eq!(completed.role, ReplicaRole::ActiveSecondary);
     assert_eq!(completed.previous_configuration, None);
-    assert_eq!(completed.current_configuration, Some(current));
+    assert_eq!(completed.current_configuration, Some(current.clone()));
     assert!(completed.retired_builds.contains(&build_id));
-    assert_eq!(completed.scale_up_commands.len(), 2);
+    assert_eq!(
+        completed
+            .retained_command
+            .as_ref()
+            .map(|retained| &retained.command),
+        Some(&configuration(true))
+    );
+}
+
+#[test]
+fn scale_up_candidate_pc_cc_requires_exact_completed_durable_build_progress() {
+    let (mut state, command, progress) = candidate_admission_fixture();
+    assert!(admit_configuration(&command, &state).is_err());
+
+    let build_id = progress.authority.build_id.clone();
+    let mut incomplete = progress.clone();
+    incomplete.completed = false;
+    state.build_progress.insert(build_id.clone(), incomplete);
+    assert!(admit_configuration(&command, &state).is_err());
+
+    let mut mutated_boundary = progress.clone();
+    mutated_boundary.catch_up_boundary_lsn = Some(10);
+    state
+        .build_progress
+        .insert(build_id.clone(), mutated_boundary);
+    assert!(admit_configuration(&command, &state).is_err());
+
+    let mut below_boundary = progress.clone();
+    below_boundary.durable_lsn = 8;
+    state
+        .build_progress
+        .insert(build_id.clone(), below_boundary);
+    assert!(admit_configuration(&command, &state).is_err());
+
+    let mut wrong_authority = progress.clone();
+    wrong_authority.authority.replication_boundary_lsn = 5;
+    state
+        .build_progress
+        .insert(build_id.clone(), wrong_authority);
+    assert!(admit_configuration(&command, &state).is_err());
+
+    state.build_progress.insert(build_id, progress);
+    assert!(admit_configuration(&command, &state).is_ok());
 }
 
 #[test]
@@ -1282,6 +1461,16 @@ fn scale_up_failover_requires_durable_pc_cc_and_the_new_primary_witness() {
     assert_eq!(admitted.current_configuration, failover);
     assert_eq!(admitted.local_role(), ReplicaRole::Primary);
 
+    let mut installed = state.clone();
+    installed.highest_epoch = command.current_epoch;
+    installed.previous_configuration = command.previous_configuration.clone();
+    installed.current_configuration = Some(command.current_configuration.clone());
+    installed.scale_up_evidence = command.scale_up_evidence.clone();
+    installed.role = ReplicaRole::Primary;
+    installed.read_status = AccessStatus::ReconfigurationPending;
+    installed.write_status = AccessStatus::ReconfigurationPending;
+    assert!(admit_persisted_configuration(&command, &installed).is_ok());
+
     let mut missing_new_primary = command.clone();
     let ScaleUpConfigurationEvidence::Failover { evidence } = missing_new_primary
         .scale_up_evidence
@@ -1295,6 +1484,28 @@ fn scale_up_failover_requires_durable_pc_cc_and_the_new_primary_witness() {
         witness(identities[2].clone(), 5),
     ];
     assert!(admit_configuration(&missing_new_primary, &state).is_err());
+
+    let mut insufficient_previous = command.clone();
+    let ScaleUpConfigurationEvidence::Failover { evidence } = insufficient_previous
+        .scale_up_evidence
+        .as_deref_mut()
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    evidence.previous_read_quorum.clear();
+    assert!(admit_configuration(&insufficient_previous, &state).is_err());
+
+    let mut insufficient_current = command.clone();
+    let ScaleUpConfigurationEvidence::Failover { evidence } = insufficient_current
+        .scale_up_evidence
+        .as_deref_mut()
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    evidence.current_read_quorum.truncate(1);
+    assert!(admit_configuration(&insufficient_current, &state).is_err());
 
     let mut no_durable_pc_cc = state;
     no_durable_pc_cc.scale_up_evidence = None;

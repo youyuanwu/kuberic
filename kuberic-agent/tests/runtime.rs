@@ -5,16 +5,20 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
+use kuberic_agent::coordinator::Coordinator;
 use kuberic_agent::hosting::{OutboundReplication, PodRuntime, PreparedCopy, RuntimeControlPlane};
+use kuberic_agent::runtime_adapter::RuntimeAdapter;
 use kuberic_agent::service::AgentService;
 use kuberic_agent::sqlite_store::SqliteStore;
-use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+use kuberic_agent::state::{AgentState, CoordinatorStage, SCHEMA_VERSION, StorageIdentity};
+use kuberic_agent::store::AgentStore;
+use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
-    Epoch, FaultType, LoadMetric, OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose,
-    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
-    ScaleUpConfigurationEvidence, ScaleUpIntent, ScaleUpProvisioning, SwitchoverHandoff,
-    SwitchoverRequestId, TransitionKind,
+    Epoch, FaultType, InitializationId, LoadMetric, OperationId, PodUid, ProcessSessionId,
+    ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, ScaleUpIntent, ScaleUpProvisioning,
+    SwitchoverHandoff, SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::application::{
     ClientWrite, CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext,
@@ -129,6 +133,71 @@ async fn open_removal_member<S: kuberic_runtime_internal::authority::AuthoritySt
             .unwrap();
     }
     runtime
+}
+
+struct ScaleUpAgentBuildFixture {
+    resource_uid: ResourceUid,
+    source: ReplicaIdentity,
+    target: ReplicaIdentity,
+    previous_policy: EffectivePolicy,
+    current_policy: EffectivePolicy,
+    previous: ConfigurationDescriptor,
+    provisioning: ProvisioningIntent,
+    authority: BuildAuthority,
+}
+
+fn scale_up_agent_build_fixture() -> ScaleUpAgentBuildFixture {
+    let source = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("source-pod"),
+        agent_generation: AgentGeneration::new("source-generation"),
+    };
+    let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![ConfigurationMember {
+            identity: source.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        previous_policy.write_quorum,
+    );
+    let resource_uid = ResourceUid::new("scale-up-set");
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy: previous_policy.clone(),
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("candidate-pod"),
+        pvc_uid: PvcUid::new("candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let authority = BuildAuthority {
+        build_id: provisioning.scale_up_build_id(&resource_uid).unwrap(),
+        kind: BuildAuthorityKind::Provisioning,
+        source: source.clone(),
+        target: target.clone(),
+        current_configuration: previous.clone(),
+        replication_boundary_lsn: 4,
+    };
+    ScaleUpAgentBuildFixture {
+        resource_uid,
+        source,
+        target,
+        previous_policy,
+        current_policy,
+        previous,
+        provisioning,
+        authority,
+    }
 }
 
 #[tokio::test]
@@ -264,6 +333,225 @@ async fn scale_up_receiver_replays_immutable_build_progress_without_reusing_sour
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn scale_up_receiver_replays_every_durable_build_boundary_without_role_activation() {
+    let boundaries = [
+        ("authorized", None),
+        ("snapshot-progress", Some((1_u64, 4_i64, false, None))),
+        (
+            "frozen-catch-up-boundary",
+            Some((2_u64, 4_i64, true, Some(9_i64))),
+        ),
+        ("caught-up", Some((3_u64, 9_i64, true, Some(9_i64)))),
+    ];
+    for (name, progress) in boundaries {
+        let fixture = scale_up_agent_build_fixture();
+        let command = kuberic_protocol::command::EnsureReplicaBuild {
+            operation_id: fixture.authority.build_id.clone(),
+            local_replica_id: fixture.target.replica_id,
+            expected_instance_id: fixture.target.instance_id.clone(),
+            expected_agent_generation: fixture.target.agent_generation.clone(),
+            target: fixture.target.clone(),
+            authority: Some(fixture.authority.clone()),
+            source_session_id: Some(ProcessSessionId::new("retired-source-session")),
+        };
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: fixture.resource_uid.clone(),
+            pod_uid: fixture.provisioning.pod_uid.clone(),
+            pvc_uid: fixture.provisioning.pvc_uid.clone(),
+            initialization_id: fixture
+                .provisioning
+                .initialization_id(&fixture.resource_uid),
+            local_identity: fixture.target.clone(),
+            effective_policy: fixture.current_policy.clone(),
+        });
+        state.scale_up_initialization = Some(fixture.provisioning.clone());
+        state.role = ReplicaRole::IdleSecondary;
+        state
+            .build_commands
+            .insert(fixture.authority.build_id.clone(), command);
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        store.admit_build(&fixture.authority).await.unwrap();
+        if let Some((last_sequence, durable_lsn, completed, catch_up_boundary_lsn)) = progress {
+            store
+                .record_build_progress(&DurableBuildProgress {
+                    authority: fixture.authority.clone(),
+                    last_sequence,
+                    durable_lsn,
+                    completed,
+                    catch_up_boundary_lsn,
+                })
+                .await
+                .unwrap();
+        }
+        drop(store);
+
+        let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+        let runtime = Arc::new(PodRuntime::new(
+            fixture.target.clone(),
+            Arc::new(TestApplication::default()),
+            store.clone(),
+        ));
+        let service = AgentService::new(store, runtime.clone(), runtime.clone(), "token").unwrap();
+        service.reconstruct_runtime().await.unwrap();
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.role, ReplicaRole::IdleSecondary, "{name}");
+        assert_ne!(snapshot.read_status, AccessStatus::Granted, "{name}");
+        assert_ne!(snapshot.write_status, AccessStatus::Granted, "{name}");
+        assert_eq!(snapshot.builds.len(), 1, "{name}");
+        let replayed = &snapshot.builds[0];
+        assert_eq!(replayed.authority, fixture.authority, "{name}");
+        match progress {
+            None => {
+                assert_eq!(replayed.last_sequence, 0, "{name}");
+                assert_eq!(replayed.durable_lsn, 0, "{name}");
+                assert!(!replayed.completed, "{name}");
+                assert_eq!(replayed.catch_up_boundary_lsn, None, "{name}");
+            }
+            Some((last_sequence, durable_lsn, completed, boundary)) => {
+                assert_eq!(replayed.last_sequence, last_sequence, "{name}");
+                assert_eq!(replayed.durable_lsn, durable_lsn, "{name}");
+                assert_eq!(replayed.completed, completed, "{name}");
+                assert_eq!(replayed.catch_up_boundary_lsn, boundary, "{name}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scale_up_source_replays_each_durable_build_boundary_with_exact_authority() {
+    let boundaries = [
+        ("authorized", None),
+        ("enumerating", Some((1_u64, 4_i64, false, None))),
+        ("boundary-frozen", Some((2_u64, 4_i64, true, Some(9_i64)))),
+        (
+            "receiver-caught-up",
+            Some((3_u64, 9_i64, true, Some(9_i64))),
+        ),
+    ];
+    for (name, progress) in boundaries {
+        let fixture = scale_up_agent_build_fixture();
+        let command = kuberic_protocol::command::EnsureReplicaBuild {
+            operation_id: fixture.authority.build_id.clone(),
+            local_replica_id: fixture.source.replica_id,
+            expected_instance_id: fixture.source.instance_id.clone(),
+            expected_agent_generation: fixture.source.agent_generation.clone(),
+            target: fixture.target.clone(),
+            authority: None,
+            source_session_id: None,
+        };
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: fixture.resource_uid.clone(),
+            pod_uid: PodUid::new(fixture.source.instance_id.as_str()),
+            pvc_uid: PvcUid::new("source-pvc"),
+            initialization_id: InitializationId::new("source-initialization"),
+            local_identity: fixture.source.clone(),
+            effective_policy: fixture.previous_policy.clone(),
+        });
+        state.admitted_policy = Some(fixture.previous_policy.clone());
+        state.highest_epoch = fixture.previous.epoch;
+        state.current_configuration = Some(fixture.previous.clone());
+        state.role = ReplicaRole::Primary;
+        state.read_status = AccessStatus::Granted;
+        state.write_status = AccessStatus::Granted;
+        state
+            .build_commands
+            .insert(fixture.authority.build_id.clone(), command);
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        store
+            .admit(&AdmittedAuthority {
+                local_identity: fixture.source.clone(),
+                transition_kind: None,
+                previous_configuration: None,
+                current_configuration: fixture.previous.clone(),
+                switchover_handoff: None,
+                secondary_removal: None,
+                scale_up: None,
+            })
+            .await
+            .unwrap();
+        store.admit_build(&fixture.authority).await.unwrap();
+        if let Some((last_sequence, durable_lsn, completed, catch_up_boundary_lsn)) = progress {
+            store
+                .record_build_progress(&DurableBuildProgress {
+                    authority: fixture.authority.clone(),
+                    last_sequence,
+                    durable_lsn,
+                    completed,
+                    catch_up_boundary_lsn,
+                })
+                .await
+                .unwrap();
+        }
+        drop(store);
+
+        let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+        let runtime = Arc::new(PodRuntime::new(
+            fixture.source.clone(),
+            Arc::new(TestApplication::default()),
+            store.clone(),
+        ));
+        runtime
+            .reconstruct(
+                OpenMode::Existing,
+                ReplicaRole::Primary,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+                None,
+            )
+            .await
+            .unwrap();
+        let command = store
+            .load_state()
+            .await
+            .unwrap()
+            .build_commands
+            .get(&fixture.authority.build_id)
+            .cloned()
+            .unwrap();
+        let coordinator = Arc::new(Coordinator::new(store.clone(), runtime.clone()));
+        let replay = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move { coordinator.ensure_build(command).await })
+        };
+        let outbound = timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap()
+            .unwrap();
+        let OutboundReplication::Build(endpoint) = outbound else {
+            panic!("{name}: expected replayed build, got {outbound:?}");
+        };
+        assert_eq!(endpoint.build_id, fixture.authority.build_id, "{name}");
+        assert_eq!(endpoint.identity, fixture.target, "{name}");
+        assert_eq!(endpoint.replication_address, "", "{name}");
+        replay.abort();
+        assert_eq!(
+            store
+                .load_build_progress(&fixture.authority.build_id)
+                .await
+                .unwrap(),
+            progress.map(
+                |(last_sequence, durable_lsn, completed, catch_up_boundary_lsn)| {
+                    DurableBuildProgress {
+                        authority: fixture.authority,
+                        last_sequence,
+                        durable_lsn,
+                        completed,
+                        catch_up_boundary_lsn,
+                    }
+                }
+            ),
+            "{name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -8539,6 +8827,400 @@ async fn same_primary_scale_up_preserves_granted_access_and_fences_old_completio
         .await
         .unwrap();
     next.committed().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_primary_scale_up_accepts_real_writes_after_every_durable_agent_effect() {
+    let primary = identity(1, "durable-primary");
+    let secondary = identity(2, "durable-secondary");
+    let candidate = identity(3, "durable-candidate");
+    let previous_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(3, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: secondary.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        previous_policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: secondary.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: candidate.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        current_policy.write_quorum,
+    );
+    let build = BuildAuthority {
+        build_id: OperationId::new("durable-scale-up-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: primary.clone(),
+        target: candidate.clone(),
+        current_configuration: previous.clone(),
+        replication_boundary_lsn: 0,
+    };
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: ResourceUid::new("durable-scale-up-set"),
+        spec_generation: 2,
+        desired_replicas: 3,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: previous_policy.clone(),
+        current_policy: current_policy.clone(),
+        primary: primary.clone(),
+        target: candidate.clone(),
+        build_id: build.build_id.clone(),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 0,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let evidence = ScaleUpConfigurationEvidence::Admission {
+        intent: intent.clone(),
+    };
+    let configuration = |current_only: bool| EnsureConfiguration {
+        operation_id: intent.command_operation_id(
+            if current_only {
+                kuberic_protocol::types::ScaleUpStage::CurrentOnly
+            } else {
+                kuberic_protocol::types::ScaleUpStage::PreviousCurrent
+            },
+            &primary,
+            &current,
+        ),
+        previous_configuration: (!current_only).then_some(previous.clone()),
+        current_configuration: current.clone(),
+        previous_epoch: (!current_only).then_some(previous.epoch),
+        current_epoch: current.epoch,
+        effective_policy: current_policy.clone(),
+        previous_policy: Some(previous_policy.clone()),
+        secondary_removal_evidence: None,
+        scale_up_evidence: Some(Box::new(evidence.clone())),
+        local_replica_id: primary.replica_id,
+        expected_instance_id: primary.instance_id.clone(),
+        expected_agent_generation: primary.agent_generation.clone(),
+        transition_kind: TransitionKind::ScaleUp,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::Granted,
+        current_only,
+        retire_build_ids: current_only
+            .then_some(vec![build.build_id.clone()])
+            .unwrap_or_default(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        pod_uid: PodUid::new(primary.instance_id.as_str()),
+        pvc_uid: PvcUid::new("durable-primary-pvc"),
+        initialization_id: InitializationId::new("durable-primary-initialization"),
+        local_identity: primary.clone(),
+        effective_policy: previous_policy.clone(),
+    });
+    state.admitted_policy = Some(previous_policy.clone());
+    state.highest_epoch = previous.epoch;
+    state.current_configuration = Some(previous.clone());
+    state.role = ReplicaRole::Primary;
+    state.read_status = AccessStatus::Granted;
+    state.write_status = AccessStatus::Granted;
+    state.next_effect_sequence = 5;
+    state.build_commands.insert(
+        build.build_id.clone(),
+        kuberic_protocol::command::EnsureReplicaBuild {
+            operation_id: build.build_id.clone(),
+            local_replica_id: primary.replica_id,
+            expected_instance_id: primary.instance_id.clone(),
+            expected_agent_generation: primary.agent_generation.clone(),
+            target: candidate.clone(),
+            authority: None,
+            source_session_id: None,
+        },
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let previous_authority = AdmittedAuthority {
+        local_identity: primary.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: previous.clone(),
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    };
+    store.admit(&previous_authority).await.unwrap();
+    store.admit_build(&build).await.unwrap();
+    store
+        .record_build_progress(&DurableBuildProgress {
+            authority: build.clone(),
+            last_sequence: 1,
+            durable_lsn: 0,
+            completed: true,
+            catch_up_boundary_lsn: Some(0),
+        })
+        .await
+        .unwrap();
+    let runtime = Arc::new(PodRuntime::new(
+        primary.clone(),
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    ));
+    for (sequence, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(previous_authority)),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(sequence as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
+    let mut effect_sequence = store.load_state().await.unwrap().next_effect_sequence;
+    let mut write_sequence = 0_u64;
+    let write_after = |label: &'static str,
+                       authority: AdmittedAuthority,
+                       runtime: Arc<PodRuntime>,
+                       secondary: ReplicaIdentity,
+                       candidate: ReplicaIdentity,
+                       operation: u64| async move {
+        let pending = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new(format!("durable-scale-up-{label}-{operation}")),
+                data: Bytes::from(format!("{label}-{operation}")),
+            })
+            .await
+            .unwrap();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(acknowledgement(&authority, secondary, pending.lsn))
+            .await
+            .unwrap();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(acknowledgement(&authority, candidate, pending.lsn))
+            .await
+            .unwrap();
+        pending.committed().await.unwrap();
+    };
+
+    let pc_cc = configuration(false);
+    store.begin_configuration(&pc_cc).await.unwrap();
+    let pc_cc_authority =
+        kuberic_agent::command::admit_configuration(&pc_cc, &store.load_state().await.unwrap())
+            .unwrap();
+    adapter
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new(format!("{}:admit-authority", pc_cc.operation_id)),
+            sequence: effect_sequence,
+            action: RuntimeEffectAction::AdmitAuthority(Box::new(pc_cc_authority.clone())),
+        })
+        .await
+        .unwrap();
+    effect_sequence += 1;
+    store
+        .advance_configuration(
+            &pc_cc.operation_id,
+            CoordinatorStage::AdmitAuthority,
+            CoordinatorStage::Activate,
+            None,
+        )
+        .await
+        .unwrap();
+    write_sequence += 1;
+    write_after(
+        "pc-cc-authority",
+        pc_cc_authority.clone(),
+        runtime.clone(),
+        secondary.clone(),
+        candidate.clone(),
+        write_sequence,
+    )
+    .await;
+    adapter
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new(format!("{}:activate", pc_cc.operation_id)),
+            sequence: effect_sequence,
+            action: RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        })
+        .await
+        .unwrap();
+    effect_sequence += 1;
+    store
+        .advance_configuration(
+            &pc_cc.operation_id,
+            CoordinatorStage::Activate,
+            CoordinatorStage::Complete,
+            None,
+        )
+        .await
+        .unwrap();
+    write_sequence += 1;
+    write_after(
+        "pc-cc-access",
+        pc_cc_authority.clone(),
+        runtime.clone(),
+        secondary.clone(),
+        candidate.clone(),
+        write_sequence,
+    )
+    .await;
+    store
+        .complete_configuration(&pc_cc.operation_id)
+        .await
+        .unwrap();
+    write_sequence += 1;
+    write_after(
+        "pc-cc-completion",
+        pc_cc_authority,
+        runtime.clone(),
+        secondary.clone(),
+        candidate.clone(),
+        write_sequence,
+    )
+    .await;
+
+    let current_only = configuration(true);
+    store.begin_configuration(&current_only).await.unwrap();
+    let current_only_authority = kuberic_agent::command::admit_configuration(
+        &current_only,
+        &store.load_state().await.unwrap(),
+    )
+    .unwrap();
+    adapter
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new(format!(
+                "{}:admit-authority",
+                current_only.operation_id
+            )),
+            sequence: effect_sequence,
+            action: RuntimeEffectAction::AdmitAuthority(Box::new(current_only_authority.clone())),
+        })
+        .await
+        .unwrap();
+    effect_sequence += 1;
+    store
+        .advance_configuration(
+            &current_only.operation_id,
+            CoordinatorStage::AdmitAuthority,
+            CoordinatorStage::Activate,
+            None,
+        )
+        .await
+        .unwrap();
+    write_sequence += 1;
+    write_after(
+        "current-only-authority",
+        current_only_authority.clone(),
+        runtime.clone(),
+        secondary.clone(),
+        candidate.clone(),
+        write_sequence,
+    )
+    .await;
+    adapter
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new(format!("{}:activate", current_only.operation_id)),
+            sequence: effect_sequence,
+            action: RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        })
+        .await
+        .unwrap();
+    effect_sequence += 1;
+    store
+        .advance_configuration(
+            &current_only.operation_id,
+            CoordinatorStage::Activate,
+            CoordinatorStage::RetireBuild,
+            None,
+        )
+        .await
+        .unwrap();
+    write_sequence += 1;
+    write_after(
+        "current-only-access",
+        current_only_authority.clone(),
+        runtime.clone(),
+        secondary.clone(),
+        candidate.clone(),
+        write_sequence,
+    )
+    .await;
+    adapter
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new(format!("{}:retire-build-0", current_only.operation_id)),
+            sequence: effect_sequence,
+            action: RuntimeEffectAction::RetireBuild(build.build_id.clone()),
+        })
+        .await
+        .unwrap();
+    store
+        .advance_configuration(
+            &current_only.operation_id,
+            CoordinatorStage::RetireBuild,
+            CoordinatorStage::Complete,
+            None,
+        )
+        .await
+        .unwrap();
+    write_sequence += 1;
+    write_after(
+        "build-retirement",
+        current_only_authority.clone(),
+        runtime.clone(),
+        secondary.clone(),
+        candidate.clone(),
+        write_sequence,
+    )
+    .await;
+    store
+        .complete_configuration(&current_only.operation_id)
+        .await
+        .unwrap();
+    write_sequence += 1;
+    write_after(
+        "current-only-completion",
+        current_only_authority,
+        runtime,
+        secondary,
+        candidate,
+        write_sequence,
+    )
+    .await;
 }
 
 #[tokio::test]

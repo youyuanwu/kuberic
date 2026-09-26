@@ -1065,9 +1065,9 @@ mod tests {
     use super::*;
     use kuberic_protocol::types::{
         AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId,
-        ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid, PvcUid, ReplicaIdentity,
-        ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, ScaleUpIntent,
-        SwitchoverRequestId, TransitionKind,
+        ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId, PvcUid,
+        ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence,
+        ScaleUpIntent, SwitchoverRequestId, TransitionKind,
     };
 
     #[test]
@@ -1192,6 +1192,53 @@ mod tests {
         assert_eq!(
             startup_write_status(AccessStatus::Granted, Some(&pending)),
             AccessStatus::Granted
+        );
+    }
+
+    #[tokio::test]
+    async fn scale_up_carried_failover_rejects_old_primary_and_receiver_sessions() {
+        let old_primary = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("old-primary"),
+            agent_generation: AgentGeneration::new("old-primary-generation"),
+        };
+        let new_primary = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("new-primary"),
+            agent_generation: AgentGeneration::new("new-primary-generation"),
+        };
+        let registry = SessionRegistry::new(ProcessSessionId::new("receiver-current"));
+        registry
+            .register_peer(
+                new_primary.clone(),
+                ProcessSessionId::new("new-primary-current"),
+            )
+            .await;
+        assert!(
+            registry
+                .validate_peer(
+                    &old_primary,
+                    "old-primary-retired",
+                    registry.local_session().as_str()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_peer(&new_primary, "new-primary-current", "receiver-retired")
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_peer(
+                    &new_primary,
+                    "new-primary-current",
+                    registry.local_session().as_str()
+                )
+                .await
+                .is_ok()
         );
     }
 }

@@ -557,13 +557,36 @@ fn admit_scale_up_configuration(
                     && member.role == ReplicaRole::Primary
             })
             .expect("validated failover configuration has one primary");
-        if state.scale_up_evidence.is_none()
-            || state.previous_configuration.as_ref() != Some(&intent.previous_configuration)
-            || state.current_configuration.as_ref() != Some(&intent.current_configuration)
-            || !evidence
-                .current_read_quorum
-                .iter()
-                .any(|witness| witness.identity == new_primary.identity)
+        let has_new_primary_witness = evidence
+            .current_read_quorum
+            .iter()
+            .any(|witness| witness.identity == new_primary.identity);
+        let first_failover_admission = !command.current_only
+            && matches!(
+                state.scale_up_evidence.as_deref(),
+                Some(
+                    kuberic_protocol::types::ScaleUpConfigurationEvidence::Admission {
+                        intent: durable_intent
+                    }
+                ) if durable_intent == intent
+            )
+            && state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.current_configuration.as_ref() == Some(&intent.current_configuration);
+        let exact_installed_failover = state.scale_up_evidence.as_deref()
+            == Some(
+                command
+                    .scale_up_evidence
+                    .as_deref()
+                    .expect("validated evidence"),
+            )
+            && state.current_configuration.as_ref() == Some(&command.current_configuration)
+            && (state.previous_configuration == command.previous_configuration
+                || (command.current_only
+                    && persisted_exact_replay
+                    && state.previous_configuration.is_none()));
+        if !has_new_primary_witness
+            || (!first_failover_admission
+                && !(exact_installed_failover && (command.current_only || persisted_exact_replay)))
         {
             return Err(AgentError::CommandRejected(
                 "carried scale-up failover lacks durable PC/CC authority or a new-primary witness"
@@ -603,18 +626,32 @@ fn admit_scale_up_configuration(
                 "candidate has not durably admitted the exact scale-up build".into(),
             )
         })?;
-        if state.retired_builds.contains(&intent.build_id)
+        let authority = build.authority.as_ref().ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate build command lacks immutable receiver authority".into(),
+            )
+        })?;
+        let progress = state.build_progress.get(&intent.build_id).ok_or_else(|| {
+            AgentError::CommandRejected(
+                "candidate lacks durable exact scale-up build progress".into(),
+            )
+        })?;
+        if (state.retired_builds.contains(&intent.build_id)
+            && !(command.current_only && persisted_exact_replay))
             || build.target != intent.target
-            || build.authority.as_ref().is_none_or(|authority| {
-                authority.build_id != intent.build_id
-                    || authority.source != intent.primary
-                    || authority.target != intent.target
-                    || authority.current_configuration != intent.previous_configuration
-                    || authority.replication_boundary_lsn != intent.snapshot_boundary_lsn
-            })
+            || authority.build_id != intent.build_id
+            || authority.source != intent.primary
+            || authority.target != intent.target
+            || authority.current_configuration != intent.previous_configuration
+            || authority.replication_boundary_lsn != intent.snapshot_boundary_lsn
+            || progress.authority != *authority
+            || !progress.completed
+            || progress.catch_up_boundary_lsn != Some(intent.catch_up_boundary_lsn)
+            || progress.durable_lsn < intent.catch_up_boundary_lsn
         {
             return Err(AgentError::CommandRejected(
-                "candidate build authority differs from scale-up admission".into(),
+                "candidate requires exact completed build progress through the frozen boundary"
+                    .into(),
             ));
         }
     }

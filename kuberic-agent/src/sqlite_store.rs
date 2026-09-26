@@ -534,14 +534,6 @@ impl AgentStore for SqliteStore {
     ) -> Result<BeginConfiguration> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            if let Some(retained) = state.scale_up_commands.get(&command.operation_id) {
-                if retained.command != *command {
-                    return Err(AgentError::EffectConflict(
-                        "scale-up command operation was mutated".into(),
-                    ));
-                }
-                return Ok(BeginConfiguration::Completed(retained.clone()));
-            }
             if let Some(retained) = state.removal_commands.get(&command.operation_id) {
                 if retained.command != *command {
                     return Err(AgentError::EffectConflict(
@@ -781,11 +773,6 @@ impl AgentStore for SqliteStore {
             if result.command.transition_kind == TransitionKind::SecondaryScaleDown {
                 state
                     .removal_commands
-                    .insert(result.command.operation_id.clone(), result.clone());
-            }
-            if result.command.scale_up_evidence.is_some() {
-                state
-                    .scale_up_commands
                     .insert(result.command.operation_id.clone(), result.clone());
             }
             state.retained_command = Some(result.clone());
@@ -1480,6 +1467,13 @@ impl BuildProgressStore for SqliteStore {
                     params![progress.authority.build_id.as_str(), json],
                 )
                 .map_err(contract_sqlite_error)?;
+            let mut state = load_state_from_connection(transaction)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            state
+                .build_progress
+                .insert(progress.authority.build_id.clone(), progress.clone());
+            write_agent_state(transaction, &state)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
             Ok(())
         })
     }

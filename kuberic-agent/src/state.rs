@@ -8,7 +8,7 @@ use kuberic_protocol::types::{
     ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, SecondaryRemovalEvidence,
     SecondaryRemovalPreparation, SecondaryScaleDownCleanup, SwitchoverHandoff,
 };
-use kuberic_runtime_internal::authority::RetiredAuthority;
+use kuberic_runtime_internal::authority::{DurableBuildProgress, RetiredAuthority};
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -135,9 +135,9 @@ pub struct AgentState {
     #[serde(default)]
     pub scale_up_evidence: Option<Box<ScaleUpConfigurationEvidence>>,
     #[serde(default)]
-    pub scale_up_commands: BTreeMap<OperationId, RetainedCommandResult>,
-    #[serde(default)]
     pub build_commands: BTreeMap<OperationId, EnsureReplicaBuild>,
+    #[serde(default)]
+    pub build_progress: BTreeMap<OperationId, DurableBuildProgress>,
     #[serde(default)]
     pub retired_builds: BTreeSet<OperationId>,
     #[serde(default = "initial_effect_sequence")]
@@ -180,8 +180,8 @@ impl AgentState {
             reconfiguration: None,
             retained_command: None,
             scale_up_evidence: None,
-            scale_up_commands: BTreeMap::new(),
             build_commands: BTreeMap::new(),
+            build_progress: BTreeMap::new(),
             retired_builds: BTreeSet::new(),
             next_effect_sequence: 1,
             load_metrics: Vec::new(),

@@ -777,6 +777,15 @@ async fn durable_build_catch_up_boundary_is_write_once() {
     advanced.last_sequence = 2;
     advanced.durable_lsn = 2;
     store.record_build_progress(&advanced).await.unwrap();
+    assert_eq!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .build_progress
+            .get(&advanced.authority.build_id),
+        Some(&advanced)
+    );
 
     let mut changed = advanced.clone();
     changed.catch_up_boundary_lsn = Some(3);
