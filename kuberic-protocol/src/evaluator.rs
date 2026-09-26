@@ -2249,7 +2249,24 @@ fn evaluate_transition(
     if let Some(condition) = unsupported {
         status = status.with_condition(condition);
     }
-    if status != snapshot.status {
+    // Persist the first transition projection and any newly changed
+    // UnsupportedSpec condition, but do not overwrite an already persisted
+    // precise Progressing reason merely with "TransitionActive". Doing so
+    // would alternate forever with the subsequent Wait result and starve the
+    // next epoch-fenced command.
+    let has_precise_progress_wait = snapshot.status.conditions.iter().any(|condition| {
+        condition.type_ == "Progressing" && condition.reason == "ElectionProgressPending"
+    });
+    let unsupported_changed = snapshot
+        .status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "UnsupportedSpec")
+        != status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "UnsupportedSpec");
+    if status != snapshot.status && (!has_precise_progress_wait || unsupported_changed) {
         return Plan::Apply {
             changes: vec![KubernetesChange::PersistStatus {
                 status: Box::new(status),
@@ -3806,7 +3823,9 @@ fn select_failover_candidate<'a>(
                 .members
                 .iter()
                 .any(|member| member.identity == report.identity)
-                && report.write_status != AccessStatus::Granted
+                && (report.write_status != AccessStatus::Granted
+                    || (report.identity.replica_id == configuration.primary_id
+                        && report.deactivation_epoch == Some(configuration.epoch)))
                 && (report.role != ReplicaRole::Primary
                     || report.identity.replica_id == configuration.primary_id)
         })

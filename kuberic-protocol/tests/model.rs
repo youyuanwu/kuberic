@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use kuberic_protocol::command::{KubernetesChange, ProtocolCommand};
+use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, ScaleDownResource};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
     AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation, ObservationSnapshot,
@@ -11,7 +11,7 @@ use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverOutcome,
     PlannedSwitchoverRequest, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
-    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpStage,
     SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind, derive_transition_id,
 };
 use kuberic_protocol::validation::{ValidationError, validate_snapshot, validate_status};
@@ -63,26 +63,7 @@ fn model_env_u64(name: &str, default: u64) -> u64 {
 }
 
 fn scale_up_model_writable(model: &scale_up_model::Model) -> bool {
-    let accepted = &model
-        .snapshot
-        .status
-        .topology
-        .as_ref()
-        .unwrap()
-        .configuration;
-    let primary = accepted
-        .members
-        .iter()
-        .find(|member| member.role == ReplicaRole::Primary)
-        .unwrap();
-    model.snapshot.replicas.values().any(|observation| {
-        matches!(
-            &observation.agent,
-            AgentObservation::Report(report)
-                if report.identity == primary.identity
-                    && report.write_status == AccessStatus::Granted
-        )
-    })
+    model.can_acknowledge_write()
 }
 
 fn assert_stale_report_cannot_advance(model: &scale_up_model::Model) {
@@ -138,6 +119,7 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
         "scale-up-model seed={configured_seed:#018x} cases={cases} runs={runs}; \
          reproduce with KUBERIC_MODEL_SEED={configured_seed} KUBERIC_MODEL_CASES={cases}"
     );
+    let mut coverage = BTreeMap::<&'static str, u64>::new();
 
     for run in 0..runs {
         let seed = configured_seed.wrapping_add((run as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
@@ -150,10 +132,12 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
             let mut cancellation_requested = false;
             let mut cancellation_completed = false;
             let mut cancelled_incarnation = None;
+            let mut replay_trace = Vec::new();
 
             for step in 0..480_u64 {
                 if step % 5 == 0 && scale_up_model_writable(&model) {
                     model.acknowledge_write(case + run as u64 * cases, step);
+                    *coverage.entry("write-varied-times").or_default() += 1;
                 }
                 if step % 7 == 0 {
                     let ids = model
@@ -169,10 +153,14 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                         .collect::<Vec<_>>();
                     if !ids.is_empty() {
                         model.restart(ids[rng.index(ids.len())]);
+                        *coverage
+                            .entry("restart-drops-volatile-session")
+                            .or_default() += 1;
                     }
                 }
                 if step % 11 == 0 {
                     assert_stale_report_cannot_advance(&model);
+                    *coverage.entry("obsolete-session-report").or_default() += 1;
                 }
 
                 if case % 4 == 0
@@ -189,6 +177,7 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     model.snapshot.desired.replicas = model.accepted_count();
                     model.snapshot.desired.generation += 1;
                     cancellation_requested = true;
+                    *coverage.entry("desired-churn-cancel").or_default() += 1;
                 } else if cancellation_requested
                     && !cancellation_completed
                     && model.snapshot.status.scale_up_cleanup.is_none()
@@ -198,16 +187,44 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
                     model.snapshot.desired.replicas = desired;
                     model.snapshot.desired.generation += 1;
                     cancellation_completed = true;
+                    *coverage.entry("fresh-incarnation-retry").or_default() += 1;
                 }
 
                 let replay = model.snapshot.clone();
                 let plan = model.plan();
+                replay_trace.push(format!(
+                    "step={step} accepted={} desired={} plan={plan:?}",
+                    model.accepted_count(),
+                    model.snapshot.desired.replicas
+                ));
+                if model.snapshot.status.provisioning.is_some() {
+                    *coverage.entry("candidate-provisioning").or_default() += 1;
+                }
+                if model.snapshot.status.scale_up_cleanup.is_some() {
+                    *coverage.entry("exact-candidate-cleanup").or_default() += 1;
+                }
+                if model
+                    .snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up.is_some())
+                {
+                    *coverage.entry("pc-cc-authority").or_default() += 1;
+                }
                 assert_eq!(
                     plan,
                     evaluate(&replay, &scale_up_model::config()),
                     "seed={seed:#x} case={case} step={step}"
                 );
-                model.step();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.step())).is_err()
+                {
+                    panic!(
+                        "model replay failed seed={seed:#x} case={case} step={step}; \
+                         full replay trace:\n{}",
+                        replay_trace.join("\n")
+                    );
+                }
                 if model.accepted_count() == desired
                     && model.snapshot.status.transition.is_none()
                     && model.snapshot.status.provisioning.is_none()
@@ -247,8 +264,30 @@ fn seeded_scale_up_adversarial_histories_preserve_authority_and_writes() {
             }
             model.assert_acknowledged_write_oracle();
             model.assert_safety_invariants();
+            if additions == 2 {
+                *coverage
+                    .entry("sequential-additions-late-receipt")
+                    .or_default() += 1;
+            }
         }
     }
+    for required in [
+        "write-varied-times",
+        "restart-drops-volatile-session",
+        "obsolete-session-report",
+        "desired-churn-cancel",
+        "fresh-incarnation-retry",
+        "candidate-provisioning",
+        "exact-candidate-cleanup",
+        "pc-cc-authority",
+        "sequential-additions-late-receipt",
+    ] {
+        assert!(
+            coverage.get(required).copied().unwrap_or_default() > 0,
+            "recorded/default corpus missed event class {required}"
+        );
+    }
+    println!("scale-up-model event-coverage={coverage:?}");
 }
 
 fn fail_model_primary(model: &mut scale_up_model::Model) -> (ReplicaIdentity, Box<AgentReport>) {
@@ -282,6 +321,353 @@ fn fail_model_primary(model: &mut scale_up_model::Model) -> (ReplicaIdentity, Bo
     (primary, report)
 }
 
+fn drive_exact_scale_up_pc_cc(model: &mut scale_up_model::Model) {
+    for step in 0..240 {
+        let installed = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .is_some_and(|intent| {
+                model.snapshot.status.scale_up_admission_started.as_ref()
+                    == Some(&intent.operation_id)
+                    && intent.current_configuration.members.iter().all(|member| {
+                        model.snapshot.replicas.values().any(|observation| {
+                            matches!(
+                                &observation.agent,
+                                AgentObservation::Report(report)
+                                    if report.identity == member.identity
+                                        && report.previous_configuration.as_ref()
+                                            == Some(&intent.previous_configuration)
+                                        && report.current_configuration.as_ref()
+                                            == Some(&intent.current_configuration)
+                                        && report.retained_operation_id.as_ref()
+                                            == Some(&intent.command_operation_id(
+                                                ScaleUpStage::PreviousCurrent,
+                                                &member.identity,
+                                                &intent.current_configuration,
+                                            ))
+                            )
+                        })
+                    })
+            });
+        if installed {
+            return;
+        }
+        model.step();
+        assert!(step < 239, "exact PC/CC installation was not reached");
+    }
+}
+
+#[test]
+fn acknowledged_write_requires_independent_durable_pc_and_cc_quorums() {
+    let mut missing_previous = scale_up_model::Model::new(2, 3);
+    drive_exact_scale_up_pc_cc(&mut missing_previous);
+    let intent = missing_previous
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .scale_up
+        .as_deref()
+        .unwrap()
+        .clone();
+    let dropped_previous = intent
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.identity != intent.primary)
+        .unwrap()
+        .identity
+        .clone();
+    let error = missing_previous
+        .try_acknowledge_write(1, 1, &BTreeSet::from([dropped_previous]))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "previous write quorum missing: delivered=1, required=2"
+    );
+
+    let mut missing_current = scale_up_model::Model::new(3, 4);
+    drive_exact_scale_up_pc_cc(&mut missing_current);
+    let intent = missing_current
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .scale_up
+        .as_deref()
+        .unwrap()
+        .clone();
+    let dropped_retained = intent
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.identity != intent.primary)
+        .unwrap()
+        .identity
+        .clone();
+    let error = missing_current
+        .try_acknowledge_write(
+            2,
+            1,
+            &BTreeSet::from([intent.target.clone(), dropped_retained]),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "current write quorum missing: delivered=2, required=3"
+    );
+}
+
+#[test]
+fn configuration_and_terminal_reads_detect_missing_durable_history() {
+    let mut configuration = scale_up_model::Model::new(2, 3);
+    let (command, target, boundary) = loop {
+        match configuration.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command
+                .scale_up_evidence
+                .as_deref()
+                .is_some_and(|evidence| {
+                    command.local_replica_id == evidence.intent().target.replica_id
+                }) =>
+            {
+                let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+                let target = intent.target.clone();
+                let boundary = intent.catch_up_boundary_lsn;
+                break (
+                    ProtocolCommand::EnsureConfiguration(command),
+                    target,
+                    boundary,
+                );
+            }
+            _ => {
+                configuration.step();
+            }
+        }
+    };
+    configuration.remove_durable_value(&target, boundary);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            configuration.execute(command);
+        }))
+        .is_err(),
+        "authority installation repaired missing application bytes"
+    );
+
+    let mut terminal = scale_up_model::Model::new(3, 3);
+    let lsn = terminal.acknowledge_write(7, 1);
+    let identities = terminal.accepted_identities();
+    terminal.remove_durable_value(&identities[0], lsn);
+    terminal.remove_durable_value(&identities[1], lsn);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            terminal.assert_acknowledged_write_oracle();
+        }))
+        .is_err(),
+        "terminal read masks ignored missing per-incarnation durable bytes"
+    );
+}
+
+#[test]
+fn insufficient_scale_up_failover_witness_masks_block_precisely() {
+    for missing in ["previous", "current"] {
+        let mut model = scale_up_model::Model::new(2, 3);
+        drive_exact_scale_up_pc_cc(&mut model);
+        let intent = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .scale_up
+            .as_deref()
+            .unwrap()
+            .clone();
+        let (failed_primary, _) = fail_model_primary(&mut model);
+        let unavailable = if missing == "previous" {
+            intent
+                .previous_configuration
+                .members
+                .iter()
+                .find(|member| member.identity != failed_primary)
+                .unwrap()
+                .identity
+                .clone()
+        } else {
+            intent.target.clone()
+        };
+        model
+            .snapshot
+            .replicas
+            .get_mut(&ReplicaObservationKey::new(
+                unavailable.replica_id,
+                unavailable.instance_id.clone(),
+            ))
+            .unwrap()
+            .agent = AgentObservation::Absent;
+        let plan = model.plan();
+        let Plan::Wait { reason, status, .. } = plan else {
+            panic!("{missing} witness loss was not safely blocked: {plan:?}");
+        };
+        assert_eq!(reason, kuberic_protocol::plan::WaitReason::ActiveTransition);
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Progressing")
+            .unwrap();
+        assert_eq!(condition.reason, "ScaleUpFailoverEvidencePending");
+        assert!(condition.message.contains("failover-recovery"));
+        assert!(condition.message.contains("blocking="));
+    }
+}
+
+#[test]
+fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
+    let mut epoch = scale_up_model::Model::new(2, 2);
+    let mut rolled_back = epoch.snapshot.status.clone();
+    let accepted = rolled_back.topology.as_ref().unwrap().configuration.clone();
+    rolled_back.topology = Some(AcceptedTopology {
+        configuration: ConfigurationDescriptor::new(
+            Epoch::default(),
+            accepted.primary_id,
+            accepted.members,
+            accepted.write_quorum,
+        ),
+    });
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            epoch.apply(KubernetesChange::PersistStatus {
+                status: Box::new(rolled_back),
+            });
+        }))
+        .is_err(),
+        "accepted epoch rollback escaped the high-water invariant"
+    );
+
+    let mut cleanup = scale_up_model::Model::new(1, 2);
+    let delete = loop {
+        if cleanup.snapshot.status.provisioning.is_some()
+            && cleanup.snapshot.status.transition.is_none()
+        {
+            cleanup.snapshot.desired.replicas = 1;
+            cleanup.snapshot.desired.generation += 1;
+        }
+        match cleanup.plan() {
+            Plan::Apply { changes } => {
+                if let Some(delete) = changes.iter().find(|change| {
+                    matches!(
+                        change,
+                        KubernetesChange::DeleteScaleDownResource {
+                            resource: ScaleDownResource::Pod | ScaleDownResource::Pvc,
+                            ..
+                        }
+                    )
+                }) {
+                    break delete.clone();
+                }
+                for change in changes {
+                    cleanup.apply(change);
+                }
+            }
+            _ => {
+                cleanup.step();
+            }
+        }
+    };
+    cleanup.validate_deletion_change(&delete).unwrap();
+    let KubernetesChange::DeleteScaleDownResource {
+        resource,
+        uid,
+        resource_version,
+        ..
+    } = &delete
+    else {
+        unreachable!()
+    };
+    for mutation in [
+        KubernetesChange::DeleteScaleDownResource {
+            resource: *resource,
+            name: "wrong-name".into(),
+            uid: uid.clone(),
+            resource_version: resource_version.clone(),
+        },
+        KubernetesChange::DeleteScaleDownResource {
+            resource: *resource,
+            name: match &delete {
+                KubernetesChange::DeleteScaleDownResource { name, .. } => name.clone(),
+                _ => unreachable!(),
+            },
+            uid: "wrong-incarnation".into(),
+            resource_version: resource_version.clone(),
+        },
+        KubernetesChange::DeleteScaleDownResource {
+            resource: *resource,
+            name: match &delete {
+                KubernetesChange::DeleteScaleDownResource { name, .. } => name.clone(),
+                _ => unreachable!(),
+            },
+            uid: uid.clone(),
+            resource_version: "wrong-resource-version".into(),
+        },
+    ] {
+        assert!(cleanup.validate_deletion_change(&mutation).is_err());
+    }
+    cleanup
+        .snapshot
+        .status
+        .scale_up_cleanup
+        .as_mut()
+        .unwrap()
+        .provisioning
+        .operation_id = OperationId::new("wrong-allocation-provenance");
+    assert!(cleanup.validate_deletion_change(&delete).is_err());
+
+    let mut duplicate = scale_up_model::Model::new(1, 2);
+    while duplicate.snapshot.status.provisioning.is_none() {
+        duplicate.step();
+    }
+    let provisioning = duplicate.snapshot.status.provisioning.clone().unwrap();
+    let mut allocation = duplicate
+        .snapshot
+        .status
+        .scale_up_allocation
+        .clone()
+        .unwrap_or_else(|| {
+            let scale_up = provisioning.scale_up().unwrap();
+            let mut allocation = kuberic_protocol::types::ScaleUpAllocation {
+                resource_uid: scale_up.resource_uid.clone(),
+                spec_generation: scale_up.spec_generation,
+                desired_replicas: scale_up.desired_replicas,
+                previous_configuration_id: scale_up.previous_configuration.configuration_id.clone(),
+                accepted_configuration_id: scale_up.previous_configuration.configuration_id.clone(),
+                target_replica_id: scale_up.target_replica_id,
+                operation_id: OperationId::default(),
+                previous_operation_id: None,
+                scaffolding_requested: true,
+                pod_uid: Some(PodUid::new("duplicate-incarnation")),
+                pvc_uid: Some(PvcUid::new("duplicate-pvc")),
+                cancellation_started: false,
+            };
+            allocation.operation_id = allocation.expected_operation_id();
+            allocation
+        });
+    allocation.pod_uid = Some(PodUid::new("duplicate-incarnation"));
+    duplicate.snapshot.status.scale_up_allocation = Some(allocation);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            duplicate.assert_safety_invariants();
+        }))
+        .is_err(),
+        "two exact incarnations of one logical candidate were counted as one"
+    );
+}
+
 #[test]
 fn generated_scale_up_primary_failure_traces_classify_pre_and_post_admission_recovery() {
     for fail_after_pc_cc in [false, true] {
@@ -296,9 +682,29 @@ fn generated_scale_up_primary_failure_traces_classify_pre_and_post_admission_rec
                     .status
                     .transition
                     .as_ref()
-                    .is_some_and(|transition| {
-                        transition.scale_up.is_some()
-                            && transition.previous_configuration_id.is_some()
+                    .and_then(|transition| transition.scale_up.as_deref())
+                    .is_some_and(|intent| {
+                        model.snapshot.status.scale_up_admission_started.as_ref()
+                            == Some(&intent.operation_id)
+                            && intent.current_configuration.members.iter().all(|member| {
+                                model.snapshot.replicas.values().any(|observation| {
+                                    matches!(
+                                        &observation.agent,
+                                        AgentObservation::Report(report)
+                                            if report.identity == member.identity
+                                                && report.previous_configuration.as_ref()
+                                                    == Some(&intent.previous_configuration)
+                                                && report.current_configuration.as_ref()
+                                                    == Some(&intent.current_configuration)
+                                                && report.retained_operation_id.as_ref()
+                                                    == Some(&intent.command_operation_id(
+                                                        ScaleUpStage::PreviousCurrent,
+                                                        &member.identity,
+                                                        &intent.current_configuration,
+                                                    ))
+                                    )
+                                })
+                            })
                     })
             } else {
                 model.snapshot.status.provisioning.is_some()
@@ -311,6 +717,14 @@ fn generated_scale_up_primary_failure_traces_classify_pre_and_post_admission_rec
             assert!(step < 159, "scale-up failure cut was not reached");
         }
         let (failed_primary, mut returning_primary) = fail_model_primary(&mut model);
+        if !fail_after_pc_cc {
+            // Explicit desired churn cancels the unadmitted attempt while
+            // ordinary failover preserves the accepted two-member authority.
+            // Once exact cleanup completes, the original request is restored
+            // and must allocate a fresh incarnation.
+            model.snapshot.desired.replicas = model.accepted_count();
+            model.snapshot.desired.generation += 1;
+        }
         let failed_attempt = model
             .snapshot
             .status
@@ -327,22 +741,10 @@ fn generated_scale_up_primary_failure_traces_classify_pre_and_post_admission_rec
                     .map(|provisioning| provisioning.operation_id.clone())
             })
             .unwrap();
-        let failed_build = model
-            .snapshot
-            .status
-            .transition
-            .as_ref()
-            .and_then(|transition| transition.build_id.clone());
-        let failed_provisioning = model
-            .snapshot
-            .status
-            .provisioning
-            .as_ref()
-            .map(|provisioning| provisioning.operation_id.clone());
-
         let mut observed_cleanup = false;
         let mut observed_failover = false;
         let mut primary_returned = false;
+        let mut retry_requested = fail_after_pc_cc;
         let mut converged = false;
         for _step in 0..320 {
             model.snapshot.now_unix_seconds += 1;
@@ -361,9 +763,39 @@ fn generated_scale_up_primary_failure_traces_classify_pre_and_post_admission_rec
                     .transition
                     .as_ref()
                     .is_some_and(|transition| transition.kind == TransitionKind::Failover);
-            if observed_failover && !primary_returned {
+            if observed_failover && !primary_returned && !fail_after_pc_cc {
                 returning_primary.process_session_id =
                     ProcessSessionId::new("failed-primary-restarted");
+                returning_primary.report_sequence = 1;
+                model
+                    .snapshot
+                    .replicas
+                    .get_mut(&ReplicaObservationKey::new(
+                        failed_primary.replica_id,
+                        failed_primary.instance_id.clone(),
+                    ))
+                    .unwrap()
+                    .agent = AgentObservation::Report(returning_primary.clone());
+                primary_returned = true;
+            }
+            if !fail_after_pc_cc
+                && observed_cleanup
+                && !retry_requested
+                && model.snapshot.status.transition.is_none()
+                && model.snapshot.status.scale_up_cleanup.is_none()
+                && model.snapshot.status.provisioning.is_none()
+            {
+                model.snapshot.desired.replicas = 3;
+                model.snapshot.desired.generation += 1;
+                retry_requested = true;
+            }
+            if fail_after_pc_cc
+                && !primary_returned
+                && model.accepted_count() == 3
+                && model.snapshot.status.transition.is_none()
+            {
+                returning_primary.process_session_id =
+                    ProcessSessionId::new("failed-primary-late-return");
                 returning_primary.report_sequence = 1;
                 model
                     .snapshot
@@ -387,59 +819,44 @@ fn generated_scale_up_primary_failure_traces_classify_pre_and_post_admission_rec
             }
         }
         assert!(observed_failover);
-        if converged {
+        assert!(
+            converged,
+            "{} recoverable primary-failure trace did not converge: {:?}",
             if fail_after_pc_cc {
-                let receipt = model.snapshot.status.last_scale_up.as_ref().unwrap();
-                assert_eq!(receipt.intent.operation_id, failed_attempt);
+                "post-PC/CC"
             } else {
-                assert!(observed_cleanup);
-                let receipt = model.snapshot.status.last_scale_up.as_ref().unwrap();
-                assert_ne!(receipt.intent.operation_id, failed_attempt);
-            }
+                "pre-PC/CC"
+            },
+            (
+                model.plan(),
+                model
+                    .snapshot
+                    .replicas
+                    .values()
+                    .filter_map(|observation| match &observation.agent {
+                        AgentObservation::Report(report) => Some((
+                            report.identity.clone(),
+                            report.role,
+                            report.epoch,
+                            report.previous_configuration.clone(),
+                            report.current_configuration.clone(),
+                            report.deactivation_epoch,
+                            report.deactivated_lsn,
+                            report.write_status,
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            )
+        );
+        if fail_after_pc_cc {
+            let receipt = model.snapshot.status.last_scale_up.as_ref().unwrap();
+            assert_eq!(receipt.intent.operation_id, failed_attempt);
+            assert!(!observed_cleanup);
         } else {
-            let transition = model
-                .snapshot
-                .status
-                .transition
-                .as_ref()
-                .expect("blocked recovery retains explicit authority");
-            if fail_after_pc_cc {
-                let retained_intent = transition.scale_up.as_deref().or_else(|| {
-                    transition
-                        .scale_up_failover
-                        .as_deref()
-                        .map(|evidence| &evidence.intent)
-                });
-                if let Some(intent) = retained_intent {
-                    assert_eq!(intent.operation_id, failed_attempt);
-                } else {
-                    assert_eq!(transition.kind, TransitionKind::Failover);
-                    assert!(transition.build_id == failed_build || transition.build_id.is_none());
-                    assert_eq!(
-                        model
-                            .snapshot
-                            .status
-                            .provisioning
-                            .as_ref()
-                            .map(|provisioning| provisioning.operation_id.clone()),
-                        failed_provisioning
-                    );
-                }
-                assert!(model.snapshot.status.scale_up_cleanup.is_none());
-            } else {
-                assert_eq!(transition.kind, TransitionKind::Failover);
-                assert_eq!(
-                    model
-                        .snapshot
-                        .status
-                        .provisioning
-                        .as_ref()
-                        .unwrap()
-                        .operation_id,
-                    failed_attempt
-                );
-                assert_eq!(model.accepted_count(), 2);
-            }
+            assert!(observed_cleanup);
+            let receipt = model.snapshot.status.last_scale_up.as_ref().unwrap();
+            assert_ne!(receipt.intent.operation_id, failed_attempt);
         }
         model.assert_acknowledged_write_oracle();
         model.assert_safety_invariants();

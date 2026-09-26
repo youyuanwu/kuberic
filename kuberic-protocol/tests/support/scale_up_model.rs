@@ -7,6 +7,15 @@ use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::*;
 use kuberic_protocol::validation::validate_status;
 
+type DurableAcknowledgementEntries = Vec<(i64, Vec<(ReplicaIdentity, ProcessSessionId)>)>;
+type RestartImage = (
+    BTreeMap<i64, String>,
+    BTreeMap<i64, BTreeMap<i64, String>>,
+    BTreeMap<i64, String>,
+    BTreeMap<String, BTreeMap<i64, String>>,
+    DurableAcknowledgementEntries,
+);
+
 pub fn config() -> EvaluationConfig {
     EvaluationConfig {
         enable_secondary_scale_down: true,
@@ -23,7 +32,9 @@ pub struct Model {
     pub durable_receivers: BTreeMap<i64, BTreeMap<i64, String>>,
     pub acknowledged_writes: BTreeMap<i64, String>,
     durable_incarnations: BTreeMap<String, BTreeMap<i64, String>>,
+    durable_acknowledgements: BTreeMap<i64, BTreeMap<ReplicaIdentity, ProcessSessionId>>,
     accepted_epochs: Vec<Epoch>,
+    accepted_policy_high_water: u32,
     frozen_boundaries: BTreeMap<OperationId, i64>,
     committed_incarnations: BTreeSet<String>,
     next_incarnation: u64,
@@ -130,6 +141,25 @@ impl Model {
         let durable_source = (1..=10)
             .map(|lsn| (lsn, format!("value-{lsn}")))
             .collect::<BTreeMap<_, _>>();
+        let initial_acknowledgements = (1..=10)
+            .map(|lsn| {
+                (
+                    lsn,
+                    members
+                        .iter()
+                        .map(|member| {
+                            (
+                                member.identity.clone(),
+                                ProcessSessionId::new(format!(
+                                    "accepted-session-{}",
+                                    member.identity.replica_id
+                                )),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
         Self {
             snapshot: ObservationSnapshot {
                 resource_uid,
@@ -175,7 +205,9 @@ impl Model {
                     )
                 })
                 .collect(),
+            durable_acknowledgements: initial_acknowledgements,
             accepted_epochs: vec![accepted_epoch],
+            accepted_policy_high_water: accepted,
             frozen_boundaries: BTreeMap::new(),
             committed_incarnations: members
                 .iter()
@@ -193,9 +225,23 @@ impl Model {
 
     pub fn from_snapshot(snapshot: ObservationSnapshot, accepted_history: Vec<u32>) -> Self {
         let configuration = &snapshot.status.topology.as_ref().unwrap().configuration;
+        let accepted_policy_high_water = configuration.members.len() as u32;
         let durable_source = (1..=10)
             .map(|lsn| (lsn, format!("value-{lsn}")))
             .collect::<BTreeMap<_, _>>();
+        let initial_sessions = snapshot
+            .replicas
+            .values()
+            .filter_map(|observation| match &observation.agent {
+                AgentObservation::Report(report) => {
+                    Some((report.identity.clone(), report.process_session_id.clone()))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let initial_acknowledgements = (1..=10)
+            .map(|lsn| (lsn, initial_sessions.clone()))
+            .collect();
         Self {
             accepted_epochs: vec![configuration.epoch],
             committed_incarnations: configuration
@@ -213,6 +259,7 @@ impl Model {
                     )
                 })
                 .collect(),
+            durable_acknowledgements: initial_acknowledgements,
             snapshot,
             accepted_history,
             pending_build: None,
@@ -220,6 +267,7 @@ impl Model {
             durable_receivers: BTreeMap::new(),
             acknowledged_writes: durable_source,
             frozen_boundaries: BTreeMap::new(),
+            accepted_policy_high_water,
             next_incarnation: 1,
         }
     }
@@ -239,7 +287,9 @@ impl Model {
             durable_receivers: self.durable_receivers.clone(),
             acknowledged_writes: self.acknowledged_writes.clone(),
             durable_incarnations: self.durable_incarnations.clone(),
+            durable_acknowledgements: self.durable_acknowledgements.clone(),
             accepted_epochs: self.accepted_epochs.clone(),
+            accepted_policy_high_water: self.accepted_policy_high_water,
             frozen_boundaries: self.frozen_boundaries.clone(),
             committed_incarnations: self.committed_incarnations.clone(),
             next_incarnation: self.next_incarnation,
@@ -328,9 +378,34 @@ impl Model {
                     .unwrap()
                     .configuration
                     .epoch;
+                let new_epoch = status
+                    .topology
+                    .as_ref()
+                    .expect("persisted accepted topology")
+                    .configuration
+                    .epoch;
+                let new_policy = status
+                    .effective_policy
+                    .as_ref()
+                    .expect("persisted accepted policy")
+                    .replica_set_size;
+                assert!(
+                    new_epoch >= old_epoch,
+                    "accepted-state persistence rolled epoch back from {old_epoch:?} to {new_epoch:?}"
+                );
+                assert!(
+                    new_policy >= self.accepted_policy_high_water,
+                    "accepted-state persistence rolled policy back from {} to {new_policy}",
+                    self.accepted_policy_high_water
+                );
                 self.snapshot.status = *status;
                 self.refresh_allocation_observation();
+                self.bind_candidate_provenance();
                 let new = self.accepted_count();
+                if new_epoch != old_epoch {
+                    self.accepted_epochs.push(new_epoch);
+                }
+                self.accepted_policy_high_water = new_policy;
                 if new != old {
                     assert_eq!(new, old + 1);
                     self.accepted_history.push(new);
@@ -342,7 +417,6 @@ impl Model {
                         .unwrap()
                         .configuration;
                     assert!(accepted.epoch > old_epoch);
-                    self.accepted_epochs.push(accepted.epoch);
                     self.committed_incarnations.extend(
                         accepted
                             .members
@@ -365,7 +439,20 @@ impl Model {
             KubernetesChange::RemoveWriteRouting => {
                 self.snapshot.routing.write_target = None;
             }
-            KubernetesChange::DeleteScaleDownResource { resource, .. } => {
+            KubernetesChange::DeleteScaleDownResource {
+                resource,
+                name,
+                uid,
+                resource_version,
+            } => {
+                let deletion = KubernetesChange::DeleteScaleDownResource {
+                    resource,
+                    name,
+                    uid,
+                    resource_version,
+                };
+                self.validate_deletion_change(&deletion)
+                    .unwrap_or_else(|error| panic!("invalid modeled deletion: {error}"));
                 let target = self
                     .snapshot
                     .status
@@ -405,8 +492,88 @@ impl Model {
                         .remove(target.instance_id.as_str());
                 }
             }
+
             other => panic!("unexpected scale-up model change: {other:?}"),
         }
+    }
+
+    pub fn validate_deletion_change(&self, change: &KubernetesChange) -> Result<(), String> {
+        let KubernetesChange::DeleteScaleDownResource {
+            resource,
+            name,
+            uid,
+            resource_version,
+        } = change
+        else {
+            return Err("not a deletion command".into());
+        };
+        let (target, provenance) = if let Some(cleanup) = &self.snapshot.status.scale_up_cleanup {
+            (
+                cleanup.target.clone(),
+                cleanup.provisioning.operation_id.clone(),
+            )
+        } else if let Some(allocation) = &self.snapshot.status.scale_up_allocation {
+            (
+                allocation.observation_target(),
+                allocation.operation_id.clone(),
+            )
+        } else {
+            return Err("deletion has no active cleanup/allocation provenance".into());
+        };
+        let exact = self
+            .snapshot
+            .secondary_scale_down_resources
+            .iter()
+            .find(|observation| {
+                observation.resource_uid == self.snapshot.resource_uid
+                    && observation.target == target
+            })
+            .ok_or_else(|| "deletion has no exact target observation".to_string())?;
+        let (identity, observed, allocation_operation) = match resource {
+            ScaleDownResource::Endpoint => (&exact.identity.endpoint, &exact.endpoint, None),
+            ScaleDownResource::Pod => (
+                &exact.identity.pod,
+                &exact.pod,
+                exact.pod_allocation_operation_id.as_ref(),
+            ),
+            ScaleDownResource::Pvc => (
+                &exact.identity.pvc,
+                &exact.pvc,
+                exact.pvc_allocation_operation_id.as_ref(),
+            ),
+        };
+        let CleanupResourceIdentity::Present {
+            name: expected_name,
+            uid: expected_uid,
+        } = identity
+        else {
+            return Err("deletion identity is not frozen present".into());
+        };
+        let ExactResourceObservation::FrozenUidPresent {
+            resource_version: expected_resource_version,
+        } = observed
+        else {
+            return Err("deletion target is not the frozen incarnation".into());
+        };
+        if name != expected_name
+            || uid != expected_uid
+            || resource_version != expected_resource_version
+        {
+            return Err(format!(
+                "deletion identity/version mismatch for {target:?}: expected \
+                 {expected_name}/{expected_uid}@{expected_resource_version}, got \
+                 {name}/{uid}@{resource_version}"
+            ));
+        }
+        if matches!(resource, ScaleDownResource::Pod | ScaleDownResource::Pvc)
+            && allocation_operation != Some(&provenance)
+        {
+            return Err(format!(
+                "deletion allocation provenance mismatch: expected {provenance}, got \
+                 {allocation_operation:?}"
+            ));
+        }
+        Ok(())
     }
 
     fn refresh_allocation_observation(&mut self) {
@@ -497,6 +664,23 @@ impl Model {
                 pvc_allocation_operation_id: Some(allocation.operation_id.clone()),
                 endpoint: ExactResourceObservation::NotFound,
             });
+    }
+
+    fn bind_candidate_provenance(&mut self) {
+        let Some(provisioning) = self.snapshot.status.provisioning.as_ref() else {
+            return;
+        };
+        let target = provisioning.target_identity(&self.snapshot.resource_uid);
+        if let Some(exact) = self
+            .snapshot
+            .secondary_scale_down_resources
+            .iter_mut()
+            .find(|exact| exact.target == target)
+        {
+            exact.pod_allocation_operation_id = Some(provisioning.operation_id.clone());
+            exact.pvc_allocation_operation_id = Some(provisioning.operation_id.clone());
+            exact.pod_matches_allocation_metadata = true;
+        }
     }
 
     fn add_candidate(&mut self, replica_id: ReplicaId) {
@@ -612,7 +796,7 @@ impl Model {
                 observation.agent = AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_protocol::PROTOCOL_VERSION,
                     resource_uid: self.snapshot.resource_uid.clone(),
-                    identity: target,
+                    identity: target.clone(),
                     process_session_id: ProcessSessionId::new("candidate-initialized"),
                     report_sequence: 2,
                     role: ReplicaRole::None,
@@ -624,6 +808,17 @@ impl Model {
                     committed_lsn: 0,
                     ..Default::default()
                 }));
+                if let Some(provisioning) = self.snapshot.status.provisioning.as_ref() {
+                    let exact = self
+                        .snapshot
+                        .secondary_scale_down_resources
+                        .iter_mut()
+                        .find(|exact| exact.target == target)
+                        .expect("initialized target exact resource observation");
+                    exact.pod_allocation_operation_id = Some(provisioning.operation_id.clone());
+                    exact.pvc_allocation_operation_id = Some(provisioning.operation_id.clone());
+                    exact.pod_matches_allocation_metadata = true;
+                }
             }
             ProtocolCommand::EnsureReplicaBuild(command) => {
                 if self.pending_build.is_some() {
@@ -710,14 +905,14 @@ impl Model {
                         assert_eq!(copied.get(&lsn), self.durable_source.get(&lsn));
                     }
                 }
-                if command.scale_up_evidence.is_some() {
-                    for member in &command.current_configuration.members {
-                        self.durable_incarnations
-                            .entry(member.identity.instance_id.to_string())
-                            .or_default()
-                            .extend(self.durable_source.clone());
-                    }
-                }
+                // Configuration only installs authority. It must never synthesize
+                // application history. Every progress claim below is derived from
+                // bytes already durably applied to this exact incarnation.
+                let durable_lsn = self
+                    .durable_incarnations
+                    .get(identity.instance_id.as_str())
+                    .and_then(|history| history.keys().next_back().copied())
+                    .unwrap_or_default();
                 report.role = member.role;
                 report.read_status = AccessStatus::Granted;
                 report.write_status = if member.role == ReplicaRole::Primary {
@@ -734,10 +929,15 @@ impl Model {
                     .map_or(report.current_progress, |evidence| {
                         evidence.intent().catch_up_boundary_lsn
                     });
-                report.current_progress = report.current_progress.max(boundary);
-                report.verified_replication_lsn = Some(boundary);
-                report.committed_lsn = report.committed_lsn.max(boundary);
-                report.current_configuration_quorum_progress = boundary;
+                assert!(
+                    durable_lsn >= boundary,
+                    "configuration cannot repair missing durable history for {identity:?}: \
+                     durable={durable_lsn}, required={boundary}"
+                );
+                report.current_progress = durable_lsn;
+                report.verified_replication_lsn = Some(durable_lsn);
+                report.committed_lsn = durable_lsn;
+                report.current_configuration_quorum_progress = durable_lsn;
                 report.catch_up_boundary = Some(boundary);
                 report.catch_up_complete = true;
                 if command.transition_kind == TransitionKind::Failover {
@@ -771,9 +971,30 @@ impl Model {
                 {
                     Some(report.as_mut())
                 }
+
                 _ => None,
             })
             .unwrap()
+    }
+
+    pub fn accepted_identities(&self) -> Vec<ReplicaIdentity> {
+        self.snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .iter()
+            .map(|member| member.identity.clone())
+            .collect()
+    }
+
+    pub fn remove_durable_value(&mut self, identity: &ReplicaIdentity, lsn: i64) {
+        self.durable_incarnations
+            .get_mut(identity.instance_id.as_str())
+            .expect("modeled durable incarnation")
+            .remove(&lsn);
     }
 
     pub fn restart(&mut self, replica_id: i64) {
@@ -782,14 +1003,39 @@ impl Model {
             self.durable_receivers.clone(),
             self.acknowledged_writes.clone(),
             self.durable_incarnations.clone(),
+            self.durable_acknowledgements
+                .iter()
+                .map(|(lsn, acknowledgements)| {
+                    (
+                        *lsn,
+                        acknowledgements
+                            .iter()
+                            .map(|(identity, session)| (identity.clone(), session.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
         ))
         .unwrap();
-        let (source, receivers, acknowledged, incarnations) =
-            serde_json::from_slice(&bytes).unwrap();
+        let (
+            source,
+            receivers,
+            acknowledged,
+            incarnations,
+            durable_acknowledgement_entries,
+        ): RestartImage = serde_json::from_slice(&bytes).unwrap();
         self.durable_source = source;
         self.durable_receivers = receivers;
         self.acknowledged_writes = acknowledged;
         self.durable_incarnations = incarnations;
+        self.durable_acknowledgements = durable_acknowledgement_entries
+            .into_iter()
+            .map(
+                |(lsn, acknowledgements): (i64, Vec<(ReplicaIdentity, ProcessSessionId)>)| {
+                    (lsn, acknowledgements.into_iter().collect())
+                },
+            )
+            .collect();
         let report = self.report_mut(replica_id);
         report.process_session_id =
             ProcessSessionId::new(format!("{}-restart", report.process_session_id));
@@ -822,6 +1068,22 @@ impl Model {
                     source.current_progress,
                     format!("value-{}", source.current_progress),
                 );
+                let value = self.durable_source[&source.current_progress].clone();
+                for member in self
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .members
+                    .iter()
+                {
+                    self.durable_incarnations
+                        .entry(member.identity.instance_id.to_string())
+                        .or_default()
+                        .insert(source.current_progress, value.clone());
+                }
                 source.report_sequence += 1;
                 let AgentObservation::Report(target) = &mut self
                     .snapshot
@@ -852,6 +1114,22 @@ impl Model {
                 self.durable_source
                     .entry(pending.catch_up_boundary)
                     .or_insert_with(|| format!("value-{}", pending.catch_up_boundary));
+                let value = self.durable_source[&pending.catch_up_boundary].clone();
+                for member in self
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .members
+                    .iter()
+                {
+                    self.durable_incarnations
+                        .entry(member.identity.instance_id.to_string())
+                        .or_default()
+                        .insert(pending.catch_up_boundary, value.clone());
+                }
                 source.builds[0].last_sequence = 2;
                 source.builds[0].durable_lsn = pending.catch_up_boundary;
                 source.builds[0].completed = true;
@@ -876,20 +1154,29 @@ impl Model {
                 target.builds[0].completed = true;
                 target.builds[0].catch_up_boundary_lsn = Some(pending.catch_up_boundary);
                 target.report_sequence += 1;
-                self.durable_receivers.insert(
-                    pending.target.replica_id.value(),
-                    self.durable_source
-                        .range(..=pending.catch_up_boundary)
-                        .map(|(lsn, value)| (*lsn, value.clone()))
-                        .collect(),
-                );
-                self.durable_incarnations.insert(
-                    pending.target.instance_id.to_string(),
-                    self.durable_source
-                        .range(..=pending.catch_up_boundary)
-                        .map(|(lsn, value)| (*lsn, value.clone()))
-                        .collect(),
-                );
+                let copied = self
+                    .durable_source
+                    .range(..=pending.catch_up_boundary)
+                    .map(|(lsn, value)| (*lsn, value.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let receiver = self
+                    .durable_receivers
+                    .entry(pending.target.replica_id.value())
+                    .or_default();
+                let incarnation = self
+                    .durable_incarnations
+                    .entry(pending.target.instance_id.to_string())
+                    .or_default();
+                for (lsn, value) in copied {
+                    if let Some(existing) = receiver.get(&lsn) {
+                        assert_eq!(existing, &value, "receiver payload changed at LSN {lsn}");
+                    }
+                    if let Some(existing) = incarnation.get(&lsn) {
+                        assert_eq!(existing, &value, "incarnation payload changed at LSN {lsn}");
+                    }
+                    receiver.insert(lsn, value.clone());
+                    incarnation.insert(lsn, value);
+                }
                 self.pending_build = None;
             }
             _ => unreachable!(),
@@ -923,57 +1210,61 @@ impl Model {
     }
 
     pub fn acknowledge_write(&mut self, case: u64, step: u64) -> i64 {
-        let primary = self
-            .snapshot
-            .status
-            .topology
-            .as_ref()
-            .unwrap()
-            .configuration
+        self.try_acknowledge_write(case, step, &BTreeSet::new())
+            .unwrap_or_else(|reason| panic!("write was not durably acknowledgeable: {reason}"))
+    }
+
+    pub fn can_acknowledge_write(&self) -> bool {
+        self.fork()
+            .try_acknowledge_write(u64::MAX, u64::MAX, &BTreeSet::new())
+            .is_ok()
+    }
+
+    pub fn try_acknowledge_write(
+        &mut self,
+        case: u64,
+        step: u64,
+        dropped: &BTreeSet<ReplicaIdentity>,
+    ) -> Result<i64, String> {
+        let (previous, current, previous_policy, current_policy) = self.write_authority();
+        let primary = current
             .members
             .iter()
             .find(|member| member.role == ReplicaRole::Primary)
-            .unwrap()
+            .expect("current primary")
             .identity
             .clone();
-        let writable = self.snapshot.replicas.values().any(|observation| {
-            matches!(
-                &observation.agent,
-                AgentObservation::Report(report)
-                    if report.identity == primary
-                        && report.write_status == AccessStatus::Granted
-            )
-        });
-        assert!(
-            writable,
-            "model may acknowledge only through the accepted writer"
-        );
+        let primary_session = self
+            .exact_installed_report(&primary, previous.as_ref(), &current)
+            .filter(|report| report.write_status == AccessStatus::Granted)
+            .map(|report| report.process_session_id.clone());
+        if primary_session.is_none() {
+            return Err("exact installed primary does not grant writes".into());
+        }
         let lsn = self.durable_source.keys().next_back().copied().unwrap_or(0) + 1;
         let value = format!("ack-{case}-{step}-{lsn}");
-        self.durable_source.insert(lsn, value.clone());
-        self.acknowledged_writes.insert(lsn, value.clone());
-
-        let authority = self.snapshot.status.transition.as_ref().map_or_else(
-            || {
-                self.snapshot
-                    .status
-                    .topology
-                    .as_ref()
-                    .unwrap()
-                    .configuration
-                    .clone()
-            },
-            |transition| transition.current_configuration.clone(),
-        );
-        for member in &authority.members {
+        let delivered = current
+            .members
+            .iter()
+            .filter_map(|member| {
+                (!dropped.contains(&member.identity))
+                    .then(|| {
+                        self.exact_installed_report(&member.identity, previous.as_ref(), &current)
+                    })
+                    .flatten()
+                    .filter(|report| report.healthy)
+                    .map(|report| (member.identity.clone(), report.process_session_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (identity, _) in &delivered {
             self.durable_incarnations
-                .entry(member.identity.instance_id.to_string())
+                .entry(identity.instance_id.to_string())
                 .or_default()
                 .insert(lsn, value.clone());
             if let Some(report) = self.snapshot.replicas.values_mut().find_map(|observation| {
                 match &mut observation.agent {
                     AgentObservation::Report(report)
-                        if report.identity == member.identity
+                        if report.identity == *identity
                             && matches!(
                                 report.role,
                                 ReplicaRole::Primary | ReplicaRole::ActiveSecondary
@@ -986,16 +1277,144 @@ impl Model {
             }) {
                 report.current_progress = report.current_progress.max(lsn);
                 report.committed_lsn = report.committed_lsn.max(lsn);
-                if report.current_configuration.as_ref() == Some(&authority) {
-                    report.verified_replication_lsn =
-                        Some(report.verified_replication_lsn.unwrap_or_default().max(lsn));
-                    report.current_configuration_quorum_progress =
-                        report.current_configuration_quorum_progress.max(lsn);
-                }
+                report.verified_replication_lsn =
+                    Some(report.verified_replication_lsn.unwrap_or_default().max(lsn));
+                report.current_configuration_quorum_progress =
+                    report.current_configuration_quorum_progress.max(lsn);
                 report.report_sequence += 1;
             }
         }
-        lsn
+        // A completed copy stream may continue carrying ordered operations to
+        // the unadmitted IdleSecondary. This is explicit durable delivery, but
+        // it contributes no PC/CC acknowledgement credit until that exact
+        // incarnation has installed membership authority.
+        let build_targets = self
+            .snapshot
+            .replicas
+            .values()
+            .filter_map(|observation| match &observation.agent {
+                AgentObservation::Report(report)
+                    if report.role == ReplicaRole::IdleSecondary && !report.builds.is_empty() =>
+                {
+                    Some(report.identity.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for identity in build_targets {
+            self.durable_incarnations
+                .entry(identity.instance_id.to_string())
+                .or_default()
+                .insert(lsn, value.clone());
+            let report = self
+                .snapshot
+                .replicas
+                .values_mut()
+                .find_map(|observation| match &mut observation.agent {
+                    AgentObservation::Report(report) if report.identity == identity => {
+                        Some(report.as_mut())
+                    }
+                    _ => None,
+                })
+                .expect("build target report");
+            report.current_progress = report.current_progress.max(lsn);
+            report.committed_lsn = report.committed_lsn.max(lsn);
+            report.report_sequence += 1;
+        }
+        let delivered_identities = delivered
+            .iter()
+            .map(|(identity, _)| identity)
+            .collect::<BTreeSet<_>>();
+        let current_count = current
+            .members
+            .iter()
+            .filter(|member| delivered_identities.contains(&member.identity))
+            .count();
+        let previous_count = previous.as_ref().map_or(current_count, |configuration| {
+            configuration
+                .members
+                .iter()
+                .filter(|member| delivered_identities.contains(&member.identity))
+                .count()
+        });
+        if previous_count < previous_policy.write_quorum as usize {
+            return Err(format!(
+                "previous write quorum missing: delivered={previous_count}, required={}",
+                previous_policy.write_quorum
+            ));
+        }
+        if current_count < current_policy.write_quorum as usize {
+            return Err(format!(
+                "current write quorum missing: delivered={current_count}, required={}",
+                current_policy.write_quorum
+            ));
+        }
+        let acknowledgements = delivered.into_iter().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            acknowledgements.get(&primary),
+            primary_session.as_ref(),
+            "primary acknowledgement must bind the exact installed session"
+        );
+        self.durable_source.insert(lsn, value.clone());
+        self.acknowledged_writes.insert(lsn, value);
+        self.durable_acknowledgements.insert(lsn, acknowledgements);
+        Ok(lsn)
+    }
+
+    fn write_authority(
+        &self,
+    ) -> (
+        Option<ConfigurationDescriptor>,
+        ConfigurationDescriptor,
+        EffectivePolicy,
+        EffectivePolicy,
+    ) {
+        if let Some(transition) = &self.snapshot.status.transition
+            && let Some(intent) = transition.scale_up.as_deref().or_else(|| {
+                transition
+                    .scale_up_failover
+                    .as_deref()
+                    .map(|evidence| &evidence.intent)
+            })
+        {
+            return (
+                Some(intent.previous_configuration.clone()),
+                transition.current_configuration.clone(),
+                intent.previous_policy.clone(),
+                intent.current_policy.clone(),
+            );
+        }
+        let configuration = self
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        let policy = self.snapshot.status.effective_policy.clone().unwrap();
+        (None, configuration, policy.clone(), policy)
+    }
+
+    fn exact_installed_report(
+        &self,
+        identity: &ReplicaIdentity,
+        previous: Option<&ConfigurationDescriptor>,
+        current: &ConfigurationDescriptor,
+    ) -> Option<&AgentReport> {
+        self.snapshot.replicas.values().find_map(|observation| {
+            let AgentObservation::Report(report) = &observation.agent else {
+                return None;
+            };
+            (report.identity == *identity
+                && report.current_configuration.as_ref() == Some(current)
+                && report.previous_configuration.as_ref() == previous
+                && current
+                    .members
+                    .iter()
+                    .any(|member| member.identity == report.identity && member.role == report.role))
+            .then_some(report.as_ref())
+        })
     }
 
     pub fn assert_acknowledged_write_oracle(&self) {
@@ -1003,6 +1422,21 @@ impl Model {
         let configuration = &status.topology.as_ref().unwrap().configuration;
         let policy = status.effective_policy.as_ref().unwrap();
         for (lsn, value) in &self.acknowledged_writes {
+            let durable_acks = self
+                .durable_acknowledgements
+                .get(lsn)
+                .unwrap_or_else(|| panic!("acknowledged write {lsn} has no durable ack record"));
+            assert!(
+                durable_acks.iter().all(|(identity, session)| {
+                    !session.as_str().is_empty()
+                        && self
+                            .durable_incarnations
+                            .get(identity.instance_id.as_str())
+                            .and_then(|history| history.get(lsn))
+                            == Some(value)
+                }),
+                "acknowledgement record for {lsn} is not backed by exact durable application"
+            );
             let recoverable = configuration
                 .members
                 .iter()
@@ -1073,12 +1507,12 @@ impl Model {
 
         let mut active_targets = BTreeSet::new();
         if let Some(allocation) = &self.snapshot.status.scale_up_allocation {
-            active_targets.insert(allocation.target_replica_id);
+            active_targets.insert(allocation.observation_target());
         }
         if let Some(provisioning) = &self.snapshot.status.provisioning
             && provisioning.scale_up().is_some()
         {
-            active_targets.insert(provisioning.replica_id());
+            active_targets.insert(provisioning.target_identity(&self.snapshot.resource_uid));
         }
         if let Some(transition) = &self.snapshot.status.transition
             && let Some(intent) = transition.scale_up.as_deref().or_else(|| {
@@ -1088,10 +1522,10 @@ impl Model {
                     .map(|evidence| &evidence.intent)
             })
         {
-            active_targets.insert(intent.target.replica_id);
+            active_targets.insert(intent.target.clone());
         }
         if let Some(cleanup) = &self.snapshot.status.scale_up_cleanup {
-            active_targets.insert(cleanup.target.replica_id);
+            active_targets.insert(cleanup.target.clone());
             assert!(
                 !accepted
                     .members
