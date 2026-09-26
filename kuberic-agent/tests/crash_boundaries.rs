@@ -6,7 +6,7 @@ use std::{env, process::Command};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt, stream};
 use kuberic_agent::command::admit_configuration;
 use kuberic_agent::coordinator::Coordinator;
 use kuberic_agent::hosting::PodRuntime;
@@ -623,10 +623,27 @@ impl StateProvider for CrashState {
 
     async fn get_copy_state(
         &self,
-        _up_to_lsn: i64,
-        _copy_context: OperationDataStream,
+        up_to_lsn: i64,
+        mut copy_context: OperationDataStream,
     ) -> RuntimeResult<OperationDataStream> {
-        Ok(Box::pin(stream::empty()))
+        if copy_context.next().await.is_some() {
+            return Err(RuntimeError::Application(
+                "crash fixture does not use copy context".into(),
+            ));
+        }
+        let chunks = self
+            .state
+            .lock()
+            .unwrap()
+            .operations
+            .range(..=up_to_lsn)
+            .map(|(lsn, data)| {
+                serde_json::to_vec(&(*lsn, data))
+                    .map(Bytes::from)
+                    .map_err(|error| RuntimeError::Application(error.to_string()))
+            })
+            .collect::<Vec<_>>();
+        Ok(Box::pin(stream::iter(chunks)))
     }
 
     async fn on_data_loss(&self) -> RuntimeResult<bool> {
@@ -662,8 +679,23 @@ impl DurableState for CrashState {
         &self,
         _build_id: &OperationId,
         _sequence: u64,
-        _chunk: CopyChunk,
+        chunk: CopyChunk,
     ) -> RuntimeResult<()> {
+        let (lsn, data): (i64, Vec<u8>) = serde_json::from_slice(&chunk.data)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let mut state = self.state.lock().unwrap();
+        if let Some(existing) = state.operations.get(&lsn)
+            && existing != &data
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "copy chunk disagrees with existing durable bytes".into(),
+            ));
+        }
+        let mut candidate = state.clone();
+        candidate.operations.insert(lsn, data);
+        candidate.applied_lsn = candidate.applied_lsn.max(lsn);
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(())
     }
 
@@ -671,9 +703,11 @@ impl DurableState for CrashState {
         &self,
         _build_id: &OperationId,
         _sequence: u64,
-        _chunk: &CopyChunk,
+        chunk: &CopyChunk,
     ) -> RuntimeResult<bool> {
-        Ok(true)
+        let (lsn, data): (i64, Vec<u8>) = serde_json::from_slice(&chunk.data)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        Ok(self.state.lock().unwrap().operations.get(&lsn) == Some(&data))
     }
 
     async fn finish_copy(
@@ -1136,6 +1170,228 @@ fn scale_up_configuration_cut_exit_code(cut: &str) -> i32 {
     .position(|candidate| *candidate == cut)
     .unwrap_or_else(|| panic!("unknown scale-up configuration cut {cut}"));
     96 + i32::try_from(index).unwrap()
+}
+
+#[test]
+fn scale_up_cut_adapter_matches_real_source_and_candidate_runtime_trace() {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let directory = tempdir().unwrap();
+        let source_root = directory.path().join("source-owner");
+        let candidate_root = directory.path().join("candidate-owner");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&candidate_root).unwrap();
+
+        let (source_state, command, build) = scale_up_crash_fixture(false);
+        let evidence = command.scale_up_evidence.as_deref().unwrap();
+        let intent = evidence.intent();
+        let source_path = SqliteStore::metadata_database_path(&source_root);
+        let source_store =
+            Arc::new(SqliteStore::create_authorized(&source_path, source_state.clone()).unwrap());
+        let source_authority = AdmittedAuthority {
+            local_identity: intent.primary.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: intent.previous_configuration.clone(),
+            switchover_handoff: None,
+            secondary_removal: None,
+            scale_up: None,
+        };
+        source_store.admit(&source_authority).await.unwrap();
+        source_store.admit_build(&build).await.unwrap();
+
+        let candidate_path = SqliteStore::metadata_database_path(&candidate_root);
+        let mut candidate_state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: intent.resource_uid.clone(),
+            pod_uid: PodUid::new(intent.target.instance_id.as_str()),
+            pvc_uid: PvcUid::new("candidate-real-pvc"),
+            initialization_id: InitializationId::new("candidate-real-initialization"),
+            local_identity: intent.target.clone(),
+            effective_policy: intent.current_policy.clone(),
+        });
+        candidate_state.role = ReplicaRole::IdleSecondary;
+        let candidate_store =
+            Arc::new(SqliteStore::create_authorized(&candidate_path, candidate_state).unwrap());
+        candidate_store.admit_build(&build).await.unwrap();
+
+        let source_application = Arc::new(CrashState::open(source_root.join("application.json")));
+        let snapshot_operations = [
+            Operation {
+                lsn: 1,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"snapshot-row-alpha"),
+            },
+            Operation {
+                lsn: 2,
+                committed_lsn: 2,
+                data: Bytes::from_static(b"snapshot-row-beta-with-different-length"),
+            },
+            Operation {
+                lsn: 4,
+                committed_lsn: 4,
+                data: Bytes::from_static(b"snapshot-boundary-row"),
+            },
+        ];
+        for operation in snapshot_operations.iter().cloned() {
+            source_application.apply(operation).await.unwrap();
+        }
+        let source_runtime = Arc::new(PodRuntime::new(
+            intent.primary.clone(),
+            source_application.clone(),
+            source_store.clone(),
+        ));
+        source_runtime
+            .reconstruct(
+                OpenMode::Existing,
+                ReplicaRole::Primary,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let candidate_application =
+            Arc::new(CrashState::open(candidate_root.join("application.json")));
+        let candidate_runtime = Arc::new(PodRuntime::new(
+            intent.target.clone(),
+            candidate_application.clone(),
+            candidate_store.clone(),
+        ));
+        candidate_runtime
+            .apply_effect(RuntimeEffect {
+                operation_id: OperationId::new("candidate-open"),
+                sequence: 1,
+                action: RuntimeEffectAction::Open(OpenMode::New),
+            })
+            .await
+            .unwrap();
+        candidate_runtime
+            .apply_effect(RuntimeEffect {
+                operation_id: OperationId::new("candidate-idle"),
+                sequence: 2,
+                action: RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+            })
+            .await
+            .unwrap();
+        candidate_runtime
+            .apply_effect(RuntimeEffect {
+                operation_id: OperationId::new("candidate-build-authority"),
+                sequence: 3,
+                action: RuntimeEffectAction::AdmitBuildAuthority(Box::new(build.clone())),
+            })
+            .await
+            .unwrap();
+
+        let mut enumeration = source_application
+            .get_copy_state(4, Box::pin(stream::empty()))
+            .await
+            .unwrap();
+        let post_enumeration_operations = [
+            Operation {
+                lsn: 5,
+                committed_lsn: 5,
+                data: Bytes::from_static(b"client-write-after-enumeration"),
+            },
+            Operation {
+                lsn: 7,
+                committed_lsn: 7,
+                data: Bytes::from_static(b"client-write-with-lsn-gap"),
+            },
+            Operation {
+                lsn: 9,
+                committed_lsn: 9,
+                data: Bytes::from_static(b"catch-up-boundary-value"),
+            },
+        ];
+        for operation in post_enumeration_operations.iter().cloned() {
+            source_application.apply(operation).await.unwrap();
+        }
+
+        let mut sequence = 0;
+        while let Some(bytes) = enumeration.next().await {
+            candidate_application
+                .apply_copy_chunk(
+                    &build.build_id,
+                    sequence,
+                    CopyChunk {
+                        data: bytes.unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            sequence += 1;
+        }
+        candidate_application
+            .finish_copy(&build.build_id, 4, 4)
+            .await
+            .unwrap();
+        for operation in post_enumeration_operations.iter().cloned() {
+            candidate_application.apply(operation).await.unwrap();
+        }
+        candidate_store
+            .record_build_progress(&DurableBuildProgress {
+                authority: build.clone(),
+                last_sequence: sequence,
+                durable_lsn: 9,
+                completed: true,
+                catch_up_boundary_lsn: Some(9),
+            })
+            .await
+            .unwrap();
+
+        for operation in snapshot_operations
+            .iter()
+            .chain(post_enumeration_operations.iter())
+        {
+            assert!(
+                source_application.verify_applied(operation).await.unwrap()
+                    && candidate_application
+                        .verify_applied(operation)
+                        .await
+                        .unwrap(),
+                "source/candidate durable bytes differ at LSN {}",
+                operation.lsn
+            );
+        }
+        assert_eq!(
+            candidate_application.durable_progress().await.unwrap(),
+            DurableApplicationProgress {
+                applied_lsn: 9,
+                committed_lsn: 9,
+            }
+        );
+
+        let authority =
+            admit_configuration(&command, &source_store.load_state().await.unwrap()).unwrap();
+        source_runtime
+            .apply_effect(RuntimeEffect {
+                operation_id: OperationId::new("real-source-refresh-progress"),
+                sequence: 4,
+                action: RuntimeEffectAction::RefreshApplicationProgress,
+            })
+            .await
+            .unwrap();
+        let real_result = source_runtime
+            .apply_effect(RuntimeEffect {
+                operation_id: OperationId::new("real-source-scale-up-authority"),
+                sequence: 5,
+                action: RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+            })
+            .await
+            .unwrap();
+        assert_eq!(real_result.postcondition.authority, Some(authority));
+        assert_eq!(real_result.postcondition.current_progress, 9);
+        assert_eq!(
+            candidate_store
+                .load_build_progress(&build.build_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .durable_lsn,
+            9
+        );
+    });
 }
 
 async fn ensure_scale_up_store_cut(path: &Path, cut: &str, after: bool, terminate: bool) {
