@@ -60,11 +60,12 @@ allocation_schema = status["scaleUpAllocation"]
 allocation = allocation_schema["properties"]
 assert set(allocation) == {
     "resourceUid", "specGeneration", "desiredReplicas", "previousConfigurationId",
-    "targetReplicaId", "operationId", "podUid", "pvcUid",
+    "acceptedConfigurationId", "targetReplicaId", "operationId", "podUid", "pvcUid",
+    "cancellationStarted",
 }
 assert set(allocation_schema["required"]) == {
     "resourceUid", "specGeneration", "desiredReplicas", "previousConfigurationId",
-    "targetReplicaId", "operationId",
+    "acceptedConfigurationId", "targetReplicaId", "operationId",
 }
 assert allocation["targetReplicaId"]["minimum"] == 1
 assert set(status["scaleUpCleanup"]["properties"]) == {
