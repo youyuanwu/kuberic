@@ -683,6 +683,25 @@ pub(super) fn recover_local_acceptance(
             })
         });
     for member in &receipt.accepted_configuration.members {
+        let permanently_failed = snapshot
+            .observation_for_identity(&member.identity)
+            .is_some_and(|observation| {
+                matches!(
+                    &observation.agent,
+                    AgentObservation::Report(report)
+                        if report.reported_fault == Some(crate::types::FaultType::Permanent)
+                )
+            });
+        if permanently_failed
+            && accepted
+                .members
+                .iter()
+                .any(|accepted_member| accepted_member.identity == member.identity)
+        {
+            // The receipt remains historical evidence, but accepted-membership
+            // repair/replacement must arbitrate the committed member failure.
+            return None;
+        }
         let Some(report) = report(snapshot, &member.identity) else {
             return Some(wait(
                 snapshot,

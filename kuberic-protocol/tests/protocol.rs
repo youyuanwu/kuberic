@@ -9346,6 +9346,27 @@ fn scale_up_provisioning_and_prefence_failover_delays_keep_context() {
             while model.snapshot.status.transition.is_none() {
                 model.step();
             }
+
+            fn scale_up_receipt_yields_to_permanent_accepted_member_replacement() {
+                use scale_up_model::Model;
+                for replica_id in [2, 3] {
+                    let mut model = Model::new(2, 3);
+                    model.run(120);
+                    model.report_mut(replica_id).reported_fault = Some(FaultType::Permanent);
+                    model.report_mut(replica_id).healthy = false;
+                    let plan = model.plan();
+                    assert!(!matches!(
+                        &plan,
+                        Plan::Wait { status, .. }
+                            if status.conditions.iter().any(|condition|
+                                condition.reason == "ScaleUpCommittedDegraded")
+                    ));
+                    assert!(matches!(plan, Plan::Apply { .. } | Plan::Wait { .. }));
+                    assert!(model.snapshot.status.last_scale_up.is_some());
+                    assert!(model.snapshot.status.scale_up_cleanup.is_none());
+                }
+            }
+            scale_up_receipt_yields_to_permanent_accepted_member_replacement();
             assert!(model.snapshot.status.scale_up_admission_started.is_none());
         } else {
             while model.snapshot.status.provisioning.is_none() {

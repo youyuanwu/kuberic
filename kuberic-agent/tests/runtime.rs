@@ -8924,7 +8924,7 @@ async fn evaluator_scale_up_sqlite_trace() {
             })
             .collect::<Vec<_>>()
     };
-    let transition = kuberic_protocol::types::TransitionIntent {
+    let expected_transition = kuberic_protocol::types::TransitionIntent {
         transition_id: intent.transition_id(TransitionKind::ScaleUp, &current),
         kind: TransitionKind::ScaleUp,
         spec_generation: intent.spec_generation,
@@ -8958,8 +8958,6 @@ async fn evaluator_scale_up_sqlite_trace() {
                 configuration: previous.clone(),
             }),
             provisioning: Some(provisioning.clone()),
-            transition: Some(transition),
-            scale_up_admission_started: Some(intent.operation_id.clone()),
             ..Default::default()
         },
         replicas: BTreeMap::from([
@@ -9042,15 +9040,76 @@ async fn evaluator_scale_up_sqlite_trace() {
         observation_failures: Vec::new(),
         now_unix_seconds: 100,
     };
+    let config = EvaluationConfig {
+        allow_scale_up: true,
+        ..Default::default()
+    };
+    for remove_source in [true, false] {
+        let mut incomplete = snapshot.clone();
+        let replica_id = if remove_source {
+            source.replica_id
+        } else {
+            target.replica_id
+        };
+        let report = incomplete
+            .replicas
+            .values_mut()
+            .find_map(|observation| match &mut observation.agent {
+                AgentObservation::Report(report) if report.identity.replica_id == replica_id => {
+                    Some(report)
+                }
+                _ => None,
+            })
+            .unwrap();
+        report.builds.clear();
+        match evaluate(&incomplete, &config) {
+            Plan::Execute {
+                command: kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(_),
+            } => panic!("incomplete build evidence produced configuration command"),
+            Plan::Apply { changes } => assert!(!changes.iter().any(|change| {
+                matches!(
+                    change,
+                    kuberic_protocol::command::KubernetesChange::PersistStatus { status }
+                        if status.transition.is_some()
+                            || status.scale_up_admission_started.is_some()
+                )
+            })),
+            _ => {}
+        }
+    }
+    let mut snapshot = snapshot;
+    let Plan::Apply { changes } = evaluate(&snapshot, &config) else {
+        panic!("completed durable copy must persist evaluator transition")
+    };
+    snapshot.status = changes
+        .into_iter()
+        .find_map(|change| match change {
+            kuberic_protocol::command::KubernetesChange::PersistStatus { status } => Some(*status),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        snapshot.status.transition.as_ref(),
+        Some(&expected_transition)
+    );
+    assert!(snapshot.status.scale_up_admission_started.is_none());
+    let Plan::Apply { changes } = evaluate(&snapshot, &config) else {
+        panic!("evaluator must persist admission fence")
+    };
+    snapshot.status = changes
+        .into_iter()
+        .find_map(|change| match change {
+            kuberic_protocol::command::KubernetesChange::PersistStatus { status } => Some(*status),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        snapshot.status.scale_up_admission_started.as_ref(),
+        Some(&intent.operation_id)
+    );
     let Plan::Execute {
         command: kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(target_command),
-    } = evaluate(
-        &snapshot,
-        &EvaluationConfig {
-            allow_scale_up: true,
-            ..Default::default()
-        },
-    )
+    } = evaluate(&snapshot, &config)
     else {
         panic!("completed durable copy must produce evaluator configuration command")
     };
@@ -9075,6 +9134,9 @@ async fn evaluator_scale_up_sqlite_trace() {
     let original_application = Arc::as_ptr(&target_application) as usize;
     drop(target_application);
     drop(target_store);
+    if env::var("KUBERIC_SQLITE_SCALE_UP_WRITER").as_deref() == Ok("1") {
+        return;
+    }
 
     let (persisted_operations, applied_lsn, committed_lsn): PersistedApplicationState =
         serde_json::from_slice(&std::fs::read(&application_path).unwrap()).unwrap();
