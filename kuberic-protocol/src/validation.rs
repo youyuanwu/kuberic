@@ -1190,10 +1190,19 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 && exact_identities(&topology.configuration)
                     == exact_identities(&scale_up.previous_configuration)
         });
-        let transition_allows_failover = status
-            .transition
-            .as_ref()
-            .is_none_or(|transition| transition.kind == TransitionKind::Failover);
+        let transition_allows_failover = status.transition.as_ref().is_none_or(|transition| {
+            transition.kind == TransitionKind::Failover
+                && transition.scale_up.is_none()
+                && transition.scale_up_failover.is_none()
+                && !transition
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|member| {
+                        member.identity.replica_id == cleanup.target.replica_id
+                            || member.identity == cleanup.target
+                    })
+        });
         if status.provisioning.is_some()
             || !transition_allows_failover
             || status.secondary_scale_down_cleanup.is_some()

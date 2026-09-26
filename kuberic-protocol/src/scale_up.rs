@@ -1037,6 +1037,98 @@ mod tests {
     }
 
     #[test]
+    fn pending_candidate_cleanup_rejects_failover_that_admits_the_candidate() {
+        let mut intent = intent(1);
+        let provisioning = provisioning(&intent);
+        let candidate = provisioning.target_identity(&intent.resource_uid);
+        intent.target = candidate.clone();
+        let mut expanded_members = intent.current_configuration.members.clone();
+        expanded_members
+            .iter_mut()
+            .find(|member| member.identity.replica_id == candidate.replica_id)
+            .unwrap()
+            .identity = candidate.clone();
+        intent.current_configuration = ConfigurationDescriptor::new(
+            intent.current_configuration.epoch,
+            intent.current_configuration.primary_id,
+            expanded_members,
+            intent.current_policy.write_quorum,
+        );
+        intent.operation_id = intent.expected_operation_id();
+        let cleanup = ScaleUpCleanup {
+            provisioning,
+            target: candidate.clone(),
+            resources: ReplicaCleanupIdentity {
+                pod: CleanupResourceIdentity::Present {
+                    name: "db-1".into(),
+                    uid: candidate.instance_id.to_string(),
+                },
+                pvc: CleanupResourceIdentity::Present {
+                    name: "db-1-data".into(),
+                    uid: "pvc-2".into(),
+                },
+                endpoint: CleanupResourceIdentity::Present {
+                    name: derive_replica_endpoint_name(&intent.resource_uid, &candidate),
+                    uid: "service-2".into(),
+                },
+            },
+        };
+        let evidence = ScaleUpFailoverEvidence {
+            previous_read_quorum: vec![witness(
+                &intent,
+                intent.previous_configuration.members[0].identity.clone(),
+                true,
+                1,
+            )],
+            current_read_quorum: vec![witness(&intent, candidate.clone(), true, 2)],
+            intent: intent.clone(),
+        };
+        let mut members = intent.current_configuration.members.clone();
+        for member in &mut members {
+            member.role = if member.identity == candidate {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            };
+        }
+        let failover = ConfigurationDescriptor::new(
+            Epoch::new(0, 3),
+            candidate.replica_id,
+            members,
+            intent.current_policy.write_quorum,
+        );
+        let mut status = AcceptedStatus {
+            initialized: true,
+            effective_policy: Some(intent.previous_policy.clone()),
+            topology: Some(AcceptedTopology {
+                configuration: intent.previous_configuration.clone(),
+            }),
+            transition: Some(TransitionIntent {
+                transition_id: intent.transition_id(TransitionKind::Failover, &failover),
+                kind: TransitionKind::Failover,
+                spec_generation: intent.spec_generation,
+                effective_policy: intent.current_policy.clone(),
+                previous_configuration_id: Some(
+                    intent.previous_configuration.configuration_id.clone(),
+                ),
+                current_configuration: failover,
+                election_lsn: Some(0),
+                build_id: Some(intent.build_id.clone()),
+                repair: None,
+                switchover: None,
+                secondary_scale_down: None,
+                secondary_removal_evidence: None,
+                scale_up: None,
+                scale_up_failover: Some(Box::new(evidence)),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(crate::validation::validate_status(&status), Ok(()));
+        status.scale_up_cleanup = Some(Box::new(cleanup));
+        assert!(crate::validation::validate_status(&status).is_err());
+    }
+
+    #[test]
     fn typed_report_evidence_allows_only_the_exact_expansion() {
         let intent = intent(2);
         let primary = intent.primary.clone();
