@@ -2864,10 +2864,6 @@ impl StatefulServiceReplica for TestApplication {
             .lock()
             .unwrap()
             .push("service.abort".to_string());
-        *self.partition.lock().unwrap() = None;
-        *self.state_replicator.lock().unwrap() = None;
-        *self.returned_control.lock().unwrap() = None;
-        self.held_streams.lock().unwrap().clear();
     }
 }
 
