@@ -2864,6 +2864,10 @@ impl StatefulServiceReplica for TestApplication {
             .lock()
             .unwrap()
             .push("service.abort".to_string());
+        *self.partition.lock().unwrap() = None;
+        *self.state_replicator.lock().unwrap() = None;
+        *self.returned_control.lock().unwrap() = None;
+        self.held_streams.lock().unwrap().clear();
     }
 }
 
@@ -8611,6 +8615,8 @@ fn evaluator_scale_up_command_uses_reopened_sqlite_copy_and_preserves_live_write
         .unwrap();
 }
 
+type PersistedApplicationState = (Vec<(i64, i64, Vec<u8>)>, i64, i64);
+
 async fn evaluator_scale_up_sqlite_trace() {
     let resource_uid = ResourceUid::new("sqlite-evaluator-scale-up");
     let source = identity(1, "sqlite-source");
@@ -8833,6 +8839,31 @@ async fn evaluator_scale_up_sqlite_trace() {
             .await
             .unwrap();
     }
+    let application_path = target_directory.path().join("application-state.json");
+    let persisted_operations = target_application
+        .applied
+        .lock()
+        .unwrap()
+        .values()
+        .map(|operation| {
+            (
+                operation.lsn,
+                operation.committed_lsn,
+                operation.data.to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let persisted_progress = *target_application.progress.lock().unwrap();
+    std::fs::write(
+        &application_path,
+        serde_json::to_vec(&(
+            persisted_operations,
+            persisted_progress.applied_lsn,
+            persisted_progress.committed_lsn,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         target_application
             .durable_progress()
@@ -8990,13 +9021,50 @@ async fn evaluator_scale_up_sqlite_trace() {
     };
     assert_eq!(target_command.local_replica_id, target.replica_id);
     assert!(kuberic_agent::command::admit_configuration(&target_command, &before_copy).is_err());
+    target_runtime
+        .apply_effect(effect(4, RuntimeEffectAction::Close))
+        .await
+        .unwrap();
+    target_runtime.abort();
+    *target_application.partition.lock().unwrap() = None;
+    *target_application.factory.lock().unwrap() = None;
+    *target_application.state_replicator.lock().unwrap() = None;
+    *target_application.returned_control.lock().unwrap() = None;
+    target_application.held_streams.lock().unwrap().clear();
     drop(target_runtime);
+    let original_application = Arc::as_ptr(&target_application) as usize;
+    drop(target_application);
     drop(target_store);
+
+    let (persisted_operations, applied_lsn, committed_lsn): PersistedApplicationState =
+        serde_json::from_slice(&std::fs::read(&application_path).unwrap()).unwrap();
+    let reopened_application = Arc::new(TestApplication::default());
+    assert_ne!(
+        Arc::as_ptr(&reopened_application) as usize,
+        original_application
+    );
+    {
+        let mut applied = reopened_application.applied.lock().unwrap();
+        for (lsn, committed_lsn, data) in persisted_operations {
+            applied.insert(
+                lsn,
+                Operation {
+                    lsn,
+                    committed_lsn,
+                    data: Bytes::from(data),
+                },
+            );
+        }
+        *reopened_application.progress.lock().unwrap() = DurableApplicationProgress {
+            applied_lsn,
+            committed_lsn,
+        };
+    }
 
     let reopened_store = Arc::new(SqliteStore::open_existing(&target_path, None).unwrap());
     let reopened_runtime = Arc::new(PodRuntime::new(
         target.clone(),
-        target_application.clone(),
+        reopened_application.clone(),
         reopened_store.clone(),
     ));
     let service = AgentService::new(
@@ -9018,12 +9086,22 @@ async fn evaluator_scale_up_sqlite_trace() {
         ReplicaRole::ActiveSecondary
     );
     assert_eq!(
-        target_application
+        reopened_application
             .durable_progress()
             .await
             .unwrap()
             .applied_lsn,
         2
+    );
+    assert_eq!(
+        reopened_application
+            .applied
+            .lock()
+            .unwrap()
+            .get(&2)
+            .unwrap()
+            .data,
+        Bytes::from_static(b"live-value")
     );
 }
 
