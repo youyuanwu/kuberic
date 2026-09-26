@@ -200,10 +200,16 @@ mod tests {
                 previous_configuration: None,
                 current_configuration: None,
                 current_progress: 5,
+                verified_replication_lsn: None,
                 committed_lsn: 5,
+                read_status: "NotPrimary".into(),
                 write_status: "NotPrimary".into(),
+                catch_up_boundary_lsn: None,
+                catch_up_complete: false,
+                scale_up_operation: None,
                 retired,
                 pending_operation: None,
+                blocking: None,
                 builds: Vec::new(),
             };
             let json = serde_json::to_value(diagnostics).unwrap();
