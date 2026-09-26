@@ -531,6 +531,21 @@ where
                 .iter()
                 .any(|pod| pod.name_any() == pod_name)
             {
+                let pvc = authoritative_pvc_for_pod_create(
+                    &pvcs,
+                    pvc,
+                    &observation.set,
+                    *replica_id,
+                    allocation_operation_id,
+                    observation
+                        .set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
+                        .and_then(|allocation| allocation.pvc_uid.as_ref()),
+                )
+                .await?;
+                let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
                 create_exact(
                     &pods,
                     &pod_name,
@@ -1126,6 +1141,55 @@ fn pvc_matches_allocation(pvc: &PersistentVolumeClaim, operation_id: &OperationI
         .get(SCALE_UP_ALLOCATION_ANNOTATION)
         .map(String::as_str)
         == Some(operation_id.as_str())
+}
+
+async fn authoritative_pvc_for_pod_create(
+    pvcs: &Api<PersistentVolumeClaim>,
+    observed: &PersistentVolumeClaim,
+    set: &KubericSet,
+    replica_id: ReplicaId,
+    allocation_operation_id: Option<&OperationId>,
+    frozen_pvc_uid: Option<&PvcUid>,
+) -> Result<PersistentVolumeClaim> {
+    let expected_name = format!("{}-{}-data", set.name_any(), replica_id.value());
+    let set_uid = set.uid().ok_or(ControllerError::ObservationStale)?;
+    let owner = owner_reference(set)?;
+    let live = pvcs.get(&expected_name).await.map_err(|error| {
+        tracing::warn!(
+            %error,
+            pvc = %expected_name,
+            "authoritative PVC revalidation failed before Pod creation"
+        );
+        ControllerError::ObservationStale
+    })?;
+    let live_uid = live.uid().ok_or(ControllerError::ObservationStale)?;
+    let expected_uid = observed.uid().ok_or(ControllerError::ObservationStale)?;
+    let live_resource_version = live
+        .resource_version()
+        .ok_or(ControllerError::ObservationStale)?;
+    let expected_resource_version = observed
+        .resource_version()
+        .ok_or(ControllerError::ObservationStale)?;
+    let expected_replica_id = replica_id.to_string();
+    let owned = live
+        .owner_references()
+        .iter()
+        .any(|candidate| candidate == &owner);
+    let provenance_matches = allocation_operation_id
+        .is_none_or(|operation_id| pvc_matches_allocation(&live, operation_id));
+    if live.name_any() != expected_name
+        || live_uid != expected_uid
+        || live_resource_version != expected_resource_version
+        || frozen_pvc_uid.is_some_and(|frozen| frozen.as_str() != live_uid)
+        || live.labels().get(SET_UID_LABEL).map(String::as_str) != Some(set_uid.as_str())
+        || live.labels().get(REPLICA_ID_LABEL).map(String::as_str)
+            != Some(expected_replica_id.as_str())
+        || !owned
+        || !provenance_matches
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    Ok(live)
 }
 
 fn replica_pod(

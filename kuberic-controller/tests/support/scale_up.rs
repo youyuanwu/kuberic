@@ -1,8 +1,11 @@
 use super::*;
+use kube::Client;
 use kube::Resource;
-use kuberic_controller::crd::SCALE_UP_ALLOCATION_ANNOTATION;
+use kuberic_controller::cluster_api::{GrpcAgentApi, KubeClusterApi};
+use kuberic_controller::crd::{INSTANCE_LABEL, SCALE_UP_ALLOCATION_ANNOTATION};
+use kuberic_controller::executor::execute_plan;
 use kuberic_protocol::command::{KubernetesChange, ScaleDownResource};
-use kuberic_protocol::types::{AccessStatus, Epoch, TransitionKind};
+use kuberic_protocol::types::{AccessStatus, Epoch, OperationId, TransitionKind};
 use std::collections::BTreeSet;
 
 fn enabled() -> EvaluationConfig {
@@ -999,6 +1002,192 @@ async fn cancelled_candidate_cleanup_is_exact_ordered_and_restart_safe() {
             .and_then(ResourceExt::uid)
             .unwrap(),
         old_pvc_uid
+    );
+}
+
+#[tokio::test]
+async fn failed_provisioning_cleanup_seeds_bounded_fresh_allocation_lineage() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let (old_allocation_operation_id, provisioning_operation_id, old_pvc) = loop {
+        tick(&api).await;
+        let raw = api.observation().await;
+        let Some(provisioning) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.provisioning.as_ref())
+            .filter(|provisioning| provisioning.scale_up().is_some())
+        else {
+            continue;
+        };
+        let target = provisioning.target_identity(&ResourceUid::new(UID));
+        let key = ReplicaObservationKey::new(target.replica_id, target.instance_id);
+        let Some(RawAgentObservation::Report(report)) = raw.agents.get(&key) else {
+            continue;
+        };
+        if report.storage_state != proto::AgentStorageState::Initialized as i32 {
+            continue;
+        }
+        let pvc = raw
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == "db-2-data")
+            .unwrap()
+            .clone();
+        let allocation_operation_id = OperationId::new(
+            pvc.annotations()
+                .get(SCALE_UP_ALLOCATION_ANNOTATION)
+                .expect("candidate PVC allocation provenance"),
+        );
+        break (
+            allocation_operation_id,
+            provisioning.operation_id.clone(),
+            pvc,
+        );
+    };
+
+    let mut failed = api.observation().await;
+    let target = failed
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .provisioning
+        .as_ref()
+        .unwrap()
+        .target_identity(&ResourceUid::new(UID));
+    let key = ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+    let RawAgentObservation::Report(report) = failed.agents.get_mut(&key).unwrap() else {
+        panic!("provisioning candidate report");
+    };
+    report.reported_fault = proto::FaultType::Permanent as i32;
+    report.healthy = false;
+    api.set_observation(failed).await;
+
+    let cleanup_effects_start = api.effects().await.len();
+    let fresh_allocation = loop {
+        let (kind, effects) = tick(&api).await;
+        let raw = api.observation().await;
+        assert_ne!(
+            kind,
+            ReconcileKind::Unsafe,
+            "{:?}",
+            raw.set
+                .status
+                .as_ref()
+                .map(|status| &status.authority.conditions)
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+        );
+        if let Some(allocation) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.scale_up_allocation.as_ref())
+            .filter(|allocation| {
+                allocation.scaffolding_requested
+                    && allocation.pvc_uid.is_none()
+                    && raw.pvcs.iter().all(|pvc| pvc.name_any() != "db-2-data")
+            })
+        {
+            break allocation.clone();
+        }
+    };
+    assert_ne!(fresh_allocation.operation_id, old_allocation_operation_id);
+    assert_eq!(
+        fresh_allocation.previous_operation_id.as_ref(),
+        Some(&provisioning_operation_id)
+    );
+    let cleanup_effects = api.effects().await;
+    assert!(
+        cleanup_effects[cleanup_effects_start..]
+            .iter()
+            .any(|effect| {
+                matches!(
+                    effect,
+                    EffectRecord::DeleteScaleDownResource {
+                        resource: ScaleDownResource::Pvc,
+                        uid,
+                        ..
+                    } if uid == old_pvc.uid().as_deref().unwrap()
+                )
+            })
+    );
+
+    let mut occupied = api.observation().await;
+    occupied.pvcs.push(old_pvc.clone());
+    api.set_observation(occupied).await;
+    let occupant_effects_start = api.effects().await.len();
+    for _ in 0..10 {
+        let (kind, effects) = tick(&api).await;
+        assert_ne!(kind, ReconcileKind::Unsafe);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+        );
+    }
+    let blocked = api.observation().await;
+    assert!(
+        blocked
+            .pvcs
+            .iter()
+            .any(|pvc| { pvc.name_any() == "db-2-data" && pvc.uid() == old_pvc.uid() })
+    );
+    assert!(blocked.set.status.as_ref().is_some_and(|status| {
+        status
+            .authority
+            .scale_up_allocation
+            .as_ref()
+            .is_none_or(|allocation| {
+                allocation.pvc_uid.as_ref().map(PvcUid::as_str) != old_pvc.uid().as_deref()
+            })
+    }));
+    assert!(
+        api.effects().await[occupant_effects_start..]
+            .iter()
+            .all(|effect| {
+                !matches!(
+                    effect,
+                    EffectRecord::DeleteScaleDownResource {
+                        resource: ScaleDownResource::Pvc,
+                        uid,
+                        ..
+                    } if Some(uid.as_str()) == old_pvc.uid().as_deref()
+                ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
+            })
+    );
+
+    let old_uid = old_pvc.uid().unwrap();
+    let mut available = blocked;
+    available
+        .pvcs
+        .retain(|pvc| pvc.uid().as_deref() != Some(old_uid.as_str()));
+    api.set_observation(available).await;
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    let receipt = completed
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .last_scale_up
+        .as_deref()
+        .unwrap();
+    assert_ne!(
+        receipt.intent.target.instance_id.as_str(),
+        target.instance_id.as_str()
+    );
+    assert!(
+        completed
+            .pvcs
+            .iter()
+            .all(|pvc| { pvc.uid().as_deref() != Some(old_uid.as_str()) })
     );
 }
 
@@ -2086,6 +2275,252 @@ async fn active_pvc_only_allocation(
         }
     }
     panic!("active PVC-only allocation boundary not reached");
+}
+
+fn kube_response<T: serde::Serialize>(object: &T, kind: &str) -> serde_json::Value {
+    let mut value = serde_json::to_value(object).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert("apiVersion".into(), "v1".into());
+    object.insert("kind".into(), kind.into());
+    value
+}
+
+async fn kube_http_sequence(
+    responses: Vec<serde_json::Value>,
+) -> (Client, tokio::task::JoinHandle<Vec<String>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            requests.push(String::from_utf8(bytes).unwrap());
+            let body = response.to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        requests
+    });
+    let config = kube::Config::new(format!("http://{address}").parse().unwrap());
+    (Client::try_from(config).unwrap(), server)
+}
+
+#[tokio::test]
+async fn production_pod_effect_revalidates_live_pvc_before_create() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let allocation = active_pvc_only_allocation(&api).await;
+    let cached = api.observe("tests", "db").await.unwrap();
+    let snapshot = normalize(cached.clone(), BTreeMap::new()).unwrap();
+    let plan = evaluate(&snapshot, &enabled());
+    assert!(matches!(
+        plan,
+        Plan::Apply { ref changes }
+            if changes == &vec![KubernetesChange::EnsureReplicaScaffolding {
+                replica_ids: vec![ReplicaId::new(2)],
+            }]
+    ));
+
+    let old_pvc_uid = allocation.pvc_uid.as_ref().unwrap().clone();
+    let replacement_uid = "replacement-at-pod-effect";
+    let mut physical = api.observation().await;
+    let replacement = physical
+        .pvcs
+        .iter_mut()
+        .find(|pvc| pvc.name_any() == "db-2-data")
+        .unwrap();
+    replacement.metadata.uid = Some(replacement_uid.into());
+    replacement.metadata.resource_version = Some("replacement-at-effect-rv".into());
+    let live_replacement = replacement.clone();
+    let secret = cached
+        .secrets
+        .iter()
+        .find(|secret| secret.name_any() == "db-agent-credentials")
+        .unwrap()
+        .clone();
+    api.set_observation(physical).await;
+
+    let (client, requests) = kube_http_sequence(vec![
+        kube_response(&secret, "Secret"),
+        kube_response(&secret, "Secret"),
+        kube_response(&live_replacement, "PersistentVolumeClaim"),
+    ])
+    .await;
+    let production = KubeClusterApi::new(
+        client,
+        Arc::new(GrpcAgentApi::new(Duration::from_secs(1))),
+        "test-token",
+    )
+    .unwrap();
+    let result = execute_plan(&production, &cached, &snapshot, plan).await;
+    assert_eq!(result, Err(ControllerError::ObservationStale));
+    let requests = requests.await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request.starts_with("GET /api/v1/namespaces/tests/persistentvolumeclaims/db-2-data ")
+    }));
+    assert!(requests.iter().all(|request| {
+        !request.starts_with("POST /api/v1/namespaces/tests/pods ")
+            && !request.contains("\"KUBERIC_PVC_UID\":\"replacement-at-pod-effect\"")
+    }));
+
+    let effects_start = api.effects().await.len();
+    for _ in 0..8 {
+        let (kind, effects) = tick(&api).await;
+        assert_ne!(kind, ReconcileKind::Unsafe);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+        );
+    }
+    let occupied = api.observation().await;
+    assert!(occupied.pods.iter().all(|pod| pod.name_any() != "db-2"));
+    assert!(occupied.pvcs.iter().any(|pvc| {
+        pvc.name_any() == "db-2-data" && pvc.uid().as_deref() == Some(replacement_uid)
+    }));
+    assert!(api.effects().await[effects_start..].iter().all(|effect| {
+        !matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pvc,
+                uid,
+                ..
+            } if uid == replacement_uid
+        ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
+    }));
+
+    let mut available = occupied;
+    available
+        .pvcs
+        .retain(|pvc| pvc.uid().as_deref() != Some(replacement_uid));
+    api.set_observation(available).await;
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    assert!(completed.set.status.as_ref().is_some_and(|status| {
+        status.authority.last_scale_up.is_some() && status.authority.scale_up_allocation.is_none()
+    }));
+    assert!(completed.pvcs.iter().all(|pvc| {
+        pvc.uid().as_deref() != Some(old_pvc_uid.as_str())
+            && pvc.uid().as_deref() != Some(replacement_uid)
+    }));
+}
+
+#[tokio::test]
+async fn residual_pvc_replace_after_live_get_is_candidate_local() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let allocation = active_pvc_only_allocation(&api).await;
+    let frozen_pvc_uid = allocation.pvc_uid.as_ref().unwrap().clone();
+    let replacement_uid = "replacement-after-live-get";
+    let raced_pod_uid = "raced-candidate-pod";
+    let mut raced = api.observation().await;
+    let pvc = raced
+        .pvcs
+        .iter_mut()
+        .find(|pvc| pvc.name_any() == "db-2-data")
+        .unwrap();
+    pvc.metadata.uid = Some(replacement_uid.into());
+    pvc.metadata.resource_version = Some("replacement-after-live-get-rv".into());
+    let mut pod = raced
+        .pods
+        .iter()
+        .find(|pod| pod.name_any() == "db-1")
+        .unwrap()
+        .clone();
+    pod.metadata.name = Some("db-2".into());
+    pod.metadata.uid = Some(raced_pod_uid.into());
+    pod.metadata.resource_version = Some("raced-candidate-pod-rv".into());
+    pod.metadata
+        .labels
+        .get_or_insert_default()
+        .insert(REPLICA_ID_LABEL.into(), "2".into());
+    pod.metadata
+        .labels
+        .get_or_insert_default()
+        .insert(INSTANCE_LABEL.into(), raced_pod_uid.into());
+    let spec = pod.spec.as_mut().unwrap();
+    spec.volumes
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|volume| volume.persistent_volume_claim.as_mut())
+        .unwrap()
+        .claim_name = "db-2-data".into();
+    spec.containers[0]
+        .env
+        .get_or_insert_default()
+        .push(k8s_openapi::api::core::v1::EnvVar {
+            name: "KUBERIC_PVC_UID".into(),
+            value: Some(frozen_pvc_uid.to_string()),
+            ..Default::default()
+        });
+    raced.pods.push(pod);
+    api.set_observation(raced).await;
+    let effects_start = api.effects().await.len();
+
+    for _ in 0..12 {
+        let (kind, effects) = tick(&api).await;
+        assert_ne!(kind, ReconcileKind::Unsafe);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+        );
+    }
+    let blocked = api.observation().await;
+    assert!(
+        blocked
+            .pods
+            .iter()
+            .all(|pod| pod.uid().as_deref() != Some(raced_pod_uid))
+    );
+    assert!(blocked.pvcs.iter().any(|pvc| {
+        pvc.name_any() == "db-2-data" && pvc.uid().as_deref() == Some(replacement_uid)
+    }));
+    assert!(api.effects().await[effects_start..].iter().all(|effect| {
+        !matches!(
+            effect,
+            EffectRecord::DeleteScaleDownResource {
+                resource: ScaleDownResource::Pvc,
+                uid,
+                ..
+            } if uid == replacement_uid
+        ) && !matches!(effect, EffectRecord::RemoveWriteRouting)
+    }));
+
+    let mut available = blocked;
+    available
+        .pvcs
+        .retain(|pvc| pvc.uid().as_deref() != Some(replacement_uid));
+    api.set_observation(available).await;
+    finish(&api, 2).await;
 }
 
 #[tokio::test]

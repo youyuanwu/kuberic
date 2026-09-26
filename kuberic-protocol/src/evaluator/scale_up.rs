@@ -534,6 +534,62 @@ pub(super) fn cleanup(
     }
     let mut status = snapshot.status.clone();
     status.scale_up_cleanup = None;
+    let policy = status
+        .effective_policy
+        .as_ref()
+        .expect("validated cleanup has accepted policy");
+    if snapshot.desired.replicas > policy.replica_set_size {
+        let Some(target_value) = policy.replica_set_size.checked_add(1) else {
+            return unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::InvalidDesiredState(
+                    "scale-up retry target ordinal overflowed".into(),
+                ),
+                config,
+            );
+        };
+        let topology = &status
+            .topology
+            .as_ref()
+            .expect("validated cleanup has accepted topology")
+            .configuration;
+        let Some(target_id) = (1..=i64::from(target_value))
+            .map(ReplicaId::new)
+            .find(|candidate| {
+                topology
+                    .members
+                    .iter()
+                    .all(|member| member.identity.replica_id != *candidate)
+            })
+        else {
+            return unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::InvalidAcceptedAuthority(
+                    "scale-up retry could not allocate a logical identity outside accepted authority"
+                        .into(),
+                ),
+                config,
+            );
+        };
+        let allocation = allocation_for(
+            snapshot,
+            topology,
+            target_id,
+            Some(cleanup.provisioning.operation_id.clone()),
+        );
+        let retry_target = allocation.observation_target();
+        let retry_operation_id = allocation.operation_id.clone();
+        status.scale_up_allocation = Some(allocation);
+        return persist(progress_status(
+            snapshot,
+            status,
+            "ScaleUpAllocationRetryAccepted",
+            "allocation",
+            Some(&retry_target),
+            Some(&retry_operation_id),
+            "atomically began a fresh allocation from the completed provisioning cleanup",
+        ));
+    }
     persist(progress_status(
         snapshot,
         status,
@@ -999,35 +1055,7 @@ pub(super) fn begin(
             config,
         ));
     }
-    let Some(current_policy) =
-        EffectivePolicy::fixed(target_value, previous_policy.failover_delay_seconds)
-    else {
-        unreachable!("positive scale-up target has a policy")
-    };
-    let scale_up = ScaleUpProvisioning {
-        resource_uid: snapshot.resource_uid.clone(),
-        spec_generation: snapshot.desired.generation,
-        desired_replicas: snapshot.desired.replicas,
-        previous_configuration: topology.clone(),
-        previous_policy: previous_policy.clone(),
-        current_policy,
-        target_replica_id: target_id,
-    };
-    let mut allocation = ScaleUpAllocation {
-        resource_uid: scale_up.resource_uid,
-        spec_generation: scale_up.spec_generation,
-        desired_replicas: scale_up.desired_replicas,
-        previous_configuration_id: scale_up.previous_configuration.configuration_id.clone(),
-        accepted_configuration_id: scale_up.previous_configuration.configuration_id,
-        target_replica_id: scale_up.target_replica_id,
-        operation_id: OperationId::default(),
-        previous_operation_id: None,
-        scaffolding_requested: false,
-        pod_uid: None,
-        pvc_uid: None,
-        cancellation_started: false,
-    };
-    allocation.operation_id = allocation.expected_operation_id();
+    let allocation = allocation_for(snapshot, topology, target_id, None);
     let target = allocation.observation_target();
     let attempt = allocation.operation_id.clone();
     let mut next = status;
@@ -1124,6 +1152,30 @@ fn retry_or_complete_allocation_cleanup(
         Some(&allocation.operation_id),
         "exact cancelled allocation is absent",
     ))
+}
+
+fn allocation_for(
+    snapshot: &ObservationSnapshot,
+    previous_configuration: &ConfigurationDescriptor,
+    target_replica_id: ReplicaId,
+    previous_operation_id: Option<OperationId>,
+) -> ScaleUpAllocation {
+    let mut allocation = ScaleUpAllocation {
+        resource_uid: snapshot.resource_uid.clone(),
+        spec_generation: snapshot.desired.generation,
+        desired_replicas: snapshot.desired.replicas,
+        previous_configuration_id: previous_configuration.configuration_id.clone(),
+        accepted_configuration_id: previous_configuration.configuration_id.clone(),
+        target_replica_id,
+        operation_id: OperationId::default(),
+        previous_operation_id,
+        scaffolding_requested: false,
+        pod_uid: None,
+        pvc_uid: None,
+        cancellation_started: false,
+    };
+    allocation.operation_id = allocation.expected_operation_id();
+    allocation
 }
 
 pub(super) fn allocation(
@@ -1352,13 +1404,24 @@ pub(super) fn allocation(
                 .map(PvcUid::as_str)
                 != expected_pvc
         {
-            return unsafe_plan(
-                snapshot.status.clone(),
-                UnsafeReason::ContradictoryReplicaEvidence(
-                    "scale-up allocation Pod is not uniquely bound to the frozen PVC".into(),
-                ),
-                config,
-            );
+            let mut status = snapshot.status.clone();
+            let allocation = status
+                .scale_up_allocation
+                .as_mut()
+                .expect("active allocation");
+            allocation.pod_uid = Some(PodUid::new(uid));
+            allocation.cancellation_started = true;
+            let target = allocation.observation_target();
+            let operation_id = allocation.operation_id.clone();
+            return persist(progress_status(
+                snapshot,
+                status,
+                "ScaleUpAllocationPodBindingLost",
+                "cleanup",
+                Some(&target),
+                Some(&operation_id),
+                "candidate Pod did not bind the frozen PVC; persisted exact candidate-local cleanup",
+            ));
         }
         if cancelled {
             let mut status = snapshot.status.clone();

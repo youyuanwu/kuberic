@@ -792,6 +792,9 @@ mod tests {
             },
         };
         assert_eq!(validate_scale_up_cleanup(&cleanup), Ok(()));
+        let mut malformed_lineage = cleanup.clone();
+        malformed_lineage.provisioning.operation_id = OperationId::new("stale-retry-lineage");
+        assert!(validate_scale_up_cleanup(&malformed_lineage).is_err());
         let mut replaced = cleanup;
         replaced.target.instance_id = ReplicaInstanceId::new("replacement");
         assert!(validate_scale_up_cleanup(&replaced).is_err());
