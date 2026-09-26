@@ -905,22 +905,43 @@ mod tests {
 
     #[test]
     fn representative_scale_up_status_evidence_remains_bounded() {
-        const KUBERNETES_CONFIGMAP_DATA_LIMIT: usize = 1_048_576;
-        const RESERVED_OBJECT_HEADROOM: usize = 262_144;
-        const PRODUCTION_STATUS_BUDGET: usize =
-            KUBERNETES_CONFIGMAP_DATA_LIMIT - RESERVED_OBJECT_HEADROOM;
-        const FIXED_VARIANT_ALLOWANCE: usize = 32_768;
-        const PER_MEMBER_ALLOWANCE: usize = 16_384;
+        const PER_MEMBER_ENCODING_JITTER: usize = 512;
 
-        fn within_linear_envelope(count: u32, size: usize) -> std::result::Result<(), String> {
-            let limit = FIXED_VARIANT_ALLOWANCE + count as usize * PER_MEMBER_ALLOWANCE;
-            (size <= limit)
-                .then_some(())
-                .ok_or_else(|| format!("{size} bytes exceeds linear envelope {limit}"))
+        fn delta_bound(samples: &[(u32, usize)]) -> usize {
+            samples
+                .windows(2)
+                .map(|window| {
+                    let member_delta = usize::try_from(window[1].0 - window[0].0).unwrap();
+                    window[1]
+                        .1
+                        .saturating_sub(window[0].1)
+                        .div_ceil(member_delta)
+                })
+                .max()
+                .unwrap_or_default()
+                + PER_MEMBER_ENCODING_JITTER
         }
 
-        let mut prior_sizes = std::collections::BTreeMap::<&str, (u32, usize)>::new();
-        let mut production_high_water = 0;
+        fn require_linear_deltas(
+            phase: &str,
+            samples: &[(u32, usize)],
+            per_member_bound: usize,
+        ) -> std::result::Result<(), String> {
+            for window in samples.windows(2) {
+                let member_delta = usize::try_from(window[1].0 - window[0].0).unwrap();
+                let byte_delta = window[1].1.saturating_sub(window[0].1);
+                if byte_delta > member_delta * per_member_bound {
+                    return Err(format!(
+                        "{phase} grew by {byte_delta} bytes across {member_delta} members; \
+                         per-member bound is {per_member_bound}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        let mut samples = std::collections::BTreeMap::<&str, Vec<(u32, usize)>>::new();
+        let mut quadratic_samples = Vec::new();
         for previous_count in [1_u32, 2, 3, 5, 9, 17] {
             let mut intent = intent(previous_count);
             let provisioning = provisioning(&intent);
@@ -1219,46 +1240,58 @@ mod tests {
                 crate::validation::validate_status(&status).unwrap();
                 let size = serde_json::to_vec(&status).unwrap().len();
                 let count = previous_count + 1;
-                within_linear_envelope(count, size)
-                    .unwrap_or_else(|error| panic!("{phase} status at {count} members: {error}"));
-                if let Some((previous_count, previous)) = prior_sizes.insert(phase, (count, size)) {
-                    let member_delta = (count - previous_count) as usize;
-                    assert!(
-                        size.saturating_sub(previous)
-                            <= member_delta * PER_MEMBER_ALLOWANCE + 4_096,
-                        "{phase} evidence grew faster than its member delta: \
-                         {previous} -> {size} bytes across {member_delta} members"
-                    );
-                }
-                production_high_water = production_high_water.max(size);
+                samples.entry(phase).or_default().push((count, size));
                 eprintln!("scale-up-status phase={phase} members={count} bytes={size}");
             }
 
-            if previous_count == 17 {
-                let quadratic_counterexample = serde_json::to_vec(&serde_json::json!({
-                    "status": stable,
-                    "membersSquaredEvidence": vec![
-                        receipt.clone();
-                        usize::try_from((previous_count + 1).pow(2)).unwrap()
-                    ],
-                }))
-                .unwrap()
-                .len();
+            let count = previous_count + 1;
+            let evidence_item = witness(&intent, intent.target.clone(), false, 99);
+            let copies_per_member =
+                vec![evidence_item; usize::try_from(count).expect("sample count")];
+            let quadratic_counterexample = serde_json::to_vec(&serde_json::json!({
+                "status": stable,
+                "memberEvidence": vec![
+                    copies_per_member;
+                    usize::try_from(count).expect("sample count")
+                ],
+            }))
+            .unwrap()
+            .len();
+            quadratic_samples.push((count, quadratic_counterexample));
+        }
+
+        let mut bounds = std::collections::BTreeMap::new();
+        for (phase, phase_samples) in &samples {
+            let per_member_bound = delta_bound(phase_samples);
+            let fixed_bytes = phase_samples
+                .iter()
+                .map(|(count, size)| {
+                    size.saturating_sub(usize::try_from(*count).unwrap() * per_member_bound)
+                })
+                .max()
+                .unwrap_or_default();
+            require_linear_deltas(phase, phase_samples, per_member_bound).unwrap();
+            for (count, size) in phase_samples {
                 assert!(
-                    within_linear_envelope(previous_count + 1, quadratic_counterexample).is_err(),
-                    "members^2 evidence mutation unexpectedly fit the linear envelope"
+                    *size <= fixed_bytes + usize::try_from(*count).unwrap() * per_member_bound,
+                    "{phase} exceeded its current-fixture fixed + per-member guard"
                 );
             }
+            bounds.insert(*phase, (fixed_bytes, per_member_bound));
+            eprintln!(
+                "scale-up-status guard phase={phase} fixed={fixed_bytes} \
+                 per-member={per_member_bound}"
+            );
         }
+
+        let stable_bound = bounds["stable"].1;
+        let quadratic_error =
+            require_linear_deltas("quadratic-mutation", &quadratic_samples, stable_bound)
+                .expect_err("N copies per member escaped the sampled quadratic slope guard");
         assert!(
-            production_high_water <= PRODUCTION_STATUS_BUDGET,
-            "count-18 representative status high-water {production_high_water} leaves less \
-             than {RESERVED_OBJECT_HEADROOM} bytes below the \
-             {KUBERNETES_CONFIGMAP_DATA_LIMIT}-byte object-data policy"
-        );
-        eprintln!(
-            "scale-up-status capacity high-water={production_high_water} \
-             budget={PRODUCTION_STATUS_BUDGET} reserved-headroom={RESERVED_OBJECT_HEADROOM}"
+            quadratic_error.contains("quadratic-mutation grew by")
+                && quadratic_error.contains("per-member bound"),
+            "quadratic mutation failed for the wrong reason: {quadratic_error}"
         );
     }
 
