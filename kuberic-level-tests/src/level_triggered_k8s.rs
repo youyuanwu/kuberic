@@ -11,6 +11,24 @@ struct NetworkPartition {
     rules: Vec<(String, Vec<String>)>,
 }
 
+impl NetworkPartition {
+    fn heal(mut self) -> Result<()> {
+        for (node, rule) in self.rules.drain(..).rev() {
+            let output = Command::new("docker")
+                .args(["exec", &node, "iptables", "-D", "FORWARD"])
+                .args(&rule)
+                .output()
+                .context("removing replica network partition")?;
+            ensure!(
+                output.status.success(),
+                "cannot heal replica partition on {node}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+}
+
 struct ReplicaSuspension {
     node: String,
     pid: i64,
@@ -215,6 +233,78 @@ fn stop_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Res
             String::from_utf8_lossy(&stopped.stderr)
         );
     }
+    Ok(())
+}
+
+fn kill_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Result<()> {
+    let pod = pod_for_replica(kubeconfig, context, replica_id)?;
+    let node = kubectl(
+        kubeconfig,
+        context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            &pod,
+            "-o",
+            "jsonpath={.spec.nodeName}",
+        ],
+    )?
+    .trim()
+    .to_string();
+    let container = Command::new("docker")
+        .args([
+            "exec",
+            &node,
+            "crictl",
+            "ps",
+            "--label",
+            &format!("io.kubernetes.pod.name={pod}"),
+            "-q",
+        ])
+        .output()
+        .context("resolving exact replica container for forced restart")?;
+    ensure!(
+        container.status.success(),
+        "cannot resolve replica {replica_id} container: {}",
+        String::from_utf8_lossy(&container.stderr)
+    );
+    let containers = String::from_utf8(container.stdout)?;
+    let container_id = containers
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("running replica container")?;
+    ensure!(
+        containers
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            == 1,
+        "expected one exact replica container, observed {containers:?}"
+    );
+    let inspection = Command::new("docker")
+        .args(["exec", &node, "crictl", "inspect", container_id])
+        .output()
+        .context("inspecting exact replica container for forced restart")?;
+    ensure!(
+        inspection.status.success(),
+        "cannot inspect replica {replica_id} container: {}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let inspection: Value = serde_json::from_slice(&inspection.stdout)?;
+    let pid = inspection["info"]["pid"]
+        .as_i64()
+        .context("exact replica host PID")?;
+    let killed = Command::new("docker")
+        .args(["exec", &node, "kill", "-KILL", &pid.to_string()])
+        .output()
+        .context("force-restarting exact replica process")?;
+    ensure!(
+        killed.status.success(),
+        "cannot force-restart replica {replica_id}: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
     Ok(())
 }
 
@@ -1108,10 +1198,11 @@ fn routed_kubectl(cluster: &SwitchoverCluster, deadline: Instant, args: &[&str])
         "routed Service deadline expired before kubectl {args:?}"
     );
     // Bound exec and API discovery by the scenario deadline, not a fresh timeout.
+    let attempt_timeout = remaining.min(Duration::from_secs(15));
     Command::new("timeout")
         .args([
-            "--signal=KILL",
-            &format!("{}s", remaining.as_secs_f64()),
+            "--kill-after=2s",
+            &format!("{}s", attempt_timeout.as_secs_f64()),
             "kubectl",
         ])
         .args([
@@ -1124,6 +1215,45 @@ fn routed_kubectl(cluster: &SwitchoverCluster, deadline: Instant, args: &[&str])
         .args(args)
         .output()
         .with_context(|| format!("routed kubectl {args:?}"))
+}
+
+fn transient_routed_lookup_failure(output: &Output) -> bool {
+    if output.status.success() {
+        return false;
+    }
+    if output.status.code() == Some(124) {
+        return true;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [
+        "Unable to connect to the server",
+        "The connection to the server",
+        "context deadline exceeded",
+        "i/o timeout",
+        "TLS handshake timeout",
+        "connection refused",
+        "connection reset by peer",
+        "EOF",
+        "ServiceUnavailable",
+        "Too Many Requests",
+    ]
+    .iter()
+    .any(|transient| stderr.contains(transient))
+}
+
+fn require_routed_lookup(output: Output, resource: &str) -> Result<Option<Output>> {
+    if output.status.success() {
+        return Ok(Some(output));
+    }
+    if transient_routed_lookup_failure(&output) {
+        return Ok(None);
+    }
+    bail!(
+        "nonretryable routed Service {resource} lookup failed: exit={:?}, stdout={:?}, stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 fn routed_service_client_pod(
@@ -1144,10 +1274,13 @@ fn routed_service_client_pod(
             "json",
         ],
     )?;
-    if !service.status.success() {
+    let Some(service) = require_routed_lookup(service, "Service")? else {
+        return Ok(None);
+    };
+    let service: Value = serde_json::from_slice(&service.stdout)?;
+    if routing_instance(&service) == Some("disabled") {
         return Ok(None);
     }
-    let service: Value = serde_json::from_slice(&service.stdout)?;
     validate_routed_service(&service, primary)?;
     let endpoints = routed_kubectl(
         cluster,
@@ -1162,9 +1295,9 @@ fn routed_service_client_pod(
             "json",
         ],
     )?;
-    if !endpoints.status.success() {
+    let Some(endpoints) = require_routed_lookup(endpoints, "Endpoints")? else {
         return Ok(None);
-    }
+    };
     let endpoints: Value = serde_json::from_slice(&endpoints.stdout)?;
     let ready = endpoints["subsets"]
         .as_array()
@@ -1209,9 +1342,9 @@ fn routed_service_client_pod(
             "json",
         ],
     )?;
-    if !pods.status.success() {
+    let Some(pods) = require_routed_lookup(pods, "Pod")? else {
         return Ok(None);
-    }
+    };
     let pods: Value = serde_json::from_slice(&pods.stdout)?;
     Ok(pods["items"]
         .as_array()
@@ -2832,17 +2965,7 @@ impl LiveStepper {
     }
 
     fn step(&self, cluster: &SwitchoverCluster) -> Result<LiveStep> {
-        self.step_with_permanent_fault(cluster, None)
-    }
-
-    fn step_with_permanent_fault(
-        &self,
-        cluster: &SwitchoverCluster,
-        failed: Option<&kuberic_protocol::types::ReplicaIdentity>,
-    ) -> Result<LiveStep> {
         use kuberic_controller::cluster_api::{ClusterApi, KubeClusterApi};
-        use kuberic_protocol::observation::AgentObservation;
-        use kuberic_protocol::types::{AccessStatus, FaultType};
         self.runtime.block_on(async {
             let options = kube::config::KubeConfigOptions {
                 context: Some(cluster.context.clone()),
@@ -2859,23 +2982,8 @@ impl LiveStepper {
                 std::env::var("KUBERIC_AGENT_BEARER_TOKEN").context("live agent token")?,
             )?;
             let raw = api.observe("default", "kvstore2").await?;
-            let mut snapshot =
+            let snapshot =
                 kuberic_controller::normalize::normalize(raw.clone(), Default::default())?;
-            if let Some(failed) = failed {
-                let report = snapshot
-                    .replicas
-                    .values_mut()
-                    .find_map(|observation| match &mut observation.agent {
-                        AgentObservation::Report(report) if report.identity == *failed => {
-                            Some(report.as_mut())
-                        }
-                        _ => None,
-                    })
-                    .context("faulted exact accepted primary report")?;
-                report.healthy = false;
-                report.reported_fault = Some(FaultType::Permanent);
-                report.write_status = AccessStatus::ReconfigurationPending;
-            }
             let plan = kuberic_protocol::evaluator::evaluate(
                 &snapshot,
                 &kuberic_controller::production_evaluation_config(30, 5, 30),
@@ -3725,7 +3833,31 @@ struct PhaseWriteEvidence {
     boundary_lsn: i64,
     write_lsn: i64,
     candidate: Value,
+    candidate_process_session: String,
+    build_id: String,
     reached_candidate: bool,
+}
+
+fn candidate_delivery_matches(report: &Value, evidence: &PhaseWriteEvidence) -> bool {
+    if identity(report) != evidence.candidate
+        || report["processSession"].as_str() != Some(&evidence.candidate_process_session)
+    {
+        return false;
+    }
+    let Some(build) = report["builds"].as_array().and_then(|builds| {
+        builds.iter().find(|build| {
+            build["buildId"].as_str() == Some(&evidence.build_id)
+                && build["targetInstance"] == evidence.candidate["instanceId"]
+        })
+    }) else {
+        return false;
+    };
+    report["currentProgress"]
+        .as_i64()
+        .is_some_and(|progress| progress >= evidence.write_lsn)
+        || build["durableLsn"]
+            .as_i64()
+            .is_some_and(|durable| durable >= evidence.write_lsn)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4120,17 +4252,7 @@ impl<'a> ScaleUpCase<'a> {
                 &self.cluster.context,
                 evidence.target,
             )?;
-            let reached = report["currentProgress"]
-                .as_i64()
-                .is_some_and(|progress| progress >= evidence.write_lsn)
-                || report["builds"].as_array().is_some_and(|builds| {
-                    builds.iter().any(|build| {
-                        build["targetInstance"] == evidence.candidate["instanceId"]
-                            && build["durableLsn"]
-                                .as_i64()
-                                .is_some_and(|durable| durable >= evidence.write_lsn)
-                    })
-                });
+            let reached = candidate_delivery_matches(&report, &evidence);
             if reached {
                 self.phase_writes
                     .get_mut(&key)
@@ -4215,6 +4337,12 @@ impl<'a> ScaleUpCase<'a> {
                 boundary_lsn,
                 write_lsn,
                 candidate: serde_json::to_value(&candidate.identity)?,
+                candidate_process_session: candidate.process_session_id.to_string(),
+                build_id: source_build
+                    .or(candidate_build)
+                    .expect("frozen build evidence")
+                    .build_id
+                    .to_string(),
                 reached_candidate: false,
             },
         );
@@ -4277,6 +4405,11 @@ impl<'a> ScaleUpCase<'a> {
                             boundary_lsn,
                             write_lsn,
                             candidate: serde_json::to_value(&intent.target)?,
+                            candidate_process_session: candidate
+                                .expect("exact PC/CC candidate")
+                                .process_session_id
+                                .to_string(),
+                            build_id: intent.build_id.to_string(),
                             reached_candidate: false,
                         },
                     );
@@ -4642,6 +4775,93 @@ fn scale_up_cleanup_order_rejects_every_wrong_permutation_and_identity() -> Resu
     Ok(())
 }
 
+#[test]
+fn scale_up_candidate_delivery_requires_exact_incarnation_session_and_build() {
+    let evidence = PhaseWriteEvidence {
+        target: 4,
+        phase: "copy",
+        boundary_lsn: 10,
+        write_lsn: 12,
+        candidate: json!({
+            "replicaId":4,
+            "instanceId":"candidate-pod-uid",
+            "agentGeneration":"candidate-generation"
+        }),
+        candidate_process_session: "candidate-session".into(),
+        build_id: "scale-up-build".into(),
+        reached_candidate: false,
+    };
+    let report = json!({
+        "replicaId":4,
+        "instanceId":"candidate-pod-uid",
+        "agentGeneration":"candidate-generation",
+        "processSession":"candidate-session",
+        "currentProgress":12,
+        "builds":[{
+            "buildId":"scale-up-build",
+            "targetInstance":"candidate-pod-uid",
+            "durableLsn":12
+        }]
+    });
+    assert!(candidate_delivery_matches(&report, &evidence));
+    for (pointer, replacement) in [
+        ("/instanceId", json!("wrong-pod-uid")),
+        ("/agentGeneration", json!("wrong-generation")),
+        ("/processSession", json!("wrong-session")),
+        ("/builds/0/buildId", json!("wrong-build")),
+        ("/builds/0/targetInstance", json!("other-target")),
+    ] {
+        let mut wrong = report.clone();
+        *wrong.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            !candidate_delivery_matches(&wrong, &evidence),
+            "wrong candidate delivery evidence passed at {pointer}: {wrong}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn scale_up_retry_classifiers_propagate_unknown_failures() {
+    use kuberic_controller::ControllerError;
+
+    for transient in [
+        anyhow::Error::new(ControllerError::ObservationStale),
+        anyhow::Error::new(ControllerError::AgentUnavailable("restart".into())),
+        anyhow::Error::new(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
+    ] {
+        assert!(transient_live_step_error(&transient), "{transient:#}");
+    }
+    for permanent in [
+        anyhow::Error::new(ControllerError::InvalidAgentEvidence("bad protocol".into())),
+        anyhow::Error::new(ControllerError::Effect("rejected".into())),
+        anyhow::anyhow!("unknown live-step failure"),
+    ] {
+        assert!(!transient_live_step_error(&permanent), "{permanent:#}");
+    }
+
+    assert!(
+        require_routed_lookup(routed_test_output(0, "{}", ""), "Service")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        require_routed_lookup(
+            routed_test_output(1, "", "Unable to connect to the server"),
+            "Service"
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        require_routed_lookup(
+            routed_test_output(1, "", "Error from server (Forbidden): denied"),
+            "Service"
+        )
+        .is_err()
+    );
+}
+
 fn scale_up_stage(plan: &kuberic_protocol::plan::Plan) -> Option<String> {
     use kuberic_protocol::{
         command::{KubernetesChange, ProtocolCommand},
@@ -4701,36 +4921,54 @@ fn scale_up_stage(plan: &kuberic_protocol::plan::Plan) -> Option<String> {
     }
 }
 
+fn transient_live_step_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(controller) = cause.downcast_ref::<kuberic_controller::ControllerError>() {
+            return matches!(
+                controller,
+                kuberic_controller::ControllerError::Observation(_)
+                    | kuberic_controller::ControllerError::ObservationStale
+                    | kuberic_controller::ControllerError::AgentUnavailable(_)
+            );
+        }
+        if let Some(kube) = cause.downcast_ref::<kube::Error>() {
+            return match kube {
+                kube::Error::Api(status) => {
+                    matches!(status.code, 409 | 410 | 429 | 500 | 502 | 503 | 504)
+                }
+                kube::Error::HyperError(_)
+                | kube::Error::Service(_)
+                | kube::Error::ReadEvents(_) => true,
+                _ => false,
+            };
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::Interrupted
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::WouldBlock
+            )
+        })
+    })
+}
+
 fn manual_live_step(cluster: &SwitchoverCluster, deadline: Instant) -> Result<LiveStep> {
     loop {
         let error = match LiveStepper::new(cluster).and_then(|stepper| stepper.step(cluster)) {
             Ok(step) => return Ok(step),
             Err(error) => error,
         };
+        if !transient_live_step_error(&error) {
+            return Err(error.context("manual live controller step failed permanently"));
+        }
         ensure!(
             Instant::now() < deadline,
             "manual live controller could not take a step; last error: {:#}",
-            error
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-fn manual_live_step_with_permanent_fault(
-    cluster: &SwitchoverCluster,
-    failed: &kuberic_protocol::types::ReplicaIdentity,
-    deadline: Instant,
-) -> Result<LiveStep> {
-    loop {
-        let error = match LiveStepper::new(cluster)
-            .and_then(|stepper| stepper.step_with_permanent_fault(cluster, Some(failed)))
-        {
-            Ok(step) => return Ok(step),
-            Err(error) => error,
-        };
-        ensure!(
-            Instant::now() < deadline,
-            "faulted live controller could not take a step; last error: {:#}",
             error
         );
         std::thread::sleep(Duration::from_millis(250));
@@ -4773,15 +5011,35 @@ fn patch_replicas(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
     Ok(())
 }
 
-fn write_direct(
-    client: &mut DirectClient,
+fn wait_process_session_change(
+    cluster: &SwitchoverCluster,
+    replica_id: i64,
+    previous: &Value,
+    deadline: Instant,
+) -> Result<Value> {
+    loop {
+        if let Ok(report) = replica_diagnostics(&cluster.kubeconfig, &cluster.context, replica_id)
+            && report["processSession"] != *previous
+        {
+            return Ok(report);
+        }
+        poll(
+            deadline,
+            &format!("replica {replica_id} process-session restart"),
+        )?;
+    }
+}
+
+fn write_routed(
+    cluster: &SwitchoverCluster,
+    primary: &Value,
     acknowledged: &mut Vec<(String, String)>,
     label: &str,
+    deadline: Instant,
 ) -> Result<()> {
     let key = format!("scale-up-adversarial-{label}-{}", acknowledged.len());
     let value = format!("acknowledged-{key}");
-    let (code, body) = client.request("PUT", &format!("/kv/{key}"), &value)?;
-    ensure!(code == 200, "write {label} failed: HTTP {code} {body}");
+    assert_routed_service_write(cluster, primary, &key, &value, deadline)?;
     acknowledged.push((key, value));
     Ok(())
 }
@@ -4901,9 +5159,14 @@ fn scale_up_cancellation_failure_and_retry(
     )?
     .clone();
     let deadline = Instant::now() + Duration::from_secs(900);
-    let mut writer = DirectClient::connect(cluster, &cluster.pod(&primary)?, deadline)?;
     let mut acknowledged = Vec::new();
-    write_direct(&mut writer, &mut acknowledged, "before-cancellation")?;
+    write_routed(
+        cluster,
+        &primary,
+        &mut acknowledged,
+        "before-cancellation",
+        deadline,
+    )?;
 
     let pause = ControllerPause::new(cluster)?;
     patch_replicas(cluster, 2)?;
@@ -5092,42 +5355,122 @@ fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(S
     let old_primary_id = topology_primary_id(&start).context("starting primary")?;
     let old_primary = exact_member(&start, old_primary_id)?.clone();
     let deadline = Instant::now() + Duration::from_secs(900);
-    let mut writer = DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
     let mut acknowledged = Vec::new();
-    write_direct(
-        &mut writer,
+    write_routed(
+        cluster,
+        &old_primary,
         &mut acknowledged,
         "before-pre-admission-failover",
+        deadline,
     )?;
     let pause = ControllerPause::new(cluster)?;
     patch_replicas(cluster, 4)?;
-    let (old_provisioning_id, old_candidate) = loop {
+    let mut old_candidate = None;
+    let mut old_provisioning_id = None;
+    let mut restarted_sessions = None;
+    loop {
         let status = cluster.status()?;
         assert_scale_up_condition_context(&status)?;
         let reason = scale_up_progress_condition(&status)
             .and_then(|condition| condition["reason"].as_str())
             .unwrap_or_default();
-        if reason == "ScaleUpCopying" && status["status"]["transition"].is_null() {
-            let resources = exact_replica_resources(cluster, 4)?;
-            let operation = status["status"]["provisioning"]["operationId"]
-                .as_str()
-                .context("old pre-admission provisioning operation")?
-                .to_string();
-            break (operation, resources);
+        if reason == "ScaleUpCopying"
+            && status["status"]["transition"].is_null()
+            && restarted_sessions.is_none()
+        {
+            old_candidate = Some(exact_replica_resources(cluster, 4)?);
+            old_provisioning_id = Some(
+                status["status"]["provisioning"]["operationId"]
+                    .as_str()
+                    .context("old pre-admission provisioning operation")?
+                    .to_string(),
+            );
+            let candidate_before = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 4)?;
+            let source_before =
+                replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+            let mut old_source =
+                DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
+            let partition = cluster.partition_replication(4)?;
+            write_routed(
+                cluster,
+                &old_primary,
+                &mut acknowledged,
+                "during-blocked-copy",
+                deadline,
+            )?;
+            kill_replica_process(&cluster.kubeconfig, &cluster.context, 4)?;
+            let candidate_after = wait_process_session_change(
+                cluster,
+                4,
+                &candidate_before["processSession"],
+                deadline,
+            )?;
+            ensure!(
+                identity(&candidate_after) == identity(&candidate_before),
+                "candidate process restart changed its frozen identity: before={candidate_before} after={candidate_after}"
+            );
+            partition.heal()?;
+            kill_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+            let source_after = wait_process_session_change(
+                cluster,
+                old_primary_id,
+                &source_before["processSession"],
+                deadline,
+            )?;
+            ensure!(
+                identity(&source_after) == identity(&source_before),
+                "source process restart changed its frozen identity: before={source_before} after={source_after}"
+            );
+            check_old_session_response(old_source.request(
+                "PUT",
+                "/kv/stale-scale-up-copy-source-session",
+                "forbidden",
+            ))?;
+            write_routed(
+                cluster,
+                &old_primary,
+                &mut acknowledged,
+                "after-copy-restarts",
+                deadline,
+            )?;
+            restarted_sessions = Some((
+                source_before["processSession"].clone(),
+                source_after["processSession"].clone(),
+                candidate_before["processSession"].clone(),
+                candidate_after["processSession"].clone(),
+            ));
+        }
+        if status["status"]["transition"]["scaleUp"].is_object()
+            && status["status"]["scaleUpAdmissionStarted"].is_null()
+            && restarted_sessions.is_some()
+        {
+            break;
         }
         manual_live_step(cluster, deadline)?;
-        poll(deadline, "pre-admission candidate build boundary")?;
-    };
+        poll(deadline, "restarted copy through pre-admission boundary")?;
+    }
+    let old_provisioning_id =
+        old_provisioning_id.context("pre-admission copy operation was not observed")?;
+    let old_candidate = old_candidate.context("pre-admission candidate was not observed")?;
+    let (_, restarted_source_session, _, restarted_candidate_session) =
+        restarted_sessions.context("source and candidate restarts were not observed")?;
     let old_uids = old_candidate
         .iter()
         .map(|resource| (resource.kind, resource.uid().to_string()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let failed_primary =
-        serde_json::from_value::<kuberic_protocol::types::ReplicaIdentity>(identity(&old_primary))?;
+    cluster.delete_exact_pod(&old_primary)?;
+    let mut failed_process_changed = false;
     let new_primary = loop {
-        manual_live_step_with_permanent_fault(cluster, &failed_primary, deadline)?;
+        manual_live_step(cluster, deadline)?;
         let status = cluster.status()?;
         assert_scale_up_condition_context(&status)?;
+        failed_process_changed |=
+            replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id).is_ok_and(
+                |report| {
+                    report["instanceId"] != old_primary["instanceId"]
+                        || report["processSession"] != restarted_source_session
+                },
+            );
         ensure!(
             status["status"]["scaleUpAdmissionStarted"].is_null(),
             "pre-admission primary failure crossed the PC/CC admission fence: {status}"
@@ -5141,40 +5484,45 @@ fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(S
         }
         poll(deadline, "ordinary failover before scale-up admission")?;
     };
+    ensure!(
+        failed_process_changed || new_primary != old_primary_id,
+        "accepted-primary fault produced neither a new process session nor a failover primary"
+    );
     loop {
         let status = cluster.status()?;
-        let accepted = &status["status"]["topology"]["configurationId"];
-        ensure!(
-            !status["status"]["transition"]["scaleUp"].is_object(),
-            "fresh scale-up transition began before accepted failover correction: {status}"
-        );
-        let corrected = status["status"]["transition"].is_null()
-            && status["status"]["topology"]["members"]
-                .as_array()
-                .is_some_and(|members| {
-                    members.iter().all(|member| {
-                        cluster.report(member).is_ok_and(|report| {
-                            report["currentConfiguration"] == *accepted
-                                && report["previousConfiguration"].is_null()
-                                && report["pendingOperation"].is_null()
-                        })
-                    })
-                });
-        if corrected {
-            let primary = exact_member(&status, new_primary)?.clone();
-            let mut recovered_writer =
-                DirectClient::connect(cluster, &cluster.pod(&primary)?, deadline)?;
-            write_direct(
-                &mut recovered_writer,
+        let primary = exact_member(&status, new_primary)?.clone();
+        let writable = cluster.report(&primary).is_ok_and(|report| {
+            identity(&report) == identity(&primary)
+                && report["writeStatus"] == "Granted"
+                && report["pendingOperation"].is_null()
+        });
+        let routed = cluster
+            .kubectl(&[
+                "-n",
+                "default",
+                "get",
+                "service",
+                "kvstore2-write",
+                "-o",
+                "json",
+            ])
+            .ok()
+            .and_then(|service| serde_json::from_str::<Value>(&service).ok())
+            .is_some_and(|service| routing_instance(&service) == primary["instanceId"].as_str());
+        if writable && routed {
+            write_routed(
+                cluster,
+                &primary,
                 &mut acknowledged,
                 "after-pre-admission-failover",
+                deadline,
             )?;
             break;
         }
         manual_live_step(cluster, deadline)?;
         poll(
             deadline,
-            "accepted failover current-only correction before fresh scale-up",
+            "writable failover primary while desired scale-up retry remains active",
         )?;
     }
     drop(pause);
@@ -5251,8 +5599,14 @@ fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(S
     ensure!(
         retained_identities
             .iter()
+            .filter(|retained| retained["replicaId"].as_i64() != Some(old_primary_id))
             .all(|retained| members.iter().any(|member| identity(member) == *retained)),
-        "fresh retry changed a retained exact identity: {members:?}"
+        "fresh retry changed a surviving retained exact identity: {members:?}"
+    );
+    let replacement = exact_member(&stable, old_primary_id)?;
+    ensure!(
+        identity(replacement) != identity(&old_primary),
+        "deleted accepted-primary incarnation returned without a fresh identity: {replacement}"
     );
     let fresh_pod = fresh
         .iter()
@@ -5266,9 +5620,10 @@ fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(S
     );
     verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
     eprintln!(
-        "scale-up pre-admission failover/retry PASS: desired=4, primary \
+        "scale-up pre-admission process restarts/failover/retry PASS: desired=4, primary \
          {old_primary_id}->{new_primary}, old_operation={old_provisioning_id}, \
-         fresh_operation={fresh_provisioning_id}"
+         fresh_operation={fresh_provisioning_id}, source_session={restarted_source_session}, \
+         candidate_session={restarted_candidate_session}"
     );
     Ok(acknowledged)
 }
@@ -5288,9 +5643,14 @@ fn scale_up_post_admission_recovery_and_replacement(
         .context("retained secondary")?
         .clone();
     let deadline = Instant::now() + Duration::from_secs(900);
-    let mut writer = DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
     let mut acknowledged = Vec::new();
-    write_direct(&mut writer, &mut acknowledged, "before-post-pc-failover")?;
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "before-post-pc-failover",
+        deadline,
+    )?;
     let pause = ControllerPause::new(cluster)?;
     patch_replicas(cluster, 3)?;
     let (intent, expanded) = loop {
@@ -5350,7 +5710,43 @@ fn scale_up_post_admission_recovery_and_replacement(
             "exact expanded PC/CC authority/policy on source, retained member, and candidate",
         )?;
     };
-    write_direct(&mut writer, &mut acknowledged, "during-pc-cc-admission")?;
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "during-pc-cc-admission",
+        deadline,
+    )?;
+    let candidate_before = replica_diagnostics(
+        &cluster.kubeconfig,
+        &cluster.context,
+        intent.target.replica_id.value(),
+    )?;
+    kill_replica_process(
+        &cluster.kubeconfig,
+        &cluster.context,
+        intent.target.replica_id.value(),
+    )?;
+    let candidate_after = wait_process_session_change(
+        cluster,
+        intent.target.replica_id.value(),
+        &candidate_before["processSession"],
+        deadline,
+    )?;
+    ensure!(
+        identity(&candidate_after) == identity(&candidate_before)
+            && candidate_after["previousConfiguration"]
+                == candidate_before["previousConfiguration"]
+            && candidate_after["currentConfiguration"] == candidate_before["currentConfiguration"],
+        "candidate process restart lost exact admitted PC/CC authority: before={candidate_before} after={candidate_after}"
+    );
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "after-candidate-pc-cc-restart",
+        deadline,
+    )?;
     let suspension =
         suspend_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
     let (carried, new_primary_id) = loop {
@@ -5439,8 +5835,9 @@ fn scale_up_post_admission_recovery_and_replacement(
     verify_acknowledged(cluster, &stable, &acknowledged, deadline)?;
     eprintln!(
         "scale-up post-PC/CC accepted-primary failover PASS: carried operation={}, \
-         primary {old_primary_id}->{new_primary_id}, exact expanded membership stable",
-        intent.operation_id
+         primary {old_primary_id}->{new_primary_id}, candidate_session {}->{}, \
+         exact expanded membership stable",
+        intent.operation_id, candidate_before["processSession"], candidate_after["processSession"]
     );
 
     // A separate post-completion cut retains the original member-replacement
@@ -5488,12 +5885,13 @@ fn scale_down_then_restore_non_contiguous(cluster: &SwitchoverCluster) -> Result
         .find(|member| member["role"] == "primary")
         .context("restoration starting primary")?
         .clone();
-    let mut writer = DirectClient::connect(cluster, &cluster.pod(&primary)?, deadline)?;
     let mut acknowledged = Vec::new();
-    write_direct(
-        &mut writer,
+    write_routed(
+        cluster,
+        &primary,
         &mut acknowledged,
         "before-non-contiguous-restoration",
+        deadline,
     )?;
     let target = exact_member(&stable, 3)?.clone();
     if topology_primary_id(&stable) != Some(3) {

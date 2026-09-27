@@ -134,7 +134,7 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         return plan;
     }
     if config.allow_scale_up
-        && let Some(plan) = scale_up_active_accepted_current_only(snapshot)
+        && let Some(plan) = scale_up_active_accepted_current_only(snapshot, config)
     {
         return plan;
     }
@@ -282,7 +282,7 @@ fn scale_up_stale_accepted_correction(snapshot: &ObservationSnapshot) -> Option<
     }
     let accepted = &snapshot.status.topology.as_ref()?.configuration;
     let policy = snapshot.status.effective_policy.as_ref()?;
-    let (member, report, previous) = accepted.members.iter().find_map(|member| {
+    let (member, report, previous, operation_id) = accepted.members.iter().find_map(|member| {
         if member.role == ReplicaRole::Primary {
             return None;
         }
@@ -293,8 +293,16 @@ fn scale_up_stale_accepted_correction(snapshot: &ObservationSnapshot) -> Option<
                 _ => None,
             })?;
         let previous = report.current_configuration.as_ref()?;
-        (report.epoch < accepted.epoch && report.pending_operation_id.is_none())
-            .then_some((member, report, previous))
+        let operation_id = OperationId::new(format!(
+            "scale-up-accepted-correction:{}:{}",
+            accepted.configuration_id, member.identity.replica_id
+        ));
+        (report.epoch < accepted.epoch
+            && report
+                .pending_operation_id
+                .as_ref()
+                .is_none_or(|pending| pending == &operation_id))
+        .then_some((member, report, previous, operation_id))
     })?;
     Some(Plan::Execute {
         command: ProtocolCommand::EnsureConfiguration(Box::new(failover_configuration_command(
@@ -302,10 +310,7 @@ fn scale_up_stale_accepted_correction(snapshot: &ObservationSnapshot) -> Option<
             accepted,
             member,
             policy,
-            OperationId::new(format!(
-                "scale-up-accepted-correction:{}:{}",
-                accepted.configuration_id, member.identity.replica_id
-            )),
+            operation_id,
             Some(report.current_progress),
             AccessStatus::ReconfigurationPending,
             false,
@@ -314,13 +319,16 @@ fn scale_up_stale_accepted_correction(snapshot: &ObservationSnapshot) -> Option<
     })
 }
 
-fn scale_up_active_accepted_current_only(snapshot: &ObservationSnapshot) -> Option<Plan> {
+fn scale_up_active_accepted_current_only(
+    snapshot: &ObservationSnapshot,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
     if !scale_up_authority_active(snapshot) {
         return None;
     }
     let accepted = &snapshot.status.topology.as_ref()?.configuration;
     let policy = snapshot.status.effective_policy.as_ref()?;
-    let (member, report, previous) = accepted.members.iter().find_map(|member| {
+    let (member, report, previous, operation_id) = accepted.members.iter().find_map(|member| {
         if member.role == ReplicaRole::Primary {
             return None;
         }
@@ -331,22 +339,40 @@ fn scale_up_active_accepted_current_only(snapshot: &ObservationSnapshot) -> Opti
                 _ => None,
             })?;
         let previous = report.previous_configuration.as_ref()?;
+        let operation_id = OperationId::new(format!(
+            "scale-up-accepted-current-only:{}:{}",
+            accepted.configuration_id, member.identity.replica_id
+        ));
         (report.epoch == accepted.epoch
             && report.current_configuration.as_ref() == Some(accepted)
-            && report.scale_up_intent.is_none()
-            && report.pending_operation_id.is_none())
-        .then_some((member, report, previous))
+            && report.scale_up_intent.is_none())
+        .then_some((member, report, previous, operation_id))
     })?;
+    if report
+        .pending_operation_id
+        .as_ref()
+        .is_some_and(|pending| pending != &operation_id)
+    {
+        return Some(unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::ContradictoryReplicaEvidence(format!(
+                "accepted member {} has unrelated pending configuration operation {}",
+                member.identity.replica_id,
+                report
+                    .pending_operation_id
+                    .as_ref()
+                    .expect("checked pending operation")
+            )),
+            config,
+        ));
+    }
     Some(Plan::Execute {
         command: ProtocolCommand::EnsureConfiguration(Box::new(failover_configuration_command(
             previous,
             accepted,
             member,
             policy,
-            OperationId::new(format!(
-                "scale-up-accepted-current-only:{}:{}",
-                accepted.configuration_id, member.identity.replica_id
-            )),
+            operation_id,
             Some(report.current_progress),
             AccessStatus::ReconfigurationPending,
             true,

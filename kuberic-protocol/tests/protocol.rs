@@ -7691,6 +7691,151 @@ fn scale_up_primary_loss_before_and_after_pc_cc_follow_distinct_paths() {
 }
 
 #[test]
+fn scale_up_carried_failover_corrects_returning_original_pc_cc_and_current_only_primary() {
+    use scale_up_model::Model;
+
+    fn carried_failover() -> (Model, ScaleUpIntent) {
+        let mut model = Model::new(2, 3);
+        loop {
+            let primary_pc_cc = model
+                .snapshot
+                .status
+                .transition
+                .as_ref()
+                .and_then(|transition| transition.scale_up.as_deref())
+                .is_some_and(|intent| {
+                    model
+                        .snapshot
+                        .observation_for_identity(&intent.primary)
+                        .and_then(|observation| match &observation.agent {
+                            AgentObservation::Report(report) => Some(report.as_ref()),
+                            _ => None,
+                        })
+                        .is_some_and(|report| {
+                            report.previous_configuration.as_ref()
+                                == Some(&intent.previous_configuration)
+                                && report.current_configuration.as_ref()
+                                    == Some(&intent.current_configuration)
+                        })
+                });
+            if primary_pc_cc {
+                break;
+            }
+            model.step();
+        }
+        let intent = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up.as_deref())
+            .unwrap()
+            .clone();
+        let report = model.report_mut(intent.primary.replica_id.value());
+        report.reported_fault = Some(FaultType::Permanent);
+        report.write_status = AccessStatus::ReconfigurationPending;
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("primary failure must freeze carried failover")
+        };
+        let status = changes.into_iter().find_map(|change| match change {
+            KubernetesChange::PersistStatus { status }
+                if status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.scale_up_failover.is_some()) =>
+            {
+                Some(*status)
+            }
+            _ => None,
+        });
+        model.snapshot.status = status.expect("carried failover status");
+        (model, intent)
+    }
+
+    for current_only in [false, true] {
+        let (mut model, intent) = carried_failover();
+        let report = model.report_mut(intent.primary.replica_id.value());
+        report.healthy = true;
+        report.reported_fault = None;
+        report.role = ReplicaRole::Primary;
+        report.read_status = AccessStatus::Granted;
+        report.write_status = if current_only {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::ReconfigurationPending
+        };
+        report.epoch = intent.current_configuration.epoch;
+        report.previous_configuration =
+            (!current_only).then(|| intent.previous_configuration.clone());
+        report.current_configuration = Some(intent.current_configuration.clone());
+        report.scale_up_intent = Some(Box::new(intent.clone()));
+        report.pending_operation_id = None;
+        report.retained_operation_id = Some(intent.command_operation_id(
+            if current_only {
+                kuberic_protocol::types::ScaleUpStage::CurrentOnly
+            } else {
+                kuberic_protocol::types::ScaleUpStage::PreviousCurrent
+            },
+            &intent.primary,
+            &intent.current_configuration,
+        ));
+        report.report_sequence += 1;
+
+        if current_only {
+            let mut unrelated = model.fork();
+            unrelated
+                .report_mut(intent.primary.replica_id.value())
+                .retained_operation_id = Some(OperationId::new("unrelated-current-only"));
+            assert!(matches!(
+                unrelated.plan(),
+                Plan::Unsafe {
+                    safety_changes,
+                    ..
+                } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+            ));
+            let mut stale = model.fork();
+            stale
+                .report_mut(intent.primary.replica_id.value())
+                .scale_up_intent = None;
+            assert!(matches!(
+                stale.plan(),
+                Plan::Unsafe {
+                    safety_changes,
+                    ..
+                } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+            ));
+        }
+
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command),
+        } = model.plan()
+        else {
+            panic!(
+                "returning original {} authority must receive carried failover correction: {:?}",
+                if current_only {
+                    "current-only"
+                } else {
+                    "PC/CC"
+                },
+                model.plan()
+            )
+        };
+        assert_eq!(command.local_replica_id, intent.primary.replica_id);
+        assert_eq!(command.transition_kind, TransitionKind::Failover);
+        assert!(!command.current_only);
+        assert!(
+            command.current_epoch > intent.current_configuration.epoch,
+            "carried failover correction must move authority monotonically forward"
+        );
+        model.execute(ProtocolCommand::EnsureConfiguration(command));
+        model.run(120);
+        assert_eq!(model.accepted_count(), 3);
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.status.last_scale_up.is_some());
+    }
+}
+
+#[test]
 fn scale_up_retry_corrects_late_stale_failover_member_before_pc_cc() {
     use scale_up_model::Model;
 
@@ -7780,7 +7925,12 @@ fn scale_up_retry_corrects_late_stale_failover_member_before_pc_cc() {
     stale.previous_configuration = None;
     stale.current_configuration = Some(stale_configuration);
     stale.write_status = AccessStatus::Granted;
-    stale.pending_operation_id = None;
+    let correction_operation = OperationId::new(format!(
+        "scale-up-accepted-correction:{}:{}",
+        accepted.configuration_id,
+        ReplicaId::new(1)
+    ));
+    stale.pending_operation_id = Some(correction_operation.clone());
 
     let Plan::Execute {
         command: ProtocolCommand::EnsureConfiguration(command),
@@ -7792,6 +7942,15 @@ fn scale_up_retry_corrects_late_stale_failover_member_before_pc_cc() {
     assert_eq!(command.current_configuration, accepted);
     assert_eq!(command.transition_kind, TransitionKind::Failover);
     assert!(!command.current_only);
+    assert_eq!(command.operation_id, correction_operation);
+    let correction = command.clone();
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(correction)
+        },
+        "matching frozen accepted-member correction must replay byte-for-byte"
+    );
     model.execute(ProtocolCommand::EnsureConfiguration(command));
     let Plan::Execute {
         command: ProtocolCommand::EnsureConfiguration(command),
@@ -7803,6 +7962,30 @@ fn scale_up_retry_corrects_late_stale_failover_member_before_pc_cc() {
     assert_eq!(command.current_configuration, accepted);
     assert_eq!(command.transition_kind, TransitionKind::Failover);
     assert!(command.current_only);
+    let current_only_operation = command.operation_id.clone();
+    model.report_mut(1).pending_operation_id = Some(current_only_operation.clone());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed),
+    } = model.plan()
+    else {
+        panic!("matching frozen accepted current-only correction must replay")
+    };
+    assert_eq!(replayed, command);
+    assert_eq!(replayed.operation_id, current_only_operation);
+    model.report_mut(1).pending_operation_id =
+        Some(OperationId::new("unrelated-accepted-correction"));
+    let unrelated_plan = model.plan();
+    assert!(
+        matches!(
+            &unrelated_plan,
+            Plan::Unsafe {
+                safety_changes,
+                ..
+            } if safety_changes == &vec![SafetyChange::RemoveWriteRouting]
+        ),
+        "unrelated accepted correction was not fenced: {unrelated_plan:?}"
+    );
+    model.report_mut(1).pending_operation_id = Some(current_only_operation);
     model.execute(ProtocolCommand::EnsureConfiguration(command));
     model.run(100);
     assert_eq!(model.accepted_count(), 4);
@@ -8459,6 +8642,67 @@ fn scale_up_diagnostics_cover_every_externally_visible_phase() {
         panic!("stable phase")
     };
     assert_phase(&status, "ScaleUpStable", "stable");
+}
+
+#[test]
+fn scale_up_replays_exact_pending_current_only_before_and_after_authority_install() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(2, 3);
+    let current_only = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only => break command,
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("current-only setup: {other:?}"),
+        }
+    };
+    let target = current_only.local_replica_id.value();
+    model.report_mut(target).pending_operation_id = Some(current_only.operation_id.clone());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed_before_install),
+    } = model.plan()
+    else {
+        panic!(
+            "exact pending current-only command before authority installation must be replayed: {:?}",
+            model.plan()
+        )
+    };
+    assert_eq!(replayed_before_install, current_only);
+
+    let mut unrelated = model.fork();
+    unrelated.report_mut(target).pending_operation_id =
+        Some(OperationId::new("unrelated-current-only"));
+    assert!(matches!(
+        unrelated.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpCommandPending")
+    ));
+
+    model.execute(ProtocolCommand::EnsureConfiguration(current_only.clone()));
+    model.report_mut(target).pending_operation_id = Some(current_only.operation_id.clone());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed_after_install),
+    } = model.plan()
+    else {
+        panic!(
+            "exact pending current-only command after authority installation must be replayed: {:?}",
+            model.plan()
+        )
+    };
+    assert_eq!(replayed_after_install, current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(current_only));
+    model.run(100);
+    assert_eq!(model.accepted_count(), 3);
+    assert!(model.snapshot.status.last_scale_up.is_some());
 }
 
 #[test]

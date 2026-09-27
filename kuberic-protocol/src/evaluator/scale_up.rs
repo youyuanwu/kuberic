@@ -167,11 +167,31 @@ pub(super) fn recoverable_failover_conflict(
         .find(|member| member.identity.replica_id.value() == replica_id)
         .and_then(|member| report(snapshot, &member.identity))
         .is_some_and(|report| {
-            report.epoch == intent.current_configuration.epoch
-                && report.current_configuration.as_ref() == Some(&intent.current_configuration)
-                && report.previous_configuration.as_ref() == Some(&intent.previous_configuration)
-                && report.scale_up_intent.as_deref() == Some(intent)
-                && report.pending_operation_id.is_none()
+            if report.epoch != intent.current_configuration.epoch
+                || report.current_configuration.as_ref() != Some(&intent.current_configuration)
+                || report.scale_up_intent.as_deref() != Some(intent)
+                || report.pending_operation_id.is_some()
+            {
+                return false;
+            }
+            let stage =
+                if report.previous_configuration.as_ref() == Some(&intent.previous_configuration) {
+                    ScaleUpStage::PreviousCurrent
+                } else if report.previous_configuration.is_none()
+                    && report.identity == intent.primary
+                    && report.role == ReplicaRole::Primary
+                    && report.write_status == AccessStatus::Granted
+                {
+                    ScaleUpStage::CurrentOnly
+                } else {
+                    return false;
+                };
+            report.retained_operation_id.as_ref()
+                == Some(&intent.command_operation_id(
+                    stage,
+                    &report.identity,
+                    &intent.current_configuration,
+                ))
         })
 }
 
@@ -2533,6 +2553,19 @@ pub(super) fn transition(
                 &member.identity,
                 current,
             );
+            let current_only_operation_id =
+                intent.command_operation_id(ScaleUpStage::CurrentOnly, &member.identity, current);
+            if report.pending_operation_id.as_ref() == Some(&current_only_operation_id) {
+                return Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
+                        evidence.clone(),
+                        current,
+                        member,
+                        true,
+                        transition.election_lsn,
+                    ))),
+                };
+            }
             if !exact_pc_cc_report(report, intent, current)
                 || report.pending_operation_id.is_some()
                 || report.retained_operation_id.as_ref() != Some(&operation_id)

@@ -1155,6 +1155,41 @@ fn scale_up_fixture(current_only: bool) -> (AgentState, EnsureConfiguration, Adm
     (state, command, authority)
 }
 
+#[test]
+fn exact_pending_scale_up_current_only_is_admitted_before_and_after_authority_install() {
+    let (mut state, command, expected) = scale_up_fixture(true);
+    assert_eq!(admit_configuration(&command, &state).unwrap(), expected);
+
+    state.reconfiguration = Some(ReconfigurationRecord {
+        command: command.clone(),
+        stage: CoordinatorStage::AdmitAuthority,
+        observed_lsn: None,
+    });
+    assert_eq!(
+        admit_persisted_configuration(&command, &state).unwrap(),
+        expected,
+        "the exact journaled current-only command must remain admissible before authority install"
+    );
+
+    state.previous_configuration = None;
+    state.current_configuration = Some(command.current_configuration.clone());
+    state.highest_epoch = command.current_epoch;
+    state.admitted_policy = Some(command.effective_policy.clone());
+    state.scale_up_evidence = command.scale_up_evidence.clone();
+    assert_eq!(
+        admit_persisted_configuration(&command, &state).unwrap(),
+        expected,
+        "the exact journaled current-only command must remain admissible after authority install"
+    );
+
+    let mut mutated = command.clone();
+    mutated.retire_build_ids = vec![OperationId::new("different-build")];
+    assert!(admit_persisted_configuration(&mutated, &state).is_err());
+    let mut unrelated = command;
+    unrelated.operation_id = OperationId::new("unrelated-current-only");
+    assert!(admit_persisted_configuration(&unrelated, &state).is_err());
+}
+
 fn candidate_admission_fixture() -> (
     AgentState,
     EnsureConfiguration,

@@ -1023,6 +1023,374 @@ async fn scale_up_reobserves_status_conflict_and_lost_agent_replies() {
 }
 
 #[tokio::test]
+async fn scale_up_replays_pending_current_only_before_and_after_installation() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    let current_only = loop {
+        observe_fresh_candidate(&api).await;
+        let raw = api.observe("tests", "db").await.unwrap();
+        match evaluate(&normalize(raw, BTreeMap::new()).unwrap(), &enabled()) {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only => break command,
+            _ => {
+                tick(&api).await;
+            }
+        }
+    };
+    let key = ReplicaObservationKey::new(
+        current_only.local_replica_id,
+        current_only.expected_instance_id.clone(),
+    );
+    let mut pending = api.observation().await;
+    let RawAgentObservation::Report(report) = pending.agents.get_mut(&key).unwrap() else {
+        panic!("current-only target report")
+    };
+    report.pending_operation_id = current_only.operation_id.to_string();
+    report.report_sequence += 1;
+    api.set_observation(pending).await;
+
+    let (kind, effects) = tick(&api).await;
+    assert_eq!(kind, ReconcileKind::Executed);
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(replayed))
+                if replayed == &current_only
+        )
+    }));
+
+    let mut installed_pending = api.observation().await;
+    let RawAgentObservation::Report(report) = installed_pending.agents.get_mut(&key).unwrap()
+    else {
+        panic!("installed current-only target report")
+    };
+    assert_eq!(
+        report.current_configuration.as_ref(),
+        Some(&current_only.current_configuration.clone().into())
+    );
+    assert!(report.previous_configuration.is_none());
+    report.pending_operation_id = current_only.operation_id.to_string();
+    report.report_sequence += 1;
+    api.set_observation(installed_pending).await;
+
+    let (kind, effects) = tick(&api).await;
+    assert_eq!(kind, ReconcileKind::Executed);
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(replayed))
+                if replayed == &current_only
+        )
+    }));
+    finish(&api, 3).await;
+}
+
+#[tokio::test]
+async fn scale_up_carried_failover_repairs_returning_original_current_only_primary() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    let (intent, original_key) = loop {
+        tick(&api).await;
+        let raw = api.observation().await;
+        let Some(intent) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.transition.as_ref())
+            .and_then(|transition| transition.scale_up.as_deref())
+            .cloned()
+        else {
+            continue;
+        };
+        let key = ReplicaObservationKey::new(
+            intent.primary.replica_id,
+            intent.primary.instance_id.clone(),
+        );
+        let installed = matches!(
+            raw.agents.get(&key),
+            Some(RawAgentObservation::Report(report))
+                if report.previous_configuration.as_ref().is_some_and(|previous|
+                    previous.configuration_id == intent.previous_configuration.configuration_id.as_str())
+                    && report.current_configuration.as_ref().is_some_and(|current|
+                        current.configuration_id == intent.current_configuration.configuration_id.as_str())
+        );
+        if installed {
+            break (intent, key);
+        }
+    };
+
+    let mut failed = api.observation().await;
+    let RawAgentObservation::Report(report) = failed.agents.get_mut(&original_key).unwrap() else {
+        panic!("original primary report")
+    };
+    report.healthy = false;
+    report.reported_fault = proto::FaultType::Permanent as i32;
+    report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
+    failed.now_unix_seconds += 11;
+    api.set_observation(failed).await;
+    for _ in 0..80 {
+        let mut raw = api.observation().await;
+        raw.now_unix_seconds += 11;
+        api.set_observation(raw).await;
+        tick(&api).await;
+        if api
+            .observation()
+            .await
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.transition.as_ref())
+            .is_some_and(|transition| transition.scale_up_failover.is_some())
+        {
+            break;
+        }
+    }
+    let mut returned = api.observation().await;
+    assert!(
+        returned
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.transition.as_ref())
+            .is_some_and(|transition| transition.scale_up_failover.is_some())
+    );
+    let RawAgentObservation::Report(report) = returned.agents.get_mut(&original_key).unwrap()
+    else {
+        panic!("returning original primary report")
+    };
+    report.healthy = true;
+    report.reported_fault = proto::FaultType::Unknown as i32;
+    report.role = proto::ReplicaRole::Primary as i32;
+    report.read_status = proto::AccessStatus::Granted as i32;
+    report.write_status = proto::AccessStatus::Granted as i32;
+    report.epoch = Some(intent.current_configuration.epoch.into());
+    report.previous_configuration = None;
+    report.current_configuration = Some(intent.current_configuration.clone().into());
+    report.scale_up_intent = Some(intent.clone().into());
+    report.pending_operation_id.clear();
+    report.retained_operation_id = intent
+        .command_operation_id(
+            kuberic_protocol::types::ScaleUpStage::CurrentOnly,
+            &intent.primary,
+            &intent.current_configuration,
+        )
+        .to_string();
+    report.report_sequence += 1;
+    api.set_observation(returned).await;
+
+    let (kind, effects) = tick(&api).await;
+    assert_ne!(kind, ReconcileKind::Unsafe);
+    assert!(
+        effects
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+    );
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command))
+                if command.local_replica_id == intent.primary.replica_id
+                    && command.transition_kind == TransitionKind::Failover
+                    && !command.current_only
+                    && command.current_epoch > intent.current_configuration.epoch
+        )
+    }));
+    finish(&api, 3).await;
+}
+
+#[tokio::test]
+async fn scale_up_accepted_member_correction_replays_exact_pending_and_fences_unrelated() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(3, 4)));
+    let starting = api
+        .observation()
+        .await
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    while api
+        .observation()
+        .await
+        .set
+        .status
+        .as_ref()
+        .is_none_or(|status| status.authority.provisioning.is_none())
+    {
+        tick(&api).await;
+    }
+    let original = starting
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    let original_key =
+        ReplicaObservationKey::new(original.replica_id, original.instance_id.clone());
+    let mut failed = api.observation().await;
+    let RawAgentObservation::Report(report) = failed.agents.get_mut(&original_key).unwrap() else {
+        panic!("accepted primary report")
+    };
+    report.healthy = false;
+    report.reported_fault = proto::FaultType::Permanent as i32;
+    report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
+    failed.now_unix_seconds += 11;
+    api.set_observation(failed).await;
+    let accepted =
+        loop {
+            let mut raw = api.observation().await;
+            raw.now_unix_seconds += 11;
+            api.set_observation(raw).await;
+            tick(&api).await;
+            let raw = api.observation().await;
+            let status = raw.set.status.as_ref().unwrap();
+            if status.authority.transition.is_none()
+                && status.authority.topology.as_ref().is_some_and(|topology| {
+                    topology.configuration.primary_id != original.replica_id
+                })
+            {
+                break status
+                    .authority
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .clone();
+            }
+        };
+
+    let correction_id = OperationId::new(format!(
+        "scale-up-accepted-correction:{}:{}",
+        accepted.configuration_id, original.replica_id
+    ));
+    for _ in 0..200 {
+        if api
+            .observation()
+            .await
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.transition.as_ref())
+            .is_some_and(|transition| transition.scale_up.is_some())
+        {
+            break;
+        }
+        tick(&api).await;
+    }
+    let mut stale = api.observation().await;
+    assert!(
+        stale
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.transition.as_ref())
+            .is_some_and(|transition| transition.scale_up.is_some()),
+        "fresh scale-up transition did not begin after accepted failover correction"
+    );
+    let RawAgentObservation::Report(report) = stale.agents.get_mut(&original_key).unwrap() else {
+        panic!("late original member report")
+    };
+    report.healthy = true;
+    report.reported_fault = proto::FaultType::Unknown as i32;
+    report.role = proto::ReplicaRole::Primary as i32;
+    report.read_status = proto::AccessStatus::Granted as i32;
+    report.write_status = proto::AccessStatus::Granted as i32;
+    report.epoch = Some(starting.epoch.into());
+    report.previous_configuration = None;
+    report.current_configuration = Some(starting.into());
+    report.scale_up_intent = None;
+    report.pending_operation_id = correction_id.to_string();
+    report.report_sequence += 1;
+
+    let mut unrelated = stale.clone();
+    let RawAgentObservation::Report(report) = unrelated.agents.get_mut(&original_key).unwrap()
+    else {
+        unreachable!()
+    };
+    report.pending_operation_id = "unrelated-accepted-correction".into();
+    let unrelated_api = Arc::new(InMemoryClusterApi::new(unrelated));
+    let mut unrelated_effects = Vec::new();
+    for _ in 0..4 {
+        let (_, effects) = tick(&unrelated_api).await;
+        unrelated_effects.extend(effects);
+        if unrelated_effects
+            .iter()
+            .any(|effect| matches!(effect, EffectRecord::RemoveWriteRouting))
+        {
+            break;
+        }
+    }
+    assert!(
+        unrelated_effects
+            .iter()
+            .any(|effect| matches!(effect, EffectRecord::RemoveWriteRouting)),
+        "unrelated pending correction was not fenced: {unrelated_effects:?}"
+    );
+    assert!(
+        unrelated_effects
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::Execute(_))),
+        "unrelated pending correction dispatched authority: {unrelated_effects:?}"
+    );
+
+    api.set_observation(stale).await;
+    let mut correction = None;
+    for _ in 0..8 {
+        let (_, effects) = tick(&api).await;
+        correction = effects.iter().find_map(|effect| match effect {
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command))
+                if command.operation_id == correction_id =>
+            {
+                Some(command.clone())
+            }
+            _ => None,
+        });
+        if correction.is_some() {
+            break;
+        }
+    }
+    let correction = correction.expect("exact pending accepted-member correction replay");
+    assert_eq!(correction.current_configuration, accepted);
+    assert!(!correction.current_only);
+
+    let current_only = loop {
+        let raw = api.observe("tests", "db").await.unwrap();
+        match evaluate(&normalize(raw, BTreeMap::new()).unwrap(), &enabled()) {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.current_only && command.local_replica_id == original.replica_id => {
+                break command;
+            }
+            _ => {
+                tick(&api).await;
+            }
+        }
+    };
+    let mut pending = api.observation().await;
+    let RawAgentObservation::Report(report) = pending.agents.get_mut(&original_key).unwrap() else {
+        unreachable!()
+    };
+    report.pending_operation_id = current_only.operation_id.to_string();
+    report.report_sequence += 1;
+    api.set_observation(pending).await;
+    let (kind, effects) = tick(&api).await;
+    assert_eq!(kind, ReconcileKind::Executed);
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(replayed))
+                if replayed == &current_only
+        )
+    }));
+    finish(&api, 4).await;
+}
+
+#[tokio::test]
 async fn scale_up_stale_process_session_cannot_advance_and_fresh_session_recovers() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
     let mut stale_key = None;
