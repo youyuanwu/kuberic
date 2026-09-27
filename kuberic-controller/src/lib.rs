@@ -28,6 +28,8 @@ pub fn production_evaluation_config(
 pub enum ControllerError {
     #[error("observation failed: {0}")]
     Observation(String),
+    #[error("transient observation failed: {0}")]
+    TransientObservation(String),
     #[error("observed Kubernetes object changed; a fresh observation is required")]
     ObservationStale,
     #[error("agent is unavailable: {0}")]

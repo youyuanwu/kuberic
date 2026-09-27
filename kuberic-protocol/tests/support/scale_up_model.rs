@@ -1061,6 +1061,7 @@ impl Model {
                     report.deactivated_lsn = Some(boundary);
                 }
                 report.pending_operation_id = None;
+                report.pending_configuration = None;
                 report.retained_operation_id = Some(command.operation_id);
                 report.scale_up_intent = command
                     .scale_up_evidence

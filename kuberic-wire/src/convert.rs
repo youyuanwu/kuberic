@@ -99,6 +99,59 @@ pub struct ExecuteEnvelope {
     pub command: ProtocolCommand,
 }
 
+pub fn configuration_command_to_proto(
+    command: EnsureConfiguration,
+) -> proto::EnsureConfigurationCommand {
+    let transition_kind = match command.transition_kind {
+        TransitionKind::Bootstrap => proto::TransitionKind::Bootstrap,
+        TransitionKind::Replacement => proto::TransitionKind::Replacement,
+        TransitionKind::Failover => proto::TransitionKind::Failover,
+        TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
+        TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
+        TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
+    };
+    let primary_write_status = match command.primary_write_status {
+        AccessStatus::Granted => proto::AccessStatus::Granted,
+        AccessStatus::ReconfigurationPending => proto::AccessStatus::ReconfigurationPending,
+        AccessStatus::NotPrimary => proto::AccessStatus::NotPrimary,
+        AccessStatus::NoWriteQuorum => proto::AccessStatus::NoWriteQuorum,
+    };
+    proto::EnsureConfigurationCommand {
+        previous_policy: command.previous_policy.map(Into::into),
+        secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(|evidence| (*evidence).into()),
+        operation_id: command.operation_id.to_string(),
+        previous_configuration: command.previous_configuration.map(Into::into),
+        current_configuration: Some(command.current_configuration.into()),
+        previous_epoch: command.previous_epoch.map(Into::into),
+        current_epoch: Some(command.current_epoch.into()),
+        effective_policy: Some(command.effective_policy.into()),
+        local_replica_id: command.local_replica_id.value(),
+        expected_instance_id: command.expected_instance_id.to_string(),
+        expected_agent_generation: command.expected_agent_generation.to_string(),
+        transition_kind: transition_kind as i32,
+        grant_write: command.primary_write_status == AccessStatus::Granted,
+        current_only: command.current_only,
+        retire_build_id: command
+            .retire_build_ids
+            .first()
+            .map_or_else(String::new, ToString::to_string),
+        primary_write_status: primary_write_status as i32,
+        retire_build_ids: command
+            .retire_build_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        failover_safe_lsn: command.failover_safe_lsn,
+        switchover_handoff: command.switchover_handoff.map(Into::into),
+        retire_switchover_preparation_ids: command
+            .retire_switchover_preparation_ids
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    }
+}
+
 /// Requires an exact protocol-version match; negotiation is intentionally unsupported.
 pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
     if observed == kuberic_protocol::PROTOCOL_VERSION {
@@ -335,6 +388,28 @@ pub fn normalize_agent_status_report(
                     scale_up: report.scale_up_intent.is_some(),
                 },
             )?;
+            let pending_configuration = report
+                .pending_configuration
+                .map(|command| {
+                    normalize_execute_request(proto::ExecuteCommandRequest {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        resource_uid: report.resource_uid.clone(),
+                        target: Some(identity.clone().into()),
+                        expected_process_session_id: report.process_session_id.clone(),
+                        command: Some(
+                            proto::execute_command_request::Command::EnsureConfiguration(Box::new(
+                                command,
+                            )),
+                        ),
+                    })
+                    .and_then(|envelope| match envelope.command {
+                        ProtocolCommand::EnsureConfiguration(command) => Ok(command),
+                        _ => Err(WireError::InvalidAuthority(
+                            "pending configuration decoded as another command".into(),
+                        )),
+                    })
+                })
+                .transpose()?;
             let report = AgentReport {
                 accepted_secondary_removal: report
                     .accepted_secondary_removal
@@ -370,6 +445,7 @@ pub fn normalize_agent_status_report(
                 reported_fault,
                 pending_operation_id: (!report.pending_operation_id.is_empty())
                     .then(|| OperationId::new(report.pending_operation_id)),
+                pending_configuration,
                 retained_operation_id: (!report.retained_operation_id.is_empty())
                     .then(|| OperationId::new(report.retained_operation_id)),
                 builds,

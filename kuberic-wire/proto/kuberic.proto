@@ -148,6 +148,7 @@ message AgentStatusReport {
   ReplicaRetirementReport retired_replica = 35;
   SecondaryScaleDownCleanup accepted_secondary_removal = 36;
   ScaleUpIntent scale_up_intent = 37;
+  EnsureConfigurationCommand pending_configuration = 38;
 }
 
 message InitializeAgentStoreCommand {

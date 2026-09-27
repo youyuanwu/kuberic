@@ -136,6 +136,9 @@ fn build_report(
             .collect(),
         reported_fault: fault_to_proto(state.reported_fault) as i32,
         pending_operation_id,
+        pending_configuration: state
+            .reconfiguration
+            .map(|record| kuberic_wire::configuration_command_to_proto(record.command)),
         retained_operation_id: retained_removal
             .map(|id| id.to_string())
             .unwrap_or_else(|| {

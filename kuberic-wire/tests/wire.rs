@@ -1,12 +1,15 @@
+use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, InitializationId,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, derive_agent_generation,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+    Epoch, InitializationId, OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaRole, TransitionKind, derive_agent_generation,
 };
 use kuberic_wire::convert::WireError;
 use kuberic_wire::{
-    ensure_supported_version, normalize_agent_status_report, normalize_execute_request, proto,
-    validate_agent_status_report, validate_copy_ack, validate_copy_item, validate_execute_request,
-    validate_replication_ack, validate_replication_item,
+    configuration_command_to_proto, ensure_supported_version, normalize_agent_status_report,
+    normalize_execute_request, proto, validate_agent_status_report, validate_copy_ack,
+    validate_copy_item, validate_execute_request, validate_replication_ack,
+    validate_replication_item,
 };
 use prost::Message;
 
@@ -477,6 +480,77 @@ fn configuration() -> ConfigurationDescriptor {
         ],
         2,
     )
+}
+
+#[test]
+fn pending_configuration_report_round_trips_exact_durable_command() {
+    use kuberic_protocol::observation::AgentObservation;
+
+    let policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("pod-uid-1"),
+        agent_generation: AgentGeneration::new("generation-1"),
+    };
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        identity.replica_id,
+        vec![ConfigurationMember {
+            identity: identity.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        policy.write_quorum,
+    );
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new("pending-bootstrap-authority"),
+        previous_configuration: None,
+        current_configuration: current.clone(),
+        previous_epoch: None,
+        current_epoch: current.epoch,
+        effective_policy: policy,
+        previous_policy: None,
+        secondary_removal_evidence: None,
+        scale_up_evidence: None,
+        local_replica_id: identity.replica_id,
+        expected_instance_id: identity.instance_id.clone(),
+        expected_agent_generation: identity.agent_generation.clone(),
+        transition_kind: TransitionKind::Bootstrap,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    let wire = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-uid".into(),
+        identity: Some(identity.into()),
+        process_session_id: "process-session".into(),
+        report_sequence: 1,
+        role: proto::ReplicaRole::Primary as i32,
+        read_status: proto::AccessStatus::ReconfigurationPending as i32,
+        write_status: proto::AccessStatus::ReconfigurationPending as i32,
+        epoch: Some(current.epoch.into()),
+        current_configuration: Some(current.into()),
+        current_progress: 12,
+        verified_replication_lsn: Some(12),
+        committed_lsn: 12,
+        storage_state: proto::AgentStorageState::Initialized as i32,
+        healthy: true,
+        pending_operation_id: command.operation_id.to_string(),
+        pending_configuration: Some(configuration_command_to_proto(command.clone())),
+        ..Default::default()
+    };
+    let AgentObservation::Report(normalized) = normalize_agent_status_report(wire.clone()).unwrap()
+    else {
+        panic!("initialized pending report")
+    };
+    assert_eq!(normalized.pending_configuration.as_deref(), Some(&command));
+
+    let mut mismatched = wire;
+    mismatched.pending_operation_id = "different-operation".into();
+    assert!(normalize_agent_status_report(mismatched).is_err());
 }
 
 #[test]

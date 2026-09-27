@@ -3153,30 +3153,45 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
         });
     }
     let coordinator = Coordinator::new(store.clone(), runtime.clone());
+    let command = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
+        scale_up_evidence: None,
+        operation_id: OperationId::new("failover-no-quorum"),
+        previous_configuration: Some(previous.clone()),
+        current_configuration: current.clone(),
+        previous_epoch: Some(previous.epoch),
+        current_epoch: current.epoch,
+        effective_policy: policy,
+        local_replica_id: local.replica_id,
+        expected_instance_id: local.instance_id,
+        expected_agent_generation: local.agent_generation,
+        transition_kind: TransitionKind::Failover,
+        failover_safe_lsn: Some(7),
+        primary_write_status: AccessStatus::NoWriteQuorum,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
     coordinator
-        .ensure_configuration(EnsureConfiguration {
-            previous_policy: None,
-            secondary_removal_evidence: None,
-            scale_up_evidence: None,
-            operation_id: OperationId::new("failover-no-quorum"),
-            previous_configuration: Some(previous.clone()),
-            current_configuration: current.clone(),
-            previous_epoch: Some(previous.epoch),
-            current_epoch: current.epoch,
-            effective_policy: policy,
-            local_replica_id: local.replica_id,
-            expected_instance_id: local.instance_id,
-            expected_agent_generation: local.agent_generation,
-            transition_kind: TransitionKind::Failover,
-            failover_safe_lsn: Some(7),
-            primary_write_status: AccessStatus::NoWriteQuorum,
-            current_only: false,
-            retire_build_ids: Vec::new(),
-            switchover_handoff: None,
-            retire_switchover_preparation_ids: Vec::new(),
-        })
+        .ensure_configuration(command.clone())
         .await
         .unwrap();
+    assert_eq!(
+        coordinator
+            .ensure_configuration(command.clone())
+            .await
+            .unwrap()
+            .command,
+        command
+    );
+    let mut mutated = command.clone();
+    mutated.failover_safe_lsn = Some(8);
+    assert!(matches!(
+        coordinator.ensure_configuration(mutated).await,
+        Err(AgentError::EffectConflict(_))
+    ));
 
     let calls = runtime.calls.lock().unwrap().clone();
     let admit = calls.iter().position(|stage| *stage == "admit").unwrap();
@@ -3492,8 +3507,17 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
         .await
         .unwrap();
     let calls = runtime.calls.lock().unwrap().clone();
-    coordinator.ensure_configuration(command).await.unwrap();
+    coordinator
+        .ensure_configuration(command.clone())
+        .await
+        .unwrap();
     assert_eq!(*runtime.calls.lock().unwrap(), calls);
+    let mut mutated = command;
+    mutated.retire_build_ids = vec![OperationId::new("different-build")];
+    assert!(matches!(
+        coordinator.ensure_configuration(mutated).await,
+        Err(AgentError::EffectConflict(_))
+    ));
 }
 
 #[test]

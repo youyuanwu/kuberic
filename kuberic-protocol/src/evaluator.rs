@@ -16,7 +16,7 @@ use crate::types::{
     derive_initialization_id, derive_switchover_preparation_operation_id, derive_transition_id,
 };
 use crate::validation::ValidationError;
-use crate::validation::validate_snapshot;
+use crate::validation::{validate_report_internal, validate_snapshot};
 
 mod replacement_cleanup;
 mod scale_up;
@@ -75,47 +75,64 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         return switchover_unsafe(snapshot, message, config);
     }
     if let Err(error) = validate_snapshot(snapshot) {
-        if config.allow_scale_up
-            && matches!(error, ValidationError::StaleReplicaEpoch { .. })
-            && let Some(plan) = scale_up_stale_accepted_correction(snapshot)
-        {
-            return plan;
-        }
-        if config.allow_scale_up
-            && let ValidationError::ConflictingReplicaConfiguration { replica_id, .. } = &error
-            && scale_up::recoverable_failover_conflict(snapshot, *replica_id)
-            && let Some(transition) = snapshot.status.transition.as_ref()
-        {
-            return scale_up::transition(snapshot, transition, config);
-        }
-        if config.enable_secondary_scale_down
-            && secondary_scale_down::active(snapshot)
-            && matches!(error, ValidationError::StaleReportSequence { .. })
-        {
-            return secondary_scale_down::wait(
-                snapshot.status.clone(),
-                "ScaleDownFreshReportRequired",
-                "Re-observe a newer report in the exact process session",
-                config,
-            );
-        }
-        if switchover.is_some() {
-            if matches!(error, ValidationError::StaleReportSequence { .. }) {
-                return switchover_wait(
+        let stale_correction_identity = config
+            .allow_scale_up
+            .then(|| scale_up_stale_correction_identity(snapshot))
+            .flatten();
+        let exact_stale_correction = matches!(
+            &error,
+            ValidationError::StaleReplicaEpoch { replica_id, .. }
+                if stale_correction_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.replica_id.value() == *replica_id)
+        );
+        if exact_stale_correction {
+            if let Err(other_error) = validate_snapshot_around_stale_correction(snapshot) {
+                return unsafe_plan(
                     snapshot.status.clone(),
-                    "SwitchoverFreshReportRequired",
-                    "Re-observe a strictly newer report in the current process session",
+                    UnsafeReason::InvalidAcceptedAuthority(other_error.to_string()),
                     config,
                 );
             }
-            return switchover_unsafe(snapshot, &error.to_string(), config);
-        }
-        let reason = if error == ValidationError::DesiredReplicasZero {
-            UnsafeReason::InvalidDesiredState(error.to_string())
+            // Continue through protocol-version, invalid-agent, observation,
+            // and primary-failure arbitration before dispatching correction.
         } else {
-            UnsafeReason::InvalidAcceptedAuthority(error.to_string())
-        };
-        return unsafe_plan(snapshot.status.clone(), reason, config);
+            if config.allow_scale_up
+                && let ValidationError::ConflictingReplicaConfiguration { replica_id, .. } = &error
+                && scale_up::recoverable_failover_conflict(snapshot, *replica_id)
+                && let Some(transition) = snapshot.status.transition.as_ref()
+            {
+                return scale_up::transition(snapshot, transition, config);
+            }
+            if config.enable_secondary_scale_down
+                && secondary_scale_down::active(snapshot)
+                && matches!(error, ValidationError::StaleReportSequence { .. })
+            {
+                return secondary_scale_down::wait(
+                    snapshot.status.clone(),
+                    "ScaleDownFreshReportRequired",
+                    "Re-observe a newer report in the exact process session",
+                    config,
+                );
+            }
+            if switchover.is_some() {
+                if matches!(error, ValidationError::StaleReportSequence { .. }) {
+                    return switchover_wait(
+                        snapshot.status.clone(),
+                        "SwitchoverFreshReportRequired",
+                        "Re-observe a strictly newer report in the current process session",
+                        config,
+                    );
+                }
+                return switchover_unsafe(snapshot, &error.to_string(), config);
+            }
+            let reason = if error == ValidationError::DesiredReplicasZero {
+                UnsafeReason::InvalidDesiredState(error.to_string())
+            } else {
+                UnsafeReason::InvalidAcceptedAuthority(error.to_string())
+            };
+            return unsafe_plan(snapshot.status.clone(), reason, config);
+        }
     }
 
     if let Some(plan) = incompatible_protocol_plan(snapshot, config) {
@@ -126,16 +143,6 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
                 config,
             );
         }
-        return plan;
-    }
-    if config.allow_scale_up
-        && let Some(plan) = scale_up_stale_accepted_correction(snapshot)
-    {
-        return plan;
-    }
-    if config.allow_scale_up
-        && let Some(plan) = scale_up_active_accepted_current_only(snapshot, config)
-    {
         return plan;
     }
     if let Some(plan) = invalid_agent_plan(snapshot, config) {
@@ -158,6 +165,31 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             ),
             requeue_after_seconds: config.wait_requeue_seconds,
         };
+    }
+    if config.allow_scale_up
+        && let Some(plan) = scale_up_accepted_correction(snapshot, config)
+    {
+        let accepted = snapshot
+            .status
+            .topology
+            .as_ref()
+            .map(|topology| &topology.configuration);
+        let accepted_primary_failed = accepted.is_some_and(|configuration| {
+            replica_failed(snapshot, &configuration_primary(configuration).identity)
+        });
+        if accepted_primary_failed {
+            if let Some(transition) = snapshot.status.transition.as_ref()
+                && (transition.scale_up.is_some() || transition.scale_up_failover.is_some())
+            {
+                return scale_up::transition(snapshot, transition, config);
+            }
+            if let Some(failover) =
+                maybe_begin_stable_failover(snapshot, snapshot.status.clone(), config)
+            {
+                return failover;
+            }
+        }
+        return plan;
     }
     if !snapshot.supporting_resources_ready {
         return Plan::Apply {
@@ -276,13 +308,12 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     evaluate_never_initialized(snapshot, config)
 }
 
-fn scale_up_stale_accepted_correction(snapshot: &ObservationSnapshot) -> Option<Plan> {
+fn scale_up_stale_correction_identity(snapshot: &ObservationSnapshot) -> Option<ReplicaIdentity> {
     if !scale_up_authority_active(snapshot) {
         return None;
     }
     let accepted = &snapshot.status.topology.as_ref()?.configuration;
-    let policy = snapshot.status.effective_policy.as_ref()?;
-    let (member, report, previous, operation_id) = accepted.members.iter().find_map(|member| {
+    accepted.members.iter().find_map(|member| {
         if member.role == ReplicaRole::Primary {
             return None;
         }
@@ -292,34 +323,51 @@ fn scale_up_stale_accepted_correction(snapshot: &ObservationSnapshot) -> Option<
                 AgentObservation::Report(report) => Some(report.as_ref()),
                 _ => None,
             })?;
-        let previous = report.current_configuration.as_ref()?;
         let operation_id = OperationId::new(format!(
             "scale-up-accepted-correction:{}:{}",
             accepted.configuration_id, member.identity.replica_id
         ));
-        (report.epoch < accepted.epoch
+        (report.identity == member.identity
+            && report.resource_uid == snapshot.resource_uid
+            && report.reported_fault != Some(crate::types::FaultType::Permanent)
+            && report.epoch < accepted.epoch
             && report
                 .pending_operation_id
                 .as_ref()
                 .is_none_or(|pending| pending == &operation_id))
-        .then_some((member, report, previous, operation_id))
-    })?;
-    Some(Plan::Execute {
-        command: ProtocolCommand::EnsureConfiguration(Box::new(failover_configuration_command(
-            previous,
-            accepted,
-            member,
-            policy,
-            operation_id,
-            Some(report.current_progress),
-            AccessStatus::ReconfigurationPending,
-            false,
-            Vec::new(),
-        ))),
+        .then_some(member.identity.clone())
     })
 }
 
-fn scale_up_active_accepted_current_only(
+fn validate_snapshot_around_stale_correction(
+    snapshot: &ObservationSnapshot,
+) -> Result<(), ValidationError> {
+    let identity = scale_up_stale_correction_identity(snapshot).ok_or(
+        ValidationError::InvalidScaleUp("stale correction is not exactly authorized"),
+    )?;
+    let report = snapshot
+        .observation_for_identity(&identity)
+        .and_then(|observation| match &observation.agent {
+            AgentObservation::Report(report) => Some(report.as_ref()),
+            _ => None,
+        })
+        .ok_or(ValidationError::InvalidScaleUp(
+            "stale correction report is unavailable",
+        ))?;
+    validate_report_internal(report)?;
+    let mut remaining = snapshot.clone();
+    remaining
+        .replicas
+        .get_mut(&crate::observation::ReplicaObservationKey::new(
+            identity.replica_id,
+            identity.instance_id,
+        ))
+        .expect("exact stale correction observation exists")
+        .agent = AgentObservation::Absent;
+    validate_snapshot(&remaining)
+}
+
+fn scale_up_accepted_correction(
     snapshot: &ObservationSnapshot,
     config: &EvaluationConfig,
 ) -> Option<Plan> {
@@ -328,57 +376,156 @@ fn scale_up_active_accepted_current_only(
     }
     let accepted = &snapshot.status.topology.as_ref()?.configuration;
     let policy = snapshot.status.effective_policy.as_ref()?;
-    let (member, report, previous, operation_id) = accepted.members.iter().find_map(|member| {
-        if member.role == ReplicaRole::Primary {
-            return None;
-        }
-        let report = snapshot
+    for member in accepted
+        .members
+        .iter()
+        .filter(|member| member.role != ReplicaRole::Primary)
+    {
+        let Some(report) = snapshot
             .observation_for_identity(&member.identity)
             .and_then(|observation| match &observation.agent {
                 AgentObservation::Report(report) => Some(report.as_ref()),
                 _ => None,
-            })?;
-        let previous = report.previous_configuration.as_ref()?;
-        let operation_id = OperationId::new(format!(
+            })
+        else {
+            continue;
+        };
+        let pc_cc_operation_id = OperationId::new(format!(
+            "scale-up-accepted-correction:{}:{}",
+            accepted.configuration_id, member.identity.replica_id
+        ));
+        let current_only_operation_id = OperationId::new(format!(
             "scale-up-accepted-current-only:{}:{}",
             accepted.configuration_id, member.identity.replica_id
         ));
-        (report.epoch == accepted.epoch
+        if let Some(pending) = &report.pending_operation_id {
+            let expected_stage = if pending == &pc_cc_operation_id {
+                Some(false)
+            } else if pending == &current_only_operation_id {
+                Some(true)
+            } else {
+                None
+            };
+            let Some(current_only) = expected_stage else {
+                if report
+                    .pending_configuration
+                    .as_deref()
+                    .is_some_and(|command| {
+                        command.operation_id == *pending && command.scale_up_evidence.is_some()
+                    })
+                {
+                    continue;
+                }
+                let correction_context = report.epoch < accepted.epoch
+                    || (report.epoch == accepted.epoch
+                        && report.current_configuration.as_ref() == Some(accepted)
+                        && report.scale_up_intent.is_none());
+                if correction_context {
+                    return Some(unsafe_plan(
+                        snapshot.status.clone(),
+                        UnsafeReason::ContradictoryReplicaEvidence(format!(
+                            "accepted member {} has unrelated pending configuration operation {}",
+                            member.identity.replica_id, pending
+                        )),
+                        config,
+                    ));
+                }
+                continue;
+            };
+            let Some(frozen) = report.pending_configuration.as_deref() else {
+                return Some(unsafe_plan(
+                    snapshot.status.clone(),
+                    UnsafeReason::ContradictoryReplicaEvidence(format!(
+                        "accepted member {} omitted its durable pending configuration",
+                        member.identity.replica_id
+                    )),
+                    config,
+                ));
+            };
+            let previous = if current_only {
+                accepted
+            } else {
+                let Some(previous) = frozen.previous_configuration.as_ref() else {
+                    return Some(unsafe_plan(
+                        snapshot.status.clone(),
+                        UnsafeReason::ContradictoryReplicaEvidence(
+                            "pending PC/CC correction omitted Previous Configuration".into(),
+                        ),
+                        config,
+                    ));
+                };
+                previous
+            };
+            let expected = failover_configuration_command(
+                previous,
+                accepted,
+                member,
+                policy,
+                pending.clone(),
+                Some(0),
+                AccessStatus::ReconfigurationPending,
+                current_only,
+                Vec::new(),
+            );
+            if frozen != &expected {
+                return Some(unsafe_plan(
+                    snapshot.status.clone(),
+                    UnsafeReason::ContradictoryReplicaEvidence(format!(
+                        "accepted member {} pending correction differs from frozen authority",
+                        member.identity.replica_id
+                    )),
+                    config,
+                ));
+            }
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(frozen.clone())),
+            });
+        }
+        if report.reported_fault != Some(crate::types::FaultType::Permanent)
+            && report.epoch < accepted.epoch
+            && let Some(previous) = report.current_configuration.as_ref()
+        {
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(
+                    failover_configuration_command(
+                        previous,
+                        accepted,
+                        member,
+                        policy,
+                        pc_cc_operation_id,
+                        Some(0),
+                        AccessStatus::ReconfigurationPending,
+                        false,
+                        Vec::new(),
+                    ),
+                )),
+            });
+        }
+        let Some(previous) = report.previous_configuration.as_ref() else {
+            continue;
+        };
+        if report.epoch == accepted.epoch
             && report.current_configuration.as_ref() == Some(accepted)
-            && report.scale_up_intent.is_none())
-        .then_some((member, report, previous, operation_id))
-    })?;
-    if report
-        .pending_operation_id
-        .as_ref()
-        .is_some_and(|pending| pending != &operation_id)
-    {
-        return Some(unsafe_plan(
-            snapshot.status.clone(),
-            UnsafeReason::ContradictoryReplicaEvidence(format!(
-                "accepted member {} has unrelated pending configuration operation {}",
-                member.identity.replica_id,
-                report
-                    .pending_operation_id
-                    .as_ref()
-                    .expect("checked pending operation")
-            )),
-            config,
-        ));
+            && report.scale_up_intent.is_none()
+        {
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(
+                    failover_configuration_command(
+                        previous,
+                        accepted,
+                        member,
+                        policy,
+                        current_only_operation_id,
+                        Some(0),
+                        AccessStatus::ReconfigurationPending,
+                        true,
+                        Vec::new(),
+                    ),
+                )),
+            });
+        }
     }
-    Some(Plan::Execute {
-        command: ProtocolCommand::EnsureConfiguration(Box::new(failover_configuration_command(
-            previous,
-            accepted,
-            member,
-            policy,
-            operation_id,
-            Some(report.current_progress),
-            AccessStatus::ReconfigurationPending,
-            true,
-            Vec::new(),
-        ))),
-    })
+    None
 }
 
 fn scale_up_authority_active(snapshot: &ObservationSnapshot) -> bool {

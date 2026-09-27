@@ -5,7 +5,9 @@ use kuberic_controller::cluster_api::{GrpcAgentApi, KubeClusterApi};
 use kuberic_controller::crd::{INSTANCE_LABEL, SCALE_UP_ALLOCATION_ANNOTATION};
 use kuberic_controller::executor::execute_plan;
 use kuberic_protocol::command::{KubernetesChange, SafetyChange, ScaleDownResource};
-use kuberic_protocol::types::{AccessStatus, Epoch, OperationId, TransitionKind};
+use kuberic_protocol::types::{
+    AccessStatus, ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, TransitionKind,
+};
 use std::collections::BTreeSet;
 
 fn enabled() -> EvaluationConfig {
@@ -321,6 +323,7 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
             report.catch_up_boundary = Some(boundary);
             report.catch_up_complete = true;
             report.pending_operation_id.clear();
+            report.pending_configuration = None;
             report.retained_operation_id = command.operation_id.to_string();
             report.scale_up_intent = command
                 .scale_up_evidence
@@ -1304,7 +1307,8 @@ async fn scale_up_accepted_member_correction_replays_exact_pending_and_fences_un
     report.previous_configuration = None;
     report.current_configuration = Some(starting.into());
     report.scale_up_intent = None;
-    report.pending_operation_id = correction_id.to_string();
+    report.pending_operation_id.clear();
+    report.pending_configuration = None;
     report.report_sequence += 1;
 
     let mut unrelated = stale.clone();
@@ -1357,6 +1361,30 @@ async fn scale_up_accepted_member_correction_replays_exact_pending_and_fences_un
     let correction = correction.expect("exact pending accepted-member correction replay");
     assert_eq!(correction.current_configuration, accepted);
     assert!(!correction.current_only);
+    assert_eq!(correction.failover_safe_lsn, Some(0));
+
+    let mut installed_pc_cc = api.observation().await;
+    let RawAgentObservation::Report(report) =
+        installed_pc_cc.agents.get_mut(&original_key).unwrap()
+    else {
+        unreachable!()
+    };
+    report.current_progress += 1;
+    report.pending_operation_id = correction.operation_id.to_string();
+    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+        (*correction).clone(),
+    ));
+    report.report_sequence += 1;
+    api.set_observation(installed_pc_cc).await;
+    let (kind, effects) = tick(&api).await;
+    assert_eq!(kind, ReconcileKind::Executed);
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(replayed))
+                if replayed == &correction
+        )
+    }));
 
     let current_only = loop {
         let raw = api.observe("tests", "db").await.unwrap();
@@ -1376,6 +1404,10 @@ async fn scale_up_accepted_member_correction_replays_exact_pending_and_fences_un
         unreachable!()
     };
     report.pending_operation_id = current_only.operation_id.to_string();
+    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+        (*current_only).clone(),
+    ));
+    report.current_progress += 1;
     report.report_sequence += 1;
     api.set_observation(pending).await;
     let (kind, effects) = tick(&api).await;
@@ -1388,6 +1420,233 @@ async fn scale_up_accepted_member_correction_replays_exact_pending_and_fences_un
         )
     }));
     finish(&api, 4).await;
+}
+
+#[tokio::test]
+async fn scale_up_receipt_allows_replacement_then_failover_to_return_ready() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    finish(&api, 3).await;
+    let completed = api.observation().await;
+    let receipt = completed
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.last_scale_up.as_ref())
+        .expect("completed scale-up receipt")
+        .clone();
+    let topology = &completed
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    let primary = topology
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    let replaced = topology
+        .members
+        .iter()
+        .find(|member| member.identity != primary)
+        .unwrap()
+        .identity
+        .clone();
+    let replaced_key =
+        ReplicaObservationKey::new(replaced.replica_id, replaced.instance_id.clone());
+    let RawAgentObservation::Report(report) = completed.agents.get(&replaced_key).unwrap() else {
+        panic!("accepted secondary report")
+    };
+    let mut superseded_report = report.clone();
+    let pod_name = completed
+        .pods
+        .iter()
+        .find(|pod| pod.uid().as_deref() == Some(replaced.instance_id.as_str()))
+        .map(ResourceExt::name_any)
+        .expect("accepted secondary Pod");
+    api.delete_exact_pod(
+        &completed,
+        &pod_name,
+        &PodUid::new(replaced.instance_id.as_str()),
+    )
+    .await
+    .unwrap();
+    finish(&api, 3).await;
+    let replacement_identity = api
+        .observation()
+        .await
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == replaced.replica_id)
+        .unwrap()
+        .identity
+        .clone();
+    assert_ne!(replacement_identity, replaced);
+
+    let mut failover_observed = api.observation().await;
+    let authority = &mut failover_observed.set.status.as_mut().unwrap().authority;
+    let replacement_configuration = authority.topology.as_ref().unwrap().configuration.clone();
+    let current_primary = replacement_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    let failover_primary = replacement_configuration
+        .members
+        .iter()
+        .find(|member| member.identity != current_primary)
+        .unwrap()
+        .identity
+        .clone();
+    let failover_configuration = ConfigurationDescriptor::new(
+        Epoch::new(
+            replacement_configuration.epoch.data_loss_number,
+            replacement_configuration.epoch.configuration_number + 1,
+        ),
+        failover_primary.replica_id,
+        replacement_configuration
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity == failover_primary {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        replacement_configuration.write_quorum,
+    );
+    authority.topology = Some(AcceptedTopology {
+        configuration: failover_configuration.clone(),
+    });
+    authority.primary_failure = None;
+    authority.transition = None;
+    authority.conditions.clear();
+    for member in &failover_configuration.members {
+        let key = ReplicaObservationKey::new(
+            member.identity.replica_id,
+            member.identity.instance_id.clone(),
+        );
+        let RawAgentObservation::Report(report) = failover_observed.agents.get_mut(&key).unwrap()
+        else {
+            panic!("accepted post-failover report")
+        };
+        report.role = match member.role {
+            ReplicaRole::Primary => proto::ReplicaRole::Primary as i32,
+            ReplicaRole::ActiveSecondary => proto::ReplicaRole::ActiveSecondary as i32,
+            ReplicaRole::IdleSecondary => proto::ReplicaRole::IdleSecondary as i32,
+            ReplicaRole::None => proto::ReplicaRole::None as i32,
+        };
+        report.epoch = Some(failover_configuration.epoch.into());
+        report.previous_configuration = None;
+        report.current_configuration = Some(failover_configuration.clone().into());
+        report.scale_up_intent = None;
+        report.pending_operation_id.clear();
+        report.pending_configuration = None;
+        report.read_status = proto::AccessStatus::Granted as i32;
+        report.write_status = if member.role == ReplicaRole::Primary {
+            proto::AccessStatus::Granted as i32
+        } else {
+            proto::AccessStatus::NotPrimary as i32
+        };
+        report.healthy = true;
+        report.reported_fault = proto::FaultType::Unknown as i32;
+        report.report_sequence += 1;
+    }
+    let mut failed_former_primary = failover_observed.clone();
+    let current_primary_key = ReplicaObservationKey::new(
+        current_primary.replica_id,
+        current_primary.instance_id.clone(),
+    );
+    failed_former_primary
+        .agents
+        .insert(current_primary_key, RawAgentObservation::Absent);
+    let failed_former_plan = evaluate(
+        &normalize(failed_former_primary, BTreeMap::new()).unwrap(),
+        &enabled(),
+    );
+    assert!(
+        !matches!(&failed_former_plan, Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpCommittedDegraded")),
+        "accepted failover former primary blocked replacement: {failed_former_plan:?}"
+    );
+    superseded_report.role = proto::ReplicaRole::ActiveSecondary as i32;
+    superseded_report.write_status = proto::AccessStatus::NotPrimary as i32;
+    superseded_report.healthy = false;
+    superseded_report.reported_fault = proto::FaultType::Permanent as i32;
+    superseded_report.pending_operation_id.clear();
+    superseded_report.pending_configuration = None;
+    failover_observed.agents.insert(
+        ReplicaObservationKey::new(replaced.replica_id, replaced.instance_id.clone()),
+        RawAgentObservation::Report(superseded_report),
+    );
+    if let Some(service) = failover_observed
+        .services
+        .iter_mut()
+        .find(|service| service.name_any().ends_with("-write"))
+    {
+        service.spec.get_or_insert_default().selector = Some(BTreeMap::from([(
+            INSTANCE_LABEL.to_string(),
+            failover_primary.instance_id.to_string(),
+        )]));
+    }
+    api.set_observation(failover_observed).await;
+    let mut final_status = None;
+    for _ in 0..20 {
+        let (kind, _) = tick(&api).await;
+        let observed = api.observation().await;
+        let authority = &observed.set.status.as_ref().unwrap().authority;
+        assert!(
+            authority
+                .conditions
+                .iter()
+                .all(|condition| { condition.reason != "ScaleUpCommittedDegraded" }),
+            "historical receipt blocked ordinary failover/replacement: {authority:?}"
+        );
+        if kind == ReconcileKind::Stable
+            && authority.topology.as_ref().is_some_and(|topology| {
+                topology.configuration.primary_id == failover_primary.replica_id
+            })
+        {
+            final_status = Some(observed);
+            break;
+        }
+    }
+    let final_status = final_status.expect("ordinary failover/replacement returned to Stable");
+    let authority = &final_status.set.status.as_ref().unwrap().authority;
+    assert_eq!(authority.last_scale_up.as_ref(), Some(&receipt));
+    assert_eq!(
+        normalize(final_status.clone(), BTreeMap::new())
+            .unwrap()
+            .routing
+            .write_target
+            .as_ref()
+            .map(|identity| identity.replica_id),
+        authority
+            .topology
+            .as_ref()
+            .map(|topology| topology.configuration.primary_id)
+    );
 }
 
 #[tokio::test]

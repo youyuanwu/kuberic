@@ -656,14 +656,30 @@ fn prior_receipt_settled(snapshot: &ObservationSnapshot, receipt: &ScaleUpReceip
         .as_ref()
         .map(|topology| &topology.configuration);
     receipt.accepted_configuration.members.iter().all(|member| {
+        let superseded = accepted.is_some_and(|configuration| {
+            configuration
+                .members
+                .iter()
+                .all(|accepted_member| accepted_member.identity != member.identity)
+        });
+        if superseded {
+            return true;
+        }
+        let retired_by_newer_authority = accepted.is_some_and(|configuration| {
+            configuration.epoch > receipt.accepted_configuration.epoch
+                && configuration.members.iter().any(|accepted_member| {
+                    accepted_member.identity == member.identity
+                        && accepted_member.role != ReplicaRole::Primary
+                })
+        });
         let Some(report) = report(snapshot, &member.identity) else {
-            return accepted.is_some_and(|configuration| {
-                configuration
-                    .members
-                    .iter()
-                    .all(|accepted_member| accepted_member.identity != member.identity)
-            });
+            return retired_by_newer_authority;
         };
+        if retired_by_newer_authority
+            && report.reported_fault == Some(crate::types::FaultType::Permanent)
+        {
+            return true;
+        }
         let accepted_newer = accepted.is_some_and(|configuration| {
             report.previous_configuration.is_none()
                 && report.current_configuration.as_ref() == Some(configuration)
@@ -948,6 +964,15 @@ pub(super) fn recover_local_acceptance(
             && (report.previous_configuration.is_some()
                 || report.current_configuration.as_ref() != Some(accepted))
         {
+            let retired_historical_consumer = accepted.epoch > receipt.accepted_configuration.epoch
+                && accepted_member
+                    .is_some_and(|accepted_member| accepted_member.role != ReplicaRole::Primary);
+            if retired_historical_consumer {
+                // Newer accepted authority has already retired this member's
+                // historical receipt obligation. Let ordinary accepted-authority
+                // correction repair a reachable stale retained incarnation.
+                return None;
+            }
             return Some(wait(
                 snapshot,
                 snapshot.status.clone(),

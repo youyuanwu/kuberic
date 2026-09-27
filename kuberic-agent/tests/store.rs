@@ -9,8 +9,7 @@ use kuberic_agent::provisioning::{
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, CoordinatorStage, ReconfigurationRecord, SCHEMA_VERSION};
 use kuberic_agent::state::{EffectStage, PendingEffect, RetainedResult};
-use kuberic_agent::store::AgentStore;
-use kuberic_agent::store::BeginEffect;
+use kuberic_agent::store::{AgentStore, BeginConfiguration, BeginEffect};
 use kuberic_protocol::command::AcceptSecondaryRemovalCommit;
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore};
 use kuberic_protocol::types::{AccessStatus, SecondaryRemovalStage};
@@ -995,6 +994,113 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
             .prepared_switchover
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejects_mutation() {
+    let directory = tempdir().unwrap();
+    let (initialize, observed, transition) = bootstrap_fixture();
+    let storage_identity = authorize_initialization(
+        &initialize,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let previous = initialize.bootstrap_configuration.clone();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        previous.primary_id,
+        previous.members.clone(),
+        previous.write_quorum,
+    );
+    let pc_cc = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
+        scale_up_evidence: None,
+        operation_id: OperationId::new("accepted-correction-pc-cc"),
+        previous_configuration: Some(previous.clone()),
+        current_configuration: current.clone(),
+        previous_epoch: Some(previous.epoch),
+        current_epoch: current.epoch,
+        effective_policy: storage_identity.effective_policy.clone(),
+        local_replica_id: storage_identity.local_identity.replica_id,
+        expected_instance_id: storage_identity.local_identity.instance_id.clone(),
+        expected_agent_generation: storage_identity.local_identity.agent_generation.clone(),
+        transition_kind: TransitionKind::Failover,
+        failover_safe_lsn: Some(0),
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    let store = SqliteStore::create_authorized(
+        SqliteStore::metadata_database_path(directory.path()),
+        AgentState::new(storage_identity.clone()),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.begin_configuration(&pc_cc).await.unwrap(),
+        BeginConfiguration::Execute(_)
+    ));
+    store
+        .admit(&AdmittedAuthority {
+            local_identity: storage_identity.local_identity.clone(),
+            transition_kind: Some(TransitionKind::Failover),
+            previous_configuration: Some(previous),
+            current_configuration: current.clone(),
+            switchover_handoff: None,
+            secondary_removal: None,
+            scale_up: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.begin_configuration(&pc_cc).await.unwrap(),
+        BeginConfiguration::Pending(record) if record.command == pc_cc
+    ));
+    let mut mutated = pc_cc.clone();
+    mutated.failover_safe_lsn = Some(1);
+    assert!(matches!(
+        store.begin_configuration(&mutated).await,
+        Err(AgentError::EffectConflict(_))
+    ));
+
+    let current_only = EnsureConfiguration {
+        operation_id: OperationId::new("accepted-correction-current-only"),
+        previous_configuration: None,
+        previous_epoch: None,
+        current_only: true,
+        ..pc_cc
+    };
+    let mut installed = AgentState::new(storage_identity);
+    installed.highest_epoch = current.epoch;
+    installed.current_configuration = Some(current);
+    installed.role = ReplicaRole::Primary;
+    installed.reconfiguration = Some(ReconfigurationRecord {
+        command: current_only.clone(),
+        stage: CoordinatorStage::Activate,
+        observed_lsn: Some(12),
+    });
+    fs::create_dir(directory.path().join("current-only")).unwrap();
+    let current_only_store = SqliteStore::create_authorized(
+        SqliteStore::metadata_database_path(&directory.path().join("current-only")),
+        installed,
+    )
+    .unwrap();
+    assert!(matches!(
+        current_only_store
+            .begin_configuration(&current_only)
+            .await
+            .unwrap(),
+        BeginConfiguration::Pending(record) if record.command == current_only
+    ));
+    let mut mutated = current_only.clone();
+    mutated.failover_safe_lsn = Some(2);
+    assert!(matches!(
+        current_only_store.begin_configuration(&mutated).await,
+        Err(AgentError::EffectConflict(_))
+    ));
 }
 
 #[tokio::test]

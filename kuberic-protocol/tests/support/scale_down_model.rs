@@ -558,6 +558,7 @@ impl Model {
                         }
                         r.current_configuration = Some(c.current_configuration);
                         r.pending_operation_id = None;
+                        r.pending_configuration = None;
                         r.retained_operation_id = Some(c.operation_id);
                         r.catch_up_complete = true;
                         r.builds
@@ -614,6 +615,7 @@ impl Model {
                         r.prepared_secondary_removal = None;
                         r.accepted_secondary_removal = Some(c.committed);
                         r.pending_operation_id = None;
+                        r.pending_configuration = None;
                     }
                     ProtocolCommand::RetireReplica(c) => {
                         assert!(self.snapshot.status.transition.is_none());
@@ -631,6 +633,7 @@ impl Model {
                         r.verified_replication_lsn = None;
                         r.previous_configuration = None;
                         r.pending_operation_id = None;
+                        r.pending_configuration = None;
                         r.retained_operation_id = Some(c.operation_id);
                         r.prepared_secondary_removal = None;
                         r.secondary_removal_evidence = None;

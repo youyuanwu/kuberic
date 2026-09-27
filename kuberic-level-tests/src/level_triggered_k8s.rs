@@ -4827,6 +4827,12 @@ fn scale_up_retry_classifiers_propagate_unknown_failures() {
 
     for transient in [
         anyhow::Error::new(ControllerError::ObservationStale),
+        anyhow::Error::new(ControllerError::TransientObservation(
+            "HTTP 429 Too Many Requests".into(),
+        )),
+        anyhow::Error::new(ControllerError::TransientObservation(
+            "HTTP 503 Service Unavailable".into(),
+        )),
         anyhow::Error::new(ControllerError::AgentUnavailable("restart".into())),
         anyhow::Error::new(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
     ] {
@@ -4835,9 +4841,35 @@ fn scale_up_retry_classifiers_propagate_unknown_failures() {
     for permanent in [
         anyhow::Error::new(ControllerError::InvalidAgentEvidence("bad protocol".into())),
         anyhow::Error::new(ControllerError::Effect("rejected".into())),
+        anyhow::Error::new(ControllerError::Observation(
+            "ApiError: Forbidden (ErrorResponse { code: 403 })".into(),
+        )),
+        anyhow::Error::new(ControllerError::Observation("KubericSet has no UID".into())),
+        anyhow::Error::new(ControllerError::Observation(
+            "invalid Kubernetes object".into(),
+        )),
         anyhow::anyhow!("unknown live-step failure"),
     ] {
         assert!(!transient_live_step_error(&permanent), "{permanent:#}");
+    }
+    for (code, transient) in [
+        (403, false),
+        (404, false),
+        (422, false),
+        (429, true),
+        (500, true),
+        (503, true),
+    ] {
+        let error = anyhow::Error::new(kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            message: format!("HTTP {code}"),
+            ..Default::default()
+        })));
+        assert_eq!(
+            transient_live_step_error(&error),
+            transient,
+            "HTTP {code} observation classification"
+        );
     }
 
     assert!(
@@ -4926,7 +4958,7 @@ fn transient_live_step_error(error: &anyhow::Error) -> bool {
         if let Some(controller) = cause.downcast_ref::<kuberic_controller::ControllerError>() {
             return matches!(
                 controller,
-                kuberic_controller::ControllerError::Observation(_)
+                kuberic_controller::ControllerError::TransientObservation(_)
                     | kuberic_controller::ControllerError::ObservationStale
                     | kuberic_controller::ControllerError::AgentUnavailable(_)
             );
@@ -5870,6 +5902,80 @@ fn scale_up_post_admission_recovery_and_replacement(
     verify_acknowledged(cluster, &replaced, &acknowledged, deadline)?;
     eprintln!(
         "scale-up separate post-completion member replacement PASS: primary={new_primary_id}"
+    );
+
+    let replacement_primary =
+        topology_primary_id(&replaced).context("replacement topology primary")?;
+    let failover_started = Instant::now();
+    let failed_primary =
+        suspend_replica_process(&cluster.kubeconfig, &cluster.context, replacement_primary)?;
+    let failed_over = loop {
+        let status = cluster.status()?;
+        if status_ready(&status)
+            && topology_primary_id(&status).is_some_and(|primary| primary != replacement_primary)
+        {
+            break status;
+        }
+        poll(
+            deadline,
+            "Ready after scale-up, accepted replacement, and ordinary primary failover",
+        )?;
+    };
+    let failover_primary =
+        topology_primary_id(&failed_over).context("post-replacement failover primary")?;
+    let routed: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        "kvstore2-write",
+        "-o",
+        "json",
+    ])?)?;
+    validate_routed_service(&routed, exact_member(&failed_over, failover_primary)?)?;
+    drop(failed_primary);
+    loop {
+        if replica_diagnostics(&cluster.kubeconfig, &cluster.context, replacement_primary).is_ok() {
+            break;
+        }
+        poll(
+            deadline,
+            "former primary process resumed after readiness proof",
+        )?;
+    }
+    let recovered = scale_ready(cluster, 3, deadline)?;
+    let recovered_primary =
+        topology_primary_id(&recovered).context("recovered post-failover primary")?;
+    let recovered_member = exact_member(&recovered, recovered_primary)?;
+    let routed: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "default",
+        "get",
+        "service",
+        "kvstore2-write",
+        "-o",
+        "json",
+    ])?)?;
+    validate_routed_service(&routed, recovered_member)?;
+    write_routed(
+        cluster,
+        recovered_member,
+        &mut acknowledged,
+        "after-scale-up-replacement-failover",
+        deadline,
+    )?;
+    ensure!(
+        recovered["status"]["lastScaleUp"]["intent"]["operationId"].as_str()
+            == Some(intent.operation_id.as_str()),
+        "historical scale-up receipt was erased after replacement/failover: {}",
+        recovered["status"]
+    );
+    verify_acknowledged(cluster, &recovered, &acknowledged, deadline)?;
+    eprintln!(
+        "scale-up -> accepted replacement -> ordinary failover readiness PASS: primary \
+         {replacement_primary}->{failover_primary}, recovered_primary={recovered_primary}, \
+         ready_ms={}",
+        failover_started.elapsed().as_millis()
     );
     Ok(acknowledged)
 }

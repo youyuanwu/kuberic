@@ -92,6 +92,8 @@ pub struct AgentReport {
     #[serde(default)]
     pub pending_operation_id: Option<OperationId>,
     #[serde(default)]
+    pub pending_configuration: Option<Box<crate::command::EnsureConfiguration>>,
+    #[serde(default)]
     pub retained_operation_id: Option<OperationId>,
     #[serde(default)]
     pub builds: Vec<AgentBuildReport>,
@@ -157,6 +159,7 @@ impl Default for AgentReport {
             load_metrics: Vec::new(),
             reported_fault: None,
             pending_operation_id: None,
+            pending_configuration: None,
             retained_operation_id: None,
             builds: Vec::new(),
             prepared_switchover: None,

@@ -326,10 +326,7 @@ where
     }
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation> {
         let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), namespace);
-        let set = sets
-            .get(name)
-            .await
-            .map_err(|error| ControllerError::Observation(error.to_string()))?;
+        let set = sets.get(name).await.map_err(map_kube_observation_error)?;
         let uid = set
             .uid()
             .ok_or_else(|| ControllerError::Observation("KubericSet has no UID".to_string()))?;
@@ -1813,6 +1810,19 @@ fn map_kube_effect_error(error: kube::Error) -> ControllerError {
     }
 }
 
+fn map_kube_observation_error(error: kube::Error) -> ControllerError {
+    let transient = match &error {
+        kube::Error::Api(response) => response.code == 429 || response.code >= 500,
+        kube::Error::HyperError(_) | kube::Error::Service(_) | kube::Error::ReadEvents(_) => true,
+        _ => false,
+    };
+    if transient {
+        ControllerError::TransientObservation(error.to_string())
+    } else {
+        ControllerError::Observation(error.to_string())
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn exact_pod_precondition_failures_require_reobservation() {
@@ -1827,6 +1837,41 @@ fn exact_pod_precondition_failures_require_reobservation() {
             map_kube_effect_error(error),
             ControllerError::ObservationStale
         ));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn observation_http_errors_preserve_permanent_and_transient_classification() {
+    for code in [400, 401, 403, 404, 422] {
+        let error = kube::Error::Api(Box::new(kube::core::Status {
+            message: "permanent observation failure".into(),
+            reason: "Permanent".into(),
+            code,
+            ..Default::default()
+        }));
+        assert!(
+            matches!(
+                map_kube_observation_error(error),
+                ControllerError::Observation(_)
+            ),
+            "HTTP {code} must fail immediately"
+        );
+    }
+    for code in [429, 500, 502, 503, 504] {
+        let error = kube::Error::Api(Box::new(kube::core::Status {
+            message: "transient observation failure".into(),
+            reason: "Transient".into(),
+            code,
+            ..Default::default()
+        }));
+        assert!(
+            matches!(
+                map_kube_observation_error(error),
+                ControllerError::TransientObservation(_)
+            ),
+            "HTTP {code} must remain retryable"
+        );
     }
 }
 

@@ -531,6 +531,21 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
 pub fn validate_report_internal(
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
+    if report
+        .pending_configuration
+        .as_ref()
+        .is_some_and(|command| {
+            report.pending_operation_id.as_ref() != Some(&command.operation_id)
+                || command.local_replica_id != report.identity.replica_id
+                || command.expected_instance_id != report.identity.instance_id
+                || command.expected_agent_generation != report.identity.agent_generation
+        })
+        || (report.pending_operation_id.is_none() && report.pending_configuration.is_some())
+    {
+        return Err(ValidationError::InvalidReplicaReportAuthority(
+            report.identity.replica_id.value(),
+        ));
+    }
     validate_secondary_removal_report(report)?;
     if report.scale_up_intent.is_some() && report.secondary_removal_evidence.is_some() {
         return Err(ValidationError::InvalidScaleUp(
