@@ -59,13 +59,14 @@ struct Config {
         default_value = "0.0.0.0:8080"
     )]
     application_address: SocketAddr,
+    #[arg(long, env = "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS")]
+    live_test_copy_gate_address: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
 struct HttpState {
     application: Arc<KvService>,
     replica: ReplicaHandle,
-    copy_gate: CopyGate,
 }
 
 #[tokio::main]
@@ -82,7 +83,10 @@ async fn main() -> Result<()> {
         ApplicationStorageState::Established
     };
     let persistence = Arc::new(KvPersistence::open(application_path)?);
-    let copy_gate = CopyGate::new(config.data_root.join(".live-test-copy-gate"));
+    let copy_gate = match config.live_test_copy_gate_address {
+        Some(_) => CopyGate::enabled(config.data_root.join(".live-test-copy-gate"))?,
+        None => CopyGate::disabled(),
+    };
     let application = Arc::new(KvService::new(
         persistence,
         format!("http://{}:50052", config.pod_ip),
@@ -114,23 +118,31 @@ async fn main() -> Result<()> {
     let http_state = HttpState {
         application,
         replica: replica.handle(),
-        copy_gate,
     };
-    let router = Router::new()
-        .route("/kv/{key}", put(put_value).get(get_value))
-        .route("/status", get(get_status))
-        .route("/live-test/copy-gate/{action}", put(set_copy_gate))
-        .with_state(http_state);
+    let router = application_router(http_state);
     let listener = tokio::net::TcpListener::bind(config.application_address).await?;
     let mut http_task = tokio::spawn(
         axum::serve(listener, router)
             .with_graceful_shutdown(wait_shutdown(shutdown_rx.clone()))
             .into_future(),
     );
+    let live_test_address = config.live_test_copy_gate_address;
+    let live_test_router = copy_gate_router(live_test_address.map(|_| copy_gate));
+    let mut live_test_task = tokio::spawn(async move {
+        if let Some(address) = live_test_address {
+            let listener = tokio::net::TcpListener::bind(address).await?;
+            axum::serve(listener, live_test_router)
+                .with_graceful_shutdown(wait_shutdown(shutdown_rx))
+                .await
+        } else {
+            futures::future::pending::<std::io::Result<()>>().await
+        }
+    });
 
     tokio::select! {
         result = replica.wait() => result?,
         result = &mut http_task => result??,
+        result = &mut live_test_task => result??,
         result = tokio::signal::ctrl_c() => result?,
     }
 
@@ -138,13 +150,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn application_router(state: HttpState) -> Router {
+    Router::new()
+        .route("/kv/{key}", put(put_value).get(get_value))
+        .route("/status", get(get_status))
+        .with_state(state)
+}
+
+fn copy_gate_router(copy_gate: Option<CopyGate>) -> Router {
+    match copy_gate {
+        Some(copy_gate) => Router::new()
+            .route("/live-test/copy-gate/{action}", put(set_copy_gate))
+            .with_state(copy_gate),
+        None => Router::new(),
+    }
+}
+
 async fn set_copy_gate(
-    State(state): State<HttpState>,
+    State(copy_gate): State<CopyGate>,
     Path(action): Path<String>,
 ) -> std::result::Result<&'static str, (StatusCode, String)> {
     match action.as_str() {
-        "hold" => state.copy_gate.hold().map(|()| "held"),
-        "release" => state.copy_gate.release().map(|()| "released"),
+        "hold" => copy_gate.hold().map(|()| "held"),
+        "release" => copy_gate.release().map(|()| "released"),
         _ => return Err((StatusCode::BAD_REQUEST, "unknown copy-gate action".into())),
     }
     .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
@@ -205,6 +233,12 @@ async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use crate::state::CopyGate;
+
     #[test]
     fn diagnostics_distinguish_terminal_retirement_from_closed_access() {
         for retired in [false, true] {
@@ -266,5 +300,45 @@ mod tests {
             );
         }
         assert!(production.contains("ReplicaHost::new"));
+    }
+
+    #[tokio::test]
+    async fn default_router_does_not_register_live_test_copy_gate() {
+        let response = super::copy_gate_router(None)
+            .oneshot(
+                Request::put("/live-test/copy-gate/hold")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn explicitly_enabled_live_test_router_arms_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let gate = CopyGate::enabled(directory.path().join("copy-gate")).unwrap();
+        let response = super::copy_gate_router(Some(gate.clone()))
+            .oneshot(
+                Request::put("/live-test/copy-gate/hold")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(gate.is_held());
+        gate.release().unwrap();
+    }
+
+    #[test]
+    fn default_manifest_neither_enables_nor_routes_live_test_gate() {
+        let sample = include_str!("../deploy/sample.yaml");
+        let service = include_str!("../deploy/service.yaml");
+        assert!(!sample.contains("testing.kuberic.io/live-copy-gate"));
+        assert!(!sample.contains("KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS"));
+        assert!(service.contains("targetPort: 8080"));
+        assert!(!service.contains("18080"));
     }
 }

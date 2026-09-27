@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -615,6 +616,16 @@ struct DirectClient {
 
 impl DirectClient {
     fn connect(cluster: &SwitchoverCluster, pod: &str, deadline: Instant) -> Result<Self> {
+        Self::connect_port(cluster, pod, 8080, deadline)
+    }
+
+    fn connect_port(
+        cluster: &SwitchoverCluster,
+        pod: &str,
+        remote_port: u16,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let port_mapping = format!(":{remote_port}");
         let mut forward = OwnedChild(
             Command::new("kubectl")
                 .args([
@@ -623,14 +634,8 @@ impl DirectClient {
                     "--context",
                     &cluster.context,
                 ])
-                .args([
-                    "-n",
-                    "default",
-                    "port-forward",
-                    "--address=127.0.0.1",
-                    pod,
-                    ":8080",
-                ])
+                .args(["-n", "default", "port-forward", "--address=127.0.0.1", pod])
+                .arg(port_mapping)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()?,
@@ -2298,7 +2303,11 @@ fn reset_scale_set_with_delay(
     }
     let object = json!({
         "apiVersion":"operator.kuberic.io/v1alpha1", "kind":"KubericSet",
-        "metadata":{"name":"kvstore2","namespace":"default"},
+        "metadata":{
+            "name":"kvstore2",
+            "namespace":"default",
+            "annotations":{"testing.kuberic.io/live-copy-gate":"enabled"}
+        },
         "spec":{"replicas":count,"image":"localhost/kvstore2:level-triggered-v1",
             "failoverDelaySeconds":failover_delay_seconds}
     });
@@ -4131,38 +4140,112 @@ fn active_copy_reconstruction_checkpoint(
 }
 
 struct LiveCopyGate {
+    cleanup: GateCleanupOwner<LiveCopyGateCleanup>,
+}
+
+trait CopyGateCleanup {
+    fn cleanup(&mut self) -> Result<()>;
+}
+
+struct GateCleanupOwner<C: CopyGateCleanup> {
+    cleanup: C,
+    armed: bool,
+}
+
+impl<C: CopyGateCleanup> GateCleanupOwner<C> {
+    fn release(&mut self) -> Result<()> {
+        if self.armed {
+            self.cleanup.cleanup()?;
+            self.armed = false;
+        }
+        Ok(())
+    }
+}
+
+impl<C: CopyGateCleanup> Drop for GateCleanupOwner<C> {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn arm_with_cleanup<C: CopyGateCleanup>(
+    cleanup: C,
+    arm: impl FnOnce() -> Result<()>,
+) -> Result<GateCleanupOwner<C>> {
+    let owner = GateCleanupOwner {
+        cleanup,
+        armed: true,
+    };
+    arm()?;
+    Ok(owner)
+}
+
+#[cfg(test)]
+struct FileCopyGateCleanup {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl CopyGateCleanup for FileCopyGateCleanup {
+    fn cleanup(&mut self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[test]
+fn lost_copy_gate_hold_response_still_runs_preowned_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("copy-gate");
+    let result = arm_with_cleanup(
+        FileCopyGateCleanup { path: path.clone() },
+        || -> Result<()> {
+            std::fs::write(&path, b"armed")?;
+            anyhow::bail!("simulated lost hold response")
+        },
+    );
+    assert!(result.is_err());
+    assert!(!path.exists());
+}
+
+struct LiveCopyGateCleanup {
     cluster: SwitchoverCluster,
     source: Value,
     deadline: Instant,
-    held: bool,
 }
 
-impl LiveCopyGate {
-    fn hold(cluster: &SwitchoverCluster, source: &Value, deadline: Instant) -> Result<Self> {
-        let mut client = DirectClient::connect(cluster, &cluster.pod(source)?, deadline)?;
-        let (code, body) = client.request("PUT", "/live-test/copy-gate/hold", "")?;
-        ensure!(
-            code == 200 && body == "held",
-            "copy gate hold failed: HTTP {code} {body}"
-        );
-        Ok(Self {
-            cluster: cluster.clone(),
-            source: source.clone(),
-            deadline,
-            held: true,
-        })
+impl LiveCopyGateCleanup {
+    fn pod(&self) -> Result<String> {
+        self.cluster.pod(&self.source)
     }
 
-    fn release(&mut self) -> Result<()> {
-        if !self.held {
-            return Ok(());
-        }
+    fn sentinel_absent(&self) -> Result<()> {
+        let pod = self.pod()?;
+        self.cluster
+            .kubectl(&[
+                "-n",
+                "default",
+                "exec",
+                &pod,
+                "--",
+                "test",
+                "!",
+                "-e",
+                "/var/lib/kuberic/.live-test-copy-gate",
+            ])
+            .context("live-test copy gate sentinel remained present")?;
+        Ok(())
+    }
+}
+
+impl CopyGateCleanup for LiveCopyGateCleanup {
+    fn cleanup(&mut self) -> Result<()> {
+        let pod = self.pod()?;
         let release = (|| {
-            let mut client = DirectClient::connect(
-                &self.cluster,
-                &self.cluster.pod(&self.source)?,
-                self.deadline,
-            )?;
+            let mut client = DirectClient::connect_port(&self.cluster, &pod, 18080, self.deadline)?;
             let (code, body) = client.request("PUT", "/live-test/copy-gate/release", "")?;
             ensure!(
                 code == 200 && body == "released",
@@ -4171,7 +4254,6 @@ impl LiveCopyGate {
             Ok(())
         })();
         if let Err(http_error) = release {
-            let pod = self.cluster.pod(&self.source)?;
             self.cluster
                 .kubectl(&[
                     "-n",
@@ -4185,14 +4267,32 @@ impl LiveCopyGate {
                 ])
                 .with_context(|| format!("copy gate HTTP release also failed: {http_error:#}"))?;
         }
-        self.held = false;
-        Ok(())
+        self.sentinel_absent()
     }
 }
 
-impl Drop for LiveCopyGate {
-    fn drop(&mut self) {
-        let _ = self.release();
+impl LiveCopyGate {
+    fn hold(cluster: &SwitchoverCluster, source: &Value, deadline: Instant) -> Result<Self> {
+        let pod = cluster.pod(source)?;
+        let cleanup = LiveCopyGateCleanup {
+            cluster: cluster.clone(),
+            source: source.clone(),
+            deadline,
+        };
+        let owner = arm_with_cleanup(cleanup, || {
+            let mut client = DirectClient::connect_port(cluster, &pod, 18080, deadline)?;
+            let (code, body) = client.request("PUT", "/live-test/copy-gate/hold", "")?;
+            ensure!(
+                code == 200 && body == "held",
+                "copy gate hold failed: HTTP {code} {body}"
+            );
+            Ok(())
+        })?;
+        Ok(Self { cleanup: owner })
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.cleanup.release()
     }
 }
 

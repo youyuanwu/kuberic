@@ -39,6 +39,8 @@ use crate::{ControllerError, Result};
 
 const CONTROL_PORT: i32 = 50051;
 const REPLICATION_PORT: i32 = 50052;
+const LIVE_TEST_COPY_GATE_ANNOTATION: &str = "testing.kuberic.io/live-copy-gate";
+const LIVE_TEST_COPY_GATE_ADDRESS: &str = "0.0.0.0:18080";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
@@ -1258,6 +1260,89 @@ fn replica_pod_named(
         )])
     });
     let credential_name = agent_credential_name(set);
+    let mut env = vec![
+        EnvVar {
+            name: "KUBERIC_RESOURCE_UID".to_string(),
+            value: Some(uid.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_REPLICA_ID".to_string(),
+            value: Some(replica_id.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_PVC_UID".to_string(),
+            value: Some(pvc_uid.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_SET_NAME".to_string(),
+            value: Some(set.name_any()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_NAMESPACE".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_string()),
+                    field_path: "metadata.namespace".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_POD_UID".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_string()),
+                    field_path: "metadata.uid".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_POD_IP".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_string()),
+                    field_path: "status.podIP".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_AGENT_BEARER_TOKEN".to_string(),
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    key: "bearer-token".to_string(),
+                    name: credential_name,
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "KUBERIC_DATA_ROOT".to_string(),
+            value: Some("/var/lib/kuberic".to_string()),
+            ..Default::default()
+        },
+    ];
+    if set
+        .annotations()
+        .get(LIVE_TEST_COPY_GATE_ANNOTATION)
+        .is_some_and(|value| value == "enabled")
+    {
+        env.push(EnvVar {
+            name: "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS".to_string(),
+            value: Some(LIVE_TEST_COPY_GATE_ADDRESS.to_string()),
+            ..Default::default()
+        });
+    }
     Pod {
         metadata: kube::core::ObjectMeta {
             name: Some(pod_name.to_string()),
@@ -1296,78 +1381,7 @@ fn replica_pod_named(
                         ..Default::default()
                     },
                 ]),
-                env: Some(vec![
-                    EnvVar {
-                        name: "KUBERIC_RESOURCE_UID".to_string(),
-                        value: Some(uid.to_string()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_REPLICA_ID".to_string(),
-                        value: Some(replica_id.to_string()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_PVC_UID".to_string(),
-                        value: Some(pvc_uid.to_string()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_SET_NAME".to_string(),
-                        value: Some(set.name_any()),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_NAMESPACE".to_string(),
-                        value_from: Some(EnvVarSource {
-                            field_ref: Some(ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "metadata.namespace".to_string(),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_POD_UID".to_string(),
-                        value_from: Some(EnvVarSource {
-                            field_ref: Some(ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "metadata.uid".to_string(),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_POD_IP".to_string(),
-                        value_from: Some(EnvVarSource {
-                            field_ref: Some(ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "status.podIP".to_string(),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_AGENT_BEARER_TOKEN".to_string(),
-                        value_from: Some(EnvVarSource {
-                            secret_key_ref: Some(SecretKeySelector {
-                                key: "bearer-token".to_string(),
-                                name: credential_name,
-                                optional: Some(false),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    EnvVar {
-                        name: "KUBERIC_DATA_ROOT".to_string(),
-                        value: Some("/var/lib/kuberic".to_string()),
-                        ..Default::default()
-                    },
-                ]),
+                env: Some(env),
                 volume_mounts: Some(vec![VolumeMount {
                     mount_path: "/var/lib/kuberic".to_string(),
                     name: "data".to_string(),
@@ -3231,6 +3245,35 @@ mod tests {
         }
     }
 
+    fn replica_environment(set: &KubericSet) -> Vec<EnvVar> {
+        let owner = OwnerReference {
+            api_version: "operator.kuberic.io/v1alpha1".to_string(),
+            kind: "KubericSet".to_string(),
+            name: set.name_any(),
+            uid: "set-uid".to_string(),
+            block_owner_deletion: None,
+            controller: Some(true),
+        };
+        replica_pod(
+            set,
+            ReplicaId::new(1),
+            "set-uid",
+            &owner,
+            "kvstore2-1-data",
+            "pvc-uid",
+            "kvstore2:test",
+            None,
+        )
+        .spec
+        .unwrap()
+        .containers
+        .into_iter()
+        .find(|container| container.name == "application")
+        .unwrap()
+        .env
+        .unwrap()
+    }
+
     async fn http_response(
         status: u16,
         body: serde_json::Value,
@@ -3596,5 +3639,48 @@ mod tests {
             .unwrap();
             assert_eq!(request.expected_process_session_id, "session-current");
         }
+    }
+
+    #[test]
+    fn default_replica_pod_does_not_enable_live_test_copy_gate() {
+        let set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                switchover: None,
+            },
+        );
+        assert!(
+            replica_environment(&set)
+                .iter()
+                .all(|variable| variable.name != "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS")
+        );
+    }
+
+    #[test]
+    fn owned_live_test_annotation_enables_fixed_diagnostic_address() {
+        let mut set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                switchover: None,
+            },
+        );
+        set.metadata.annotations = Some(BTreeMap::from([(
+            LIVE_TEST_COPY_GATE_ANNOTATION.to_string(),
+            "enabled".to_string(),
+        )]));
+        let environment = replica_environment(&set);
+        assert_eq!(
+            environment
+                .iter()
+                .find(|variable| variable.name == "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS")
+                .and_then(|variable| variable.value.as_deref()),
+            Some(LIVE_TEST_COPY_GATE_ADDRESS)
+        );
     }
 }

@@ -133,8 +133,9 @@ level-triggered-install: verify-kind-context
         controller=localhost/kuberic-controller:level-triggered-v1
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n kuberic-system rollout status deployment/kuberic-controller --timeout=180s
-    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        apply -f examples/kvstore2/deploy/sample.yaml
+    awk '1; /^metadata:$/ { print "  annotations:"; print "    testing.kuberic.io/live-copy-gate: enabled" }' \
+        examples/kvstore2/deploy/sample.yaml | \
+        kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" apply -f -
 
 # Run one or more explicit isolated level-triggered KinD scenarios.
 level-triggered-kind-test *scenarios: verify-kind-context
