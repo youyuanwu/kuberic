@@ -7691,6 +7691,124 @@ fn scale_up_primary_loss_before_and_after_pc_cc_follow_distinct_paths() {
 }
 
 #[test]
+fn scale_up_retry_corrects_late_stale_failover_member_before_pc_cc() {
+    use scale_up_model::Model;
+
+    let mut seed = Model::new(3, 4);
+    let stale_configuration = seed
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let members = stale_configuration
+        .members
+        .iter()
+        .map(|member| ConfigurationMember {
+            identity: member.identity.clone(),
+            role: if member.identity.replica_id == ReplicaId::new(2) {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            },
+        })
+        .collect::<Vec<_>>();
+    let accepted = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        ReplicaId::new(2),
+        members,
+        stale_configuration.write_quorum,
+    );
+    seed.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: accepted.clone(),
+    });
+    for observation in seed.snapshot.replicas.values_mut() {
+        let AgentObservation::Report(report) = &mut observation.agent else {
+            continue;
+        };
+        let member = accepted
+            .members
+            .iter()
+            .find(|member| member.identity == report.identity)
+            .unwrap();
+        report.role = member.role;
+        report.epoch = accepted.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(accepted.clone());
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+    }
+    seed.snapshot.routing.write_target = Some(
+        accepted
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .unwrap()
+            .identity
+            .clone(),
+    );
+    let mut model = Model::from_snapshot(seed.snapshot, vec![3]);
+    for _ in 0..100 {
+        if model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+        {
+            break;
+        }
+        model.step();
+    }
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+    );
+
+    let stale = model.report_mut(1);
+    stale.role = ReplicaRole::Primary;
+    stale.epoch = stale_configuration.epoch;
+    stale.previous_configuration = None;
+    stale.current_configuration = Some(stale_configuration);
+    stale.write_status = AccessStatus::Granted;
+    stale.pending_operation_id = None;
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = model.plan()
+    else {
+        panic!("late stale retained member must receive accepted failover correction")
+    };
+    assert_eq!(command.local_replica_id, ReplicaId::new(1));
+    assert_eq!(command.current_configuration, accepted);
+    assert_eq!(command.transition_kind, TransitionKind::Failover);
+    assert!(!command.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(command));
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = model.plan()
+    else {
+        panic!("accepted correction PC/CC must collapse to current-only before scale-up")
+    };
+    assert_eq!(command.local_replica_id, ReplicaId::new(1));
+    assert_eq!(command.current_configuration, accepted);
+    assert_eq!(command.transition_kind, TransitionKind::Failover);
+    assert!(command.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(command));
+    model.run(100);
+    assert_eq!(model.accepted_count(), 4);
+}
+
+#[test]
 fn scale_up_commits_degraded_without_candidate_and_blocks_the_next_addition() {
     use scale_up_model::Model;
     let mut model = Model::new(2, 4);
@@ -8281,12 +8399,16 @@ fn scale_up_diagnostics_cover_every_externally_visible_phase() {
     else {
         panic!("PC/CC target report")
     };
-    report.pending_operation_id = Some(command.operation_id);
+    let pending_operation = command.operation_id.clone();
+    report.pending_operation_id = Some(pending_operation.clone());
     report.report_sequence += 1;
-    let Plan::Wait { status, .. } = model.plan() else {
-        panic!("PC/CC pending diagnostic")
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(replayed),
+    } = model.plan()
+    else {
+        panic!("PC/CC matching pending command must be replayed")
     };
-    assert_phase(&status, "ScaleUpCommandPending", "pc-cc");
+    assert_eq!(replayed.operation_id, pending_operation);
 
     let mut current_only = Model::new(2, 3);
     loop {

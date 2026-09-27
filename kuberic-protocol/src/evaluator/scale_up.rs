@@ -147,6 +147,34 @@ fn report<'a>(
     healthy_report(snapshot, identity)
 }
 
+pub(super) fn recoverable_failover_conflict(
+    snapshot: &ObservationSnapshot,
+    replica_id: i64,
+) -> bool {
+    let evidence = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.scale_up_failover.as_deref());
+    let Some(evidence) = evidence else {
+        return false;
+    };
+    let intent = &evidence.intent;
+    intent
+        .current_configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id.value() == replica_id)
+        .and_then(|member| report(snapshot, &member.identity))
+        .is_some_and(|report| {
+            report.epoch == intent.current_configuration.epoch
+                && report.current_configuration.as_ref() == Some(&intent.current_configuration)
+                && report.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+                && report.scale_up_intent.as_deref() == Some(intent)
+                && report.pending_operation_id.is_none()
+        })
+}
+
 fn build<'a>(
     report: &'a AgentReport,
     build_id: &OperationId,
@@ -2509,7 +2537,11 @@ pub(super) fn transition(
                 || report.pending_operation_id.is_some()
                 || report.retained_operation_id.as_ref() != Some(&operation_id)
             {
-                if report.pending_operation_id.is_some() {
+                if report
+                    .pending_operation_id
+                    .as_ref()
+                    .is_some_and(|pending| pending != &operation_id)
+                {
                     return wait(
                         snapshot,
                         snapshot.status.clone(),
@@ -2634,7 +2666,11 @@ pub(super) fn transition(
             || report.pending_operation_id.is_some()
             || report.retained_operation_id.as_ref() != Some(&operation_id)
         {
-            if report.pending_operation_id.is_some() {
+            if report
+                .pending_operation_id
+                .as_ref()
+                .is_some_and(|pending| pending != &operation_id)
+            {
                 continue;
             }
             return Plan::Execute {
