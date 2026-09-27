@@ -6,6 +6,9 @@ cd "$(dirname "$0")/.."
 grep -Fqx 'apiVersion: operator.kuberic.io/v1alpha1' examples/kvstore2/deploy/sample.yaml
 grep -Fqx 'kind: KubericSet' examples/kvstore2/deploy/sample.yaml
 grep -Fqx '  replicas: 3' examples/kvstore2/deploy/sample.yaml
+grep -Fqx '  # A singleton has no redundancy; raise replicas to restore one fresh ordinal at a time.' examples/kvstore2/deploy/sample.yaml
+grep -Fqx '  # Scale-up creates/freezes the PVC before the Pod and retries failed candidates fresh.' examples/kvstore2/deploy/sample.yaml
+grep -Fqx '  # The test-only live copy gate is intentionally absent from this user manifest.' examples/kvstore2/deploy/sample.yaml
 grep -Fqx '  image: localhost/kvstore2:level-triggered-v1' examples/kvstore2/deploy/sample.yaml
 grep -Fqx '  failoverDelaySeconds: 10' examples/kvstore2/deploy/sample.yaml
 grep -Fqx '  # switchover:' examples/kvstore2/deploy/sample.yaml
@@ -35,6 +38,9 @@ if checked_crd != generated_crd:
         fromfile="checked-in CRD", tofile="generated CRD",
     ))
     raise SystemExit(1)
+crd_guard = 350_000
+assert len(checked_crd) < crd_guard
+crd_headroom = crd_guard - len(checked_crd)
 schema = json.loads(checked_crd)
 properties = schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
 spec = properties["spec"]
@@ -127,6 +133,10 @@ assert set(intent["handoff"]["properties"]) == {
 }
 
 sample = (root / "examples/kvstore2/deploy/sample.yaml").read_text()
+service = (root / "examples/kvstore2/deploy/service.yaml").read_text()
+assert "testing.kuberic.io/live-copy-gate" not in sample
+assert "KUBERIC_LIVE_TEST_COPY_GATE_ADDRESS" not in sample
+assert "18080" not in service
 active_sample = "\n".join(line for line in sample.splitlines() if not line.lstrip().startswith("#"))
 assert "switchover:" not in active_sample, "Installation must not submit a switchover"
 request_example = "\n".join(
@@ -142,6 +152,27 @@ guide = root / "docs/features/kuberic/level-triggered-operator.md"
 guide_text = guide.read_text()
 assert "operator.kuberic.io/scale-up-allocation-operation" in guide_text
 assert "same-name PVC with missing or mismatched" in guide_text
+assert f"**{len(checked_crd):,} bytes**" in guide_text
+assert f"**{crd_headroom:,} bytes**" in guide_text
+status_size_run = subprocess.run(
+    [
+        "cargo", "test", "-p", "kuberic-protocol",
+        "representative_scale_up_status_variants", "--", "--nocapture",
+    ],
+    check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+)
+status_sizes = {
+    (phase, int(members)): int(size)
+    for phase, members, size in re.findall(
+        r"scale-up-status phase=(\S+) members=(\d+) bytes=(\d+)",
+        status_size_run.stdout,
+    )
+}
+carried_failover_18 = status_sizes[("carried-failover", 18)]
+assert (
+    f"largest current 18-member sample is carried failover at "
+    f"**{carried_failover_18:,} bytes**"
+) in guide_text
 examples = re.findall(r"```yaml\n(.*?)\n```", guide_text, re.DOTALL)
 assert active_sample in examples, "Guide bootstrap example differs from sample"
 assert request_example in examples, "Guide request example differs from opt-in sample"
@@ -179,7 +210,7 @@ for selector, test in (
     assert selector in matrix
     assert f'{selector}) test_name="level_triggered_k8s::{test}"' in recipes
     assert re.search(rf"fn {test}\(", live_tests)
-    if selector.startswith("scale-down"):
+    if selector.startswith(("scale-down", "scale-up")):
         for document in (guide, root / "examples/kvstore2/README.md",
                          root / "docs/features/kuberic/testing.md"):
             assert f"just level-triggered-kind-test {selector}" in document.read_text()
@@ -189,6 +220,13 @@ assert "just level-triggered-kind-test scale-up" in workflow
 assert "cargo test -p kvstore --test reconciler test_reconciler_scale_up -- --exact" in workflow
 assert "test_scale_up_replays_writes_buffered_during_copy -- --exact" in workflow
 assert "expanded+=(scale-up scale-up-multi scale-up-adversarial)" in recipes
+for document in (guide, root / "docs/features/kuberic/testing.md"):
+    assert "just level-triggered-kind-test scale-up-full" in document.read_text()
+for document in (guide, root / "docs/features/kuberic/testing.md"):
+    text = " ".join(re.sub(r"[`*>]", "", document.read_text()).split()).lower()
+    for claim in ("test-only", "disabled by default", "diagnostic port 18080",
+                  "not a crd field", "supported user api"):
+        assert claim in text, f"{document.relative_to(root)}: missing live gate boundary: {claim}"
 
 documents = [
     root / "README.md",
@@ -219,11 +257,14 @@ def heading_anchors(document):
         anchors.add(f"{slug}-{count}" if count else slug)
     return anchors
 
-assert {"secondary-scale-down", "authority-and-cleanup", "availability-and-restart",
+assert {"sequential-scale-up", "provisioning-copy-and-admission",
+        "cancellation-failover-and-cleanup", "secondary-scale-down",
+        "authority-and-cleanup", "availability-and-restart",
         "tests-and-diagnostics"} <= heading_anchors(guide)
 for document in (root / "README.md", root / "examples/kvstore2/README.md",
                  root / "docs/proposal/v1-retirement-plan.md"):
     assert "level-triggered-operator.md#secondary-scale-down" in document.read_text()
+    assert "level-triggered-operator.md#sequential-scale-up" in document.read_text()
 
 def prose(text):
     # Check claims across Markdown wrapping/emphasis, not incidental line layout.
@@ -241,6 +282,21 @@ for document in summary_documents:
                   "write closure", "sequential cleanup", "kubernetes resource deletion",
                   "independently configurable"):
         assert claim in text, f"{document.relative_to(root)}: missing narrowed claim: {claim}"
+    for claim in ("sequential scale-up", "protocol 7", "schema 3"):
+        assert claim in text, f"{document.relative_to(root)}: missing scale-up claim: {claim}"
+
+scale_up_text = prose(guide_text.split("## Sequential Scale-Up\n", 1)[1]
+                     .split("\n## Secondary Scale-Down", 1)[0])
+for claim in ("service fabric-inspired replica-add semantics",
+              "classic kuberic.io/v1 reconciliation remains unchanged",
+              "one member at a time", "first missing positive logical id",
+              "fresh allocation operation", "creates the pvc",
+              "only then creates the pod", "catchupboundarylsn",
+              "without quorum credit", "independent write-quorum requirements",
+              "scaleupcommitteddegraded", "endpoint → pod → pvc",
+              "same-name/different-uid", "scaleupstable"):
+    assert claim in scale_up_text, f"Scale-up guide missing contract: {claim}"
+assert "maximum replica-count budget" in scale_up_text
 
 removal_text = prose(guide_text.split("## Secondary Scale-Down\n", 1)[1]
                     .split("\n## Planned Switchover", 1)[0])
@@ -263,6 +319,15 @@ assert not re.search(r"following the (?:selected )?service fabric target/minimum
 retirement = root / "docs/proposal/v1-retirement-plan.md"
 assert "deferred-scale-down-follow-ups" in heading_anchors(retirement)
 assert "v1-retirement-plan.md#deferred-scale-down-follow-ups" in guide_text
+retirement_text = prose(retirement.read_text())
+for claim in ("sequential scale-up and secondary scale-down",
+              "production v2 controller configuration",
+              "classic kuberic.io/v1 remains unchanged",
+              "pvc-before-pod", "post-enumeration catch-up boundary",
+              "protocol 7 and agent schema 3", "primary-removal behavior"):
+    assert claim in retirement_text, f"Retirement plan missing scale-up status: {claim}"
+assert "outstanding scale-up" not in retirement_text
+assert "scale-up | remains absent" not in retirement_text
 followups = prose(retirement.read_text().split("### Deferred scale-down follow-ups\n", 1)[1]
                   .split("\n## Workstream 3", 1)[0])
 for claim in ("priority", "why deferred", "durable per-member kubernetes resource provenance",
@@ -274,8 +339,8 @@ for claim in ("priority", "why deferred", "durable per-member kubernetes resourc
               "plb/placement-aware", "frozen-primary recovery", "overlapping cleanup",
               "multi-member removal", "durable primary-agent coordinator",
               "keep desired-count/target policy in the evaluator/controller",
-              "keep local journals out of cr status", "scale-up", "build/copy",
-              "catch-up", "ready-state admission",
+              "keep local journals out of cr status", "scale-up operational budget",
+              "maximum replica count", "completion slo", "throughput target",
               "do not use opaque schemas, hash-only receipts, or ttl evidence deletion"):
     assert claim in followups, f"Deferred follow-ups missing contract: {claim}"
 
@@ -313,4 +378,4 @@ PY
 
 scripts/check_runtime_public_api.sh
 
-echo "Level-triggered links, API examples, scale-down/scale-up contracts, protocol 7, generated CRD, and runtime API boundaries are current."
+echo "Level-triggered links, examples, scale-down/scale-up contracts, live selector boundaries, protocol/schema versions, CRD/status size guards, and runtime API boundaries are current."

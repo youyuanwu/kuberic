@@ -9,6 +9,10 @@ boundaries.
 > use. The controller and `kvstore2` images are not published release
 > artifacts.
 
+The production v2 controller configuration enables sequential scale-up. This
+means the normal controller binary runs the implemented path; it does not
+change the stack's experimental release status.
+
 The stack coexists with the classic `kuberic.io/v1` operator. It uses a
 different API group, controller deployment, image names, labels, Services,
 source crates, and example. It does not migrate, reinterpret, replace, or
@@ -104,8 +108,9 @@ spec:
 ```
 
 `spec.replicas` must be positive. Lowering it after initialization requests
-[secondary scale-down](#secondary-scale-down); increasing accepted membership
-is unsupported. `spec.image` selects the application image.
+[secondary scale-down](#secondary-scale-down); increasing it requests
+[sequential scale-up](#sequential-scale-up). The desired count is both target
+and minimum by Kuberic policy. `spec.image` selects the application image.
 `spec.failoverDelaySeconds` defaults to 30.
 
 Status is controller-owned durable authority. Users must not author or repair
@@ -122,12 +127,22 @@ it manually. Important projections include:
   for one frozen removal and its authority evidence;
 - `secondaryScaleDownCleanup` after reduced membership commits, then
   `lastSecondaryRemoval` for bounded retained-member convergence, not deletion;
+- `scaleUpAllocation` before resource creation, then scale-up `provisioning`
+  and `transition.scaleUp` during build/admission;
+- `scaleUpCleanup` for one exact failed or cancelled unadmitted candidate,
+  then `lastScaleUp` for bounded post-commit convergence;
 - `pendingReplacementCleanup`, moved unchanged to `lastReplacement` at
   replacement acceptance, for one exact cleanup obligation;
 - conditions describing waiting or unsafe observations.
 
 The checked-in CRD is generated from the Rust type and verified byte-for-byte
 by `scripts/check_level_triggered_documentation.sh`.
+At the Phase 8 baseline it is **348,768 bytes**, leaving **1,232 bytes** before
+the current strict-below-350,000-byte regression guard fails. Representative
+serialized scale-up status guards cover 2, 3, 4, 6, 10, and 18 members; the
+largest current 18-member sample is carried failover at **22,017 bytes**.
+These are schema/status growth guards, not a supported-cardinality or
+Kubernetes object-limit claim. No validated maximum replica-count budget exists.
 
 ## Supported Behavior
 
@@ -143,6 +158,10 @@ The implemented contract supports:
   original-authority restoration, and evidence-gated newer-epoch compensation;
 - deterministic secondary scale-down, including 3→2, 2→1, sequential 5→2,
   and unavailable-target removal with sufficient old-read/new-write evidence;
+- sequential scale-up, including one-at-a-time multi-count increases,
+  restoration of a missing ordinal with a fresh incarnation, writes during
+  healthy copy/catch-up, cancellation, exact retry cleanup, and pre/post-PC/CC
+  failover recovery;
 - retained-history repair or full-copy fallback during supported failover;
 - quorum-loss detection, `NoWriteQuorum`, and non-destructive write recovery
   when the same configuration quorum returns;
@@ -176,6 +195,103 @@ successful-write history generator remains deferred.
 Quorum loss does not advance the data-loss number and does not call an
 application data-loss callback. Unsupported evidence produces `Wait` or
 `Unsafe`, never success-shaped recovery.
+
+## Sequential Scale-Up
+
+This is **Service Fabric-inspired replica-add semantics**, not general Service
+Fabric placement or scaling parity. The normal v2 controller enables the
+feature, while classic `kuberic.io/v1` reconciliation remains unchanged.
+
+Increase only `spec.replicas` on a stable initialized set. For example, after a
+completed 3→2 secondary scale-down:
+
+```bash
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+  patch kubericsets.operator.kuberic.io kvstore2 --type=merge \
+  -p '{"spec":{"replicas":3}}'
+```
+
+For a larger increase, patch directly to the final desired count. The
+controller still admits one member at a time; a 1→3 request completes 1→2
+before allocating 2→3. A successful patch is not admission or readiness.
+Inspect desired count, accepted topology/policy, the exact candidate attempt,
+conditions, cleanup, and `Ready` together.
+There is no validated maximum replica-count budget.
+
+The next candidate is the first missing positive logical ID through accepted
+count plus one. Normal growth therefore uses the next ordinal; scaling down and
+back up restores the missing ordinal. The logical ID and canonical Pod/PVC names
+may recur, but every attempt has a fresh allocation operation, PVC UID, Pod
+UID/replica instance, durable generation, process session, endpoint, build ID,
+and admission identity.
+
+### Provisioning, copy, and admission
+
+The controller persists `scaleUpAllocation` before resource creation. It proves
+the canonical name absent, creates the PVC with
+`operator.kuberic.io/scale-up-allocation-operation`, freezes the exact PVC UID,
+revalidates that live PVC, and only then creates the Pod bound to it. A
+same-name PVC or Pod with missing or mismatched allocation provenance is never
+adopted or deleted.
+
+The exact accepted primary supplies the build. The candidate remains
+`IdleSecondary`, outside accepted membership and without quorum credit while it
+is merely allocated, Ready, copying, or catching up. Snapshot enumeration uses
+an immutable snapshot boundary. When enumeration ends, the source freezes a
+separate post-enumeration `catchUpBoundaryLsn`; source and target must agree on
+it, and the target must durably apply the snapshot plus every contiguous
+operation through that boundary.
+
+Admission then installs expanded previous/current authority. PC uses the prior
+policy and CC uses the majority policy for the expanded membership. The exact
+primary is unchanged in the healthy path. Writes may continue during allocation,
+copy, catch-up, and PC/CC only while the accepted primary remains authorized and
+both configurations satisfy their independent write-quorum requirements. There
+is no zero-downtime, completion-time, or outage guarantee.
+
+Expanded current-only authority is irreversible. Stable completion additionally
+requires exact local current-only acceptance by the primary and candidate, the
+candidate's `ActiveSecondary` role, expanded current write quorum including the
+primary, write grant when quorum is available, and exact write-Service routing.
+If current-only membership commits before candidate-local acceptance, status is
+`ScaleUpCommittedDegraded`: the new member is accepted, pre-admission cleanup is
+forbidden, and local convergence or ordinary accepted-member repair continues.
+
+### Cancellation, failover, and cleanup
+
+If desired count returns to accepted count before the first PC/CC command, the
+unadmitted candidate is cancelled and exactly cleaned. After the durable
+admission fence, a newer reduction does not roll back scale-up; the accepted
+transition finishes before the latest desired count is evaluated.
+
+Accepted-primary failure before admission invalidates the old-primary build,
+allows ordinary failover, then cleans the exact candidate before a fresh retry.
+Failure after PC/CC begins preserves the typed scale-up authority and requires
+independent previous- and expanded-configuration recovery evidence before
+failover supersession. A failed or disappeared unadmitted candidate is never
+resumed from its partial PVC.
+
+Cleanup is peer endpoint → Pod → PVC. Deletes use frozen UIDs and fresh resource
+versions; PVC deletion waits for authoritative exact Pod absence. List omission
+is not absence, and same-name/different-UID resources survive. After membership
+commit, candidate loss is degraded accepted membership and cannot be handled by
+failed-candidate cleanup.
+
+| Condition reason | Inspect or wait for |
+|---|---|
+| `ScaleUpBlockedByHigherPriorityWork`, `ScaleUpAwaitingStableAuthority` | Existing repair, cleanup, accepted-member convergence, or unstable authority |
+| `ScaleUpAllocationPvcPending`, `ScaleUpAllocationNameCollision`, `ScaleUpAllocationPodBindingLost` | Exact allocation provenance, canonical-name availability, and PVC-before-Pod identity |
+| `ScaleUpCopying`, `ScaleUpBoundaryPending`, `ScaleUpCatchUpPending` | Exact build reports and durable receiver progress through the frozen boundary |
+| `ScaleUpDualQuorumUnavailable`, `ScaleUpDualQuorumPending` | Independent PC/CC quorum, caught-up candidate, and writable primary evidence |
+| `ScaleUpCommittedDegraded`, `ScaleUpCurrentOnlyQuorumPending` | Accepted expanded authority and remaining exact local/current-only convergence |
+| `ScaleUpEndpointCleanupPending`, `ScaleUpPodCleanupPending`, `ScaleUpPvcCleanupPending` | Ordered exact cleanup and authoritative absence |
+| `ScaleUpFailoverArbitrationPending`, `ScaleUpDualQuorumEvidencePending` | Pre-admission ordinary failover or post-admission carried recovery evidence |
+
+Scale-up condition messages include accepted and desired counts, exact target,
+operation attempt, phase, and blocking class. `ScaleUpStable` is the terminal
+Ready reason. Status retains at most one allocation/active intent, one cleanup
+obligation, and one latest receipt. A later addition waits if a retained member
+still needs the prior receipt for exact local acceptance.
 
 ## Secondary Scale-Down
 
@@ -328,7 +444,7 @@ reduction even when quorum arithmetic alone would permit it.
 | `ScaleDownExactPodFencePending`, `ScaleDownExactPodAbsenceRequired` | Exact Pod fence or authoritative absence |
 | `ScaleDownCleanupPending` | Endpoint/Pod/PVC reads, finalizers, and deletion retries |
 | `ScaleDownRetainedMemberPending` | Late retained-member convergence before the next removal |
-| `ScaleUpUnsupported`, `SpecDriftUnsupported` | Unsupported desired changes, not accepted policy |
+| `SpecDriftUnsupported` | Replica-count change combined with unsupported image/delay drift |
 
 No next removal, provisioning, replacement, failover, or switchover starts
 while cleanup remains. Existing authority work finishes first; stable primary
@@ -643,11 +759,16 @@ just level-triggered-kind-test switchover
 just level-triggered-kind-test switchover-adversarial
 just level-triggered-kind-test scale-down
 just level-triggered-kind-test scale-down-adversarial
+just level-triggered-kind-test scale-up
+just level-triggered-kind-test scale-up-multi
+just level-triggered-kind-test scale-up-adversarial
+just level-triggered-kind-test scale-up-full
 ```
 
 The bounded full matrix expands to replacement, quorum loss, the composed
 adversarial restart/partition/failover scenario, both switchover scenarios, and
-both scale-down scenarios (seven tests, in that order):
+both scale-down scenarios, followed by healthy, multi-count, and adversarial
+scale-up (ten tests, in that order):
 
 ```bash
 just level-triggered-kind-test all
@@ -659,7 +780,8 @@ cluster rather than prepending it to that matrix.
 
 The [PR workflow](../../../.github/workflows/level-triggered-CI.yml) separately
 runs bootstrap, replacement, failover, healthy switchover, and healthy scale-down
-smoke tests. Targeted tests run serially. Scheduled
+plus healthy sequential scale-up smoke tests. Targeted tests run serially and
+retain classic v1 scale-up/write-during-copy regressions. Scheduled
 and manually dispatched full CI runs the matrix twice on separate fresh
 clusters.
 
@@ -672,6 +794,23 @@ clients, controller/primary/target restarts, ambiguous replies and old-session
 rejection, unavailable-target sequential 3→1 (including 2→1), exact post-commit
 Pod fencing, ownership-label loss, already-absent Pods, and preservation of a
 same-name/different-UID endpoint.
+
+`scale-up` covers healthy sequential growth, acknowledged writes during a
+deliberately held live copy, exact PC/CC/current-only admission, and stable
+routing. `scale-up-multi` covers larger one-at-a-time convergence.
+`scale-up-adversarial` covers cancellation, failed-build cleanup/fresh retry,
+primary and participant restart, pre-admission failover, post-PC/CC carried
+failover, accepted-member replacement/failover composition, and
+scale-down→scale-up restoration with a fresh incarnation. These tests validate
+their bounded scenarios; they do not establish a maximum replica count,
+arbitrary-failure coverage, outage bound, or production SLO.
+
+The live copy gate used by those tests is disabled by default. The checked-in
+sample and Service do not enable or route it. `just level-triggered-install`
+injects the test-only `testing.kuberic.io/live-copy-gate: enabled` annotation,
+which causes replica Pods to bind hold/release controls only on direct
+diagnostic port 18080. This annotation, environment variable, port, and its
+endpoints are test harness controls, not a CRD field or supported user API.
 
 Recorded secondary-scale-down validation used two original full seven-scenario
 fresh-cluster lifecycles of **18m16s / 16m29s**. Healthy scale-down measured
@@ -749,6 +888,14 @@ For replacement cleanup also retain `pendingReplacementCleanup`/`lastReplacement
 Compare exact-name objects with frozen UIDs; a label-filtered list cannot prove
 absence. Do not remove finalizers or edit status merely to force progress.
 
+For scale-up, preserve `scaleUpAllocation`, `provisioning`,
+`transition.scaleUp` or carried failover evidence, `scaleUpAdmissionStarted`,
+`scaleUpCleanup`/`lastScaleUp`, condition messages, exact allocation
+annotations, Pod/PVC/Service UIDs, and source/target build diagnostics. Compare
+the snapshot and catch-up boundaries and both independent policies. Do not
+manually add the live copy annotation or call its diagnostic port outside the
+owned test harness.
+
 Each replica also exposes `GET /status`, including its exact identity, durable
 generation, process session, role, epoch, PC/CC IDs, progress, committed LSN,
 write status, pending operation, active builds, and an additive `retired` boolean.
@@ -809,5 +956,5 @@ Classic v1 remains the documented path for existing `kuberic.io/v1` resources
 and the SQLite/PostgreSQL examples. V2 supports explicit planned switchover,
 secondary-only scale-down, and sequential scale-up; no v1 conversion, data import, or
 classic-path removal is implied. The [retirement plan](../../proposal/v1-retirement-plan.md)
-keeps remaining scaling,
-application ports, distribution, deprecation, and removal as separate workstreams.
+keeps primary removal, application ports, distribution, deprecation, and source
+removal as separate workstreams.

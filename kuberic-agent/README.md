@@ -75,10 +75,12 @@ integrity, exact storage identity, and the exact schema version. The current
 migration hook is idempotent only for that version; it is not an older-schema
 upgrade path.
 
-Schema **2** intentionally rejects schema 1 and unknown versions without
+Schema **3** intentionally rejects schema 2 and unknown versions without
 migration. Initialization identity (including its original policy) remains
-immutable. Admitted PC/CC policies are separate durable authority; a reduced
-policy does not rewrite initialization replay or Pod/PVC validation.
+immutable. Admitted PC/CC policies are separate durable authority; reduced or
+expanded policy does not rewrite initialization replay or Pod/PVC validation.
+Schema 3 adds exact scale-up initialization, build-boundary, PC/CC/current-only
+admission, carried-failover, and bounded completion evidence.
 
 The controller enables SF-inspired secondary scale-down using PC/CC quorum
 principles, with Kuberic-specific target/minimum coupling, deterministic
@@ -148,7 +150,10 @@ Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequenti
 cleanup must finish, and every retained member needs its original completed
 current-only witness or fresh completed local acceptance before superseding the
 bounded receipt. Sequential scale-up uses durable schema-3 build and admission
-authority. These limits and the explicitly deferred
+authority, preserves healthy same-primary writes only while both PC/CC quorums
+remain authorized, and retries failed unadmitted candidates only after exact
+endpoint→Pod→PVC cleanup. Protocol 7/schema 3 require a fresh coordinated
+deployment; classic v1 remains unchanged. These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
 
