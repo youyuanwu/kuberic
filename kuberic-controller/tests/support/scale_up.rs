@@ -287,7 +287,11 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
                 .members
                 .iter()
                 .find(|member| member.identity == target)
-                .expect("configuration contains local target");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "configuration contains local target: target={target:?} command={command:?}"
+                    )
+                });
             let boundary = command
                 .scale_up_evidence
                 .as_deref()
@@ -425,7 +429,23 @@ async fn finish_switchover(api: &Arc<InMemoryClusterApi>, primary_id: i64) {
             return;
         }
     }
-    panic!("switchover did not converge");
+    let raw = api.observation().await;
+    let status = raw.set.status.clone();
+    let snapshot = normalize(raw, BTreeMap::new()).unwrap();
+    let invalid = snapshot
+        .replicas
+        .iter()
+        .filter_map(|(key, observation)| match &observation.agent {
+            AgentObservation::Invalid { message, .. } => Some((key.clone(), message.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let validation = kuberic_protocol::validation::validate_snapshot(&snapshot);
+    let plan = evaluate(&snapshot, &enabled());
+    panic!(
+        "switchover did not converge: invalid={invalid:?} validation={validation:?} \
+         status={status:?} plan={plan:?}"
+    );
 }
 
 async fn finish_scale_down(api: &Arc<InMemoryClusterApi>, desired: u32) {
@@ -1646,6 +1666,248 @@ async fn scale_up_receipt_allows_replacement_then_failover_to_return_ready() {
             .topology
             .as_ref()
             .map(|topology| topology.configuration.primary_id)
+    );
+}
+
+#[tokio::test]
+async fn scale_up_replacement_then_ordinary_failover_pc_cc_converges_with_receipt() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    finish(&api, 3).await;
+    let completed = api.observation().await;
+    let receipt = completed
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.last_scale_up.as_ref())
+        .expect("completed scale-up receipt")
+        .clone();
+    let topology = &completed
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    let primary = topology
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    let historical = topology
+        .members
+        .iter()
+        .find(|member| member.identity != primary)
+        .unwrap()
+        .identity
+        .clone();
+    let pod_name = completed
+        .pods
+        .iter()
+        .find(|pod| pod.uid().as_deref() == Some(historical.instance_id.as_str()))
+        .map(ResourceExt::name_any)
+        .expect("historical accepted secondary Pod");
+    api.delete_exact_pod(
+        &completed,
+        &pod_name,
+        &PodUid::new(historical.instance_id.as_str()),
+    )
+    .await
+    .unwrap();
+    finish(&api, 3).await;
+    let replacement = api.observation().await;
+    let replacement_configuration = replacement
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    assert!(
+        replacement_configuration
+            .members
+            .iter()
+            .all(|member| member.identity != historical)
+    );
+
+    let failed_primary = replacement_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .unwrap()
+        .identity
+        .clone();
+    let failed_key = ReplicaObservationKey::new(
+        failed_primary.replica_id,
+        failed_primary.instance_id.clone(),
+    );
+    let mut failed = replacement;
+    let RawAgentObservation::Report(report) = failed.agents.get_mut(&failed_key).unwrap() else {
+        panic!("accepted primary report")
+    };
+    report.healthy = false;
+    report.reported_fault = proto::FaultType::Permanent as i32;
+    report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
+    report.report_sequence += 1;
+    failed.now_unix_seconds += 11;
+    api.set_observation(failed).await;
+
+    let mut saw_pc_cc = false;
+    let mut converged = None;
+    for _ in 0..160 {
+        let mut advancing = api.observation().await;
+        advancing.now_unix_seconds += 1;
+        api.set_observation(advancing).await;
+        let (_kind, effects) = tick(&api).await;
+        saw_pc_cc |= effects.iter().any(|effect| {
+            matches!(
+                effect,
+                EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command))
+                    if command.transition_kind == TransitionKind::Failover
+                        && !command.current_only
+            )
+        });
+        let observed = api.observation().await;
+        let authority = &observed.set.status.as_ref().unwrap().authority;
+        assert_eq!(authority.last_scale_up.as_ref(), Some(&receipt));
+        assert!(
+            authority
+                .conditions
+                .iter()
+                .all(|condition| condition.reason != "ScaleUpCommittedDegraded"),
+            "superseded historical receipt consumer blocked ordinary failover: {authority:?}"
+        );
+        if saw_pc_cc
+            && authority.transition.is_none()
+            && authority.topology.as_ref().is_some_and(|topology| {
+                topology.configuration.primary_id != failed_primary.replica_id
+            })
+        {
+            converged = Some(observed);
+            break;
+        }
+    }
+    assert!(saw_pc_cc, "ordinary failover never installed PC/CC");
+    let converged = converged.expect("ordinary failover transition did not converge");
+    assert_eq!(
+        converged
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .last_scale_up
+            .as_ref(),
+        Some(&receipt)
+    );
+}
+
+#[tokio::test]
+async fn stable_scale_up_then_planned_switchover_converges_with_receipt() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    finish(&api, 3).await;
+    let completed = api.observation().await;
+    let receipt = completed
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.last_scale_up.as_ref())
+        .expect("completed scale-up receipt")
+        .clone();
+    let topology = &completed
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration;
+    let target = topology
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::ActiveSecondary)
+        .unwrap()
+        .identity
+        .replica_id;
+
+    let mut requested = completed;
+    requested.set.spec.switchover = Some(PlannedSwitchoverRequestSpec {
+        request_id: "post-scale-up-switchover".into(),
+        target_replica_id: u32::try_from(target.value()).unwrap(),
+    });
+    requested.set.metadata.generation =
+        Some(requested.set.metadata.generation.unwrap_or_default() + 1);
+    api.set_observation(requested).await;
+    let mut switchover_complete = false;
+    for step in 0..200 {
+        let snapshot = normalize(api.observation().await, BTreeMap::new()).unwrap();
+        assert!(
+            kuberic_protocol::validation::validate_snapshot(&snapshot).is_ok(),
+            "post-scale-up switchover snapshot invalid at step {step}: {:?}",
+            kuberic_protocol::validation::validate_snapshot(&snapshot)
+        );
+        let invalid = snapshot
+            .replicas
+            .iter()
+            .filter_map(|(key, observation)| match &observation.agent {
+                AgentObservation::Invalid { message, .. } => Some((key.clone(), message.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            invalid.is_empty(),
+            "post-scale-up switchover produced invalid agent evidence at step {step}: {invalid:?}"
+        );
+        let plan = evaluate(&snapshot, &enabled());
+        assert!(
+            !matches!(plan, Plan::Unsafe { .. }),
+            "post-scale-up switchover became unsafe at step {step}: invalid={invalid:?} \
+             plan={plan:?}"
+        );
+        tick(&api).await;
+        let observed = api.observation().await;
+        let status = observed.set.status.as_ref().unwrap();
+        if status
+            .authority
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.configuration.primary_id == target)
+            && status.authority.transition.is_none()
+            && status.authority.last_switchover.is_some()
+        {
+            switchover_complete = true;
+            break;
+        }
+    }
+    assert!(
+        switchover_complete,
+        "post-scale-up switchover did not converge: {:?}",
+        api.observation().await.set.status
+    );
+
+    let completed = api.observation().await;
+    let authority = &completed.set.status.as_ref().unwrap().authority;
+    assert_eq!(authority.last_scale_up.as_ref(), Some(&receipt));
+    assert!(authority.transition.is_none());
+    assert!(authority.last_switchover.is_some());
+    assert_eq!(
+        authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .primary_id,
+        target
     );
 }
 

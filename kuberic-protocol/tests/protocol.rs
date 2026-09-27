@@ -1781,11 +1781,12 @@ use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, FaultType, OperationId, PlannedSwitchoverIntent,
     PlannedSwitchoverOutcome, PlannedSwitchoverReceipt, PlannedSwitchoverRequest,
-    PlannedSwitchoverResolution, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
-    PvcUid, QuorumLossObservation, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRepairIntent, ReplicaRole, ResourceUid, ScaleUpIntent, SwitchoverHandoff,
-    SwitchoverRequestId, TransitionIntent, TransitionKind, derive_agent_generation,
-    derive_initialization_id, derive_switchover_preparation_operation_id, derive_transition_id,
+    PlannedSwitchoverResolution, PodUid, PrimaryFailureObservation, ProcessSessionId,
+    ProvisioningIntent, ProvisioningPurpose, PvcUid, QuorumLossObservation, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole, ResourceUid,
+    ScaleUpIntent, SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind,
+    derive_agent_generation, derive_initialization_id, derive_switchover_preparation_operation_id,
+    derive_transition_id,
 };
 use kuberic_protocol::validation::{
     ValidationError, validate_configuration, validate_status, validate_transition_relationship,
@@ -7762,7 +7763,10 @@ fn scale_up_carried_failover_corrects_returning_original_pc_cc_and_current_only_
         report.write_status = if current_only {
             AccessStatus::Granted
         } else {
-            AccessStatus::ReconfigurationPending
+            // Same-primary scale-up deliberately preserves Granted writes while
+            // PC/CC is installed; failover must still recognize this exact
+            // retained command as the authorized returning original primary.
+            AccessStatus::Granted
         };
         report.epoch = intent.current_configuration.epoch;
         report.previous_configuration =
@@ -7805,6 +7809,86 @@ fn scale_up_carried_failover_corrects_returning_original_pc_cc_and_current_only_
                 } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
             ));
         }
+
+        let independent = model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity != intent.primary)
+            .unwrap()
+            .identity
+            .clone();
+        let independent_key =
+            ReplicaObservationKey::new(independent.replica_id, independent.instance_id.clone());
+
+        let mut invalid_peer = model.fork();
+        invalid_peer
+            .snapshot
+            .replicas
+            .get_mut(&independent_key)
+            .unwrap()
+            .agent = AgentObservation::Invalid {
+            message: "independent invalid peer".into(),
+            uninitialized_report: None,
+        };
+        assert!(matches!(
+            invalid_peer.plan(),
+            Plan::Unsafe {
+                safety_changes,
+                ..
+            } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+        ));
+
+        let mut wrong_generation = model.fork();
+        wrong_generation
+            .report_mut(independent.replica_id.value())
+            .identity
+            .agent_generation = AgentGeneration::new("independent-wrong-generation");
+        assert!(matches!(
+            wrong_generation.plan(),
+            Plan::Unsafe {
+                safety_changes,
+                ..
+            } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+        ));
+
+        let mut incompatible_protocol = model.fork();
+        incompatible_protocol
+            .report_mut(independent.replica_id.value())
+            .protocol_version = kuberic_protocol::PROTOCOL_VERSION + 1;
+        assert!(matches!(
+            incompatible_protocol.plan(),
+            Plan::Unsafe {
+                reason: UnsafeReason::IncompatibleProtocolVersion {
+                    replica_id,
+                    ..
+                },
+                safety_changes,
+                ..
+            } if replica_id == independent.replica_id.value()
+                && safety_changes == vec![SafetyChange::RemoveWriteRouting]
+        ));
+
+        let mut observation_failure = model.fork();
+        observation_failure
+            .snapshot
+            .observation_failures
+            .push(ObservationFailure {
+                source: "independent-agent".into(),
+                message: "timeout".into(),
+            });
+        assert!(matches!(
+            observation_failure.plan(),
+            Plan::Wait {
+                reason: WaitReason::AgentUnavailable,
+                ..
+            }
+        ));
 
         let Plan::Execute {
             command: ProtocolCommand::EnsureConfiguration(command),
@@ -10548,7 +10632,165 @@ fn scale_up_historical_receipt_does_not_block_ready_after_replacement_and_failov
     model.snapshot.status.pending_replacement_cleanup = None;
     model.snapshot.status.last_replacement = None;
     model.snapshot.status.last_scale_up = Some(receipt.clone());
-    model.snapshot.routing.write_target = Some(new_primary);
+    model.snapshot.routing.write_target = Some(new_primary.clone());
+
+    let mut ordinary_failover = model.fork();
+    ordinary_failover
+        .snapshot
+        .replicas
+        .get_mut(&old_key)
+        .unwrap()
+        .agent = AgentObservation::Absent;
+    let failed_primary = settled
+        .members
+        .iter()
+        .find(|member| member.identity == new_primary)
+        .unwrap()
+        .identity
+        .clone();
+    let elected_primary = settled
+        .members
+        .iter()
+        .find(|member| member.identity != failed_primary)
+        .unwrap()
+        .identity
+        .clone();
+    let failover_configuration = ConfigurationDescriptor::new(
+        Epoch::new(
+            settled.epoch.data_loss_number,
+            settled.epoch.configuration_number + 1,
+        ),
+        elected_primary.replica_id,
+        settled
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity == elected_primary {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        settled.write_quorum,
+    );
+    let transition_id = derive_transition_id(
+        &ordinary_failover.snapshot.resource_uid,
+        TransitionKind::Failover,
+        &failover_configuration.configuration_id,
+    );
+    ordinary_failover.snapshot.status.primary_failure = Some(PrimaryFailureObservation {
+        primary: failed_primary.clone(),
+        started_at_unix_seconds: ordinary_failover.snapshot.now_unix_seconds - 10,
+    });
+    ordinary_failover.snapshot.status.transition = Some(TransitionIntent {
+        transition_id,
+        kind: TransitionKind::Failover,
+        spec_generation: ordinary_failover.snapshot.desired.generation,
+        effective_policy: ordinary_failover
+            .snapshot
+            .status
+            .effective_policy
+            .clone()
+            .unwrap(),
+        previous_configuration_id: Some(settled.configuration_id.clone()),
+        current_configuration: failover_configuration.clone(),
+        election_lsn: Some(12),
+        build_id: None,
+        repair: None,
+        switchover: None,
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
+    });
+    for member in &settled.members {
+        let report = ordinary_failover.report_mut(member.identity.replica_id.value());
+        report.current_progress = 10;
+        report.verified_replication_lsn = Some(10);
+        report.committed_lsn = 10;
+        report.current_configuration_quorum_progress = 10;
+    }
+    let failed_report = ordinary_failover.report_mut(failed_primary.replica_id.value());
+    failed_report.healthy = false;
+    failed_report.reported_fault = Some(FaultType::Permanent);
+    failed_report.write_status = AccessStatus::ReconfigurationPending;
+    failed_report.report_sequence += 1;
+
+    fn apply_composed_plan(model: &mut scale_up_model::Model, plan: Plan) {
+        match plan {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            Plan::Stable { status, .. } => model.snapshot.status = status,
+            Plan::Unsafe { reason, .. } => panic!("composed failover became unsafe: {reason:?}"),
+        }
+    }
+
+    let mut composed = scale_up_model::Model::from_snapshot(ordinary_failover.snapshot, vec![2, 3]);
+    let mut installed_pc_cc = false;
+    for _ in 0..20 {
+        let plan = evaluate(&composed.snapshot, &scale_up_model::config());
+        assert!(
+            !matches!(&plan, Plan::Wait { status, .. }
+                if status.conditions.iter().any(|condition|
+                    condition.reason == "ScaleUpCommittedDegraded")),
+            "superseded receipt identity blocked ordinary failover before PC/CC: {plan:?}"
+        );
+        installed_pc_cc |= matches!(
+            &plan,
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(command),
+            } if command.transition_kind == TransitionKind::Failover && !command.current_only
+        );
+        apply_composed_plan(&mut composed, plan);
+        if installed_pc_cc {
+            break;
+        }
+    }
+    assert!(installed_pc_cc, "ordinary failover PC/CC was not installed");
+    let after_pc_cc = evaluate(&composed.snapshot, &scale_up_model::config());
+    assert!(
+        !matches!(&after_pc_cc, Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpCommittedDegraded")),
+        "superseded historical incarnation blocked failover after retained-member PC/CC: \
+         {after_pc_cc:?}"
+    );
+    apply_composed_plan(&mut composed, after_pc_cc);
+    let mut converged = false;
+    for _ in 0..80 {
+        let plan = evaluate(&composed.snapshot, &scale_up_model::config());
+        assert!(
+            !matches!(&plan, Plan::Wait { status, .. }
+                if status.conditions.iter().any(|condition|
+                    condition.reason == "ScaleUpCommittedDegraded")),
+            "historical receipt blocked composed failover convergence: {plan:?}"
+        );
+        apply_composed_plan(&mut composed, plan);
+        converged = composed.snapshot.status.transition.is_none()
+            && composed.snapshot.status.last_scale_up.as_ref() == Some(&receipt)
+            && composed
+                .snapshot
+                .status
+                .topology
+                .as_ref()
+                .is_some_and(|topology| topology.configuration == failover_configuration);
+        if converged {
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "scale-up -> replacement -> ordinary failover transition did not converge with receipt \
+         retained: {:?}",
+        evaluate(&composed.snapshot, &scale_up_model::config())
+    );
 
     let plan = model.plan();
     assert!(

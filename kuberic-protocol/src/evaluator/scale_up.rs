@@ -147,51 +147,58 @@ fn report<'a>(
     healthy_report(snapshot, identity)
 }
 
-pub(super) fn recoverable_failover_conflict(
+pub(super) fn recoverable_failover_conflict_identity(
     snapshot: &ObservationSnapshot,
     replica_id: i64,
-) -> bool {
+) -> Option<ReplicaIdentity> {
     let evidence = snapshot
         .status
         .transition
         .as_ref()
         .and_then(|transition| transition.scale_up_failover.as_deref());
-    let Some(evidence) = evidence else {
-        return false;
-    };
+    let evidence = evidence?;
     let intent = &evidence.intent;
     intent
         .current_configuration
         .members
         .iter()
-        .find(|member| member.identity.replica_id.value() == replica_id)
+        .find(|member| {
+            member.identity == intent.primary
+                && member.identity.replica_id.value() == replica_id
+                && member.role == ReplicaRole::Primary
+        })
         .and_then(|member| report(snapshot, &member.identity))
-        .is_some_and(|report| {
+        .and_then(|report| {
             if report.epoch != intent.current_configuration.epoch
                 || report.current_configuration.as_ref() != Some(&intent.current_configuration)
                 || report.scale_up_intent.as_deref() != Some(intent)
                 || report.pending_operation_id.is_some()
+                || report.identity != intent.primary
+                || report.role != ReplicaRole::Primary
             {
-                return false;
+                return None;
             }
-            let stage =
-                if report.previous_configuration.as_ref() == Some(&intent.previous_configuration) {
-                    ScaleUpStage::PreviousCurrent
-                } else if report.previous_configuration.is_none()
-                    && report.identity == intent.primary
-                    && report.role == ReplicaRole::Primary
-                    && report.write_status == AccessStatus::Granted
-                {
-                    ScaleUpStage::CurrentOnly
-                } else {
-                    return false;
-                };
-            report.retained_operation_id.as_ref()
+            let stage = if report.previous_configuration.as_ref()
+                == Some(&intent.previous_configuration)
+                && matches!(
+                    report.write_status,
+                    AccessStatus::Granted | AccessStatus::ReconfigurationPending
+                ) {
+                ScaleUpStage::PreviousCurrent
+            } else if report.previous_configuration.is_none()
+                && report.write_status == AccessStatus::Granted
+            {
+                ScaleUpStage::CurrentOnly
+            } else {
+                return None;
+            };
+            (report.retained_operation_id.as_ref()
                 == Some(&intent.command_operation_id(
                     stage,
                     &report.identity,
                     &intent.current_configuration,
-                ))
+                )))
+            .then(|| report.identity.clone())
         })
 }
 
@@ -656,13 +663,7 @@ fn prior_receipt_settled(snapshot: &ObservationSnapshot, receipt: &ScaleUpReceip
         .as_ref()
         .map(|topology| &topology.configuration);
     receipt.accepted_configuration.members.iter().all(|member| {
-        let superseded = accepted.is_some_and(|configuration| {
-            configuration
-                .members
-                .iter()
-                .all(|accepted_member| accepted_member.identity != member.identity)
-        });
-        if superseded {
+        if receipt_member_superseded(accepted, member) {
             return true;
         }
         let retired_by_newer_authority = accepted.is_some_and(|configuration| {
@@ -694,6 +695,18 @@ fn prior_receipt_settled(snapshot: &ObservationSnapshot, receipt: &ScaleUpReceip
                     .is_some_and(|lsn| lsn >= receipt.intent.catch_up_boundary_lsn)
                 && report.scale_up_intent.as_deref() == Some(&receipt.intent)
                 && report.pending_operation_id.is_none())
+    })
+}
+
+fn receipt_member_superseded(
+    accepted: Option<&ConfigurationDescriptor>,
+    member: &ConfigurationMember,
+) -> bool {
+    accepted.is_some_and(|configuration| {
+        configuration
+            .members
+            .iter()
+            .all(|accepted_member| accepted_member.identity != member.identity)
     })
 }
 
@@ -803,6 +816,12 @@ pub(super) fn recover_local_acceptance(
             })
         });
     for member in &receipt.accepted_configuration.members {
+        if receipt_member_superseded(Some(accepted), member) {
+            // A newer accepted configuration has retired this exact historical
+            // incarnation. Keep the receipt as evidence, but never wait on or
+            // correct an identity that accepted authority no longer contains.
+            continue;
+        }
         if snapshot
             .status
             .pending_replacement_cleanup
@@ -864,8 +883,7 @@ pub(super) fn recover_local_acceptance(
                 config,
             ));
         };
-        let advanced_to_newer_scale_up = report.epoch > receipt.accepted_configuration.epoch
-            && report.scale_up_intent.as_deref() != Some(&receipt.intent)
+        let advanced_to_newer_transition = report.epoch > receipt.accepted_configuration.epoch
             && snapshot
                 .status
                 .transition
@@ -873,7 +891,7 @@ pub(super) fn recover_local_acceptance(
                 .is_some_and(|transition| {
                     report.current_configuration.as_ref() == Some(&transition.current_configuration)
                 });
-        if advanced_to_newer_scale_up {
+        if advanced_to_newer_transition {
             continue;
         }
         let missed_failover_expansion = receipt.failover_evidence.is_some()

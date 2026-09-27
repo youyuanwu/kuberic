@@ -79,6 +79,13 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             .allow_scale_up
             .then(|| scale_up_stale_correction_identity(snapshot))
             .flatten();
+        let recoverable_failover_conflict_identity = if config.allow_scale_up
+            && let ValidationError::ConflictingReplicaConfiguration { replica_id, .. } = &error
+        {
+            scale_up::recoverable_failover_conflict_identity(snapshot, *replica_id)
+        } else {
+            None
+        };
         let exact_stale_correction = matches!(
             &error,
             ValidationError::StaleReplicaEpoch { replica_id, .. }
@@ -87,7 +94,24 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
                     .is_some_and(|identity| identity.replica_id.value() == *replica_id)
         );
         if exact_stale_correction {
-            if let Err(other_error) = validate_snapshot_around_stale_correction(snapshot) {
+            if let Err(other_error) = validate_snapshot_around_authorized_correction(
+                snapshot,
+                stale_correction_identity
+                    .as_ref()
+                    .expect("exact stale correction identity exists"),
+            ) {
+                return unsafe_plan(
+                    snapshot.status.clone(),
+                    UnsafeReason::InvalidAcceptedAuthority(other_error.to_string()),
+                    config,
+                );
+            }
+            // Continue through protocol-version, invalid-agent, observation,
+            // and primary-failure arbitration before dispatching correction.
+        } else if let Some(identity) = recoverable_failover_conflict_identity.as_ref() {
+            if let Err(other_error) =
+                validate_snapshot_around_authorized_correction(snapshot, identity)
+            {
                 return unsafe_plan(
                     snapshot.status.clone(),
                     UnsafeReason::InvalidAcceptedAuthority(other_error.to_string()),
@@ -97,13 +121,6 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             // Continue through protocol-version, invalid-agent, observation,
             // and primary-failure arbitration before dispatching correction.
         } else {
-            if config.allow_scale_up
-                && let ValidationError::ConflictingReplicaConfiguration { replica_id, .. } = &error
-                && scale_up::recoverable_failover_conflict(snapshot, *replica_id)
-                && let Some(transition) = snapshot.status.transition.as_ref()
-            {
-                return scale_up::transition(snapshot, transition, config);
-            }
             if config.enable_secondary_scale_down
                 && secondary_scale_down::active(snapshot)
                 && matches!(error, ValidationError::StaleReportSequence { .. })
@@ -339,14 +356,12 @@ fn scale_up_stale_correction_identity(snapshot: &ObservationSnapshot) -> Option<
     })
 }
 
-fn validate_snapshot_around_stale_correction(
+fn validate_snapshot_around_authorized_correction(
     snapshot: &ObservationSnapshot,
+    identity: &ReplicaIdentity,
 ) -> Result<(), ValidationError> {
-    let identity = scale_up_stale_correction_identity(snapshot).ok_or(
-        ValidationError::InvalidScaleUp("stale correction is not exactly authorized"),
-    )?;
     let report = snapshot
-        .observation_for_identity(&identity)
+        .observation_for_identity(identity)
         .and_then(|observation| match &observation.agent {
             AgentObservation::Report(report) => Some(report.as_ref()),
             _ => None,
@@ -360,9 +375,9 @@ fn validate_snapshot_around_stale_correction(
         .replicas
         .get_mut(&crate::observation::ReplicaObservationKey::new(
             identity.replica_id,
-            identity.instance_id,
+            identity.instance_id.clone(),
         ))
-        .expect("exact stale correction observation exists")
+        .expect("exact authorized correction observation exists")
         .agent = AgentObservation::Absent;
     validate_snapshot(&remaining)
 }

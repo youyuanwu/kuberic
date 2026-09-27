@@ -548,6 +548,23 @@ fn pending_configuration_report_round_trips_exact_durable_command() {
     };
     assert_eq!(normalized.pending_configuration.as_deref(), Some(&command));
 
+    let uninitialized_with_pending_authority = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-uid".into(),
+        process_session_id: "uninitialized-session".into(),
+        report_sequence: 1,
+        storage_state: proto::AgentStorageState::Uninitialized as i32,
+        replica_id: 1,
+        pod_uid: "uninitialized-pod".into(),
+        pvc_uid: "uninitialized-pvc".into(),
+        pending_configuration: wire.pending_configuration.clone(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        normalize_agent_status_report(uninitialized_with_pending_authority),
+        Err(WireError::InvalidAuthority(_))
+    ));
+
     let mut mismatched = wire;
     mismatched.pending_operation_id = "different-operation".into();
     assert!(normalize_agent_status_report(mismatched).is_err());

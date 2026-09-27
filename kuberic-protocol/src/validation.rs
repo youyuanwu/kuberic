@@ -584,12 +584,19 @@ pub fn validate_report_internal(
                     == intent.current_configuration.epoch.data_loss_number
                 && current.epoch.configuration_number
                     > intent.current_configuration.epoch.configuration_number);
+        let previous_matches = report
+            .previous_configuration
+            .as_ref()
+            .is_none_or(|previous| {
+                previous == &intent.previous_configuration
+                    || (current != &intent.current_configuration
+                        && exact_identities(previous) == exact_identities(current)
+                        && previous.epoch.data_loss_number == current.epoch.data_loss_number
+                        && previous.epoch.configuration_number < current.epoch.configuration_number)
+            });
         if report.resource_uid != intent.resource_uid
             || !current_matches
-            || report
-                .previous_configuration
-                .as_ref()
-                .is_some_and(|previous| previous != &intent.previous_configuration)
+            || !previous_matches
             || !current
                 .members
                 .iter()

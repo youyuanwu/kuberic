@@ -234,6 +234,7 @@ pub fn normalize_agent_status_report(
                 || report.retired_replica.is_some()
                 || report.accepted_secondary_removal.is_some()
                 || report.scale_up_intent.is_some()
+                || report.pending_configuration.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
