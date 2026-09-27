@@ -1,4 +1,6 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream;
@@ -10,15 +12,79 @@ use crate::persistence::{KvPersistence, snapshot_stream};
 
 pub struct KvStateProvider {
     persistence: Arc<KvPersistence>,
+    copy_gate: CopyGate,
 }
 
 impl KvStateProvider {
-    pub fn new(persistence: Arc<KvPersistence>) -> Self {
-        Self { persistence }
+    pub fn new(persistence: Arc<KvPersistence>, copy_gate: CopyGate) -> Self {
+        Self {
+            persistence,
+            copy_gate,
+        }
     }
 
     pub fn persistence(&self) -> &Arc<KvPersistence> {
         &self.persistence
+    }
+}
+
+#[derive(Clone)]
+pub struct CopyGate {
+    path: Arc<PathBuf>,
+    max_hold: Duration,
+}
+
+impl CopyGate {
+    const MAX_HOLD: Duration = Duration::from_secs(120);
+
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: Arc::new(path.into()),
+            max_hold: Self::MAX_HOLD,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(path: impl Into<PathBuf>, max_hold: Duration) -> Self {
+        Self {
+            path: Arc::new(path.into()),
+            max_hold,
+        }
+    }
+
+    pub fn hold(&self) -> std::io::Result<()> {
+        std::fs::write(self.path.as_ref(), b"held")
+    }
+
+    pub fn release(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.path.as_ref()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.path.exists()
+    }
+
+    async fn wait_until_released(&self) -> Result<()> {
+        let deadline = Instant::now() + self.max_hold;
+        while self.is_held() {
+            if Instant::now() >= deadline {
+                self.release().map_err(|error| {
+                    RuntimeError::Application(format!(
+                        "live-test copy gate timeout cleanup failed: {error}"
+                    ))
+                })?;
+                return Err(RuntimeError::Application(format!(
+                    "live-test copy gate remained held for more than {:?}",
+                    self.max_hold
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
     }
 }
 
@@ -48,6 +114,7 @@ impl StateProvider for KvStateProvider {
                 "kvstore2 does not use a copy context".into(),
             ));
         }
+        self.copy_gate.wait_until_released().await?;
         snapshot_stream(self.persistence.snapshot_at(up_to_lsn)?)
     }
 
@@ -88,7 +155,10 @@ mod tests {
             .await
             .unwrap();
         persistence.commit(1).await.unwrap();
-        let provider = KvStateProvider::new(persistence.clone());
+        let provider = KvStateProvider::new(
+            persistence.clone(),
+            CopyGate::new(directory.path().join("copy-gate")),
+        );
         let frozen = provider
             .get_copy_state(1, Box::pin(stream::empty()))
             .await
@@ -125,10 +195,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_test_copy_gate_is_bounded_and_released_explicitly() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
+        let gate = CopyGate::new(directory.path().join("copy-gate"));
+        gate.hold().unwrap();
+        let provider = Arc::new(KvStateProvider::new(persistence, gate.clone()));
+        let pending = tokio::spawn({
+            let provider = provider.clone();
+            async move { provider.get_copy_state(0, Box::pin(stream::empty())).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!pending.is_finished());
+        gate.release().unwrap();
+        let mut stream = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"{}")
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_test_copy_gate_timeout_cleans_up_without_deadlock() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
+        let gate = CopyGate::with_timeout(
+            directory.path().join("copy-gate"),
+            Duration::from_millis(50),
+        );
+        gate.hold().unwrap();
+        let provider = KvStateProvider::new(persistence, gate.clone());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.get_copy_state(0, Box::pin(stream::empty())),
+        )
+        .await
+        .unwrap();
+        let Err(error) = result else {
+            panic!("held copy gate unexpectedly returned a stream");
+        };
+        assert!(error.to_string().contains("remained held"));
+        assert!(!gate.is_held());
+    }
+
+    #[tokio::test]
     async fn provider_empty_state_copy_uses_boundary_zero() {
         let directory = tempfile::tempdir().unwrap();
         let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
-        let provider = KvStateProvider::new(persistence);
+        let provider = KvStateProvider::new(
+            persistence,
+            CopyGate::new(directory.path().join("copy-gate")),
+        );
         let chunks = collect_copy(
             provider
                 .get_copy_state(0, Box::pin(stream::empty()))

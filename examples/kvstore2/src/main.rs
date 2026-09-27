@@ -23,6 +23,7 @@ use tokio::sync::watch;
 
 use crate::persistence::KvPersistence;
 use crate::service::KvService;
+use crate::state::CopyGate;
 
 #[derive(Debug, Parser)]
 struct Config {
@@ -64,6 +65,7 @@ struct Config {
 struct HttpState {
     application: Arc<KvService>,
     replica: ReplicaHandle,
+    copy_gate: CopyGate,
 }
 
 #[tokio::main]
@@ -80,9 +82,11 @@ async fn main() -> Result<()> {
         ApplicationStorageState::Established
     };
     let persistence = Arc::new(KvPersistence::open(application_path)?);
+    let copy_gate = CopyGate::new(config.data_root.join(".live-test-copy-gate"));
     let application = Arc::new(KvService::new(
         persistence,
         format!("http://{}:50052", config.pod_ip),
+        copy_gate.clone(),
     ));
     let mut replica = ReplicaHost::new(
         ReplicaProcessConfig {
@@ -110,10 +114,12 @@ async fn main() -> Result<()> {
     let http_state = HttpState {
         application,
         replica: replica.handle(),
+        copy_gate,
     };
     let router = Router::new()
         .route("/kv/{key}", put(put_value).get(get_value))
         .route("/status", get(get_status))
+        .route("/live-test/copy-gate/{action}", put(set_copy_gate))
         .with_state(http_state);
     let listener = tokio::net::TcpListener::bind(config.application_address).await?;
     let mut http_task = tokio::spawn(
@@ -130,6 +136,18 @@ async fn main() -> Result<()> {
 
     replica.shutdown();
     Ok(())
+}
+
+async fn set_copy_gate(
+    State(state): State<HttpState>,
+    Path(action): Path<String>,
+) -> std::result::Result<&'static str, (StatusCode, String)> {
+    match action.as_str() {
+        "hold" => state.copy_gate.hold().map(|()| "held"),
+        "release" => state.copy_gate.release().map(|()| "released"),
+        _ => return Err((StatusCode::BAD_REQUEST, "unknown copy-gate action".into())),
+    }
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 async fn put_value(

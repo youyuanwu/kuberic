@@ -71,6 +71,7 @@ pub struct ReplicaDiagnostics {
 pub struct ReplicaBuildDiagnostics {
     pub build_id: String,
     pub target_instance: String,
+    pub replication_boundary_lsn: i64,
     pub durable_lsn: i64,
     pub completed: bool,
     pub catch_up_boundary_lsn: Option<i64>,
@@ -145,6 +146,7 @@ impl ReplicaHandle {
                 .map(|build| ReplicaBuildDiagnostics {
                     build_id: build.authority.build_id.to_string(),
                     target_instance: build.authority.target.instance_id.to_string(),
+                    replication_boundary_lsn: build.authority.replication_boundary_lsn,
                     durable_lsn: build.durable_lsn,
                     completed: build.completed,
                     catch_up_boundary_lsn: build.catch_up_boundary_lsn,

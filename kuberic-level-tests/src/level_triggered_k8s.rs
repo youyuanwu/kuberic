@@ -11,24 +11,6 @@ struct NetworkPartition {
     rules: Vec<(String, Vec<String>)>,
 }
 
-impl NetworkPartition {
-    fn heal(mut self) -> Result<()> {
-        for (node, rule) in self.rules.drain(..).rev() {
-            let output = Command::new("docker")
-                .args(["exec", &node, "iptables", "-D", "FORWARD"])
-                .args(&rule)
-                .output()
-                .context("removing replica network partition")?;
-            ensure!(
-                output.status.success(),
-                "cannot heal replica partition on {node}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(())
-    }
-}
-
 struct ReplicaSuspension {
     node: String,
     pid: i64,
@@ -902,6 +884,7 @@ fn retains_acknowledged_prefix(
         && report["pendingOperation"].is_null()
 }
 
+#[derive(Clone)]
 struct SwitchoverCluster {
     kubeconfig: String,
     context: String,
@@ -2928,7 +2911,6 @@ impl kuberic_controller::cluster_api::AgentApi for LiveAgents {
 struct LiveStep {
     plan: kuberic_protocol::plan::Plan,
     command: Option<(String, kuberic_wire::proto::ExecuteCommandRequest)>,
-    snapshot: kuberic_protocol::observation::ObservationSnapshot,
 }
 
 struct LiveStepper {
@@ -3005,7 +2987,6 @@ impl LiveStepper {
             Ok(LiveStep {
                 plan,
                 command: self.agents.last_command.lock().unwrap().take(),
-                snapshot,
             })
         })
     }
@@ -3838,6 +3819,477 @@ struct PhaseWriteEvidence {
     reached_candidate: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveScaleUpCopyCheckpoint {
+    operation_id: String,
+    build_id: String,
+    source: Value,
+    source_process_session: String,
+    candidate: Value,
+    candidate_process_session: String,
+    snapshot_boundary_lsn: i64,
+}
+
+fn active_scale_up_copy_checkpoint(
+    status: &Value,
+    source: &Value,
+    candidate: &Value,
+    expected_source_session: &str,
+    expected_candidate_session: &str,
+) -> Result<ActiveScaleUpCopyCheckpoint> {
+    use kuberic_protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
+
+    let provisioning: ProvisioningIntent =
+        serde_json::from_value(status["status"]["provisioning"].clone())
+            .context("active scale-up provisioning")?;
+    let scale_up = provisioning
+        .scale_up()
+        .context("active provisioning is not scale-up")?;
+    let resource_uid = ResourceUid::new(
+        status["metadata"]["uid"]
+            .as_str()
+            .context("active scale-up resource UID")?,
+    );
+    ensure!(
+        provisioning.operation_id == provisioning.expected_operation_id(),
+        "active scale-up provisioning operation is not deterministic"
+    );
+    let build_id = provisioning
+        .scale_up_build_id(&resource_uid)
+        .context("active scale-up build ID")?;
+    let target = provisioning.target_identity(&resource_uid);
+    let primary = scale_up
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| {
+            member.identity.replica_id == scale_up.previous_configuration.primary_id
+                && member.role == ReplicaRole::Primary
+        })
+        .context("active scale-up primary")?
+        .identity
+        .clone();
+    let target_json = serde_json::to_value(&target)?;
+    let primary_json = serde_json::to_value(&primary)?;
+    ensure!(
+        status["status"]["transition"].is_null()
+            && status["status"]["scaleUpAdmissionStarted"].is_null(),
+        "active-copy checkpoint was observed after transition/admission began"
+    );
+    ensure!(
+        status["status"]["topology"]["configurationId"]
+            == scale_up.previous_configuration.configuration_id.as_str(),
+        "active-copy checkpoint no longer has the exact previous accepted configuration"
+    );
+    ensure!(
+        status["status"]["topology"]["members"]
+            .as_array()
+            .is_some_and(|members| members.iter().all(|member| identity(member) != target_json)),
+        "active-copy candidate already has accepted membership credit"
+    );
+    ensure!(
+        identity(source) == primary_json
+            && source["role"] == "Primary"
+            && source["previousConfiguration"].is_null()
+            && source["currentConfiguration"]
+                == scale_up.previous_configuration.configuration_id.as_str(),
+        "active-copy source differs from exact pre-admission authority: {source}"
+    );
+    ensure!(
+        identity(candidate) == target_json
+            && candidate["role"] == "IdleSecondary"
+            && candidate["previousConfiguration"].is_null()
+            && candidate["currentConfiguration"].is_null()
+            && candidate["scaleUpOperation"].is_null()
+            && candidate["readStatus"] == "NotPrimary"
+            && matches!(
+                candidate["writeStatus"].as_str(),
+                Some("NotPrimary" | "ReconfigurationPending")
+            ),
+        "active-copy candidate is not exact, idle, and unadmitted: {candidate}"
+    );
+    let source_session = source["processSession"]
+        .as_str()
+        .filter(|session| !session.is_empty())
+        .context("active-copy source process session")?;
+    let candidate_session = candidate["processSession"]
+        .as_str()
+        .filter(|session| !session.is_empty())
+        .context("active-copy candidate process session")?;
+    ensure!(
+        source_session == expected_source_session
+            && candidate_session == expected_candidate_session,
+        "active-copy diagnostics differ from exact observed process sessions: \
+         source={source_session}/{expected_source_session} \
+         candidate={candidate_session}/{expected_candidate_session}"
+    );
+    let exact_build = |report: &Value| {
+        report["builds"]
+            .as_array()
+            .and_then(|builds| {
+                builds.iter().find(|build| {
+                    build["buildId"].as_str() == Some(build_id.as_str())
+                        && build["targetInstance"].as_str() == Some(target.instance_id.as_str())
+                })
+            })
+            .cloned()
+    };
+    let source_build = exact_build(source);
+    let candidate_build = exact_build(candidate);
+    ensure!(
+        source_build.is_some() || candidate_build.is_some(),
+        "source and candidate both lack the exact active scale-up build"
+    );
+    if source_build.is_none() {
+        ensure!(
+            source["pendingOperation"]
+                .as_str()
+                .is_some_and(|operation| operation == format!("{build_id}:build-replica")),
+            "source lacks both exact build report and exact pending build effect: {source}"
+        );
+    }
+    let boundary = source_build
+        .as_ref()
+        .or(candidate_build.as_ref())
+        .and_then(|build| build["replicationBoundaryLsn"].as_i64())
+        .context("active snapshot boundary")?;
+    ensure!(boundary >= 0, "active snapshot boundary is negative");
+    if let (Some(source_build), Some(candidate_build)) = (&source_build, &candidate_build) {
+        ensure!(
+            source_build["replicationBoundaryLsn"] == candidate_build["replicationBoundaryLsn"],
+            "source/candidate active builds disagree on snapshot boundary: \
+             source={source_build} candidate={candidate_build}"
+        );
+    }
+    ensure!(
+        source_build
+            .iter()
+            .chain(candidate_build.iter())
+            .any(|build| build["completed"] == false),
+        "exact build is already complete rather than actively held"
+    );
+    ensure!(
+        source_build
+            .iter()
+            .chain(candidate_build.iter())
+            .all(|build| build["catchUpBoundaryLsn"].is_null()),
+        "active-copy checkpoint was observed after copy enumeration completed"
+    );
+    Ok(ActiveScaleUpCopyCheckpoint {
+        operation_id: provisioning.operation_id.to_string(),
+        build_id: build_id.to_string(),
+        source: primary_json,
+        source_process_session: source_session.to_string(),
+        candidate: target_json,
+        candidate_process_session: candidate_session.to_string(),
+        snapshot_boundary_lsn: boundary,
+    })
+}
+
+fn active_copy_observed_sessions(
+    cluster: &SwitchoverCluster,
+    status: &Value,
+) -> Result<(String, String)> {
+    use kuberic_protocol::observation::AgentObservation;
+    use kuberic_protocol::types::{ProvisioningIntent, ReplicaRole, ResourceUid};
+
+    let provisioning: ProvisioningIntent =
+        serde_json::from_value(status["status"]["provisioning"].clone())?;
+    let scale_up = provisioning.scale_up().context("scale-up provisioning")?;
+    let resource_uid = ResourceUid::new(
+        status["metadata"]["uid"]
+            .as_str()
+            .context("scale-up resource UID")?,
+    );
+    let target = provisioning.target_identity(&resource_uid);
+    let primary = scale_up
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .context("scale-up primary")?
+        .identity
+        .clone();
+    let snapshot = LiveStepper::new(cluster)?.observe_snapshot(cluster)?;
+    let session = |identity| {
+        snapshot
+            .replicas
+            .values()
+            .find_map(|observation| match &observation.agent {
+                AgentObservation::Report(report) if report.identity == identity => {
+                    Some(report.process_session_id.to_string())
+                }
+                _ => None,
+            })
+            .with_context(|| format!("exact observed process session for {identity:?}"))
+    };
+    Ok((session(primary)?, session(target)?))
+}
+
+fn active_copy_reconstruction_checkpoint(
+    cluster: &SwitchoverCluster,
+    status: &Value,
+) -> Result<ActiveScaleUpCopyCheckpoint> {
+    use kuberic_protocol::observation::AgentObservation;
+    use kuberic_protocol::types::{OperationId, ProvisioningIntent, ReplicaRole, ResourceUid};
+
+    let provisioning: ProvisioningIntent =
+        serde_json::from_value(status["status"]["provisioning"].clone())?;
+    let scale_up = provisioning.scale_up().context("scale-up provisioning")?;
+    let resource_uid = ResourceUid::new(
+        status["metadata"]["uid"]
+            .as_str()
+            .context("scale-up resource UID")?,
+    );
+    let target = provisioning.target_identity(&resource_uid);
+    let build_id = provisioning
+        .scale_up_build_id(&resource_uid)
+        .context("scale-up build ID")?;
+    let primary = scale_up
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.role == ReplicaRole::Primary)
+        .context("scale-up primary")?
+        .identity
+        .clone();
+    ensure!(
+        status["status"]["transition"].is_null()
+            && status["status"]["scaleUpAdmissionStarted"].is_null()
+            && status["status"]["topology"]["configurationId"]
+                == scale_up.previous_configuration.configuration_id.as_str(),
+        "reconstructed active copy crossed transition/admission authority"
+    );
+    let snapshot = LiveStepper::new(cluster)?.observe_snapshot(cluster)?;
+    let report = |identity| {
+        snapshot
+            .replicas
+            .values()
+            .find_map(|observation| match &observation.agent {
+                AgentObservation::Report(report) if report.identity == identity => {
+                    Some(report.as_ref())
+                }
+                _ => None,
+            })
+            .with_context(|| format!("exact reconstructed report for {identity:?}"))
+    };
+    let source = report(primary.clone())?;
+    let candidate = report(target.clone())?;
+    ensure!(
+        source.role == ReplicaRole::Primary
+            && source.previous_configuration.is_none()
+            && source.current_configuration.as_ref() == Some(&scale_up.previous_configuration)
+            && candidate.role == ReplicaRole::IdleSecondary
+            && candidate.previous_configuration.is_none()
+            && candidate.current_configuration.is_none()
+            && candidate.scale_up_intent.is_none(),
+        "reconstructed active copy installed membership authority prematurely"
+    );
+    let source_build = source
+        .builds
+        .iter()
+        .find(|build| build.build_id == build_id && build.target == target);
+    let candidate_build = candidate
+        .builds
+        .iter()
+        .find(|build| build.build_id == build_id && build.target == target);
+    ensure!(
+        source_build.is_some() || candidate_build.is_some(),
+        "reconstructed source/candidate reports omit the exact build"
+    );
+    if source_build.is_none() {
+        ensure!(
+            source.pending_operation_id.as_ref()
+                == Some(&OperationId::new(format!("{build_id}:build-replica"))),
+            "reconstructed source lacks exact pending build authority"
+        );
+    }
+    let boundary = source_build
+        .or(candidate_build)
+        .map(|build| build.replication_boundary_lsn)
+        .context("reconstructed snapshot boundary")?;
+    ensure!(
+        source_build
+            .into_iter()
+            .chain(candidate_build)
+            .all(|build| {
+                build.replication_boundary_lsn == boundary
+                    && !build.completed
+                    && build.catch_up_boundary_lsn.is_none()
+            }),
+        "reconstructed exact build is conflicting or no longer active"
+    );
+    Ok(ActiveScaleUpCopyCheckpoint {
+        operation_id: provisioning.operation_id.to_string(),
+        build_id: build_id.to_string(),
+        source: serde_json::to_value(primary)?,
+        source_process_session: source.process_session_id.to_string(),
+        candidate: serde_json::to_value(target)?,
+        candidate_process_session: candidate.process_session_id.to_string(),
+        snapshot_boundary_lsn: boundary,
+    })
+}
+
+struct LiveCopyGate {
+    cluster: SwitchoverCluster,
+    source: Value,
+    deadline: Instant,
+    held: bool,
+}
+
+impl LiveCopyGate {
+    fn hold(cluster: &SwitchoverCluster, source: &Value, deadline: Instant) -> Result<Self> {
+        let mut client = DirectClient::connect(cluster, &cluster.pod(source)?, deadline)?;
+        let (code, body) = client.request("PUT", "/live-test/copy-gate/hold", "")?;
+        ensure!(
+            code == 200 && body == "held",
+            "copy gate hold failed: HTTP {code} {body}"
+        );
+        Ok(Self {
+            cluster: cluster.clone(),
+            source: source.clone(),
+            deadline,
+            held: true,
+        })
+    }
+
+    fn release(&mut self) -> Result<()> {
+        if !self.held {
+            return Ok(());
+        }
+        let release = (|| {
+            let mut client = DirectClient::connect(
+                &self.cluster,
+                &self.cluster.pod(&self.source)?,
+                self.deadline,
+            )?;
+            let (code, body) = client.request("PUT", "/live-test/copy-gate/release", "")?;
+            ensure!(
+                code == 200 && body == "released",
+                "copy gate release failed: HTTP {code} {body}"
+            );
+            Ok(())
+        })();
+        if let Err(http_error) = release {
+            let pod = self.cluster.pod(&self.source)?;
+            self.cluster
+                .kubectl(&[
+                    "-n",
+                    "default",
+                    "exec",
+                    &pod,
+                    "--",
+                    "rm",
+                    "-f",
+                    "/var/lib/kuberic/.live-test-copy-gate",
+                ])
+                .with_context(|| format!("copy gate HTTP release also failed: {http_error:#}"))?;
+        }
+        self.held = false;
+        Ok(())
+    }
+}
+
+impl Drop for LiveCopyGate {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+struct HeldActiveCopy {
+    gate: LiveCopyGate,
+    step: Option<std::thread::JoinHandle<Result<LiveStep>>>,
+}
+
+impl HeldActiveCopy {
+    fn release_and_finish(mut self) -> Result<()> {
+        self.gate.release()?;
+        if let Some(step) = self.step.take() {
+            step.join()
+                .map_err(|_| anyhow::anyhow!("active copy controller step panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HeldActiveCopy {
+    fn drop(&mut self) {
+        let _ = self.gate.release();
+        if let Some(step) = self.step.take() {
+            let _ = step.join();
+        }
+    }
+}
+
+fn begin_exact_active_copy(
+    cluster: &SwitchoverCluster,
+    source: &Value,
+    target: i64,
+    deadline: Instant,
+) -> Result<(ActiveScaleUpCopyCheckpoint, HeldActiveCopy)> {
+    let gate = LiveCopyGate::hold(cluster, source, deadline)?;
+    let mut step = None;
+    let mut build_dispatched = false;
+    loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if let (Ok(source_report), Ok(candidate_report)) = (
+            replica_diagnostics(
+                &cluster.kubeconfig,
+                &cluster.context,
+                source["replicaId"].as_i64().unwrap(),
+            ),
+            replica_diagnostics(&cluster.kubeconfig, &cluster.context, target),
+        ) && let Ok((source_session, candidate_session)) =
+            active_copy_observed_sessions(cluster, &status)
+            && let Ok(checkpoint) = active_scale_up_copy_checkpoint(
+                &status,
+                &source_report,
+                &candidate_report,
+                &source_session,
+                &candidate_session,
+            )
+        {
+            eprintln!(
+                "held exact active scale-up copy: operation={}, build={}, source_session={}, \
+                 candidate_session={}, snapshot_boundary={}",
+                checkpoint.operation_id,
+                checkpoint.build_id,
+                checkpoint.source_process_session,
+                checkpoint.candidate_process_session,
+                checkpoint.snapshot_boundary_lsn
+            );
+            return Ok((checkpoint, HeldActiveCopy { gate, step }));
+        }
+        if step
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            let finished = step
+                .take()
+                .expect("finished active-copy step remains present")
+                .join()
+                .map_err(|_| anyhow::anyhow!("active copy controller step panicked"))?;
+            finished?;
+        }
+        if !build_dispatched
+            && scale_up_progress_condition(&status)
+                .and_then(|condition| condition["reason"].as_str())
+                == Some("ScaleUpCopying")
+            && status["status"]["transition"].is_null()
+        {
+            let owned = cluster.clone();
+            build_dispatched = true;
+            step = Some(std::thread::spawn(move || {
+                manual_live_step(&owned, deadline)
+            }));
+        } else if !build_dispatched {
+            manual_live_step(cluster, deadline)?;
+        }
+        poll(deadline, "exact active scale-up copy checkpoint")?;
+    }
+}
+
 fn candidate_delivery_matches(report: &Value, evidence: &PhaseWriteEvidence) -> bool {
     if identity(report) != evidence.candidate
         || report["processSession"].as_str() != Some(&evidence.candidate_process_session)
@@ -4263,89 +4715,34 @@ impl<'a> ScaleUpCase<'a> {
         Ok(())
     }
 
-    fn maybe_write_after_snapshot_boundary(&mut self, step: &LiveStep) -> Result<()> {
-        use kuberic_protocol::observation::AgentObservation;
-        let target = self.accepted["members"]
-            .as_array()
-            .context("accepted members")?
-            .len() as i64
-            + 1;
-        if self.phase_writes.contains_key(&(target, "copy")) {
-            return Ok(());
-        }
-        let reports = step
-            .snapshot
-            .replicas
-            .values()
-            .filter_map(|observation| match &observation.agent {
-                AgentObservation::Report(report) => Some(report.as_ref()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let Some(source) = reports.iter().copied().find(|report| {
-            report.identity.replica_id.value() == self.primary["replicaId"].as_i64().unwrap()
-                && report.identity.instance_id.as_str()
-                    == self.primary["instanceId"].as_str().unwrap()
-        }) else {
-            return Ok(());
-        };
-        let Some(candidate) = reports
-            .iter()
-            .copied()
-            .find(|report| report.identity.replica_id.value() == target)
-        else {
-            return Ok(());
-        };
-        let source_build = source
-            .builds
-            .iter()
-            .find(|build| build.target == candidate.identity);
-        let candidate_build = candidate
-            .builds
-            .iter()
-            .find(|build| build.target == candidate.identity);
-        let Some(boundary_lsn) = source_build
-            .map(|build| build.replication_boundary_lsn)
-            .or_else(|| candidate_build.map(|build| build.replication_boundary_lsn))
-        else {
-            return Ok(());
-        };
-        if let (Some(source_build), Some(candidate_build)) = (source_build, candidate_build) {
-            ensure!(
-                source_build.build_id == candidate_build.build_id
-                    && source_build.replication_boundary_lsn
-                        == candidate_build.replication_boundary_lsn,
-                "source/candidate reported conflicting snapshot enumeration boundaries"
-            );
-        }
-        if source_build.is_some_and(|build| build.completed)
-            && candidate_build.is_some_and(|build| build.completed)
-        {
-            return Ok(());
-        }
+    fn write_during_exact_active_copy(&mut self, target: i64) -> Result<()> {
+        let (checkpoint, held) =
+            begin_exact_active_copy(self.cluster, &self.primary, target, self.deadline)?;
+        ensure!(
+            checkpoint.candidate["replicaId"].as_i64() == Some(target),
+            "held copy targeted the wrong candidate: {checkpoint:?}"
+        );
         let write_lsn = self.write(&format!("copy-target-{target}"))?;
         ensure!(
-            write_lsn > boundary_lsn,
+            write_lsn > checkpoint.snapshot_boundary_lsn,
             "copy-phase acknowledged write LSN {write_lsn} did not exceed \
-             snapshot boundary {boundary_lsn}"
+             snapshot boundary {}",
+            checkpoint.snapshot_boundary_lsn
         );
         self.phase_writes.insert(
             (target, "copy"),
             PhaseWriteEvidence {
                 target,
                 phase: "copy",
-                boundary_lsn,
+                boundary_lsn: checkpoint.snapshot_boundary_lsn,
                 write_lsn,
-                candidate: serde_json::to_value(&candidate.identity)?,
-                candidate_process_session: candidate.process_session_id.to_string(),
-                build_id: source_build
-                    .or(candidate_build)
-                    .expect("frozen build evidence")
-                    .build_id
-                    .to_string(),
+                candidate: checkpoint.candidate,
+                candidate_process_session: checkpoint.candidate_process_session,
+                build_id: checkpoint.build_id,
                 reached_candidate: false,
             },
         );
+        held.release_and_finish()?;
         Ok(())
     }
 
@@ -4360,6 +4757,8 @@ impl<'a> ScaleUpCase<'a> {
             let intent = &status["status"]["transition"]["scaleUp"];
             if intent.is_object()
                 && status["status"]["scaleUpAdmissionStarted"] == intent["operationId"]
+                && status["status"]["topology"]["configurationId"]
+                    == intent["previousConfiguration"]["configurationId"]
                 && let Ok(intent) =
                     serde_json::from_value::<kuberic_protocol::types::ScaleUpIntent>(intent.clone())
                 && let Ok(current) =
@@ -4390,7 +4789,15 @@ impl<'a> ScaleUpCase<'a> {
                         && report.scale_up_intent.as_deref() == Some(&intent)
                         && report.pending_operation_id.is_none()
                 };
-                if source.is_some_and(exact_pc_cc) && candidate.is_some_and(exact_pc_cc) {
+                if source.is_some_and(|report| {
+                    exact_pc_cc(report)
+                        && report.identity == intent.primary
+                        && report.role == kuberic_protocol::types::ReplicaRole::Primary
+                }) && candidate.is_some_and(|report| {
+                    exact_pc_cc(report)
+                        && report.identity == intent.target
+                        && report.role == kuberic_protocol::types::ReplicaRole::ActiveSecondary
+                }) {
                     let write_lsn = self.write(&format!("admission-target-{target}"))?;
                     let boundary_lsn = intent.catch_up_boundary_lsn;
                     ensure!(
@@ -4437,8 +4844,16 @@ impl<'a> ScaleUpCase<'a> {
                 self.process_status(&status)?;
                 return Ok(status);
             }
-            let step = manual_live_step(self.cluster, self.deadline)?;
-            self.maybe_write_after_snapshot_boundary(&step)?;
+            let target = self.accepted["members"]
+                .as_array()
+                .context("accepted members")?
+                .len() as i64
+                + 1;
+            if target <= count as i64 && !self.phase_writes.contains_key(&(target, "copy")) {
+                self.write_during_exact_active_copy(target)?;
+            } else {
+                manual_live_step(self.cluster, self.deadline)?;
+            }
             poll(
                 self.deadline,
                 &format!("manually stepped stable scale-up to {count}"),
@@ -4821,6 +5236,175 @@ fn scale_up_candidate_delivery_requires_exact_incarnation_session_and_build() {
 }
 
 #[test]
+fn scale_up_active_copy_oracle_requires_exact_unadmitted_inflight_build() {
+    use kuberic_protocol::types::{
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
+        OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
+        ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpProvisioning,
+    };
+
+    let resource_uid = ResourceUid::new("set-uid");
+    let primary = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("primary-pod"),
+        agent_generation: AgentGeneration::new("primary-generation"),
+    };
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let previous_policy = EffectivePolicy::fixed(1, 3).unwrap();
+    let current_policy = EffectivePolicy::fixed(2, 3).unwrap();
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: previous.clone(),
+            previous_policy,
+            current_policy,
+            target_replica_id: ReplicaId::new(2),
+        }),
+        pod_uid: PodUid::new("candidate-pod"),
+        pvc_uid: PvcUid::new("candidate-pvc"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let build_id = provisioning.scale_up_build_id(&resource_uid).unwrap();
+    let status = json!({
+        "metadata":{"uid":resource_uid},
+        "status":{
+            "topology":serde_json::to_value(&previous).unwrap(),
+            "provisioning":serde_json::to_value(&provisioning).unwrap(),
+            "transition":null,
+            "scaleUpAdmissionStarted":null
+        }
+    });
+    let build = json!({
+        "buildId":build_id,
+        "targetInstance":target.instance_id,
+        "replicationBoundaryLsn":7,
+        "durableLsn":7,
+        "completed":false,
+        "catchUpBoundaryLsn":null
+    });
+    let source = json!({
+        "replicaId":primary.replica_id,
+        "instanceId":primary.instance_id,
+        "agentGeneration":primary.agent_generation,
+        "processSession":"source-session",
+        "role":"Primary",
+        "previousConfiguration":null,
+        "currentConfiguration":previous.configuration_id,
+        "scaleUpOperation":null,
+        "readStatus":"Granted",
+        "writeStatus":"Granted",
+        "builds":[build.clone()]
+    });
+    let candidate = json!({
+        "replicaId":target.replica_id,
+        "instanceId":target.instance_id,
+        "agentGeneration":target.agent_generation,
+        "processSession":"candidate-session",
+        "role":"IdleSecondary",
+        "previousConfiguration":null,
+        "currentConfiguration":null,
+        "scaleUpOperation":null,
+        "readStatus":"NotPrimary",
+        "writeStatus":"NotPrimary",
+        "builds":[build]
+    });
+    assert!(
+        active_scale_up_copy_checkpoint(
+            &status,
+            &source,
+            &candidate,
+            "source-session",
+            "candidate-session"
+        )
+        .is_ok()
+    );
+
+    let mut invalid = Vec::new();
+    let mut empty_builds = source.clone();
+    empty_builds["builds"] = json!([]);
+    let mut empty_candidate_builds = candidate.clone();
+    empty_candidate_builds["builds"] = json!([]);
+    invalid.push((
+        "empty builds",
+        status.clone(),
+        empty_builds,
+        empty_candidate_builds,
+    ));
+    let mut wrong_build = source.clone();
+    wrong_build["builds"][0]["buildId"] = json!("wrong-build");
+    let mut wrong_candidate_build = candidate.clone();
+    wrong_candidate_build["builds"][0]["buildId"] = json!("wrong-build");
+    invalid.push((
+        "wrong build",
+        status.clone(),
+        wrong_build,
+        wrong_candidate_build,
+    ));
+    let mut wrong_identity = candidate.clone();
+    wrong_identity["instanceId"] = json!("wrong-candidate");
+    invalid.push((
+        "wrong identity",
+        status.clone(),
+        source.clone(),
+        wrong_identity,
+    ));
+    let mut wrong_session = candidate.clone();
+    wrong_session["processSession"] = json!("wrong-session");
+    invalid.push((
+        "wrong session",
+        status.clone(),
+        source.clone(),
+        wrong_session,
+    ));
+    let mut pc_cc = status.clone();
+    pc_cc["status"]["transition"] = json!({"kind":"scaleUp"});
+    let mut admitted_candidate = candidate.clone();
+    admitted_candidate["role"] = json!("ActiveSecondary");
+    admitted_candidate["previousConfiguration"] = json!(previous.configuration_id.as_str());
+    admitted_candidate["currentConfiguration"] = json!("expanded-configuration");
+    invalid.push(("PC/CC installed", pc_cc, source.clone(), admitted_candidate));
+    let mut post_admission = status.clone();
+    post_admission["status"]["scaleUpAdmissionStarted"] = json!(provisioning.operation_id.as_str());
+    invalid.push((
+        "post admission",
+        post_admission,
+        source.clone(),
+        candidate.clone(),
+    ));
+    let mut completed_source = source.clone();
+    completed_source["builds"][0]["completed"] = json!(true);
+    let mut completed_candidate = candidate.clone();
+    completed_candidate["builds"][0]["completed"] = json!(true);
+    invalid.push(("post copy", status, completed_source, completed_candidate));
+
+    for (case, status, source, candidate) in invalid {
+        assert!(
+            active_scale_up_copy_checkpoint(
+                &status,
+                &source,
+                &candidate,
+                "source-session",
+                "candidate-session"
+            )
+            .is_err(),
+            "{case} evidence passed the active-copy oracle"
+        );
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn scale_up_retry_classifiers_propagate_unknown_failures() {
     use kuberic_controller::ControllerError;
@@ -5074,6 +5658,38 @@ fn write_routed(
     assert_routed_service_write(cluster, primary, &key, &value, deadline)?;
     acknowledged.push((key, value));
     Ok(())
+}
+
+fn write_routed_after_boundary(
+    cluster: &SwitchoverCluster,
+    primary: &Value,
+    primary_client: &mut DirectClient,
+    acknowledged: &mut Vec<(String, String)>,
+    label: &str,
+    boundary_lsn: i64,
+    deadline: Instant,
+) -> Result<(String, String, i64)> {
+    let key = format!("scale-up-adversarial-{label}-{}", acknowledged.len());
+    let value = format!("acknowledged-{key}");
+    let before = primary_client.report()?["committedLsn"]
+        .as_i64()
+        .context("committed LSN before routed active-copy write")?;
+    assert_routed_service_write(cluster, primary, &key, &value, deadline)?;
+    let write_lsn = loop {
+        let committed = primary_client.report()?["committedLsn"]
+            .as_i64()
+            .context("committed LSN after routed active-copy write")?;
+        if committed > before {
+            break committed;
+        }
+        poll(deadline, "routed active-copy write committed LSN")?;
+    };
+    ensure!(
+        write_lsn > boundary_lsn,
+        "active-copy acknowledged write LSN {write_lsn} did not exceed snapshot boundary {boundary_lsn}"
+    );
+    acknowledged.push((key.clone(), value.clone()));
+    Ok((key, value, write_lsn))
 }
 
 fn verify_acknowledged(
@@ -5397,95 +6013,145 @@ fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(S
     )?;
     let pause = ControllerPause::new(cluster)?;
     patch_replicas(cluster, 4)?;
-    let mut old_candidate = None;
-    let mut old_provisioning_id = None;
-    let mut restarted_sessions = None;
+    let (checkpoint, held_copy) = begin_exact_active_copy(cluster, &old_primary, 4, deadline)?;
+    let old_candidate = exact_replica_resources(cluster, 4)?;
+    let old_provisioning_id = checkpoint.operation_id.clone();
+    let candidate_before = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 4)?;
+    let source_before = replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+    ensure!(
+        source_before["processSession"] == checkpoint.source_process_session
+            && candidate_before["processSession"] == checkpoint.candidate_process_session,
+        "active-copy checkpoint sessions changed before restart injection: \
+         checkpoint={checkpoint:?} source={source_before} candidate={candidate_before}"
+    );
+    let mut old_source = DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
+    let (copy_key, _copy_value, copy_write_lsn) = write_routed_after_boundary(
+        cluster,
+        &old_primary,
+        &mut old_source,
+        &mut acknowledged,
+        "during-held-copy",
+        checkpoint.snapshot_boundary_lsn,
+        deadline,
+    )?;
+    kill_replica_process(&cluster.kubeconfig, &cluster.context, 4)?;
+    let candidate_after =
+        wait_process_session_change(cluster, 4, &candidate_before["processSession"], deadline)?;
+    ensure!(
+        identity(&candidate_after) == identity(&candidate_before),
+        "candidate process restart changed its frozen identity: before={candidate_before} after={candidate_after}"
+    );
+    let after_candidate_restart = loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        let source = replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+        if let Ok((source_session, candidate_session)) =
+            active_copy_observed_sessions(cluster, &status)
+            && let Ok(active) = active_scale_up_copy_checkpoint(
+                &status,
+                &source,
+                &candidate_after,
+                &source_session,
+                &candidate_session,
+            )
+        {
+            break active;
+        }
+        poll(
+            deadline,
+            "candidate restart under exact active-copy authority",
+        )?;
+    };
+    ensure!(
+        after_candidate_restart.operation_id == checkpoint.operation_id
+            && after_candidate_restart.build_id == checkpoint.build_id
+            && after_candidate_restart.candidate_process_session
+                != checkpoint.candidate_process_session,
+        "candidate restart did not reconstruct the same exact active build: \
+         before={checkpoint:?} after={after_candidate_restart:?}"
+    );
+    kill_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
+    drop(old_source);
+    let after_source_restart = loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
+        if let Ok(active) = active_copy_reconstruction_checkpoint(cluster, &status)
+            && active.source_process_session != checkpoint.source_process_session
+        {
+            break active;
+        }
+        poll(deadline, "source restart under exact active-copy authority")?;
+    };
+    ensure!(
+        after_source_restart.operation_id == checkpoint.operation_id
+            && after_source_restart.build_id == checkpoint.build_id
+            && after_source_restart.source_process_session != checkpoint.source_process_session
+            && after_source_restart.candidate_process_session
+                == after_candidate_restart.candidate_process_session,
+        "source restart did not reconstruct the same exact active build: \
+         before={checkpoint:?} after={after_source_restart:?}"
+    );
+    let copy_evidence = PhaseWriteEvidence {
+        target: 4,
+        phase: "copy",
+        boundary_lsn: checkpoint.snapshot_boundary_lsn,
+        write_lsn: copy_write_lsn,
+        candidate: checkpoint.candidate.clone(),
+        candidate_process_session: after_source_restart.candidate_process_session.clone(),
+        build_id: checkpoint.build_id.clone(),
+        reached_candidate: false,
+    };
+    held_copy.release_and_finish()?;
     loop {
         let status = cluster.status()?;
         assert_scale_up_condition_context(&status)?;
-        let reason = scale_up_progress_condition(&status)
-            .and_then(|condition| condition["reason"].as_str())
-            .unwrap_or_default();
-        if reason == "ScaleUpCopying"
-            && status["status"]["transition"].is_null()
-            && restarted_sessions.is_none()
-        {
-            old_candidate = Some(exact_replica_resources(cluster, 4)?);
-            old_provisioning_id = Some(
-                status["status"]["provisioning"]["operationId"]
-                    .as_str()
-                    .context("old pre-admission provisioning operation")?
-                    .to_string(),
-            );
-            let candidate_before = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 4)?;
-            let source_before =
-                replica_diagnostics(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
-            let mut old_source =
-                DirectClient::connect(cluster, &cluster.pod(&old_primary)?, deadline)?;
-            let partition = cluster.partition_replication(4)?;
-            write_routed(
-                cluster,
-                &old_primary,
-                &mut acknowledged,
-                "during-blocked-copy",
-                deadline,
-            )?;
-            kill_replica_process(&cluster.kubeconfig, &cluster.context, 4)?;
-            let candidate_after = wait_process_session_change(
-                cluster,
-                4,
-                &candidate_before["processSession"],
-                deadline,
-            )?;
+        ensure!(
+            status["status"]["scaleUpAdmissionStarted"].is_null(),
+            "copy delivery crossed the admission fence before exact candidate durability: {status}"
+        );
+        let candidate = replica_diagnostics(&cluster.kubeconfig, &cluster.context, 4)?;
+        if candidate_delivery_matches(&candidate, &copy_evidence) {
             ensure!(
-                identity(&candidate_after) == identity(&candidate_before),
-                "candidate process restart changed its frozen identity: before={candidate_before} after={candidate_after}"
+                candidate["currentProgress"]
+                    .as_i64()
+                    .is_some_and(|progress| progress >= copy_write_lsn),
+                "candidate build report claimed delivery without durable application progress: {candidate}"
             );
-            partition.heal()?;
-            kill_replica_process(&cluster.kubeconfig, &cluster.context, old_primary_id)?;
-            let source_after = wait_process_session_change(
-                cluster,
-                old_primary_id,
-                &source_before["processSession"],
-                deadline,
-            )?;
-            ensure!(
-                identity(&source_after) == identity(&source_before),
-                "source process restart changed its frozen identity: before={source_before} after={source_after}"
-            );
-            check_old_session_response(old_source.request(
-                "PUT",
-                "/kv/stale-scale-up-copy-source-session",
-                "forbidden",
-            ))?;
-            write_routed(
-                cluster,
-                &old_primary,
-                &mut acknowledged,
-                "after-copy-restarts",
-                deadline,
-            )?;
-            restarted_sessions = Some((
-                source_before["processSession"].clone(),
-                source_after["processSession"].clone(),
-                candidate_before["processSession"].clone(),
-                candidate_after["processSession"].clone(),
-            ));
+            break;
         }
+        manual_live_step(cluster, deadline)?;
+        poll(deadline, "held-copy write durable on restarted candidate")?;
+    }
+    loop {
+        let status = cluster.status()?;
+        assert_scale_up_condition_context(&status)?;
         if status["status"]["transition"]["scaleUp"].is_object()
             && status["status"]["scaleUpAdmissionStarted"].is_null()
-            && restarted_sessions.is_some()
         {
             break;
         }
         manual_live_step(cluster, deadline)?;
         poll(deadline, "restarted copy through pre-admission boundary")?;
     }
-    let old_provisioning_id =
-        old_provisioning_id.context("pre-admission copy operation was not observed")?;
-    let old_candidate = old_candidate.context("pre-admission candidate was not observed")?;
-    let (_, restarted_source_session, _, restarted_candidate_session) =
-        restarted_sessions.context("source and candidate restarts were not observed")?;
+    write_routed(
+        cluster,
+        &old_primary,
+        &mut acknowledged,
+        "after-copy-restarts",
+        deadline,
+    )?;
+    let restarted_source_session = after_source_restart.source_process_session.clone();
+    let restarted_candidate_session = after_source_restart.candidate_process_session.clone();
+    eprintln!(
+        "restarted exact active copy resumed: operation={}, build={}, source_session={} -> {}, \
+         candidate_session={} -> {}, write={copy_key}@{copy_write_lsn}",
+        checkpoint.operation_id,
+        checkpoint.build_id,
+        checkpoint.source_process_session,
+        restarted_source_session,
+        checkpoint.candidate_process_session,
+        restarted_candidate_session
+    );
     let old_uids = old_candidate
         .iter()
         .map(|resource| (resource.kind, resource.uid().to_string()))
