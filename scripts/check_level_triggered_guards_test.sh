@@ -67,6 +67,7 @@ new_git_repo "$sqlite_scope"
 mkdir -p "$sqlite_scope/examples/sqlite/src"
 printf 'pub fn sqlite() {}\n' > "$sqlite_scope/examples/sqlite/src/lib.rs"
 (cd "$sqlite_scope" && scripts/check_level_triggered_scope.sh HEAD)
+(cd "$sqlite_scope" && git add examples/sqlite/src/lib.rs && scripts/check_level_triggered_scope.sh HEAD)
 
 new_cargo_repo() {
     local directory=$1
@@ -185,11 +186,24 @@ kuberic-core = { path = "../../kuberic-core" }
 EOF
 expect_dependency_failure "$sqlite_dependency"
 
+# Reject both classic runtime and operator dependencies on the migrated package.
+mv "$sqlite_dependency/kuberic-core" "$sqlite_dependency/kuberic-operator"
+sed -i 's/kuberic-core/kuberic-operator/g' \
+    "$sqlite_dependency/Cargo.toml" \
+    "$sqlite_dependency/examples/sqlite/Cargo.toml" \
+    "$sqlite_dependency/kuberic-operator/Cargo.toml"
+expect_dependency_failure "$sqlite_dependency"
+
 sqlite_source="$temporary/sqlite-source"
 new_sqlite_repo "$sqlite_source"
 cat > "$sqlite_source/examples/sqlite/src/lib.rs" <<'EOF'
 include!("../../../kuberic-core/src/types.rs");
 EOF
 expect_dependency_failure "$sqlite_source"
+
+sqlite_symlink="$temporary/sqlite-symlink"
+new_sqlite_repo "$sqlite_symlink"
+ln -s ../../../kuberic-core/src/types.rs "$sqlite_symlink/examples/sqlite/src/classic.rs"
+expect_dependency_failure "$sqlite_symlink"
 
 echo "Level-triggered guard regression tests passed."

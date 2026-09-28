@@ -24,7 +24,7 @@ new_packages = {
     "kuberic-agent",
     "kuberic-controller",
     "kvstore2",
-    "sqlite-replicated",
+    "sqlite-replicated",  # Migrated in place; never allow classic dependencies back in.
     "sqlite-commit-barrier",
     "kuberic-level-tests",
 }

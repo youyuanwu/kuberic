@@ -100,12 +100,16 @@ integrity, exact storage identity, and the exact schema version. The current
 migration hook is idempotent only for that version; it is not an older-schema
 upgrade path.
 
-Schema **3** intentionally rejects schema 2 and unknown versions without
+Schema **4** intentionally rejects schemas 2 and 3 and unknown versions without
 migration. Initialization identity (including its original policy) remains
 immutable. Admitted PC/CC policies are separate durable authority; reduced or
 expanded policy does not rewrite initialization replay or Pod/PVC validation.
-Schema 3 adds exact scale-up initialization, build-boundary, PC/CC/current-only
-admission, carried-failover, and bounded completion evidence.
+Schema 3 introduced exact scale-up initialization, build-boundary,
+PC/CC/current-only admission, carried-failover, and bounded completion evidence.
+Schema 4 retains that evidence and establishes committed snapshot boundaries:
+the exact applied suffix is delivered separately through retained catch-up.
+Source restart reuses immutable build authority; final-marker commitment must
+equal that boundary. This is a fresh-storage contract, not an old-schema upgrade.
 
 The controller enables SF-inspired secondary scale-down using PC/CC quorum
 principles, with Kuberic-specific target/minimum coupling, deterministic
@@ -165,7 +169,7 @@ means a retirement tombstone exists. The JSON field is additive; older diagnosti
 responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
-Use a fresh coordinated protocol-8/schema-3 deployment, not a rolling upgrade.
+Use a fresh coordinated protocol-8/schema-4 deployment, not a rolling upgrade.
 Exact original PVC provenance must be reconstructable before admission; if Pod
 and PVC already disappeared without that provenance, scale-down waits/fails
 closed rather than treating list omission as absence. Unavailable-target support
@@ -174,7 +178,7 @@ has no retention or import path, not a physical storage erasure guarantee.
 Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequential
 cleanup must finish, and every retained member needs its original completed
 current-only witness or fresh completed local acceptance before superseding the
-bounded receipt. Sequential scale-up uses durable schema-3 build and admission
+bounded receipt. Sequential scale-up uses durable schema-4 build and admission
 authority, preserves healthy same-primary writes only while both PC/CC quorums
 remain authorized, and retries failed unadmitted candidates only after exact
 endpoint→Pod→PVC cleanup. Carried failover first installs a write-closed
@@ -187,7 +191,7 @@ configuration, policy, final epoch, and safe prefix. The completion receipt keep
 that proof with a provisional-primary reference instead of duplicating the full
 intent/configuration, so a returning provisional member can advance through
 final PC/CC and current-only without accepting unrelated stale authority. Protocol
-8/schema 3 require a fresh coordinated deployment; classic v1 remains unchanged.
+8/schema 4 require a fresh coordinated deployment; classic v1 remains unchanged.
 These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
