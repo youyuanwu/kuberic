@@ -61,6 +61,626 @@ mod removal_fixture;
 #[path = "support/removal_oracle.rs"]
 mod removal_oracle;
 
+#[cfg(feature = "testing")]
+mod in_process_transport_tests {
+    use super::*;
+    use futures::FutureExt;
+    use kuberic_agent::testing::{
+        ControlOutput, InProcessTransport, Message, TransportError, TransportEvent,
+    };
+
+    async fn receiver(
+        local: ReplicaIdentity,
+        members: Vec<ReplicaIdentity>,
+        manual: bool,
+    ) -> (Arc<TestApplication>, Arc<PodRuntime>) {
+        let application = Arc::new(TestApplication::default());
+        application.manual_streams.store(manual, Ordering::SeqCst);
+        let runtime = Arc::new(PodRuntime::new(
+            local.clone(),
+            application.clone(),
+            Arc::new(MemoryAuthorityStore::default()),
+        ));
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::New),
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority(local, members))),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime
+                .apply_effect(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+        (application, runtime)
+    }
+
+    pub(super) async fn event(
+        transport: &mut InProcessTransport,
+        predicate: impl Fn(&TransportEvent) -> bool,
+    ) -> TransportEvent {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                for event in transport.next().await.events {
+                    if predicate(&event) {
+                        return event;
+                    }
+                    if let TransportEvent::Rejected { error, .. } = event {
+                        panic!("unexpected transport rejection: {error}");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected transport event")
+    }
+
+    async fn persist(
+        application: &TestApplication,
+        operation: &kuberic_runtime::replicator::stream::StreamOperation,
+    ) -> DurableApplicationProgress {
+        let OperationMetadata::Replication { lsn, committed_lsn } = operation.metadata else {
+            panic!("expected replication")
+        };
+        application
+            .apply(Operation {
+                lsn,
+                committed_lsn,
+                data: operation.data.clone(),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn received_is_not_applied_and_idle_excludes_pending_acknowledgements() {
+        let primary = identity(1, "primary");
+        let secondary = identity(2, "secondary");
+        let members = vec![primary.clone(), secondary.clone()];
+        let source_app = Arc::new(TestApplication::default());
+        let source = open_primary(source_app.clone(), members.clone()).await;
+        let (target_app, target) = receiver(secondary, members, true).await;
+        let mut transport = InProcessTransport::new();
+        transport
+            .register(source.clone(), ProcessSessionId::new("source-session"))
+            .await
+            .unwrap();
+        transport
+            .register(target.clone(), ProcessSessionId::new("target-session"))
+            .await
+            .unwrap();
+        assert!(transport.pump().idle);
+        let state = source_app.state_replicator.lock().unwrap().clone().unwrap();
+        let write = tokio::spawn(async move { state.replicate(Bytes::from_static(b"one")).await });
+        let received = event(&mut transport, |e| {
+            matches!(e, TransportEvent::Received { .. })
+        })
+        .await;
+        let TransportEvent::Received {
+            acknowledgement, ..
+        } = received
+        else {
+            unreachable!()
+        };
+        assert_eq!(acknowledgement.received_lsn, 1);
+        assert_eq!(acknowledgement.applied_lsn, 0);
+        assert_eq!(acknowledgement.receiver_session_id, "target-session");
+        let report = transport.pump();
+        assert!(!report.idle);
+        assert_eq!(report.in_flight, 1);
+        let mut stream = target_app.held_streams.lock().unwrap().remove(0);
+        let operation = stream.get_operation().await.unwrap().unwrap();
+        let progress = persist(&target_app, &operation).await;
+        assert!(!write.is_finished());
+        assert!(
+            !transport.pump().idle,
+            "persistence without a service ACK is insufficient"
+        );
+        assert!(
+            transport.next().now_or_never().is_none(),
+            "cancelling a wait must retain the pending delivery"
+        );
+        operation.acknowledge(progress).unwrap();
+        let applied = event(&mut transport, |e| {
+            matches!(e, TransportEvent::Applied { .. })
+        })
+        .await;
+        let TransportEvent::Applied {
+            acknowledgement, ..
+        } = applied
+        else {
+            unreachable!()
+        };
+        assert_eq!(acknowledgement.applied_lsn, 1);
+        assert_eq!(write.await.unwrap().unwrap(), 1);
+        assert!(transport.pump().idle);
+        assert_eq!(target.snapshot().await.verified_replication_lsn, Some(1));
+    }
+
+    #[tokio::test]
+    async fn rejected_and_dropped_operations_never_earn_applied_credit() {
+        for reject in [false, true] {
+            let members = vec![identity(1, "primary"), identity(2, "secondary")];
+            let source_app = Arc::new(TestApplication::default());
+            let source = open_primary(source_app.clone(), members.clone()).await;
+            let (target_app, target) = receiver(members[1].clone(), members, true).await;
+            let mut transport = InProcessTransport::new();
+            transport
+                .register(source.clone(), ProcessSessionId::new("source"))
+                .await
+                .unwrap();
+            transport
+                .register(target, ProcessSessionId::new("target"))
+                .await
+                .unwrap();
+            let state = source_app.state_replicator.lock().unwrap().clone().unwrap();
+            let write =
+                tokio::spawn(async move { state.replicate(Bytes::from_static(b"one")).await });
+            event(&mut transport, |e| {
+                matches!(e, TransportEvent::Received { .. })
+            })
+            .await;
+            let mut stream = target_app.held_streams.lock().unwrap().remove(0);
+            let operation = stream.get_operation().await.unwrap().unwrap();
+            if reject {
+                operation
+                    .reject(RuntimeError::Application("explicit rejection".into()))
+                    .unwrap();
+            } else {
+                drop(operation);
+            }
+            event(&mut transport, |e| {
+                matches!(e, TransportEvent::Rejected { .. })
+            })
+            .await;
+            assert_eq!(source_app.progress.lock().unwrap().committed_lsn, 0);
+            assert!(!write.is_finished());
+            assert!(
+                transport.pump().idle,
+                "transport idle does not imply client quorum"
+            );
+            source.abort();
+            assert!(write.await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_uses_full_identity_and_rejects_stale_wire_sessions() {
+        let primary = identity(1, "primary");
+        let secondary = identity(2, "current");
+        let source = open_primary(
+            Arc::new(TestApplication::default()),
+            vec![primary.clone(), secondary.clone()],
+        )
+        .await;
+        let (current_app, current) =
+            receiver(secondary.clone(), vec![primary, secondary], false).await;
+        let old_app = Arc::new(TestApplication::default());
+        let old = Arc::new(PodRuntime::new(
+            identity(2, "old-incarnation"),
+            old_app.clone(),
+            Arc::new(MemoryAuthorityStore::default()),
+        ));
+        old.apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+            .await
+            .unwrap();
+        let mut transport = InProcessTransport::new();
+        transport
+            .register(source.clone(), ProcessSessionId::new("source"))
+            .await
+            .unwrap();
+        transport
+            .register(current, ProcessSessionId::new("current"))
+            .await
+            .unwrap();
+        transport
+            .register(old, ProcessSessionId::new("old"))
+            .await
+            .unwrap();
+        let pending = source
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("exact-route"),
+                data: Bytes::from_static(b"one"),
+            })
+            .await
+            .unwrap();
+        let raw = pending.replication_items[0].clone();
+        assert!(matches!(
+            transport.enqueue(Message::Replication(raw.clone())),
+            Err(TransportError::StaleSession { .. })
+        ));
+        let mut absent = raw.clone();
+        absent.receiver = Some(identity(2, "unregistered-incarnation").into());
+        assert!(matches!(
+            transport.bind(Message::Replication(absent)),
+            Err(TransportError::Unregistered(_))
+        ));
+        let mut wrong_generation = raw.clone();
+        wrong_generation.receiver.as_mut().unwrap().agent_generation = "obsolete-generation".into();
+        assert!(matches!(
+            transport.bind(Message::Replication(wrong_generation)),
+            Err(TransportError::Unregistered(_))
+        ));
+        let bound = transport.bind(Message::Replication(raw)).unwrap();
+        for sender in [false, true] {
+            let Message::Replication(mut stale) = bound.clone() else {
+                unreachable!()
+            };
+            if sender {
+                stale.sender_session_id = "obsolete-source".into();
+            } else {
+                stale.receiver_session_id = "obsolete-target".into();
+            }
+            assert!(matches!(
+                transport.bind(Message::Replication(stale.clone())),
+                Err(TransportError::StaleSession { .. })
+            ));
+            assert!(matches!(
+                transport.enqueue(Message::Replication(stale)),
+                Err(TransportError::StaleSession { .. })
+            ));
+        }
+        transport.enqueue(bound).unwrap();
+        event(&mut transport, |e| {
+            matches!(e, TransportEvent::Applied { .. })
+        })
+        .await;
+        assert_eq!(pending.committed().await.unwrap().lsn, 1);
+        assert_eq!(current_app.progress.lock().unwrap().applied_lsn, 1);
+        assert_eq!(old_app.progress.lock().unwrap().applied_lsn, 0);
+    }
+
+    #[tokio::test]
+    async fn replacing_a_session_cancels_old_delivery_and_rejects_delayed_replay() {
+        let members = vec![identity(1, "primary"), identity(2, "secondary")];
+        let source = open_primary(Arc::new(TestApplication::default()), members.clone()).await;
+        let (old_app, old_target) = receiver(members[1].clone(), members.clone(), true).await;
+        let mut transport = InProcessTransport::new();
+        transport
+            .register(source.clone(), ProcessSessionId::new("source"))
+            .await
+            .unwrap();
+        transport
+            .register(old_target.clone(), ProcessSessionId::new("old-session"))
+            .await
+            .unwrap();
+        let pending = source
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("restart-route"),
+                data: Bytes::from_static(b"one"),
+            })
+            .await
+            .unwrap();
+        let raw = Message::Replication(pending.replication_items[0].clone());
+        let delayed = transport.bind(raw.clone()).unwrap();
+        let ticket = transport.enqueue(delayed.clone()).unwrap();
+        event(&mut transport, |e| {
+            matches!(e, TransportEvent::Received { .. })
+        })
+        .await;
+        let mut stream = old_app.held_streams.lock().unwrap().remove(0);
+        let operation = stream.get_operation().await.unwrap().unwrap();
+        let progress = persist(&old_app, &operation).await;
+        let (new_app, new_target) = receiver(members[1].clone(), members, false).await;
+        transport
+            .register(new_target.clone(), ProcessSessionId::new("new-session"))
+            .await
+            .unwrap();
+        assert!(
+            operation.acknowledge(progress).is_err(),
+            "old waiter was cancelled"
+        );
+        let rejected = transport.pump();
+        assert!(rejected.events.iter().any(|event| matches!(event,
+            TransportEvent::Rejected { delivery: Some(id), error: TransportError::StaleSession { .. }, .. } if *id == ticket)));
+        assert_eq!(source.snapshot().await.committed_lsn, 0);
+        assert!(matches!(
+            transport.enqueue(delayed),
+            Err(TransportError::StaleSession { .. })
+        ));
+        assert!(matches!(
+            transport
+                .register(old_target, ProcessSessionId::new("old-session"))
+                .await,
+            Err(TransportError::StaleSession { .. })
+        ));
+        transport.enqueue(transport.bind(raw).unwrap()).unwrap();
+        let applied = event(&mut transport, |e| {
+            matches!(e, TransportEvent::Applied { .. })
+        })
+        .await;
+        let TransportEvent::Applied {
+            acknowledgement, ..
+        } = applied
+        else {
+            unreachable!()
+        };
+        assert_eq!(acknowledgement.receiver_session_id, "new-session");
+        assert_eq!(pending.committed().await.unwrap().lsn, 1);
+        assert_eq!(new_app.progress.lock().unwrap().applied_lsn, 1);
+        let aliased = receiver(
+            identity(2, "secondary"),
+            vec![identity(1, "primary"), identity(2, "secondary")],
+            false,
+        )
+        .await
+        .1;
+        assert!(matches!(
+            transport
+                .register(aliased, ProcessSessionId::new("new-session"))
+                .await,
+            Err(TransportError::Registration(_))
+        ));
+        assert!(transport.pump().idle);
+
+        let unfinished = source
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("before-source-restart"),
+                data: Bytes::from_static(b"two"),
+            })
+            .await
+            .unwrap();
+        let delayed = transport
+            .bind(Message::Replication(
+                unfinished.replication_items[0].clone(),
+            ))
+            .unwrap();
+        let ticket = transport.enqueue(delayed.clone()).unwrap();
+        let recovered_app = Arc::new(TestApplication::default());
+        recovered_app
+            .apply(Operation {
+                lsn: 1,
+                committed_lsn: 0,
+                data: Bytes::from_static(b"one"),
+            })
+            .await
+            .unwrap();
+        recovered_app.commit(1).await.unwrap();
+        let recovered_source = open_primary(
+            recovered_app,
+            vec![identity(1, "primary"), identity(2, "secondary")],
+        )
+        .await;
+        transport
+            .register(
+                recovered_source.clone(),
+                ProcessSessionId::new("source-restarted"),
+            )
+            .await
+            .unwrap();
+        assert!(transport.pump().events.iter().any(|event| matches!(event,
+            TransportEvent::Rejected { delivery: Some(id), error: TransportError::StaleSession { .. }, .. } if *id == ticket)));
+        assert!(matches!(
+            transport.enqueue(delayed),
+            Err(TransportError::StaleSession { .. })
+        ));
+        assert_eq!(recovered_source.snapshot().await.current_progress, 1);
+        assert_eq!(new_app.progress.lock().unwrap().applied_lsn, 1);
+        source.abort();
+        assert!(unfinished.committed().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_acknowledgements_follow_durable_service_acceptance_and_return_to_source() {
+        let source_id = identity(1, "source");
+        let target_id = identity(1, "replacement");
+        let source = open_primary(Arc::new(TestApplication::default()), vec![source_id]).await;
+        source
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("snapshot-row"),
+                data: Bytes::from_static(b"snapshot"),
+            })
+            .await
+            .unwrap()
+            .committed()
+            .await
+            .unwrap();
+        let mut prepared = prepare_copy_authorized(
+            &source,
+            PrepareCopyRequest {
+                build_id: OperationId::new("transport-copy"),
+                target: target_id.clone(),
+                configuration: BuildConfiguration::Current,
+                copy_context: empty_copy_context(),
+            },
+        )
+        .await
+        .unwrap();
+        let items = copy_through_final(&mut prepared).await;
+        let target_app = Arc::new(TestApplication::default());
+        target_app.manual_streams.store(true, Ordering::SeqCst);
+        let target = Arc::new(PodRuntime::new(
+            target_id,
+            target_app.clone(),
+            Arc::new(MemoryAuthorityStore::default()),
+        ));
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::New),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(prepared.authority.clone())),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            target
+                .apply_effect(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+        let mut transport = InProcessTransport::new();
+        transport
+            .register(source.clone(), ProcessSessionId::new("copy-source"))
+            .await
+            .unwrap();
+        transport
+            .register(target, ProcessSessionId::new("copy-target"))
+            .await
+            .unwrap();
+        let mut stream = target_app.held_streams.lock().unwrap().remove(1);
+        for item in &items {
+            let id = transport
+                .enqueue(transport.bind(Message::Copy(item.clone())).unwrap())
+                .unwrap();
+            let report = transport.pump();
+            assert_eq!(report.in_flight, 1);
+            assert!(!report.idle);
+            assert!(
+                !report
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, TransportEvent::Copied { .. }))
+            );
+            let operation = stream.get_operation().await.unwrap().unwrap();
+            let progress = match &operation.metadata {
+                OperationMetadata::Copy { build_id, sequence } => {
+                    target_app
+                        .apply_copy_chunk(
+                            build_id,
+                            *sequence,
+                            CopyChunk {
+                                data: operation.data.clone(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    target_app.durable_progress().await.unwrap()
+                }
+                OperationMetadata::CopyComplete {
+                    build_id,
+                    up_to_lsn,
+                    committed_lsn,
+                } => target_app
+                    .finish_copy(build_id, *up_to_lsn, *committed_lsn)
+                    .await
+                    .unwrap(),
+                _ => panic!("expected copy stream"),
+            };
+            operation.acknowledge(progress).unwrap();
+            let copied = event(
+                &mut transport,
+                |e| matches!(e, TransportEvent::Copied { delivery, .. } if *delivery == id),
+            )
+            .await;
+            let TransportEvent::Copied {
+                acknowledgement, ..
+            } = copied
+            else {
+                unreachable!()
+            };
+            assert_eq!(acknowledgement.sequence, item.sequence);
+            assert_eq!(acknowledgement.sender_session_id, "copy-source");
+            assert_eq!(acknowledgement.receiver_session_id, "copy-target");
+        }
+        assert!(source.snapshot().await.builds[0].completed);
+        assert_eq!(
+            *target_app.progress.lock().unwrap(),
+            DurableApplicationProgress {
+                applied_lsn: 1,
+                committed_lsn: 1
+            }
+        );
+        assert!(transport.pump().idle);
+    }
+
+    #[tokio::test]
+    async fn build_remove_and_evict_are_surfaced_without_automatic_authority_changes() {
+        let source = open_primary(
+            Arc::new(TestApplication::default()),
+            vec![identity(1, "source")],
+        )
+        .await;
+        let before = source.snapshot().await.authority;
+        let primary = source.primary_replicator().await.unwrap();
+        let target = identity(2, "replacement");
+        let info = ReplicaInformation {
+            build_id: OperationId::new("control-build"),
+            identity: target.clone(),
+            replication_address: "in-process://replacement".into(),
+        };
+        let mut transport = InProcessTransport::new();
+        transport
+            .register(source.clone(), ProcessSessionId::new("source"))
+            .await
+            .unwrap();
+        let building = tokio::spawn({
+            let primary = primary.clone();
+            async move { primary.build_replica(info).await }
+        });
+        let output = event(&mut transport, |e| {
+            matches!(
+                e,
+                TransportEvent::Control {
+                    output: ControlOutput::Build(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            matches!(output, TransportEvent::Control { output: ControlOutput::Build(endpoint), .. } if endpoint.identity == target)
+        );
+        assert!(!building.is_finished());
+        assert_eq!(source.snapshot().await.authority, before);
+        primary.remove_replica(target.replica_id).await.unwrap();
+        event(&mut transport, |e| matches!(e, TransportEvent::Control { output: ControlOutput::Remove(id), .. } if *id == target.replica_id)).await;
+        assert!(building.await.unwrap().is_err());
+        assert!(transport.pump().idle);
+
+        let intent = removal_fixture::intent(&[1, 2], 1);
+        let reduced = open_removal_member(
+            &intent,
+            intent.primary.clone(),
+            Arc::new(TestApplication::default()),
+            Arc::new(MemoryAuthorityStore::default()),
+        )
+        .await;
+        let prepared = reduced
+            .apply_effect(effect(5, prepare_removal(&intent)))
+            .await
+            .unwrap();
+        let evidence = removal_evidence(prepared.postcondition.prepared_secondary_removal.unwrap());
+        let mut admitted = AdmittedAuthority {
+            local_identity: intent.primary.clone(),
+            transition_kind: Some(TransitionKind::SecondaryScaleDown),
+            previous_configuration: Some(intent.previous_configuration.clone()),
+            current_configuration: intent.current_configuration.clone(),
+            switchover_handoff: None,
+            scale_up: None,
+            secondary_removal: Some(evidence),
+        };
+        reduced
+            .apply_effect(effect(
+                6,
+                RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+            ))
+            .await
+            .unwrap();
+        admitted.previous_configuration = None;
+        admitted.transition_kind = None;
+        reduced
+            .apply_effect(effect(
+                7,
+                RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+            ))
+            .await
+            .unwrap();
+        let mut transport = InProcessTransport::new();
+        transport
+            .register(reduced.clone(), ProcessSessionId::new("reduced"))
+            .await
+            .unwrap();
+        event(&mut transport, |e| matches!(e, TransportEvent::Control { output: ControlOutput::Evict(id), .. } if *id == intent.target)).await;
+        assert_eq!(reduced.snapshot().await.authority, Some(admitted));
+        assert!(transport.pump().idle);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_snapshots_do_not_reacquire_read_locks_behind_queued_peer_eviction() {
     let intent = removal_fixture::intent(&[1, 2], 1);
@@ -4151,24 +4771,52 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     assert!(state.get_replication_stream().await.is_err());
     assert!(state.get_copy_stream().await.is_err());
     let write = tokio::spawn(async move { state.replicate(Bytes::from_static(b"one")).await });
-    let OutboundReplication::Replication(item) = source.data_plane().next_outbound().await.unwrap()
-    else {
-        panic!("expected replication")
-    };
+    #[cfg(not(feature = "testing"))]
     let receive = {
-        let target = target.clone();
-        tokio::spawn(async move { target.data_plane().receive_replication(item).await })
+        let OutboundReplication::Replication(item) =
+            source.data_plane().next_outbound().await.unwrap()
+        else {
+            panic!("expected replication")
+        };
+        target.data_plane().receive_replication(item).await.unwrap()
+    };
+    #[cfg(feature = "testing")]
+    let mut transport = {
+        let mut transport = kuberic_agent::testing::InProcessTransport::new();
+        transport
+            .register(source.clone(), ProcessSessionId::new("service-source"))
+            .await
+            .unwrap();
+        transport
+            .register(target.clone(), ProcessSessionId::new("service-target"))
+            .await
+            .unwrap();
+        let event = in_process_transport_tests::event(&mut transport, |e| {
+            matches!(e, kuberic_agent::testing::TransportEvent::Received { .. })
+        })
+        .await;
+        let kuberic_agent::testing::TransportEvent::Received {
+            acknowledgement, ..
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(acknowledgement.received_lsn, 1);
+        assert_eq!(acknowledgement.applied_lsn, 0);
+        transport
     };
     let mut stream = target_app.held_streams.lock().unwrap().remove(0);
     let operation = stream.get_operation().await.unwrap().unwrap();
-    let receive = receive.await.unwrap().unwrap();
-    assert_eq!(receive.received.received_lsn, 1);
-    assert_eq!(receive.received.applied_lsn, 0);
-    source
-        .data_plane()
-        .accept_acknowledgement(receive.received.clone())
-        .await
-        .unwrap();
+    #[cfg(not(feature = "testing"))]
+    {
+        assert_eq!(receive.received.received_lsn, 1);
+        assert_eq!(receive.received.applied_lsn, 0);
+        source
+            .data_plane()
+            .accept_acknowledgement(receive.received.clone())
+            .await
+            .unwrap();
+    }
     assert!(!write.is_finished());
     let OperationMetadata::Replication { lsn, committed_lsn } = operation.metadata else {
         panic!("expected replication metadata")
@@ -4183,11 +4831,17 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
         .unwrap();
     assert!(!write.is_finished());
     operation.acknowledge(progress).unwrap();
+    #[cfg(not(feature = "testing"))]
     source
         .data_plane()
         .accept_acknowledgement(receive.applied().await.unwrap())
         .await
         .unwrap();
+    #[cfg(feature = "testing")]
+    in_process_transport_tests::event(&mut transport, |e| {
+        matches!(e, kuberic_agent::testing::TransportEvent::Applied { .. })
+    })
+    .await;
     assert_eq!(write.await.unwrap().unwrap(), 1);
     assert_eq!(target.snapshot().await.verified_replication_lsn, Some(1));
 }

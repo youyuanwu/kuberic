@@ -46,13 +46,13 @@ async fn waiting_without_durable_quorum_cannot_publish_sqlite_commit_bytes() {
     let first = SqlitePod::new(1, root.path().join("first"), 2).await;
     let second = SqlitePod::new(2, root.path().join("second"), 2).await;
     bootstrap(&[&first, &second]).await;
-    let routes = route(&first, &[&second]);
+    let routes = route(&first, &[&second]).await;
     first
         .execute("CREATE TABLE data(id INTEGER)")
         .await
         .unwrap();
     wait_applied(&[&second], 1).await;
-    drop(routes);
+    routes.stop().await;
     let writer = first.server.clone();
     let pending = tokio::spawn(async move {
         writer

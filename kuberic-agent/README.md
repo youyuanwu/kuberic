@@ -61,6 +61,31 @@ re-observing command postconditions, routing fences, and distributing
 deployment authentication material. Concrete outbound peer dialing is wired
 through the agent's `OutboundDispatcher` contract.
 
+## In-process application tests (opt-in)
+
+The `testing` Cargo feature exposes `testing::InProcessTransport`; it is absent
+from default production builds. Register each opened `PodRuntime` with its exact
+process session. Registration derives the full replica identity from the runtime,
+not just its numeric replica ID. A fresh registration after restart replaces old
+polling/delivery futures and rejects reuse of retired sessions; it does not
+reconstruct or transfer application data, authority, or write journals.
+
+`pump()` performs a bounded nonblocking poll in identity/delivery order.
+`next().await` waits on real queue/ACK wakers rather than sleeping or busy-polling.
+Reports distinguish received ACKs from application-applied ACKs, include pending
+delivery counts, and report idle only when nothing is ready and no delivery is
+outstanding. Transport idle does not imply cluster convergence or write quorum.
+One transport must be the sole outbound consumer of its registered runtimes.
+
+For prepared copy streams or deliberate delayed delivery, call `bind(message)`
+at emission time, retain that session-bound public wire message, then `enqueue`
+it. Copy ACKs return through the source runtime only after durable receiver
+acceptance. Missing exact endpoints, changed sessions, rejected operations, and
+dropped stream operations produce explicit errors/rejection events, never fake
+applied progress. `Build`, `Remove`, and `Evict` outputs are surfaced to the
+caller without interpreting them or granting authority. Tests remain responsible
+for agent-side admission, storage directories, process lifetime, and recovery.
+
 ## Storage and recovery contract
 
 `ReplicaHost` places metadata at

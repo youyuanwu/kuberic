@@ -1,4 +1,5 @@
 use futures::TryStreamExt;
+use kuberic_agent::testing::{InProcessTransport, TransportError, TransportEvent};
 use kuberic_protocol::types::{AccessStatus, ReplicaRole, SwitchoverRequestId, TransitionKind};
 use kuberic_runtime::engine::DurableState;
 use kuberic_runtime_internal::effects::RuntimeEffectAction;
@@ -14,7 +15,7 @@ async fn v2_sqlite_replication_covers_multi_page_schema_and_secondary_restart() 
     let second = SqlitePod::new(2, root.path().join("two"), 3).await;
     let third = SqlitePod::new(3, root.path().join("three"), 3).await;
     bootstrap(&[&first, &second, &third]).await;
-    let routes = route(&first, &[&second, &third]);
+    let routes = route(&first, &[&second, &third]).await;
     first
         .execute("CREATE TABLE data(id INTEGER PRIMARY KEY,value TEXT)")
         .await
@@ -34,7 +35,7 @@ async fn v2_sqlite_replication_covers_multi_page_schema_and_secondary_restart() 
     wait_applied(&[&second, &third], altered.lsn).await;
     assert_eq!(first.count().await, 50);
     assert!(second.query("SELECT * FROM data").await.is_err());
-    drop(routes);
+    routes.stop().await;
     let second = second.reopen().await;
     assert_eq!(
         second
@@ -45,7 +46,7 @@ async fn v2_sqlite_replication_covers_multi_page_schema_and_secondary_restart() 
             .applied_lsn,
         altered.lsn
     );
-    let _routes = route(&first, &[&second, &third]);
+    let _routes = route(&first, &[&second, &third]).await;
     let next = first
         .execute("INSERT INTO data(id,value) VALUES(50,'after-restart')")
         .await
@@ -81,6 +82,17 @@ async fn stream_ack_requires_durable_sqlite_acceptance() {
     let first = SqlitePod::new(1, root.path().join("one"), 2).await;
     let second = SqlitePod::new(2, root.path().join("two"), 2).await;
     bootstrap(&[&first, &second]).await;
+    let mut transport = InProcessTransport::new();
+    for pod in [&first, &second] {
+        transport
+            .register(pod.runtime.clone(), pod.session.id().clone())
+            .await
+            .unwrap();
+    }
+    second
+        .application
+        .persistence()
+        .fail_once(PersistenceFault::BeforeApply);
     let writer = first.server.clone();
     let pending = tokio::spawn(async move {
         use sqlite_replicated::proto::sqlite_store_server::SqliteStore;
@@ -93,28 +105,29 @@ async fn stream_ack_requires_durable_sqlite_acceptance() {
             ))
             .await
     });
-    let outgoing = first.runtime.data_plane().next_outbound().await.unwrap();
-    let kuberic_agent::hosting::OutboundReplication::Replication(item) = outgoing else {
-        panic!("expected replication");
-    };
-    second
-        .application
-        .persistence()
-        .fail_once(PersistenceFault::BeforeApply);
-    let received = second
-        .runtime
-        .data_plane()
-        .receive_replication(item.clone())
-        .await
-        .unwrap();
-    assert_eq!(received.received.applied_lsn, 0);
-    first
-        .runtime
-        .data_plane()
-        .accept_acknowledgement(received.received.clone())
-        .await
-        .unwrap();
-    assert!(received.applied().await.is_err());
+    let mut received = false;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            for event in transport.next().await.events {
+                match event {
+                    TransportEvent::Received {
+                        acknowledgement, ..
+                    } => {
+                        assert_eq!(acknowledgement.applied_lsn, 0);
+                        received = true;
+                    }
+                    TransportEvent::Rejected {
+                        error: TransportError::Runtime(_),
+                        ..
+                    } => return,
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(received);
     assert!(!pending.is_finished());
     assert_eq!(
         second
@@ -125,13 +138,30 @@ async fn stream_ack_requires_durable_sqlite_acceptance() {
             .applied_lsn,
         0
     );
-    let retried = second
+    assert!(transport.pump().idle);
+    first
         .runtime
-        .data_plane()
-        .receive_replication(item)
+        .repair_peer(second.identity.clone(), 0)
         .await
         .unwrap();
-    let applied = retried.applied().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            for event in transport.next().await.events {
+                match event {
+                    TransportEvent::Applied {
+                        acknowledgement, ..
+                    } => {
+                        assert_eq!(acknowledgement.applied_lsn, 1);
+                        return;
+                    }
+                    TransportEvent::Received { .. } => {}
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         second
             .application
@@ -141,14 +171,22 @@ async fn stream_ack_requires_durable_sqlite_acceptance() {
             .applied_lsn,
         1
     );
-    first
-        .runtime
-        .data_plane()
-        .accept_acknowledgement(applied)
+    assert_eq!(pending.await.unwrap().unwrap().into_inner().lsn, 1);
+    let old_session = second.session.id().clone();
+    transport
+        .unregister(&second.identity, &old_session)
+        .unwrap();
+    let second = second.reopen().await;
+    transport
+        .register(second.runtime.clone(), second.session.id().clone())
         .await
         .unwrap();
-    assert_eq!(pending.await.unwrap().unwrap().into_inner().lsn, 1);
-    let second = second.reopen().await;
+    assert!(matches!(
+        transport
+            .register(second.runtime.clone(), old_session)
+            .await,
+        Err(TransportError::StaleSession { .. })
+    ));
     assert_eq!(
         second
             .application
@@ -266,7 +304,7 @@ async fn failover_and_planned_handoff_materialize_last_acknowledged_write_before
         let second = SqlitePod::new(2, root.path().join("two"), 3).await;
         let third = SqlitePod::new(3, root.path().join("three"), 3).await;
         let previous = bootstrap(&[&first, &second, &third]).await;
-        let routes = route(&first, &[&second, &third]);
+        let routes = route(&first, &[&second, &third]).await;
         first
             .execute("CREATE TABLE data(id INTEGER)")
             .await
@@ -308,7 +346,7 @@ async fn failover_and_planned_handoff_materialize_last_acknowledged_write_before
             first.runtime.abort();
             None
         };
-        drop(routes);
+        routes.stop().await;
         let members = vec![
             first.identity.clone(),
             second.identity.clone(),
@@ -352,7 +390,7 @@ async fn failover_and_planned_handoff_materialize_last_acknowledged_write_before
         } else {
             vec![&third]
         };
-        let _routes = route(&second, &targets);
+        let _routes = route(&second, &targets).await;
         for target in &targets {
             second
                 .runtime
@@ -403,10 +441,10 @@ async fn failover_and_planned_handoff_materialize_last_acknowledged_write_before
         }
         second.grant().await;
         // Restart the promoted replica using both reopened durable stores.
-        drop(_routes);
+        _routes.stop().await;
         let second = second.reopen().await;
         assert_eq!(second.count().await, 1);
-        let _routes = route(&second, &targets);
+        let _routes = route(&second, &targets).await;
         second.execute("INSERT INTO data VALUES(43)").await.unwrap();
         assert_eq!(second.count().await, 2);
     }

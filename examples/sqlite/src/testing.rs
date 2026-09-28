@@ -1,16 +1,17 @@
 //! Package-local in-process v2 fixture. Authority belongs to the agent-side test
-//! driver, never to the production SQLite service. Phase 3 extracts routing.
+//! driver, never to the production SQLite service. Routing is agent-owned test infrastructure.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use kuberic_agent::hosting::{OutboundReplication, PodRuntime};
+use kuberic_agent::hosting::PodRuntime;
 use kuberic_agent::runtime_adapter::RuntimeAdapter;
 use kuberic_agent::session::ProcessSession;
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_agent::store::AgentStore;
+use kuberic_agent::testing::{InProcessTransport, Message, TransportError, TransportEvent};
 use kuberic_protocol::types::*;
 use kuberic_runtime::application::OpenMode;
 use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
@@ -172,6 +173,8 @@ impl SqlitePod {
         .unwrap();
     }
 
+    /// Stop attached routes and finish/cancel client requests first. Recovery
+    /// constructs new stores, service and runtime rather than reusing journals.
     pub async fn reopen(self) -> Self {
         let id = self.identity.replica_id.value();
         let root = self.root.clone();
@@ -240,70 +243,76 @@ impl Drop for SqlitePod {
     }
 }
 
-pub struct Routes(Vec<tokio::task::JoinHandle<()>>);
+pub struct Routes {
+    task: tokio::task::JoinHandle<()>,
+    pub events: tokio::sync::mpsc::UnboundedReceiver<TransportEvent>,
+}
+impl Routes {
+    /// Await driver teardown before reopening any of its registered replicas.
+    pub async fn stop(mut self) {
+        self.task.abort();
+        match (&mut self.task).await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => panic!("in-process transport driver failed: {error}"),
+        }
+    }
+}
 impl Drop for Routes {
     fn drop(&mut self) {
-        for task in &self.0 {
-            task.abort();
-        }
+        self.task.abort();
     }
 }
 
 /// Deliver actual public wire messages and their explicit durable service ACKs.
-pub fn route(source: &SqlitePod, targets: &[&SqlitePod]) -> Routes {
-    let source = source.runtime.clone();
-    let targets: Vec<_> = targets
-        .iter()
-        .map(|p| (p.identity.clone(), p.runtime.clone()))
-        .collect();
-    Routes(vec![tokio::spawn(async move {
-        while let Some(outbound) = source.data_plane().next_outbound().await {
-            match outbound {
-                OutboundReplication::Replication(item) => {
-                    let identity: ReplicaIdentity =
-                        item.receiver.clone().unwrap().try_into().unwrap();
-                    // The caller supplies reachable peers. An omitted failed
-                    // replica receives neither delivery nor fabricated ACK credit.
-                    let Some((_, target)) = targets.iter().find(|(id, _)| *id == identity) else {
-                        continue;
-                    };
-                    let pending = target.data_plane().receive_replication(item).await.unwrap();
-                    source
-                        .data_plane()
-                        .accept_acknowledgement(pending.received.clone())
-                        .await
-                        .unwrap();
-                    let ack = pending.applied().await.unwrap();
-                    source
-                        .data_plane()
-                        .accept_acknowledgement(ack)
-                        .await
-                        .unwrap();
+pub async fn route(source: &SqlitePod, targets: &[&SqlitePod]) -> Routes {
+    let mut transport = InProcessTransport::new();
+    for pod in std::iter::once(source).chain(targets.iter().copied()) {
+        transport
+            .register(pod.runtime.clone(), pod.session.id().clone())
+            .await
+            .unwrap();
+    }
+    let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        loop {
+            for event in transport.next().await.events {
+                if let TransportEvent::Rejected { error, .. } = &event {
+                    if matches!(error, TransportError::Unregistered(_)) {
+                        tracing::debug!(%error, "test link has no reachable exact receiver");
+                    } else {
+                        tracing::error!(%error, "in-process delivery rejected");
+                    }
                 }
-                other => panic!("unexpected routed operation: {other:?}"),
+                if sender.send(event).is_err() {
+                    return;
+                }
             }
         }
-    })])
+    });
+    Routes { task, events }
 }
 
 pub async fn wait_applied(pods: &[&SqlitePod], lsn: i64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if pods.iter().all(|pod| {
-                pod.application
-                    .persistence()
-                    .progress()
-                    .unwrap()
-                    .applied_lsn
-                    >= lsn
-            }) {
+            let mut applied = true;
+            for pod in pods {
+                applied &= pod
+                    .runtime
+                    .snapshot()
+                    .await
+                    .verified_replication_lsn
+                    .is_some_and(|verified| verified >= lsn);
+            }
+            if applied {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("replicas applied the operation");
+    .expect("replicas durably acknowledged the operation");
 }
 
 pub async fn bootstrap(pods: &[&SqlitePod]) -> ConfigurationDescriptor {
@@ -351,21 +360,36 @@ pub async fn bootstrap(pods: &[&SqlitePod]) -> ConfigurationDescriptor {
             })
             .await
             .unwrap();
+        let mut transport = InProcessTransport::new();
+        for pod in [pods[0], *target] {
+            transport
+                .register(pod.runtime.clone(), pod.session.id().clone())
+                .await
+                .unwrap();
+        }
         loop {
             let item = prepared.items.next().await.unwrap().unwrap();
             let last = item.final_item;
-            let ack = target
-                .runtime
-                .data_plane()
-                .receive_copy_item(item)
-                .await
-                .unwrap();
-            pods[0]
-                .runtime
-                .data_plane()
-                .accept_copy_acknowledgement(ack)
-                .await
-                .unwrap();
+            let message = transport.bind(Message::Copy(item)).unwrap();
+            let delivery = transport.enqueue(message).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut completed = false;
+                    for event in transport.next().await.events {
+                        match event {
+                            TransportEvent::Copied { delivery: id, .. } if id == delivery => {
+                                completed = true
+                            }
+                            other => panic!("unexpected bootstrap transport event: {other:?}"),
+                        }
+                    }
+                    if completed {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("durable copy acknowledgement");
             if last {
                 break;
             }

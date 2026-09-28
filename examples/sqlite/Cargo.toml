@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [features]
-testing = ["dep:kuberic-runtime-internal", "dep:kuberic-wire", "dep:tempfile"]
+testing = ["kuberic-agent/testing", "dep:kuberic-runtime-internal", "dep:kuberic-wire", "dep:tempfile"]
 
 [[bin]]
 name = "sqlite-replicated"
