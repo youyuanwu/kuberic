@@ -17,6 +17,8 @@ pub struct SqlitePersistence {
     log: Mutex<DurableFrameLog>,
     #[cfg(any(test, feature = "testing"))]
     fault: std::sync::atomic::AtomicU8,
+    #[cfg(any(test, feature = "testing"))]
+    pub after_apply: crate::testing::PauseGate,
 }
 
 /// Application acceptance fault cuts; absent from production builds.
@@ -26,6 +28,7 @@ pub enum PersistenceFault {
     BeforeApply = 1,
     AfterApply = 2,
     AfterCommit = 3,
+    AfterCopyInstall = 4,
 }
 
 impl SqlitePersistence {
@@ -47,6 +50,8 @@ impl SqlitePersistence {
             log: Mutex::new(log),
             #[cfg(any(test, feature = "testing"))]
             fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            after_apply: crate::testing::PauseGate::default(),
         })
     }
 
@@ -70,6 +75,14 @@ impl SqlitePersistence {
 
     pub fn snapshot(&self, up_to_lsn: i64) -> io::Result<Vec<u8>> {
         self.lock()?.snapshot(up_to_lsn)
+    }
+
+    /// Offline test oracle for retained applied data; never changes commitment
+    /// or exposes that suffix through the production SQL connection.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn applied_image_for_test(&self) -> io::Result<Vec<u8>> {
+        let log = self.lock()?;
+        log.image_at(log.progress().applied_lsn)
     }
 
     /// Requires that the caller has closed every connection to the materialized database.
@@ -181,9 +194,13 @@ impl DurableState for SqlitePersistence {
         up_to_lsn: i64,
         committed_lsn: i64,
     ) -> kuberic_runtime::Result<DurableApplicationProgress> {
-        self.lock()
+        let progress = self
+            .lock()
             .and_then(|mut log| log.finish(build_id.as_str(), up_to_lsn, committed_lsn))
-            .map_err(persistence_error)
+            .map_err(persistence_error)?;
+        #[cfg(any(test, feature = "testing"))]
+        self.fault_at(PersistenceFault::AfterCopyInstall)?;
+        Ok(progress)
     }
 
     async fn apply(&self, operation: Operation) -> kuberic_runtime::Result<DurableApplicationAck> {
@@ -193,6 +210,8 @@ impl DurableState for SqlitePersistence {
             .lock()
             .and_then(|mut log| log.apply(operation))
             .map_err(persistence_error)?;
+        #[cfg(any(test, feature = "testing"))]
+        self.after_apply.pause().await;
         #[cfg(any(test, feature = "testing"))]
         self.fault_at(PersistenceFault::AfterApply)?;
         Ok(progress)

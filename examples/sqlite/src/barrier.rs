@@ -39,6 +39,10 @@ pub struct ReplicationBarrier {
     failure: Mutex<Option<CommitFailure>>,
     #[cfg(any(test, feature = "testing"))]
     fail_after_quorum: AtomicBool,
+    #[cfg(any(test, feature = "testing"))]
+    pub before_dispatch: crate::testing::PauseGate,
+    #[cfg(any(test, feature = "testing"))]
+    pub after_quorum: crate::testing::PauseGate,
 }
 
 static NEXT_VFS: AtomicU64 = AtomicU64::new(1);
@@ -58,6 +62,10 @@ impl ReplicationBarrier {
             failure: Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             fail_after_quorum: AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            before_dispatch: crate::testing::PauseGate::default(),
+            #[cfg(any(test, feature = "testing"))]
+            after_quorum: crate::testing::PauseGate::default(),
         });
         sqlite_commit_barrier::register(&name, barrier.clone()).map_err(std::io::Error::other)?;
         Ok((barrier, name))
@@ -99,6 +107,8 @@ impl ReplicationBarrier {
                     _ = cancel.cancelled() => break,
                     request = receiver.recv() => match request { Some(request) => request, None => break },
                 };
+                #[cfg(any(test, feature = "testing"))]
+                barrier.before_dispatch.pause().await;
                 let outcome = if cancel.is_cancelled()
                     || barrier.is_fenced()
                     || !matches!(
@@ -124,6 +134,8 @@ impl ReplicationBarrier {
                     };
                     match result {
                         Ok(lsn) => {
+                            #[cfg(any(test, feature = "testing"))]
+                            barrier.after_quorum.pause().await;
                             #[cfg(any(test, feature = "testing"))]
                             if barrier.fail_after_quorum.swap(false, Ordering::SeqCst) {
                                 let reason =
