@@ -374,6 +374,77 @@ fn restore_accepted_service_before_cleanup(
     None
 }
 
+fn cleanup_source_build_retirement(
+    snapshot: &ObservationSnapshot,
+    cleanup: &ScaleUpCleanup,
+    accepted: &ConfigurationDescriptor,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    let scale_up = cleanup
+        .provisioning
+        .scale_up()
+        .expect("validated cleanup has scale-up provisioning");
+    let source = configuration_primary(&scale_up.previous_configuration);
+    if !accepted
+        .members
+        .iter()
+        .any(|member| member.identity == source.identity)
+    {
+        return None;
+    }
+    let source_report = report(snapshot, &source.identity)?;
+    let build_id = cleanup
+        .provisioning
+        .scale_up_build_id(&snapshot.resource_uid)
+        .expect("validated cleanup has deterministic build ID");
+    let build_operation_id = source_build_operation_id(&build_id);
+    let retirement_operation_id = OperationId::new(format!("{build_id}:retire-abandoned-build"));
+    let retirement = || Plan::Execute {
+        command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
+            operation_id: build_id.clone(),
+            local_replica_id: source.identity.replica_id,
+            expected_instance_id: source.identity.instance_id.clone(),
+            expected_agent_generation: source.identity.agent_generation.clone(),
+            target: cleanup.target.clone(),
+            authority: None,
+            source_session_id: None,
+            retire: true,
+        })),
+    };
+
+    if source_report.pending_operation_id.as_ref() == Some(&retirement_operation_id)
+        || source_report.pending_operation_id.as_ref() == Some(&build_operation_id)
+    {
+        return Some(retirement());
+    }
+    if let Some(pending) = source_report.pending_operation_id.as_ref() {
+        return Some(wait(
+            snapshot,
+            snapshot.status.clone(),
+            "ScaleUpSourceBuildRetirementBlocked",
+            "cleanup",
+            Some(&cleanup.target),
+            Some(&cleanup.provisioning.operation_id),
+            &format!(
+                "source has unrelated pending operation {pending}; exact abandoned build retirement remains fenced"
+            ),
+            config,
+        ));
+    }
+    if source_report.retained_operation_id.as_ref() == Some(&retirement_operation_id) {
+        return None;
+    }
+    if source_report.retained_operation_id.as_ref() == Some(&build_operation_id)
+        || source_report
+            .builds
+            .iter()
+            .any(|build| build.build_id == build_id && build.target == cleanup.target)
+    {
+        return Some(retirement());
+    }
+    None
+}
+
 fn freeze_cleanup(
     snapshot: &ObservationSnapshot,
     provisioning: &ProvisioningIntent,
@@ -523,6 +594,9 @@ pub(super) fn cleanup(
         .as_ref()
         .expect("validated cleanup has accepted topology")
         .configuration;
+    if let Some(plan) = cleanup_source_build_retirement(snapshot, cleanup, accepted, config) {
+        return plan;
+    }
     if let Some(plan) = restore_accepted_service_before_cleanup(
         snapshot,
         accepted,
@@ -537,40 +611,6 @@ pub(super) fn cleanup(
         config,
     ) {
         return plan;
-    }
-    let scale_up = cleanup
-        .provisioning
-        .scale_up()
-        .expect("validated cleanup has scale-up provisioning");
-    let source = configuration_primary(&scale_up.previous_configuration);
-    if accepted
-        .members
-        .iter()
-        .any(|member| member.identity == source.identity)
-        && let Some(source_report) = report(snapshot, &source.identity)
-    {
-        let build_id = cleanup
-            .provisioning
-            .scale_up_build_id(&snapshot.resource_uid)
-            .expect("validated cleanup has deterministic build ID");
-        if source_report
-            .builds
-            .iter()
-            .any(|build| build.build_id == build_id && build.target == cleanup.target)
-        {
-            return Plan::Execute {
-                command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
-                    operation_id: build_id,
-                    local_replica_id: source.identity.replica_id,
-                    expected_instance_id: source.identity.instance_id.clone(),
-                    expected_agent_generation: source.identity.agent_generation.clone(),
-                    target: cleanup.target.clone(),
-                    authority: None,
-                    source_session_id: None,
-                    retire: true,
-                })),
-            };
-        }
     }
     let target = &cleanup.target;
     let Some(exact) = cleanup_observation(snapshot, target) else {

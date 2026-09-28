@@ -1769,7 +1769,9 @@ fn evaluator_scale_down_local_commit_cannot_precede_status_commit_or_change_proo
     assert!(matches!(model.plan(), Plan::Unsafe { .. }));
 }
 
-use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, SafetyChange};
+use kuberic_protocol::command::{
+    KubernetesChange, ProtocolCommand, SafetyChange, ScaleDownResource,
+};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation,
@@ -7584,6 +7586,120 @@ fn scale_up_cancellation_and_failed_build_freeze_exact_cleanup() {
                 KubernetesChange::PersistStatus { status }
                     if status.scale_up_cleanup.is_some()
             ))
+    ));
+}
+
+#[test]
+fn scale_up_cleanup_retires_exact_source_build_before_service_restoration() {
+    use scale_up_model::Model;
+
+    let mut model = Model::new(1, 2);
+    let build = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } if !command.retire => {
+                model.execute(ProtocolCommand::EnsureReplicaBuild(command.clone()));
+                break command;
+            }
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            Plan::Execute { command } => model.execute(command),
+            Plan::Wait { status, .. } => model.apply_wait(status),
+            other => panic!("source build setup: {other:?}"),
+        }
+    };
+    let build_operation_id = OperationId::new(format!("{}:build-replica", build.operation_id));
+    let retirement_operation_id =
+        OperationId::new(format!("{}:retire-abandoned-build", build.operation_id));
+    model.snapshot.desired.replicas = 1;
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("cancellation must freeze exact cleanup")
+    };
+    for change in changes {
+        model.apply(change);
+    }
+    assert!(model.snapshot.status.scale_up_cleanup.is_some());
+
+    let assert_retirement = |plan: Plan| {
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(retirement),
+        } = plan
+        else {
+            panic!("cleanup must retire the exact source build before restoration")
+        };
+        assert!(retirement.retire);
+        assert_eq!(retirement.operation_id, build.operation_id);
+        assert_eq!(retirement.local_replica_id, build.local_replica_id);
+        assert_eq!(retirement.expected_instance_id, build.expected_instance_id);
+        assert_eq!(
+            retirement.expected_agent_generation,
+            build.expected_agent_generation
+        );
+        assert_eq!(retirement.target, build.target);
+        assert!(retirement.authority.is_none());
+        assert!(retirement.source_session_id.is_none());
+    };
+
+    let mut visible = model.fork();
+    visible
+        .report_mut(build.local_replica_id.value())
+        .write_status = AccessStatus::ReconfigurationPending;
+    assert_retirement(visible.plan());
+
+    let mut hidden_pending = model.fork();
+    hidden_pending
+        .report_mut(build.local_replica_id.value())
+        .builds
+        .clear();
+    assert_eq!(
+        hidden_pending
+            .report_mut(build.local_replica_id.value())
+            .pending_operation_id,
+        Some(build_operation_id.clone())
+    );
+    assert_retirement(hidden_pending.plan());
+
+    let mut hidden_consumed = hidden_pending.fork();
+    let source = hidden_consumed.report_mut(build.local_replica_id.value());
+    source.pending_operation_id = None;
+    source.retained_operation_id = Some(build_operation_id.clone());
+    assert_retirement(hidden_consumed.plan());
+
+    let mut pending_retirement = hidden_pending.fork();
+    pending_retirement
+        .report_mut(build.local_replica_id.value())
+        .pending_operation_id = Some(retirement_operation_id.clone());
+    assert_retirement(pending_retirement.plan());
+
+    let mut unrelated = hidden_pending.fork();
+    unrelated
+        .report_mut(build.local_replica_id.value())
+        .pending_operation_id = Some(OperationId::new("unrelated-pending"));
+    assert!(matches!(
+        unrelated.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpSourceBuildRetirementBlocked")
+    ));
+
+    let mut retired = hidden_pending;
+    let source = retired.report_mut(build.local_replica_id.value());
+    source.pending_operation_id = None;
+    source.retained_operation_id = Some(retirement_operation_id);
+    assert!(matches!(
+        retired.plan(),
+        Plan::Apply { changes }
+            if matches!(
+                changes.as_slice(),
+                [KubernetesChange::DeleteScaleDownResource {
+                    resource: ScaleDownResource::Endpoint,
+                    ..
+                }]
+            )
     ));
 }
 

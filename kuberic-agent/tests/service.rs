@@ -19,13 +19,24 @@ use kuberic_agent::transport::{
     GrpcOutboundDispatcher, ReliableTransport, ReplicaEndpointResolver, run_outbound,
 };
 use kuberic_agent::{AgentError, Result as AgentResult};
-use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
+use kuberic_protocol::command::{
+    EnsureConfiguration, EnsureReplicaBuild, KubernetesChange, ProtocolCommand, ScaleDownResource,
+};
+use kuberic_protocol::evaluator::evaluate;
+use kuberic_protocol::observation::{
+    AgentObservation, AgentReport, DesiredState, ExactResourceObservation,
+    KubernetesReplicaObservation, ObservationSnapshot, ReplicaObservation, ReplicaObservationKey,
+    RoutingObservation, SecondaryScaleDownResourceObservation,
+};
+use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, EffectivePolicy,
-    Epoch, OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence,
-    ScaleUpIntent, ScaleUpProvisioning, ScaleUpStage, SwitchoverHandoff, SwitchoverRequestId,
-    TransitionKind, derive_agent_generation, derive_initialization_id,
+    AcceptedStatus, AcceptedTopology, AccessStatus, CleanupResourceIdentity,
+    ConfigurationDescriptor, ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch,
+    FaultType, OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid,
+    ReplicaCleanupIdentity, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    ResourceUid, ScaleUpCleanup, ScaleUpConfigurationEvidence, ScaleUpIntent, ScaleUpProvisioning,
+    ScaleUpStage, SwitchoverHandoff, SwitchoverRequestId, TransitionKind, derive_agent_generation,
+    derive_initialization_id, derive_replica_endpoint_name,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext, Operation,
@@ -52,6 +63,10 @@ use tonic::{Code, Request};
 #[allow(dead_code)]
 #[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
 mod scale_down_fixture;
+
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/scale_up_model.rs"]
+mod scale_up_model;
 
 #[test]
 fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
@@ -516,6 +531,77 @@ struct ReplayApplication;
 struct LoseCancelledBuildReply {
     runtime: Arc<PodRuntime>,
     lose_once: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RetirementCut {
+    BeforeConsume,
+    AfterConsume,
+    AfterRetire,
+}
+
+struct CutRetirementReply {
+    runtime: Arc<PodRuntime>,
+    cut: RetirementCut,
+    lose_once: AtomicBool,
+}
+
+#[async_trait]
+impl kuberic_agent::runtime_adapter::RuntimeEffectExecutor for CutRetirementReply {
+    async fn apply_runtime_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> AgentResult<kuberic_runtime_internal::effects::RuntimeEffectResult> {
+        let lose = matches!(effect.action, RuntimeEffectAction::RetireBuild(_))
+            && matches!(self.cut, RetirementCut::AfterRetire)
+            && self.lose_once.swap(false, Ordering::SeqCst);
+        let result =
+            <PodRuntime as kuberic_agent::runtime_adapter::RuntimeEffectExecutor>::apply_runtime_effect(
+                self.runtime.as_ref(),
+                effect,
+            )
+            .await?;
+        if lose {
+            return Err(AgentError::SessionRejected(
+                "injected lost build-retirement reply".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn consume_cancelled_build_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> AgentResult<kuberic_runtime_internal::effects::RuntimeEffectResult> {
+        if matches!(self.cut, RetirementCut::BeforeConsume)
+            && self.lose_once.swap(false, Ordering::SeqCst)
+        {
+            return Err(AgentError::SessionRejected(
+                "injected pre-consume build-cancellation interruption".into(),
+            ));
+        }
+        let result = <PodRuntime as kuberic_agent::runtime_adapter::RuntimeEffectExecutor>::consume_cancelled_build_effect(
+            self.runtime.as_ref(),
+            effect,
+        )
+        .await?;
+        if matches!(self.cut, RetirementCut::AfterConsume)
+            && self.lose_once.swap(false, Ordering::SeqCst)
+        {
+            return Err(AgentError::SessionRejected(
+                "injected lost cancelled-build consumption reply".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn cancel_build(&self, build_id: &OperationId) -> AgentResult<()> {
+        <PodRuntime as kuberic_agent::runtime_adapter::RuntimeEffectExecutor>::cancel_build(
+            self.runtime.as_ref(),
+            build_id,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -2054,6 +2140,584 @@ async fn scale_up_source_startup_finishes_retirement_after_abandonment_reply_los
     assert!(state.pending_effect.is_none());
     let status = service_status(control, &fixture.primary).await;
     assert!(status.builds.is_empty());
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
+    fn cleanup_model(
+        fixture: &ScaleUpSourceFixture,
+        permanent_candidate_failure: bool,
+    ) -> scale_up_model::Model {
+        let scale_up = fixture.provisioning.scale_up().unwrap();
+        let previous = scale_up.previous_configuration.clone();
+        let previous_policy = scale_up.previous_policy.clone();
+        let secondary = previous
+            .members
+            .iter()
+            .find(|member| member.identity != fixture.primary)
+            .unwrap()
+            .identity
+            .clone();
+        let report = |identity: ReplicaIdentity, role, write_status| AgentReport {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: ResourceUid::new("resource-1"),
+            identity,
+            process_session_id: kuberic_protocol::types::ProcessSessionId::new("synthetic"),
+            report_sequence: 1,
+            role,
+            read_status: AccessStatus::Granted,
+            write_status,
+            healthy: true,
+            epoch: previous.epoch,
+            previous_configuration: None,
+            current_configuration: Some(previous.clone()),
+            current_progress: 0,
+            verified_replication_lsn: Some(0),
+            committed_lsn: 0,
+            current_configuration_quorum_progress: 0,
+            catch_up_complete: true,
+            ..Default::default()
+        };
+        let endpoint_name =
+            derive_replica_endpoint_name(&ResourceUid::new("resource-1"), &fixture.target);
+        let cleanup = ScaleUpCleanup {
+            provisioning: fixture.provisioning.clone(),
+            target: fixture.target.clone(),
+            resources: ReplicaCleanupIdentity {
+                pod: CleanupResourceIdentity::Present {
+                    name: "pod-3".into(),
+                    uid: fixture.provisioning.pod_uid.to_string(),
+                },
+                pvc: CleanupResourceIdentity::Present {
+                    name: "data-3".into(),
+                    uid: fixture.provisioning.pvc_uid.to_string(),
+                },
+                endpoint: CleanupResourceIdentity::Present {
+                    name: endpoint_name.clone(),
+                    uid: "endpoint-3".into(),
+                },
+            },
+        };
+        let candidate = AgentReport {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: ResourceUid::new("resource-1"),
+            identity: fixture.target.clone(),
+            process_session_id: kuberic_protocol::types::ProcessSessionId::new(
+                "candidate-synthetic",
+            ),
+            report_sequence: 1,
+            role: ReplicaRole::IdleSecondary,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            healthy: !permanent_candidate_failure,
+            reported_fault: permanent_candidate_failure.then_some(FaultType::Permanent),
+            ..Default::default()
+        };
+        let snapshot = ObservationSnapshot {
+            resource_uid: ResourceUid::new("resource-1"),
+            resource_version: "1".into(),
+            desired: DesiredState {
+                generation: 3,
+                replicas: if permanent_candidate_failure { 3 } else { 2 },
+                image: "example:v1".into(),
+                failover_delay_seconds: 30,
+                switchover: None,
+            },
+            status: AcceptedStatus {
+                initialized: true,
+                observed_generation: 2,
+                effective_policy: Some(previous_policy),
+                topology: Some(AcceptedTopology {
+                    configuration: previous.clone(),
+                }),
+                provisioning: Some(fixture.provisioning.clone()),
+                ..Default::default()
+            },
+            replicas: BTreeMap::from([
+                (
+                    ReplicaObservationKey::new(
+                        fixture.primary.replica_id,
+                        fixture.primary.instance_id.clone(),
+                    ),
+                    ReplicaObservation {
+                        kubernetes: Some(KubernetesReplicaObservation {
+                            replica_id: fixture.primary.replica_id,
+                            pod_name: "pod-1".into(),
+                            pod_uid: Some(PodUid::new("pod-1")),
+                            pvc_name: "data-1".into(),
+                            pvc_uid: Some(PvcUid::new("pvc-1")),
+                            image: Some("example:v1".into()),
+                            pod_ready: true,
+                            peer_endpoint_ready: true,
+                        }),
+                        agent: AgentObservation::Report(Box::new(report(
+                            fixture.primary.clone(),
+                            ReplicaRole::Primary,
+                            AccessStatus::Granted,
+                        ))),
+                    },
+                ),
+                (
+                    ReplicaObservationKey::new(secondary.replica_id, secondary.instance_id.clone()),
+                    ReplicaObservation {
+                        kubernetes: Some(KubernetesReplicaObservation {
+                            replica_id: secondary.replica_id,
+                            pod_name: secondary.instance_id.to_string(),
+                            pod_uid: Some(PodUid::new(secondary.instance_id.as_str())),
+                            pvc_name: "data-2".into(),
+                            pvc_uid: Some(PvcUid::new("pvc-2")),
+                            image: Some("example:v1".into()),
+                            pod_ready: true,
+                            peer_endpoint_ready: true,
+                        }),
+                        agent: AgentObservation::Report(Box::new(report(
+                            secondary,
+                            ReplicaRole::ActiveSecondary,
+                            AccessStatus::NotPrimary,
+                        ))),
+                    },
+                ),
+                (
+                    ReplicaObservationKey::new(
+                        fixture.target.replica_id,
+                        fixture.target.instance_id.clone(),
+                    ),
+                    ReplicaObservation {
+                        kubernetes: Some(KubernetesReplicaObservation {
+                            replica_id: fixture.target.replica_id,
+                            pod_name: "pod-3".into(),
+                            pod_uid: Some(fixture.provisioning.pod_uid.clone()),
+                            pvc_name: "data-3".into(),
+                            pvc_uid: Some(fixture.provisioning.pvc_uid.clone()),
+                            image: Some("example:v1".into()),
+                            pod_ready: true,
+                            peer_endpoint_ready: true,
+                        }),
+                        agent: AgentObservation::Report(Box::new(candidate)),
+                    },
+                ),
+            ]),
+            secondary_scale_down_resources: vec![SecondaryScaleDownResourceObservation {
+                resource_uid: ResourceUid::new("resource-1"),
+                target: fixture.target.clone(),
+                identity: cleanup.resources.clone(),
+                pod: ExactResourceObservation::FrozenUidPresent {
+                    resource_version: "1".into(),
+                },
+                pod_allocation_operation_id: Some(fixture.provisioning.operation_id.clone()),
+                pod_matches_allocation_metadata: true,
+                pvc: ExactResourceObservation::FrozenUidPresent {
+                    resource_version: "1".into(),
+                },
+                pvc_allocation_operation_id: Some(fixture.provisioning.operation_id.clone()),
+                endpoint: ExactResourceObservation::FrozenUidPresent {
+                    resource_version: "1".into(),
+                },
+            }],
+            previous_report_watermarks: BTreeMap::new(),
+            durable_storage_evidence: true,
+            supporting_resources_ready: true,
+            routing: RoutingObservation {
+                service_present: true,
+                unresolved_write_target: false,
+                write_target: Some(fixture.primary.clone()),
+            },
+            observation_failures: Vec::new(),
+            now_unix_seconds: 100,
+        };
+        scale_up_model::Model::from_snapshot(snapshot, vec![2])
+    }
+
+    fn install_source_report(
+        model: &mut scale_up_model::Model,
+        source: &ReplicaIdentity,
+        status: proto::AgentStatusReport,
+    ) {
+        let report = kuberic_wire::normalize_agent_status_report(status).unwrap();
+        let key = ReplicaObservationKey::new(source.replica_id, source.instance_id.clone());
+        model.snapshot.replicas.get_mut(&key).unwrap().agent = report;
+    }
+
+    fn persist_cleanup(model: &mut scale_up_model::Model) {
+        let Plan::Apply { changes } = evaluate(&model.snapshot, &scale_up_model::config()) else {
+            panic!("evaluator must persist exact abandoned-candidate cleanup")
+        };
+        assert!(changes.iter().any(|change| matches!(
+            change,
+            KubernetesChange::PersistStatus { status }
+                if status.scale_up_cleanup.is_some() && status.provisioning.is_none()
+        )));
+        for change in changes {
+            model.apply(change);
+        }
+    }
+
+    fn exact_retirement(plan: Plan, fixture: &ScaleUpSourceFixture) -> EnsureReplicaBuild {
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(command),
+        } = plan
+        else {
+            panic!("evaluator must issue exact source build retirement")
+        };
+        assert!(command.retire);
+        assert_eq!(command.operation_id, fixture.build_id);
+        assert_eq!(command.local_replica_id, fixture.primary.replica_id);
+        assert_eq!(command.expected_instance_id, fixture.primary.instance_id);
+        assert_eq!(
+            command.expected_agent_generation,
+            fixture.primary.agent_generation
+        );
+        assert_eq!(command.target, fixture.target);
+        assert!(command.authority.is_none());
+        assert!(command.source_session_id.is_none());
+        *command
+    }
+
+    for permanent_candidate_failure in [false, true] {
+        for cut in [
+            RetirementCut::BeforeConsume,
+            RetirementCut::AfterConsume,
+            RetirementCut::AfterRetire,
+        ] {
+            let directory = tempdir().unwrap();
+            let fixture = scale_up_source_fixture(directory.path(), false, false).await;
+            let runtime = Arc::new(PodRuntime::new(
+                fixture.primary.clone(),
+                Arc::new(ReplayApplication),
+                fixture.store.clone(),
+            ));
+            let executor = Arc::new(CutRetirementReply {
+                runtime: runtime.clone(),
+                cut,
+                lose_once: AtomicBool::new(true),
+            });
+            let service =
+                AgentService::new(fixture.store.clone(), runtime.clone(), executor, "token")
+                    .unwrap();
+            let control = free_address();
+            let replication = free_address();
+            let (ready, mut ready_rx) = watch::channel(false);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+            ready_rx.wait_for(|ready| *ready).await.unwrap();
+
+            let source_status = service_status(control, &fixture.primary).await;
+            let build_request = proto::EnsureReplicaBuildCommand {
+                operation_id: fixture.build_id.to_string(),
+                local_replica_id: fixture.primary.replica_id.value(),
+                expected_instance_id: fixture.primary.instance_id.to_string(),
+                expected_agent_generation: fixture.primary.agent_generation.to_string(),
+                target: Some(fixture.target.clone().into()),
+                authority: None,
+                source_session_id: String::new(),
+                retire: false,
+            };
+            let mut build_client = proto::agent_control_client::AgentControlClient::connect(
+                format!("http://{control}"),
+            )
+            .await
+            .unwrap();
+            let build_primary = fixture.primary.clone();
+            let build_session = source_status.process_session_id.clone();
+            let pending_build = build_request.clone();
+            let build = tokio::spawn(async move {
+                build_client
+                    .execute(authorized_request(
+                        "resource-1",
+                        &build_primary,
+                        &build_session,
+                        proto::execute_command_request::Command::EnsureReplicaBuild(pending_build),
+                    ))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if fixture
+                        .store
+                        .load_state()
+                        .await
+                        .unwrap()
+                        .pending_effect
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            matches!(
+                                &pending.effect.action,
+                                RuntimeEffectAction::BuildReplica { build_id, .. }
+                                    if build_id == &fixture.build_id
+                            )
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("real copy remained incomplete with a durable source effect");
+
+            let mut model = cleanup_model(&fixture, permanent_candidate_failure);
+            install_source_report(
+                &mut model,
+                &fixture.primary,
+                service_status(control, &fixture.primary).await,
+            );
+            persist_cleanup(&mut model);
+            let retirement = exact_retirement(
+                evaluate(&model.snapshot, &scale_up_model::config()),
+                &fixture,
+            );
+            let retirement_proto = proto::EnsureReplicaBuildCommand {
+                operation_id: retirement.operation_id.to_string(),
+                local_replica_id: retirement.local_replica_id.value(),
+                expected_instance_id: retirement.expected_instance_id.to_string(),
+                expected_agent_generation: retirement.expected_agent_generation.to_string(),
+                target: Some(retirement.target.clone().into()),
+                authority: None,
+                source_session_id: String::new(),
+                retire: true,
+            };
+            let mut retire_client = proto::agent_control_client::AgentControlClient::connect(
+                format!("http://{control}"),
+            )
+            .await
+            .unwrap();
+            assert!(
+                retire_client
+                    .execute(authorized_request(
+                        "resource-1",
+                        &fixture.primary,
+                        &source_status.process_session_id,
+                        proto::execute_command_request::Command::EnsureReplicaBuild(
+                            retirement_proto,
+                        ),
+                    ))
+                    .await
+                    .is_err(),
+                "{cut:?} must interrupt retirement settlement"
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), build)
+                    .await
+                    .expect("cancelled real copy request completed")
+                    .unwrap()
+                    .is_err()
+            );
+            let interrupted = fixture.store.load_state().await.unwrap();
+            assert!(interrupted.abandoned_builds.contains(&fixture.build_id));
+            assert!(!interrupted.retired_builds.contains(&fixture.build_id));
+
+            let hidden = service_status(control, &fixture.primary).await;
+            assert!(
+                hidden
+                    .builds
+                    .iter()
+                    .all(|build| build.build_id != fixture.build_id.as_str()),
+                "durable abandonment must hide the stale build report"
+            );
+            install_source_report(&mut model, &fixture.primary, hidden);
+            assert_eq!(
+                exact_retirement(
+                    evaluate(&model.snapshot, &scale_up_model::config()),
+                    &fixture,
+                ),
+                retirement,
+                "hidden abandonment evidence must replay the exact retirement command"
+            );
+
+            shutdown.send_replace(true);
+            server.await.unwrap().unwrap();
+
+            let (restarted_control, restarted_shutdown, restarted_server) = loop {
+                let restarted_runtime = Arc::new(PodRuntime::new(
+                    fixture.primary.clone(),
+                    Arc::new(ReplayApplication),
+                    fixture.store.clone(),
+                ));
+                let restarted_service = AgentService::new(
+                    fixture.store.clone(),
+                    restarted_runtime.clone(),
+                    restarted_runtime,
+                    "token",
+                )
+                .unwrap();
+                let restarted_control = free_address();
+                let (restarted_ready, mut restarted_ready_rx) = watch::channel(false);
+                let (restarted_shutdown, restarted_shutdown_rx) = watch::channel(false);
+                let mut restarted_server = tokio::spawn(restarted_service.serve(
+                    restarted_control,
+                    free_address(),
+                    restarted_ready,
+                    restarted_shutdown_rx,
+                ));
+                let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        ready = restarted_ready_rx.wait_for(|ready| *ready) => {
+                            Ok(ready)
+                        }
+                        stopped = &mut restarted_server => {
+                            Err(stopped)
+                        }
+                    }
+                })
+                .await
+                .expect("restarted source owner settled abandoned build");
+                match outcome {
+                    Ok(Ok(_)) => {
+                        break (restarted_control, restarted_shutdown, restarted_server);
+                    }
+                    Ok(Err(error)) => panic!("restarted readiness closed: {error}"),
+                    Err(Ok(Err(error))) if error.to_string().contains("Address already in use") => {
+                        continue;
+                    }
+                    Err(result) => panic!("restarted source owner failed: {result:?}"),
+                }
+            };
+            let settled = fixture.store.load_state().await.unwrap();
+            assert!(settled.pending_effect.is_none());
+            assert!(settled.retired_builds.contains(&fixture.build_id));
+
+            install_source_report(
+                &mut model,
+                &fixture.primary,
+                service_status(restarted_control, &fixture.primary).await,
+            );
+            let old_attempt = model
+                .snapshot
+                .status
+                .scale_up_cleanup
+                .as_ref()
+                .unwrap()
+                .provisioning
+                .operation_id
+                .clone();
+            let mut deleted = Vec::new();
+            for _ in 0..12 {
+                match evaluate(&model.snapshot, &scale_up_model::config()) {
+                    Plan::Apply { changes } => {
+                        for change in changes {
+                            if let KubernetesChange::DeleteScaleDownResource { resource, .. } =
+                                &change
+                            {
+                                deleted.push(*resource);
+                            }
+                            model.apply(change);
+                        }
+                    }
+                    Plan::Wait { status, .. } => model.apply_wait(status),
+                    Plan::Execute {
+                        command: ProtocolCommand::EnsureReplicaBuild(command),
+                    } => panic!("settled retirement was reissued: {command:?}"),
+                    other => panic!("cleanup convergence after restart: {other:?}"),
+                }
+                if model.snapshot.status.scale_up_cleanup.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(
+                deleted,
+                vec![
+                    ScaleDownResource::Endpoint,
+                    ScaleDownResource::Pod,
+                    ScaleDownResource::Pvc,
+                ]
+            );
+            assert!(model.snapshot.status.scale_up_cleanup.is_none());
+
+            if !permanent_candidate_failure {
+                model.snapshot.desired.replicas = 3;
+                model.snapshot.desired.generation += 1;
+            }
+            for _ in 0..20 {
+                let fresh = model
+                    .snapshot
+                    .status
+                    .provisioning
+                    .as_ref()
+                    .map(|provisioning| &provisioning.operation_id)
+                    .or_else(|| {
+                        model
+                            .snapshot
+                            .status
+                            .scale_up_allocation
+                            .as_ref()
+                            .map(|allocation| &allocation.operation_id)
+                    });
+                if fresh.is_some_and(|operation_id| operation_id != &old_attempt) {
+                    break;
+                }
+                model.step();
+            }
+            let fresh = model
+                .snapshot
+                .status
+                .provisioning
+                .as_ref()
+                .map(|provisioning| &provisioning.operation_id)
+                .or_else(|| {
+                    model
+                        .snapshot
+                        .status
+                        .scale_up_allocation
+                        .as_ref()
+                        .map(|allocation| &allocation.operation_id)
+                })
+                .expect("cleanup must authorize a fresh retry");
+            assert_ne!(fresh, &old_attempt);
+
+            restarted_shutdown.send_replace(true);
+            restarted_server.await.unwrap().unwrap();
+        }
+    }
+
+    let directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(directory.path(), false, false).await;
+    let runtime = Arc::new(PodRuntime::new(
+        fixture.primary.clone(),
+        Arc::new(ReplayApplication),
+        fixture.store.clone(),
+    ));
+    let service =
+        AgentService::new(fixture.store.clone(), runtime.clone(), runtime, "token").unwrap();
+    let control = free_address();
+    let (ready, mut ready_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(control, free_address(), ready, shutdown_rx));
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let unrelated = RuntimeEffect {
+        operation_id: OperationId::new("unrelated-pending"),
+        sequence: fixture
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .next_effect_sequence,
+        action: RuntimeEffectAction::RefreshApplicationProgress,
+    };
+    fixture.store.begin_effect(&unrelated).await.unwrap();
+    let mut model = cleanup_model(&fixture, false);
+    install_source_report(
+        &mut model,
+        &fixture.primary,
+        service_status(control, &fixture.primary).await,
+    );
+    persist_cleanup(&mut model);
+    assert!(matches!(
+        evaluate(&model.snapshot, &scale_up_model::config()),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpSourceBuildRetirementBlocked")
+    ));
+    let fenced = fixture.store.load_state().await.unwrap();
+    assert_eq!(
+        fenced
+            .pending_effect
+            .as_ref()
+            .map(|pending| &pending.effect),
+        Some(&unrelated)
+    );
+    assert!(!fenced.abandoned_builds.contains(&fixture.build_id));
     shutdown.send_replace(true);
     server.await.unwrap().unwrap();
 }

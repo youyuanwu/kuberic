@@ -887,6 +887,12 @@ impl Model {
                             if report.pending_operation_id.as_ref() == Some(&build_operation) {
                                 report.pending_operation_id = None;
                             }
+                            if report.identity.replica_id == command.local_replica_id {
+                                report.retained_operation_id = Some(OperationId::new(format!(
+                                    "{}:retire-abandoned-build",
+                                    command.operation_id
+                                )));
+                            }
                         }
                     }
                     self.pending_build = None;
