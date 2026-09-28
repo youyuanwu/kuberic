@@ -184,6 +184,10 @@ pub(crate) struct DefaultReplicatorInner {
     build_authority_store: Arc<dyn BuildAuthorityStore>,
     build_progress_store: Arc<dyn BuildProgressStore>,
     state: RwLock<RuntimeState>,
+    // Lock order: effect_lock -> delivery_lock whenever an operation needs both.
+    // Control paths that do not own effect_lock must acquire delivery_lock before
+    // advancing fence_generation, so boundary persistence has one linearization
+    // point with authority, role, epoch, access, receive, and cancellation work.
     effect_lock: Mutex<()>,
     copy_prepare_lock: Mutex<()>,
     delivery_lock: Arc<Mutex<()>>,
@@ -491,8 +495,8 @@ impl DefaultReplicatorInner {
 
     pub(crate) async fn control_change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
         self.check_aborted()?;
-        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         let _delivery = self.delivery_lock.lock().await;
+        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
         self.replicator.lock().await.fence_client_writes();
         self.replicator.lock().await.change_role(epoch, role)?;
@@ -507,8 +511,8 @@ impl DefaultReplicatorInner {
         provider: &dyn StateProvider,
     ) -> Result<()> {
         self.check_aborted()?;
-        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         let _delivery = self.delivery_lock.lock().await;
+        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         let state = self.state.read().await;
         if !state.open {
             return Err(RuntimeError::NotOpen);
@@ -522,11 +526,11 @@ impl DefaultReplicatorInner {
     }
 
     pub(crate) async fn control_close(&self) -> Result<()> {
-        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         if let Some(streams) = self.streams.read().await.as_ref() {
             streams.shutdown();
         }
         let _delivery = self.delivery_lock.lock().await;
+        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         {
             let mut state = self.state.write().await;
             state.open = false;
@@ -583,8 +587,8 @@ impl DefaultReplicatorInner {
         current_progress: i64,
         committed_lsn: i64,
     ) -> Result<()> {
-        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         let _delivery = self.delivery_lock.lock().await;
+        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         self.local_write_journal
             .reset_local_writes_after_data_loss(committed_lsn)
             .await?;
@@ -1524,9 +1528,13 @@ impl DefaultReplicatorInner {
             sequence += 1;
         }
 
-        self.check_delivery_generation(generation)?;
         let catch_up_boundary_lsn = self
-            .freeze_build_catch_up_boundary(authority, generation, &initial_operations)
+            .freeze_build_catch_up_boundary(
+                authority,
+                generation,
+                &initial_operations,
+                &cancellation,
+            )
             .await?;
         let final_item = copy_final_item(authority, sequence, committed_lsn, catch_up_boundary_lsn);
         {
@@ -1598,10 +1606,13 @@ impl DefaultReplicatorInner {
         authority: &BuildAuthority,
         generation: u64,
         initial_operations: &BTreeMap<i64, Operation>,
+        cancellation: &watch::Receiver<bool>,
     ) -> Result<i64> {
-        let _delivery = self.delivery_lock.lock().await;
+        self.check_copy_producer(generation, cancellation)?;
         let _effect = self.effect_lock.lock().await;
-        self.check_delivery_generation(generation)?;
+        self.check_copy_producer(generation, cancellation)?;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_copy_producer(generation, cancellation)?;
         let state = self.state.read().await;
         let build = state
             .outbound_builds
@@ -1659,6 +1670,11 @@ impl DefaultReplicatorInner {
         self.build_progress_store
             .record_build_progress(&progress)
             .await?;
+        // Cancellation can arrive while the immutable durable write is in
+        // flight. Re-check before publishing it into the active generation; an
+        // exact retry may reuse a linearized write, while a fenced authority
+        // ignores it.
+        self.check_copy_producer(generation, cancellation)?;
         let mut state = self.state.write().await;
         let build = state
             .outbound_builds
@@ -1671,6 +1687,17 @@ impl DefaultReplicatorInner {
         }
         build.progress = progress;
         Ok(boundary)
+    }
+
+    fn check_copy_producer(
+        &self,
+        generation: u64,
+        cancellation: &watch::Receiver<bool>,
+    ) -> Result<()> {
+        if *cancellation.borrow() {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.check_delivery_generation(generation)
     }
 
     async fn record_emitted_copy_item(
@@ -3548,6 +3575,8 @@ impl ManagedReplicator for DefaultReplicatorInner {
 
     async fn cancel_configuration_work(&self) -> Result<()> {
         self.check_aborted()?;
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
         self.fence_generation.fetch_add(1, Ordering::AcqRel);
         self.replicator.lock().await.fence_client_writes();
         self.changed.notify_waiters();
@@ -3647,6 +3676,8 @@ impl ManagedReplicator for DefaultReplicatorInner {
     }
 
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
         let mut state = self.state.write().await;
         state.outbound_builds.remove(build_id);
         state.cancelled_outbound_builds.insert(build_id.clone());

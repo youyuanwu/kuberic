@@ -2175,6 +2175,9 @@ struct MemoryAuthorityStore {
     admit_count: AtomicUsize,
     fail_after_admit: AtomicBool,
     fail_build_progress_once: AtomicBool,
+    pause_build_progress: AtomicBool,
+    build_progress_notify: Notify,
+    resume_build_progress_notify: Notify,
     fail_registered_write_once: AtomicBool,
     pause_registered_write: AtomicBool,
     registered_write_notify: Notify,
@@ -2492,6 +2495,10 @@ impl BuildProgressStore for MemoryAuthorityStore {
                 "injected build progress failure".to_string(),
             ));
         }
+        if self.pause_build_progress.load(Ordering::SeqCst) {
+            self.build_progress_notify.notify_one();
+            self.resume_build_progress_notify.notified().await;
+        }
         let mut builds = self.build_progress.lock().unwrap();
         if builds
             .get(&progress.authority.build_id)
@@ -2534,6 +2541,9 @@ struct TestApplication {
     pause_copy_enumeration: Arc<AtomicBool>,
     copy_enumeration_notify: Arc<Notify>,
     resume_copy_enumeration_notify: Arc<Notify>,
+    pause_copy_completion: Arc<AtomicBool>,
+    copy_completion_notify: Arc<Notify>,
+    resume_copy_completion_notify: Arc<Notify>,
     pause_retained_enumeration: Arc<AtomicBool>,
     retained_enumeration_notify: Arc<Notify>,
     resume_retained_enumeration_notify: Arc<Notify>,
@@ -2938,18 +2948,31 @@ impl StateProvider for TestApplication {
         let pause = self.pause_copy_enumeration.clone();
         let paused = self.copy_enumeration_notify.clone();
         let resume = self.resume_copy_enumeration_notify.clone();
+        let pause_completion = self.pause_copy_completion.clone();
+        let completion_paused = self.copy_completion_notify.clone();
+        let resume_completion = self.resume_copy_completion_notify.clone();
         Ok(Box::pin(stream::unfold(
             (chunks.into_iter(), true),
             move |(mut chunks, first)| {
                 let pause = pause.clone();
                 let paused = paused.clone();
                 let resume = resume.clone();
+                let pause_completion = pause_completion.clone();
+                let completion_paused = completion_paused.clone();
+                let resume_completion = resume_completion.clone();
                 async move {
                     if first && pause.load(Ordering::SeqCst) {
                         paused.notify_one();
                         resume.notified().await;
                     }
-                    std::iter::Iterator::next(&mut chunks).map(|chunk| (chunk, (chunks, false)))
+                    if let Some(chunk) = std::iter::Iterator::next(&mut chunks) {
+                        return Some((chunk, (chunks, false)));
+                    }
+                    if pause_completion.load(Ordering::SeqCst) {
+                        completion_paused.notify_one();
+                        resume_completion.notified().await;
+                    }
+                    None
                 }
             },
         )))
@@ -7437,6 +7460,200 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
     assert_eq!(live.catch_up_boundary_lsn, None);
     assert!(!live.snapshot_chunk);
     assert!(!live.final_item);
+}
+
+async fn exercise_copy_boundary_demotion_overlap(iteration: usize) {
+    let source = identity(1, &format!("boundary-source-{iteration}"));
+    let new_primary = identity(2, &format!("boundary-primary-{iteration}"));
+    let target = identity(3, &format!("boundary-target-{iteration}"));
+    let previous = authority(source.clone(), vec![source.clone(), new_primary.clone()]);
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        new_primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: new_primary,
+                role: ReplicaRole::Primary,
+            },
+        ],
+        2,
+    );
+    let demoted = AdmittedAuthority {
+        local_identity: source.clone(),
+        transition_kind: Some(TransitionKind::Failover),
+        previous_configuration: Some(previous.current_configuration.clone()),
+        current_configuration: current,
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    };
+    let application = Arc::new(TestApplication::default());
+    application.seed_operation(1, Bytes::from_static(b"seed"));
+    application
+        .pause_copy_completion
+        .store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = Arc::new(PodRuntime::new(source, application.clone(), store.clone()));
+    for (sequence, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(previous)),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(sequence as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+
+    let build_id = OperationId::new(format!("boundary-build-{iteration}"));
+    let mut prepared = prepare_copy_authorized(
+        &runtime,
+        PrepareCopyRequest {
+            build_id: build_id.clone(),
+            target,
+            configuration: BuildConfiguration::Current,
+            copy_context: empty_copy_context(),
+        },
+    )
+    .await
+    .unwrap();
+    let first = next_copy_item(&mut prepared).await;
+    assert!(first.snapshot_chunk);
+    application.copy_completion_notify.notified().await;
+
+    store.pause_build_progress.store(true, Ordering::SeqCst);
+    let ack_runtime = runtime.clone();
+    let acknowledgement = proto::CopyAck {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: first.build_id.clone(),
+        sender: first.sender.clone(),
+        receiver: first.receiver.clone(),
+        epoch: first.epoch,
+        current_configuration_id: first.current_configuration_id.clone(),
+        sequence: first.sequence,
+        durable_lsn: first.lsn,
+        replication_boundary_lsn: first.replication_boundary_lsn,
+        catch_up_boundary_lsn: first.catch_up_boundary_lsn,
+        final_item: first.final_item,
+        snapshot_chunk: first.snapshot_chunk,
+        ..Default::default()
+    };
+    let acknowledgement = tokio::spawn(async move {
+        ack_runtime
+            .data_plane()
+            .accept_copy_acknowledgement(acknowledgement)
+            .await
+    });
+    store.build_progress_notify.notified().await;
+
+    application
+        .pause_copy_completion
+        .store(false, Ordering::SeqCst);
+    application.resume_copy_completion_notify.notify_waiters();
+    tokio::task::yield_now().await;
+
+    let demotion_runtime = runtime.clone();
+    let expected_demoted = demoted.clone();
+    let demotion = tokio::spawn(async move {
+        demotion_runtime
+            .apply_effect(effect(
+                5,
+                RuntimeEffectAction::AdmitAuthority(Box::new(demoted)),
+            ))
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    drop(prepared);
+    store.pause_build_progress.store(false, Ordering::SeqCst);
+    store.resume_build_progress_notify.notify_waiters();
+
+    timeout(Duration::from_secs(2), async {
+        acknowledgement.await.unwrap().unwrap();
+        demotion.await.unwrap().unwrap();
+        loop {
+            if runtime.snapshot().await.builds.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.authority, Some(expected_demoted));
+    assert_eq!(snapshot.write_status, AccessStatus::ReconfigurationPending);
+    assert!(snapshot.builds.is_empty());
+    let progress = store.load_build_progress(&build_id).await.unwrap().unwrap();
+    assert_eq!(progress.last_sequence, first.sequence);
+    assert_eq!(progress.catch_up_boundary_lsn, None);
+}
+
+#[tokio::test]
+async fn cancelled_copy_boundary_cannot_deadlock_source_demotion() {
+    for iteration in 0..8 {
+        exercise_copy_boundary_demotion_overlap(iteration).await;
+    }
+}
+
+#[tokio::test]
+async fn copy_boundary_persists_without_concurrent_authority_change() {
+    let source = identity(1, "boundary-control-source");
+    let target = identity(2, "boundary-control-target");
+    let application = Arc::new(TestApplication::default());
+    application.seed_operation(1, Bytes::from_static(b"seed"));
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = Arc::new(PodRuntime::new(source.clone(), application, store.clone()));
+    for (sequence, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(source.clone(), vec![source]))),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(sequence as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let build_id = OperationId::new("boundary-control-build");
+    let mut prepared = prepare_copy_authorized(
+        &runtime,
+        PrepareCopyRequest {
+            build_id: build_id.clone(),
+            target,
+            configuration: BuildConfiguration::Current,
+            copy_context: empty_copy_context(),
+        },
+    )
+    .await
+    .unwrap();
+    let final_item = copy_through_final(&mut prepared)
+        .await
+        .into_iter()
+        .find(|item| item.final_item)
+        .unwrap();
+    assert_eq!(final_item.catch_up_boundary_lsn, Some(1));
+    assert_eq!(
+        store
+            .load_build_progress(&build_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .catch_up_boundary_lsn,
+        Some(1)
+    );
 }
 
 #[tokio::test]
