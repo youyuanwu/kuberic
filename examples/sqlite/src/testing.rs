@@ -572,43 +572,13 @@ pub async fn write_receipt(primary: &SqlitePod, id: i64) -> SqlReceipt {
     }
 }
 
-pub async fn assert_receipts(primary: &SqlitePod, receipts: &[SqlReceipt]) {
-    for receipt in receipts {
-        let rows = primary
-            .query(&format!("SELECT value FROM data WHERE id={}", receipt.id))
-            .await
-            .unwrap()
-            .rows;
-        assert_eq!(rows.len(), 1, "acknowledged receipt {receipt:?}");
-        assert_eq!(
-            rows[0].values[0].kind,
-            Some(proto::value::Kind::TextValue(receipt.value.clone()))
-        );
-        assert!(
-            primary
-                .application
-                .persistence()
-                .progress()
-                .unwrap()
-                .committed_lsn
-                >= receipt.lsn
-        );
+fn image_rows(image: &[u8]) -> Vec<(i64, String)> {
+    if image.is_empty() {
+        return Vec::new();
     }
-}
-
-/// Inspect an offline reconstruction, not a public SQL read or a commit shortcut.
-pub fn assert_durable_receipts(replica: &SqlitePod, receipts: &[SqlReceipt]) {
     let inspection = scratch();
     let path = inspection.path().join("applied.sqlite");
-    std::fs::write(
-        &path,
-        replica
-            .application
-            .persistence()
-            .applied_image_for_test()
-            .unwrap(),
-    )
-    .unwrap();
+    std::fs::write(&path, image).unwrap();
     let database = rusqlite::Connection::open(path).unwrap();
     assert_eq!(
         database
@@ -616,37 +586,256 @@ pub fn assert_durable_receipts(replica: &SqlitePod, receipts: &[SqlReceipt]) {
             .unwrap(),
         "ok"
     );
-    for receipt in receipts {
-        assert_eq!(
-            database
-                .query_row("SELECT value FROM data WHERE id=?1", [receipt.id], |r| {
-                    r.get::<_, String>(0)
-                })
-                .unwrap(),
-            receipt.value
-        );
-        assert!(
-            replica
-                .application
-                .persistence()
-                .progress()
-                .unwrap()
-                .applied_lsn
-                >= receipt.lsn
-        );
+    database
+        .prepare("SELECT id,value FROM data ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// Exact-set oracle: no unexpected rows, LSNs, reservations, or WAL operations.
+/// Callers must list resolved unknown-outcome transactions explicitly as well.
+pub fn verify_contents(replica: &SqlitePod, expected: &[SqlReceipt]) -> Result<(), String> {
+    let evidence = replica
+        .application
+        .persistence()
+        .inspect_for_test()
+        .map_err(|e| e.to_string())?;
+    let mut rows = expected
+        .iter()
+        .map(|receipt| (receipt.id, receipt.value.clone()))
+        .collect::<Vec<_>>();
+    rows.sort();
+    if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("expected rows contain duplicate identities".into());
+    }
+    if image_rows(&evidence.image) != rows {
+        return Err("complete SQL contents differ from expected transactions".into());
+    }
+    let mut lsns = expected.iter().map(|r| r.lsn).collect::<Vec<_>>();
+    lsns.sort();
+    let last = expected.len() as i64 + 1; // LSN 1 creates the data table.
+    if lsns != (2..=last).collect::<Vec<_>>() || evidence.progress.applied_lsn != last {
+        return Err("unexpected, missing, or duplicate application history LSN".into());
+    }
+    if evidence
+        .operations
+        .iter()
+        .map(|op| op.lsn)
+        .collect::<Vec<_>>()
+        != (evidence.base_lsn + 1..=last).collect::<Vec<_>>()
+    {
+        return Err("retained history does not exactly cover the post-base suffix".into());
+    }
+    // Replay each retained boundary against the expected SQL prefix, not merely
+    // the final image: even an extra write later undone cannot hide in history.
+    for operation in &evidence.operations {
+        let prefix = replica
+            .application
+            .persistence()
+            .image_at_for_test(operation.lsn)
+            .map_err(|e| e.to_string())?;
+        let mut expected_prefix = expected
+            .iter()
+            .filter(|r| r.lsn <= operation.lsn)
+            .map(|r| (r.id, r.value.clone()))
+            .collect::<Vec<_>>();
+        expected_prefix.sort();
+        if image_rows(&prefix) != expected_prefix {
+            return Err(format!(
+                "unexpected SQL state at retained LSN {}",
+                operation.lsn
+            ));
+        }
+    }
+    let mut journal_lsns = std::collections::BTreeSet::new();
+    for write in local_journal(replica) {
+        if write.lsn < 1 || write.lsn > last {
+            return Err("unexpected agent reservation or terminal write".into());
+        }
+        if !journal_lsns.insert(write.lsn) {
+            return Err("multiple agent reservations occupy one expected history LSN".into());
+        }
+        if let Some(operation) = evidence.operations.iter().find(|op| op.lsn == write.lsn)
+            && (operation.data != write.data || operation.committed_lsn != write.committed_lsn)
+        {
+            return Err("agent journal differs from exact application operation".into());
+        }
+    }
+    Ok(())
+}
+
+pub async fn assert_receipts(primary: &SqlitePod, receipts: &[SqlReceipt]) {
+    let response = primary
+        .query("SELECT id,value FROM data ORDER BY id")
+        .await
+        .unwrap();
+    let actual = response
+        .rows
+        .into_iter()
+        .map(|row| {
+            let Some(proto::value::Kind::IntegerValue(id)) = row.values[0].kind else {
+                panic!("integer ID")
+            };
+            let Some(proto::value::Kind::TextValue(value)) = &row.values[1].kind else {
+                panic!("text value")
+            };
+            (id, value.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut expected = receipts
+        .iter()
+        .map(|r| (r.id, r.value.clone()))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected, "complete served SQL contents");
+    verify_contents(primary, receipts).unwrap();
+    assert_eq!(
+        primary
+            .application
+            .persistence()
+            .progress()
+            .unwrap()
+            .committed_lsn,
+        receipts.len() as i64 + 1
+    );
+}
+
+/// Offline applied-state inspection does not grant SQL access or commitment.
+pub fn assert_durable_receipts(replica: &SqlitePod, receipts: &[SqlReceipt]) {
+    verify_contents(replica, receipts).unwrap();
+}
+
+fn local_journal(
+    replica: &SqlitePod,
+) -> Vec<kuberic_runtime_internal::authority::DurableLocalWrite> {
+    // Include committed entries too; load_local_writes deliberately omits them.
+    let database = rusqlite::Connection::open_with_flags(
+        replica.store.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    database
+        .prepare("SELECT write_json FROM local_writes ORDER BY lsn,operation_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect()
+}
+
+fn application_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            for (path, bytes) in application_files(&entry.path()) {
+                files.insert(PathBuf::from(entry.file_name()).join(path), bytes);
+            }
+        } else {
+            files.insert(
+                PathBuf::from(entry.file_name()),
+                std::fs::read(entry.path()).unwrap(),
+            );
+        }
+    }
+    files
+}
+
+#[derive(Debug, Clone)]
+pub struct FencedProbe {
+    pub id: i64,
+    pub reason: String,
+}
+
+static NEXT_PROBE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Exact authority/access responses only: not SQL errors, unknown outcomes,
+/// missing barriers, transport unavailability, or arbitrary FailedPrecondition.
+pub fn definitive_fence(outcome: &Result<proto::ExecuteResponse, Status>) -> Result<(), String> {
+    let Err(status) = outcome else {
+        return Err("new stale write succeeded".into());
+    };
+    let accepted = status.code() == tonic::Code::Unavailable
+        && [
+            kuberic_runtime::RuntimeError::NotPrimary.to_string(),
+            kuberic_runtime::RuntimeError::NotOpen.to_string(),
+            kuberic_runtime::RuntimeError::Closed.to_string(),
+            kuberic_runtime::RuntimeError::WriteClosed(AccessStatus::ReconfigurationPending)
+                .to_string(),
+            kuberic_runtime::RuntimeError::WriteClosed(AccessStatus::NotPrimary).to_string(),
+            kuberic_runtime::RuntimeError::WriteClosed(AccessStatus::NoWriteQuorum).to_string(),
+        ]
+        .contains(&status.message().to_owned());
+    if accepted {
+        Ok(())
+    } else {
+        Err(format!("not a definitive authority/access fence: {status}"))
     }
 }
 
-pub async fn assert_closed(replica: &SqlitePod) {
-    assert!(
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            replica.execute("INSERT INTO data VALUES(-999,'stale-writer')")
+pub async fn probe_closed(replica: &SqlitePod) -> Result<FencedProbe, String> {
+    let id = NEXT_PROBE
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |value| value.checked_add(1),
         )
+        .expect("probe ID exhausted");
+    let before = replica
+        .application
+        .persistence()
+        .inspect_for_test()
+        .map_err(|e| e.to_string())?;
+    if image_rows(&before.image)
+        .iter()
+        .any(|(existing, _)| *existing == id)
+    {
+        return Err("fresh probe identity already exists".into());
+    }
+    let journal = local_journal(replica);
+    let files = application_files(&replica.root.join("application"));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        replica.execute(&format!("INSERT INTO data VALUES({id},'stale-probe-{id}')")),
+    )
+    .await
+    .map_err(|_| "stale probe blocked instead of definitively rejecting".to_owned())?;
+    definitive_fence(&outcome)?;
+    if replica
+        .application
+        .persistence()
+        .inspect_for_test()
+        .map_err(|e| e.to_string())?
+        != before
+        || local_journal(replica) != journal
+        || application_files(&replica.root.join("application")) != files
+    {
+        return Err("fenced probe changed application/journal evidence".into());
+    }
+    let after = replica
+        .application
+        .persistence()
+        .applied_image_for_test()
+        .map_err(|e| e.to_string())?;
+    if image_rows(&after)
+        .iter()
+        .any(|(existing, _)| *existing == id)
+    {
+        return Err("fenced probe left a SQL row".into());
+    }
+    Ok(FencedProbe {
+        id,
+        reason: outcome.unwrap_err().message().to_owned(),
+    })
+}
+
+pub async fn assert_closed(replica: &SqlitePod) -> FencedProbe {
+    probe_closed(replica)
         .await
-        .expect("a stale request is rejected without waiting for replication")
-        .is_err()
-    );
+        .unwrap_or_else(|reason| panic!("{}: {reason}", replica.identity.instance_id))
 }
 
 pub async fn close_access(replica: &SqlitePod) {
@@ -880,16 +1069,40 @@ pub async fn persisted_build(pod: &SqlitePod, id: &OperationId) -> BuildAuthorit
     pod.store.load_build(id).await.unwrap().unwrap()
 }
 
-/// Complete a handoff/failover through real peer delivery, then current-only
-/// convergence. `boundary` is an actually retained, acknowledged/elected suffix.
-pub async fn change_primary(
-    pods: &[&SqlitePod],
-    previous: &ConfigurationDescriptor,
-    target: &SqlitePod,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryCheckpoint {
+    Prepared,
+    AuthorityInstalled,
+    TargetActivated,
+    TargetGrantedOldAlive,
+    OldDemoted,
+    Complete,
+}
+
+/// Each method is a deterministic checkpoint, not a background transition.
+/// The prepared old application remains alive until `demote_old`, allowing
+/// callers to distinguish new probes from delayed pre-transition SQL responses.
+pub struct PrimaryChange<'a> {
+    pods: Vec<&'a SqlitePod>,
+    source: &'a SqlitePod,
+    target: &'a SqlitePod,
+    previous: ConfigurationDescriptor,
+    pub current: ConfigurationDescriptor,
+    handoff: Option<SwitchoverHandoff>,
     planned: bool,
     boundary: i64,
-) -> ConfigurationDescriptor {
-    let source = pods
+    pub checkpoint: PrimaryCheckpoint,
+    routes: Option<Routes>,
+}
+
+pub async fn begin_primary_change<'a>(
+    pods: &[&'a SqlitePod],
+    previous: &ConfigurationDescriptor,
+    target: &'a SqlitePod,
+    planned: bool,
+    boundary: i64,
+) -> PrimaryChange<'a> {
+    let source = *pods
         .iter()
         .find(|p| p.identity.replica_id == previous.primary_id)
         .unwrap();
@@ -931,62 +1144,174 @@ pub async fn change_primary(
         .position(|id| *id == target.identity)
         .unwrap();
     let current = configuration(&members, index, previous.epoch.configuration_number + 1);
-    let survivors: Vec<_> = pods
-        .iter()
-        .copied()
-        .filter(|pod| planned || pod.identity != source.identity)
-        .collect();
-    for pod in &survivors {
-        let mut admitted = authority(pod.identity.clone(), current.clone());
-        admitted.previous_configuration = Some(previous.clone());
-        admitted.transition_kind = Some(if planned {
-            TransitionKind::PlannedSwitchover
-        } else {
-            TransitionKind::Failover
-        });
-        admitted.switchover_handoff = handoff.clone();
-        pod.effect(RuntimeEffectAction::AdmitAuthority(Box::new(admitted)))
+    PrimaryChange {
+        pods: pods.to_vec(),
+        source,
+        target,
+        previous: previous.clone(),
+        current,
+        handoff,
+        planned,
+        boundary,
+        checkpoint: PrimaryCheckpoint::Prepared,
+        routes: None,
+    }
+}
+
+impl PrimaryChange<'_> {
+    fn survivors(&self) -> Vec<&SqlitePod> {
+        self.pods
+            .iter()
+            .copied()
+            .filter(|p| self.planned || p.identity != self.source.identity)
+            .collect()
+    }
+
+    pub async fn install_authority(&mut self) {
+        assert_eq!(self.checkpoint, PrimaryCheckpoint::Prepared);
+        for pod in self.survivors() {
+            let mut admitted = authority(pod.identity.clone(), self.current.clone());
+            admitted.previous_configuration = Some(self.previous.clone());
+            admitted.transition_kind = Some(if self.planned {
+                TransitionKind::PlannedSwitchover
+            } else {
+                TransitionKind::Failover
+            });
+            admitted.switchover_handoff = self.handoff.clone();
+            pod.effect(RuntimeEffectAction::AdmitAuthority(Box::new(admitted)))
+                .await
+                .unwrap();
+            if !self.planned {
+                pod.effect(RuntimeEffectAction::AuthorizeFailoverPrefix(self.boundary))
+                    .await
+                    .unwrap();
+            }
+        }
+        self.checkpoint = PrimaryCheckpoint::AuthorityInstalled;
+    }
+
+    pub async fn activate_target(&mut self) {
+        assert_eq!(self.checkpoint, PrimaryCheckpoint::AuthorityInstalled);
+        for pod in self
+            .survivors()
+            .into_iter()
+            .filter(|p| p.identity != self.source.identity)
+        {
+            pod.effect(RuntimeEffectAction::ChangeRole(
+                if pod.identity == self.target.identity {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            ))
             .await
             .unwrap();
-        if !planned {
-            pod.effect(RuntimeEffectAction::AuthorizeFailoverPrefix(boundary))
+        }
+        self.checkpoint = PrimaryCheckpoint::TargetActivated;
+    }
+
+    pub async fn grant_target(&mut self) {
+        assert_eq!(self.checkpoint, PrimaryCheckpoint::TargetActivated);
+        // The old application remains Primary and cannot receive new-epoch
+        // replication until demoted. Use only the actual remaining quorum.
+        let peers = self
+            .survivors()
+            .into_iter()
+            .filter(|p| p.identity != self.target.identity && p.identity != self.source.identity)
+            .collect::<Vec<_>>();
+        assert!(
+            peers.len() + 1 >= self.current.write_quorum as usize,
+            "this checkpoint requires a real target quorum without the undemoted old application"
+        );
+        let routes = route(self.target, &peers).await;
+        for peer in peers {
+            self.target
+                .runtime
+                .repair_peer(peer.identity.clone(), self.boundary.saturating_sub(1))
                 .await
                 .unwrap();
         }
-        pod.effect(RuntimeEffectAction::ChangeRole(
-            if pod.identity == target.identity {
-                ReplicaRole::Primary
-            } else {
-                ReplicaRole::ActiveSecondary
-            },
-        ))
-        .await
-        .unwrap();
+        wait_catchup(self.target).await;
+        self.target.grant().await;
+        self.routes = Some(routes);
+        self.checkpoint = PrimaryCheckpoint::TargetGrantedOldAlive;
     }
-    let peers = survivors
-        .iter()
-        .copied()
-        .filter(|p| p.identity != target.identity)
-        .collect::<Vec<_>>();
-    let routes = route(target, &peers).await;
-    for peer in &peers {
-        target
-            .runtime
-            .repair_peer(peer.identity.clone(), boundary.saturating_sub(1))
-            .await
-            .unwrap();
+
+    pub async fn demote_old(&mut self) {
+        assert_eq!(self.checkpoint, PrimaryCheckpoint::TargetGrantedOldAlive);
+        if self.planned {
+            self.source
+                .effect(RuntimeEffectAction::ChangeRole(
+                    ReplicaRole::ActiveSecondary,
+                ))
+                .await
+                .unwrap();
+        }
+        self.checkpoint = PrimaryCheckpoint::OldDemoted;
     }
-    wait_catchup(target).await;
-    for pod in &survivors {
-        let mut completed = authority(pod.identity.clone(), current.clone());
-        completed.switchover_handoff = handoff.clone();
-        pod.effect(RuntimeEffectAction::AdmitAuthority(Box::new(completed)))
-            .await
-            .unwrap();
+
+    pub async fn complete(mut self) -> ConfigurationDescriptor {
+        assert_eq!(self.checkpoint, PrimaryCheckpoint::OldDemoted);
+        self.routes.take().unwrap().stop().await;
+        let peers = self
+            .survivors()
+            .into_iter()
+            .filter(|p| p.identity != self.target.identity)
+            .collect::<Vec<_>>();
+        let routes = route(self.target, &peers).await;
+        for peer in &peers {
+            self.target
+                .runtime
+                .repair_peer(peer.identity.clone(), self.boundary.saturating_sub(1))
+                .await
+                .unwrap();
+        }
+        wait_catchup(self.target).await;
+        wait_applied(
+            &peers,
+            self.target
+                .application
+                .persistence()
+                .progress()
+                .unwrap()
+                .applied_lsn,
+        )
+        .await;
+        for pod in self.survivors() {
+            let mut completed = authority(pod.identity.clone(), self.current.clone());
+            completed.switchover_handoff = self.handoff.clone();
+            pod.effect(RuntimeEffectAction::AdmitAuthority(Box::new(completed)))
+                .await
+                .unwrap();
+        }
+        self.target.grant().await;
+        routes.stop().await;
+        self.checkpoint = PrimaryCheckpoint::Complete;
+        self.current
     }
-    target.grant().await;
-    routes.stop().await;
-    current
+}
+
+pub async fn change_primary(
+    pods: &[&SqlitePod],
+    previous: &ConfigurationDescriptor,
+    target: &SqlitePod,
+    planned: bool,
+    boundary: i64,
+) -> ConfigurationDescriptor {
+    let mut transition = begin_primary_change(pods, previous, target, planned, boundary).await;
+    // Prove rejection while the old application is still alive, not merely
+    // after demotion has made the SQL service unreachable.
+    assert_closed(transition.source).await;
+    assert_closed(target).await;
+    transition.install_authority().await;
+    assert_closed(transition.source).await;
+    transition.activate_target().await;
+    assert_closed(transition.source).await;
+    assert_closed(target).await;
+    transition.grant_target().await;
+    assert_closed(transition.source).await;
+    transition.demote_old().await;
+    transition.complete().await
 }
 
 pub async fn removal_intent(

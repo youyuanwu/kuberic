@@ -126,7 +126,7 @@ async fn replacement_replays_copy_across_source_candidate_and_install_ack_crash_
         .unwrap();
     assert_eq!(retained[0].data.as_ref(), original[2].data.as_slice());
     assert_eq!(retained[0].committed_lsn, original[2].committed_lsn);
-    let receipts = vec![first, second];
+    let mut receipts = vec![first, second];
     assert_durable_receipts(&candidate, &receipts);
     assert_closed(&candidate).await;
     deliver_copy(&mut transport, original[1].clone())
@@ -243,7 +243,8 @@ async fn replacement_replays_copy_across_source_candidate_and_install_ack_crash_
     let routes = route(&candidate, &[&source, &witness]).await;
     let next = write_receipt(&candidate, 30).await;
     wait_applied(&[&source, &witness], next.lsn).await;
-    assert_receipts(&candidate, std::slice::from_ref(&next)).await;
+    receipts.push(next);
+    assert_receipts(&candidate, &receipts).await;
     for stale in [&source, &witness, &old] {
         assert_closed(stale).await;
     }

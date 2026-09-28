@@ -112,6 +112,11 @@ impl SqliteService {
     pub fn vfs_name(&self) -> &str {
         &self.vfs_name
     }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn primary_application_active_for_test(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
     pub fn partition(&self) -> Result<StatefulServicePartition> {
         self.partition
             .lock()

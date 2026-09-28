@@ -145,30 +145,23 @@ async fn authority_revocation_at_three_sql_cuts_preserves_exact_outcome_semantic
             boundary,
         )
         .await;
-        assert_receipts(&target, std::slice::from_ref(&baseline)).await;
-        let rows = target
-            .query("SELECT value FROM data WHERE id=99")
-            .await
-            .unwrap()
-            .rows;
-        if cut == Cut::BeforeReservation {
-            assert!(rows.is_empty());
-        } else {
-            assert_eq!(
-                rows[0].values[0].kind,
-                Some(proto::value::Kind::TextValue("interrupted".into()))
-            );
+        let mut expected_transactions = vec![baseline];
+        if cut != Cut::BeforeReservation {
+            // AfterApply was unknown to its caller but exactly recovered by the
+            // handoff. AfterQuorum was a delayed success, not a new stale write.
+            expected_transactions.push(SqlReceipt {
+                id: 99,
+                value: "interrupted".into(),
+                lsn: boundary,
+            });
         }
+        assert_receipts(&target, &expected_transactions).await;
+        assert_durable_receipts(&witness, &expected_transactions);
         assert_closed(&source).await;
         assert_closed(&witness).await;
         let target = target.reopen().await;
-        assert_receipts(&target, std::slice::from_ref(&baseline)).await;
-        let rows = target
-            .query("SELECT value FROM data WHERE id=99")
-            .await
-            .unwrap()
-            .rows;
-        assert_eq!(rows.len(), usize::from(cut != Cut::BeforeReservation));
+        assert_receipts(&target, &expected_transactions).await;
+        assert_durable_receipts(&witness, &expected_transactions);
     }
 }
 

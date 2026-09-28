@@ -31,6 +31,16 @@ pub enum PersistenceFault {
     AfterCopyInstall = 4,
 }
 
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistenceInspection {
+    pub progress: DurableApplicationProgress,
+    pub recovery: RecoveryState,
+    pub base_lsn: i64,
+    pub operations: Vec<Operation>,
+    pub image: Vec<u8>,
+}
+
 impl SqlitePersistence {
     /// Prove freshness before opening storage or asking ReplicaHost to initialize authority.
     pub fn is_fresh_empty(root: &Path) -> io::Result<bool> {
@@ -83,6 +93,26 @@ impl SqlitePersistence {
     pub fn applied_image_for_test(&self) -> io::Result<Vec<u8>> {
         let log = self.lock()?;
         log.image_at(log.progress().applied_lsn)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn image_at_for_test(&self, lsn: i64) -> io::Result<Vec<u8>> {
+        self.lock()?.image_at(lsn)
+    }
+
+    /// One coherent read of the application evidence used by fencing oracles.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn inspect_for_test(&self) -> io::Result<PersistenceInspection> {
+        let log = self.lock()?;
+        let progress = log.progress();
+        let base_lsn = log.base_lsn_for_test();
+        Ok(PersistenceInspection {
+            progress,
+            recovery: log.recovery(),
+            base_lsn,
+            operations: log.retained(base_lsn + 1, progress.applied_lsn)?,
+            image: log.image_at(progress.applied_lsn)?,
+        })
     }
 
     /// Requires that the caller has closed every connection to the materialized database.

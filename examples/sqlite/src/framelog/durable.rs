@@ -283,6 +283,11 @@ impl DurableFrameLog {
         }
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn base_lsn_for_test(&self) -> i64 {
+        self.meta.base_lsn
+    }
+
     pub fn recovery(&self) -> RecoveryState {
         self.meta.recovery.clone()
     }
