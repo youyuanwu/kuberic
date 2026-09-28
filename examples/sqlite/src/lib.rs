@@ -1,14 +1,7 @@
-//! SQLite: Replicated SQLite on Kuberic
-//!
-//! A stateful SQLite database using kuberic-core's PodRuntime.
-//! Demonstrates WAL frame shipping replication:
-//! - Primary replicates each transaction before its commit becomes visible
-//! - Secondary persists frames to frames.log, applies on commit
-//! - StateProvider callbacks for copy/catchup/epoch management
-//! - Client-facing gRPC API for Execute/Query/ExecuteBatch
+//! One replicated SQLite application on the public level-triggered v2 stack.
 
 pub mod barrier;
-pub mod demo;
+mod connection;
 pub mod framelog;
 pub mod frames;
 pub mod server;

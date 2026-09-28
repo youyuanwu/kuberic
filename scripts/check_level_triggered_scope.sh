@@ -24,7 +24,7 @@ violations=()
 while IFS= read -r -d '' path; do
     case "$path" in
         kuberic-core/* | kuberic-operator/* | examples/kvstore/* | \
-            examples/sqlite/* | examples/postgres/* | kuberic-tests/*)
+            examples/postgres/* | kuberic-tests/*)
             violations+=("$path")
             ;;
     esac

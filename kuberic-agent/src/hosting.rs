@@ -667,11 +667,14 @@ impl PartitionAccessView for HostAccessView {
 
     async fn report_fault(&self, fault: FaultType) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        let _effect = host.effect_lock.lock().await;
+        // Applications may report a fault from Open/change_role while the host
+        // already owns effect_lock. Reports change diagnostics, not authority;
+        // the state lock serializes them without re-entering a lifecycle effect.
+        let mut state = host.state.write().await;
         if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        host.state.write().await.reported_fault = Some(fault);
+        state.reported_fault = Some(fault);
         Ok(())
     }
 }

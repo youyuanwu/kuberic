@@ -21,6 +21,19 @@ fn open(dir: &TempDir) -> SqlitePersistence {
     SqlitePersistence::open(dir.path().to_owned()).unwrap()
 }
 
+#[test]
+fn startup_freshness_does_not_confuse_empty_sql_state_with_missing_metadata() {
+    let root = directory();
+    let application = root.path().join("application");
+    assert!(SqlitePersistence::is_fresh_empty(&application).unwrap());
+    let state = SqlitePersistence::open(application.clone()).unwrap();
+    assert!(!SqlitePersistence::is_fresh_empty(&application).unwrap());
+    drop(state);
+    std::fs::remove_file(application.join("state-v2.json")).unwrap();
+    assert!(!SqlitePersistence::is_fresh_empty(&application).unwrap());
+    assert!(SqlitePersistence::open(application).is_err());
+}
+
 fn progress(applied_lsn: i64, committed_lsn: i64) -> DurableApplicationProgress {
     DurableApplicationProgress {
         applied_lsn,

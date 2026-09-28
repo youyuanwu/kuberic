@@ -1,200 +1,401 @@
-//! Test utilities for the SQLite replicated example.
-//! Compiled under `#[cfg(test)]` or `feature = "testing"`.
-
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+//! Package-local in-process v2 fixture. Authority belongs to the agent-side test
+//! driver, never to the production SQLite service. Phase 3 extracts routing.
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use kuberic_core::grpc::handle::GrpcReplicaHandle;
-use kuberic_core::pod::PodRuntime;
-use kuberic_core::types::ReplicaInstanceId;
-use tokio::sync::Mutex;
+use futures::StreamExt;
+use kuberic_agent::hosting::{OutboundReplication, PodRuntime};
+use kuberic_agent::runtime_adapter::RuntimeAdapter;
+use kuberic_agent::session::ProcessSession;
+use kuberic_agent::sqlite_store::SqliteStore;
+use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+use kuberic_agent::store::AgentStore;
+use kuberic_protocol::types::*;
+use kuberic_runtime::application::OpenMode;
+use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
+use kuberic_runtime_internal::authority::AdmittedAuthority;
+use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction};
+use tonic::{Request, Status};
 
-use crate::state::{SharedState, SqliteState};
+use crate::proto::sqlite_store_server::SqliteStore as _;
+use crate::{SqlitePersistence, proto, server::SqliteServer, service::SqliteService};
 
-async fn allocate_unique_address() -> String {
-    static ALLOCATED_PORTS: OnceLock<StdMutex<HashSet<u16>>> = OnceLock::new();
+pub fn scratch() -> tempfile::TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sqlite-v2-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    tempfile::tempdir_in(root).unwrap()
+}
 
-    loop {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let is_new = ALLOCATED_PORTS
-            .get_or_init(|| StdMutex::new(HashSet::new()))
-            .lock()
-            .unwrap()
-            .insert(port);
-        drop(listener);
-
-        if is_new {
-            return format!("127.0.0.1:{port}");
-        }
+pub fn identity(id: i64) -> ReplicaIdentity {
+    ReplicaIdentity {
+        replica_id: ReplicaId::new(id),
+        instance_id: ReplicaInstanceId::new(format!("sqlite-{id}")),
+        agent_generation: AgentGeneration::new(format!("sqlite-generation-{id}")),
     }
 }
 
-/// A running SQLite pod: PodRuntime + SQLite service event loop.
+pub fn configuration(
+    members: &[ReplicaIdentity],
+    primary: usize,
+    epoch: i64,
+) -> ConfigurationDescriptor {
+    ConfigurationDescriptor::new(
+        Epoch::new(0, epoch),
+        members[primary].replica_id,
+        members
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| ConfigurationMember {
+                identity: identity.clone(),
+                role: if index == primary {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        members.len() as u32 / 2 + 1,
+    )
+}
+
+pub fn authority(
+    local: ReplicaIdentity,
+    configuration: ConfigurationDescriptor,
+) -> AdmittedAuthority {
+    AdmittedAuthority {
+        local_identity: local,
+        current_configuration: configuration,
+        previous_configuration: None,
+        transition_kind: None,
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    }
+}
+
 pub struct SqlitePod {
-    pub instance_id: ReplicaInstanceId,
-    pub control_address: String,
-    pub data_address: String,
-    pub client_address: String,
-    pub state: SharedState,
-    pub data_dir: PathBuf,
-    _runtime_handle: tokio::task::JoinHandle<()>,
-    _service_handle: tokio::task::JoinHandle<()>,
+    pub runtime: Arc<PodRuntime>,
+    pub application: Arc<SqliteService>,
+    pub store: Arc<SqliteStore>,
+    pub server: SqliteServer,
+    pub root: PathBuf,
+    pub identity: ReplicaIdentity,
+    pub session: ProcessSession,
+    replicas: u32,
 }
 
 impl SqlitePod {
-    /// Start a SQLite pod with a PodRuntime and the SQLite service event loop.
-    pub async fn start(id: i64) -> Self {
-        Self::start_with_timeout(id, Duration::from_secs(10)).await
-    }
-
-    /// Start with a custom reply timeout.
-    pub async fn start_with_timeout(id: i64, reply_timeout: Duration) -> Self {
-        Self::start_with_timeout_and_data_loss(
-            id,
-            reply_timeout,
-            crate::service::DataLossBehavior::default(),
-        )
-        .await
-    }
-
-    pub async fn start_with_data_loss_behavior(
-        id: i64,
-        behavior: crate::service::DataLossBehavior,
-    ) -> Self {
-        Self::start_with_timeout_and_data_loss(id, Duration::from_secs(10), behavior).await
-    }
-
-    async fn start_with_timeout_and_data_loss(
-        id: i64,
-        reply_timeout: Duration,
-        data_loss_behavior: crate::service::DataLossBehavior,
-    ) -> Self {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let data_dir = std::env::temp_dir().join("sqlite-test").join(format!(
-            "pod-{}-{}-{}",
-            id,
-            std::process::id(),
-            n
+    pub async fn new(id: i64, root: PathBuf, replicas: u32) -> Self {
+        let identity = identity(id);
+        let metadata = SqliteStore::metadata_database_path(&root);
+        let store = if metadata.exists() {
+            SqliteStore::open_existing(metadata, None).unwrap()
+        } else {
+            assert!(SqlitePersistence::is_fresh_empty(&root.join("application")).unwrap());
+            SqliteStore::create_authorized(
+                metadata,
+                AgentState::new(StorageIdentity {
+                    schema_version: SCHEMA_VERSION,
+                    resource_uid: ResourceUid::new("sqlite-test"),
+                    pod_uid: PodUid::new(identity.instance_id.as_str()),
+                    pvc_uid: PvcUid::new(format!("sqlite-pvc-{id}")),
+                    initialization_id: InitializationId::new(format!("sqlite-init-{id}")),
+                    local_identity: identity.clone(),
+                    effective_policy: EffectivePolicy::fixed(replicas, 30).unwrap(),
+                }),
+            )
+            .unwrap()
+        };
+        let store = Arc::new(store);
+        let persistence = Arc::new(SqlitePersistence::open(root.join("application")).unwrap());
+        let application =
+            Arc::new(SqliteService::new(persistence, format!("in-process://sqlite-{id}")).unwrap());
+        let runtime = Arc::new(PodRuntime::new(
+            identity.clone(),
+            application.clone(),
+            store.clone(),
         ));
-        Self::start_with_dir_and_data_loss(id, data_dir, reply_timeout, data_loss_behavior).await
-    }
-
-    /// Start with a specific data directory (for restart tests).
-    pub async fn start_with_dir(id: i64, data_dir: PathBuf, reply_timeout: Duration) -> Self {
-        Self::start_with_dir_and_data_loss(
-            id,
-            data_dir,
-            reply_timeout,
-            crate::service::DataLossBehavior::default(),
-        )
-        .await
-    }
-
-    async fn start_with_dir_and_data_loss(
-        id: i64,
-        data_dir: PathBuf,
-        reply_timeout: Duration,
-        data_loss_behavior: crate::service::DataLossBehavior,
-    ) -> Self {
-        static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
-        let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let instance_id = ReplicaInstanceId::new(format!("sqlite-pod-{id}-{generation}"));
-        let client_address = allocate_unique_address().await;
-        let data_bind = allocate_unique_address().await;
-        let data_address = format!("http://{}", data_bind);
-        let control_bind = allocate_unique_address().await;
-
-        let bundle = PodRuntime::builder(id)
-            .instance_id(instance_id.clone())
-            .reply_timeout(reply_timeout)
-            .control_bind(control_bind)
-            .data_bind(data_bind)
-            .build()
-            .await
-            .unwrap();
-
-        let control_address = bundle.control_address.clone();
-        let state: SharedState = Arc::new(Mutex::new(
-            SqliteState::open(data_dir.clone()).await.unwrap(),
-        ));
-
-        let runtime_handle = tokio::spawn(bundle.runtime.serve());
-        let st = state.clone();
-        let bind = client_address.clone();
-        let service_handle = tokio::spawn(crate::service::run_service_with_data_loss(
-            bundle.lifecycle_rx,
-            st,
-            bind,
-            data_loss_behavior,
-        ));
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
+        let server = SqliteServer::new(application.clone());
         Self {
-            instance_id,
-            control_address,
-            data_address,
-            client_address,
-            state,
-            data_dir,
-            _runtime_handle: runtime_handle,
-            _service_handle: service_handle,
+            runtime,
+            application,
+            store,
+            server,
+            root,
+            identity,
+            session: ProcessSession::new(),
+            replicas,
         }
     }
 
-    /// Create a GrpcReplicaHandle for this pod.
-    pub async fn replica_handle(&self, id: i64) -> GrpcReplicaHandle {
-        GrpcReplicaHandle::connect(
-            id,
-            self.instance_id.clone(),
-            self.control_address.clone(),
-            self.data_address.clone(),
-        )
+    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_agent::Result<()> {
+        let sequence = self.store.load_state().await?.next_effect_sequence;
+        RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
+            .execute(RuntimeEffect {
+                operation_id: OperationId::new(format!("sqlite-effect-{sequence}")),
+                sequence,
+                action,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn open(&self) {
+        self.effect(RuntimeEffectAction::Open(OpenMode::Existing))
+            .await
+            .unwrap();
+    }
+
+    pub async fn singleton(root: PathBuf) -> Self {
+        let pod = Self::new(1, root, 1).await;
+        pod.open().await;
+        pod.effect(RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+            pod.identity.clone(),
+            configuration(std::slice::from_ref(&pod.identity), 0, 1),
+        ))))
         .await
-        .unwrap()
+        .unwrap();
+        pod.effect(RuntimeEffectAction::ChangeRole(ReplicaRole::Primary))
+            .await
+            .unwrap();
+        pod.grant().await;
+        pod
     }
 
-    /// Simulate a pod crash. Aborts the PodRuntime and service without
-    /// graceful shutdown. All in-memory state is lost. gRPC connections
-    /// break with transport errors. The SqlitePod instance becomes unusable.
-    pub async fn crash(self) {
-        self._runtime_handle.abort();
-        self._service_handle.abort();
+    pub async fn grant(&self) {
+        self.effect(RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        })
+        .await
+        .unwrap();
     }
 
-    /// Crash this pod and start a fresh one with the same replica ID
-    /// and the same data directory. The new pod recovers from the DB file.
-    /// Returns a new SqlitePod with fresh gRPC addresses.
-    pub async fn restart(self, id: i64) -> SqlitePod {
-        let dir = self.data_dir.clone();
-        self.crash().await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        SqlitePod::start_with_dir(id, dir, Duration::from_secs(5)).await
+    pub async fn reopen(self) -> Self {
+        let id = self.identity.replica_id.value();
+        let root = self.root.clone();
+        let replicas = self.replicas;
+        let old_session = self.session.id().clone();
+        self.runtime.abort();
+        drop(self);
+        let pod = Self::new(id, root, replicas).await;
+        assert_ne!(*pod.session.id(), old_session);
+        let state = pod.store.load_state().await.unwrap();
+        assert!(
+            state.pending_effect.is_none(),
+            "fixture restart requires a settled control effect"
+        );
+        pod.runtime
+            .reconstruct(
+                OpenMode::Existing,
+                state.role,
+                state.read_status,
+                state.write_status,
+                None,
+            )
+            .await
+            .unwrap();
+        pod
+    }
+
+    pub async fn execute(&self, sql: &str) -> Result<proto::ExecuteResponse, Status> {
+        self.server
+            .execute(Request::new(proto::ExecuteRequest {
+                sql: sql.into(),
+                params: Vec::new(),
+            }))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+    pub async fn query(&self, sql: &str) -> Result<proto::QueryResponse, Status> {
+        self.server
+            .query(Request::new(proto::QueryRequest {
+                sql: sql.into(),
+                params: Vec::new(),
+            }))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+    pub async fn batch(&self, statements: &[&str]) -> Result<proto::ExecuteBatchResponse, Status> {
+        self.server
+            .execute_batch(Request::new(proto::ExecuteBatchRequest {
+                statements: statements.iter().map(|s| (*s).to_owned()).collect(),
+            }))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+    pub async fn count(&self) -> i64 {
+        let result = self.query("SELECT COUNT(*) FROM data").await.unwrap();
+        match result.rows[0].values[0].kind {
+            Some(proto::value::Kind::IntegerValue(value)) => value,
+            _ => panic!("expected integer"),
+        }
     }
 }
 
-/// Helper: connect a SQLite gRPC client with retries.
-pub async fn connect_sqlite_client(
-    addr: &str,
-) -> crate::proto::sqlite_store_client::SqliteStoreClient<tonic::transport::Channel> {
-    for attempt in 0..30 {
-        match crate::proto::sqlite_store_client::SqliteStoreClient::connect(format!(
-            "http://{}",
-            addr
-        ))
-        .await
-        {
-            Ok(c) => return c,
-            Err(_) if attempt < 29 => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => panic!("failed to connect to SQLite server: {}", e),
+impl Drop for SqlitePod {
+    fn drop(&mut self) {
+        self.runtime.abort();
+    }
+}
+
+pub struct Routes(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for Routes {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
         }
     }
-    unreachable!()
+}
+
+/// Deliver actual public wire messages and their explicit durable service ACKs.
+pub fn route(source: &SqlitePod, targets: &[&SqlitePod]) -> Routes {
+    let source = source.runtime.clone();
+    let targets: Vec<_> = targets
+        .iter()
+        .map(|p| (p.identity.clone(), p.runtime.clone()))
+        .collect();
+    Routes(vec![tokio::spawn(async move {
+        while let Some(outbound) = source.data_plane().next_outbound().await {
+            match outbound {
+                OutboundReplication::Replication(item) => {
+                    let identity: ReplicaIdentity =
+                        item.receiver.clone().unwrap().try_into().unwrap();
+                    // The caller supplies reachable peers. An omitted failed
+                    // replica receives neither delivery nor fabricated ACK credit.
+                    let Some((_, target)) = targets.iter().find(|(id, _)| *id == identity) else {
+                        continue;
+                    };
+                    let pending = target.data_plane().receive_replication(item).await.unwrap();
+                    source
+                        .data_plane()
+                        .accept_acknowledgement(pending.received.clone())
+                        .await
+                        .unwrap();
+                    let ack = pending.applied().await.unwrap();
+                    source
+                        .data_plane()
+                        .accept_acknowledgement(ack)
+                        .await
+                        .unwrap();
+                }
+                other => panic!("unexpected routed operation: {other:?}"),
+            }
+        }
+    })])
+}
+
+pub async fn wait_applied(pods: &[&SqlitePod], lsn: i64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if pods.iter().all(|pod| {
+                pod.application
+                    .persistence()
+                    .progress()
+                    .unwrap()
+                    .applied_lsn
+                    >= lsn
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replicas applied the operation");
+}
+
+pub async fn bootstrap(pods: &[&SqlitePod]) -> ConfigurationDescriptor {
+    let members = pods
+        .iter()
+        .map(|pod| pod.identity.clone())
+        .collect::<Vec<_>>();
+    let configuration = configuration(&members, 0, 1);
+    for pod in pods {
+        pod.open().await;
+    }
+    pods[0]
+        .effect(RuntimeEffectAction::ChangeRole(ReplicaRole::Primary))
+        .await
+        .unwrap();
+    let mut builds = Vec::new();
+    for target in &pods[1..] {
+        target
+            .effect(RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary))
+            .await
+            .unwrap();
+        let build_id =
+            OperationId::new(format!("bootstrap-{}", target.identity.replica_id.value()));
+        let build = pods[0]
+            .runtime
+            .authorize_build(
+                build_id.clone(),
+                target.identity.clone(),
+                BuildConfiguration::Bootstrap(configuration.clone()),
+            )
+            .await
+            .unwrap();
+        target
+            .effect(RuntimeEffectAction::AdmitBuildAuthority(Box::new(build)))
+            .await
+            .unwrap();
+        let mut prepared = pods[0]
+            .runtime
+            .data_plane()
+            .prepare_copy(PrepareCopyRequest {
+                build_id: build_id.clone(),
+                target: target.identity.clone(),
+                configuration: BuildConfiguration::Bootstrap(configuration.clone()),
+                copy_context: Box::pin(futures::stream::empty()),
+            })
+            .await
+            .unwrap();
+        loop {
+            let item = prepared.items.next().await.unwrap().unwrap();
+            let last = item.final_item;
+            let ack = target
+                .runtime
+                .data_plane()
+                .receive_copy_item(item)
+                .await
+                .unwrap();
+            pods[0]
+                .runtime
+                .data_plane()
+                .accept_copy_acknowledgement(ack)
+                .await
+                .unwrap();
+            if last {
+                break;
+            }
+        }
+        builds.push((target, build_id));
+    }
+    for (index, pod) in pods.iter().enumerate() {
+        let mut admitted = authority(pod.identity.clone(), configuration.clone());
+        admitted.transition_kind = Some(TransitionKind::Bootstrap);
+        pod.effect(RuntimeEffectAction::AdmitAuthority(Box::new(admitted)))
+            .await
+            .unwrap();
+        pod.effect(RuntimeEffectAction::ChangeRole(if index == 0 {
+            ReplicaRole::Primary
+        } else {
+            ReplicaRole::ActiveSecondary
+        }))
+        .await
+        .unwrap();
+    }
+    for (target, build_id) in builds {
+        pods[0]
+            .effect(RuntimeEffectAction::RetireBuild(build_id.clone()))
+            .await
+            .unwrap();
+        target
+            .effect(RuntimeEffectAction::RetireBuild(build_id))
+            .await
+            .unwrap();
+    }
+    pods[0].grant().await;
+    configuration
 }

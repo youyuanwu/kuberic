@@ -2533,6 +2533,7 @@ struct TestApplication {
     held_streams: Mutex<Vec<OperationStream>>,
     settings: Mutex<Option<ReplicatorSettings>>,
     pause_open: AtomicBool,
+    report_fault_on_open: AtomicBool,
     fail_open: AtomicBool,
     open_notify: Notify,
     resume_open_notify: Notify,
@@ -2882,6 +2883,9 @@ impl RuntimeControlPlane for TestControlPlane {
 impl StatefulServiceReplica for TestApplication {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
         self.events.lock().unwrap().push("service.open".to_string());
+        if self.report_fault_on_open.load(Ordering::SeqCst) {
+            context.partition.report_fault(FaultType::Permanent).await?;
+        }
         *self.partition.lock().unwrap() = Some(context.partition.clone());
         assert_eq!(
             context.partition.get_write_status().await?,
@@ -2960,6 +2964,30 @@ impl StatefulServiceReplica for TestApplication {
             .unwrap()
             .push("service.abort".to_string());
     }
+}
+
+#[tokio::test]
+async fn application_can_report_a_rebuild_fault_during_open_without_reentering_effect_lock() {
+    let application = Arc::new(TestApplication::default());
+    application
+        .report_fault_on_open
+        .store(true, Ordering::SeqCst);
+    let runtime = PodRuntime::new(
+        identity(1, "open-fault"),
+        application,
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    timeout(
+        Duration::from_secs(2),
+        runtime.apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing))),
+    )
+    .await
+    .expect("fault reporting must not deadlock Open")
+    .unwrap();
+    assert_eq!(
+        runtime.partition_report().await.reported_fault,
+        Some(FaultType::Permanent)
+    );
 }
 
 #[async_trait]
