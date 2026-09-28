@@ -47,6 +47,8 @@ pub trait AgentStore: Send + Sync {
 
     async fn journal_build(&self, command: &EnsureReplicaBuild) -> Result<EnsureReplicaBuild>;
 
+    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> Result<()>;
+
     async fn advance_configuration(
         &self,
         operation_id: &OperationId,

@@ -3213,6 +3213,10 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
         state.role = ReplicaRole::ActiveSecondary;
         state.read_status = AccessStatus::Granted;
         state.write_status = AccessStatus::NotPrimary;
+        state.current_progress = 13;
+        state.verified_replication_lsn = Some(13);
+        state.committed_lsn = 13;
+        state.current_configuration_quorum_progress = 13;
         state.authority = Some(AdmittedAuthority {
             scale_up: None,
             secondary_removal: None,
@@ -3238,7 +3242,7 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
         expected_instance_id: local.instance_id,
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Failover,
-        failover_safe_lsn: Some(7),
+        failover_safe_lsn: Some(12),
         primary_write_status: AccessStatus::NoWriteQuorum,
         current_only: false,
         retire_build_ids: Vec::new(),
@@ -3258,7 +3262,7 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
         command
     );
     let mut mutated = command.clone();
-    mutated.failover_safe_lsn = Some(8);
+    mutated.failover_safe_lsn = Some(13);
     assert!(matches!(
         coordinator.ensure_configuration(mutated).await,
         Err(AgentError::EffectConflict(_))

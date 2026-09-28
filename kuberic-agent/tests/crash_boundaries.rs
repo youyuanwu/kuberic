@@ -480,6 +480,13 @@ impl AgentStore for ScaleUpProductionCutStore {
         self.inner.journal_build(command).await
     }
 
+    async fn abandon_build(
+        &self,
+        command: &kuberic_protocol::command::EnsureReplicaBuild,
+    ) -> Result<()> {
+        self.inner.abandon_build(command).await
+    }
+
     async fn advance_configuration(
         &self,
         operation_id: &OperationId,

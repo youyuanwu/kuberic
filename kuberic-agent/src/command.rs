@@ -794,9 +794,11 @@ pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<(
         }
         return Ok(());
     }
-    if state.retired_builds.contains(&command.operation_id) {
+    if state.retired_builds.contains(&command.operation_id)
+        || state.abandoned_builds.contains(&command.operation_id)
+    {
         return Err(AgentError::CommandRejected(
-            "retired build authority cannot be reopened".into(),
+            "abandoned or retired build authority cannot be reopened".into(),
         ));
     }
     if command.operation_id.is_empty()

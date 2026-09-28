@@ -1131,6 +1131,200 @@ async fn scale_up_source_startup_ignores_incomplete_abandoned_delivery_until_rei
 }
 
 #[tokio::test]
+async fn scale_up_source_service_abandons_an_in_flight_copy_and_restarts_retired() {
+    let directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(directory.path(), false, false).await;
+    let start = |store: Arc<SqliteStore>| {
+        let primary = fixture.primary.clone();
+        async move {
+            let runtime = Arc::new(PodRuntime::new(
+                primary,
+                Arc::new(ReplayApplication),
+                store.clone(),
+            ));
+            let service = AgentService::new(store, runtime.clone(), runtime, "token").unwrap();
+            let control = free_address();
+            let replication = free_address();
+            let (ready, ready_rx) = watch::channel(false);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+            (control, ready_rx, shutdown, server)
+        }
+    };
+    let (control, mut ready_rx, shutdown, server) = start(fixture.store.clone()).await;
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let status = service_status(control, &fixture.primary).await;
+    let build_request = proto::EnsureReplicaBuildCommand {
+        operation_id: fixture.build_id.to_string(),
+        local_replica_id: fixture.primary.replica_id.value(),
+        expected_instance_id: fixture.primary.instance_id.to_string(),
+        expected_agent_generation: fixture.primary.agent_generation.to_string(),
+        target: Some(fixture.target.clone().into()),
+        authority: None,
+        source_session_id: String::new(),
+        retire: false,
+    };
+    let build_client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    let build_primary = fixture.primary.clone();
+    let build_session = status.process_session_id.clone();
+    let pending_build_request = build_request.clone();
+    let build = tokio::spawn(async move {
+        let mut build_client = build_client;
+        build_client
+            .execute(authorized_request(
+                "resource-1",
+                &build_primary,
+                &build_session,
+                proto::execute_command_request::Command::EnsureReplicaBuild(pending_build_request),
+            ))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if fixture
+                .store
+                .load_state()
+                .await
+                .unwrap()
+                .pending_effect
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(
+                        &pending.effect.action,
+                        RuntimeEffectAction::BuildReplica { build_id, .. }
+                            if build_id == &fixture.build_id
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real source copy effect became pending");
+
+    let mut retire_client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    let retirement = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        retire_client.execute(authorized_request(
+            "resource-1",
+            &fixture.primary,
+            &status.process_session_id,
+            proto::execute_command_request::Command::EnsureReplicaBuild(
+                proto::EnsureReplicaBuildCommand {
+                    retire: true,
+                    ..build_request
+                },
+            ),
+        )),
+    )
+    .await
+    .expect("retirement must cancel rather than wait for copy completion")
+    .unwrap();
+    assert!(retirement.into_inner().observation.is_some());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), build)
+            .await
+            .expect("cancelled copy RPC completed")
+            .unwrap()
+            .is_err()
+    );
+    let retired = fixture.store.load_state().await.unwrap();
+    assert!(retired.pending_effect.is_none());
+    assert!(retired.abandoned_builds.contains(&fixture.build_id));
+    assert!(retired.retired_builds.contains(&fixture.build_id));
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+
+    let (control, mut ready_rx, shutdown, server) = start(fixture.store.clone()).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ready_rx.wait_for(|ready| *ready),
+    )
+    .await
+    .expect("retired source restart became ready")
+    .unwrap();
+    let restarted = service_status(control, &fixture.primary).await;
+    assert!(restarted.builds.is_empty());
+    assert_eq!(restarted.write_status, proto::AccessStatus::Granted as i32);
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn scale_up_source_startup_finishes_retirement_after_abandonment_reply_loss() {
+    let directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(directory.path(), false, false).await;
+    let pending = RuntimeEffect {
+        operation_id: OperationId::new(format!("{}:build-replica", fixture.build_id)),
+        sequence: fixture
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .next_effect_sequence,
+        action: RuntimeEffectAction::BuildReplica {
+            build_id: fixture.build_id.clone(),
+            target: fixture.target.clone(),
+            replication_address: String::new(),
+        },
+    };
+    fixture.store.begin_effect(&pending).await.unwrap();
+    fixture
+        .store
+        .abandon_build(&EnsureReplicaBuild {
+            operation_id: fixture.build_id.clone(),
+            local_replica_id: fixture.primary.replica_id,
+            expected_instance_id: fixture.primary.instance_id.clone(),
+            expected_agent_generation: fixture.primary.agent_generation.clone(),
+            target: fixture.target.clone(),
+            authority: None,
+            source_session_id: None,
+            retire: true,
+        })
+        .await
+        .unwrap();
+    let abandoned = fixture.store.load_state().await.unwrap();
+    assert!(abandoned.pending_effect.is_none());
+    assert!(abandoned.abandoned_builds.contains(&fixture.build_id));
+    assert!(!abandoned.retired_builds.contains(&fixture.build_id));
+
+    let runtime = Arc::new(PodRuntime::new(
+        fixture.primary.clone(),
+        Arc::new(ReplayApplication),
+        fixture.store.clone(),
+    ));
+    let service =
+        AgentService::new(fixture.store.clone(), runtime.clone(), runtime, "token").unwrap();
+    let control = free_address();
+    let replication = free_address();
+    let (ready, mut ready_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ready_rx.wait_for(|ready| *ready),
+    )
+    .await
+    .expect("abandoned source startup became ready")
+    .unwrap();
+    let state = fixture.store.load_state().await.unwrap();
+    assert!(state.retired_builds.contains(&fixture.build_id));
+    assert!(state.pending_effect.is_none());
+    let status = service_status(control, &fixture.primary).await;
+    assert!(status.builds.is_empty());
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn scale_up_source_service_retirement_survives_pre_admission_restart() {
     let directory = tempdir().unwrap();
     let fixture = scale_up_source_fixture(directory.path(), false, true).await;

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{Stream, StreamExt};
-use kuberic_protocol::command::ProtocolCommand;
+use kuberic_protocol::command::{EnsureReplicaBuild, ProtocolCommand};
 use kuberic_protocol::types::{
     ProcessSessionId, ReplicaId, ReplicaIdentity, TransitionIntent, TransitionKind,
     derive_transition_id,
@@ -626,6 +626,18 @@ where
                 .retired_builds
                 .contains(&command.operation_id)
             {
+                if build_recovery
+                    .abandoned_builds
+                    .contains(&command.operation_id)
+                {
+                    self.coordinator
+                        .ensure_build(EnsureReplicaBuild {
+                            retire: true,
+                            ..command
+                        })
+                        .await?;
+                    continue;
+                }
                 if command.authority.is_none() {
                     continue;
                 }

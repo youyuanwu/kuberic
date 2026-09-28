@@ -612,10 +612,16 @@ where
     }
 
     pub async fn ensure_build(&self, command: EnsureReplicaBuild) -> Result<()> {
-        let _command = self.command_lock.lock().await;
         let state = self.store.load_state().await?;
         admit_build(&command, &state)?;
         if command.retire {
+            if state.retired_builds.contains(&command.operation_id) {
+                return Ok(());
+            }
+            self.store.abandon_build(&command).await?;
+            self.runtime.cancel_build(&command.operation_id).await?;
+            let _command = self.command_lock.lock().await;
+            let state = self.store.load_state().await?;
             if state.retired_builds.contains(&command.operation_id) {
                 return Ok(());
             }
@@ -627,6 +633,9 @@ where
             .await?;
             return Ok(());
         }
+        let _command = self.command_lock.lock().await;
+        let state = self.store.load_state().await?;
+        admit_build(&command, &state)?;
         let command = self.store.journal_build(&command).await?;
         if let Some(authority) = command.authority.clone() {
             if state.current_configuration.as_ref().is_some_and(|current| {

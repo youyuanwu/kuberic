@@ -743,6 +743,84 @@ async fn scale_up_build_journal_replays_current_session_and_fences_retirement() 
 }
 
 #[tokio::test]
+async fn source_build_abandonment_resolves_only_the_exact_pending_copy_effect() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (initialize, observed, transition) = bootstrap_fixture();
+    let identity = authorize_initialization(
+        &initialize,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let store = SqliteStore::create_authorized(&path, AgentState::new(identity.clone())).unwrap();
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("candidate-pod"),
+        agent_generation: AgentGeneration::new("candidate-generation"),
+    };
+    let build_id = OperationId::new("source-build");
+    let build = EnsureReplicaBuild {
+        operation_id: build_id.clone(),
+        local_replica_id: identity.local_identity.replica_id,
+        expected_instance_id: identity.local_identity.instance_id.clone(),
+        expected_agent_generation: identity.local_identity.agent_generation.clone(),
+        target: target.clone(),
+        authority: None,
+        source_session_id: None,
+        retire: false,
+    };
+    store.journal_build(&build).await.unwrap();
+    let pending = RuntimeEffect {
+        operation_id: OperationId::new("source-build:build-replica"),
+        sequence: 7,
+        action: RuntimeEffectAction::BuildReplica {
+            build_id: build_id.clone(),
+            target: target.clone(),
+            replication_address: String::new(),
+        },
+    };
+    assert_eq!(
+        store.begin_effect(&pending).await.unwrap(),
+        BeginEffect::Execute(pending.clone())
+    );
+    let retirement = EnsureReplicaBuild {
+        retire: true,
+        ..build.clone()
+    };
+    store.abandon_build(&retirement).await.unwrap();
+    let abandoned = store.load_state().await.unwrap();
+    assert!(abandoned.pending_effect.is_none());
+    assert!(abandoned.abandoned_builds.contains(&build_id));
+    assert_eq!(abandoned.next_effect_sequence, 8);
+    assert!(store.journal_build(&build).await.is_err());
+
+    let unrelated_path = directory.path().join("unrelated.db");
+    let unrelated =
+        SqliteStore::create_authorized(&unrelated_path, AgentState::new(identity)).unwrap();
+    unrelated.journal_build(&build).await.unwrap();
+    let other = RuntimeEffect {
+        operation_id: OperationId::new("unrelated"),
+        sequence: 1,
+        action: RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    };
+    unrelated.begin_effect(&other).await.unwrap();
+    assert!(matches!(
+        unrelated.abandon_build(&retirement).await,
+        Err(AgentError::EffectConflict(_))
+    ));
+    let fenced = unrelated.load_state().await.unwrap();
+    assert_eq!(
+        fenced
+            .pending_effect
+            .as_ref()
+            .map(|pending| &pending.effect),
+        Some(&other)
+    );
+    assert!(!fenced.abandoned_builds.contains(&build_id));
+}
+
+#[tokio::test]
 async fn durable_build_catch_up_boundary_is_write_once() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
@@ -1028,7 +1106,7 @@ async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejec
         expected_instance_id: storage_identity.local_identity.instance_id.clone(),
         expected_agent_generation: storage_identity.local_identity.agent_generation.clone(),
         transition_kind: TransitionKind::Failover,
-        failover_safe_lsn: Some(0),
+        failover_safe_lsn: Some(12),
         primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
         retire_build_ids: Vec::new(),
@@ -1061,7 +1139,7 @@ async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejec
         BeginConfiguration::Pending(record) if record.command == pc_cc
     ));
     let mut mutated = pc_cc.clone();
-    mutated.failover_safe_lsn = Some(1);
+    mutated.failover_safe_lsn = Some(13);
     assert!(matches!(
         store.begin_configuration(&mutated).await,
         Err(AgentError::EffectConflict(_))
@@ -1081,7 +1159,7 @@ async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejec
     installed.reconfiguration = Some(ReconfigurationRecord {
         command: current_only.clone(),
         stage: CoordinatorStage::Activate,
-        observed_lsn: Some(12),
+        observed_lsn: Some(13),
     });
     fs::create_dir(directory.path().join("current-only")).unwrap();
     let current_only_store = SqliteStore::create_authorized(
@@ -1097,7 +1175,7 @@ async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejec
         BeginConfiguration::Pending(record) if record.command == current_only
     ));
     let mut mutated = current_only.clone();
-    mutated.failover_safe_lsn = Some(2);
+    mutated.failover_safe_lsn = Some(13);
     assert!(matches!(
         current_only_store.begin_configuration(&mutated).await,
         Err(AgentError::EffectConflict(_))

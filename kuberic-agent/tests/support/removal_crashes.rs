@@ -91,6 +91,12 @@ impl AgentStore for CrashStore {
     ) -> Result<kuberic_protocol::command::EnsureReplicaBuild> {
         self.inner.journal_build(command).await
     }
+    async fn abandon_build(
+        &self,
+        command: &kuberic_protocol::command::EnsureReplicaBuild,
+    ) -> Result<()> {
+        self.inner.abandon_build(command).await
+    }
     async fn advance_configuration(
         &self,
         id: &OperationId,

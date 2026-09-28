@@ -1247,6 +1247,90 @@ async fn invalid_provisioning_candidate_retires_build_cleans_exact_resources_and
 }
 
 #[tokio::test]
+async fn invalid_candidate_is_globally_fenced_at_and_after_admission_start() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
+    let fenced = loop {
+        tick(&api).await;
+        let raw = api.observation().await;
+        if raw
+            .set
+            .status
+            .as_ref()
+            .is_some_and(|status| status.authority.scale_up_admission_started.is_some())
+        {
+            break raw;
+        }
+    };
+    let (candidate_key, _) = candidate_key(&fenced).expect("fenced candidate");
+    assert!(
+        fenced.agents.values().all(|observation| {
+            !matches!(
+                observation,
+                RawAgentObservation::Report(report)
+                    if report.previous_configuration.is_some()
+            )
+        }),
+        "admission fence regression must stop before the first PC/CC command"
+    );
+    let mut invalid_at_fence = fenced.clone();
+    invalid_at_fence.agents.insert(
+        candidate_key.clone(),
+        RawAgentObservation::Invalid {
+            message: "candidate became invalid after admission fence".into(),
+        },
+    );
+    assert!(matches!(
+        evaluate(
+            &normalize(invalid_at_fence, BTreeMap::new()).unwrap(),
+            &enabled()
+        ),
+        Plan::Unsafe {
+            ref safety_changes,
+            ..
+        } if safety_changes == &[SafetyChange::RemoveWriteRouting]
+    ));
+
+    let installed_api = Arc::new(InMemoryClusterApi::new(fenced));
+    let installed = loop {
+        tick(&installed_api).await;
+        let raw = installed_api.observation().await;
+        if raw.agents.values().any(|observation| {
+            matches!(
+                observation,
+                RawAgentObservation::Report(report)
+                    if report.previous_configuration.is_some()
+            )
+        }) {
+            break raw;
+        }
+    };
+    let mut invalid_after_install = installed;
+    invalid_after_install
+        .set
+        .status
+        .as_mut()
+        .unwrap()
+        .authority
+        .scale_up_admission_started = None;
+    invalid_after_install.agents.insert(
+        candidate_key,
+        RawAgentObservation::Invalid {
+            message: "candidate became invalid after PC/CC install".into(),
+        },
+    );
+    assert!(matches!(
+        evaluate(
+            &normalize(invalid_after_install, BTreeMap::new()).unwrap(),
+            &enabled()
+        ),
+        Plan::Unsafe {
+            ref safety_changes,
+            ..
+        } if safety_changes == &[SafetyChange::RemoveWriteRouting]
+    ));
+}
+
+#[tokio::test]
 async fn scale_up_carried_failover_repairs_returning_original_current_only_primary() {
     let api = Arc::new(InMemoryClusterApi::new(fixture(2, 3)));
     let (intent, original_key) = loop {

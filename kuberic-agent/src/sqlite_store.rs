@@ -600,9 +600,11 @@ impl AgentStore for SqliteStore {
     async fn journal_build(&self, command: &EnsureReplicaBuild) -> Result<EnsureReplicaBuild> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            if state.retired_builds.contains(&command.operation_id) {
+            if state.retired_builds.contains(&command.operation_id)
+                || state.abandoned_builds.contains(&command.operation_id)
+            {
                 return Err(AgentError::CommandRejected(
-                    "retired build authority cannot be reopened".into(),
+                    "abandoned or retired build authority cannot be reopened".into(),
                 ));
             }
             if let Some(existing) = state.build_commands.get(&command.operation_id) {
@@ -634,6 +636,55 @@ impl AgentStore for SqliteStore {
                 .insert(command.operation_id.clone(), command.clone());
             write_agent_state(transaction, &state)?;
             Ok(command.clone())
+        })
+    }
+
+    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            crate::command::admit_build(command, &state)?;
+            if state.retired_builds.contains(&command.operation_id) {
+                return Ok(());
+            }
+            if let Some(pending) = state.pending_effect.as_ref() {
+                let matching_build = matches!(
+                    &pending.effect.action,
+                    RuntimeEffectAction::BuildReplica {
+                        build_id,
+                        target,
+                        ..
+                    } if build_id == &command.operation_id
+                        && target == &command.target
+                        && pending.effect.operation_id
+                            == OperationId::new(format!(
+                                "{}:build-replica",
+                                command.operation_id
+                            ))
+                );
+                let matching_retirement = matches!(
+                    &pending.effect.action,
+                    RuntimeEffectAction::RetireBuild(build_id)
+                        if build_id == &command.operation_id
+                            && pending.effect.operation_id
+                                == OperationId::new(format!(
+                                    "{}:retire-abandoned-build",
+                                    command.operation_id
+                                ))
+                );
+                if !matching_build && !matching_retirement {
+                    return Err(AgentError::EffectConflict(
+                        "build abandonment conflicts with unrelated pending work".into(),
+                    ));
+                }
+                if matching_build {
+                    state.next_effect_sequence = state
+                        .next_effect_sequence
+                        .max(pending.effect.sequence.saturating_add(1));
+                    state.pending_effect = None;
+                }
+            }
+            state.abandoned_builds.insert(command.operation_id.clone());
+            write_agent_state(transaction, &state)
         })
     }
 

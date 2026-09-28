@@ -142,6 +142,8 @@ pub struct AgentState {
     pub build_progress: BTreeMap<OperationId, DurableBuildProgress>,
     #[serde(default)]
     pub retired_builds: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub abandoned_builds: BTreeSet<OperationId>,
     #[serde(default = "initial_effect_sequence")]
     pub next_effect_sequence: u64,
     #[serde(default)]
@@ -186,6 +188,7 @@ impl AgentState {
             build_commands: BTreeMap::new(),
             build_progress: BTreeMap::new(),
             retired_builds: BTreeSet::new(),
+            abandoned_builds: BTreeSet::new(),
             next_effect_sequence: 1,
             load_metrics: Vec::new(),
             reported_fault: None,

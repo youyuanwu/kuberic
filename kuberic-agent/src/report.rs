@@ -78,6 +78,7 @@ fn build_report(
     for (build_id, command) in &state.build_commands {
         if command.authority.is_none()
             && !state.retired_builds.contains(build_id)
+            && !state.abandoned_builds.contains(build_id)
             && let Some(progress) = state.build_progress.get(build_id)
         {
             builds.entry(build_id.clone()).or_insert_with(|| {

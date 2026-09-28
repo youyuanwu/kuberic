@@ -62,6 +62,7 @@ struct RuntimeState {
     builds: BTreeMap<OperationId, BuildProgress>,
     inbound_build_generations: BTreeMap<OperationId, u64>,
     outbound_builds: BTreeMap<OperationId, OutboundBuild>,
+    cancelled_outbound_builds: BTreeSet<OperationId>,
     removed_replicas: BTreeSet<ReplicaId>,
     pending_evictions: BTreeSet<ReplicaIdentity>,
     local_writes: BTreeMap<OperationId, DurableLocalWrite>,
@@ -242,6 +243,7 @@ impl DefaultReplicatorInner {
                 builds: BTreeMap::new(),
                 inbound_build_generations: BTreeMap::new(),
                 outbound_builds: BTreeMap::new(),
+                cancelled_outbound_builds: BTreeSet::new(),
                 removed_replicas: BTreeSet::new(),
                 pending_evictions: BTreeSet::new(),
                 local_writes: BTreeMap::new(),
@@ -737,11 +739,12 @@ impl DefaultReplicatorInner {
             .authority
             .as_ref()
             .map(|a| a.fence());
-        self.state
-            .write()
-            .await
-            .removed_replicas
-            .remove(&replica.identity.replica_id);
+        let build_id = replica.build_id.clone();
+        {
+            let mut state = self.state.write().await;
+            state.removed_replicas.remove(&replica.identity.replica_id);
+            state.cancelled_outbound_builds.remove(&build_id);
+        }
         self.send_outbound(OutboundOperation::Build(ReplicaEndpoint {
             build_id: replica.build_id,
             identity: replica.identity.clone(),
@@ -764,6 +767,9 @@ impl DefaultReplicatorInner {
                 return Err(RuntimeError::ReplicaRemoved(
                     replica.identity.replica_id.value(),
                 ));
+            }
+            if state.cancelled_outbound_builds.contains(&build_id) {
+                return Err(RuntimeError::OperationCancelled);
             }
             if state.authority.as_ref().map(|a| a.fence()) != fence {
                 return Err(RuntimeError::AuthorityMismatch(
@@ -2881,6 +2887,7 @@ impl DefaultReplicatorInner {
                 let mut state = self.state.write().await;
                 state.builds.remove(&build_id);
                 state.outbound_builds.remove(&build_id);
+                state.cancelled_outbound_builds.remove(&build_id);
             }
             RuntimeEffectAction::PrepareSecondaryRemoval {
                 intent,
@@ -3640,7 +3647,10 @@ impl ManagedReplicator for DefaultReplicatorInner {
     }
 
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
-        self.state.write().await.outbound_builds.remove(build_id);
+        let mut state = self.state.write().await;
+        state.outbound_builds.remove(build_id);
+        state.cancelled_outbound_builds.insert(build_id.clone());
+        drop(state);
         self.changed.notify_waiters();
         Ok(())
     }

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use kuberic_protocol::types::OperationId;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 
 use crate::hosting::PodRuntime;
@@ -16,6 +17,10 @@ pub trait RuntimeEffectExecutor: Send + Sync {
     async fn cancel_configuration_work(&self) -> Result<()> {
         Ok(())
     }
+
+    async fn cancel_build(&self, _build_id: &OperationId) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -26,6 +31,10 @@ impl RuntimeEffectExecutor for PodRuntime {
 
     async fn cancel_configuration_work(&self) -> Result<()> {
         Ok(PodRuntime::cancel_configuration_work(self).await?)
+    }
+
+    async fn cancel_build(&self, build_id: &OperationId) -> Result<()> {
+        Ok(PodRuntime::cancel_outbound_build(self, build_id).await?)
     }
 }
 
@@ -65,7 +74,14 @@ where
                                 | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_))
                             || state.reconfiguration.as_ref().is_some_and(|r|
                                 r.command.transition_kind == kuberic_protocol::types::TransitionKind::SecondaryScaleDown);
-                        if !removal {
+                        let abandoned_build = match &effect.action {
+                            kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                                build_id,
+                                ..
+                            } => state.abandoned_builds.contains(build_id),
+                            _ => false,
+                        };
+                        if !removal && !abandoned_build {
                             self.store.cancel_effect(&effect).await?;
                         }
                         return Err(error);
@@ -90,6 +106,10 @@ where
 
     pub async fn cancel_configuration_work(&self) -> Result<()> {
         self.executor.cancel_configuration_work().await
+    }
+
+    pub async fn cancel_build(&self, build_id: &OperationId) -> Result<()> {
+        self.executor.cancel_build(build_id).await
     }
 }
 

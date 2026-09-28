@@ -830,26 +830,24 @@ pub(super) fn recover_local_acceptance(
             evidence: evidence.clone(),
         },
     );
-    let failover_safe_lsn = receipt
-        .failover_evidence
-        .as_ref()
-        .and_then(|_| {
-            receipt
-                .current_only_write_quorum
-                .iter()
-                .find_map(|witness| {
-                    (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
-                        .then_some(witness.verified_replication_lsn)
-                })
-        })
-        .or_else(|| {
-            receipt.failover_evidence.as_ref().and_then(|evidence| {
-                evidence.current_read_quorum.iter().find_map(|witness| {
-                    (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
-                        .then_some(witness.verified_replication_lsn)
-                })
+    let failover_safe_lsn = receipt.failover_evidence.as_ref().and_then(|evidence| {
+        evidence
+            .current_read_quorum
+            .iter()
+            .find_map(|witness| {
+                (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
+                    .then_some(witness.verified_replication_lsn)
             })
-        });
+            .or_else(|| {
+                receipt
+                    .current_only_write_quorum
+                    .iter()
+                    .find_map(|witness| {
+                        (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
+                            .then_some(witness.verified_replication_lsn)
+                    })
+            })
+    });
     for member in &receipt.accepted_configuration.members {
         if receipt_member_superseded(Some(accepted), member) {
             // A newer accepted configuration has retired this exact historical
@@ -1832,7 +1830,36 @@ pub(super) fn invalid_candidate_binding(
                 .iter()
                 .any(|member| member.identity == target)
         });
+        let admission_started = snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| {
+                let active = transition.scale_up.as_deref().or_else(|| {
+                    transition
+                        .scale_up_failover
+                        .as_deref()
+                        .map(|evidence| &evidence.intent)
+                });
+                active.is_some_and(|active| {
+                    snapshot.status.scale_up_admission_started.as_ref()
+                        == Some(&active.operation_id)
+                        || transition.scale_up_failover.is_some()
+                        || snapshot.replicas.values().any(|candidate| {
+                            matches!(
+                                &candidate.agent,
+                                AgentObservation::Report(report)
+                                    if exact_pc_cc_report(
+                                        report,
+                                        active,
+                                        &transition.current_configuration,
+                                    )
+                            )
+                        })
+                })
+            });
         if !accepted_contains_target
+            && !admission_started
             && key.replica_id == target.replica_id
             && key.instance_id == target.instance_id
             && matches!(observation.agent, AgentObservation::Invalid { .. })

@@ -4415,6 +4415,43 @@ async fn removing_a_replica_terminates_its_pending_build_wait() {
 }
 
 #[tokio::test]
+async fn cancelling_an_exact_outbound_build_terminates_only_its_pending_wait() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "primary")],
+    )
+    .await;
+    let control = runtime.primary_replicator().await.unwrap();
+    let cancelled_id = OperationId::new("cancelled-build");
+    let cancelled = {
+        let control = control.clone();
+        let build_id = cancelled_id.clone();
+        tokio::spawn(async move {
+            control
+                .build_replica(kuberic_runtime::replicator::ReplicaInformation {
+                    build_id,
+                    identity: identity(2, "cancelled-target"),
+                    replication_address: "cancelled-target".into(),
+                })
+                .await
+        })
+    };
+    assert!(matches!(
+        runtime.data_plane().next_outbound().await,
+        Some(OutboundReplication::Build(endpoint))
+            if endpoint.build_id == cancelled_id
+    ));
+    runtime.cancel_outbound_build(&cancelled_id).await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), cancelled)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+}
+
+#[tokio::test]
 async fn bounded_outbound_build_queue_is_cancelled_by_abort() {
     let runtime = open_primary(
         Arc::new(TestApplication::default()),
