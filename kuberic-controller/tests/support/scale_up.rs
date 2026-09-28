@@ -1422,6 +1422,7 @@ async fn scale_up_carried_failover_repairs_returning_original_current_only_prima
     report.report_sequence += 1;
     api.set_observation(returned).await;
 
+    let effects_start = api.effects().await.len();
     let (kind, effects) = tick(&api).await;
     assert_ne!(kind, ReconcileKind::Unsafe);
     assert!(
@@ -1433,13 +1434,22 @@ async fn scale_up_carried_failover_repairs_returning_original_current_only_prima
         matches!(
             effect,
             EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command))
-                if command.local_replica_id == intent.primary.replica_id
+                if command.local_replica_id != intent.primary.replica_id
                     && command.transition_kind == TransitionKind::Failover
                     && !command.current_only
                     && command.current_epoch > intent.current_configuration.epoch
         )
     }));
     finish(&api, 3).await;
+    assert!(api.effects().await[effects_start..].iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(command))
+                if command.local_replica_id == intent.primary.replica_id
+                    && command.transition_kind == TransitionKind::Failover
+                    && command.current_epoch > intent.current_configuration.epoch
+        )
+    }));
 }
 
 #[tokio::test]

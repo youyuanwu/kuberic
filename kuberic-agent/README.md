@@ -152,7 +152,9 @@ current-only witness or fresh completed local acceptance before superseding the
 bounded receipt. Sequential scale-up uses durable schema-3 build and admission
 authority, preserves healthy same-primary writes only while both PC/CC quorums
 remain authorized, and retries failed unadmitted candidates only after exact
-endpoint→Pod→PVC cleanup. Protocol 7/schema 3 require a fresh coordinated
+endpoint→Pod→PVC cleanup. Carried failover first installs a write-closed
+provisional epoch, then uses fresh fenced PC/CC progress for final primary and
+safe-prefix selection before activation. Protocol 8/schema 3 require a fresh coordinated
 deployment; classic v1 remains unchanged. These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).

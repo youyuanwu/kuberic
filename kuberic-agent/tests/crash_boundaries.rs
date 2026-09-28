@@ -1577,7 +1577,7 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
         expected_agent_generation: identities[1].agent_generation.clone(),
         transition_kind: TransitionKind::Failover,
         failover_safe_lsn: Some(9),
-        primary_write_status: AccessStatus::Granted,
+        primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
         retire_build_ids: Vec::new(),
         switchover_handoff: None,
@@ -1612,6 +1612,29 @@ fn scale_up_failover_command_for_identity(
         local_replica_id: identity.replica_id,
         expected_instance_id: identity.instance_id,
         expected_agent_generation: identity.agent_generation,
+        ..command.clone()
+    }
+}
+
+fn scale_up_failover_current_only_command_for_identity(
+    command: &EnsureConfiguration,
+    identity: ReplicaIdentity,
+) -> EnsureConfiguration {
+    let intent = command.scale_up_evidence.as_deref().unwrap().intent();
+    EnsureConfiguration {
+        operation_id: intent.command_operation_id(
+            ScaleUpStage::CurrentOnly,
+            &identity,
+            &command.current_configuration,
+        ),
+        previous_configuration: None,
+        previous_epoch: None,
+        local_replica_id: identity.replica_id,
+        expected_instance_id: identity.instance_id,
+        expected_agent_generation: identity.agent_generation,
+        primary_write_status: AccessStatus::Granted,
+        current_only: true,
+        retire_build_ids: vec![intent.build_id.clone()],
         ..command.clone()
     }
 }
@@ -4617,6 +4640,39 @@ async fn execute_scale_up_failover_cut(path: &Path, boundary: &str, terminate: b
         .unwrap();
     eprintln!("scale-up-failover cut={boundary} stage=source-complete");
     assert_eq!(completed.command, source_command);
+    let fenced_source = source_store.load_state().await.unwrap();
+    assert_eq!(fenced_source.role, ReplicaRole::Primary);
+    assert_eq!(
+        fenced_source.read_status,
+        AccessStatus::ReconfigurationPending
+    );
+    assert_eq!(
+        fenced_source.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+    let fenced_runtime = source_runtime.snapshot().await;
+    assert_eq!(fenced_runtime.role, ReplicaRole::Primary);
+    assert_eq!(
+        fenced_runtime.read_status,
+        AccessStatus::ReconfigurationPending
+    );
+    assert_eq!(
+        fenced_runtime.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+    for (owner_store, owner_runtime) in [
+        (peer_store.clone(), peer_runtime.clone()),
+        (witness_store.clone(), witness_runtime.clone()),
+        (source_store.clone(), source_runtime.clone()),
+    ] {
+        let identity = owner_store.identity().await.unwrap().local_identity;
+        let current_only =
+            scale_up_failover_current_only_command_for_identity(&source_command, identity);
+        Coordinator::new(owner_store, owner_runtime)
+            .ensure_configuration(current_only)
+            .await
+            .unwrap();
+    }
     let source = source_store.load_state().await.unwrap();
     assert!(source.reconfiguration.is_none() && source.pending_effect.is_none());
     assert_eq!(source.role, ReplicaRole::Primary);

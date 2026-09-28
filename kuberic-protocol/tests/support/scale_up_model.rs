@@ -1067,7 +1067,14 @@ impl Model {
                 // this exact incarnation. Logical receiver bookkeeping is not
                 // admissible evidence.
                 report.role = member.role;
-                report.read_status = AccessStatus::Granted;
+                report.read_status = if command.transition_kind == TransitionKind::Failover
+                    && member.role == ReplicaRole::Primary
+                    && command.primary_write_status != AccessStatus::Granted
+                {
+                    AccessStatus::ReconfigurationPending
+                } else {
+                    AccessStatus::Granted
+                };
                 report.write_status = if member.role == ReplicaRole::Primary {
                     command.primary_write_status
                 } else {
@@ -1084,7 +1091,7 @@ impl Model {
                 report.catch_up_complete = true;
                 if command.transition_kind == TransitionKind::Failover {
                     report.deactivation_epoch = Some(command.current_epoch);
-                    report.deactivated_lsn = Some(boundary);
+                    report.deactivated_lsn = Some(durable_lsn);
                 }
                 report.pending_operation_id = None;
                 report.pending_configuration = None;
@@ -1224,6 +1231,32 @@ impl Model {
             contiguous = next;
         }
         Ok(contiguous)
+    }
+
+    pub fn truncate_durable_history(&mut self, through_lsn: i64) {
+        self.durable_source.retain(|lsn, _| *lsn <= through_lsn);
+        self.acknowledged_writes
+            .retain(|lsn, _| *lsn <= through_lsn);
+        self.durable_acknowledgements
+            .retain(|lsn, _| *lsn <= through_lsn);
+        for history in self.durable_incarnations.values_mut() {
+            history.retain(|lsn, _| *lsn <= through_lsn);
+        }
+        for history in self.durable_receivers.values_mut() {
+            history.retain(|lsn, _| *lsn <= through_lsn);
+        }
+        for observation in self.snapshot.replicas.values_mut() {
+            if let AgentObservation::Report(report) = &mut observation.agent {
+                report.current_progress = report.current_progress.min(through_lsn);
+                report.committed_lsn = report.committed_lsn.min(through_lsn);
+                report.verified_replication_lsn = report
+                    .verified_replication_lsn
+                    .map(|lsn| lsn.min(through_lsn));
+                report.current_configuration_quorum_progress = report
+                    .current_configuration_quorum_progress
+                    .min(through_lsn);
+            }
+        }
     }
 
     pub fn has_pending_build(&self) -> bool {
@@ -1544,6 +1577,93 @@ impl Model {
     pub fn acknowledge_write(&mut self, case: u64, step: u64) -> i64 {
         self.try_acknowledge_write(case, step, &BTreeSet::new())
             .unwrap_or_else(|reason| panic!("write was not durably acknowledgeable: {reason}"))
+    }
+
+    pub fn acknowledge_old_scale_up_authority_write(
+        &mut self,
+        case: u64,
+        step: u64,
+        replica_ids: &[i64],
+    ) -> i64 {
+        let intent = self
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|transition| transition.scale_up_failover.as_deref())
+            .map(|evidence| evidence.intent.clone())
+            .expect("old-authority write requires a carried scale-up failover");
+        let recipients = replica_ids
+            .iter()
+            .map(|id| {
+                intent
+                    .current_configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == ReplicaId::new(*id))
+                    .expect("old-authority recipient belongs to expanded CC")
+                    .identity
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            recipients
+                .iter()
+                .any(|identity| identity == &intent.primary),
+            "old-authority acknowledgement requires the exact original primary"
+        );
+        let previous_count = intent
+            .previous_configuration
+            .members
+            .iter()
+            .filter(|member| recipients.contains(&member.identity))
+            .count();
+        let current_count = intent
+            .current_configuration
+            .members
+            .iter()
+            .filter(|member| recipients.contains(&member.identity))
+            .count();
+        assert!(
+            previous_count >= intent.previous_policy.write_quorum as usize
+                && current_count >= intent.current_policy.write_quorum as usize,
+            "old-authority acknowledgement lacks exact PC/CC write quorums"
+        );
+        let primary_session = self
+            .snapshot
+            .observation_for_identity(&intent.primary)
+            .and_then(|observation| match &observation.agent {
+                AgentObservation::Report(report) => Some(report.process_session_id.clone()),
+                _ => None,
+            })
+            .expect("old primary report");
+        let lsn = self.durable_source.keys().next_back().copied().unwrap_or(0) + 1;
+        let value = format!("old-ack-{case}-{step}-{lsn}");
+        let mut acknowledgements = BTreeMap::new();
+        for identity in recipients {
+            self.durable_incarnations
+                .entry(identity.instance_id.to_string())
+                .or_default()
+                .insert(lsn, value.clone());
+            let report = self.report_mut(identity.replica_id.value());
+            report.current_progress = report.current_progress.max(lsn);
+            report.committed_lsn = report.committed_lsn.max(lsn);
+            report.current_configuration_quorum_progress =
+                report.current_configuration_quorum_progress.max(lsn);
+            report.report_sequence += 1;
+            acknowledgements.insert(
+                identity.clone(),
+                if identity == intent.primary {
+                    primary_session.clone()
+                } else {
+                    report.process_session_id.clone()
+                },
+            );
+        }
+        self.durable_source.insert(lsn, value.clone());
+        self.acknowledged_writes.insert(lsn, value);
+        self.durable_acknowledgements.insert(lsn, acknowledgements);
+        lsn
     }
 
     pub fn can_acknowledge_write(&self) -> bool {

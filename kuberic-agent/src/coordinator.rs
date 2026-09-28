@@ -403,6 +403,7 @@ where
                         CoordinatorStage::Activate
                     } else if record.command.transition_kind
                         == kuberic_protocol::types::TransitionKind::Failover
+                        && record.command.failover_safe_lsn.is_some()
                     {
                         CoordinatorStage::FailoverPrefix
                     } else {
@@ -453,7 +454,9 @@ where
                         == kuberic_protocol::types::TransitionKind::Failover
                     {
                         if authority.local_role() == ReplicaRole::Primary
-                            && record.command.primary_write_status == AccessStatus::Granted
+                            && (record.command.primary_write_status == AccessStatus::Granted
+                                || (record.command.failover_safe_lsn.is_some()
+                                    && authority.scale_up.is_some()))
                         {
                             CoordinatorStage::Catchup
                         } else {

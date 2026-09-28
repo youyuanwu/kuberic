@@ -896,21 +896,27 @@ fn apply_evaluator_configuration(
                     command.scale_up_evidence.as_deref()
                 );
             } else {
-                assert!(matches!(
+                let first_fenced_epoch = matches!(
                     state.scale_up_evidence.as_deref(),
                     Some(ScaleUpConfigurationEvidence::Admission {
                         intent: durable_intent
                     }) if durable_intent == intent
-                ));
+                ) && state.current_configuration.as_ref()
+                    == Some(&intent.current_configuration);
+                let finalized_epoch = state.scale_up_evidence.as_deref()
+                    == command.scale_up_evidence.as_deref()
+                    && state
+                        .current_configuration
+                        .as_ref()
+                        .is_some_and(|current| current.epoch < command.current_epoch);
+                assert!(first_fenced_epoch || finalized_epoch);
             }
-            assert_eq!(
-                state.current_configuration.as_ref(),
-                Some(if command.current_only {
-                    &command.current_configuration
-                } else {
-                    &intent.current_configuration
-                })
-            );
+            if command.current_only {
+                assert_eq!(
+                    state.current_configuration.as_ref(),
+                    Some(&command.current_configuration)
+                );
+            }
         }
         let build = state.build_commands.get(&intent.build_id).unwrap();
         let authority = build.authority.as_ref().unwrap();
@@ -2169,7 +2175,7 @@ fn scale_up_failover_requires_durable_pc_cc_and_the_new_primary_witness() {
         expected_agent_generation: identities[1].agent_generation.clone(),
         transition_kind: TransitionKind::Failover,
         failover_safe_lsn: Some(9),
-        primary_write_status: AccessStatus::Granted,
+        primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
         retire_build_ids: Vec::new(),
         switchover_handoff: None,

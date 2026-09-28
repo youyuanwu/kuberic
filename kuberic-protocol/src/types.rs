@@ -979,6 +979,9 @@ pub struct ScaleUpReceipt {
     pub accepted_configuration: ConfigurationDescriptor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failover_evidence: Option<ScaleUpFailoverEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0))]
+    pub failover_safe_lsn: Option<i64>,
     pub current_only_write_quorum: Vec<ScaleUpWitness>,
 }
 

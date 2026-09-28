@@ -35,8 +35,9 @@ use kuberic_protocol::types::{
     FaultType, OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid,
     ReplicaCleanupIdentity, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
     ResourceUid, ScaleUpCleanup, ScaleUpConfigurationEvidence, ScaleUpIntent, ScaleUpProvisioning,
-    ScaleUpStage, SwitchoverHandoff, SwitchoverRequestId, TransitionKind, derive_agent_generation,
-    derive_initialization_id, derive_replica_endpoint_name,
+    ScaleUpReceipt, ScaleUpStage, ScaleUpWitness, SwitchoverHandoff, SwitchoverRequestId,
+    TransitionKind, derive_agent_generation, derive_initialization_id,
+    derive_replica_endpoint_name,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext, Operation,
@@ -2149,6 +2150,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
     fn cleanup_model(
         fixture: &ScaleUpSourceFixture,
         permanent_candidate_failure: bool,
+        include_prior_receipt: bool,
     ) -> scale_up_model::Model {
         let scale_up = fixture.provisioning.scale_up().unwrap();
         let previous = scale_up.previous_configuration.clone();
@@ -2160,6 +2162,70 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
             .unwrap()
             .identity
             .clone();
+        let prior_policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let prior_configuration = ConfigurationDescriptor::new(
+            Epoch::new(
+                previous.epoch.data_loss_number,
+                previous.epoch.configuration_number.saturating_sub(1),
+            ),
+            fixture.primary.replica_id,
+            vec![ConfigurationMember {
+                identity: fixture.primary.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            prior_policy.write_quorum,
+        );
+        let mut prior_intent = ScaleUpIntent {
+            operation_id: OperationId::default(),
+            resource_uid: ResourceUid::new("resource-1"),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration: prior_configuration,
+            current_configuration: previous.clone(),
+            previous_policy: prior_policy,
+            current_policy: previous_policy.clone(),
+            primary: fixture.primary.clone(),
+            target: secondary.clone(),
+            build_id: OperationId::new("settled-prior-build"),
+            snapshot_boundary_lsn: 0,
+            catch_up_boundary_lsn: 0,
+        };
+        prior_intent.operation_id = prior_intent.expected_operation_id();
+        let prior_witness = |identity: ReplicaIdentity, role, sequence| ScaleUpWitness {
+            resource_uid: prior_intent.resource_uid.clone(),
+            identity: identity.clone(),
+            role,
+            process_session_id: kuberic_protocol::types::ProcessSessionId::new(format!(
+                "prior-session-{sequence}"
+            )),
+            report_sequence: sequence,
+            epoch: previous.epoch,
+            previous_configuration_id: None,
+            current_configuration_id: previous.configuration_id.clone(),
+            verified_replication_lsn: 0,
+            write_status: if role == ReplicaRole::Primary {
+                AccessStatus::Granted
+            } else {
+                AccessStatus::NotPrimary
+            },
+            pending_operation_id: None,
+            retained_operation_id: Some(prior_intent.command_operation_id(
+                ScaleUpStage::CurrentOnly,
+                &identity,
+                &previous,
+            )),
+        };
+        let current_only_write_quorum = vec![
+            prior_witness(fixture.primary.clone(), ReplicaRole::Primary, 1),
+            prior_witness(secondary.clone(), ReplicaRole::ActiveSecondary, 2),
+        ];
+        let prior_receipt = ScaleUpReceipt {
+            intent: prior_intent,
+            accepted_configuration: previous.clone(),
+            failover_evidence: None,
+            failover_safe_lsn: None,
+            current_only_write_quorum,
+        };
         let report = |identity: ReplicaIdentity, role, write_status| AgentReport {
             protocol_version: kuberic_protocol::PROTOCOL_VERSION,
             resource_uid: ResourceUid::new("resource-1"),
@@ -2233,6 +2299,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                     configuration: previous.clone(),
                 }),
                 provisioning: Some(fixture.provisioning.clone()),
+                last_scale_up: include_prior_receipt.then(|| Box::new(prior_receipt)),
                 ..Default::default()
             },
             replicas: BTreeMap::from([
@@ -2341,8 +2408,9 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
     }
 
     fn persist_cleanup(model: &mut scale_up_model::Model) {
-        let Plan::Apply { changes } = evaluate(&model.snapshot, &scale_up_model::config()) else {
-            panic!("evaluator must persist exact abandoned-candidate cleanup")
+        let changes = match evaluate(&model.snapshot, &scale_up_model::config()) {
+            Plan::Apply { changes } => changes,
+            other => panic!("evaluator must persist exact abandoned-candidate cleanup: {other:?}"),
         };
         assert!(changes.iter().any(|change| matches!(
             change,
@@ -2355,11 +2423,11 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
     }
 
     fn exact_retirement(plan: Plan, fixture: &ScaleUpSourceFixture) -> EnsureReplicaBuild {
-        let Plan::Execute {
-            command: ProtocolCommand::EnsureReplicaBuild(command),
-        } = plan
-        else {
-            panic!("evaluator must issue exact source build retirement")
+        let command = match plan {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => command,
+            other => panic!("evaluator must issue exact source build retirement: {other:?}"),
         };
         assert!(command.retire);
         assert_eq!(command.operation_id, fixture.build_id);
@@ -2457,7 +2525,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
             .await
             .expect("real copy remained incomplete with a durable source effect");
 
-            let mut model = cleanup_model(&fixture, permanent_candidate_failure);
+            let mut model = cleanup_model(&fixture, permanent_candidate_failure, true);
             install_source_report(
                 &mut model,
                 &fixture.primary,
@@ -2696,7 +2764,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
         action: RuntimeEffectAction::RefreshApplicationProgress,
     };
     fixture.store.begin_effect(&unrelated).await.unwrap();
-    let mut model = cleanup_model(&fixture, false);
+    let mut model = cleanup_model(&fixture, false, false);
     install_source_report(
         &mut model,
         &fixture.primary,

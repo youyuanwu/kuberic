@@ -86,9 +86,11 @@ version 4 additionally binds control commands to the exact observed target
 process session. Version 5 added accepted-spec-generation fencing for preparation
 and retirement. Protocol version 6 added secondary removal, independent
 previous/reduced policies, and durable preparation, acceptance, and retirement
-evidence. **Protocol version 7** adds sequential scale-up with exact
-allocation, build, admission, completion, and cleanup authority; all
-level-triggered components must use that exact version.
+evidence. Protocol version 7 added sequential scale-up with exact allocation,
+build, admission, completion, and cleanup authority. **Protocol version 8**
+adds epoch-fenced carried-failover election and persists its exact final safe
+LSN in the completion receipt; all level-triggered components must use that
+exact version.
 The current primary revalidates the progress certificate
 before it can contribute remote quorum credit.
 
@@ -130,14 +132,15 @@ it manually. Important projections include:
 - `scaleUpAllocation` before resource creation, then scale-up `provisioning`
   and `transition.scaleUp` during build/admission;
 - `scaleUpCleanup` for one exact failed or cancelled unadmitted candidate,
-  then `lastScaleUp` for bounded post-commit convergence;
+  then `lastScaleUp` for bounded post-commit convergence, including the exact
+  final fenced failover-safe LSN when primary failure carried admission;
 - `pendingReplacementCleanup`, moved unchanged to `lastReplacement` at
   replacement acceptance, for one exact cleanup obligation;
 - conditions describing waiting or unsafe observations.
 
 The checked-in CRD is generated from the Rust type and verified byte-for-byte
 by `scripts/check_level_triggered_documentation.sh`.
-At the Phase 8 baseline it is **348,768 bytes**, leaving **1,232 bytes** before
+At the final-review baseline it is **349,003 bytes**, leaving **997 bytes** before
 the current strict-below-350,000-byte regression guard fails. Representative
 serialized scale-up status guards cover 2, 3, 4, 6, 10, and 18 members; the
 largest current 18-member sample is carried failover at **22,017 bytes**.
@@ -266,10 +269,23 @@ transition finishes before the latest desired count is evaluated.
 
 Accepted-primary failure before admission invalidates the old-primary build,
 allows ordinary failover, then cleans the exact candidate before a fresh retry.
-Failure after PC/CC begins preserves the typed scale-up authority and requires
-independent previous- and expanded-configuration recovery evidence before
-failover supersession. A failed or disappeared unadmitted candidate is never
-resumed from its partial PVC.
+Failure after PC/CC begins preserves the typed scale-up authority and its
+original previous/expanded recovery evidence. The controller first persists a
+provisional newer-epoch primary, installs that epoch write-closed, and waits
+for fresh deactivation/progress reports that independently satisfy both read
+quorums. It then persists a still-newer final primary and exact safe LSN from
+that fenced evidence. A replica holding a later acknowledged tail wins the
+final election; the provisional primary cannot repair peers from a shorter
+prefix and become writable. The failed original primary is not a required
+participant; if it returns, bounded receipt correction moves it to final
+authority afterward. Final PC/CC catch-up and activation must certify
+the exact safe LSN before current-only grants writes. A failed or disappeared
+unadmitted candidate is never resumed from its partial PVC.
+
+A completed prior addition never interprets the exact pending build or
+retirement of a newer cancellation-eligible attempt as historical work. The
+newer build is durably cancelled/retired first; unrelated pending work remains
+blocked, and any genuine prior-receipt correction remains available afterward.
 
 Cleanup is peer endpoint → Pod → PVC. Deletes use frozen UIDs and fresh resource
 versions; PVC deletion waits for authoritative exact Pod absence. List omission
@@ -285,7 +301,9 @@ failed-candidate cleanup.
 | `ScaleUpDualQuorumUnavailable`, `ScaleUpDualQuorumPending` | Independent PC/CC quorum, caught-up candidate, and writable primary evidence |
 | `ScaleUpCommittedDegraded`, `ScaleUpCurrentOnlyQuorumPending` | Accepted expanded authority and remaining exact local/current-only convergence |
 | `ScaleUpEndpointCleanupPending`, `ScaleUpPodCleanupPending`, `ScaleUpPvcCleanupPending` | Ordered exact cleanup and authoritative absence |
-| `ScaleUpFailoverArbitrationPending`, `ScaleUpDualQuorumEvidencePending` | Pre-admission ordinary failover or post-admission carried recovery evidence |
+| `ScaleUpFailoverArbitrationPending`, `ScaleUpDualQuorumEvidencePending` | Pre-admission ordinary failover or original post-admission carried recovery evidence |
+| `ScaleUpFencedPreviousQuorumPending`, `ScaleUpFencedCurrentQuorumPending`, `ScaleUpFencedDualQuorumPending` | Fresh write-closed election-epoch evidence independently missing for PC, CC, or both |
+| `ScaleUpFencedCandidatePending`, `ScaleUpFinalPrimaryCatchupPending` | Final primary selection or exact fenced safe-prefix catch-up remains incomplete |
 
 Scale-up condition messages include accepted and desired counts, exact target,
 operation attempt, phase, and blocking class. `ScaleUpStable` is the terminal
@@ -470,8 +488,9 @@ scheduling are [deferred](../../proposal/v1-retirement-plan.md#deferred-scale-do
 Scale-up is sequential and restores the first missing positive logical ordinal
 outside accepted authority before allocating a new highest ordinal.
 
-Protocol 7 and agent store schema 3 require a **fresh coordinated deployment**;
-protocol 6 and schema 2 are rejected, with no migration or mixed-version mode.
+Protocol 8 and agent store schema 3 require a **fresh coordinated deployment**;
+protocol 7 and earlier are rejected, as is schema 2, with no migration or
+mixed-version mode.
 Schema 3 persists scale-up build and admission authority in addition to the
 schema-2 initialization provenance and admitted policies.
 Retirement-started and terminal tombstone records both prevent application Open

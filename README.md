@@ -90,7 +90,7 @@ the production v2 controller configuration enables
 [sequential scale-up](docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
 one fresh incarnation at a time. Classic v1 remains unchanged. Primary removal,
 an independent minimum replica count, a validated maximum replica count, and
-the SQLite/PostgreSQL ports remain future work. Protocol 7 / agent schema 3
+the SQLite/PostgreSQL ports remain future work. Protocol 8 / agent schema 3
 require a fresh coordinated v2 deployment.
 
 ## Continuous Delivery

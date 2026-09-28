@@ -149,7 +149,7 @@ fn report<'a>(
 
 pub(super) fn recoverable_failover_conflict_identity(
     snapshot: &ObservationSnapshot,
-    replica_id: i64,
+    _replica_id: i64,
 ) -> Option<ReplicaIdentity> {
     let evidence = snapshot
         .status
@@ -162,11 +162,7 @@ pub(super) fn recoverable_failover_conflict_identity(
         .current_configuration
         .members
         .iter()
-        .find(|member| {
-            member.identity == intent.primary
-                && member.identity.replica_id.value() == replica_id
-                && member.role == ReplicaRole::Primary
-        })
+        .find(|member| member.identity == intent.primary && member.role == ReplicaRole::Primary)
         .and_then(|member| report(snapshot, &member.identity))
         .and_then(|report| {
             if report.epoch != intent.current_configuration.epoch
@@ -443,6 +439,122 @@ fn cleanup_source_build_retirement(
         return Some(retirement());
     }
     None
+}
+
+fn newer_attempt_build_retirement_precedes_receipt(
+    snapshot: &ObservationSnapshot,
+    receipt: &ScaleUpReceipt,
+) -> bool {
+    let (provisioning, target, cleanup_frozen) =
+        if let Some(cleanup) = snapshot.status.scale_up_cleanup.as_deref() {
+            (&cleanup.provisioning, cleanup.target.clone(), true)
+        } else if let Some(provisioning) = snapshot.status.provisioning.as_ref()
+            && provisioning.scale_up().is_some()
+        {
+            (
+                provisioning,
+                provisioning.target_identity(&snapshot.resource_uid),
+                false,
+            )
+        } else {
+            return false;
+        };
+    if provisioning.operation_id == receipt.intent.operation_id {
+        return false;
+    }
+    let scale_up = provisioning
+        .scale_up()
+        .expect("selected provisioning is scale-up");
+    let source = configuration_primary(&scale_up.previous_configuration);
+    let build_id = provisioning
+        .scale_up_build_id(&snapshot.resource_uid)
+        .expect("validated scale-up provisioning has a build ID");
+    let exact_transition = snapshot
+        .status
+        .transition
+        .as_ref()
+        .is_none_or(|transition| {
+            transition.scale_up.as_deref().is_some_and(|intent| {
+                intent.operation_id == provisioning.operation_id
+                    && intent.build_id == build_id
+                    && intent.primary == source.identity
+                    && intent.target == target
+            })
+        });
+    if !exact_transition {
+        return false;
+    }
+    let candidate_failed = snapshot
+        .observation_for_identity(&target)
+        .is_none_or(|observation| {
+            matches!(
+                &observation.agent,
+                AgentObservation::Absent | AgentObservation::Invalid { .. }
+            ) || matches!(
+                &observation.agent,
+                AgentObservation::Report(report)
+                    if report.reported_fault == Some(crate::types::FaultType::Permanent)
+                        || !report.healthy
+            )
+        });
+    let accepted_count = snapshot
+        .status
+        .effective_policy
+        .as_ref()
+        .map_or(0, |policy| policy.replica_set_size);
+    if !cleanup_frozen && snapshot.desired.replicas > accepted_count && !candidate_failed {
+        return false;
+    }
+    let Some(source_report) = report(snapshot, &source.identity) else {
+        return false;
+    };
+    let build_operation_id = source_build_operation_id(&build_id);
+    let retirement_operation_id = OperationId::new(format!("{build_id}:retire-abandoned-build"));
+    source_report
+        .pending_operation_id
+        .as_ref()
+        .is_some_and(|pending| {
+            pending == &build_operation_id || pending == &retirement_operation_id
+        })
+}
+
+fn newer_active_attempt_owns_receipt_reports(
+    snapshot: &ObservationSnapshot,
+    receipt: &ScaleUpReceipt,
+) -> bool {
+    let Some(transition) = snapshot.status.transition.as_ref() else {
+        return false;
+    };
+    let Some(active) = transition.scale_up.as_deref().or_else(|| {
+        transition
+            .scale_up_failover
+            .as_deref()
+            .map(|evidence| &evidence.intent)
+    }) else {
+        return false;
+    };
+    active.operation_id != receipt.intent.operation_id
+        && active.previous_configuration == receipt.accepted_configuration
+        && snapshot
+            .status
+            .provisioning
+            .as_ref()
+            .is_some_and(|provisioning| {
+                provisioning.target_identity(&snapshot.resource_uid) == active.target
+                    && provisioning
+                        .scale_up_build_id(&snapshot.resource_uid)
+                        .as_ref()
+                        == Some(&active.build_id)
+                    && provisioning.scale_up().is_some_and(|scale_up| {
+                        scale_up.resource_uid == active.resource_uid
+                            && scale_up.spec_generation == active.spec_generation
+                            && scale_up.desired_replicas == active.desired_replicas
+                            && scale_up.previous_configuration == active.previous_configuration
+                            && scale_up.previous_policy == active.previous_policy
+                            && scale_up.current_policy == active.current_policy
+                            && scale_up.target_replica_id == active.target.replica_id
+                    })
+            })
 }
 
 fn freeze_cleanup(
@@ -816,6 +928,7 @@ fn configuration_command(
     failover_safe_lsn: Option<i64>,
 ) -> EnsureConfiguration {
     let intent = evidence.intent();
+    let failover = matches!(evidence, ScaleUpConfigurationEvidence::Failover { .. });
     let retire_build_id = intent.build_id.clone();
     let stage = if current_only {
         ScaleUpStage::CurrentOnly
@@ -835,13 +948,17 @@ fn configuration_command(
         local_replica_id: member.identity.replica_id,
         expected_instance_id: member.identity.instance_id.clone(),
         expected_agent_generation: member.identity.agent_generation.clone(),
-        transition_kind: if failover_safe_lsn.is_some() {
+        transition_kind: if failover {
             TransitionKind::Failover
         } else {
             TransitionKind::ScaleUp
         },
         failover_safe_lsn,
-        primary_write_status: AccessStatus::Granted,
+        primary_write_status: if failover && !current_only {
+            AccessStatus::ReconfigurationPending
+        } else {
+            AccessStatus::Granted
+        },
         current_only,
         retire_build_ids: if current_only {
             vec![retire_build_id]
@@ -858,6 +975,12 @@ pub(super) fn recover_local_acceptance(
     config: &EvaluationConfig,
 ) -> Option<Plan> {
     let receipt = snapshot.status.last_scale_up.as_deref()?;
+    if newer_active_attempt_owns_receipt_reports(snapshot, receipt) {
+        return None;
+    }
+    if newer_attempt_build_retirement_precedes_receipt(snapshot, receipt) {
+        return None;
+    }
     let accepted = &snapshot.status.topology.as_ref()?.configuration;
     if replica_failed(snapshot, &configuration_primary(accepted).identity) {
         return None;
@@ -893,24 +1016,7 @@ pub(super) fn recover_local_acceptance(
             evidence: evidence.clone(),
         },
     );
-    let failover_safe_lsn = receipt.failover_evidence.as_ref().and_then(|evidence| {
-        evidence
-            .current_read_quorum
-            .iter()
-            .find_map(|witness| {
-                (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
-                    .then_some(witness.verified_replication_lsn)
-            })
-            .or_else(|| {
-                receipt
-                    .current_only_write_quorum
-                    .iter()
-                    .find_map(|witness| {
-                        (witness.identity.replica_id == receipt.accepted_configuration.primary_id)
-                            .then_some(witness.verified_replication_lsn)
-                    })
-            })
-    });
+    let failover_safe_lsn = receipt.failover_safe_lsn;
     for member in &receipt.accepted_configuration.members {
         if receipt_member_superseded(Some(accepted), member) {
             // A newer accepted configuration has retired this exact historical
@@ -2509,6 +2615,25 @@ fn exact_current_only_report(
             .is_some_and(|lsn| lsn >= intent.catch_up_boundary_lsn)
 }
 
+fn exact_fenced_pc_cc_report(
+    report: &AgentReport,
+    intent: &ScaleUpIntent,
+    current: &ConfigurationDescriptor,
+) -> bool {
+    let operation_id =
+        intent.command_operation_id(ScaleUpStage::PreviousCurrent, &report.identity, current);
+    report.epoch == current.epoch
+        && report.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+        && report.current_configuration.as_ref() == Some(current)
+        && report.scale_up_intent.as_deref() == Some(intent)
+        && report.current_progress >= intent.catch_up_boundary_lsn
+        && report.pending_operation_id.is_none()
+        && report.retained_operation_id.as_ref() == Some(&operation_id)
+        && report.deactivation_epoch == Some(current.epoch)
+        && report.deactivated_lsn.is_some()
+        && report.write_status != AccessStatus::Granted
+}
+
 fn needs_scale_up_pc_cc(
     report: &AgentReport,
     member: &ConfigurationMember,
@@ -2696,7 +2821,7 @@ fn begin_failover(
         effective_policy: intent.current_policy.clone(),
         previous_configuration_id: Some(intent.previous_configuration.configuration_id.clone()),
         current_configuration: failover,
-        election_lsn: Some(candidate.verified_replication_lsn),
+        election_lsn: None,
         build_id: Some(intent.build_id.clone()),
         repair: None,
         switchover: None,
@@ -2713,7 +2838,7 @@ fn begin_failover(
         "failover-recovery",
         Some(&intent.target),
         Some(&intent.operation_id),
-        "preserved original PC and expanded CC with independent recovery evidence",
+        "preserved original PC and expanded CC and persisted a provisional write-closed election epoch",
     );
     let mut changes = Vec::new();
     if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
@@ -2723,6 +2848,150 @@ fn begin_failover(
         status: Box::new(status),
     });
     Plan::Apply { changes }
+}
+
+fn fenced_failover_reports<'a>(
+    snapshot: &'a ObservationSnapshot,
+    intent: &ScaleUpIntent,
+    current: &ConfigurationDescriptor,
+    eligible: &ConfigurationDescriptor,
+) -> Vec<&'a AgentReport> {
+    eligible
+        .members
+        .iter()
+        .filter_map(|member| {
+            let report = report(snapshot, &member.identity)?;
+            (report.healthy
+                && report.reported_fault != Some(crate::types::FaultType::Permanent)
+                && exact_fenced_pc_cc_report(report, intent, current))
+            .then_some(report)
+        })
+        .collect()
+}
+
+fn finalize_fenced_failover(
+    snapshot: &ObservationSnapshot,
+    transition: &TransitionIntent,
+    intent: &ScaleUpIntent,
+    config: &EvaluationConfig,
+) -> Plan {
+    let provisional = &transition.current_configuration;
+    let previous_reports = fenced_failover_reports(
+        snapshot,
+        intent,
+        provisional,
+        &intent.previous_configuration,
+    );
+    let current_reports = fenced_failover_reports(snapshot, intent, provisional, provisional);
+    let previous_required = intent.previous_policy.read_quorum as usize;
+    let current_required = intent.current_policy.read_quorum as usize;
+    let previous_missing = previous_reports.len() < previous_required;
+    let current_missing = current_reports.len() < current_required;
+    if previous_missing || current_missing {
+        let (reason, blocking) = match (previous_missing, current_missing) {
+            (true, false) => (
+                "ScaleUpFencedPreviousQuorumPending",
+                format!(
+                    "fresh fenced previous configuration read quorum is insufficient: observed={} required={previous_required}; fresh current configuration quorum is satisfied: observed={} required={current_required}",
+                    previous_reports.len(),
+                    current_reports.len(),
+                ),
+            ),
+            (false, true) => (
+                "ScaleUpFencedCurrentQuorumPending",
+                format!(
+                    "fresh fenced previous configuration quorum is satisfied: observed={} required={previous_required}; fresh current configuration read quorum is insufficient: observed={} required={current_required}",
+                    previous_reports.len(),
+                    current_reports.len(),
+                ),
+            ),
+            (true, true) => (
+                "ScaleUpFencedDualQuorumPending",
+                format!(
+                    "fresh fenced previous configuration read quorum is insufficient: observed={} required={previous_required}; fresh current configuration read quorum is insufficient: observed={} required={current_required}",
+                    previous_reports.len(),
+                    current_reports.len(),
+                ),
+            ),
+            (false, false) => unreachable!(),
+        };
+        return wait(
+            snapshot,
+            snapshot.status.clone(),
+            reason,
+            "failover-election",
+            Some(&intent.target),
+            Some(&intent.operation_id),
+            &blocking,
+            config,
+        );
+    }
+    let candidate = current_reports
+        .iter()
+        .copied()
+        .filter(|report| report.identity != intent.primary)
+        .max_by(|left, right| {
+            let left_safe = left
+                .current_progress
+                .min(left.deactivated_lsn.unwrap_or_default());
+            let right_safe = right
+                .current_progress
+                .min(right.deactivated_lsn.unwrap_or_default());
+            left_safe
+                .cmp(&right_safe)
+                .then_with(|| left.current_progress.cmp(&right.current_progress))
+                .then_with(|| left.committed_lsn.cmp(&right.committed_lsn))
+                .then_with(|| right.identity.replica_id.cmp(&left.identity.replica_id))
+        });
+    let Some(candidate) = candidate else {
+        return wait(
+            snapshot,
+            snapshot.status.clone(),
+            "ScaleUpFencedCandidatePending",
+            "failover-election",
+            Some(&intent.target),
+            Some(&intent.operation_id),
+            "fresh fenced current-configuration evidence has no surviving primary candidate",
+            config,
+        );
+    };
+    let safe_lsn = candidate.current_progress.min(
+        candidate
+            .deactivated_lsn
+            .expect("fenced report has deactivation progress"),
+    );
+    let Some(configuration_number) = provisional.epoch.configuration_number.checked_add(1) else {
+        return unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::InvalidAcceptedAuthority(
+                "scale-up final failover epoch exhausted".into(),
+            ),
+            config,
+        );
+    };
+    let finalized = configuration_with_primary(
+        provisional,
+        &candidate.identity,
+        Epoch::new(provisional.epoch.data_loss_number, configuration_number),
+    );
+    let mut status = snapshot.status.clone();
+    let mut finalized_transition = transition.clone();
+    finalized_transition.transition_id = intent.transition_id(TransitionKind::Failover, &finalized);
+    finalized_transition.current_configuration = finalized;
+    finalized_transition.election_lsn = Some(safe_lsn);
+    status.transition = Some(finalized_transition);
+    persist(progress_status(
+        snapshot,
+        status,
+        "ScaleUpFencedElectionFinalized",
+        "failover-election",
+        Some(&intent.target),
+        Some(&intent.operation_id),
+        &format!(
+            "fresh epoch-fenced PC and CC evidence selected replica {} with safe prefix LSN {safe_lsn}",
+            candidate.identity.replica_id
+        ),
+    ))
 }
 
 pub(super) fn transition(
@@ -2890,7 +3159,11 @@ pub(super) fn transition(
         for member in current
             .members
             .iter()
-            .filter(|member| member.identity != primary.identity)
+            .filter(|member| {
+                member.identity != primary.identity
+                    && (transition.kind != TransitionKind::Failover
+                        || member.identity != intent.primary)
+            })
             .chain(std::iter::once(primary))
         {
             let Some(report) = report(snapshot, &member.identity) else {
@@ -2939,7 +3212,14 @@ pub(super) fn transition(
                     ))),
                 };
             }
-            if !exact_pc_cc_report(report, intent, current)
+            let installed = if transition.kind == TransitionKind::Failover
+                && transition.election_lsn.is_none()
+            {
+                exact_fenced_pc_cc_report(report, intent, current)
+            } else {
+                exact_pc_cc_report(report, intent, current)
+            };
+            if !installed
                 || report.pending_operation_id.is_some()
                 || report.retained_operation_id.as_ref() != Some(&operation_id)
             {
@@ -2972,6 +3252,9 @@ pub(super) fn transition(
         }
         if recovering_primary_failure {
             return begin_failover(snapshot, transition, intent, config);
+        }
+        if transition.kind == TransitionKind::Failover && transition.election_lsn.is_none() {
+            return finalize_fenced_failover(snapshot, transition, intent, config);
         }
         let previous_witnesses = quorum_witnesses(
             snapshot,
@@ -3020,6 +3303,35 @@ pub(super) fn transition(
                 config,
             );
         }
+        if transition.kind == TransitionKind::Failover {
+            let safe_lsn = transition
+                .election_lsn
+                .expect("finalized failover has a safe LSN");
+            let selected_primary_ready =
+                report(snapshot, &primary.identity).is_some_and(|report| {
+                    exact_pc_cc_report(report, intent, current)
+                        && report.pending_operation_id.is_none()
+                        && report.deactivation_epoch == Some(current.epoch)
+                        && report.deactivated_lsn.is_some_and(|lsn| lsn >= safe_lsn)
+                        && report
+                            .verified_replication_lsn
+                            .is_some_and(|lsn| lsn >= safe_lsn)
+                        && report.catch_up_complete
+                        && report.write_status == AccessStatus::ReconfigurationPending
+                });
+            if !selected_primary_ready {
+                return wait(
+                    snapshot,
+                    snapshot.status.clone(),
+                    "ScaleUpFinalPrimaryCatchupPending",
+                    "catch-up",
+                    Some(&intent.target),
+                    Some(&intent.operation_id),
+                    "selected primary must durably reach the exact fenced safe prefix while write-closed",
+                    config,
+                );
+            }
+        }
         if !candidate_ready || !primary_ready {
             return wait(
                 snapshot,
@@ -3049,7 +3361,11 @@ pub(super) fn transition(
     for member in current
         .members
         .iter()
-        .filter(|member| member.identity != primary.identity)
+        .filter(|member| {
+            member.identity != primary.identity
+                && (transition.kind != TransitionKind::Failover
+                    || member.identity != intent.primary)
+        })
         .chain(std::iter::once(primary))
     {
         let Some(report) = report(snapshot, &member.identity) else {
@@ -3110,6 +3426,7 @@ pub(super) fn transition(
                 ScaleUpConfigurationEvidence::Admission { .. } => None,
                 ScaleUpConfigurationEvidence::Failover { evidence } => Some(evidence.clone()),
             },
+            failover_safe_lsn: transition.election_lsn,
             current_only_write_quorum: current_only_witnesses,
         };
         if let Err(error) = validate_scale_up_receipt(&receipt) {

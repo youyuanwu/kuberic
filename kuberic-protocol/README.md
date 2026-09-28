@@ -143,9 +143,12 @@ current-only quorum, exact primary recovery (`ScaleDownPrimaryUnavailable`),
 retirement, exact Pod fencing/absence, and cleanup. `SpecDriftUnsupported`
 leaves combined count/image/delay drift unsatisfied.
 
-Protocol 7 scale-up persists one recoverable allocation before resource
+Protocol 8 scale-up persists one recoverable allocation before resource
 creation, selects the first missing positive ordinal, and admits one fresh
-candidate at a time. The canonical PVC is operation-annotated and frozen before
+candidate at a time. Carried primary failure installs a provisional election
+epoch write-closed, collects fresh independently sufficient PC/CC progress,
+then persists a final primary and exact safe LSN before catch-up/current-only
+activation. The canonical PVC is operation-annotated and frozen before
 the Pod; same-name resources without exact provenance are not adopted. The
 candidate remains outside accepted membership until snapshot copy and
 contiguous replication reach a separately frozen post-enumeration boundary,

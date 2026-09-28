@@ -410,14 +410,30 @@ pub fn validate_scale_up_receipt(receipt: &ScaleUpReceipt) -> Result {
                 "receipt failover evidence belongs to another attempt",
             ));
         }
+        let safe_lsn = receipt
+            .failover_safe_lsn
+            .ok_or_else(|| invalid("failover receipt omitted its fenced safe LSN"))?;
         validate_scale_up_failover_transition(
             evidence,
             &receipt.accepted_configuration,
             &receipt.intent.current_policy,
         )?;
+        if !receipt.current_only_write_quorum.iter().any(|witness| {
+            witness.identity == primary.identity
+                && witness.verified_replication_lsn >= safe_lsn
+                && witness.write_status == AccessStatus::Granted
+        }) {
+            return Err(invalid(
+                "failover receipt primary did not certify the fenced safe LSN",
+            ));
+        }
     } else if receipt.accepted_configuration != receipt.intent.current_configuration {
         return Err(invalid(
             "ordinary receipt accepted configuration differs from scale-up intent",
+        ));
+    } else if receipt.failover_safe_lsn.is_some() {
+        return Err(invalid(
+            "ordinary receipt must not carry a failover-safe LSN",
         ));
     }
     validate_witnesses(
@@ -465,9 +481,15 @@ pub fn validate_scale_up_configuration(command: &EnsureConfiguration) -> Result 
                 &command.current_configuration,
                 &command.effective_policy,
             )?;
+            let provisional = command.failover_safe_lsn.is_none()
+                && !command.current_only
+                && command.primary_write_status == AccessStatus::ReconfigurationPending;
+            let finalized = command.failover_safe_lsn.is_some_and(|lsn| lsn >= 0);
             if command.transition_kind != TransitionKind::Failover
                 || command.current_epoch != command.current_configuration.epoch
-                || command.failover_safe_lsn.is_none_or(|lsn| lsn < 0)
+                || (!provisional && !finalized)
+                || (!command.current_only && command.primary_write_status == AccessStatus::Granted)
+                || (command.current_only && !finalized)
             {
                 return Err(invalid("failover command has the wrong transition kind"));
             }
@@ -894,7 +916,7 @@ mod tests {
             expected_agent_generation: target.agent_generation,
             transition_kind: TransitionKind::Failover,
             failover_safe_lsn: Some(0),
-            primary_write_status: AccessStatus::Granted,
+            primary_write_status: AccessStatus::ReconfigurationPending,
             current_only: false,
             retire_build_ids: Vec::new(),
             switchover_handoff: None,
@@ -1013,6 +1035,7 @@ mod tests {
             let receipt = ScaleUpReceipt {
                 accepted_configuration: intent.current_configuration.clone(),
                 failover_evidence: None,
+                failover_safe_lsn: None,
                 current_only_write_quorum: intent
                     .current_configuration
                     .members
@@ -1352,6 +1375,7 @@ mod tests {
         let mut receipt = ScaleUpReceipt {
             accepted_configuration: intent.current_configuration.clone(),
             failover_evidence: None,
+            failover_safe_lsn: None,
             current_only_write_quorum: intent
                 .current_configuration
                 .members

@@ -245,7 +245,7 @@ fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
         match mutation {
             0 => request.protocol_version = 5,
             1 => request.protocol_version = 0,
-            2 => request.protocol_version = 8,
+            2 => request.protocol_version = 9,
             3 => request.expected_process_session_id.clear(),
             4 => request.target = None,
             5 => request.resource_uid = "other-resource".into(),

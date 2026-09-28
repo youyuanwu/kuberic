@@ -1586,7 +1586,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 || transition.switchover.is_some()
                 || transition.secondary_scale_down.is_some()
                 || transition.secondary_removal_evidence.is_some()
-                || transition.election_lsn.is_none_or(|lsn| lsn < 0)
+                || transition.election_lsn.is_some_and(|lsn| lsn < 0)
             {
                 return Err(ValidationError::InvalidScaleUp(
                     "failover transition differs from carried scale-up authority",

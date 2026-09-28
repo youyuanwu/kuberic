@@ -1077,6 +1077,12 @@
                         ],
                         "type": "object"
                       },
+                      "failoverSafeLsn": {
+                        "format": "int64",
+                        "minimum": 0.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
                       "intent": {
                         "description": "Immutable authority for one exact membership increase.",
                         "properties": {

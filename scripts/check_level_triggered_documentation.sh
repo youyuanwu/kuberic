@@ -78,7 +78,8 @@ assert set(status["scaleUpCleanup"]["properties"]) == {
     "provisioning", "target", "resources",
 }
 assert set(status["lastScaleUp"]["properties"]) == {
-    "intent", "acceptedConfiguration", "failoverEvidence", "currentOnlyWriteQuorum",
+    "intent", "acceptedConfiguration", "failoverEvidence", "failoverSafeLsn",
+    "currentOnlyWriteQuorum",
 }
 for field in ("scaleUpAllocation", "scaleUpCleanup", "lastScaleUp",
               "scaleUpAdmissionStarted"):
@@ -186,11 +187,11 @@ assert "PVC object deletion" in sample and "PVC object deletion" in guide_text
 
 protocol = (root / "kuberic-protocol/src/lib.rs").read_text()
 store = (root / "kuberic-agent/src/state.rs").read_text()
-assert re.search(r"pub const PROTOCOL_VERSION: u32 = 7;", protocol)
+assert re.search(r"pub const PROTOCOL_VERSION: u32 = 8;", protocol)
 assert re.search(r"pub const SCHEMA_VERSION: u32 = 3;", store)
-assert "Protocol version 7" in guide_text and "schema 3" in guide_text
-assert "Protocol version 7" in (root / "kuberic-wire/README.md").read_text()
-assert "Protocol 7" in sample and "schema 3" in sample
+assert "Protocol version 8" in guide_text and "schema 3" in guide_text
+assert "Protocol version 8" in (root / "kuberic-wire/README.md").read_text()
+assert "Protocol 8" in sample and "schema 3" in sample
 diagnostics = (root / "kuberic-agent/src/process.rs").read_text()
 assert "pub retired: bool" in diagnostics
 assert "state.retired_authority.is_some() || snapshot.retired_authority.is_some()" in diagnostics
@@ -282,7 +283,7 @@ for document in summary_documents:
                   "write closure", "sequential cleanup", "kubernetes resource deletion",
                   "independently configurable"):
         assert claim in text, f"{document.relative_to(root)}: missing narrowed claim: {claim}"
-    for claim in ("sequential scale-up", "protocol 7", "schema 3"):
+    for claim in ("sequential scale-up", "protocol 8", "schema 3"):
         assert claim in text, f"{document.relative_to(root)}: missing scale-up claim: {claim}"
 
 scale_up_text = prose(guide_text.split("## Sequential Scale-Up\n", 1)[1]
@@ -294,7 +295,9 @@ for claim in ("service fabric-inspired replica-add semantics",
               "only then creates the pod", "catchupboundarylsn",
               "without quorum credit", "independent write-quorum requirements",
               "scaleupcommitteddegraded", "endpoint → pod → pvc",
-              "same-name/different-uid", "scaleupstable"):
+              "same-name/different-uid", "scaleupstable",
+              "provisional newer-epoch primary", "fresh deactivation/progress reports",
+              "exact safe lsn"):
     assert claim in scale_up_text, f"Scale-up guide missing contract: {claim}"
 assert "maximum replica-count budget" in scale_up_text
 
@@ -324,7 +327,7 @@ for claim in ("sequential scale-up and secondary scale-down",
               "production v2 controller configuration",
               "classic kuberic.io/v1 remains unchanged",
               "pvc-before-pod", "post-enumeration catch-up boundary",
-              "protocol 7 and agent schema 3", "primary-removal behavior"):
+              "protocol 8 and agent schema 3", "primary-removal behavior"):
     assert claim in retirement_text, f"Retirement plan missing scale-up status: {claim}"
 assert "outstanding scale-up" not in retirement_text
 assert "scale-up | remains absent" not in retirement_text

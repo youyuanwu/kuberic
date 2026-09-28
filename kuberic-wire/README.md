@@ -48,9 +48,11 @@ commands retain the existing exact process-session envelope fence. Controller,
 agent, and runtime execution is enabled; current-only admission alone does not
 grant writes without separate accepted-commit evidence.
 
-Protocol version 7 adds sequential scale-up provisioning, copy/build progress,
+Protocol version 7 added sequential scale-up provisioning, copy/build progress,
 PC/CC and current-only admission evidence, carried failover evidence, and
-bounded completion receipts. Candidate identities remain outside accepted
+bounded completion receipts. Protocol version 8 adds a write-closed provisional
+election epoch, fresh fenced PC/CC progress selection, and the exact final
+failover-safe LSN in the receipt. Candidate identities remain outside accepted
 authority until admission, and exact allocation/cleanup provenance is durable
 before controller-created storage.
 
@@ -71,7 +73,7 @@ configurations cannot relabel historical evidence.
 
 ## Integration boundary
 
-This crate does not negotiate or downgrade versions. Protocol version 7 is an
+This crate does not negotiate or downgrade versions. Protocol version 8 is an
 exact coordinated-deployment boundary; incompatible controller, agent, or
 replica peers are rejected. Authentication, DNS resolution, retry policy, and
 session registration are agent-owned transport concerns around these schemas.

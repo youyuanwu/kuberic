@@ -201,9 +201,9 @@ classic `kuberic.io/v1` remains unchanged. Its as-built behavior is:
   UID/resource-version provenance and authoritative absence. Different-UID
   resources survive, and partial PVCs are not resumed.
 
-Protocol 7 and agent schema 3 are exact coordinated-deployment boundaries.
-Protocol 6/schema 2 are rejected with no migration, mixed-version mode, or
-rolling-upgrade contract. The generated CRD is currently 348,768 bytes under a
+Protocol 8 and agent schema 3 are exact coordinated-deployment boundaries.
+Protocol 7 and earlier, plus schema 2, are rejected with no migration,
+mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 349,003 bytes under a
 strict-below-350,000-byte regression guard; the largest current representative
 18-member serialized scale-up status sample is carried failover at 22,017
 bytes. These are growth guards, not a supported maximum replica-count budget.
@@ -246,7 +246,7 @@ sequential cleanup, and Kubernetes resource deletion.
   cleanup identity.
 - Schema-3 retirement-started/tombstone recovery prevents application Open
   after retirement begins and additionally persists scale-up build/admission
-  authority. Protocol 7/store schema 3 require fresh deployment, without
+  authority. Protocol 8/store schema 3 require fresh deployment, without
   migration or mixed-version support.
 - Active removal cannot be cancelled or retargeted. Cleanup serializes later
   removals and other authority work. Primary loss or missing evidence waits

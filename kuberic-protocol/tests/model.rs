@@ -1053,6 +1053,106 @@ fn insufficient_scale_up_failover_witness_masks_block_precisely() {
 }
 
 #[test]
+fn insufficient_fresh_fenced_pc_cc_masks_wait_with_classified_diagnostics() {
+    struct Scenario {
+        accepted: u32,
+        desired: u32,
+        unavailable: &'static [i64],
+        reason: &'static str,
+        expected_fragment: &'static str,
+    }
+    for scenario in [
+        Scenario {
+            accepted: 3,
+            desired: 4,
+            unavailable: &[3],
+            reason: "ScaleUpFencedPreviousQuorumPending",
+            expected_fragment: "fresh fenced previous configuration read quorum is insufficient: observed=1 required=2; fresh current configuration quorum is satisfied: observed=2 required=2",
+        },
+        Scenario {
+            accepted: 2,
+            desired: 3,
+            unavailable: &[3],
+            reason: "ScaleUpFencedCurrentQuorumPending",
+            expected_fragment: "fresh fenced previous configuration quorum is satisfied: observed=1 required=1; fresh current configuration read quorum is insufficient: observed=1 required=2",
+        },
+        Scenario {
+            accepted: 4,
+            desired: 5,
+            unavailable: &[3, 4, 5],
+            reason: "ScaleUpFencedDualQuorumPending",
+            expected_fragment: "fresh fenced previous configuration read quorum is insufficient: observed=1 required=2; fresh current configuration read quorum is insufficient: observed=1 required=3",
+        },
+    ] {
+        let mut model = scale_up_model::Model::new(scenario.accepted, scenario.desired);
+        drive_exact_scale_up_pc_cc(&mut model);
+        fail_model_primary(&mut model);
+        let Plan::Apply { changes } = model.plan() else {
+            panic!("primary failure did not persist provisional failover")
+        };
+        for change in changes {
+            model.apply(change);
+        }
+        assert!(
+            model
+                .snapshot
+                .status
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.election_lsn.is_none())
+        );
+        for replica_id in scenario.unavailable {
+            let key = model
+                .snapshot
+                .replicas
+                .iter()
+                .find_map(|(key, observation)| match &observation.agent {
+                    AgentObservation::Report(report)
+                        if report.identity.replica_id == ReplicaId::new(*replica_id) =>
+                    {
+                        Some(key.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Absent;
+        }
+
+        let blocked = loop {
+            match model.plan() {
+                Plan::Execute { command } => model.execute(command),
+                Plan::Apply { changes } => {
+                    for change in changes {
+                        model.apply(change);
+                    }
+                }
+                Plan::Wait { status, .. }
+                    if status.conditions.iter().any(|condition| {
+                        condition.type_ == "Progressing" && condition.reason == scenario.reason
+                    }) =>
+                {
+                    break status;
+                }
+                Plan::Wait { status, .. } => model.apply_wait(status),
+                other => panic!("fresh fenced mask was misclassified: {other:?}"),
+            }
+        };
+        let condition = blocked
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Progressing")
+            .unwrap();
+        assert_eq!(condition.reason, scenario.reason);
+        assert!(
+            condition.message.contains("phase=failover-election")
+                && condition.message.contains(scenario.expected_fragment),
+            "fresh fenced deficit was misclassified: {}",
+            condition.message
+        );
+    }
+}
+
+#[test]
 fn model_invariant_mutations_reject_epoch_incarnation_and_cleanup_provenance() {
     let epoch = scale_up_model::Model::new(2, 2);
     let accepted_epoch = epoch

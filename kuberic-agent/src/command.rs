@@ -617,11 +617,26 @@ fn admit_scale_up_configuration(
             )
             && state.current_configuration.as_ref() == Some(&command.current_configuration)
             && (exact_failover_pc_cc || exact_failover_current_only);
-        exact_failover_progression = exact_installed_failover;
+        let fenced_failover_progression = !command.current_only
+            && state.scale_up_evidence.as_deref() == command.scale_up_evidence.as_deref()
+            && state.highest_epoch < command.current_epoch
+            && state
+                .current_configuration
+                .as_ref()
+                .is_some_and(|configuration| {
+                    kuberic_protocol::validation::validate_scale_up_failover_transition(
+                        evidence,
+                        configuration,
+                        &intent.current_policy,
+                    )
+                    .is_ok()
+                });
+        exact_failover_progression = exact_installed_failover || fenced_failover_progression;
         if !has_new_primary_witness
             || (!first_failover_admission
                 && !original_authority_failover
                 && !historical_failover_current_only
+                && !fenced_failover_progression
                 && !(exact_installed_failover && (command.current_only || persisted_exact_replay)))
         {
             return Err(AgentError::CommandRejected(
@@ -730,7 +745,20 @@ fn admit_scale_up_configuration(
         ) && state.current_configuration.as_ref().is_some_and(
             |configuration| {
                 configuration == &intent.current_configuration
-                    || configuration == &command.current_configuration
+                || configuration == &command.current_configuration
+                || (state.scale_up_evidence.as_deref() == Some(evidence.as_ref())
+                    && state.highest_epoch < command.current_epoch
+                    && kuberic_protocol::validation::validate_scale_up_failover_transition(
+                        match evidence.as_ref() {
+                            kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                                evidence,
+                            } => evidence,
+                            _ => unreachable!(),
+                        },
+                        configuration,
+                        &intent.current_policy,
+                    )
+                    .is_ok())
             },
         );
         if !same_attempt_replay && !admission_start && !candidate_start && !carried_failover {

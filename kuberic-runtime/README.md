@@ -139,7 +139,7 @@ authority into the runtime. It freezes a separate post-enumeration catch-up
 boundary, admits the candidate through independently validated previous and
 expanded policies, and may preserve same-primary writes only while both
 configurations remain writable. Candidate readiness/copy completion alone never
-grants membership or quorum credit. Protocol 7/schema 3 require a fresh
+grants membership or quorum credit. Protocol 8/schema 3 require a fresh
 coordinated v2 deployment; classic v1 remains unchanged.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither

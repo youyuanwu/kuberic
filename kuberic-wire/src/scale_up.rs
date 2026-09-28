@@ -299,6 +299,7 @@ impl From<ScaleUpReceipt> for proto::ScaleUpReceipt {
             intent: Some(value.intent.into()),
             accepted_configuration: Some(value.accepted_configuration.into()),
             failover_evidence: value.failover_evidence.map(Into::into),
+            failover_safe_lsn: value.failover_safe_lsn,
             current_only_write_quorum: value
                 .current_only_write_quorum
                 .into_iter()
@@ -320,6 +321,7 @@ impl TryFrom<proto::ScaleUpReceipt> for ScaleUpReceipt {
             )?
             .try_into()?,
             failover_evidence: value.failover_evidence.map(TryInto::try_into).transpose()?,
+            failover_safe_lsn: value.failover_safe_lsn,
             current_only_write_quorum: value
                 .current_only_write_quorum
                 .into_iter()
@@ -626,10 +628,10 @@ mod tests {
             expected_instance_id: target.instance_id.to_string(),
             expected_agent_generation: target.agent_generation.to_string(),
             transition_kind: proto::TransitionKind::ScaleUp as i32,
-            grant_write: true,
+            grant_write: false,
             current_only: false,
             retire_build_id: String::new(),
-            primary_write_status: proto::AccessStatus::Granted as i32,
+            primary_write_status: proto::AccessStatus::ReconfigurationPending as i32,
             retire_build_ids: Vec::new(),
             failover_safe_lsn: None,
             switchover_handoff: None,
@@ -693,10 +695,10 @@ mod tests {
             expected_instance_id: target.instance_id.to_string(),
             expected_agent_generation: target.agent_generation.to_string(),
             transition_kind: proto::TransitionKind::Failover as i32,
-            grant_write: true,
+            grant_write: false,
             current_only: false,
             retire_build_id: String::new(),
-            primary_write_status: proto::AccessStatus::Granted as i32,
+            primary_write_status: proto::AccessStatus::ReconfigurationPending as i32,
             retire_build_ids: Vec::new(),
             failover_safe_lsn: Some(0),
             switchover_handoff: None,
@@ -753,6 +755,7 @@ mod tests {
         let receipt = ScaleUpReceipt {
             accepted_configuration: intent.current_configuration.clone(),
             failover_evidence: None,
+            failover_safe_lsn: None,
             current_only_write_quorum: vec![
                 witness(&intent, intent.primary.clone(), false, 2),
                 witness(&intent, intent.target.clone(), false, 3),
