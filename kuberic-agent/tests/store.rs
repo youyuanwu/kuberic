@@ -348,7 +348,7 @@ async fn schema_two_is_rejected_without_migration_or_provenance_changes() {
     assert!(matches!(
         SqliteStore::open_existing(&path, None),
         Err(AgentError::SchemaMismatch {
-            expected: 3,
+            expected: 4,
             observed: 2
         })
     ));
@@ -659,7 +659,7 @@ fn fresh_scale_up_store_requires_exact_frozen_authority() {
         InitializationAuthority::ScaleUp(&provisioning),
     )
     .unwrap();
-    assert_eq!(identity.schema_version, 3);
+    assert_eq!(identity.schema_version, 4);
 
     for mutation in 0..6 {
         let mut stale = command.clone();
@@ -850,6 +850,7 @@ async fn durable_build_catch_up_boundary_is_write_once() {
     store.admit_build(&authority).await.unwrap();
     let progress = DurableBuildProgress {
         authority,
+        snapshot_committed_lsn: Some(0),
         last_sequence: 1,
         durable_lsn: 0,
         completed: true,
@@ -876,6 +877,56 @@ async fn durable_build_catch_up_boundary_is_write_once() {
     assert!(store.record_build_progress(&changed).await.is_err());
     changed.catch_up_boundary_lsn = None;
     assert!(store.record_build_progress(&changed).await.is_err());
+}
+
+#[tokio::test]
+async fn frozen_snapshot_watermark_is_durable_write_once_before_first_chunk() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (command, observed, transition) = bootstrap_fixture();
+    let storage_identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let store =
+        SqliteStore::create_authorized(&path, AgentState::new(storage_identity.clone())).unwrap();
+    let authority = BuildAuthority {
+        build_id: OperationId::new("frozen-snapshot"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: storage_identity.local_identity.clone(),
+        target: identity(2, "target", "target-generation"),
+        current_configuration: transition.current_configuration,
+        replication_boundary_lsn: 10,
+    };
+    store.admit_build(&authority).await.unwrap();
+    let progress = DurableBuildProgress {
+        authority,
+        snapshot_committed_lsn: Some(9),
+        last_sequence: 0,
+        durable_lsn: 0,
+        completed: false,
+        catch_up_boundary_lsn: None,
+    };
+    store.record_build_progress(&progress).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open_existing(&path, None).unwrap();
+    assert_eq!(
+        store
+            .load_build_progress(&progress.authority.build_id)
+            .await
+            .unwrap(),
+        Some(progress.clone())
+    );
+    for watermark in [None, Some(-1), Some(8), Some(10), Some(11)] {
+        let changed = DurableBuildProgress {
+            snapshot_committed_lsn: watermark,
+            ..progress.clone()
+        };
+        assert!(store.record_build_progress(&changed).await.is_err());
+    }
+    store.record_build_progress(&progress).await.unwrap();
 }
 
 #[tokio::test]

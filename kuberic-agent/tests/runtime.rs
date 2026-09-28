@@ -285,6 +285,7 @@ async fn scale_up_receiver_replays_immutable_build_progress_without_reusing_sour
     store
         .record_build_progress(&DurableBuildProgress {
             authority: authority.clone(),
+            snapshot_committed_lsn: Some(0),
             last_sequence: 8,
             durable_lsn: 9,
             completed: true,
@@ -393,6 +394,7 @@ async fn scale_up_receiver_replays_every_durable_build_boundary_without_role_act
             store
                 .record_build_progress(&DurableBuildProgress {
                     authority: fixture.authority.clone(),
+                    snapshot_committed_lsn: Some(0),
                     last_sequence,
                     durable_lsn,
                     completed,
@@ -496,6 +498,7 @@ async fn scale_up_source_replays_each_durable_build_boundary_with_exact_authorit
             store
                 .record_build_progress(&DurableBuildProgress {
                     authority: fixture.authority.clone(),
+                    snapshot_committed_lsn: Some(0),
                     last_sequence,
                     durable_lsn,
                     completed,
@@ -555,6 +558,7 @@ async fn scale_up_source_replays_each_durable_build_boundary_with_exact_authorit
                 |(last_sequence, durable_lsn, completed, catch_up_boundary_lsn)| {
                     DurableBuildProgress {
                         authority: fixture.authority,
+                        snapshot_committed_lsn: Some(0),
                         last_sequence,
                         durable_lsn,
                         completed,
@@ -2504,6 +2508,8 @@ impl BuildProgressStore for MemoryAuthorityStore {
             .get(&progress.authority.build_id)
             .is_some_and(|existing| {
                 progress.last_sequence < existing.last_sequence
+                    || existing.snapshot_committed_lsn.is_some()
+                        && progress.snapshot_committed_lsn != existing.snapshot_committed_lsn
                     || progress.durable_lsn < existing.durable_lsn
                     || (existing.completed && !progress.completed)
                     || existing.catch_up_boundary_lsn.is_some()
@@ -2521,6 +2527,9 @@ impl BuildProgressStore for MemoryAuthorityStore {
 
 #[derive(Default)]
 struct TestApplication {
+    disk_path: Option<std::path::PathBuf>,
+    copy_boundaries: Mutex<Vec<kuberic_runtime::application::CopyBoundary>>,
+    primary_progress: Mutex<Vec<DurableApplicationProgress>>,
     partition: Mutex<Option<StatefulServicePartition>>,
     factory: Mutex<Option<Arc<dyn ReplicatorFactory>>>,
     state_replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
@@ -2569,6 +2578,76 @@ struct TestApplication {
 }
 
 impl TestApplication {
+    fn reopen(path: std::path::PathBuf) -> Self {
+        let application = Self {
+            disk_path: Some(path.clone()),
+            ..Self::default()
+        };
+        if path.exists() {
+            type DiskState = (PersistedApplicationState, Vec<(String, u64, Vec<u8>)>);
+            let ((operations, applied, committed), chunks): DiskState =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            *application.applied.lock().unwrap() = operations
+                .into_iter()
+                .map(|(lsn, committed_lsn, data)| {
+                    (
+                        lsn,
+                        Operation {
+                            lsn,
+                            committed_lsn,
+                            data: data.into(),
+                        },
+                    )
+                })
+                .collect();
+            *application.progress.lock().unwrap() = DurableApplicationProgress {
+                applied_lsn: applied,
+                committed_lsn: committed,
+            };
+            *application.copy_chunks.lock().unwrap() = chunks
+                .into_iter()
+                .map(|(id, sequence, bytes)| ((id, sequence), bytes.into()))
+                .collect();
+        }
+        application
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.disk_path else {
+            return;
+        };
+        use std::io::Write;
+        let progress = *self.progress.lock().unwrap();
+        let operations: Vec<_> = self
+            .applied
+            .lock()
+            .unwrap()
+            .values()
+            .map(|op| (op.lsn, op.committed_lsn, op.data.to_vec()))
+            .collect();
+        let chunks: Vec<_> = self
+            .copy_chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((id, sequence), bytes)| (id.clone(), *sequence, bytes.to_vec()))
+            .collect();
+        let bytes = serde_json::to_vec(&(
+            (operations, progress.applied_lsn, progress.committed_lsn),
+            chunks,
+        ))
+        .unwrap();
+        let tmp = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        std::fs::rename(tmp, path).unwrap();
+        std::fs::File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
     fn seed_progress(&self, applied_lsn: i64) {
         let mut progress = self.progress.lock().unwrap();
         let mut operations = self.applied.lock().unwrap();
@@ -2843,7 +2922,13 @@ impl StatefulServiceReplica for TestApplication {
         Ok(interfaces.replicator())
     }
 
-    async fn change_role(&self, _role: ReplicaRole) -> Result<RoleChange> {
+    async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        if role == ReplicaRole::Primary {
+            self.primary_progress
+                .lock()
+                .unwrap()
+                .push(*self.progress.lock().unwrap());
+        }
         self.events
             .lock()
             .unwrap()
@@ -2912,9 +2997,10 @@ impl StateProvider for TestApplication {
 
     async fn get_copy_state(
         &self,
-        up_to_lsn: i64,
+        boundary: kuberic_runtime::application::CopyBoundary,
         mut copy_context: OperationDataStream,
     ) -> Result<OperationDataStream> {
+        self.copy_boundaries.lock().unwrap().push(boundary);
         let mut context_items = Vec::new();
         while let Some(item) = copy_context.next().await {
             context_items.push(item?);
@@ -2928,7 +3014,7 @@ impl StateProvider for TestApplication {
             .applied
             .lock()
             .unwrap()
-            .range(..=up_to_lsn)
+            .range(..=boundary.applied_lsn)
             .map(|(_, operation)| operation)
         {
             snapshot.extend_from_slice(&operation.lsn.to_be_bytes());
@@ -3042,6 +3128,8 @@ impl DurableState for TestApplication {
             ));
         }
         chunks.insert(key, chunk.data);
+        drop(chunks);
+        self.persist();
         Ok(())
     }
 
@@ -3111,7 +3199,10 @@ impl DurableState for TestApplication {
         let mut progress = self.progress.lock().unwrap();
         progress.applied_lsn = progress.applied_lsn.max(up_to_lsn);
         progress.committed_lsn = progress.committed_lsn.max(committed_lsn);
-        Ok(*progress)
+        let result = *progress;
+        drop(progress);
+        self.persist();
+        Ok(result)
     }
 
     async fn apply(&self, operation: Operation) -> Result<DurableApplicationAck> {
@@ -3135,6 +3226,7 @@ impl DurableState for TestApplication {
                 .insert(operation.lsn, operation);
             *progress
         };
+        self.persist();
         if self.pause_after_apply.load(Ordering::SeqCst) {
             self.applied_notify.notify_one();
             self.resume_notify.notified().await;
@@ -3171,6 +3263,7 @@ impl DurableState for TestApplication {
             progress.committed_lsn = progress.committed_lsn.max(committed_lsn);
             *progress
         };
+        self.persist();
         if self.pause_commit.load(Ordering::SeqCst) {
             self.commit_notify.notify_one();
             self.resume_commit_notify.notified().await;
@@ -3240,6 +3333,444 @@ async fn consume_stream(
 
 fn empty_copy_context() -> OperationDataStream {
     Box::pin(stream::empty())
+}
+
+fn fresh_disk_store(root: &Path, local: ReplicaIdentity) -> Arc<SqliteStore> {
+    Arc::new(
+        SqliteStore::create_authorized(
+            SqliteStore::metadata_database_path(root),
+            AgentState::new(StorageIdentity {
+                schema_version: SCHEMA_VERSION,
+                resource_uid: ResourceUid::new("frozen-copy"),
+                pod_uid: PodUid::new(local.instance_id.as_str()),
+                pvc_uid: PvcUid::new(format!("pvc-{}", local.replica_id.value())),
+                initialization_id: InitializationId::new(format!(
+                    "init-{}",
+                    local.replica_id.value()
+                )),
+                local_identity: local,
+                effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+            }),
+        )
+        .unwrap(),
+    )
+}
+
+async fn activate_test_primary(runtime: &PodRuntime, admitted: AdmittedAuthority, grant: bool) {
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted)),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    if grant {
+        runtime
+            .apply_effect(effect(
+                4,
+                RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_catchup() {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/copy-unit");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let dir = tempfile::tempdir_in(&scratch).unwrap();
+    let source_root = dir.path().join("source");
+    let target_root = dir.path().join("target");
+    std::fs::create_dir_all(&source_root).unwrap();
+    std::fs::create_dir_all(&target_root).unwrap();
+    let source = identity(1, "frozen-source");
+    let target = identity(1, "frozen-replacement");
+    let source_store = fresh_disk_store(&source_root, source.clone());
+    let target_store = fresh_disk_store(&target_root, target.clone());
+    let source_app = Arc::new(TestApplication::reopen(
+        source_root.join("application.json"),
+    ));
+    let target_app = Arc::new(TestApplication::reopen(
+        target_root.join("application.json"),
+    ));
+    let source_runtime = PodRuntime::new(source.clone(), source_app.clone(), source_store.clone());
+    let admitted = authority(source.clone(), vec![source.clone()]);
+    activate_test_primary(&source_runtime, admitted.clone(), true).await;
+    for lsn in 1..=9 {
+        source_runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new(format!("write-{lsn}")),
+                data: Bytes::from(format!("value-{lsn}")),
+            })
+            .await
+            .unwrap()
+            .committed()
+            .await
+            .unwrap();
+    }
+    let tenth = ClientWrite {
+        operation_id: OperationId::new("tenth"),
+        data: Bytes::from_static(b"tenth"),
+    };
+    source_app.fail_after_apply.store(true, Ordering::SeqCst);
+    assert!(
+        source_runtime
+            .data_plane()
+            .begin_write(tenth.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        source_app.durable_progress().await.unwrap(),
+        DurableApplicationProgress {
+            applied_lsn: 10,
+            committed_lsn: 9
+        }
+    );
+    let build_id = OperationId::new("frozen-ten-nine");
+    // Application acceptance survived the injected post-apply failure. Authorize
+    // its exact durable boundary before the original reservation is reconciled.
+    source_store
+        .admit_build(&BuildAuthority {
+            build_id: build_id.clone(),
+            kind: BuildAuthorityKind::Provisioning,
+            source: source.clone(),
+            target: target.clone(),
+            current_configuration: admitted.current_configuration.clone(),
+            replication_boundary_lsn: 10,
+        })
+        .await
+        .unwrap();
+    let request = || PrepareCopyRequest {
+        build_id: build_id.clone(),
+        target: target.clone(),
+        configuration: BuildConfiguration::Current,
+        copy_context: empty_copy_context(),
+    };
+    let mut prepared = prepare_copy_authorized(&source_runtime, request())
+        .await
+        .unwrap();
+    let build = prepared.authority.clone();
+    let original = copy_through_final(&mut prepared).await;
+    assert_eq!(original.last().unwrap().snapshot_committed_lsn, 9);
+    let target_runtime = PodRuntime::new(target.clone(), target_app.clone(), target_store.clone());
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+        RuntimeEffectAction::AdmitBuildAuthority(Box::new(build.clone())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        target_runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let ack = target_runtime
+        .data_plane()
+        .receive_copy_item(original[0].clone())
+        .await
+        .unwrap();
+    let mut wrong_watermark = ack.clone();
+    wrong_watermark.snapshot_committed_lsn = 10;
+    assert!(
+        source_runtime
+            .data_plane()
+            .accept_copy_acknowledgement(wrong_watermark)
+            .await
+            .is_err()
+    );
+    source_runtime
+        .data_plane()
+        .accept_copy_acknowledgement(ack)
+        .await
+        .unwrap();
+    source_runtime
+        .data_plane()
+        .begin_write(tenth)
+        .await
+        .unwrap()
+        .committed()
+        .await
+        .unwrap();
+    source_runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("eleventh"),
+            data: Bytes::from_static(b"eleventh"),
+        })
+        .await
+        .unwrap()
+        .committed()
+        .await
+        .unwrap();
+    drop(prepared);
+    drop(source_runtime);
+    drop(target_runtime);
+    drop(source_app);
+    drop(target_app);
+    drop(source_store);
+    drop(target_store);
+
+    // Reopen all application bytes, copy staging and agent journals from disk.
+    let source_store = Arc::new(
+        SqliteStore::open_existing(SqliteStore::metadata_database_path(&source_root), None)
+            .unwrap(),
+    );
+    let target_store = Arc::new(
+        SqliteStore::open_existing(SqliteStore::metadata_database_path(&target_root), None)
+            .unwrap(),
+    );
+    let source_app = Arc::new(TestApplication::reopen(
+        source_root.join("application.json"),
+    ));
+    let target_app = Arc::new(TestApplication::reopen(
+        target_root.join("application.json"),
+    ));
+    let source_runtime = PodRuntime::new(source.clone(), source_app.clone(), source_store);
+    activate_test_primary(&source_runtime, admitted, false).await;
+    let target_runtime = PodRuntime::new(target.clone(), target_app.clone(), target_store.clone());
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+        RuntimeEffectAction::AdmitBuildAuthority(Box::new(build.clone())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        target_runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let mut resumed = prepare_copy_authorized(&source_runtime, request())
+        .await
+        .unwrap();
+    let replay = copy_through_final(&mut resumed).await;
+    assert_eq!(original, replay);
+    assert_eq!(
+        source_app.copy_boundaries.lock().unwrap().as_slice(),
+        &[kuberic_runtime::application::CopyBoundary {
+            applied_lsn: 10,
+            committed_lsn: 9
+        }]
+    );
+    for item in &replay {
+        let ack = target_runtime
+            .data_plane()
+            .receive_copy_item(item.clone())
+            .await
+            .unwrap();
+        source_runtime
+            .data_plane()
+            .accept_copy_acknowledgement(ack)
+            .await
+            .unwrap();
+    }
+    let final_item = replay.last().unwrap().clone();
+    let later = next_copy_item(&mut resumed).await;
+    assert_eq!(later.lsn, 11);
+    assert_eq!(later.committed_lsn, 10);
+    assert_eq!(later.snapshot_committed_lsn, 9);
+    target_runtime
+        .data_plane()
+        .receive_copy_item(later)
+        .await
+        .unwrap();
+    let before = target_app.durable_progress().await.unwrap();
+    target_runtime
+        .data_plane()
+        .receive_copy_item(final_item.clone())
+        .await
+        .unwrap();
+    let mut changed = final_item.clone();
+    changed.snapshot_committed_lsn = 10;
+    changed.committed_lsn = 10;
+    assert!(
+        target_runtime
+            .data_plane()
+            .receive_copy_item(changed.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(target_app.durable_progress().await.unwrap(), before);
+    drop(target_runtime);
+    drop(target_app);
+    drop(target_store);
+    let target_store = Arc::new(
+        SqliteStore::open_existing(SqliteStore::metadata_database_path(&target_root), None)
+            .unwrap(),
+    );
+    let target_app = Arc::new(TestApplication::reopen(
+        target_root.join("application.json"),
+    ));
+    let target_runtime = PodRuntime::new(target.clone(), target_app.clone(), target_store);
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
+        RuntimeEffectAction::AdmitBuildAuthority(Box::new(build)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        target_runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    target_runtime
+        .data_plane()
+        .receive_copy_item(final_item)
+        .await
+        .unwrap();
+    assert!(
+        target_runtime
+            .data_plane()
+            .receive_copy_item(changed)
+            .await
+            .is_err()
+    );
+    assert_eq!(target_app.durable_progress().await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn primary_callback_follows_durable_certified_commit_and_not_unverified_suffix() {
+    for (verified, fail_commit) in [(9, false), (10, false), (11, false), (10, true)] {
+        let source = identity(1, "certified-primary");
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let app = Arc::new(TestApplication::default());
+        for lsn in 1..=10 {
+            app.apply(Operation {
+                lsn,
+                committed_lsn: (lsn - 1).min(9),
+                data: Bytes::from(format!("op-{lsn}")),
+            })
+            .await
+            .unwrap();
+        }
+        let admitted = authority(source.clone(), vec![source.clone()]);
+        store.admit(&admitted).await.unwrap();
+        store
+            .record_replication_progress(&ReplicationProgress {
+                fence: admitted.fence(),
+                verified_lsn: verified,
+            })
+            .await
+            .unwrap();
+        let runtime = PodRuntime::new(source, app.clone(), store);
+        runtime
+            .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+            .await
+            .unwrap();
+        runtime
+            .apply_effect(effect(
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(admitted)),
+            ))
+            .await
+            .unwrap();
+        app.fail_commit.store(fail_commit, Ordering::SeqCst);
+        let result = runtime
+            .apply_effect(effect(
+                3,
+                RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            ))
+            .await;
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        if verified > 10 || fail_commit {
+            assert!(result.is_err());
+            assert!(app.primary_progress.lock().unwrap().is_empty());
+            assert!(
+                runtime
+                    .apply_effect(effect(
+                        3,
+                        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .apply_effect(effect(
+                        3,
+                        RuntimeEffectAction::SetReadStatus(AccessStatus::Granted)
+                    ))
+                    .await
+                    .is_err()
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(
+                app.primary_progress.lock().unwrap().as_slice(),
+                &[DurableApplicationProgress {
+                    applied_lsn: 10,
+                    committed_lsn: verified
+                }]
+            );
+            assert_eq!(app.applied.lock().unwrap().len(), 10);
+            if verified == 10 {
+                runtime
+                    .apply_effect(effect(
+                        4,
+                        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+                    ))
+                    .await
+                    .unwrap();
+                runtime
+                    .data_plane()
+                    .begin_write(ClientWrite {
+                        operation_id: OperationId::new("after-certified-prefix"),
+                        data: Bytes::from_static(b"eleventh"),
+                    })
+                    .await
+                    .unwrap()
+                    .committed()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    app.applied.lock().unwrap().get(&11).unwrap().committed_lsn,
+                    10
+                );
+            }
+        }
+    }
+    // Existing applied bytes without any durable authority cannot trigger promotion.
+    let app = Arc::new(TestApplication::default());
+    app.apply(Operation {
+        lsn: 1,
+        committed_lsn: 0,
+        data: Bytes::from_static(b"unverified"),
+    })
+    .await
+    .unwrap();
+    let runtime = PodRuntime::new(
+        identity(1, "no-authority"),
+        app.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .apply_effect(effect(
+                2,
+                RuntimeEffectAction::ChangeRole(ReplicaRole::Primary)
+            ))
+            .await
+            .is_err()
+    );
+    assert!(app.primary_progress.lock().unwrap().is_empty());
 }
 
 async fn next_copy_item(prepared: &mut PreparedCopy) -> proto::CopyItem {
@@ -7542,6 +8073,7 @@ async fn exercise_copy_boundary_demotion_overlap(iteration: usize) {
         durable_lsn: first.lsn,
         replication_boundary_lsn: first.replication_boundary_lsn,
         catch_up_boundary_lsn: first.catch_up_boundary_lsn,
+        snapshot_committed_lsn: first.snapshot_committed_lsn,
         final_item: first.final_item,
         snapshot_chunk: first.snapshot_chunk,
         ..Default::default()
@@ -8341,6 +8873,7 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
             durable_lsn: final_item.replication_boundary_lsn,
             replication_boundary_lsn: final_item.replication_boundary_lsn,
             catch_up_boundary_lsn: final_item.catch_up_boundary_lsn,
+            snapshot_committed_lsn: final_item.snapshot_committed_lsn,
             final_item: true,
             snapshot_chunk: false,
             ..Default::default()
@@ -9948,6 +10481,7 @@ async fn same_primary_scale_up_accepts_real_writes_after_every_durable_agent_eff
             durable_lsn: 0,
             completed: true,
             catch_up_boundary_lsn: Some(0),
+            snapshot_committed_lsn: Some(0),
         })
         .await
         .unwrap();

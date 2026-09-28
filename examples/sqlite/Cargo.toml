@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 kuberic-core = { path = "../../kuberic-core" }
+kuberic-protocol = { path = "../../kuberic-protocol" }
+kuberic-runtime = { path = "../../kuberic-runtime" }
+async-trait.workspace = true
+futures.workspace = true
 sqlite-commit-barrier = { path = "../../sqlite-commit-barrier" }
 tokio.workspace = true
 tokio-util.workspace = true
@@ -35,7 +39,6 @@ sqlite-replicated = { path = ".", features = ["testing"] }
 kuberic-operator = { path = "../../kuberic-operator" }
 k8s-openapi.workspace = true
 kube.workspace = true
-async-trait.workspace = true
 serial_test.workspace = true
 tempfile = "3"
 

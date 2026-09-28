@@ -40,6 +40,7 @@ pub struct CopyItem {
     pub lsn: i64,
     pub committed_lsn: i64,
     pub replication_boundary_lsn: i64,
+    pub snapshot_committed_lsn: i64,
     #[serde(default)]
     pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
@@ -58,6 +59,7 @@ pub struct CopyAck {
     pub sequence: u64,
     pub durable_lsn: i64,
     pub replication_boundary_lsn: i64,
+    pub snapshot_committed_lsn: i64,
     #[serde(default)]
     pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,

@@ -1122,6 +1122,7 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         lsn: 0,
         committed_lsn: 0,
         replication_boundary_lsn: 2,
+        snapshot_committed_lsn: 1,
         final_item: false,
         data: vec![1],
         snapshot_chunk: true,
@@ -1139,12 +1140,32 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         sequence: 3,
         durable_lsn: 2,
         replication_boundary_lsn: 2,
+        snapshot_committed_lsn: 1,
         catch_up_boundary_lsn: Some(2),
         final_item: true,
         snapshot_chunk: false,
         ..Default::default()
     };
     assert!(validate_copy_ack(&final_ack).is_ok());
+    for watermark in [-1, 3] {
+        let mut invalid = item.clone();
+        invalid.snapshot_committed_lsn = watermark;
+        assert!(validate_copy_item(&invalid).is_err());
+        let mut invalid = final_ack.clone();
+        invalid.snapshot_committed_lsn = watermark;
+        assert!(validate_copy_ack(&invalid).is_err());
+    }
+    let mut final_item = item.clone();
+    final_item.sequence = 3;
+    final_item.snapshot_chunk = false;
+    final_item.final_item = true;
+    final_item.lsn = 2;
+    final_item.committed_lsn = 1;
+    final_item.catch_up_boundary_lsn = Some(2);
+    final_item.data.clear();
+    assert!(validate_copy_item(&final_item).is_ok());
+    final_item.committed_lsn = 2;
+    assert!(validate_copy_item(&final_item).is_err());
     let mut missing_catch_up_boundary = final_ack.clone();
     missing_catch_up_boundary.catch_up_boundary_lsn = None;
     assert!(matches!(

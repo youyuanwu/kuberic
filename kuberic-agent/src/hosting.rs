@@ -868,6 +868,23 @@ impl RuntimeHost {
                     observed: effect.sequence,
                 });
             }
+            if state.fallback_snapshot.role_transition.is_some()
+                && matches!(
+                    effect.action,
+                    RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+                        | RuntimeEffectAction::SetReadStatus(AccessStatus::Granted)
+                        | RuntimeEffectAction::SetAccessStatus {
+                            read: AccessStatus::Granted,
+                            ..
+                        }
+                        | RuntimeEffectAction::SetAccessStatus {
+                            write: AccessStatus::Granted,
+                            ..
+                        }
+                )
+            {
+                return Err(RuntimeError::ReconfigurationPending);
+            }
         }
         if !matches!(
             effect.action,
@@ -1223,6 +1240,11 @@ impl RuntimeHost {
             return Err(RuntimeError::ReconfigurationPending);
         }
         if !transition.application_completed {
+            if role == ReplicaRole::Primary
+                && let Some(managed) = self.registered.get().and_then(|r| r.managed.as_ref())
+            {
+                managed.settle_primary_prefix().await?;
+            }
             let _ = self.application.change_role(role).await?;
         }
         let mut state = self.state.write().await;

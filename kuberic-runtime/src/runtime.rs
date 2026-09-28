@@ -1177,7 +1177,15 @@ impl DefaultReplicatorInner {
             }
             let sequence = build.next_sequence;
             build.next_sequence += 1;
-            let item = copy_operation_item(&build.progress.authority, sequence, &build_operation);
+            let item = copy_operation_item(
+                &build.progress.authority,
+                sequence,
+                &build_operation,
+                build
+                    .progress
+                    .snapshot_committed_lsn
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+            );
             build.emitted.insert(
                 sequence,
                 EmittedBuildItem {
@@ -1261,12 +1269,10 @@ impl DefaultReplicatorInner {
                 (BuildAuthorityKind::Bootstrap, configuration)
             }
         };
-        let local_committed_lsn = state.committed_lsn;
         drop(state);
 
         let replicator = self.replicator.lock().await;
         let replicator_progress = replicator.current_progress();
-        let mut committed_lsn = local_committed_lsn.max(replicator.committed_lsn());
         let retained = replicator.retained_operations_from(1);
         drop(replicator);
         let application_progress = self.storage().await?.durable_progress().await?;
@@ -1297,12 +1303,13 @@ impl DefaultReplicatorInner {
             ));
         }
         let build_authority = existing;
-        let build_progress = self
+        let mut build_progress = self
             .build_progress_store
             .load_build_progress(&build_authority.build_id)
             .await?
             .unwrap_or(DurableBuildProgress {
                 authority: build_authority.clone(),
+                snapshot_committed_lsn: None,
                 last_sequence: 0,
                 durable_lsn: 0,
                 completed: false,
@@ -1313,6 +1320,20 @@ impl DefaultReplicatorInner {
                 "build progress belongs to different authority".to_string(),
             ));
         }
+        let committed_lsn = *build_progress
+            .snapshot_committed_lsn
+            .get_or_insert(application_progress.committed_lsn.min(boundary));
+        if committed_lsn < 0
+            || committed_lsn > boundary
+            || application_progress.committed_lsn < committed_lsn
+        {
+            return Err(RuntimeError::Application(
+                "invalid frozen snapshot progress".into(),
+            ));
+        }
+        self.build_progress_store
+            .record_build_progress(&build_progress)
+            .await?;
 
         if self
             .state
@@ -1393,7 +1414,6 @@ impl DefaultReplicatorInner {
         }
         let replicator = self.replicator.lock().await;
         let replicator_epoch = replicator.epoch();
-        committed_lsn = committed_lsn.max(replicator.committed_lsn());
         drop(replicator);
         if replicator_epoch != Epoch::default()
             && replicator_epoch != build_authority.current_configuration.epoch
@@ -1425,7 +1445,13 @@ impl DefaultReplicatorInner {
         let copy_stream = match self
             .provider()
             .await?
-            .get_copy_state(boundary, copy_context)
+            .get_copy_state(
+                crate::application::CopyBoundary {
+                    applied_lsn: boundary,
+                    committed_lsn,
+                },
+                copy_context,
+            )
             .await
         {
             Ok(stream) => stream,
@@ -1521,7 +1547,7 @@ impl DefaultReplicatorInner {
                 break;
             };
             self.check_delivery_generation(generation)?;
-            let item = copy_snapshot_item(authority, sequence, chunk?);
+            let item = copy_snapshot_item(authority, sequence, chunk?, committed_lsn);
             self.record_emitted_copy_item(authority, &item, generation)
                 .await?;
             send_copy_item(sender, item, &mut cancellation).await?;
@@ -1750,7 +1776,15 @@ impl DefaultReplicatorInner {
             }
             let sequence = build.next_sequence;
             build.next_sequence += 1;
-            let item = copy_operation_item(authority, sequence, &operation);
+            let item = copy_operation_item(
+                authority,
+                sequence,
+                &operation,
+                build
+                    .progress
+                    .snapshot_committed_lsn
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+            );
             build.emitted.insert(
                 sequence,
                 EmittedBuildItem {
@@ -1794,6 +1828,7 @@ impl DefaultReplicatorInner {
             || acknowledgement.current_configuration_id
                 != authority.current_configuration.configuration_id
             || acknowledgement.replication_boundary_lsn != authority.replication_boundary_lsn
+            || Some(acknowledgement.snapshot_committed_lsn) != build.progress.snapshot_committed_lsn
         {
             return Err(RuntimeError::AuthorityMismatch(
                 "copy acknowledgement does not match the active build".to_string(),
@@ -1907,6 +1942,14 @@ impl DefaultReplicatorInner {
         }
         authority.validate()?;
         kuberic_runtime_internal::authority::validate_build_envelope(&authority, &envelope)?;
+        if progress
+            .snapshot_committed_lsn
+            .is_some_and(|lsn| lsn != envelope.snapshot_committed_lsn)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "copy item changed the frozen snapshot committed watermark".into(),
+            ));
+        }
         let replicator_epoch = self.replicator.lock().await.epoch();
         if replicator_epoch != Epoch::default() && replicator_epoch != envelope.epoch {
             return Err(RuntimeError::AuthorityMismatch(
@@ -1920,6 +1963,24 @@ impl DefaultReplicatorInner {
             return Err(RuntimeError::InvalidReplication(
                 "copy item kind does not match the current build phase".to_string(),
             ));
+        }
+        if envelope.sequence > progress.last_sequence + 1 {
+            return Err(RuntimeError::InvalidReplication("copy sequence gap".into()));
+        }
+        // Persist the pair only after authority, epoch and sequence validation,
+        // before application acceptance or the agent's sequence acknowledgement.
+        let mut progress = progress;
+        if progress.snapshot_committed_lsn.is_none() {
+            progress.snapshot_committed_lsn = Some(envelope.snapshot_committed_lsn);
+            self.build_progress_store
+                .record_build_progress(&progress)
+                .await?;
+            self.check_delivery_generation(delivery_generation)?;
+            self.state
+                .write()
+                .await
+                .builds
+                .insert(envelope.build_id.clone(), progress.clone());
         }
 
         let durable_lsn = if envelope.sequence <= progress.last_sequence {
@@ -1987,6 +2048,7 @@ impl DefaultReplicatorInner {
                     .await?;
                 let updated = DurableBuildProgress {
                     authority: progress.authority.clone(),
+                    snapshot_committed_lsn: progress.snapshot_committed_lsn,
                     last_sequence: envelope.sequence,
                     durable_lsn: progress.durable_lsn,
                     completed: false,
@@ -2039,6 +2101,7 @@ impl DefaultReplicatorInner {
                 }
                 let updated = DurableBuildProgress {
                     authority: progress.authority.clone(),
+                    snapshot_committed_lsn: progress.snapshot_committed_lsn,
                     last_sequence: envelope.sequence,
                     durable_lsn: envelope.replication_boundary_lsn,
                     completed: true,
@@ -2099,6 +2162,7 @@ impl DefaultReplicatorInner {
                 };
                 let updated = DurableBuildProgress {
                     authority: progress.authority.clone(),
+                    snapshot_committed_lsn: progress.snapshot_committed_lsn,
                     last_sequence: envelope.sequence,
                     durable_lsn: envelope.lsn,
                     completed: progress.completed,
@@ -2126,6 +2190,7 @@ impl DefaultReplicatorInner {
             sequence: envelope.sequence,
             durable_lsn,
             replication_boundary_lsn: envelope.replication_boundary_lsn,
+            snapshot_committed_lsn: envelope.snapshot_committed_lsn,
             catch_up_boundary_lsn: envelope.catch_up_boundary_lsn,
             final_item: envelope.final_item,
             snapshot_chunk: envelope.snapshot_chunk,
@@ -2681,6 +2746,7 @@ impl DefaultReplicatorInner {
                     .await?
                     .unwrap_or(DurableBuildProgress {
                         authority: authority.clone(),
+                        snapshot_committed_lsn: None,
                         last_sequence: 0,
                         durable_lsn: 0,
                         completed: false,
@@ -3573,6 +3639,76 @@ impl ManagedReplicator for DefaultReplicatorInner {
         Ok(())
     }
 
+    async fn settle_primary_prefix(&self) -> Result<()> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let state = self.state.read().await;
+        if !state.open
+            || state.role != ReplicaRole::Primary
+            || state.write_status == AccessStatus::Granted
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        let authority = state.authority.clone();
+        let progress = state.replication_progress.clone();
+        // Local reservations still need exact quorum reconciliation. Verification
+        // proves their identity, not that this process completed their quorum wait.
+        let unresolved_local = state
+            .local_writes
+            .values()
+            .filter(|write| write.phase != LocalWritePhase::Committed)
+            .map(|write| write.lsn)
+            .min();
+        drop(state);
+        let storage = self.storage().await?;
+        let durable = storage.durable_progress().await?;
+        let verified_lsn = match (authority, progress) {
+            (Some(authority), Some(progress)) => {
+                if authority.primary_identity() != &self.identity
+                    || progress.fence != authority.fence()
+                    || self.replica_authority_store.load().await?.as_ref() != Some(&authority)
+                    || self
+                        .replication_progress_store
+                        .load_replication_progress(&authority.fence())
+                        .await?
+                        .as_ref()
+                        != Some(&progress)
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "primary activation lacks durable authority-fenced progress".into(),
+                    ));
+                }
+                progress.verified_lsn
+            }
+            // A fresh bootstrap may open before admission, but certifies no data.
+            (None, None) if durable.applied_lsn == 0 && durable.committed_lsn == 0 => 0,
+            _ => return Err(RuntimeError::AuthorityNotAdmitted),
+        };
+        if verified_lsn < 0 || verified_lsn > durable.applied_lsn {
+            return Err(RuntimeError::AuthorityMismatch(
+                "primary prefix exceeds durable application data".into(),
+            ));
+        }
+        // Never regress previously durable commitment. Only new advancement is
+        // authorized here; an inbound-only certified prefix needs no local journal.
+        let settled_lsn = unresolved_local
+            .map_or(verified_lsn, |lsn| verified_lsn.min(lsn - 1))
+            .max(durable.committed_lsn);
+        let committed = storage.commit(settled_lsn).await?;
+        if committed.committed_lsn != settled_lsn || committed.applied_lsn != durable.applied_lsn {
+            return Err(RuntimeError::Application(
+                "failed to settle certified primary prefix".into(),
+            ));
+        }
+        self.replicator
+            .lock()
+            .await
+            .restore_committed_prefix(settled_lsn);
+        self.state.write().await.committed_lsn = committed.committed_lsn;
+        Ok(())
+    }
+
     async fn cancel_configuration_work(&self) -> Result<()> {
         self.check_aborted()?;
         let _effect = self.effect_lock.lock().await;
@@ -3776,7 +3912,12 @@ async fn send_copy_item(
     }
 }
 
-fn copy_snapshot_item(authority: &BuildAuthority, sequence: u64, data: Bytes) -> CopyItem {
+fn copy_snapshot_item(
+    authority: &BuildAuthority,
+    sequence: u64,
+    data: Bytes,
+    snapshot_committed_lsn: i64,
+) -> CopyItem {
     CopyItem {
         build_id: authority.build_id.clone(),
         sender: authority.source.clone(),
@@ -3787,6 +3928,7 @@ fn copy_snapshot_item(authority: &BuildAuthority, sequence: u64, data: Bytes) ->
         lsn: 0,
         committed_lsn: 0,
         replication_boundary_lsn: authority.replication_boundary_lsn,
+        snapshot_committed_lsn,
         catch_up_boundary_lsn: None,
         final_item: false,
         data,
@@ -3810,6 +3952,7 @@ fn copy_final_item(
         lsn: authority.replication_boundary_lsn,
         committed_lsn: committed_lsn.min(authority.replication_boundary_lsn),
         replication_boundary_lsn: authority.replication_boundary_lsn,
+        snapshot_committed_lsn: committed_lsn,
         catch_up_boundary_lsn: Some(catch_up_boundary_lsn),
         final_item: true,
         data: Bytes::new(),
@@ -3821,6 +3964,7 @@ fn copy_operation_item(
     authority: &BuildAuthority,
     sequence: u64,
     operation: &Operation,
+    snapshot_committed_lsn: i64,
 ) -> CopyItem {
     CopyItem {
         build_id: authority.build_id.clone(),
@@ -3832,6 +3976,7 @@ fn copy_operation_item(
         lsn: operation.lsn,
         committed_lsn: operation.committed_lsn.min(operation.lsn),
         replication_boundary_lsn: authority.replication_boundary_lsn,
+        snapshot_committed_lsn,
         catch_up_boundary_lsn: None,
         final_item: false,
         data: operation.data.clone(),

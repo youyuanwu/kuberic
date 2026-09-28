@@ -1481,6 +1481,15 @@ impl BuildProgressStore for SqliteStore {
     }
 
     async fn record_build_progress(&self, progress: &DurableBuildProgress) -> ContractResult<()> {
+        if progress
+            .snapshot_committed_lsn
+            .is_some_and(|lsn| lsn < 0 || lsn > progress.authority.replication_boundary_lsn)
+            || (progress.last_sequence > 0 && progress.snapshot_committed_lsn.is_none())
+        {
+            return Err(ContractError::AuthorityMismatch(
+                "build progress lacks a valid frozen snapshot watermark".into(),
+            ));
+        }
         self.contract_transaction(|transaction| {
             let authority: Option<BuildAuthority> = load_json_optional(
                 transaction,
@@ -1499,6 +1508,8 @@ impl BuildProgressStore for SqliteStore {
             )?;
             if existing.as_ref().is_some_and(|existing| {
                 progress.last_sequence < existing.last_sequence
+                    || existing.snapshot_committed_lsn.is_some()
+                        && progress.snapshot_committed_lsn != existing.snapshot_committed_lsn
                     || progress.durable_lsn < existing.durable_lsn
                     || (existing.completed && !progress.completed)
                     || existing.catch_up_boundary_lsn.is_some()
@@ -1716,19 +1727,19 @@ mod tests {
     }
 
     #[test]
-    fn scale_up_schema_three_rejects_schema_two_without_migration() {
+    fn frozen_copy_schema_four_rejects_schema_three_without_migration() {
         let directory = tempfile::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let expected = identity();
         drop(SqliteStore::create_authorized(&path, AgentState::new(expected.clone())).unwrap());
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
         assert!(matches!(
             SqliteStore::open_existing(&path, Some(&expected)),
             Err(AgentError::SchemaMismatch {
-                expected: 3,
-                observed: 2
+                expected: 4,
+                observed: 3
             })
         ));
     }

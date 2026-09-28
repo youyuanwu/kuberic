@@ -1015,7 +1015,7 @@ impl StateProvider for CrashState {
 
     async fn get_copy_state(
         &self,
-        up_to_lsn: i64,
+        boundary: kuberic_runtime::application::CopyBoundary,
         mut copy_context: OperationDataStream,
     ) -> RuntimeResult<OperationDataStream> {
         if copy_context.next().await.is_some() {
@@ -1028,7 +1028,7 @@ impl StateProvider for CrashState {
             .lock()
             .unwrap()
             .operations
-            .range(..=up_to_lsn)
+            .range(..=boundary.applied_lsn)
             .map(|(lsn, data)| {
                 serde_json::to_vec(&(*lsn, data))
                     .map(Bytes::from)
@@ -2934,7 +2934,13 @@ fn scale_up_cut_adapter_matches_real_source_and_candidate_runtime_trace() {
             .unwrap();
 
         let mut enumeration = source_application
-            .get_copy_state(4, Box::pin(stream::empty()))
+            .get_copy_state(
+                kuberic_runtime::application::CopyBoundary {
+                    applied_lsn: 4,
+                    committed_lsn: 4,
+                },
+                Box::pin(stream::empty()),
+            )
             .await
             .unwrap();
         let post_enumeration_operations = [
@@ -4588,6 +4594,7 @@ async fn execute_scale_up_failover_cut(path: &Path, boundary: &str, terminate: b
             build.build_id.clone(),
             DurableBuildProgress {
                 authority: build,
+                snapshot_committed_lsn: Some(0),
                 last_sequence: 9,
                 durable_lsn: 9,
                 completed: true,

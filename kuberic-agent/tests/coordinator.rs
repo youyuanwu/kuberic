@@ -880,6 +880,7 @@ fn apply_evaluator_configuration(
             intent.build_id.clone(),
             kuberic_runtime_internal::authority::DurableBuildProgress {
                 authority,
+                snapshot_committed_lsn: Some(0),
                 last_sequence: 3,
                 durable_lsn: intent.catch_up_boundary_lsn,
                 completed: true,
@@ -1267,6 +1268,7 @@ fn candidate_admission_fixture() -> (
     };
     let progress = kuberic_runtime_internal::authority::DurableBuildProgress {
         authority: authority.clone(),
+        snapshot_committed_lsn: Some(0),
         last_sequence: 2,
         durable_lsn: 9,
         completed: true,
@@ -1576,6 +1578,7 @@ async fn scale_up_candidate_activates_only_after_exact_build_and_retires_it_on_c
     store
         .record_build_progress(&kuberic_runtime_internal::authority::DurableBuildProgress {
             authority: authority.clone(),
+            snapshot_committed_lsn: Some(0),
             last_sequence: 2,
             durable_lsn: 9,
             completed: true,

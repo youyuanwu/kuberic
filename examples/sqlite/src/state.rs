@@ -15,6 +15,172 @@ use tracing::{debug, info, warn};
 use crate::framelog::{FrameLog, FrameLogMeta};
 use crate::frames::WalFrameSet;
 
+pub use crate::framelog::durable::RecoveryState;
+use crate::framelog::durable::{DurableFrameLog, replace, sync_directory};
+use kuberic_protocol::types::OperationId;
+use kuberic_runtime::application::{
+    CopyBoundary, CopyChunk, DurableApplicationAck, DurableApplicationProgress, Operation,
+};
+use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
+
+/// Application-owned v2 persistence. The classic connection owner below remains
+/// temporarily available until hosting and the commit barrier switch together.
+pub struct SqlitePersistence {
+    root: PathBuf,
+    log: std::sync::Mutex<DurableFrameLog>,
+}
+
+impl SqlitePersistence {
+    /// Open fresh-v2 storage or recover an existing manifest without importing classic data.
+    pub fn open(root: PathBuf) -> io::Result<Self> {
+        let log = DurableFrameLog::open(root.clone())?;
+        Ok(Self {
+            root,
+            log: std::sync::Mutex::new(log),
+        })
+    }
+
+    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, DurableFrameLog>> {
+        self.log
+            .lock()
+            .map_err(|_| io::Error::other("SQLite persistence mutex poisoned"))
+    }
+
+    /// Inspect the durable fence; opening the directory does not clear it.
+    pub fn recovery_state(&self) -> io::Result<RecoveryState> {
+        Ok(self.lock()?.recovery())
+    }
+
+    /// Fence SQL after a dispatched transaction has an unresolved publication outcome.
+    pub fn require_reconciliation(&self, reason: String) -> io::Result<()> {
+        self.lock()?.reconcile(reason)
+    }
+
+    /// Encode an exact committed image and retained applied suffix without touching live SQL.
+    pub fn snapshot(&self, boundary: CopyBoundary) -> io::Result<Vec<u8>> {
+        self.lock()?.snapshot(boundary)
+    }
+
+    /// Materialize committed history with no live SQLite connection. Recovery
+    /// authority must settle outstanding reservations before clearing reconciliation.
+    pub fn materialize_committed(&self) -> io::Result<PathBuf> {
+        let log = self.lock()?;
+        self.materialize(&log)
+    }
+
+    fn materialize(&self, log: &DurableFrameLog) -> io::Result<PathBuf> {
+        let image = log.image_at(log.progress().committed_lsn)?;
+        for companion in ["db.sqlite-wal", "db.sqlite-shm"] {
+            match std::fs::remove_file(self.root.join(companion)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        sync_directory(&self.root)?;
+        let path = self.root.join("db.sqlite");
+        replace(&path, &image)?;
+        Ok(path)
+    }
+
+    /// Called only after v2 has resolved exact journaled writes under accepted
+    /// authority; ordinary reopen intentionally never clears either durable fence.
+    pub fn complete_reconciliation(&self) -> io::Result<()> {
+        let mut log = self.lock()?;
+        self.materialize(&log)?;
+        log.clear_reconciliation()
+    }
+}
+
+fn persistence_error(error: io::Error) -> kuberic_runtime::RuntimeError {
+    kuberic_runtime::RuntimeError::Application(error.to_string())
+}
+
+#[async_trait::async_trait]
+impl DurableState for SqlitePersistence {
+    async fn get_replication_operations(
+        &self,
+        from_lsn: i64,
+        to_lsn: i64,
+    ) -> kuberic_runtime::Result<RetainedOperationStream> {
+        let operations = self
+            .lock()
+            .and_then(|log| log.retained(from_lsn, to_lsn))
+            .map_err(persistence_error)?;
+        Ok(Box::pin(futures::stream::iter(
+            operations.into_iter().map(Ok),
+        )))
+    }
+
+    async fn apply_copy_chunk(
+        &self,
+        build_id: &OperationId,
+        sequence: u64,
+        chunk: CopyChunk,
+    ) -> kuberic_runtime::Result<()> {
+        self.lock()
+            .and_then(|mut log| log.stage(build_id.as_str(), sequence, chunk.data.to_vec()))
+            .map_err(persistence_error)
+    }
+
+    async fn verify_copy_chunk(
+        &self,
+        build_id: &OperationId,
+        sequence: u64,
+        chunk: &CopyChunk,
+    ) -> kuberic_runtime::Result<bool> {
+        self.lock()
+            .map(|log| log.verify_chunk(build_id.as_str(), sequence, &chunk.data))
+            .map_err(persistence_error)
+    }
+
+    async fn finish_copy(
+        &self,
+        build_id: &OperationId,
+        up_to_lsn: i64,
+        committed_lsn: i64,
+    ) -> kuberic_runtime::Result<DurableApplicationProgress> {
+        self.lock()
+            .and_then(|mut log| {
+                log.finish(
+                    build_id.as_str(),
+                    CopyBoundary {
+                        applied_lsn: up_to_lsn,
+                        committed_lsn,
+                    },
+                )
+            })
+            .map_err(persistence_error)
+    }
+
+    async fn apply(&self, operation: Operation) -> kuberic_runtime::Result<DurableApplicationAck> {
+        self.lock()
+            .and_then(|mut log| log.apply(operation))
+            .map_err(persistence_error)
+    }
+
+    async fn durable_progress(&self) -> kuberic_runtime::Result<DurableApplicationProgress> {
+        self.lock()
+            .map(|log| log.progress())
+            .map_err(persistence_error)
+    }
+
+    async fn verify_applied(&self, operation: &Operation) -> kuberic_runtime::Result<bool> {
+        self.lock()
+            .and_then(|log| log.verify(operation))
+            .map_err(persistence_error)
+    }
+
+    async fn commit(
+        &self,
+        committed_lsn: i64,
+    ) -> kuberic_runtime::Result<DurableApplicationProgress> {
+        self.lock()
+            .and_then(|mut log| log.commit(committed_lsn))
+            .map_err(persistence_error)
+    }
+}
+
 /// The SQLite database state.
 pub struct SqliteState {
     /// SQLite connection (only on primary).

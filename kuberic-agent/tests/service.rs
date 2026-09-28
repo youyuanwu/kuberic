@@ -868,7 +868,7 @@ impl StateProvider for ResumableCopyApplication {
 
     async fn get_copy_state(
         &self,
-        _up_to_lsn: i64,
+        _boundary: kuberic_runtime::application::CopyBoundary,
         _copy_context: OperationDataStream,
     ) -> RuntimeResult<OperationDataStream> {
         let pause = self.pause_second_enumeration.swap(false, Ordering::SeqCst);
@@ -1111,7 +1111,7 @@ impl StateProvider for NoopApplication {
 
     async fn get_copy_state(
         &self,
-        _up_to_lsn: i64,
+        _boundary: kuberic_runtime::application::CopyBoundary,
         _copy_context: OperationDataStream,
     ) -> RuntimeResult<OperationDataStream> {
         Ok(Box::pin(stream::empty()))
@@ -1301,6 +1301,7 @@ async fn scale_up_source_fixture(
             durable_lsn: 0,
             completed: build_completed,
             catch_up_boundary_lsn: build_completed.then_some(0),
+            snapshot_committed_lsn: Some(0),
         })
         .await
         .unwrap();

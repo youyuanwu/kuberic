@@ -2,6 +2,11 @@
 //!
 //! Received WalFrameSets are persisted to frames.log (length-prefixed binary)
 //! before ACK. Applied frames are tracked via committed_lsn in meta.json.
+//!
+//! The classic adapter below is retained only until the service cutover.
+//! Fresh v2 storage never imports this format.
+
+pub(crate) mod durable;
 
 use std::io;
 use std::path::{Path, PathBuf};
