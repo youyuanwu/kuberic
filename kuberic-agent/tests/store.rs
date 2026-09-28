@@ -850,7 +850,6 @@ async fn durable_build_catch_up_boundary_is_write_once() {
     store.admit_build(&authority).await.unwrap();
     let progress = DurableBuildProgress {
         authority,
-        snapshot_committed_lsn: Some(0),
         last_sequence: 1,
         durable_lsn: 0,
         completed: true,
@@ -880,7 +879,7 @@ async fn durable_build_catch_up_boundary_is_write_once() {
 }
 
 #[tokio::test]
-async fn frozen_snapshot_watermark_is_durable_write_once_before_first_chunk() {
+async fn committed_snapshot_boundary_is_durable_write_once_before_first_chunk() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let (command, observed, transition) = bootstrap_fixture();
@@ -898,12 +897,11 @@ async fn frozen_snapshot_watermark_is_durable_write_once_before_first_chunk() {
         source: storage_identity.local_identity.clone(),
         target: identity(2, "target", "target-generation"),
         current_configuration: transition.current_configuration,
-        replication_boundary_lsn: 10,
+        replication_boundary_lsn: 9,
     };
     store.admit_build(&authority).await.unwrap();
     let progress = DurableBuildProgress {
         authority,
-        snapshot_committed_lsn: Some(9),
         last_sequence: 0,
         durable_lsn: 0,
         completed: false,
@@ -919,12 +917,12 @@ async fn frozen_snapshot_watermark_is_durable_write_once_before_first_chunk() {
             .unwrap(),
         Some(progress.clone())
     );
-    for watermark in [None, Some(-1), Some(8), Some(10), Some(11)] {
-        let changed = DurableBuildProgress {
-            snapshot_committed_lsn: watermark,
-            ..progress.clone()
+    for boundary in [-1, 8, 10, 11] {
+        let changed = BuildAuthority {
+            replication_boundary_lsn: boundary,
+            ..progress.authority.clone()
         };
-        assert!(store.record_build_progress(&changed).await.is_err());
+        assert!(store.admit_build(&changed).await.is_err());
     }
     store.record_build_progress(&progress).await.unwrap();
 }

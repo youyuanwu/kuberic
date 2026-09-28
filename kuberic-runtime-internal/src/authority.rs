@@ -36,9 +36,7 @@ pub fn validate_build_envelope(authority: &BuildAuthority, envelope: &CopyItem) 
         ));
     }
     if (envelope.final_item != envelope.catch_up_boundary_lsn.is_some())
-        || envelope.snapshot_committed_lsn < 0
-        || envelope.snapshot_committed_lsn > authority.replication_boundary_lsn
-        || (envelope.final_item && envelope.committed_lsn != envelope.snapshot_committed_lsn)
+        || (envelope.final_item && envelope.committed_lsn != authority.replication_boundary_lsn)
         || envelope
             .catch_up_boundary_lsn
             .is_some_and(|boundary| boundary < authority.replication_boundary_lsn)
@@ -66,8 +64,6 @@ pub struct ReplicationProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableBuildProgress {
     pub authority: BuildAuthority,
-    /// Set before any snapshot bytes are exposed or acknowledged; immutable thereafter.
-    pub snapshot_committed_lsn: Option<i64>,
     pub last_sequence: u64,
     pub durable_lsn: i64,
     pub completed: bool,

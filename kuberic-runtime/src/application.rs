@@ -14,13 +14,6 @@ pub type Lsn = i64;
 pub type OperationData = Bytes;
 pub type OperationDataStream = Pin<Box<dyn Stream<Item = Result<OperationData>> + Send>>;
 
-/// Immutable snapshot identity. Both watermarks are frozen for the entire build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CopyBoundary {
-    pub applied_lsn: Lsn,
-    pub committed_lsn: Lsn,
-}
-
 #[derive(Clone)]
 pub struct OpenContext {
     pub identity: ReplicaIdentity,
@@ -84,11 +77,12 @@ pub trait StateProvider: Send + Sync {
 
     async fn get_copy_context(&self) -> Result<OperationDataStream>;
 
-    /// Returns copy bytes frozen at both watermarks. Repeating an authorized
-    /// build, including after restart, must reproduce identical ordered bytes.
+    /// Returns copy bytes frozen at the committed `up_to_lsn`. Repeating an
+    /// authorized build, including after restart, must reproduce identical bytes.
+    /// Applied operations above this boundary are delivered as retained catch-up.
     async fn get_copy_state(
         &self,
-        boundary: CopyBoundary,
+        up_to_lsn: Lsn,
         copy_context: OperationDataStream,
     ) -> Result<OperationDataStream>;
 

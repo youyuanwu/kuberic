@@ -32,8 +32,6 @@ public-path documented enum crate::replicator::ReplicaSetQuorumMode
 public-path documented enum crate::replicator::stream::OperationMetadata
 public-path documented field crate::application::ClientWrite::data: Bytes
 public-path documented field crate::application::ClientWrite::operation_id: OperationId
-public-path documented field crate::application::CopyBoundary::applied_lsn: Lsn
-public-path documented field crate::application::CopyBoundary::committed_lsn: Lsn
 public-path documented field crate::application::CopyChunk::data: Bytes
 public-path documented field crate::application::DurableApplicationProgress::applied_lsn: Lsn
 public-path documented field crate::application::DurableApplicationProgress::committed_lsn: Lsn
@@ -81,7 +79,6 @@ public-path documented module crate::application
 public-path documented module crate::replicator
 public-path documented module crate::replicator::stream
 public-path documented struct crate::application::ClientWrite
-public-path documented struct crate::application::CopyBoundary
 public-path documented struct crate::application::CopyChunk
 public-path documented struct crate::application::DurableApplicationProgress
 public-path documented struct crate::application::OpenContext
@@ -100,7 +97,7 @@ public-path documented struct crate::replicator::stream::OperationStream
 public-path documented struct crate::replicator::stream::StreamOperation
 public-path documented trait crate::application::StateProvider: Send + Sync
 public-path documented trait crate::application::StateProvider::async fn get_copy_context (& self) -> Result < OperationDataStream >
-public-path documented trait crate::application::StateProvider::async fn get_copy_state (& self , boundary : CopyBoundary , copy_context : OperationDataStream ,) -> Result < OperationDataStream >
+public-path documented trait crate::application::StateProvider::async fn get_copy_state (& self , up_to_lsn : Lsn , copy_context : OperationDataStream ,) -> Result < OperationDataStream >
 public-path documented trait crate::application::StateProvider::async fn last_committed_lsn (& self) -> Result < Lsn >
 public-path documented trait crate::application::StateProvider::async fn on_data_loss (& self) -> Result < bool >
 public-path documented trait crate::application::StateProvider::async fn update_epoch (& self , epoch : Epoch , previous_epoch_last_lsn : Lsn) -> Result < () >

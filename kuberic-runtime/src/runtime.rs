@@ -1169,6 +1169,13 @@ impl DefaultReplicatorInner {
             .values_mut()
             .filter(|build| build_operation.lsn > build.progress.authority.replication_boundary_lsn)
         {
+            // Recovery may register a write already sent from durable retained
+            // history while it was still only application-applied.
+            if build.emitted.values().any(|item| {
+                !item.snapshot_chunk && !item.final_item && item.lsn == build_operation.lsn
+            }) {
+                continue;
+            }
             if build.final_sequence.is_none() || build.catching_up {
                 build
                     .pending_operations
@@ -1177,15 +1184,7 @@ impl DefaultReplicatorInner {
             }
             let sequence = build.next_sequence;
             build.next_sequence += 1;
-            let item = copy_operation_item(
-                &build.progress.authority,
-                sequence,
-                &build_operation,
-                build
-                    .progress
-                    .snapshot_committed_lsn
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
-            );
+            let item = copy_operation_item(&build.progress.authority, sequence, &build_operation);
             build.emitted.insert(
                 sequence,
                 EmittedBuildItem {
@@ -1283,9 +1282,9 @@ impl DefaultReplicatorInner {
             .await?
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
         let boundary = existing.replication_boundary_lsn;
-        if current_highest < boundary {
+        if current_highest < boundary || application_progress.committed_lsn < boundary {
             return Err(RuntimeError::Application(
-                "application progress regressed below the copy boundary".to_string(),
+                "copy boundary is not durably committed by the application".to_string(),
             ));
         }
         let candidate = BuildAuthority {
@@ -1303,13 +1302,12 @@ impl DefaultReplicatorInner {
             ));
         }
         let build_authority = existing;
-        let mut build_progress = self
+        let build_progress = self
             .build_progress_store
             .load_build_progress(&build_authority.build_id)
             .await?
             .unwrap_or(DurableBuildProgress {
                 authority: build_authority.clone(),
-                snapshot_committed_lsn: None,
                 last_sequence: 0,
                 durable_lsn: 0,
                 completed: false,
@@ -1320,20 +1318,6 @@ impl DefaultReplicatorInner {
                 "build progress belongs to different authority".to_string(),
             ));
         }
-        let committed_lsn = *build_progress
-            .snapshot_committed_lsn
-            .get_or_insert(application_progress.committed_lsn.min(boundary));
-        if committed_lsn < 0
-            || committed_lsn > boundary
-            || application_progress.committed_lsn < committed_lsn
-        {
-            return Err(RuntimeError::Application(
-                "invalid frozen snapshot progress".into(),
-            ));
-        }
-        self.build_progress_store
-            .record_build_progress(&build_progress)
-            .await?;
 
         if self
             .state
@@ -1445,13 +1429,7 @@ impl DefaultReplicatorInner {
         let copy_stream = match self
             .provider()
             .await?
-            .get_copy_state(
-                crate::application::CopyBoundary {
-                    applied_lsn: boundary,
-                    committed_lsn,
-                },
-                copy_context,
-            )
+            .get_copy_state(boundary, copy_context)
             .await
         {
             Ok(stream) => stream,
@@ -1472,7 +1450,6 @@ impl DefaultReplicatorInner {
             engine
                 .produce_copy_stream(
                     producer_authority,
-                    committed_lsn,
                     copy_stream,
                     operations,
                     stream_tx,
@@ -1488,11 +1465,9 @@ impl DefaultReplicatorInner {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn produce_copy_stream(
         &self,
         authority: BuildAuthority,
-        committed_lsn: i64,
         mut copy_stream: OperationDataStream,
         initial_operations: BTreeMap<i64, Operation>,
         sender: mpsc::Sender<Result<CopyItem>>,
@@ -1502,7 +1477,6 @@ impl DefaultReplicatorInner {
         let result = self
             .produce_copy_stream_inner(
                 &authority,
-                committed_lsn,
                 &mut copy_stream,
                 initial_operations,
                 &sender,
@@ -1525,11 +1499,9 @@ impl DefaultReplicatorInner {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn produce_copy_stream_inner(
         &self,
         authority: &BuildAuthority,
-        committed_lsn: i64,
         copy_stream: &mut OperationDataStream,
         initial_operations: BTreeMap<i64, Operation>,
         sender: &mpsc::Sender<Result<CopyItem>>,
@@ -1547,7 +1519,7 @@ impl DefaultReplicatorInner {
                 break;
             };
             self.check_delivery_generation(generation)?;
-            let item = copy_snapshot_item(authority, sequence, chunk?, committed_lsn);
+            let item = copy_snapshot_item(authority, sequence, chunk?);
             self.record_emitted_copy_item(authority, &item, generation)
                 .await?;
             send_copy_item(sender, item, &mut cancellation).await?;
@@ -1562,7 +1534,7 @@ impl DefaultReplicatorInner {
                 &cancellation,
             )
             .await?;
-        let final_item = copy_final_item(authority, sequence, committed_lsn, catch_up_boundary_lsn);
+        let final_item = copy_final_item(authority, sequence, catch_up_boundary_lsn);
         {
             let mut state = self.state.write().await;
             let build = state
@@ -1653,6 +1625,8 @@ impl DefaultReplicatorInner {
             state
                 .current_progress
                 .max(authority.replication_boundary_lsn)
+                // Application acceptance can precede the runtime's progress update.
+                .max(initial_operations.keys().next_back().copied().unwrap_or(0))
         });
         let mut available = initial_operations
             .keys()
@@ -1763,38 +1737,36 @@ impl DefaultReplicatorInner {
         cancellation: &mut watch::Receiver<bool>,
     ) -> Result<()> {
         self.check_delivery_generation(generation)?;
-        let item = {
-            let mut state = self.state.write().await;
-            let build = state
-                .outbound_builds
-                .get_mut(&authority.build_id)
-                .ok_or(RuntimeError::OperationCancelled)?;
-            if build.generation != generation {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "copy stream belongs to a fenced generation".into(),
-                ));
-            }
-            let sequence = build.next_sequence;
-            build.next_sequence += 1;
-            let item = copy_operation_item(
-                authority,
-                sequence,
-                &operation,
-                build
-                    .progress
-                    .snapshot_committed_lsn
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
-            );
-            build.emitted.insert(
-                sequence,
-                EmittedBuildItem {
-                    lsn: operation.lsn,
-                    final_item: false,
-                    snapshot_chunk: false,
-                },
-            );
-            item
-        };
+        let item =
+            {
+                let mut state = self.state.write().await;
+                let build = state
+                    .outbound_builds
+                    .get_mut(&authority.build_id)
+                    .ok_or(RuntimeError::OperationCancelled)?;
+                if build.generation != generation {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "copy stream belongs to a fenced generation".into(),
+                    ));
+                }
+                if build.emitted.values().any(|item| {
+                    !item.snapshot_chunk && !item.final_item && item.lsn == operation.lsn
+                }) {
+                    return Ok(());
+                }
+                let sequence = build.next_sequence;
+                build.next_sequence += 1;
+                let item = copy_operation_item(authority, sequence, &operation);
+                build.emitted.insert(
+                    sequence,
+                    EmittedBuildItem {
+                        lsn: operation.lsn,
+                        final_item: false,
+                        snapshot_chunk: false,
+                    },
+                );
+                item
+            };
         send_copy_item(sender, item, cancellation).await
     }
 
@@ -1828,7 +1800,6 @@ impl DefaultReplicatorInner {
             || acknowledgement.current_configuration_id
                 != authority.current_configuration.configuration_id
             || acknowledgement.replication_boundary_lsn != authority.replication_boundary_lsn
-            || Some(acknowledgement.snapshot_committed_lsn) != build.progress.snapshot_committed_lsn
         {
             return Err(RuntimeError::AuthorityMismatch(
                 "copy acknowledgement does not match the active build".to_string(),
@@ -1942,14 +1913,6 @@ impl DefaultReplicatorInner {
         }
         authority.validate()?;
         kuberic_runtime_internal::authority::validate_build_envelope(&authority, &envelope)?;
-        if progress
-            .snapshot_committed_lsn
-            .is_some_and(|lsn| lsn != envelope.snapshot_committed_lsn)
-        {
-            return Err(RuntimeError::AuthorityMismatch(
-                "copy item changed the frozen snapshot committed watermark".into(),
-            ));
-        }
         let replicator_epoch = self.replicator.lock().await.epoch();
         if replicator_epoch != Epoch::default() && replicator_epoch != envelope.epoch {
             return Err(RuntimeError::AuthorityMismatch(
@@ -1966,21 +1929,6 @@ impl DefaultReplicatorInner {
         }
         if envelope.sequence > progress.last_sequence + 1 {
             return Err(RuntimeError::InvalidReplication("copy sequence gap".into()));
-        }
-        // Persist the pair only after authority, epoch and sequence validation,
-        // before application acceptance or the agent's sequence acknowledgement.
-        let mut progress = progress;
-        if progress.snapshot_committed_lsn.is_none() {
-            progress.snapshot_committed_lsn = Some(envelope.snapshot_committed_lsn);
-            self.build_progress_store
-                .record_build_progress(&progress)
-                .await?;
-            self.check_delivery_generation(delivery_generation)?;
-            self.state
-                .write()
-                .await
-                .builds
-                .insert(envelope.build_id.clone(), progress.clone());
         }
 
         let durable_lsn = if envelope.sequence <= progress.last_sequence {
@@ -2048,7 +1996,6 @@ impl DefaultReplicatorInner {
                     .await?;
                 let updated = DurableBuildProgress {
                     authority: progress.authority.clone(),
-                    snapshot_committed_lsn: progress.snapshot_committed_lsn,
                     last_sequence: envelope.sequence,
                     durable_lsn: progress.durable_lsn,
                     completed: false,
@@ -2101,7 +2048,6 @@ impl DefaultReplicatorInner {
                 }
                 let updated = DurableBuildProgress {
                     authority: progress.authority.clone(),
-                    snapshot_committed_lsn: progress.snapshot_committed_lsn,
                     last_sequence: envelope.sequence,
                     durable_lsn: envelope.replication_boundary_lsn,
                     completed: true,
@@ -2162,7 +2108,6 @@ impl DefaultReplicatorInner {
                 };
                 let updated = DurableBuildProgress {
                     authority: progress.authority.clone(),
-                    snapshot_committed_lsn: progress.snapshot_committed_lsn,
                     last_sequence: envelope.sequence,
                     durable_lsn: envelope.lsn,
                     completed: progress.completed,
@@ -2190,7 +2135,6 @@ impl DefaultReplicatorInner {
             sequence: envelope.sequence,
             durable_lsn,
             replication_boundary_lsn: envelope.replication_boundary_lsn,
-            snapshot_committed_lsn: envelope.snapshot_committed_lsn,
             catch_up_boundary_lsn: envelope.catch_up_boundary_lsn,
             final_item: envelope.final_item,
             snapshot_chunk: envelope.snapshot_chunk,
@@ -2746,7 +2690,6 @@ impl DefaultReplicatorInner {
                     .await?
                     .unwrap_or(DurableBuildProgress {
                         authority: authority.clone(),
-                        snapshot_committed_lsn: None,
                         last_sequence: 0,
                         durable_lsn: 0,
                         completed: false,
@@ -3912,12 +3855,7 @@ async fn send_copy_item(
     }
 }
 
-fn copy_snapshot_item(
-    authority: &BuildAuthority,
-    sequence: u64,
-    data: Bytes,
-    snapshot_committed_lsn: i64,
-) -> CopyItem {
+fn copy_snapshot_item(authority: &BuildAuthority, sequence: u64, data: Bytes) -> CopyItem {
     CopyItem {
         build_id: authority.build_id.clone(),
         sender: authority.source.clone(),
@@ -3928,7 +3866,6 @@ fn copy_snapshot_item(
         lsn: 0,
         committed_lsn: 0,
         replication_boundary_lsn: authority.replication_boundary_lsn,
-        snapshot_committed_lsn,
         catch_up_boundary_lsn: None,
         final_item: false,
         data,
@@ -3939,7 +3876,6 @@ fn copy_snapshot_item(
 fn copy_final_item(
     authority: &BuildAuthority,
     sequence: u64,
-    committed_lsn: i64,
     catch_up_boundary_lsn: i64,
 ) -> CopyItem {
     CopyItem {
@@ -3950,9 +3886,8 @@ fn copy_final_item(
         current_configuration_id: authority.current_configuration.configuration_id.clone(),
         sequence,
         lsn: authority.replication_boundary_lsn,
-        committed_lsn: committed_lsn.min(authority.replication_boundary_lsn),
+        committed_lsn: authority.replication_boundary_lsn,
         replication_boundary_lsn: authority.replication_boundary_lsn,
-        snapshot_committed_lsn: committed_lsn,
         catch_up_boundary_lsn: Some(catch_up_boundary_lsn),
         final_item: true,
         data: Bytes::new(),
@@ -3964,7 +3899,6 @@ fn copy_operation_item(
     authority: &BuildAuthority,
     sequence: u64,
     operation: &Operation,
-    snapshot_committed_lsn: i64,
 ) -> CopyItem {
     CopyItem {
         build_id: authority.build_id.clone(),
@@ -3976,7 +3910,6 @@ fn copy_operation_item(
         lsn: operation.lsn,
         committed_lsn: operation.committed_lsn.min(operation.lsn),
         replication_boundary_lsn: authority.replication_boundary_lsn,
-        snapshot_committed_lsn,
         catch_up_boundary_lsn: None,
         final_item: false,
         data: operation.data.clone(),

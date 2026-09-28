@@ -242,7 +242,6 @@ fn exact_peer_eviction_discards_both_windows_and_cannot_reconnect() {
         lsn: 1,
         committed_lsn: 0,
         replication_boundary_lsn: 1,
-        snapshot_committed_lsn: 0,
         catch_up_boundary_lsn: Some(1),
         final_item: true,
         snapshot_chunk: true,

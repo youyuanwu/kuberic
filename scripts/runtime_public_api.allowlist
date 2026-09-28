@@ -2,7 +2,6 @@ page:all.html
 page:application/enum.OpenMode.html
 page:application/index.html
 page:application/struct.ClientWrite.html
-page:application/struct.CopyBoundary.html
 page:application/struct.CopyChunk.html
 page:application/struct.DurableApplicationProgress.html
 page:application/struct.OpenContext.html

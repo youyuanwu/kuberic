@@ -268,7 +268,7 @@ impl PodRuntime {
             source: self.host.identity.clone(),
             target,
             current_configuration,
-            replication_boundary_lsn: snapshot.current_progress,
+            replication_boundary_lsn: snapshot.committed_lsn,
         };
         authority.validate()?;
         self.host

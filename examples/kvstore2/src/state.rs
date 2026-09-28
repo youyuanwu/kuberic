@@ -258,7 +258,7 @@ impl StateProvider for KvStateProvider {
 
     async fn get_copy_state(
         &self,
-        boundary: kuberic_runtime::application::CopyBoundary,
+        up_to_lsn: i64,
         mut copy_context: OperationDataStream,
     ) -> Result<OperationDataStream> {
         use futures::StreamExt;
@@ -268,7 +268,7 @@ impl StateProvider for KvStateProvider {
             ));
         }
         self.copy_gate.wait_until_released().await?;
-        snapshot_stream(self.persistence.snapshot_at(boundary.applied_lsn)?)
+        snapshot_stream(self.persistence.snapshot_at(up_to_lsn)?)
     }
 
     async fn on_data_loss(&self) -> Result<bool> {
@@ -278,12 +278,6 @@ impl StateProvider for KvStateProvider {
 
 #[cfg(test)]
 mod tests {
-    fn copy_boundary(lsn: i64) -> kuberic_runtime::application::CopyBoundary {
-        kuberic_runtime::application::CopyBoundary {
-            applied_lsn: lsn,
-            committed_lsn: lsn,
-        }
-    }
     use std::collections::BTreeMap;
 
     use bytes::Bytes;
@@ -316,7 +310,7 @@ mod tests {
         persistence.commit(1).await.unwrap();
         let provider = KvStateProvider::new(persistence.clone(), CopyGate::disabled());
         let frozen = provider
-            .get_copy_state(copy_boundary(1), Box::pin(stream::empty()))
+            .get_copy_state(1, Box::pin(stream::empty()))
             .await
             .unwrap();
 
@@ -331,7 +325,7 @@ mod tests {
         let first = collect_copy(frozen).await;
         let second = collect_copy(
             provider
-                .get_copy_state(copy_boundary(1), Box::pin(stream::empty()))
+                .get_copy_state(1, Box::pin(stream::empty()))
                 .await
                 .unwrap(),
         )
@@ -359,11 +353,7 @@ mod tests {
         let provider = Arc::new(KvStateProvider::new(persistence, gate.clone()));
         let pending = tokio::spawn({
             let provider = provider.clone();
-            async move {
-                provider
-                    .get_copy_state(copy_boundary(0), Box::pin(stream::empty()))
-                    .await
-            }
+            async move { provider.get_copy_state(0, Box::pin(stream::empty())).await }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!pending.is_finished());
@@ -393,7 +383,7 @@ mod tests {
         let provider = KvStateProvider::new(persistence, gate.clone());
         let mut stream = tokio::time::timeout(
             Duration::from_secs(1),
-            provider.get_copy_state(copy_boundary(0), Box::pin(stream::empty())),
+            provider.get_copy_state(0, Box::pin(stream::empty())),
         )
         .await
         .unwrap()
@@ -413,7 +403,7 @@ mod tests {
         let persistence = Arc::new(KvPersistence::open(directory.path().join("data")).unwrap());
         let provider = KvStateProvider::new(persistence, CopyGate::disabled());
         let mut copy = provider
-            .get_copy_state(copy_boundary(0), Box::pin(stream::empty()))
+            .get_copy_state(0, Box::pin(stream::empty()))
             .await
             .unwrap();
         assert_eq!(
@@ -474,11 +464,10 @@ mod tests {
         .unwrap();
         gate.hold().unwrap();
         let provider = Arc::new(KvStateProvider::new(persistence, gate.clone()));
-        let waiting = tokio::spawn(async move {
-            provider
-                .get_copy_state(copy_boundary(0), Box::pin(stream::empty()))
-                .await
-        });
+        let waiting =
+            tokio::spawn(
+                async move { provider.get_copy_state(0, Box::pin(stream::empty())).await },
+            );
         tokio::time::sleep(Duration::from_millis(20)).await;
         waiting.abort();
         let _ = waiting.await;
@@ -518,7 +507,7 @@ mod tests {
         let provider = KvStateProvider::new(persistence, CopyGate::disabled());
         let chunks = collect_copy(
             provider
-                .get_copy_state(copy_boundary(0), Box::pin(stream::empty()))
+                .get_copy_state(0, Box::pin(stream::empty()))
                 .await
                 .unwrap(),
         )

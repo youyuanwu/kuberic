@@ -19,7 +19,7 @@ pub use crate::framelog::durable::RecoveryState;
 use crate::framelog::durable::{DurableFrameLog, replace, sync_directory};
 use kuberic_protocol::types::OperationId;
 use kuberic_runtime::application::{
-    CopyBoundary, CopyChunk, DurableApplicationAck, DurableApplicationProgress, Operation,
+    CopyChunk, DurableApplicationAck, DurableApplicationProgress, Operation,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
 
@@ -56,9 +56,10 @@ impl SqlitePersistence {
         self.lock()?.reconcile(reason)
     }
 
-    /// Encode an exact committed image and retained applied suffix without touching live SQL.
-    pub fn snapshot(&self, boundary: CopyBoundary) -> io::Result<Vec<u8>> {
-        self.lock()?.snapshot(boundary)
+    /// Encode the exact committed image without touching live SQL. Applied suffixes
+    /// are enumerated separately through `get_replication_operations`.
+    pub fn snapshot(&self, up_to_lsn: i64) -> io::Result<Vec<u8>> {
+        self.lock()?.snapshot(up_to_lsn)
     }
 
     /// Materialize committed history with no live SQLite connection. Recovery
@@ -141,15 +142,7 @@ impl DurableState for SqlitePersistence {
         committed_lsn: i64,
     ) -> kuberic_runtime::Result<DurableApplicationProgress> {
         self.lock()
-            .and_then(|mut log| {
-                log.finish(
-                    build_id.as_str(),
-                    CopyBoundary {
-                        applied_lsn: up_to_lsn,
-                        committed_lsn,
-                    },
-                )
-            })
+            .and_then(|mut log| log.finish(build_id.as_str(), up_to_lsn, committed_lsn))
             .map_err(persistence_error)
     }
 

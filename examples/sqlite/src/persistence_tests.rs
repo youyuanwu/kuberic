@@ -3,9 +3,7 @@ use std::io::Write;
 
 use futures::TryStreamExt;
 use kuberic_protocol::types::OperationId;
-use kuberic_runtime::application::{
-    CopyBoundary, CopyChunk, DurableApplicationProgress, Operation,
-};
+use kuberic_runtime::application::{CopyChunk, DurableApplicationProgress, Operation};
 use kuberic_runtime::engine::DurableState;
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -21,13 +19,6 @@ fn directory() -> TempDir {
 
 fn open(dir: &TempDir) -> SqlitePersistence {
     SqlitePersistence::open(dir.path().to_owned()).unwrap()
-}
-
-fn boundary(applied_lsn: i64, committed_lsn: i64) -> CopyBoundary {
-    CopyBoundary {
-        applied_lsn,
-        committed_lsn,
-    }
 }
 
 fn progress(applied_lsn: i64, committed_lsn: i64) -> DurableApplicationProgress {
@@ -147,33 +138,44 @@ async fn exact_apply_commit_restart_and_retained_ranges() {
 }
 
 #[tokio::test]
-async fn exact_copy_keeps_committed_image_and_uncommitted_suffix() {
+async fn committed_snapshot_then_retained_catchup_preserves_uncommitted_suffix() {
     let source_dir = directory();
     let source = open(&source_dir);
     let ops = operations();
     source.apply(ops[0].clone()).await.unwrap();
     source.apply(ops[1].clone()).await.unwrap();
-    let bytes = source.snapshot(boundary(2, 1)).unwrap();
+    assert!(source.snapshot(2).is_err());
+    let bytes = source.snapshot(1).unwrap();
     source.apply(ops[2].clone()).await.unwrap();
     source.commit(3).await.unwrap();
-    assert_eq!(bytes, source.snapshot(boundary(2, 1)).unwrap());
+    assert_eq!(bytes, source.snapshot(1).unwrap());
     drop(source);
     let source = open(&source_dir);
-    assert_eq!(bytes, source.snapshot(boundary(2, 1)).unwrap());
+    assert_eq!(bytes, source.snapshot(1).unwrap());
     let target_dir = directory();
     let target = open(&target_dir);
     let build = OperationId::new("exact-copy");
     stage(&target, &build, &bytes).await;
     assert_eq!(target.durable_progress().await.unwrap(), progress(0, 0));
     assert_eq!(
-        target.finish_copy(&build, 2, 1).await.unwrap(),
-        progress(2, 1)
+        target.finish_copy(&build, 1, 1).await.unwrap(),
+        progress(1, 1)
     );
     assert_eq!(rows(&target), 0);
-    assert!(target.verify_applied(&ops[1]).await.unwrap());
-    assert!(target.snapshot(boundary(0, 0)).is_err());
-    assert!(target.snapshot(boundary(4, 1)).is_err());
-    assert!(target.snapshot(boundary(2, 3)).is_err());
+    assert!(!target.verify_applied(&ops[1]).await.unwrap());
+    assert!(target.snapshot(0).is_err());
+    assert!(target.snapshot(4).is_err());
+    let suffix = source
+        .get_replication_operations(2, 2)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(suffix, ops[1..2]);
+    target.apply(suffix[0].clone()).await.unwrap();
+    assert_eq!(rows(&target), 0);
+    assert!(target.snapshot(2).is_err());
     drop(target);
     let target = open(&target_dir);
     assert_eq!(target.durable_progress().await.unwrap(), progress(2, 1));
@@ -195,13 +197,51 @@ async fn exact_copy_keeps_committed_image_and_uncommitted_suffix() {
 }
 
 #[tokio::test]
+async fn committed_boundary_zero_transfers_entire_applied_database_as_catchup() {
+    let source_dir = directory();
+    let source = open(&source_dir);
+    let empty = source.snapshot(0).unwrap();
+    let ops = operations();
+    source.apply(ops[0].clone()).await.unwrap();
+    assert_eq!(empty, source.snapshot(0).unwrap());
+    assert!(source.snapshot(1).is_err());
+    let suffix = source
+        .get_replication_operations(1, 1)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let target_dir = directory();
+    let target = open(&target_dir);
+    let build = OperationId::new("empty-committed-base");
+    stage(&target, &build, &empty).await;
+    assert_eq!(
+        target.finish_copy(&build, 0, 0).await.unwrap(),
+        progress(0, 0)
+    );
+    target.apply(suffix[0].clone()).await.unwrap();
+    assert_eq!(target.durable_progress().await.unwrap(), progress(1, 0));
+    assert_eq!(
+        fs::metadata(target.materialize_committed().unwrap())
+            .unwrap()
+            .len(),
+        0
+    );
+    drop(target);
+    let target = open(&target_dir);
+    target.commit(1).await.unwrap();
+    assert_eq!(rows(&target), 0);
+}
+
+#[tokio::test]
 async fn copy_retries_incomplete_restart_install_cleanup_and_completion_conflicts() {
     let source_dir = directory();
     let source = open(&source_dir);
     let ops = operations();
     source.apply(ops[0].clone()).await.unwrap();
     source.apply(ops[1].clone()).await.unwrap();
-    let bytes = source.snapshot(boundary(2, 1)).unwrap();
+    let bytes = source.snapshot(1).unwrap();
     let target_dir = directory();
     let target = open(&target_dir);
     let build = OperationId::new("../opaque-build-is-not-a-path");
@@ -235,7 +275,7 @@ async fn copy_retries_incomplete_restart_install_cleanup_and_completion_conflict
             .await
             .is_err()
     );
-    assert!(target.finish_copy(&build, 2, 1).await.is_err());
+    assert!(target.finish_copy(&build, 1, 1).await.is_err());
     drop(target);
     let target = open(&target_dir);
     assert_eq!(target.durable_progress().await.unwrap(), progress(0, 0));
@@ -251,23 +291,25 @@ async fn copy_retries_incomplete_restart_install_cleanup_and_completion_conflict
         .await
         .unwrap();
     assert!(target.finish_copy(&build, 2, 2).await.is_err());
-    target.finish_copy(&build, 2, 1).await.unwrap();
+    assert!(target.finish_copy(&build, 2, 1).await.is_err());
+    target.finish_copy(&build, 1, 1).await.unwrap();
     // Crash after application install but before agent acknowledgement.
     drop(target);
     let target = open(&target_dir);
     assert_eq!(
-        target.finish_copy(&build, 2, 1).await.unwrap(),
-        progress(2, 1)
+        target.finish_copy(&build, 1, 1).await.unwrap(),
+        progress(1, 1)
     );
     assert!(target.verify_copy_chunk(&build, 1, &chunk).await.unwrap());
+    target.apply(ops[1].clone()).await.unwrap();
     target.apply(ops[2].clone()).await.unwrap();
     target.commit(3).await.unwrap();
     assert_eq!(
-        target.finish_copy(&build, 2, 1).await.unwrap(),
+        target.finish_copy(&build, 1, 1).await.unwrap(),
         progress(3, 3)
     );
     assert!(target.finish_copy(&build, 2, 2).await.is_err());
-    assert!(target.finish_copy(&build, 1, 1).await.is_err());
+    assert!(target.finish_copy(&build, 1, 0).await.is_err());
     assert_eq!(rows(&target), 2);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(target_dir.path().join("state-v2.json")).unwrap())
@@ -277,7 +319,7 @@ async fn copy_retries_incomplete_restart_install_cleanup_and_completion_conflict
     drop(target);
     let target = open(&target_dir);
     assert_eq!(
-        target.finish_copy(&build, 2, 1).await.unwrap(),
+        target.finish_copy(&build, 1, 1).await.unwrap(),
         progress(3, 3)
     );
     assert!(target.finish_copy(&build, 2, 0).await.is_err());
@@ -327,7 +369,7 @@ async fn unrecorded_torn_tail_is_discarded_but_acknowledged_corruption_requires_
         ));
         assert!(state.commit(2).await.is_err());
         assert!(state.apply(ops[2].clone()).await.is_err());
-        assert!(state.snapshot(boundary(2, 2)).is_err());
+        assert!(state.snapshot(2).is_err());
         assert!(state.materialize_committed().is_err());
         assert!(state.complete_reconciliation().is_err());
         drop(state);
@@ -341,16 +383,30 @@ async fn unrecorded_torn_tail_is_discarded_but_acknowledged_corruption_requires_
         for op in &ops[..2] {
             source.apply(op.clone()).await.unwrap();
         }
-        let insufficient = source.snapshot(boundary(2, 1)).unwrap();
-        let insufficient_build = OperationId::new("insufficient-rebuild");
-        stage(&state, &insufficient_build, &insufficient).await;
-        assert!(state.finish_copy(&insufficient_build, 2, 1).await.is_err());
-        assert_eq!(state.durable_progress().await.unwrap(), progress(2, 2));
-        source.commit(2).await.unwrap();
-        let bytes = source.snapshot(boundary(2, 2)).unwrap();
+        let bytes = source.snapshot(1).unwrap();
         let build = OperationId::new("rebuild");
         stage(&state, &build, &bytes).await;
-        state.finish_copy(&build, 2, 2).await.unwrap();
+        state.finish_copy(&build, 1, 1).await.unwrap();
+        assert!(matches!(
+            state.recovery_state().unwrap(),
+            RecoveryState::Rebuilding { .. }
+        ));
+        assert!(state.materialize_committed().is_err());
+        assert!(state.complete_reconciliation().is_err());
+        drop(state);
+        let state = open(&dir);
+        assert!(matches!(
+            state.recovery_state().unwrap(),
+            RecoveryState::Rebuilding { .. }
+        ));
+        state.apply(ops[1].clone()).await.unwrap();
+        assert!(state.materialize_committed().is_err());
+        assert!(
+            state
+                .require_reconciliation("cannot override rebuilding".into())
+                .is_err()
+        );
+        state.commit(2).await.unwrap();
         assert_eq!(state.recovery_state().unwrap(), RecoveryState::Healthy);
         assert_eq!(rows(&state), 1);
     }
@@ -456,15 +512,15 @@ async fn metadata_corruption_cannot_silently_regress_watermarks() {
 
 #[tokio::test]
 async fn installing_older_copy_preserves_later_contiguous_history_and_geometry() {
-    for snapshot_boundary in [boundary(0, 0), boundary(2, 1)] {
+    for snapshot_boundary in [0, 1] {
         let source_dir = directory();
         let source = open(&source_dir);
         let ops = operations();
-        let empty = source.snapshot(boundary(0, 0)).unwrap();
+        let empty = source.snapshot(0).unwrap();
         for op in &ops[..2] {
             source.apply(op.clone()).await.unwrap();
         }
-        let bytes = if snapshot_boundary.applied_lsn == 0 {
+        let bytes = if snapshot_boundary == 0 {
             empty
         } else {
             source.snapshot(snapshot_boundary).unwrap()
@@ -479,11 +535,7 @@ async fn installing_older_copy_preserves_later_contiguous_history_and_geometry()
         stage(&target, &build, &bytes).await;
         assert_eq!(
             target
-                .finish_copy(
-                    &build,
-                    snapshot_boundary.applied_lsn,
-                    snapshot_boundary.committed_lsn
-                )
+                .finish_copy(&build, snapshot_boundary, snapshot_boundary)
                 .await
                 .unwrap(),
             progress(3, 3)

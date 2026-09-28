@@ -285,7 +285,6 @@ async fn scale_up_receiver_replays_immutable_build_progress_without_reusing_sour
     store
         .record_build_progress(&DurableBuildProgress {
             authority: authority.clone(),
-            snapshot_committed_lsn: Some(0),
             last_sequence: 8,
             durable_lsn: 9,
             completed: true,
@@ -394,7 +393,6 @@ async fn scale_up_receiver_replays_every_durable_build_boundary_without_role_act
             store
                 .record_build_progress(&DurableBuildProgress {
                     authority: fixture.authority.clone(),
-                    snapshot_committed_lsn: Some(0),
                     last_sequence,
                     durable_lsn,
                     completed,
@@ -498,7 +496,6 @@ async fn scale_up_source_replays_each_durable_build_boundary_with_exact_authorit
             store
                 .record_build_progress(&DurableBuildProgress {
                     authority: fixture.authority.clone(),
-                    snapshot_committed_lsn: Some(0),
                     last_sequence,
                     durable_lsn,
                     completed,
@@ -558,7 +555,6 @@ async fn scale_up_source_replays_each_durable_build_boundary_with_exact_authorit
                 |(last_sequence, durable_lsn, completed, catch_up_boundary_lsn)| {
                     DurableBuildProgress {
                         authority: fixture.authority,
-                        snapshot_committed_lsn: Some(0),
                         last_sequence,
                         durable_lsn,
                         completed,
@@ -2508,8 +2504,6 @@ impl BuildProgressStore for MemoryAuthorityStore {
             .get(&progress.authority.build_id)
             .is_some_and(|existing| {
                 progress.last_sequence < existing.last_sequence
-                    || existing.snapshot_committed_lsn.is_some()
-                        && progress.snapshot_committed_lsn != existing.snapshot_committed_lsn
                     || progress.durable_lsn < existing.durable_lsn
                     || (existing.completed && !progress.completed)
                     || existing.catch_up_boundary_lsn.is_some()
@@ -2528,7 +2522,7 @@ impl BuildProgressStore for MemoryAuthorityStore {
 #[derive(Default)]
 struct TestApplication {
     disk_path: Option<std::path::PathBuf>,
-    copy_boundaries: Mutex<Vec<kuberic_runtime::application::CopyBoundary>>,
+    copy_boundaries: Mutex<Vec<i64>>,
     primary_progress: Mutex<Vec<DurableApplicationProgress>>,
     partition: Mutex<Option<StatefulServicePartition>>,
     factory: Mutex<Option<Arc<dyn ReplicatorFactory>>>,
@@ -2997,10 +2991,10 @@ impl StateProvider for TestApplication {
 
     async fn get_copy_state(
         &self,
-        boundary: kuberic_runtime::application::CopyBoundary,
+        up_to_lsn: i64,
         mut copy_context: OperationDataStream,
     ) -> Result<OperationDataStream> {
-        self.copy_boundaries.lock().unwrap().push(boundary);
+        self.copy_boundaries.lock().unwrap().push(up_to_lsn);
         let mut context_items = Vec::new();
         while let Some(item) = copy_context.next().await {
             context_items.push(item?);
@@ -3014,7 +3008,7 @@ impl StateProvider for TestApplication {
             .applied
             .lock()
             .unwrap()
-            .range(..=boundary.applied_lsn)
+            .range(..=up_to_lsn)
             .map(|(_, operation)| operation)
         {
             snapshot.extend_from_slice(&operation.lsn.to_be_bytes());
@@ -3382,7 +3376,13 @@ async fn activate_test_primary(runtime: &PodRuntime, admitted: AdmittedAuthority
 }
 
 #[tokio::test]
-async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_catchup() {
+async fn committed_snapshot_boundary_survives_disk_reopens_with_exact_applied_catchup() {
+    for recover_during_snapshot in [false, true] {
+        committed_snapshot_restart_trace(recover_during_snapshot).await;
+    }
+}
+
+async fn committed_snapshot_restart_trace(recover_during_snapshot: bool) {
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/copy-unit");
     std::fs::create_dir_all(&scratch).unwrap();
     let dir = tempfile::tempdir_in(&scratch).unwrap();
@@ -3436,11 +3436,10 @@ async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_
         }
     );
     let build_id = OperationId::new("frozen-ten-nine");
-    // Application acceptance survived the injected post-apply failure. Authorize
-    // its exact durable boundary before the original reservation is reconciled.
+    let uncommitted_build_id = OperationId::new("reject-applied-boundary");
     source_store
         .admit_build(&BuildAuthority {
-            build_id: build_id.clone(),
+            build_id: uncommitted_build_id.clone(),
             kind: BuildAuthorityKind::Provisioning,
             source: source.clone(),
             target: target.clone(),
@@ -3449,18 +3448,54 @@ async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_
         })
         .await
         .unwrap();
+    assert!(
+        source_runtime
+            .data_plane()
+            .prepare_copy(PrepareCopyRequest {
+                build_id: uncommitted_build_id,
+                target: target.clone(),
+                configuration: BuildConfiguration::Current,
+                copy_context: empty_copy_context(),
+            })
+            .await
+            .is_err()
+    );
     let request = || PrepareCopyRequest {
         build_id: build_id.clone(),
         target: target.clone(),
         configuration: BuildConfiguration::Current,
         copy_context: empty_copy_context(),
     };
+    source_app
+        .pause_copy_enumeration
+        .store(recover_during_snapshot, Ordering::SeqCst);
     let mut prepared = prepare_copy_authorized(&source_runtime, request())
         .await
         .unwrap();
+    if recover_during_snapshot {
+        source_runtime
+            .data_plane()
+            .begin_write(tenth.clone())
+            .await
+            .unwrap()
+            .committed()
+            .await
+            .unwrap();
+        source_app
+            .pause_copy_enumeration
+            .store(false, Ordering::SeqCst);
+        source_app.resume_copy_enumeration_notify.notify_one();
+    }
     let build = prepared.authority.clone();
+    assert_eq!(build.replication_boundary_lsn, 9);
     let original = copy_through_final(&mut prepared).await;
-    assert_eq!(original.last().unwrap().snapshot_committed_lsn, 9);
+    assert_eq!(original.last().unwrap().committed_lsn, 9);
+    assert_eq!(original.last().unwrap().lsn, 9);
+    assert_eq!(original.last().unwrap().catch_up_boundary_lsn, Some(10));
+    let original_suffix = next_copy_item(&mut prepared).await;
+    assert_eq!(original_suffix.lsn, 10);
+    assert_eq!(original_suffix.committed_lsn, 9);
+    assert_eq!(original_suffix.data, b"tenth");
     let target_runtime = PodRuntime::new(target.clone(), target_app.clone(), target_store.clone());
     for (index, action) in [
         RuntimeEffectAction::Open(OpenMode::Existing),
@@ -3481,7 +3516,7 @@ async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_
         .await
         .unwrap();
     let mut wrong_watermark = ack.clone();
-    wrong_watermark.snapshot_committed_lsn = 10;
+    wrong_watermark.replication_boundary_lsn = 10;
     assert!(
         source_runtime
             .data_plane()
@@ -3513,6 +3548,10 @@ async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_
         .committed()
         .await
         .unwrap();
+    // Recovery must not emit operation 10 twice under different copy sequences.
+    let live = next_copy_item(&mut prepared).await;
+    assert_eq!(live.lsn, 11);
+    assert_eq!(live.sequence, original_suffix.sequence + 1);
     drop(prepared);
     drop(source_runtime);
     drop(target_runtime);
@@ -3557,13 +3596,7 @@ async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_
         .unwrap();
     let replay = copy_through_final(&mut resumed).await;
     assert_eq!(original, replay);
-    assert_eq!(
-        source_app.copy_boundaries.lock().unwrap().as_slice(),
-        &[kuberic_runtime::application::CopyBoundary {
-            applied_lsn: 10,
-            committed_lsn: 9
-        }]
-    );
+    assert_eq!(source_app.copy_boundaries.lock().unwrap().as_slice(), &[9]);
     for item in &replay {
         let ack = target_runtime
             .data_plane()
@@ -3577,10 +3610,36 @@ async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_
             .unwrap();
     }
     let final_item = replay.last().unwrap().clone();
+    assert_eq!(
+        target_app.durable_progress().await.unwrap(),
+        DurableApplicationProgress {
+            applied_lsn: 9,
+            committed_lsn: 9
+        }
+    );
+    target_runtime
+        .data_plane()
+        .receive_copy_item(final_item.clone())
+        .await
+        .unwrap();
+    let suffix = next_copy_item(&mut resumed).await;
+    assert_eq!(suffix, original_suffix);
+    target_runtime
+        .data_plane()
+        .receive_copy_item(suffix)
+        .await
+        .unwrap();
+    assert_eq!(
+        target_app.durable_progress().await.unwrap(),
+        DurableApplicationProgress {
+            applied_lsn: 10,
+            committed_lsn: 9
+        }
+    );
     let later = next_copy_item(&mut resumed).await;
     assert_eq!(later.lsn, 11);
     assert_eq!(later.committed_lsn, 10);
-    assert_eq!(later.snapshot_committed_lsn, 9);
+    assert_eq!(later, live);
     target_runtime
         .data_plane()
         .receive_copy_item(later)
@@ -3593,7 +3652,6 @@ async fn frozen_snapshot_pair_survives_both_disk_reopens_and_final_replay_after_
         .await
         .unwrap();
     let mut changed = final_item.clone();
-    changed.snapshot_committed_lsn = 10;
     changed.committed_lsn = 10;
     assert!(
         target_runtime
@@ -8073,7 +8131,6 @@ async fn exercise_copy_boundary_demotion_overlap(iteration: usize) {
         durable_lsn: first.lsn,
         replication_boundary_lsn: first.replication_boundary_lsn,
         catch_up_boundary_lsn: first.catch_up_boundary_lsn,
-        snapshot_committed_lsn: first.snapshot_committed_lsn,
         final_item: first.final_item,
         snapshot_chunk: first.snapshot_chunk,
         ..Default::default()
@@ -8873,7 +8930,6 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
             durable_lsn: final_item.replication_boundary_lsn,
             replication_boundary_lsn: final_item.replication_boundary_lsn,
             catch_up_boundary_lsn: final_item.catch_up_boundary_lsn,
-            snapshot_committed_lsn: final_item.snapshot_committed_lsn,
             final_item: true,
             snapshot_chunk: false,
             ..Default::default()
@@ -10481,7 +10537,6 @@ async fn same_primary_scale_up_accepts_real_writes_after_every_durable_agent_eff
             durable_lsn: 0,
             completed: true,
             catch_up_boundary_lsn: Some(0),
-            snapshot_committed_lsn: Some(0),
         })
         .await
         .unwrap();

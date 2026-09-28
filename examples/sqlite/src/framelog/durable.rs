@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use kuberic_runtime::application::{CopyBoundary, DurableApplicationProgress, Operation};
+use kuberic_runtime::application::{DurableApplicationProgress, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::frames::WalFrameSet;
@@ -19,6 +19,12 @@ pub enum RecoveryState {
     Healthy,
     ReconciliationRequired(String),
     RebuildRequired(String),
+    /// A committed snapshot is installed, but the accepted rebuild must still
+    /// recover the old durable suffix before SQL can be materialized.
+    Rebuilding {
+        required_applied_lsn: i64,
+        required_committed_lsn: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,17 +60,14 @@ impl Record {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct CopyImage {
     version: u32,
-    applied_lsn: i64,
-    committed_lsn: i64,
+    up_to_lsn: i64,
     page_size: usize,
     image: Vec<u8>,
-    suffix: Vec<Record>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct CompletedCopy {
-    applied_lsn: i64,
-    committed_lsn: i64,
+    up_to_lsn: i64,
     // Exact retry evidence survives staging cleanup and subsequent catch-up.
     chunks: BTreeMap<u64, Vec<u8>>,
 }
@@ -181,6 +184,14 @@ impl DurableFrameLog {
         };
         if let Err(error) = log.recover() {
             let mut meta = log.meta.clone();
+            if let RecoveryState::Rebuilding {
+                required_applied_lsn,
+                required_committed_lsn,
+            } = meta.recovery
+            {
+                meta.applied_lsn = meta.applied_lsn.max(required_applied_lsn);
+                meta.committed_lsn = meta.committed_lsn.max(required_committed_lsn);
+            }
             meta.recovery = RecoveryState::RebuildRequired(error.to_string());
             log.publish(meta)?;
         }
@@ -278,6 +289,9 @@ impl DurableFrameLog {
 
     pub fn reconcile(&mut self, reason: String) -> io::Result<()> {
         self.intact()?;
+        if matches!(self.meta.recovery, RecoveryState::Rebuilding { .. }) {
+            return Err(io::Error::other("rebuild catch-up is not complete"));
+        }
         let mut meta = self.meta.clone();
         meta.recovery = RecoveryState::ReconciliationRequired(reason);
         self.publish(meta)
@@ -285,6 +299,9 @@ impl DurableFrameLog {
 
     pub fn clear_reconciliation(&mut self) -> io::Result<()> {
         self.intact()?;
+        if matches!(self.meta.recovery, RecoveryState::Rebuilding { .. }) {
+            return Err(io::Error::other("rebuild catch-up is not complete"));
+        }
         let mut meta = self.meta.clone();
         meta.recovery = RecoveryState::Healthy;
         self.publish(meta)
@@ -329,6 +346,7 @@ impl DurableFrameLog {
         meta.applied_lsn = record.lsn;
         meta.committed_lsn = meta.committed_lsn.max(record.committed_lsn);
         meta.history_len += bytes.len() as u64;
+        settle_rebuild(&mut meta);
         self.publish(meta)?;
         self.operations.insert(record.lsn, record);
         Ok(self.progress())
@@ -342,6 +360,7 @@ impl DurableFrameLog {
         if lsn > self.meta.committed_lsn {
             let mut meta = self.meta.clone();
             meta.committed_lsn = lsn;
+            settle_rebuild(&mut meta);
             self.publish(meta)?;
         }
         Ok(self.progress())
@@ -367,6 +386,9 @@ impl DurableFrameLog {
 
     pub fn image_at(&self, lsn: i64) -> io::Result<Vec<u8>> {
         self.intact()?;
+        if matches!(self.meta.recovery, RecoveryState::Rebuilding { .. }) {
+            return Err(io::Error::other("rebuild catch-up is not complete"));
+        }
         if lsn < self.meta.base_lsn || lsn > self.meta.applied_lsn {
             return Err(io::Error::other(
                 "snapshot boundary outside retained history",
@@ -381,33 +403,20 @@ impl DurableFrameLog {
         Ok(image)
     }
 
-    pub fn snapshot(&self, boundary: CopyBoundary) -> io::Result<Vec<u8>> {
-        if boundary.committed_lsn > boundary.applied_lsn
-            || boundary.committed_lsn > self.meta.committed_lsn
-        {
-            return Err(io::Error::other("invalid snapshot boundary pair"));
+    pub fn snapshot(&self, up_to_lsn: i64) -> io::Result<Vec<u8>> {
+        if up_to_lsn > self.meta.committed_lsn {
+            return Err(io::Error::other("snapshot boundary is not committed"));
         }
-        let image = self.image_at(boundary.committed_lsn)?;
-        let suffix = self
-            .retained(boundary.committed_lsn + 1, boundary.applied_lsn)?
-            .into_iter()
-            .map(|op| Record {
-                lsn: op.lsn,
-                committed_lsn: op.committed_lsn,
-                data: op.data.to_vec(),
-            })
-            .collect();
+        let image = self.image_at(up_to_lsn)?;
         serde_json::to_vec(&CopyImage {
             version: VERSION,
-            applied_lsn: boundary.applied_lsn,
-            committed_lsn: boundary.committed_lsn,
-            page_size: if boundary.applied_lsn == 0 {
+            up_to_lsn,
+            page_size: if up_to_lsn == 0 {
                 0
             } else {
                 self.meta.page_size
             },
             image,
-            suffix,
         })
         .map_err(io::Error::other)
     }
@@ -451,12 +460,16 @@ impl DurableFrameLog {
     pub fn finish(
         &mut self,
         build: &str,
-        boundary: CopyBoundary,
+        up_to_lsn: i64,
+        committed_lsn: i64,
     ) -> io::Result<DurableApplicationProgress> {
+        if up_to_lsn != committed_lsn {
+            return Err(io::Error::other(
+                "copy completion must equal the committed snapshot boundary",
+            ));
+        }
         if let Some(completed) = self.meta.completed.get(build) {
-            if completed.applied_lsn != boundary.applied_lsn
-                || completed.committed_lsn != boundary.committed_lsn
-            {
+            if completed.up_to_lsn != up_to_lsn {
                 return Err(io::Error::other("conflicting copy completion"));
             }
             self.intact()?;
@@ -471,14 +484,12 @@ impl DurableFrameLog {
         let bytes: Vec<u8> = chunks.values().flatten().copied().collect();
         let snapshot: CopyImage = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         if snapshot.version != VERSION
-            || snapshot.applied_lsn != boundary.applied_lsn
-            || snapshot.committed_lsn != boundary.committed_lsn
-            || snapshot.committed_lsn < 0
-            || snapshot.committed_lsn > snapshot.applied_lsn
-            || snapshot.applied_lsn == i64::MAX
-            || (snapshot.committed_lsn == 0) != snapshot.image.is_empty()
-            || (snapshot.applied_lsn == 0 && snapshot.page_size != 0)
-            || (snapshot.applied_lsn > 0
+            || snapshot.up_to_lsn != up_to_lsn
+            || up_to_lsn < 0
+            || up_to_lsn == i64::MAX
+            || (up_to_lsn == 0) != snapshot.image.is_empty()
+            || (up_to_lsn == 0 && snapshot.page_size != 0)
+            || (up_to_lsn > 0
                 && (!(512..=65536).contains(&snapshot.page_size)
                     || !snapshot.page_size.is_power_of_two()))
             || (!snapshot.image.is_empty()
@@ -490,41 +501,21 @@ impl DurableFrameLog {
             ));
         }
         let mut operations = BTreeMap::new();
-        let mut expected = snapshot.committed_lsn + 1;
-        for record in snapshot.suffix {
-            if record.lsn != expected || record.frames()?.page_size()? != snapshot.page_size {
-                return Err(io::Error::other("copy suffix gap or malformed frames"));
-            }
-            operations.insert(record.lsn, record);
-            expected += 1;
-        }
-        if expected - 1 != snapshot.applied_lsn {
-            return Err(io::Error::other("incomplete applied suffix"));
-        }
+        let mut expected = up_to_lsn + 1;
         // A replay may arrive after catch-up but before durable agent completion.
         // Keep later contiguous operations, never overwrite conflicts or regress commitment.
-        let intact = self.intact().is_ok();
-        if !intact
-            && (snapshot.applied_lsn < self.meta.applied_lsn
-                || snapshot.committed_lsn < self.meta.committed_lsn)
-        {
-            return Err(io::Error::other(
-                "rebuild does not cover recorded durable progress",
-            ));
-        }
+        let intact = !matches!(
+            self.meta.recovery,
+            RecoveryState::RebuildRequired(_) | RecoveryState::Rebuilding { .. }
+        );
         if intact {
-            for (lsn, record) in &operations {
-                if self.operations.get(lsn).is_some_and(|old| old != record) {
-                    return Err(io::Error::other("copy conflicts with accepted history"));
-                }
-            }
-            if self.meta.base_lsn <= snapshot.committed_lsn
-                && self.meta.applied_lsn >= snapshot.committed_lsn
-                && self.image_at(snapshot.committed_lsn)? != snapshot.image
+            if self.meta.base_lsn <= up_to_lsn
+                && self.meta.applied_lsn >= up_to_lsn
+                && self.image_at(up_to_lsn)? != snapshot.image
             {
                 return Err(io::Error::other("copy conflicts with committed base"));
             }
-            for (lsn, record) in self.operations.range((snapshot.applied_lsn + 1)..) {
+            for (lsn, record) in self.operations.range((up_to_lsn + 1)..) {
                 if *lsn != expected {
                     return Err(io::Error::other("post-copy history gap"));
                 }
@@ -540,11 +531,11 @@ impl DurableFrameLog {
             .generation
             .checked_add(1)
             .ok_or_else(|| io::Error::other("generation exhausted"))?;
-        meta.base_lsn = snapshot.committed_lsn;
+        meta.base_lsn = up_to_lsn;
         meta.base_checksum = crc32fast::hash(&snapshot.image);
         // A boundary-zero snapshot carries no geometry. Later accepted history
         // still owns its original page size when reinstalling that empty base.
-        meta.page_size = if snapshot.applied_lsn == 0 && !operations.is_empty() {
+        meta.page_size = if up_to_lsn == 0 && !operations.is_empty() {
             self.meta.page_size
         } else {
             snapshot.page_size
@@ -558,9 +549,9 @@ impl DurableFrameLog {
         }
         meta.applied_lsn = expected - 1;
         meta.committed_lsn = if intact {
-            self.meta.committed_lsn.max(snapshot.committed_lsn)
+            self.meta.committed_lsn.max(up_to_lsn)
         } else {
-            snapshot.committed_lsn
+            up_to_lsn
         };
         let history: Vec<u8> = operations
             .values()
@@ -568,16 +559,21 @@ impl DurableFrameLog {
             .collect::<io::Result<Vec<_>>>()?
             .concat();
         meta.history_len = history.len() as u64;
-        meta.recovery = RecoveryState::Healthy;
+        meta.recovery = if intact {
+            RecoveryState::Healthy
+        } else {
+            match &self.meta.recovery {
+                RecoveryState::Rebuilding { .. } => self.meta.recovery.clone(),
+                _ => RecoveryState::Rebuilding {
+                    required_applied_lsn: self.meta.applied_lsn,
+                    required_committed_lsn: self.meta.committed_lsn,
+                },
+            }
+        };
+        settle_rebuild(&mut meta);
         meta.staging.remove(build);
-        meta.completed.insert(
-            build.to_owned(),
-            CompletedCopy {
-                applied_lsn: boundary.applied_lsn,
-                committed_lsn: boundary.committed_lsn,
-                chunks,
-            },
-        );
+        meta.completed
+            .insert(build.to_owned(), CompletedCopy { up_to_lsn, chunks });
         replace(
             &self.root.join(format!("base-{}.sqlite", meta.generation)),
             &snapshot.image,
@@ -596,6 +592,18 @@ impl DurableFrameLog {
         let _ = fs::remove_file(old_history);
         sync_directory(&self.root)?;
         Ok(self.progress())
+    }
+}
+
+fn settle_rebuild(meta: &mut Manifest) {
+    if let RecoveryState::Rebuilding {
+        required_applied_lsn,
+        required_committed_lsn,
+    } = meta.recovery
+        && meta.applied_lsn >= required_applied_lsn
+        && meta.committed_lsn >= required_committed_lsn
+    {
+        meta.recovery = RecoveryState::Healthy;
     }
 }
 

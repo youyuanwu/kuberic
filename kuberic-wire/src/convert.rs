@@ -70,7 +70,6 @@ pub struct CopyEnvelope {
     pub lsn: i64,
     pub committed_lsn: i64,
     pub replication_boundary_lsn: i64,
-    pub snapshot_committed_lsn: i64,
     pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
     pub snapshot_chunk: bool,
@@ -87,7 +86,6 @@ pub struct CopyAcknowledgement {
     pub sequence: u64,
     pub durable_lsn: i64,
     pub replication_boundary_lsn: i64,
-    pub snapshot_committed_lsn: i64,
     pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
     pub snapshot_chunk: bool,
@@ -1403,8 +1401,6 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
     }
     if item.sequence == 0
         || item.replication_boundary_lsn < 0
-        || item.snapshot_committed_lsn < 0
-        || item.snapshot_committed_lsn > item.replication_boundary_lsn
         || item.committed_lsn < 0
         || item.final_item != item.catch_up_boundary_lsn.is_some()
         || item
@@ -1412,8 +1408,7 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
             .is_some_and(|boundary| boundary < item.replication_boundary_lsn)
         || if item.final_item {
             item.lsn != item.replication_boundary_lsn
-                || item.committed_lsn != item.snapshot_committed_lsn
-                || item.committed_lsn > item.replication_boundary_lsn
+                || item.committed_lsn != item.replication_boundary_lsn
                 || item.snapshot_chunk
                 || !item.data.is_empty()
         } else if item.snapshot_chunk {
@@ -1436,7 +1431,6 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
         lsn: item.lsn,
         committed_lsn: item.committed_lsn,
         replication_boundary_lsn: item.replication_boundary_lsn,
-        snapshot_committed_lsn: item.snapshot_committed_lsn,
         catch_up_boundary_lsn: item.catch_up_boundary_lsn,
         final_item: item.final_item,
         snapshot_chunk: item.snapshot_chunk,
@@ -1466,8 +1460,6 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
     }
     if ack.sequence == 0
         || ack.durable_lsn < 0
-        || ack.snapshot_committed_lsn < 0
-        || ack.snapshot_committed_lsn > ack.replication_boundary_lsn
         || ack.replication_boundary_lsn < 0
         || ack.final_item != ack.catch_up_boundary_lsn.is_some()
         || ack
@@ -1490,7 +1482,6 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
         sequence: ack.sequence,
         durable_lsn: ack.durable_lsn,
         replication_boundary_lsn: ack.replication_boundary_lsn,
-        snapshot_committed_lsn: ack.snapshot_committed_lsn,
         catch_up_boundary_lsn: ack.catch_up_boundary_lsn,
         final_item: ack.final_item,
         snapshot_chunk: ack.snapshot_chunk,
