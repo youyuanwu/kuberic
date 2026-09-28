@@ -1220,23 +1220,10 @@ pub(super) fn recover_local_acceptance(
                 ))),
             });
         }
-        let stale_provisional_failover_authority =
-            receipt.failover_evidence.as_ref().is_some_and(|failover| {
-                report.scale_up_intent.as_deref() == Some(&receipt.intent)
-                    && report.epoch == failover.provisional_configuration.epoch
-                    && report.previous_configuration.as_ref()
-                        == Some(&receipt.intent.previous_configuration)
-                    && report.current_configuration.as_ref()
-                        == Some(&failover.provisional_configuration)
-                    && failover
-                        .provisional_configuration
-                        .members
-                        .iter()
-                        .any(|provisional| {
-                            provisional.identity == report.identity
-                                && provisional.role == report.role
-                        })
-            });
+        let stale_provisional_failover_authority = receipt
+            .failover_evidence
+            .as_ref()
+            .is_some_and(|failover| exact_provisional_failover_report(report, member, failover));
         if stale_provisional_failover_authority {
             return Some(Plan::Execute {
                 command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
@@ -2691,11 +2678,73 @@ fn exact_fenced_pc_cc_report(
         && report.write_status != AccessStatus::Granted
 }
 
+fn witnessed_provisional_session(evidence: &ScaleUpFailoverEvidence, report: &AgentReport) -> bool {
+    let initial = evidence
+        .previous_read_quorum
+        .iter()
+        .chain(&evidence.current_read_quorum)
+        .any(|witness| {
+            witness.identity == report.identity
+                && witness.process_session_id == report.process_session_id
+        });
+    let final_election = evidence
+        .final_election
+        .as_deref()
+        .is_some_and(|final_election| {
+            final_election
+                .previous_read_quorum
+                .iter()
+                .chain(&final_election.current_read_quorum)
+                .any(|witness| {
+                    witness.identity == report.identity
+                        && witness.process_session_id == report.process_session_id
+                })
+        });
+    initial || final_election
+}
+
+fn claims_provisional_failover_authority(
+    report: &AgentReport,
+    evidence: &ScaleUpFailoverEvidence,
+) -> bool {
+    report.epoch == evidence.provisional_configuration.epoch
+        || report.current_configuration.as_ref() == Some(&evidence.provisional_configuration)
+}
+
+fn exact_provisional_failover_report(
+    report: &AgentReport,
+    member: &ConfigurationMember,
+    evidence: &ScaleUpFailoverEvidence,
+) -> bool {
+    let intent = &evidence.intent;
+    let provisional = &evidence.provisional_configuration;
+    let operation_id =
+        intent.command_operation_id(ScaleUpStage::PreviousCurrent, &report.identity, provisional);
+    report.identity == member.identity
+        && provisional.members.iter().any(|provisional_member| {
+            provisional_member.identity == report.identity && provisional_member.role == report.role
+        })
+        && report.epoch == provisional.epoch
+        && report.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+        && report.current_configuration.as_ref() == Some(provisional)
+        && report.scale_up_intent.as_deref() == Some(intent)
+        && report.current_progress >= intent.catch_up_boundary_lsn
+        && report
+            .verified_replication_lsn
+            .is_some_and(|lsn| lsn >= intent.catch_up_boundary_lsn)
+        && report.retained_operation_id.as_ref() == Some(&operation_id)
+        && report.deactivation_epoch == Some(provisional.epoch)
+        && report.deactivated_lsn.is_some()
+        && report.write_status != AccessStatus::Granted
+        && witnessed_provisional_session(evidence, report)
+}
+
 fn needs_scale_up_pc_cc(
     report: &AgentReport,
     member: &ConfigurationMember,
-    intent: &ScaleUpIntent,
+    evidence: &ScaleUpConfigurationEvidence,
 ) -> bool {
+    let intent = evidence.intent();
     let retained_previous = report.previous_configuration.is_none()
         && report.current_configuration.as_ref() == Some(&intent.previous_configuration)
         && intent
@@ -2712,7 +2761,13 @@ fn needs_scale_up_pc_cc(
         && report.role == ReplicaRole::IdleSecondary
         && report.previous_configuration.is_none()
         && report.current_configuration.is_none();
-    retained_previous || idle_candidate
+    let provisional_failover = match evidence {
+        ScaleUpConfigurationEvidence::Admission { .. } => false,
+        ScaleUpConfigurationEvidence::Failover { evidence } => {
+            exact_provisional_failover_report(report, member, evidence)
+        }
+    };
+    retained_previous || idle_candidate || provisional_failover
 }
 
 fn quorum_witnesses(
@@ -3446,28 +3501,142 @@ pub(super) fn transition(
         return plan;
     }
 
-    for member in current
+    let exact_current_only = |member: &ConfigurationMember| {
+        let Some(report) = report(snapshot, &member.identity) else {
+            return false;
+        };
+        let operation_id =
+            intent.command_operation_id(ScaleUpStage::CurrentOnly, &member.identity, current);
+        exact_current_only_report(report, intent, current)
+            && report.pending_operation_id.is_none()
+            && report.retained_operation_id.as_ref() == Some(&operation_id)
+    };
+    let retained_original_participant = |member: &ConfigurationMember| {
+        if transition.kind != TransitionKind::Failover || member.identity != intent.primary {
+            return true;
+        }
+        let Some(report) = report(snapshot, &member.identity) else {
+            return false;
+        };
+        let ScaleUpConfigurationEvidence::Failover { evidence } = &evidence else {
+            return false;
+        };
+        claims_provisional_failover_authority(report, evidence)
+            || (report.scale_up_intent.as_deref() == Some(intent)
+                && report.epoch == current.epoch
+                && report.current_configuration.as_ref() == Some(current))
+    };
+    let mut convergence_order = current
         .members
         .iter()
         .filter(|member| {
-            member.identity != primary.identity
-                && (transition.kind != TransitionKind::Failover
-                    || member.identity != intent.primary)
+            member.identity != primary.identity && retained_original_participant(member)
         })
-        .chain(std::iter::once(primary))
-    {
+        .collect::<Vec<_>>();
+    convergence_order.push(primary);
+
+    for member in &convergence_order {
         let Some(report) = report(snapshot, &member.identity) else {
             continue;
         };
-        if needs_scale_up_pc_cc(report, member, intent) {
+        let pc_cc = configuration_command(
+            evidence.clone(),
+            current,
+            member,
+            false,
+            transition.election_lsn,
+        );
+        let current_only = configuration_command(
+            evidence.clone(),
+            current,
+            member,
+            true,
+            transition.election_lsn,
+        );
+        let Some(pending) = report.pending_operation_id.as_ref() else {
+            continue;
+        };
+        let expected = if pending == &pc_cc.operation_id {
+            Some(&pc_cc)
+        } else if pending == &current_only.operation_id {
+            Some(&current_only)
+        } else {
+            None
+        };
+        let Some(expected) = expected else {
+            continue;
+        };
+        let Some(frozen) = report.pending_configuration.as_deref() else {
+            return unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::ContradictoryReplicaEvidence(format!(
+                    "scale-up member {} omitted its pending final configuration",
+                    member.identity.replica_id
+                )),
+                config,
+            );
+        };
+        if frozen != expected {
+            return unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::ContradictoryReplicaEvidence(format!(
+                    "scale-up member {} mutated its pending final configuration",
+                    member.identity.replica_id
+                )),
+                config,
+            );
+        }
+        return Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(Box::new(frozen.clone())),
+        };
+    }
+
+    let non_primary_current_only = current
+        .members
+        .iter()
+        .filter(|member| member.identity != primary.identity && exact_current_only(member))
+        .count();
+    let prioritize_primary = !exact_current_only(primary)
+        && non_primary_current_only
+            >= intent.current_policy.write_quorum.saturating_sub(1) as usize;
+    if prioritize_primary {
+        convergence_order.rotate_right(1);
+    }
+
+    for member in convergence_order {
+        let Some(report) = report(snapshot, &member.identity) else {
+            continue;
+        };
+        let pc_cc = configuration_command(
+            evidence.clone(),
+            current,
+            member,
+            false,
+            transition.election_lsn,
+        );
+        let current_only = configuration_command(
+            evidence.clone(),
+            current,
+            member,
+            true,
+            transition.election_lsn,
+        );
+        if let ScaleUpConfigurationEvidence::Failover { evidence: failover } = &evidence
+            && claims_provisional_failover_authority(report, failover)
+            && !exact_provisional_failover_report(report, member, failover)
+        {
+            return unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::ContradictoryReplicaEvidence(format!(
+                    "scale-up member {} reports malformed provisional failover authority",
+                    member.identity.replica_id
+                )),
+                config,
+            );
+        }
+        if needs_scale_up_pc_cc(report, member, &evidence) {
             return Plan::Execute {
-                command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
-                    evidence.clone(),
-                    current,
-                    member,
-                    false,
-                    transition.election_lsn,
-                ))),
+                command: ProtocolCommand::EnsureConfiguration(Box::new(pc_cc)),
             };
         }
         let operation_id =
@@ -3484,13 +3653,7 @@ pub(super) fn transition(
                 continue;
             }
             return Plan::Execute {
-                command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
-                    evidence.clone(),
-                    current,
-                    member,
-                    true,
-                    transition.election_lsn,
-                ))),
+                command: ProtocolCommand::EnsureConfiguration(Box::new(current_only)),
             };
         }
     }

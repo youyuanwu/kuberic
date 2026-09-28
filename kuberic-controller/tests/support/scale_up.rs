@@ -1081,6 +1081,9 @@ async fn scale_up_replays_pending_current_only_before_and_after_installation() {
         panic!("current-only target report")
     };
     report.pending_operation_id = current_only.operation_id.to_string();
+    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+        (*current_only).clone(),
+    ));
     report.report_sequence += 1;
     api.set_observation(pending).await;
 
@@ -1105,6 +1108,9 @@ async fn scale_up_replays_pending_current_only_before_and_after_installation() {
     );
     assert!(report.previous_configuration.is_none());
     report.pending_operation_id = current_only.operation_id.to_string();
+    report.pending_configuration = Some(kuberic_wire::configuration_command_to_proto(
+        (*current_only).clone(),
+    ));
     report.report_sequence += 1;
     api.set_observation(installed_pending).await;
 
