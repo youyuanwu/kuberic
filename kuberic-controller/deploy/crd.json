@@ -647,6 +647,389 @@
                             },
                             "type": "array"
                           },
+                          "finalElection": {
+                            "nullable": true,
+                            "properties": {
+                              "currentReadQuorum": {
+                                "items": {
+                                  "properties": {
+                                    "committedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "currentConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "currentProgress": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivatedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivationEpoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "epoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "identity": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "pendingOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "previousConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "processSessionId": {
+                                      "type": "string"
+                                    },
+                                    "reportSequence": {
+                                      "format": "uint64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "resourceUid": {
+                                      "type": "string"
+                                    },
+                                    "retainedOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "writeStatus": {
+                                      "description": "Current write-access decision exposed by the replica runtime.",
+                                      "enum": [
+                                        "granted",
+                                        "reconfigurationPending",
+                                        "notPrimary",
+                                        "noWriteQuorum"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "committedLsn",
+                                    "currentConfigurationId",
+                                    "currentProgress",
+                                    "deactivatedLsn",
+                                    "deactivationEpoch",
+                                    "epoch",
+                                    "identity",
+                                    "previousConfigurationId",
+                                    "processSessionId",
+                                    "reportSequence",
+                                    "resourceUid",
+                                    "role",
+                                    "writeStatus"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "finalConfiguration": {
+                                "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                "properties": {
+                                  "configurationId": {
+                                    "type": "string"
+                                  },
+                                  "epoch": {
+                                    "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                    "properties": {
+                                      "configurationNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "dataLossNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "configurationNumber",
+                                      "dataLossNumber"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "members": {
+                                    "items": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        },
+                                        "role": {
+                                          "description": "Runtime role of one exact replica incarnation.",
+                                          "enum": [
+                                            "primary",
+                                            "activeSecondary",
+                                            "idleSecondary",
+                                            "none"
+                                          ],
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId",
+                                        "role"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationId",
+                                  "epoch",
+                                  "members",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "previousReadQuorum": {
+                                "items": {
+                                  "properties": {
+                                    "committedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "currentConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "currentProgress": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivatedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivationEpoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "epoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "identity": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "pendingOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "previousConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "processSessionId": {
+                                      "type": "string"
+                                    },
+                                    "reportSequence": {
+                                      "format": "uint64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "resourceUid": {
+                                      "type": "string"
+                                    },
+                                    "retainedOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "writeStatus": {
+                                      "description": "Current write-access decision exposed by the replica runtime.",
+                                      "enum": [
+                                        "granted",
+                                        "reconfigurationPending",
+                                        "notPrimary",
+                                        "noWriteQuorum"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "committedLsn",
+                                    "currentConfigurationId",
+                                    "currentProgress",
+                                    "deactivatedLsn",
+                                    "deactivationEpoch",
+                                    "epoch",
+                                    "identity",
+                                    "previousConfigurationId",
+                                    "processSessionId",
+                                    "reportSequence",
+                                    "resourceUid",
+                                    "role",
+                                    "writeStatus"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "safeLsn": {
+                                "format": "int64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "currentReadQuorum",
+                              "finalConfiguration",
+                              "previousReadQuorum",
+                              "safeLsn"
+                            ],
+                            "type": "object"
+                          },
                           "intent": {
                             "description": "Immutable authority for one exact membership increase.",
                             "properties": {
@@ -1068,12 +1451,89 @@
                               "type": "object"
                             },
                             "type": "array"
+                          },
+                          "provisionalConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
                           }
                         },
                         "required": [
                           "currentReadQuorum",
                           "intent",
-                          "previousReadQuorum"
+                          "previousReadQuorum",
+                          "provisionalConfiguration"
                         ],
                         "type": "object"
                       },
@@ -5303,6 +5763,389 @@
                             },
                             "type": "array"
                           },
+                          "finalElection": {
+                            "nullable": true,
+                            "properties": {
+                              "currentReadQuorum": {
+                                "items": {
+                                  "properties": {
+                                    "committedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "currentConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "currentProgress": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivatedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivationEpoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "epoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "identity": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "pendingOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "previousConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "processSessionId": {
+                                      "type": "string"
+                                    },
+                                    "reportSequence": {
+                                      "format": "uint64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "resourceUid": {
+                                      "type": "string"
+                                    },
+                                    "retainedOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "writeStatus": {
+                                      "description": "Current write-access decision exposed by the replica runtime.",
+                                      "enum": [
+                                        "granted",
+                                        "reconfigurationPending",
+                                        "notPrimary",
+                                        "noWriteQuorum"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "committedLsn",
+                                    "currentConfigurationId",
+                                    "currentProgress",
+                                    "deactivatedLsn",
+                                    "deactivationEpoch",
+                                    "epoch",
+                                    "identity",
+                                    "previousConfigurationId",
+                                    "processSessionId",
+                                    "reportSequence",
+                                    "resourceUid",
+                                    "role",
+                                    "writeStatus"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "finalConfiguration": {
+                                "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                "properties": {
+                                  "configurationId": {
+                                    "type": "string"
+                                  },
+                                  "epoch": {
+                                    "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                    "properties": {
+                                      "configurationNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "dataLossNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "configurationNumber",
+                                      "dataLossNumber"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "members": {
+                                    "items": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        },
+                                        "role": {
+                                          "description": "Runtime role of one exact replica incarnation.",
+                                          "enum": [
+                                            "primary",
+                                            "activeSecondary",
+                                            "idleSecondary",
+                                            "none"
+                                          ],
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId",
+                                        "role"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "writeQuorum": {
+                                    "format": "uint32",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationId",
+                                  "epoch",
+                                  "members",
+                                  "writeQuorum"
+                                ],
+                                "type": "object"
+                              },
+                              "previousReadQuorum": {
+                                "items": {
+                                  "properties": {
+                                    "committedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "currentConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "currentProgress": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivatedLsn": {
+                                      "format": "int64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "deactivationEpoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "epoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "identity": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "pendingOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "previousConfigurationId": {
+                                      "type": "string"
+                                    },
+                                    "processSessionId": {
+                                      "type": "string"
+                                    },
+                                    "reportSequence": {
+                                      "format": "uint64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "resourceUid": {
+                                      "type": "string"
+                                    },
+                                    "retainedOperationId": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "writeStatus": {
+                                      "description": "Current write-access decision exposed by the replica runtime.",
+                                      "enum": [
+                                        "granted",
+                                        "reconfigurationPending",
+                                        "notPrimary",
+                                        "noWriteQuorum"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "committedLsn",
+                                    "currentConfigurationId",
+                                    "currentProgress",
+                                    "deactivatedLsn",
+                                    "deactivationEpoch",
+                                    "epoch",
+                                    "identity",
+                                    "previousConfigurationId",
+                                    "processSessionId",
+                                    "reportSequence",
+                                    "resourceUid",
+                                    "role",
+                                    "writeStatus"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "safeLsn": {
+                                "format": "int64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "currentReadQuorum",
+                              "finalConfiguration",
+                              "previousReadQuorum",
+                              "safeLsn"
+                            ],
+                            "type": "object"
+                          },
                           "intent": {
                             "description": "Immutable authority for one exact membership increase.",
                             "properties": {
@@ -5724,12 +6567,89 @@
                               "type": "object"
                             },
                             "type": "array"
+                          },
+                          "provisionalConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
                           }
                         },
                         "required": [
                           "currentReadQuorum",
                           "intent",
-                          "previousReadQuorum"
+                          "previousReadQuorum",
+                          "provisionalConfiguration"
                         ],
                         "type": "object"
                       },

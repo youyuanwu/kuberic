@@ -260,6 +260,33 @@ message ScaleUpFailoverEvidence {
   ScaleUpIntent intent = 1;
   repeated ScaleUpWitness previous_read_quorum = 2;
   repeated ScaleUpWitness current_read_quorum = 3;
+  Configuration provisional_configuration = 4;
+  ScaleUpFinalElectionEvidence final_election = 5;
+}
+
+message ScaleUpFinalWitness {
+  string resource_uid = 1;
+  ReplicaIdentity identity = 2;
+  string process_session_id = 3;
+  uint64 report_sequence = 4;
+  Epoch epoch = 5;
+  string previous_configuration_id = 6;
+  string current_configuration_id = 7;
+  int64 current_progress = 8;
+  int64 committed_lsn = 9;
+  Epoch deactivation_epoch = 10;
+  int64 deactivated_lsn = 11;
+  AccessStatus write_status = 12;
+  string pending_operation_id = 13;
+  string retained_operation_id = 14;
+  ReplicaRole role = 15;
+}
+
+message ScaleUpFinalElectionEvidence {
+  Configuration final_configuration = 1;
+  int64 safe_lsn = 2;
+  repeated ScaleUpFinalWitness previous_read_quorum = 3;
+  repeated ScaleUpFinalWitness current_read_quorum = 4;
 }
 
 message ScaleUpConfigurationEvidence {

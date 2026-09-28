@@ -1587,6 +1587,16 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 || transition.secondary_scale_down.is_some()
                 || transition.secondary_removal_evidence.is_some()
                 || transition.election_lsn.is_some_and(|lsn| lsn < 0)
+                || match (transition.election_lsn, evidence.final_election.as_deref()) {
+                    (None, None) => {
+                        transition.current_configuration != evidence.provisional_configuration
+                    }
+                    (Some(election_lsn), Some(final_election)) => {
+                        transition.current_configuration != final_election.final_configuration
+                            || election_lsn != final_election.safe_lsn
+                    }
+                    _ => true,
+                }
             {
                 return Err(ValidationError::InvalidScaleUp(
                     "failover transition differs from carried scale-up authority",

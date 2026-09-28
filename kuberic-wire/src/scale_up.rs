@@ -194,10 +194,101 @@ impl TryFrom<proto::ScaleUpWitness> for ScaleUpWitness {
     }
 }
 
-impl From<ScaleUpFailoverEvidence> for proto::ScaleUpFailoverEvidence {
-    fn from(value: ScaleUpFailoverEvidence) -> Self {
+impl From<ScaleUpFinalWitness> for proto::ScaleUpFinalWitness {
+    fn from(value: ScaleUpFinalWitness) -> Self {
         Self {
-            intent: Some(value.intent.into()),
+            resource_uid: value.resource_uid.to_string(),
+            identity: Some(value.identity.into()),
+            process_session_id: value.process_session_id.to_string(),
+            report_sequence: value.report_sequence,
+            epoch: Some(value.epoch.into()),
+            previous_configuration_id: value.previous_configuration_id.to_string(),
+            current_configuration_id: value.current_configuration_id.to_string(),
+            current_progress: value.current_progress,
+            committed_lsn: value.committed_lsn,
+            deactivation_epoch: Some(value.deactivation_epoch.into()),
+            deactivated_lsn: value.deactivated_lsn,
+            write_status: crate::convert::access_status_to_proto(value.write_status) as i32,
+            pending_operation_id: value
+                .pending_operation_id
+                .map_or_else(String::new, |id| id.to_string()),
+            retained_operation_id: value
+                .retained_operation_id
+                .map_or_else(String::new, |id| id.to_string()),
+            role: crate::convert::role_to_proto(value.role) as i32,
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpFinalWitness> for ScaleUpFinalWitness {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpFinalWitness) -> Result<Self, Self::Error> {
+        let witness = Self {
+            resource_uid: ResourceUid::new(value.resource_uid),
+            identity: required(value.identity, "scale_up_final_witness.identity")?.try_into()?,
+            role: role_from_proto(proto::ReplicaRole::try_from(value.role).map_err(|_| {
+                WireError::InvalidEnum {
+                    field: "scale_up_final_witness.role",
+                    value: value.role,
+                }
+            })?)?,
+            process_session_id: ProcessSessionId::new(value.process_session_id),
+            report_sequence: value.report_sequence,
+            epoch: required(value.epoch, "scale_up_final_witness.epoch")?.into(),
+            previous_configuration_id: ConfigurationId::new(value.previous_configuration_id),
+            current_configuration_id: ConfigurationId::new(value.current_configuration_id),
+            current_progress: value.current_progress,
+            committed_lsn: value.committed_lsn,
+            deactivation_epoch: required(
+                value.deactivation_epoch,
+                "scale_up_final_witness.deactivation_epoch",
+            )?
+            .into(),
+            deactivated_lsn: value.deactivated_lsn,
+            write_status: access_status_from_proto(
+                proto::AccessStatus::try_from(value.write_status).map_err(|_| {
+                    WireError::InvalidEnum {
+                        field: "scale_up_final_witness.write_status",
+                        value: value.write_status,
+                    }
+                })?,
+            )?,
+            pending_operation_id: (!value.pending_operation_id.is_empty())
+                .then(|| OperationId::new(value.pending_operation_id)),
+            retained_operation_id: (!value.retained_operation_id.is_empty())
+                .then(|| OperationId::new(value.retained_operation_id)),
+        };
+        if witness.resource_uid.is_empty()
+            || witness.identity.replica_id.value() <= 0
+            || witness.identity.instance_id.is_empty()
+            || witness.identity.agent_generation.is_empty()
+            || witness.process_session_id.is_empty()
+            || witness.report_sequence == 0
+            || witness.epoch.data_loss_number < 0
+            || witness.epoch.configuration_number < 0
+            || witness.previous_configuration_id.is_empty()
+            || witness.current_configuration_id.is_empty()
+            || witness.current_progress < 0
+            || witness.committed_lsn < 0
+            || witness.deactivation_epoch.data_loss_number < 0
+            || witness.deactivation_epoch.configuration_number < 0
+            || witness.deactivated_lsn < 0
+        {
+            return Err(WireError::InvalidAuthority(
+                "final scale-up witness contains invalid identity, epoch, sequence, or progress"
+                    .into(),
+            ));
+        }
+        Ok(witness)
+    }
+}
+
+impl From<ScaleUpFinalElectionEvidence> for proto::ScaleUpFinalElectionEvidence {
+    fn from(value: ScaleUpFinalElectionEvidence) -> Self {
+        Self {
+            final_configuration: Some(value.final_configuration.into()),
+            safe_lsn: value.safe_lsn,
             previous_read_quorum: value
                 .previous_read_quorum
                 .into_iter()
@@ -212,12 +303,17 @@ impl From<ScaleUpFailoverEvidence> for proto::ScaleUpFailoverEvidence {
     }
 }
 
-impl TryFrom<proto::ScaleUpFailoverEvidence> for ScaleUpFailoverEvidence {
+impl TryFrom<proto::ScaleUpFinalElectionEvidence> for ScaleUpFinalElectionEvidence {
     type Error = WireError;
 
-    fn try_from(value: proto::ScaleUpFailoverEvidence) -> Result<Self, Self::Error> {
-        let evidence = Self {
-            intent: required(value.intent, "scale_up_failover.intent")?.try_into()?,
+    fn try_from(value: proto::ScaleUpFinalElectionEvidence) -> Result<Self, Self::Error> {
+        Ok(Self {
+            final_configuration: required(
+                value.final_configuration,
+                "scale_up_final_election.final_configuration",
+            )?
+            .try_into()?,
+            safe_lsn: value.safe_lsn,
             previous_read_quorum: value
                 .previous_read_quorum
                 .into_iter()
@@ -228,6 +324,56 @@ impl TryFrom<proto::ScaleUpFailoverEvidence> for ScaleUpFailoverEvidence {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl From<ScaleUpFailoverEvidence> for proto::ScaleUpFailoverEvidence {
+    fn from(value: ScaleUpFailoverEvidence) -> Self {
+        Self {
+            intent: Some(value.intent.into()),
+            provisional_configuration: Some(value.provisional_configuration.into()),
+            previous_read_quorum: value
+                .previous_read_quorum
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            current_read_quorum: value
+                .current_read_quorum
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            final_election: value.final_election.map(|evidence| (*evidence).into()),
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpFailoverEvidence> for ScaleUpFailoverEvidence {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpFailoverEvidence) -> Result<Self, Self::Error> {
+        let evidence = Self {
+            intent: required(value.intent, "scale_up_failover.intent")?.try_into()?,
+            provisional_configuration: required(
+                value.provisional_configuration,
+                "scale_up_failover.provisional_configuration",
+            )?
+            .try_into()?,
+            previous_read_quorum: value
+                .previous_read_quorum
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            current_read_quorum: value
+                .current_read_quorum
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            final_election: value
+                .final_election
+                .map(TryInto::try_into)
+                .transpose()?
+                .map(Box::new),
         };
         validate_scale_up_failover_evidence(&evidence).map_err(authority)?;
         Ok(evidence)
@@ -240,10 +386,10 @@ impl From<ScaleUpConfigurationEvidence> for proto::ScaleUpConfigurationEvidence 
         Self {
             evidence: Some(match value {
                 ScaleUpConfigurationEvidence::Admission { intent } => {
-                    Evidence::Admission(intent.into())
+                    Evidence::Admission(Box::new(intent.into()))
                 }
                 ScaleUpConfigurationEvidence::Failover { evidence } => {
-                    Evidence::Failover(evidence.into())
+                    Evidence::Failover(Box::new(evidence.into()))
                 }
             }),
         }
@@ -257,10 +403,10 @@ impl TryFrom<proto::ScaleUpConfigurationEvidence> for ScaleUpConfigurationEviden
         use proto::scale_up_configuration_evidence::Evidence;
         match required(value.evidence, "scale_up_evidence.evidence")? {
             Evidence::Admission(intent) => Ok(Self::Admission {
-                intent: intent.try_into()?,
+                intent: (*intent).try_into()?,
             }),
             Evidence::Failover(evidence) => Ok(Self::Failover {
-                evidence: evidence.try_into()?,
+                evidence: (*evidence).try_into()?,
             }),
         }
     }
@@ -656,17 +802,6 @@ mod tests {
     #[test]
     fn failover_configuration_round_trips_independent_recovery_evidence() {
         let intent = intent();
-        let evidence = ScaleUpFailoverEvidence {
-            previous_read_quorum: vec![witness(&intent, intent.primary.clone(), true, 1)],
-            current_read_quorum: vec![witness(&intent, intent.target.clone(), true, 2)],
-            intent: intent.clone(),
-        };
-        let wire_evidence: proto::ScaleUpFailoverEvidence = evidence.clone().into();
-        assert_eq!(
-            ScaleUpFailoverEvidence::try_from(wire_evidence).unwrap(),
-            evidence
-        );
-
         let mut members = intent.current_configuration.members.clone();
         for member in &mut members {
             member.role = if member.identity == intent.target {
@@ -681,6 +816,63 @@ mod tests {
             members,
             intent.current_policy.write_quorum,
         );
+        let evidence = ScaleUpFailoverEvidence {
+            provisional_configuration: failover.clone(),
+            previous_read_quorum: vec![witness(&intent, intent.primary.clone(), true, 1)],
+            current_read_quorum: vec![witness(&intent, intent.target.clone(), true, 2)],
+            final_election: None,
+            intent: intent.clone(),
+        };
+        let wire_evidence: proto::ScaleUpFailoverEvidence = evidence.clone().into();
+        assert_eq!(
+            ScaleUpFailoverEvidence::try_from(wire_evidence).unwrap(),
+            evidence
+        );
+        let final_configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 4),
+            intent.target.replica_id,
+            failover.members.clone(),
+            intent.current_policy.write_quorum,
+        );
+        let final_witness = |identity: ReplicaIdentity, sequence: u64| ScaleUpFinalWitness {
+            resource_uid: intent.resource_uid.clone(),
+            role: failover
+                .members
+                .iter()
+                .find(|member| member.identity == identity)
+                .unwrap()
+                .role,
+            process_session_id: ProcessSessionId::new(format!("final-session-{sequence}")),
+            report_sequence: sequence,
+            epoch: failover.epoch,
+            previous_configuration_id: intent.previous_configuration.configuration_id.clone(),
+            current_configuration_id: failover.configuration_id.clone(),
+            current_progress: intent.catch_up_boundary_lsn,
+            committed_lsn: intent.catch_up_boundary_lsn,
+            deactivation_epoch: failover.epoch,
+            deactivated_lsn: intent.catch_up_boundary_lsn,
+            write_status: AccessStatus::ReconfigurationPending,
+            pending_operation_id: None,
+            retained_operation_id: Some(intent.command_operation_id(
+                ScaleUpStage::PreviousCurrent,
+                &identity,
+                &failover,
+            )),
+            identity,
+        };
+        let mut finalized_evidence = evidence.clone();
+        finalized_evidence.final_election = Some(Box::new(ScaleUpFinalElectionEvidence {
+            final_configuration,
+            safe_lsn: intent.catch_up_boundary_lsn,
+            previous_read_quorum: vec![final_witness(intent.primary.clone(), 3)],
+            current_read_quorum: vec![final_witness(intent.target.clone(), 4)],
+        }));
+        let final_wire: proto::ScaleUpFailoverEvidence = finalized_evidence.clone().into();
+        assert_eq!(
+            ScaleUpFailoverEvidence::try_from(final_wire).unwrap(),
+            finalized_evidence
+        );
+
         let target = intent.target.clone();
         let operation_id =
             intent.command_operation_id(ScaleUpStage::PreviousCurrent, &target, &failover);
@@ -700,7 +892,7 @@ mod tests {
             retire_build_id: String::new(),
             primary_write_status: proto::AccessStatus::ReconfigurationPending as i32,
             retire_build_ids: Vec::new(),
-            failover_safe_lsn: Some(0),
+            failover_safe_lsn: None,
             switchover_handoff: None,
             retire_switchover_preparation_ids: Vec::new(),
             previous_policy: Some(intent.previous_policy.clone().into()),

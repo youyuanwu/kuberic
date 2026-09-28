@@ -709,11 +709,6 @@ mod tests {
             write_status: AccessStatus::ReconfigurationPending,
             pending_operation_id: None,
         };
-        let evidence = ScaleUpFailoverEvidence {
-            previous_read_quorum: vec![witness(intent.primary.clone(), 1)],
-            current_read_quorum: vec![witness(intent.target.clone(), 2)],
-            intent: intent.clone(),
-        };
         let mut members = intent.current_configuration.members.clone();
         for member in &mut members {
             member.role = if member.identity == intent.target {
@@ -728,6 +723,13 @@ mod tests {
             members,
             intent.current_policy.write_quorum,
         );
+        let evidence = ScaleUpFailoverEvidence {
+            provisional_configuration: failover.clone(),
+            previous_read_quorum: vec![witness(intent.primary.clone(), 1)],
+            current_read_quorum: vec![witness(intent.target.clone(), 2)],
+            final_election: None,
+            intent: intent.clone(),
+        };
         let authority = AdmittedAuthority {
             local_identity: intent.target.clone(),
             transition_kind: Some(TransitionKind::Failover),

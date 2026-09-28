@@ -61,7 +61,7 @@ credit. Cleanup freezes Pod, PVC, and endpoint names and UIDs, or explicit
 authoritative exact-name absence, separately from accepted topology.
 
 Lowering `spec.replicas` requests sequential single-secondary removal; the desired
-count is target and minimum, down to one. Increasing it requests protocol-7
+count is target and minimum, down to one. Increasing it requests protocol-8
 sequential scale-up when `EvaluationConfig::allow_scale_up` is enabled; the
 production controller enables that path.
 This `spec.replicas` target=min coupling is Kuberic policy, not general SF
@@ -147,8 +147,12 @@ Protocol 8 scale-up persists one recoverable allocation before resource
 creation, selects the first missing positive ordinal, and admits one fresh
 candidate at a time. Carried primary failure installs a provisional election
 epoch write-closed, collects fresh independently sufficient PC/CC progress,
-then persists a final primary and exact safe LSN before catch-up/current-only
-activation. The canonical PVC is operation-annotated and frozen before
+then persists a separate exact post-fence election certificate containing the
+final primary, final epoch, report sessions/progress, and safe LSN before
+catch-up/current-only activation. The completion receipt retains the original
+recovery witnesses, provisional configuration, and final election so an exact
+returning provisional member is corrected through final PC/CC and current-only.
+The canonical PVC is operation-annotated and frozen before
 the Pod; same-name resources without exact provenance are not adopted. The
 candidate remains outside accepted membership until snapshot copy and
 contiguous replication reach a separately frozen post-enumeration boundary,
@@ -197,7 +201,7 @@ published only after that proof; it never starts ordinary failover or replacemen
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 plus [sequential scale-up](../docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
 and [secondary scale-down](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
-for usage, target/minimum risks, recovery, and the protocol 7 / schema 3
+for usage, target/minimum risks, recovery, and the protocol 8 / schema 3
 fresh-deployment contract.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 separate status/API redesign, mechanical helper refactors, and new recovery protocols.

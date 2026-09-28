@@ -941,10 +941,56 @@ pub struct ScaleUpWitness {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct ScaleUpFinalWitness {
+    pub resource_uid: ResourceUid,
+    pub identity: ReplicaIdentity,
+    pub role: ReplicaRole,
+    pub process_session_id: ProcessSessionId,
+    #[schemars(range(min = 1))]
+    pub report_sequence: u64,
+    pub epoch: Epoch,
+    pub previous_configuration_id: ConfigurationId,
+    pub current_configuration_id: ConfigurationId,
+    #[schemars(range(min = 0))]
+    pub current_progress: i64,
+    #[schemars(range(min = 0))]
+    pub committed_lsn: i64,
+    pub deactivation_epoch: Epoch,
+    #[schemars(range(min = 0))]
+    pub deactivated_lsn: i64,
+    pub write_status: AccessStatus,
+    pub pending_operation_id: Option<OperationId>,
+    pub retained_operation_id: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScaleUpFinalElectionEvidence {
+    pub final_configuration: ConfigurationDescriptor,
+    #[schemars(range(min = 0))]
+    pub safe_lsn: i64,
+    pub previous_read_quorum: Vec<ScaleUpFinalWitness>,
+    pub current_read_quorum: Vec<ScaleUpFinalWitness>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ScaleUpFailoverEvidence {
     pub intent: ScaleUpIntent,
+    pub provisional_configuration: ConfigurationDescriptor,
     pub previous_read_quorum: Vec<ScaleUpWitness>,
     pub current_read_quorum: Vec<ScaleUpWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_election: Option<Box<ScaleUpFinalElectionEvidence>>,
+}
+
+impl ScaleUpFailoverEvidence {
+    pub fn same_provisional_authority(&self, other: &Self) -> bool {
+        self.intent == other.intent
+            && self.provisional_configuration == other.provisional_configuration
+            && self.previous_read_quorum == other.previous_read_quorum
+            && self.current_read_quorum == other.current_read_quorum
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

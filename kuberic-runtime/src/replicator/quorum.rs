@@ -856,18 +856,6 @@ mod tests {
             write_status: AccessStatus::ReconfigurationPending,
             pending_operation_id: None,
         };
-        let evidence = ScaleUpFailoverEvidence {
-            previous_read_quorum: vec![
-                witness(identities[2].clone(), 1),
-                witness(identities[3].clone(), 2),
-            ],
-            current_read_quorum: vec![
-                witness(identities[2].clone(), 3),
-                witness(identities[3].clone(), 4),
-                witness(identities[4].clone(), 5),
-            ],
-            intent: intent.clone(),
-        };
         let failover = ConfigurationDescriptor::new(
             Epoch::new(0, 3),
             ReplicaId::new(2),
@@ -887,6 +875,20 @@ mod tests {
                 .collect(),
             current_policy.write_quorum,
         );
+        let evidence = ScaleUpFailoverEvidence {
+            provisional_configuration: failover.clone(),
+            previous_read_quorum: vec![
+                witness(identities[2].clone(), 1),
+                witness(identities[3].clone(), 2),
+            ],
+            current_read_quorum: vec![
+                witness(identities[2].clone(), 3),
+                witness(identities[3].clone(), 4),
+                witness(identities[4].clone(), 5),
+            ],
+            final_election: None,
+            intent: intent.clone(),
+        };
         let authority = AdmittedAuthority {
             local_identity: identities[1].clone(),
             transition_kind: Some(TransitionKind::Failover),

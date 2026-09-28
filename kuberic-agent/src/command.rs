@@ -573,10 +573,25 @@ fn admit_scale_up_configuration(
                     && member.role == ReplicaRole::Primary
             })
             .expect("validated failover configuration has one primary");
-        let has_new_primary_witness = evidence
-            .current_read_quorum
-            .iter()
-            .any(|witness| witness.identity == new_primary.identity);
+        let has_new_primary_witness = if command.failover_safe_lsn.is_none() {
+            evidence
+                .current_read_quorum
+                .iter()
+                .any(|witness| witness.identity == new_primary.identity)
+        } else {
+            evidence
+                .final_election
+                .as_deref()
+                .is_some_and(|final_election| {
+                    final_election.final_configuration == command.current_configuration
+                        && command.failover_safe_lsn == Some(final_election.safe_lsn)
+                        && final_election.current_read_quorum.iter().any(|witness| {
+                            witness.identity == new_primary.identity
+                                && witness.current_progress.min(witness.deactivated_lsn)
+                                    == final_election.safe_lsn
+                        })
+                })
+        };
         let original_attempt_installed = matches!(
             state.scale_up_evidence.as_deref(),
             Some(
@@ -631,12 +646,28 @@ fn admit_scale_up_configuration(
                     )
                     .is_ok()
                 });
-        exact_failover_progression = exact_installed_failover || fenced_failover_progression;
+        let exact_provisional_return = !command.current_only
+            && command.failover_safe_lsn.is_some()
+            && state.previous_configuration.as_ref() == Some(&intent.previous_configuration)
+            && state.current_configuration.as_ref() == Some(&evidence.provisional_configuration)
+            && state.highest_epoch == evidence.provisional_configuration.epoch
+            && matches!(
+                state.scale_up_evidence.as_deref(),
+                Some(
+                    kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                        evidence: installed
+                    }
+                ) if installed.final_election.is_none()
+                    && installed.same_provisional_authority(evidence)
+            );
+        exact_failover_progression =
+            exact_installed_failover || fenced_failover_progression || exact_provisional_return;
         if !has_new_primary_witness
             || (!first_failover_admission
                 && !original_authority_failover
                 && !historical_failover_current_only
                 && !fenced_failover_progression
+                && !exact_provisional_return
                 && !(exact_installed_failover && (command.current_only || persisted_exact_replay)))
         {
             return Err(AgentError::CommandRejected(
@@ -746,6 +777,24 @@ fn admit_scale_up_configuration(
             |configuration| {
                 configuration == &intent.current_configuration
                 || configuration == &command.current_configuration
+                || matches!(
+                    (
+                        state.scale_up_evidence.as_deref(),
+                        evidence.as_ref(),
+                    ),
+                    (
+                        Some(
+                            kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                                evidence: installed
+                            }
+                        ),
+                        kuberic_protocol::types::ScaleUpConfigurationEvidence::Failover {
+                            evidence: commanded
+                        },
+                    ) if configuration == &commanded.provisional_configuration
+                        && installed.final_election.is_none()
+                        && installed.same_provisional_authority(commanded)
+                )
                 || (state.scale_up_evidence.as_deref() == Some(evidence.as_ref())
                     && state.highest_epoch < command.current_epoch
                     && kuberic_protocol::validation::validate_scale_up_failover_transition(

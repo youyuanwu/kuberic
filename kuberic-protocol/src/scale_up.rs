@@ -309,28 +309,11 @@ fn validate_recovery_witnesses(
     Ok(())
 }
 
-pub fn validate_scale_up_failover_evidence(evidence: &ScaleUpFailoverEvidence) -> Result {
-    validate_scale_up(&evidence.intent)?;
-    validate_recovery_witnesses(
-        &evidence.intent,
-        &evidence.intent.previous_configuration,
-        &evidence.previous_read_quorum,
-        evidence.intent.previous_policy.read_quorum,
-    )?;
-    validate_recovery_witnesses(
-        &evidence.intent,
-        &evidence.intent.current_configuration,
-        &evidence.current_read_quorum,
-        evidence.intent.current_policy.read_quorum,
-    )
-}
-
-pub fn validate_scale_up_failover_transition(
+fn validate_failover_configuration(
     evidence: &ScaleUpFailoverEvidence,
     current: &ConfigurationDescriptor,
     policy: &EffectivePolicy,
 ) -> Result {
-    validate_scale_up_failover_evidence(evidence)?;
     validate_policy(policy)?;
     validate_configuration(current, Some(policy))?;
     if policy != &evidence.intent.current_policy
@@ -359,6 +342,211 @@ pub fn validate_scale_up_failover_transition(
         .collect::<BTreeSet<_>>();
     if actual != expected {
         return Err(invalid("failover must preserve exact expanded membership"));
+    }
+    Ok(())
+}
+
+fn validate_final_witnesses(
+    evidence: &ScaleUpFailoverEvidence,
+    eligible_members: &ConfigurationDescriptor,
+    witnesses: &[ScaleUpFinalWitness],
+    quorum: u32,
+    required_primary: Option<&ReplicaIdentity>,
+) -> Result {
+    let intent = &evidence.intent;
+    let provisional = &evidence.provisional_configuration;
+    let mut identities = BTreeSet::new();
+    for witness in witnesses {
+        let provisional_member = provisional
+            .members
+            .iter()
+            .find(|member| member.identity == witness.identity);
+        if witness.resource_uid != intent.resource_uid
+            || witness.process_session_id.is_empty()
+            || witness.report_sequence == 0
+            || !eligible_members
+                .members
+                .iter()
+                .any(|member| member.identity == witness.identity)
+            || provisional_member.is_none_or(|member| member.role != witness.role)
+            || !identities.insert(witness.identity.clone())
+            || witness.epoch != provisional.epoch
+            || witness.previous_configuration_id != intent.previous_configuration.configuration_id
+            || witness.current_configuration_id != provisional.configuration_id
+            || witness.current_progress < intent.catch_up_boundary_lsn
+            || witness.committed_lsn < 0
+            || witness.deactivation_epoch != provisional.epoch
+            || witness.deactivated_lsn < 0
+            || witness.write_status == AccessStatus::Granted
+            || witness.pending_operation_id.is_some()
+            || witness.retained_operation_id.as_ref()
+                != Some(&intent.command_operation_id(
+                    ScaleUpStage::PreviousCurrent,
+                    &witness.identity,
+                    provisional,
+                ))
+        {
+            return Err(invalid("invalid exact final scale-up election witness"));
+        }
+    }
+    if identities.len() < quorum as usize
+        || required_primary.is_some_and(|primary| !identities.contains(primary))
+    {
+        return Err(invalid(
+            "insufficient exact final scale-up election witnesses",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_final_election(
+    evidence: &ScaleUpFailoverEvidence,
+    final_election: &ScaleUpFinalElectionEvidence,
+) -> Result {
+    let provisional = &evidence.provisional_configuration;
+    let final_configuration = &final_election.final_configuration;
+    validate_failover_configuration(
+        evidence,
+        final_configuration,
+        &evidence.intent.current_policy,
+    )?;
+    if provisional
+        .epoch
+        .configuration_number
+        .checked_add(1)
+        .is_none_or(|next| final_configuration.epoch.configuration_number != next)
+        || final_election.safe_lsn < evidence.intent.catch_up_boundary_lsn
+        || final_configuration.primary_id == evidence.intent.primary.replica_id
+    {
+        return Err(invalid(
+            "final scale-up election did not advance the provisional fence",
+        ));
+    }
+    let primary = final_configuration
+        .members
+        .iter()
+        .find(|member| {
+            member.identity.replica_id == final_configuration.primary_id
+                && member.role == ReplicaRole::Primary
+        })
+        .ok_or_else(|| invalid("final scale-up election has no primary"))?;
+    validate_final_witnesses(
+        evidence,
+        &evidence.intent.previous_configuration,
+        &final_election.previous_read_quorum,
+        evidence.intent.previous_policy.read_quorum,
+        None,
+    )?;
+    validate_final_witnesses(
+        evidence,
+        provisional,
+        &final_election.current_read_quorum,
+        evidence.intent.current_policy.read_quorum,
+        Some(&primary.identity),
+    )?;
+    for previous in &final_election.previous_read_quorum {
+        if let Some(current) = final_election
+            .current_read_quorum
+            .iter()
+            .find(|current| current.identity == previous.identity)
+            && current != previous
+        {
+            return Err(invalid(
+                "final scale-up quorum witnesses disagree on one exact report",
+            ));
+        }
+    }
+    let selected = final_election
+        .current_read_quorum
+        .iter()
+        .find(|witness| witness.identity == primary.identity)
+        .expect("validated final current quorum contains selected primary");
+    let expected = final_election
+        .current_read_quorum
+        .iter()
+        .filter(|witness| witness.identity != evidence.intent.primary)
+        .max_by(|left, right| {
+            let left_safe = left.current_progress.min(left.deactivated_lsn);
+            let right_safe = right.current_progress.min(right.deactivated_lsn);
+            left_safe
+                .cmp(&right_safe)
+                .then_with(|| left.current_progress.cmp(&right.current_progress))
+                .then_with(|| left.committed_lsn.cmp(&right.committed_lsn))
+                .then_with(|| right.identity.replica_id.cmp(&left.identity.replica_id))
+        })
+        .ok_or_else(|| invalid("final scale-up election has no surviving candidate"))?;
+    if selected != expected
+        || selected.current_progress.min(selected.deactivated_lsn) != final_election.safe_lsn
+    {
+        return Err(invalid(
+            "selected final primary did not certify the exact safe prefix",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_scale_up_failover_evidence(evidence: &ScaleUpFailoverEvidence) -> Result {
+    validate_scale_up(&evidence.intent)?;
+    validate_recovery_witnesses(
+        &evidence.intent,
+        &evidence.intent.previous_configuration,
+        &evidence.previous_read_quorum,
+        evidence.intent.previous_policy.read_quorum,
+    )?;
+    validate_recovery_witnesses(
+        &evidence.intent,
+        &evidence.intent.current_configuration,
+        &evidence.current_read_quorum,
+        evidence.intent.current_policy.read_quorum,
+    )?;
+    validate_failover_configuration(
+        evidence,
+        &evidence.provisional_configuration,
+        &evidence.intent.current_policy,
+    )?;
+    if evidence
+        .intent
+        .current_configuration
+        .epoch
+        .configuration_number
+        .checked_add(1)
+        .is_none_or(|next| {
+            evidence
+                .provisional_configuration
+                .epoch
+                .configuration_number
+                != next
+        })
+        || evidence.provisional_configuration.primary_id == evidence.intent.primary.replica_id
+    {
+        return Err(invalid(
+            "provisional scale-up failover did not advance the expanded authority",
+        ));
+    }
+    if let Some(final_election) = evidence.final_election.as_deref() {
+        validate_final_election(evidence, final_election)?;
+    }
+    Ok(())
+}
+
+pub fn validate_scale_up_failover_transition(
+    evidence: &ScaleUpFailoverEvidence,
+    current: &ConfigurationDescriptor,
+    policy: &EffectivePolicy,
+) -> Result {
+    validate_scale_up_failover_evidence(evidence)?;
+    validate_failover_configuration(evidence, current, policy)?;
+    if current == &evidence.provisional_configuration {
+        return Ok(());
+    }
+    if evidence
+        .final_election
+        .as_deref()
+        .is_none_or(|final_election| current != &final_election.final_configuration)
+    {
+        return Err(invalid(
+            "failover authority differs from provisional and final election evidence",
+        ));
     }
     Ok(())
 }
@@ -418,6 +606,17 @@ pub fn validate_scale_up_receipt(receipt: &ScaleUpReceipt) -> Result {
             &receipt.accepted_configuration,
             &receipt.intent.current_policy,
         )?;
+        let final_election = evidence
+            .final_election
+            .as_deref()
+            .ok_or_else(|| invalid("failover receipt omitted final election evidence"))?;
+        if final_election.final_configuration != receipt.accepted_configuration
+            || final_election.safe_lsn != safe_lsn
+        {
+            return Err(invalid(
+                "failover receipt differs from final election evidence",
+            ));
+        }
         if !receipt.current_only_write_quorum.iter().any(|witness| {
             witness.identity == primary.identity
                 && witness.verified_replication_lsn >= safe_lsn
@@ -476,15 +675,18 @@ pub fn validate_scale_up_configuration(command: &EnsureConfiguration) -> Result 
         }
         ScaleUpConfigurationEvidence::Failover { evidence } => {
             validate_scale_up_failover_evidence(evidence)?;
-            validate_scale_up_failover_transition(
-                evidence,
-                &command.current_configuration,
-                &command.effective_policy,
-            )?;
             let provisional = command.failover_safe_lsn.is_none()
                 && !command.current_only
-                && command.primary_write_status == AccessStatus::ReconfigurationPending;
-            let finalized = command.failover_safe_lsn.is_some_and(|lsn| lsn >= 0);
+                && command.primary_write_status == AccessStatus::ReconfigurationPending
+                && evidence.final_election.is_none()
+                && command.current_configuration == evidence.provisional_configuration;
+            let finalized = evidence
+                .final_election
+                .as_deref()
+                .is_some_and(|final_election| {
+                    command.failover_safe_lsn == Some(final_election.safe_lsn)
+                        && command.current_configuration == final_election.final_configuration
+                });
             if command.transition_kind != TransitionKind::Failover
                 || command.current_epoch != command.current_configuration.epoch
                 || (!provisional && !finalized)
@@ -675,6 +877,69 @@ mod tests {
         }
     }
 
+    fn failover_configuration(
+        intent: &ScaleUpIntent,
+        primary: &ReplicaIdentity,
+        configuration_number: i64,
+    ) -> ConfigurationDescriptor {
+        ConfigurationDescriptor::new(
+            Epoch::new(
+                intent.current_configuration.epoch.data_loss_number,
+                configuration_number,
+            ),
+            primary.replica_id,
+            intent
+                .current_configuration
+                .members
+                .iter()
+                .map(|member| ConfigurationMember {
+                    identity: member.identity.clone(),
+                    role: if member.identity == *primary {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect(),
+            intent.current_policy.write_quorum,
+        )
+    }
+
+    fn final_witness(
+        intent: &ScaleUpIntent,
+        provisional: &ConfigurationDescriptor,
+        identity: ReplicaIdentity,
+        sequence: u64,
+        progress: i64,
+    ) -> ScaleUpFinalWitness {
+        ScaleUpFinalWitness {
+            resource_uid: intent.resource_uid.clone(),
+            role: provisional
+                .members
+                .iter()
+                .find(|member| member.identity == identity)
+                .unwrap()
+                .role,
+            retained_operation_id: Some(intent.command_operation_id(
+                ScaleUpStage::PreviousCurrent,
+                &identity,
+                provisional,
+            )),
+            identity,
+            process_session_id: ProcessSessionId::new(format!("final-session-{sequence}")),
+            report_sequence: sequence,
+            epoch: provisional.epoch,
+            previous_configuration_id: intent.previous_configuration.configuration_id.clone(),
+            current_configuration_id: provisional.configuration_id.clone(),
+            current_progress: progress,
+            committed_lsn: progress,
+            deactivation_epoch: provisional.epoch,
+            deactivated_lsn: progress,
+            write_status: AccessStatus::ReconfigurationPending,
+            pending_operation_id: None,
+        }
+    }
+
     #[test]
     fn validates_zero_boundary_one_member_increase() {
         assert_eq!(validate_scale_up(&intent(1)), Ok(()));
@@ -828,12 +1093,15 @@ mod tests {
         let previous = intent.previous_configuration.members[0].identity.clone();
         let current_a = intent.current_configuration.members[0].identity.clone();
         let current_b = intent.current_configuration.members[1].identity.clone();
+        let provisional = failover_configuration(&intent, &current_b, 3);
         let evidence = ScaleUpFailoverEvidence {
+            provisional_configuration: provisional,
             previous_read_quorum: vec![witness(&intent, previous, true, 1)],
             current_read_quorum: vec![
                 witness(&intent, current_a, true, 2),
                 witness(&intent, current_b, true, 3),
             ],
+            final_election: None,
             intent,
         };
         assert_eq!(validate_scale_up_failover_evidence(&evidence), Ok(()));
@@ -865,11 +1133,6 @@ mod tests {
                 3,
             ),
         ];
-        let evidence = ScaleUpFailoverEvidence {
-            intent: intent.clone(),
-            previous_read_quorum: vec![previous_witness],
-            current_read_quorum: current_witnesses,
-        };
         let mut members = intent.current_configuration.members.clone();
         for member in &mut members {
             member.role = if member.identity.replica_id == ReplicaId::new(2) {
@@ -884,6 +1147,13 @@ mod tests {
             members,
             intent.current_policy.write_quorum,
         );
+        let evidence = ScaleUpFailoverEvidence {
+            intent: intent.clone(),
+            provisional_configuration: failover.clone(),
+            previous_read_quorum: vec![previous_witness],
+            current_read_quorum: current_witnesses,
+            final_election: None,
+        };
         let target = failover
             .members
             .iter()
@@ -915,7 +1185,7 @@ mod tests {
             expected_instance_id: target.instance_id,
             expected_agent_generation: target.agent_generation,
             transition_kind: TransitionKind::Failover,
-            failover_safe_lsn: Some(0),
+            failover_safe_lsn: None,
             primary_write_status: AccessStatus::ReconfigurationPending,
             current_only: false,
             retire_build_ids: Vec::new(),
@@ -923,6 +1193,108 @@ mod tests {
             retire_switchover_preparation_ids: Vec::new(),
         };
         assert_eq!(validate_scale_up_configuration(&command), Ok(()));
+    }
+
+    #[test]
+    fn final_failover_evidence_binds_exact_fenced_reports_primary_and_safe_prefix() {
+        let intent = intent(2);
+        let provisional_primary = intent.previous_configuration.members[1].identity.clone();
+        let final_primary = intent.target.clone();
+        let provisional = failover_configuration(&intent, &provisional_primary, 3);
+        let final_configuration = failover_configuration(&intent, &final_primary, 4);
+        let previous = witness(&intent, provisional_primary.clone(), true, 1);
+        let current = vec![
+            witness(&intent, provisional_primary.clone(), true, 2),
+            witness(&intent, final_primary.clone(), true, 3),
+        ];
+        let provisional_witness =
+            final_witness(&intent, &provisional, provisional_primary.clone(), 4, 10);
+        let selected_witness = final_witness(&intent, &provisional, final_primary.clone(), 5, 11);
+        let evidence = ScaleUpFailoverEvidence {
+            intent: intent.clone(),
+            provisional_configuration: provisional,
+            previous_read_quorum: vec![previous],
+            current_read_quorum: current,
+            final_election: Some(Box::new(ScaleUpFinalElectionEvidence {
+                final_configuration: final_configuration.clone(),
+                safe_lsn: 11,
+                previous_read_quorum: vec![provisional_witness.clone()],
+                current_read_quorum: vec![provisional_witness, selected_witness],
+            })),
+        };
+        assert_eq!(validate_scale_up_failover_evidence(&evidence), Ok(()));
+
+        let command = EnsureConfiguration {
+            operation_id: intent.command_operation_id(
+                ScaleUpStage::PreviousCurrent,
+                &final_primary,
+                &final_configuration,
+            ),
+            previous_configuration: Some(intent.previous_configuration.clone()),
+            current_configuration: final_configuration.clone(),
+            previous_epoch: Some(intent.previous_configuration.epoch),
+            current_epoch: final_configuration.epoch,
+            effective_policy: intent.current_policy.clone(),
+            previous_policy: Some(intent.previous_policy.clone()),
+            secondary_removal_evidence: None,
+            scale_up_evidence: Some(Box::new(ScaleUpConfigurationEvidence::Failover {
+                evidence: evidence.clone(),
+            })),
+            local_replica_id: final_primary.replica_id,
+            expected_instance_id: final_primary.instance_id.clone(),
+            expected_agent_generation: final_primary.agent_generation.clone(),
+            transition_kind: TransitionKind::Failover,
+            failover_safe_lsn: Some(11),
+            primary_write_status: AccessStatus::ReconfigurationPending,
+            current_only: false,
+            retire_build_ids: Vec::new(),
+            switchover_handoff: None,
+            retire_switchover_preparation_ids: Vec::new(),
+        };
+        assert_eq!(validate_scale_up_configuration(&command), Ok(()));
+
+        let mut missing = command.clone();
+        let Some(ScaleUpConfigurationEvidence::Failover {
+            evidence: missing_evidence,
+        }) = missing.scale_up_evidence.as_deref_mut()
+        else {
+            unreachable!()
+        };
+        missing_evidence.final_election = None;
+        assert!(validate_scale_up_configuration(&missing).is_err());
+
+        let mut stale_epoch = evidence.clone();
+        stale_epoch
+            .final_election
+            .as_mut()
+            .unwrap()
+            .current_read_quorum[1]
+            .epoch = intent.current_configuration.epoch;
+        assert!(validate_scale_up_failover_evidence(&stale_epoch).is_err());
+
+        let mut mismatched_session = evidence.clone();
+        mismatched_session
+            .final_election
+            .as_mut()
+            .unwrap()
+            .previous_read_quorum[0]
+            .process_session_id = ProcessSessionId::new("other-session");
+        assert!(validate_scale_up_failover_evidence(&mismatched_session).is_err());
+
+        let mut mismatched_lsn = evidence.clone();
+        mismatched_lsn
+            .final_election
+            .as_mut()
+            .unwrap()
+            .current_read_quorum[0]
+            .current_progress = 12;
+        mismatched_lsn
+            .final_election
+            .as_mut()
+            .unwrap()
+            .current_read_quorum[0]
+            .deactivated_lsn = 12;
+        assert!(validate_scale_up_failover_evidence(&mismatched_lsn).is_err());
     }
 
     #[test]
@@ -983,8 +1355,8 @@ mod tests {
             },
             FrozenGrowthGuard {
                 phase: "carried-failover",
-                fixed_bytes: 2_816,
-                per_member_bytes: 1_152,
+                fixed_bytes: 3_328,
+                per_member_bytes: 2_048,
             },
             FrozenGrowthGuard {
                 phase: "cleanup",
@@ -1246,29 +1618,81 @@ mod tests {
                 .enumerate()
                 .map(|(index, identity)| witness(&intent, identity, true, index as u64 + 40))
                 .collect();
+            let final_configuration = failover_configuration(
+                &intent,
+                &intent.target,
+                failover.epoch.configuration_number + 1,
+            );
+            let final_previous_read_quorum = intent
+                .previous_configuration
+                .members
+                .iter()
+                .take(intent.previous_policy.read_quorum as usize)
+                .map(|member| {
+                    final_witness(
+                        &intent,
+                        &failover,
+                        member.identity.clone(),
+                        u64::try_from(member.identity.replica_id.value()).unwrap() + 60,
+                        if member.identity == intent.target {
+                            intent.catch_up_boundary_lsn + 1
+                        } else {
+                            intent.catch_up_boundary_lsn
+                        },
+                    )
+                })
+                .collect();
+            let final_current_read_quorum = std::iter::once(intent.target.clone())
+                .chain(
+                    intent
+                        .current_configuration
+                        .members
+                        .iter()
+                        .filter(|member| member.identity != intent.target)
+                        .map(|member| member.identity.clone()),
+                )
+                .take(intent.current_policy.read_quorum as usize)
+                .map(|identity| {
+                    let progress = if identity == intent.target {
+                        intent.catch_up_boundary_lsn + 1
+                    } else {
+                        intent.catch_up_boundary_lsn
+                    };
+                    let sequence = u64::try_from(identity.replica_id.value()).unwrap() + 60;
+                    final_witness(&intent, &failover, identity, sequence, progress)
+                })
+                .collect();
             let failover_evidence = ScaleUpFailoverEvidence {
                 intent: intent.clone(),
+                provisional_configuration: failover.clone(),
                 previous_read_quorum,
                 current_read_quorum,
+                final_election: Some(Box::new(ScaleUpFinalElectionEvidence {
+                    final_configuration: final_configuration.clone(),
+                    safe_lsn: intent.catch_up_boundary_lsn + 1,
+                    previous_read_quorum: final_previous_read_quorum,
+                    current_read_quorum: final_current_read_quorum,
+                })),
             };
             validate_scale_up_failover_transition(
                 &failover_evidence,
-                &failover,
+                &final_configuration,
                 &intent.current_policy,
             )
             .unwrap();
             let carried_failover = AcceptedStatus {
                 provisioning: Some(provisioning.clone()),
                 transition: Some(TransitionIntent {
-                    transition_id: intent.transition_id(TransitionKind::Failover, &failover),
+                    transition_id: intent
+                        .transition_id(TransitionKind::Failover, &final_configuration),
                     kind: TransitionKind::Failover,
                     spec_generation: intent.spec_generation,
                     effective_policy: intent.current_policy.clone(),
                     previous_configuration_id: Some(
                         intent.previous_configuration.configuration_id.clone(),
                     ),
-                    current_configuration: failover,
-                    election_lsn: Some(intent.catch_up_boundary_lsn),
+                    current_configuration: final_configuration,
+                    election_lsn: Some(intent.catch_up_boundary_lsn + 1),
                     build_id: Some(intent.build_id.clone()),
                     repair: None,
                     switchover: None,
@@ -1578,16 +2002,6 @@ mod tests {
                 },
             },
         };
-        let evidence = ScaleUpFailoverEvidence {
-            previous_read_quorum: vec![witness(
-                &intent,
-                intent.previous_configuration.members[0].identity.clone(),
-                true,
-                1,
-            )],
-            current_read_quorum: vec![witness(&intent, candidate.clone(), true, 2)],
-            intent: intent.clone(),
-        };
         let mut members = intent.current_configuration.members.clone();
         for member in &mut members {
             member.role = if member.identity == candidate {
@@ -1602,6 +2016,18 @@ mod tests {
             members,
             intent.current_policy.write_quorum,
         );
+        let evidence = ScaleUpFailoverEvidence {
+            provisional_configuration: failover.clone(),
+            previous_read_quorum: vec![witness(
+                &intent,
+                intent.previous_configuration.members[0].identity.clone(),
+                true,
+                1,
+            )],
+            current_read_quorum: vec![witness(&intent, candidate.clone(), true, 2)],
+            final_election: None,
+            intent: intent.clone(),
+        };
         let mut status = AcceptedStatus {
             initialized: true,
             effective_policy: Some(intent.previous_policy.clone()),
@@ -1618,7 +2044,7 @@ mod tests {
                     intent.previous_configuration.configuration_id.clone(),
                 ),
                 current_configuration: failover,
-                election_lsn: Some(0),
+                election_lsn: None,
                 build_id: Some(intent.build_id.clone()),
                 repair: None,
                 switchover: None,

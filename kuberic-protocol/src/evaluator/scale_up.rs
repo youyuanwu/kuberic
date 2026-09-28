@@ -3,8 +3,9 @@ use crate::command::ScaleDownResource;
 use crate::observation::{AgentBuildReport, AgentReport, ExactResourceObservation};
 use crate::types::{
     CleanupResourceIdentity, PodUid, ProvisioningPurpose, PvcUid, ReplicaId, ScaleUpAllocation,
-    ScaleUpCleanup, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence, ScaleUpIntent,
-    ScaleUpProvisioning, ScaleUpReceipt, ScaleUpStage, ScaleUpWitness,
+    ScaleUpCleanup, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence,
+    ScaleUpFinalElectionEvidence, ScaleUpFinalWitness, ScaleUpIntent, ScaleUpProvisioning,
+    ScaleUpReceipt, ScaleUpStage, ScaleUpWitness,
 };
 use crate::validation::{
     validate_scale_up, validate_scale_up_cleanup, validate_scale_up_failover_evidence,
@@ -1209,6 +1210,34 @@ pub(super) fn recover_local_acceptance(
                 == Some(&receipt.intent.previous_configuration)
                 || report.previous_configuration.is_none());
         if stale_original_failover_authority {
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
+                    evidence.clone(),
+                    &receipt.accepted_configuration,
+                    member,
+                    false,
+                    failover_safe_lsn,
+                ))),
+            });
+        }
+        let stale_provisional_failover_authority =
+            receipt.failover_evidence.as_ref().is_some_and(|failover| {
+                report.scale_up_intent.as_deref() == Some(&receipt.intent)
+                    && report.epoch == failover.provisional_configuration.epoch
+                    && report.previous_configuration.as_ref()
+                        == Some(&receipt.intent.previous_configuration)
+                    && report.current_configuration.as_ref()
+                        == Some(&failover.provisional_configuration)
+                    && failover
+                        .provisional_configuration
+                        .members
+                        .iter()
+                        .any(|provisional| {
+                            provisional.identity == report.identity
+                                && provisional.role == report.role
+                        })
+            });
+        if stale_provisional_failover_authority {
             return Some(Plan::Execute {
                 command: ProtocolCommand::EnsureConfiguration(Box::new(configuration_command(
                     evidence.clone(),
@@ -2587,6 +2616,34 @@ fn witness(report: &AgentReport) -> Option<ScaleUpWitness> {
     })
 }
 
+fn final_witness(report: &AgentReport) -> Option<ScaleUpFinalWitness> {
+    Some(ScaleUpFinalWitness {
+        resource_uid: report.resource_uid.clone(),
+        identity: report.identity.clone(),
+        role: report.role,
+        process_session_id: report.process_session_id.clone(),
+        report_sequence: report.report_sequence,
+        epoch: report.epoch,
+        previous_configuration_id: report
+            .previous_configuration
+            .as_ref()?
+            .configuration_id
+            .clone(),
+        current_configuration_id: report
+            .current_configuration
+            .as_ref()?
+            .configuration_id
+            .clone(),
+        current_progress: report.current_progress,
+        committed_lsn: report.committed_lsn,
+        deactivation_epoch: report.deactivation_epoch?,
+        deactivated_lsn: report.deactivated_lsn?,
+        write_status: report.write_status,
+        pending_operation_id: report.pending_operation_id.clone(),
+        retained_operation_id: report.retained_operation_id.clone(),
+    })
+}
+
 fn exact_pc_cc_report(
     report: &AgentReport,
     intent: &ScaleUpIntent,
@@ -2803,8 +2860,10 @@ fn begin_failover(
     );
     let evidence = ScaleUpFailoverEvidence {
         intent: intent.clone(),
+        provisional_configuration: failover.clone(),
         previous_read_quorum: previous_witnesses,
         current_read_quorum: current_witnesses,
+        final_election: None,
     };
     if let Err(error) = validate_scale_up_failover_evidence(&evidence) {
         return unsafe_plan(
@@ -2974,11 +3033,40 @@ fn finalize_fenced_failover(
         &candidate.identity,
         Epoch::new(provisional.epoch.data_loss_number, configuration_number),
     );
+    let final_election = ScaleUpFinalElectionEvidence {
+        final_configuration: finalized.clone(),
+        safe_lsn,
+        previous_read_quorum: previous_reports
+            .iter()
+            .filter_map(|report| final_witness(report))
+            .collect(),
+        current_read_quorum: current_reports
+            .iter()
+            .filter_map(|report| final_witness(report))
+            .collect(),
+    };
     let mut status = snapshot.status.clone();
     let mut finalized_transition = transition.clone();
     finalized_transition.transition_id = intent.transition_id(TransitionKind::Failover, &finalized);
     finalized_transition.current_configuration = finalized;
     finalized_transition.election_lsn = Some(safe_lsn);
+    finalized_transition
+        .scale_up_failover
+        .as_mut()
+        .expect("provisional carried failover has evidence")
+        .final_election = Some(Box::new(final_election));
+    if let Err(error) = validate_scale_up_failover_evidence(
+        finalized_transition
+            .scale_up_failover
+            .as_deref()
+            .expect("final carried failover has evidence"),
+    ) {
+        return unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::ContradictoryReplicaEvidence(error.to_string()),
+            config,
+        );
+    }
     status.transition = Some(finalized_transition);
     persist(progress_status(
         snapshot,

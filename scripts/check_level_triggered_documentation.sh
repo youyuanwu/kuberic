@@ -38,7 +38,7 @@ if checked_crd != generated_crd:
         fromfile="checked-in CRD", tofile="generated CRD",
     ))
     raise SystemExit(1)
-crd_guard = 350_000
+crd_guard = 400_000
 assert len(checked_crd) < crd_guard
 crd_headroom = crd_guard - len(checked_crd)
 schema = json.loads(checked_crd)
@@ -192,6 +192,28 @@ assert re.search(r"pub const SCHEMA_VERSION: u32 = 3;", store)
 assert "Protocol version 8" in guide_text and "schema 3" in guide_text
 assert "Protocol version 8" in (root / "kuberic-wire/README.md").read_text()
 assert "Protocol 8" in sample and "schema 3" in sample
+current_requirement_documents = [
+    root / "docs/Dev.md",
+    root / "docs/features/kuberic/level-triggered-operator.md",
+    root / "kuberic-agent/README.md",
+    root / "kuberic-protocol/README.md",
+]
+for document in current_requirement_documents:
+    text = document.read_text()
+    normalized = " ".join(text.split()).lower()
+    assert "protocol 8" in normalized or "protocol-8" in normalized, \
+        f"{document.relative_to(root)}: current deployment requirement must name protocol 8"
+    assert "schema 3" in normalized or "schema-3" in normalized, \
+        f"{document.relative_to(root)}: current deployment requirement must name schema 3"
+    for stale in (
+        "fresh protocol-7/schema-3",
+        "fresh coordinated protocol-7/schema-3",
+        "fresh deployment for protocol 7 / schema 3",
+        "the protocol 7 / schema 3 fresh-deployment contract",
+        "requests protocol-7 sequential scale-up",
+    ):
+        assert stale not in normalized, \
+            f"{document.relative_to(root)}: stale current protocol-7 requirement: {stale}"
 diagnostics = (root / "kuberic-agent/src/process.rs").read_text()
 assert "pub retired: bool" in diagnostics
 assert "state.retired_authority.is_some() || snapshot.retired_authority.is_some()" in diagnostics

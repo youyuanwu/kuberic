@@ -26,8 +26,9 @@ use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
     Epoch, InitializationId, OperationId, PodUid, ProcessSessionId, ProvisioningIntent,
     ProvisioningPurpose, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ResourceUid, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence, ScaleUpIntent,
-    ScaleUpProvisioning, ScaleUpStage, ScaleUpWitness, SwitchoverRequestId, TransitionKind,
+    ResourceUid, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence,
+    ScaleUpFinalElectionEvidence, ScaleUpFinalWitness, ScaleUpIntent, ScaleUpProvisioning,
+    ScaleUpStage, ScaleUpWitness, SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::application::{
     ClientWrite, CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext,
@@ -1511,14 +1512,6 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
         )),
         identity,
     };
-    let failover_evidence = ScaleUpFailoverEvidence {
-        intent: intent.clone(),
-        previous_read_quorum: vec![witness(identities[0].clone(), 1)],
-        current_read_quorum: vec![
-            witness(identities[1].clone(), 2),
-            witness(identities[2].clone(), 3),
-        ],
-    };
     let failover = ConfigurationDescriptor::new(
         Epoch::new(0, 3),
         identities[1].replica_id,
@@ -1538,6 +1531,58 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
         ],
         current_policy.write_quorum,
     );
+    let provisional_evidence = ScaleUpFailoverEvidence {
+        intent: intent.clone(),
+        provisional_configuration: failover.clone(),
+        previous_read_quorum: vec![witness(identities[0].clone(), 1)],
+        current_read_quorum: vec![
+            witness(identities[1].clone(), 2),
+            witness(identities[2].clone(), 3),
+        ],
+        final_election: None,
+    };
+    let final_configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 4),
+        identities[1].replica_id,
+        failover.members.clone(),
+        current_policy.write_quorum,
+    );
+    let final_witness = |identity: ReplicaIdentity, sequence: u64| ScaleUpFinalWitness {
+        resource_uid: intent.resource_uid.clone(),
+        role: failover
+            .members
+            .iter()
+            .find(|member| member.identity == identity)
+            .unwrap()
+            .role,
+        process_session_id: ProcessSessionId::new(format!("final-session-{sequence}")),
+        report_sequence: sequence,
+        epoch: failover.epoch,
+        previous_configuration_id: previous.configuration_id.clone(),
+        current_configuration_id: failover.configuration_id.clone(),
+        current_progress: 9,
+        committed_lsn: 9,
+        deactivation_epoch: failover.epoch,
+        deactivated_lsn: 9,
+        write_status: AccessStatus::ReconfigurationPending,
+        pending_operation_id: None,
+        retained_operation_id: Some(intent.command_operation_id(
+            ScaleUpStage::PreviousCurrent,
+            &identity,
+            &failover,
+        )),
+        identity,
+    };
+    let mut final_evidence = provisional_evidence.clone();
+    final_evidence.final_election = Some(Box::new(ScaleUpFinalElectionEvidence {
+        final_configuration: final_configuration.clone(),
+        safe_lsn: 9,
+        previous_read_quorum: vec![final_witness(identities[1].clone(), 4)],
+        current_read_quorum: vec![
+            final_witness(identities[1].clone(), 4),
+            final_witness(identities[2].clone(), 5),
+        ],
+    }));
     let mut state = AgentState::new(StorageIdentity {
         resource_uid: intent.resource_uid.clone(),
         local_identity: identities[1].clone(),
@@ -1560,17 +1605,17 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
         operation_id: intent.command_operation_id(
             ScaleUpStage::PreviousCurrent,
             &identities[1],
-            &failover,
+            &final_configuration,
         ),
         previous_configuration: Some(previous.clone()),
-        current_configuration: failover.clone(),
+        current_configuration: final_configuration.clone(),
         previous_epoch: Some(previous.epoch),
-        current_epoch: failover.epoch,
+        current_epoch: final_configuration.epoch,
         effective_policy: current_policy,
         previous_policy: Some(previous_policy),
         secondary_removal_evidence: None,
         scale_up_evidence: Some(Box::new(ScaleUpConfigurationEvidence::Failover {
-            evidence: failover_evidence,
+            evidence: final_evidence,
         })),
         local_replica_id: identities[1].replica_id,
         expected_instance_id: identities[1].instance_id.clone(),

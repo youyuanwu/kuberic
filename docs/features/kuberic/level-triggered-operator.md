@@ -140,10 +140,10 @@ it manually. Important projections include:
 
 The checked-in CRD is generated from the Rust type and verified byte-for-byte
 by `scripts/check_level_triggered_documentation.sh`.
-At the final-review baseline it is **349,003 bytes**, leaving **997 bytes** before
-the current strict-below-350,000-byte regression guard fails. Representative
+At the final-review baseline it is **398,033 bytes**, leaving **1,967 bytes** before
+the current strict-below-400,000-byte regression guard fails. Representative
 serialized scale-up status guards cover 2, 3, 4, 6, 10, and 18 members; the
-largest current 18-member sample is carried failover at **22,017 bytes**.
+largest current 18-member sample is carried failover at **38,767 bytes**.
 These are schema/status growth guards, not a supported-cardinality or
 Kubernetes object-limit claim. No validated maximum replica-count budget exists.
 
@@ -493,6 +493,13 @@ protocol 7 and earlier are rejected, as is schema 2, with no migration or
 mixed-version mode.
 Schema 3 persists scale-up build and admission authority in addition to the
 schema-2 initialization provenance and admitted policies.
+Carried failover preserves the original PC/expanded-CC recovery witnesses and
+the exact provisional write-closed configuration. Final activation additionally
+requires a separate post-fence certificate with independently sufficient PC/CC
+read quorums, exact report sessions and progress, the selected final primary,
+final epoch, and safe prefix. The bounded completion receipt retains both
+authorities so an exact returning provisional member is corrected to final PC/CC
+and then current-only; unrelated provisional or stale authority remains fenced.
 Retirement-started and terminal tombstone records both prevent application Open
 on restart: a fresh process finishes interrupted retirement without reopening
 the removed application, then reports the exact receipt. Frozen quorum proof
@@ -682,7 +689,7 @@ storage.
 
 The current schema is **3** and accepts only its exact version. The migration hook records
 an idempotent current-version migration; it does not upgrade older schemas.
-Schema 2 is rejected without conversion. Use a fresh deployment for protocol 7 /
+Schema 2 is rejected without conversion. Use a fresh deployment for protocol 8 /
 schema 3; no rolling upgrade or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and

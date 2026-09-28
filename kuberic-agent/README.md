@@ -140,7 +140,7 @@ means a retirement tombstone exists. The JSON field is additive; older diagnosti
 responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
-Use a fresh coordinated protocol-7/schema-3 deployment, not a rolling upgrade.
+Use a fresh coordinated protocol-8/schema-3 deployment, not a rolling upgrade.
 Exact original PVC provenance must be reconstructable before admission; if Pod
 and PVC already disappeared without that provenance, scale-down waits/fails
 closed rather than treating list omission as absence. Unavailable-target support
@@ -154,8 +154,12 @@ authority, preserves healthy same-primary writes only while both PC/CC quorums
 remain authorized, and retries failed unadmitted candidates only after exact
 endpoint→Pod→PVC cleanup. Carried failover first installs a write-closed
 provisional epoch, then uses fresh fenced PC/CC progress for final primary and
-safe-prefix selection before activation. Protocol 8/schema 3 require a fresh coordinated
-deployment; classic v1 remains unchanged. These limits and the explicitly deferred
+safe-prefix selection before activation. Final commands carry a separate exact
+post-fence election certificate; the completion receipt retains both provisional
+and final authority so a returning provisional member can advance through final
+PC/CC and current-only without accepting unrelated stale authority. Protocol
+8/schema 3 require a fresh coordinated deployment; classic v1 remains unchanged.
+These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
 

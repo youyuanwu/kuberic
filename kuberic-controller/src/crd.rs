@@ -173,6 +173,45 @@ mod tests {
         }
         assert!(status.get("scaleUpCleanup").is_some());
         assert!(status.get("lastScaleUp").is_some());
+        let failover = &transition["scaleUpFailover"]["properties"];
+        for field in [
+            "intent",
+            "provisionalConfiguration",
+            "previousReadQuorum",
+            "currentReadQuorum",
+            "finalElection",
+        ] {
+            assert!(failover.get(field).is_some(), "{field}");
+        }
+        let final_election = &failover["finalElection"]["properties"];
+        for field in [
+            "finalConfiguration",
+            "safeLsn",
+            "previousReadQuorum",
+            "currentReadQuorum",
+        ] {
+            assert!(final_election.get(field).is_some(), "{field}");
+        }
+        assert_eq!(final_election["safeLsn"]["minimum"], 0.0);
+        let final_witness = &final_election["currentReadQuorum"]["items"]["properties"];
+        for field in [
+            "processSessionId",
+            "reportSequence",
+            "epoch",
+            "previousConfigurationId",
+            "currentConfigurationId",
+            "currentProgress",
+            "committedLsn",
+            "deactivationEpoch",
+            "deactivatedLsn",
+            "retainedOperationId",
+        ] {
+            assert!(final_witness.get(field).is_some(), "{field}");
+        }
+        assert_eq!(final_witness["reportSequence"]["minimum"], 1.0);
+        assert_eq!(final_witness["currentProgress"]["minimum"], 0.0);
+        assert_eq!(final_witness["committedLsn"]["minimum"], 0.0);
+        assert_eq!(final_witness["deactivatedLsn"]["minimum"], 0.0);
         let allocation = &status["scaleUpAllocation"]["properties"];
         for field in [
             "resourceUid",
@@ -209,7 +248,7 @@ mod tests {
 
         let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
         assert!(
-            generated.len() < 350_000,
+            generated.len() < 400_000,
             "generated CRD unexpectedly grew to {} bytes",
             generated.len()
         );
