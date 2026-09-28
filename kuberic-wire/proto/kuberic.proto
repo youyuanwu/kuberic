@@ -401,6 +401,7 @@ message EnsureReplicaBuildCommand {
   ReplicaIdentity target = 5;
   BuildAuthority authority = 6;
   string source_session_id = 7;
+  bool retire = 8;
 }
 
 message ExecuteCommandRequest {

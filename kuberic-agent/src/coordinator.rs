@@ -615,6 +615,18 @@ where
         let _command = self.command_lock.lock().await;
         let state = self.store.load_state().await?;
         admit_build(&command, &state)?;
+        if command.retire {
+            if state.retired_builds.contains(&command.operation_id) {
+                return Ok(());
+            }
+            self.execute_standalone(
+                &command.operation_id,
+                "retire-abandoned-build",
+                RuntimeEffectAction::RetireBuild(command.operation_id.clone()),
+            )
+            .await?;
+            return Ok(());
+        }
         let command = self.store.journal_build(&command).await?;
         if let Some(authority) = command.authority.clone() {
             if state.current_configuration.as_ref().is_some_and(|current| {

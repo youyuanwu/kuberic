@@ -611,7 +611,8 @@ impl AgentStore for SqliteStore {
                     && existing.expected_instance_id == command.expected_instance_id
                     && existing.expected_agent_generation == command.expected_agent_generation
                     && existing.target == command.target
-                    && existing.authority == command.authority;
+                    && existing.authority == command.authority
+                    && existing.retire == command.retire;
                 if !immutable_matches
                     || (existing.authority.is_none()
                         && existing.source_session_id != command.source_session_id)

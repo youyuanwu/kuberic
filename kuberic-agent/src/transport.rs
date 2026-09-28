@@ -234,6 +234,7 @@ where
             target: endpoint.identity.clone(),
             authority: Some(authority),
             source_session_id: Some(source_session_id),
+            retire: false,
         };
         let control_endpoint = self.resolver.control_endpoint(&endpoint.identity);
         let mut control = tokio::time::timeout(
@@ -487,6 +488,7 @@ fn ensure_build_to_proto(command: EnsureReplicaBuild) -> proto::EnsureReplicaBui
         source_session_id: command
             .source_session_id
             .map_or_else(String::new, |session| session.to_string()),
+        retire: command.retire,
     }
 }
 
@@ -532,6 +534,7 @@ mod build_request_tests {
                 target: target.clone(),
                 authority: None,
                 source_session_id: None,
+                retire: false,
             },
         );
 

@@ -233,6 +233,18 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
             );
         }
         ProtocolCommand::EnsureReplicaBuild(command) => {
+            if command.retire {
+                for observation in raw.agents.values_mut() {
+                    if let RawAgentObservation::Report(report) = observation {
+                        report
+                            .builds
+                            .retain(|build| build.build_id != command.operation_id.as_str());
+                        report.report_sequence += 1;
+                    }
+                }
+                api.set_observation(raw).await;
+                return;
+            }
             let source_key = ReplicaObservationKey::new(
                 command.local_replica_id,
                 command.expected_instance_id.clone(),
@@ -1106,6 +1118,132 @@ async fn scale_up_replays_pending_current_only_before_and_after_installation() {
         )
     }));
     finish(&api, 3).await;
+}
+
+#[tokio::test]
+async fn invalid_provisioning_candidate_retires_build_cleans_exact_resources_and_retries() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(1, 2)));
+    let (target_key, old_pod_uid) = loop {
+        let (_, effects) = tick(&api).await;
+        if effects.iter().any(|effect| {
+            matches!(
+                effect,
+                EffectRecord::Execute(ProtocolCommand::EnsureReplicaBuild(command))
+                    if !command.retire
+            )
+        }) {
+            let raw = api.observation().await;
+            let (key, _) = candidate_key(&raw).expect("active provisioning candidate");
+            let pod_uid = key.instance_id.to_string();
+            assert!(
+                raw.set
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.authority.provisioning.is_some())
+            );
+            break (key, pod_uid);
+        }
+    };
+    let mut invalid = api.observation().await;
+    invalid.agents.insert(
+        target_key.clone(),
+        RawAgentObservation::Invalid {
+            message: "candidate durable storage is invalid".into(),
+        },
+    );
+    let mut accepted_invalid = invalid.clone();
+    let accepted_key = accepted_invalid
+        .agents
+        .keys()
+        .find(|key| key.replica_id == ReplicaId::new(1))
+        .unwrap()
+        .clone();
+    accepted_invalid.agents.insert(
+        accepted_key,
+        RawAgentObservation::Invalid {
+            message: "accepted durable storage is invalid".into(),
+        },
+    );
+    let accepted_snapshot = normalize(accepted_invalid, BTreeMap::new()).unwrap();
+    assert!(matches!(
+        evaluate(&accepted_snapshot, &enabled()),
+        Plan::Unsafe {
+            ref safety_changes,
+            ..
+        } if safety_changes == &[SafetyChange::RemoveWriteRouting]
+    ));
+
+    api.set_observation(invalid).await;
+    let effects_start = api.effects().await.len();
+    finish(&api, 2).await;
+    let completed = api.observation().await;
+    let accepted = completed
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.authority.topology.as_ref())
+        .unwrap();
+    let fresh = accepted
+        .configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(2))
+        .unwrap();
+    assert_ne!(fresh.identity.instance_id.as_str(), old_pod_uid);
+    let effects = &api.effects().await[effects_start..];
+    assert!(
+        effects
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+    );
+    let retired = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                EffectRecord::Execute(ProtocolCommand::EnsureReplicaBuild(command))
+                    if command.retire
+            )
+        })
+        .expect("exact source build retirement");
+    let endpoint = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                EffectRecord::DeleteScaleDownResource {
+                    resource: ScaleDownResource::Endpoint,
+                    ..
+                }
+            )
+        })
+        .expect("candidate endpoint cleanup");
+    let pod = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                EffectRecord::DeleteScaleDownResource {
+                    resource: ScaleDownResource::Pod,
+                    uid,
+                    ..
+                } if uid == &old_pod_uid
+            )
+        })
+        .expect("candidate Pod cleanup");
+    let pvc = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                EffectRecord::DeleteScaleDownResource {
+                    resource: ScaleDownResource::Pvc,
+                    ..
+                }
+            )
+        })
+        .expect("candidate PVC cleanup");
+    assert!(retired < endpoint && endpoint < pod && pod < pvc);
 }
 
 #[tokio::test]

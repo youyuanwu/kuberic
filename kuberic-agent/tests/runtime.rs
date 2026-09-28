@@ -264,6 +264,7 @@ async fn scale_up_receiver_replays_immutable_build_progress_without_reusing_sour
         source_session_id: Some(kuberic_protocol::types::ProcessSessionId::new(
             "retired-source-session",
         )),
+        retire: false,
     };
     let mut state = AgentState::new(StorageIdentity {
         schema_version: SCHEMA_VERSION,
@@ -366,6 +367,7 @@ async fn scale_up_receiver_replays_every_durable_build_boundary_without_role_act
             target: fixture.target.clone(),
             authority: Some(fixture.authority.clone()),
             source_session_id: Some(ProcessSessionId::new("retired-source-session")),
+            retire: false,
         };
         let mut state = AgentState::new(StorageIdentity {
             schema_version: SCHEMA_VERSION,
@@ -454,6 +456,7 @@ async fn scale_up_source_replays_each_durable_build_boundary_with_exact_authorit
             target: fixture.target.clone(),
             authority: None,
             source_session_id: None,
+            retire: false,
         };
         let mut state = AgentState::new(StorageIdentity {
             schema_version: SCHEMA_VERSION,
@@ -8822,6 +8825,7 @@ async fn evaluator_scale_up_sqlite_trace() {
             target: target.clone(),
             authority: Some(prepared.authority.clone()),
             source_session_id: Some(ProcessSessionId::new("sqlite-source-session")),
+            retire: false,
         })
         .await
         .unwrap();
@@ -9666,6 +9670,7 @@ async fn same_primary_scale_up_accepts_real_writes_after_every_durable_agent_eff
             target: candidate.clone(),
             authority: None,
             source_session_id: None,
+            retire: false,
         },
     );
     let directory = tempfile::tempdir().unwrap();

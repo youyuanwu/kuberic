@@ -1,5 +1,6 @@
 //! Durable agent status reporting.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kuberic_protocol::types::{AccessStatus, FaultType, ReplicaRole};
@@ -69,6 +70,27 @@ fn build_report(
     catch_up_capability: Option<i64>,
     reported_fault: Option<FaultType>,
 ) -> proto::AgentStatusReport {
+    let mut builds = snapshot
+        .builds
+        .into_iter()
+        .map(|build| (build.authority.build_id.clone(), build))
+        .collect::<BTreeMap<_, _>>();
+    for (build_id, command) in &state.build_commands {
+        if command.authority.is_none()
+            && !state.retired_builds.contains(build_id)
+            && let Some(progress) = state.build_progress.get(build_id)
+        {
+            builds.entry(build_id.clone()).or_insert_with(|| {
+                kuberic_runtime_internal::effects::BuildPostcondition {
+                    authority: progress.authority.clone(),
+                    last_sequence: progress.last_sequence,
+                    durable_lsn: progress.durable_lsn,
+                    completed: progress.completed,
+                    catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+                }
+            });
+        }
+    }
     let pending_operation_id = state
         .reconfiguration
         .as_ref()
@@ -152,9 +174,8 @@ fn build_report(
                     |result| result.command.operation_id.to_string(),
                 )
             }),
-        builds: snapshot
-            .builds
-            .into_iter()
+        builds: builds
+            .into_values()
             .map(|build| proto::BuildStatus {
                 build_id: build.authority.build_id.to_string(),
                 target: Some(build.authority.target.into()),

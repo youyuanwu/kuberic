@@ -117,6 +117,8 @@ pub struct EnsureReplicaBuild {
     pub target: ReplicaIdentity,
     pub authority: Option<BuildAuthority>,
     pub source_session_id: Option<crate::types::ProcessSessionId>,
+    #[serde(default)]
+    pub retire: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -873,6 +873,7 @@ fn apply_evaluator_configuration(
                 target: intent.target.clone(),
                 authority: Some(authority.clone()),
                 source_session_id: Some(ProcessSessionId::new("evaluator-source-session")),
+                retire: false,
             },
         );
         state.build_progress.insert(
@@ -1316,9 +1317,77 @@ fn candidate_admission_fixture() -> (
             target: authority.target.clone(),
             authority: Some(authority),
             source_session_id: Some(ProcessSessionId::new("source-session")),
+            retire: false,
         },
     );
     (state, command, progress)
+}
+
+#[tokio::test]
+async fn sqlite_coordinator_replays_exact_pending_scale_up_commands_before_and_after_install() {
+    for current_only in [false, true] {
+        for fail_stage in ["admit", "access"] {
+            let (state, command, _) = scale_up_fixture(current_only);
+            let directory = tempdir().unwrap();
+            let path = SqliteStore::metadata_database_path(directory.path());
+            let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+            let runtime = Arc::new(FakeRuntime::new());
+            {
+                let mut runtime_state = runtime.state.lock().unwrap();
+                runtime_state.role = ReplicaRole::Primary;
+                runtime_state.read_status = AccessStatus::Granted;
+                runtime_state.write_status = AccessStatus::Granted;
+            }
+            runtime.fail_once(fail_stage);
+            let coordinator = Coordinator::new(store.clone(), runtime.clone());
+            assert!(
+                coordinator
+                    .ensure_configuration(command.clone())
+                    .await
+                    .is_err(),
+                "current_only={current_only} fail_stage={fail_stage}"
+            );
+            let interrupted = store.load_state().await.unwrap();
+            assert_eq!(
+                interrupted
+                    .reconfiguration
+                    .as_ref()
+                    .map(|record| &record.command),
+                Some(&command)
+            );
+            if fail_stage == "access" {
+                assert_eq!(
+                    interrupted.current_configuration.as_ref(),
+                    Some(&command.current_configuration),
+                    "authority must be installed before the interrupted completion cut"
+                );
+            }
+
+            let mut mutated = command.clone();
+            mutated.primary_write_status = AccessStatus::ReconfigurationPending;
+            assert!(
+                Coordinator::new(store.clone(), runtime.clone())
+                    .ensure_configuration(mutated)
+                    .await
+                    .is_err(),
+                "mutated pending payload must be rejected"
+            );
+            let completed = Coordinator::new(store.clone(), runtime.clone())
+                .ensure_configuration(command.clone())
+                .await
+                .unwrap();
+            assert_eq!(completed.command, command);
+            let terminal = store.load_state().await.unwrap();
+            assert!(terminal.reconfiguration.is_none());
+            assert_eq!(
+                terminal
+                    .retained_command
+                    .as_ref()
+                    .map(|retained| &retained.command),
+                Some(&completed.command)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1480,6 +1549,7 @@ async fn scale_up_candidate_activates_only_after_exact_build_and_retires_it_on_c
             target: candidate.clone(),
             authority: Some(authority.clone()),
             source_session_id: Some(ProcessSessionId::new("source-session")),
+            retire: false,
         },
     );
     let directory = tempdir().unwrap();
@@ -3014,6 +3084,7 @@ async fn replacement_build_target_is_admitted_as_idle_secondary() {
                 replication_boundary_lsn: 7,
             }),
             source_session_id: Some(ProcessSessionId::new("source-session")),
+            retire: false,
         })
         .await
         .unwrap();

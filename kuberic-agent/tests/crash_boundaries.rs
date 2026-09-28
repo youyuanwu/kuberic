@@ -1344,6 +1344,7 @@ fn scale_up_crash_fixture(current_only: bool) -> (AgentState, EnsureConfiguratio
             target: candidate,
             authority: None,
             source_session_id: None,
+            retire: false,
         },
     );
     let stage = if current_only {
@@ -3197,6 +3198,7 @@ async fn open_real_scale_up_owners(
                 target: intent.target.clone(),
                 authority: Some(build.clone()),
                 source_session_id: Some(ProcessSessionId::new("scale-up-cut-source-session")),
+                retire: false,
             },
         );
         Arc::new(SqliteStore::create_authorized(&candidate_path, state).unwrap())
@@ -4517,6 +4519,7 @@ async fn execute_scale_up_failover_cut(path: &Path, boundary: &str, terminate: b
                 target: intent.target.clone(),
                 authority: Some(build.clone()),
                 source_session_id: Some(ProcessSessionId::new("failover-build-source-session")),
+                retire: false,
             },
         );
         witness_state.build_progress.insert(

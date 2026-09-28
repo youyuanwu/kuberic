@@ -8141,6 +8141,232 @@ fn scale_up_retry_corrects_late_stale_failover_member_before_pc_cc() {
 }
 
 #[test]
+fn scale_up_two_late_stale_members_correct_sequentially_with_pending_replay() {
+    use scale_up_model::Model;
+    let mut seed = Model::new(5, 6);
+    let previous = seed
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let accepted = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        ReplicaId::new(2),
+        previous
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity.replica_id == ReplicaId::new(2) {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        previous.write_quorum,
+    );
+    seed.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: accepted.clone(),
+    });
+    for observation in seed.snapshot.replicas.values_mut() {
+        let AgentObservation::Report(report) = &mut observation.agent else {
+            continue;
+        };
+        let member = accepted
+            .members
+            .iter()
+            .find(|member| member.identity == report.identity)
+            .unwrap();
+        report.role = member.role;
+        report.epoch = accepted.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(accepted.clone());
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+    }
+    seed.snapshot.routing.write_target = Some(
+        accepted
+            .members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+            .unwrap()
+            .identity
+            .clone(),
+    );
+    let mut model = Model::from_snapshot(seed.snapshot, vec![5]);
+    for _ in 0..120 {
+        if model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.scale_up.is_some())
+        {
+            break;
+        }
+        model.step();
+    }
+    assert!(model.snapshot.status.transition.is_some());
+
+    for replica_id in [1, 3] {
+        let report = model.report_mut(replica_id);
+        let previous_member = previous
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == ReplicaId::new(replica_id))
+            .unwrap();
+        report.role = previous_member.role;
+        report.epoch = previous.epoch;
+        report.previous_configuration = None;
+        report.current_configuration = Some(previous.clone());
+        report.write_status = if previous_member.role == ReplicaRole::Primary {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::NotPrimary
+        };
+        report.pending_operation_id = None;
+        report.pending_configuration = None;
+        report.scale_up_intent = None;
+    }
+
+    let mut wrong_identity = model.fork();
+    wrong_identity.report_mut(3).identity.agent_generation =
+        AgentGeneration::new("wrong-generation");
+    assert!(matches!(
+        wrong_identity.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    let mut wrong_session = model.fork();
+    let wrong_session_report = wrong_session.report_mut(3).clone();
+    wrong_session.snapshot.previous_report_watermarks.insert(
+        ReplicaObservationKey::new(
+            wrong_session_report.identity.replica_id,
+            wrong_session_report.identity.instance_id.clone(),
+        ),
+        ReportWatermark {
+            process_session_id: wrong_session_report.process_session_id,
+            report_sequence: wrong_session_report.report_sequence,
+        },
+    );
+    assert!(matches!(
+        wrong_session.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    let mut wrong_configuration = model.fork();
+    let mut unrelated_configuration = previous.clone();
+    unrelated_configuration.epoch.configuration_number += 10;
+    wrong_configuration.report_mut(3).current_configuration = Some(unrelated_configuration);
+    assert!(matches!(
+        wrong_configuration.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    let mut malformed_peer = model.fork();
+    let peer = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(4))
+        .unwrap()
+        .identity
+        .clone();
+    malformed_peer
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            peer.replica_id,
+            peer.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Invalid {
+        message: "independent malformed peer".into(),
+        uninitialized_report: None,
+    };
+    assert!(matches!(
+        malformed_peer.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(first),
+    } = model.plan()
+    else {
+        panic!("first deterministic stale correction was not dispatched")
+    };
+    assert_eq!(first.local_replica_id, ReplicaId::new(1));
+    {
+        let pending = model.report_mut(1);
+        pending.pending_operation_id = Some(first.operation_id.clone());
+        pending.pending_configuration = Some(first.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(first.clone())
+        },
+        "first pending correction must replay while another valid stale member remains"
+    );
+    model.execute(ProtocolCommand::EnsureConfiguration(first));
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(first_current_only),
+    } = model.plan()
+    else {
+        panic!("first stale member must collapse to current-only")
+    };
+    assert_eq!(first_current_only.local_replica_id, ReplicaId::new(1));
+    assert!(first_current_only.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(first_current_only));
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(second),
+    } = model.plan()
+    else {
+        panic!("second stale member must be corrected after the first")
+    };
+    assert_eq!(second.local_replica_id, ReplicaId::new(3));
+    assert!(!second.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(second));
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(second_current_only),
+    } = model.plan()
+    else {
+        panic!("second stale member must collapse to current-only")
+    };
+    assert_eq!(second_current_only.local_replica_id, ReplicaId::new(3));
+    assert!(second_current_only.current_only);
+    model.execute(ProtocolCommand::EnsureConfiguration(second_current_only));
+    assert_eq!(
+        model
+            .snapshot
+            .routing
+            .write_target
+            .as_ref()
+            .map(|identity| identity.replica_id),
+        Some(accepted.primary_id)
+    );
+    model.run(200);
+    assert_eq!(model.accepted_count(), 6);
+    assert!(matches!(model.plan(), Plan::Stable { .. }));
+}
+
+#[test]
 fn scale_up_stale_correction_preserves_validation_and_primary_failure_priority() {
     use scale_up_model::Model;
 
@@ -8555,16 +8781,162 @@ fn scale_up_late_retained_member_blocks_receipt_supersession() {
         &retained,
         &receipt.intent.current_configuration,
     ));
-    assert!(matches!(
+    report.pending_operation_id = None;
+    report.pending_configuration = None;
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("late retained member must receive current-only receipt correction")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.local_replica_id, retained.replica_id);
+    assert!(
+        current_only
+            .scale_up_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.intent() == &receipt.intent)
+    );
+    {
+        let pending = model.report_mut(retained.replica_id.value());
+        pending.pending_operation_id = Some(current_only.operation_id.clone());
+        pending.pending_configuration = Some(current_only.clone());
+    }
+    assert_eq!(
         model.plan(),
         Plan::Execute {
-            command: ProtocolCommand::EnsureConfiguration(command)
-        } if command.current_only
-            && command.local_replica_id == retained.replica_id
-            && command.scale_up_evidence.as_ref().is_some_and(|evidence|
-                evidence.intent() == &receipt.intent)
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        },
+        "exact pending current-only receipt correction must replay before installation"
+    );
+    {
+        let installed = model.report_mut(retained.replica_id.value());
+        installed.previous_configuration = None;
+        installed.current_configuration = Some(receipt.accepted_configuration.clone());
+        installed.epoch = receipt.accepted_configuration.epoch;
+        installed.scale_up_intent = Some(Box::new(receipt.intent.clone()));
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        },
+        "installed authority cannot settle a still-pending receipt correction"
+    );
+    let mut mutated = model.fork();
+    let mutated_report = mutated.report_mut(retained.replica_id.value());
+    let mut changed = current_only.clone();
+    changed.primary_write_status = AccessStatus::ReconfigurationPending;
+    mutated_report.pending_configuration = Some(changed);
+    assert!(matches!(
+        mutated.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
     ));
+    let mut unrelated = model.fork();
+    let unrelated_report = unrelated.report_mut(retained.replica_id.value());
+    unrelated_report.pending_operation_id = Some(OperationId::new("unrelated-receipt-command"));
+    unrelated_report.pending_configuration = None;
+    assert!(matches!(
+        unrelated.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpHistoricalAcceptancePending")
+    ));
+    assert!(!matches!(model.plan(), Plan::Stable { .. }));
+    {
+        let completed = model.report_mut(retained.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(current_only.operation_id.clone());
+    }
     assert!(model.snapshot.status.provisioning.is_none());
+}
+
+#[test]
+fn scale_up_receipt_replays_pending_pc_cc_before_advancing_to_current_only() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    model.run(120);
+    let receipt = model.snapshot.status.last_scale_up.clone().unwrap();
+    let retained = receipt.intent.primary.clone();
+    let previous_member = receipt
+        .intent
+        .previous_configuration
+        .members
+        .iter()
+        .find(|member| member.identity == retained)
+        .unwrap()
+        .clone();
+    let report = model.report_mut(retained.replica_id.value());
+    report.role = previous_member.role;
+    report.epoch = receipt.intent.previous_configuration.epoch;
+    report.previous_configuration = None;
+    report.current_configuration = Some(receipt.intent.previous_configuration.clone());
+    report.scale_up_intent = None;
+    report.pending_operation_id = None;
+    report.pending_configuration = None;
+    report.retained_operation_id = None;
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(pc_cc),
+    } = model.plan()
+    else {
+        panic!(
+            "late retained member must replay receipt PC/CC first: {:?}",
+            model.plan()
+        )
+    };
+    assert!(!pc_cc.current_only);
+    {
+        let pending = model.report_mut(retained.replica_id.value());
+        pending.pending_operation_id = Some(pc_cc.operation_id.clone());
+        pending.pending_configuration = Some(pc_cc.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(pc_cc.clone())
+        },
+        "exact pending receipt PC/CC must replay before authority installation"
+    );
+    {
+        let installed = model.report_mut(retained.replica_id.value());
+        installed.role = receipt
+            .accepted_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == retained)
+            .unwrap()
+            .role;
+        installed.epoch = receipt.accepted_configuration.epoch;
+        installed.previous_configuration = Some(receipt.intent.previous_configuration.clone());
+        installed.current_configuration = Some(receipt.accepted_configuration.clone());
+        installed.scale_up_intent = Some(Box::new(receipt.intent.clone()));
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(pc_cc.clone())
+        },
+        "installed PC/CC cannot advance while the exact local command remains pending"
+    );
+    {
+        let completed = model.report_mut(retained.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(pc_cc.operation_id);
+    }
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(current_only),
+    } = model.plan()
+    else {
+        panic!("completed receipt PC/CC must advance to current-only")
+    };
+    assert!(current_only.current_only);
+    assert_eq!(current_only.local_replica_id, retained.replica_id);
 }
 
 #[test]
@@ -9845,18 +10217,97 @@ fn scale_up_late_carried_failover_member_reaches_stable_convergence() {
     assert!(!command.current_only);
     assert_eq!(command.transition_kind, TransitionKind::Failover);
     assert!(command.failover_safe_lsn.is_some());
-    model.execute(ProtocolCommand::EnsureConfiguration(command));
+    {
+        let pending = model.report_mut(old_primary.replica_id.value());
+        pending.pending_operation_id = Some(command.operation_id.clone());
+        pending.pending_configuration = Some(command.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command.clone())
+        },
+        "carried failover PC/CC must replay byte-identically before installation"
+    );
+    {
+        let installed = model.report_mut(old_primary.replica_id.value());
+        installed.epoch = command.current_epoch;
+        installed.previous_configuration = command.previous_configuration.clone();
+        installed.current_configuration = Some(command.current_configuration.clone());
+        installed.role = command
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == old_primary)
+            .unwrap()
+            .role;
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command.clone())
+        },
+        "installed carried failover PC/CC remains pending until local completion"
+    );
+    let mut mutated = model.fork();
+    let mutated_report = mutated.report_mut(old_primary.replica_id.value());
+    let mut mutated_command = command.clone();
+    mutated_command.failover_safe_lsn = mutated_command.failover_safe_lsn.map(|lsn| lsn + 1);
+    mutated_report.pending_configuration = Some(mutated_command);
+    assert!(matches!(
+        mutated.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+    {
+        let completed = model.report_mut(old_primary.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(command.operation_id.clone());
+    }
 
     let Plan::Execute {
-        command: ProtocolCommand::EnsureConfiguration(command),
+        command: ProtocolCommand::EnsureConfiguration(current_only),
     } = model.plan()
     else {
         panic!("late carried member must receive exact current-only correction")
     };
-    assert!(command.current_only);
-    assert_eq!(command.transition_kind, TransitionKind::Failover);
-    assert!(command.failover_safe_lsn.is_some());
-    model.execute(ProtocolCommand::EnsureConfiguration(command));
+    assert!(current_only.current_only);
+    assert_eq!(current_only.transition_kind, TransitionKind::Failover);
+    assert_eq!(current_only.failover_safe_lsn, command.failover_safe_lsn);
+    {
+        let pending = model.report_mut(old_primary.replica_id.value());
+        pending.pending_operation_id = Some(current_only.operation_id.clone());
+        pending.pending_configuration = Some(current_only.clone());
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        }
+    );
+    {
+        let installed = model.report_mut(old_primary.replica_id.value());
+        installed.previous_configuration = None;
+        installed.current_configuration = Some(current_only.current_configuration.clone());
+        installed.epoch = current_only.current_epoch;
+    }
+    assert_eq!(
+        model.plan(),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(current_only.clone())
+        },
+        "installed carried current-only authority cannot settle a pending receipt"
+    );
+    assert!(!matches!(model.plan(), Plan::Stable { .. }));
+    {
+        let completed = model.report_mut(old_primary.replica_id.value());
+        completed.pending_operation_id = None;
+        completed.pending_configuration = None;
+        completed.retained_operation_id = Some(current_only.operation_id);
+    }
 
     for _ in 0..20 {
         match model.plan() {
@@ -10037,6 +10488,121 @@ fn scale_up_permanent_candidate_failure_before_fence_freezes_cleanup() {
             .len(),
         3
     );
+}
+
+#[test]
+fn scale_up_exact_invalid_unadmitted_candidate_cleans_and_retries_fresh() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    let target = loop {
+        if let Some(provisioning) = model.snapshot.status.provisioning.as_ref() {
+            let target = provisioning.target_identity(&model.snapshot.resource_uid);
+            if model
+                .snapshot
+                .observation_for_identity(&target)
+                .is_some_and(|observation| {
+                    matches!(
+                        &observation.agent,
+                        AgentObservation::Report(report)
+                            if report.role == ReplicaRole::None && report.builds.is_empty()
+                    )
+                })
+            {
+                break target;
+            }
+        }
+        model.step();
+    };
+    let target_key = ReplicaObservationKey::new(target.replica_id, target.instance_id.clone());
+    model.snapshot.replicas.get_mut(&target_key).unwrap().agent = AgentObservation::Invalid {
+        message: "candidate storage is corrupt".into(),
+        uninitialized_report: None,
+    };
+
+    let mut accepted_invalid = model.fork();
+    let accepted = accepted_invalid
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members[0]
+        .identity
+        .clone();
+    accepted_invalid
+        .snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            accepted.replica_id,
+            accepted.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent = AgentObservation::Invalid {
+        message: "accepted storage is corrupt".into(),
+        uninitialized_report: None,
+    };
+    assert!(matches!(
+        accepted_invalid.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let mut unrelated_invalid = model.fork();
+    unrelated_invalid.snapshot.replicas.insert(
+        ReplicaObservationKey::new(target.replica_id, ReplicaInstanceId::new("unrelated-pod")),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Invalid {
+                message: "unrelated invalid process".into(),
+                uninitialized_report: None,
+            },
+        },
+    );
+    assert!(matches!(
+        unrelated_invalid.plan(),
+        Plan::Unsafe {
+            safety_changes,
+            ..
+        } if safety_changes == vec![SafetyChange::RemoveWriteRouting]
+    ));
+
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("exact invalid unadmitted candidate must freeze candidate-local cleanup")
+    };
+    let status = changes.iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => Some(status.as_ref()),
+        _ => None,
+    });
+    assert!(status.is_some_and(|status| status.scale_up_cleanup.is_some()));
+    assert_eq!(
+        model
+            .snapshot
+            .routing
+            .write_target
+            .as_ref()
+            .map(|identity| identity.replica_id),
+        Some(ReplicaId::new(1))
+    );
+    for change in changes {
+        model.apply(change);
+    }
+    model.run(200);
+    assert_eq!(model.accepted_count(), 3);
+    let fresh = model
+        .snapshot
+        .status
+        .last_scale_up
+        .as_ref()
+        .unwrap()
+        .intent
+        .target
+        .clone();
+    assert_eq!(fresh.replica_id, target.replica_id);
+    assert_ne!(fresh.instance_id, target.instance_id);
+    assert!(matches!(model.plan(), Plan::Stable { .. }));
 }
 
 fn assert_scale_up_receipt_allows_full_replacement(replica_id: i64) {

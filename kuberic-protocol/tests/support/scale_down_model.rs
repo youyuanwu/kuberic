@@ -439,6 +439,16 @@ impl Model {
                     }
                     ProtocolCommand::EnsureReplicaBuild(c) => {
                         let source_key = self.key(c.local_replica_id.value());
+                        if c.retire {
+                            if let AgentObservation::Report(source) =
+                                &mut self.snapshot.replicas.get_mut(&source_key).unwrap().agent
+                            {
+                                source
+                                    .builds
+                                    .retain(|build| build.build_id != c.operation_id);
+                            }
+                            return;
+                        }
                         let source_progress = match &self.snapshot.replicas[&source_key].agent {
                             AgentObservation::Report(report) => report.current_progress,
                             _ => panic!("replacement source report"),

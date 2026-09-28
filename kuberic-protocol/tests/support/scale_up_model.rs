@@ -876,6 +876,17 @@ impl Model {
                 }
             }
             ProtocolCommand::EnsureReplicaBuild(command) => {
+                if command.retire {
+                    for observation in self.snapshot.replicas.values_mut() {
+                        if let AgentObservation::Report(report) = &mut observation.agent {
+                            report
+                                .builds
+                                .retain(|build| build.build_id != command.operation_id);
+                        }
+                    }
+                    self.pending_build = None;
+                    return;
+                }
                 if self.pending_build.is_some() {
                     self.advance_async_build();
                     return;

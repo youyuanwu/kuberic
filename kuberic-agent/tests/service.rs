@@ -4,16 +4,21 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::stream;
 use kuberic_agent::hosting::PodRuntime;
+use kuberic_agent::process::{ApplicationStorageState, ReplicaHost, ReplicaProcessConfig};
 use kuberic_agent::provisioning::ObservedStorageIdentity;
 use kuberic_agent::service::AgentService;
 use kuberic_agent::service::InitializationService;
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_agent::store::AgentStore;
+use kuberic_agent::transport::ReplicaEndpointResolver;
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{
-    ConfigurationId, EffectivePolicy, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverRequestId,
-    derive_agent_generation, derive_initialization_id,
+    AccessStatus, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, EffectivePolicy,
+    Epoch, OperationId, PodUid, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence,
+    ScaleUpIntent, ScaleUpProvisioning, ScaleUpStage, SwitchoverHandoff, SwitchoverRequestId,
+    TransitionKind, derive_agent_generation, derive_initialization_id,
 };
 use kuberic_runtime::application::{
     OpenContext, OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
@@ -24,6 +29,10 @@ use kuberic_runtime::replicator::{
     ReplicatorSettings, StateReplicator,
 };
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
+use kuberic_runtime_internal::authority::{
+    AdmittedAuthority, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
+    DurableBuildProgress, ReplicaAuthorityStore,
+};
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction};
 use kuberic_wire::proto;
 use tempfile::tempdir;
@@ -744,9 +753,571 @@ fn identity() -> ReplicaIdentity {
     }
 }
 
+struct ScaleUpSourceFixture {
+    store: Arc<SqliteStore>,
+    primary: ReplicaIdentity,
+    target: ReplicaIdentity,
+    build_id: OperationId,
+    current_only: EnsureConfiguration,
+}
+
+async fn scale_up_source_fixture(
+    data_root: &std::path::Path,
+    pc_cc_installed: bool,
+    build_completed: bool,
+) -> ScaleUpSourceFixture {
+    std::fs::create_dir_all(data_root).unwrap();
+    let resource_uid = ResourceUid::new("resource-1");
+    let primary = identity();
+    let secondary_initialization = derive_initialization_id(
+        &resource_uid,
+        ReplicaId::new(2),
+        &PodUid::new("pod-2"),
+        &PvcUid::new("pvc-2"),
+    );
+    let secondary = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: derive_agent_generation(&secondary_initialization),
+    };
+    let previous_policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let current_policy = EffectivePolicy::fixed(3, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: secondary,
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        previous_policy.write_quorum,
+    );
+    let mut provisioning = ProvisioningIntent {
+        purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+            resource_uid: resource_uid.clone(),
+            spec_generation: 2,
+            desired_replicas: 3,
+            previous_configuration: previous.clone(),
+            previous_policy: previous_policy.clone(),
+            current_policy: current_policy.clone(),
+            target_replica_id: ReplicaId::new(3),
+        }),
+        pod_uid: PodUid::new("pod-3"),
+        pvc_uid: PvcUid::new("pvc-3"),
+        operation_id: OperationId::default(),
+    };
+    provisioning.operation_id = provisioning.expected_operation_id();
+    let target = provisioning.target_identity(&resource_uid);
+    let build_id = provisioning.scale_up_build_id(&resource_uid).unwrap();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        primary.replica_id,
+        previous
+            .members
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            }))
+            .collect(),
+        current_policy.write_quorum,
+    );
+    let mut intent = ScaleUpIntent {
+        operation_id: OperationId::default(),
+        resource_uid: resource_uid.clone(),
+        spec_generation: 2,
+        desired_replicas: 3,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: previous_policy.clone(),
+        current_policy: current_policy.clone(),
+        primary: primary.clone(),
+        target: target.clone(),
+        build_id: build_id.clone(),
+        snapshot_boundary_lsn: 0,
+        catch_up_boundary_lsn: 0,
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let evidence = ScaleUpConfigurationEvidence::Admission {
+        intent: intent.clone(),
+    };
+    let storage = StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid,
+        pod_uid: PodUid::new("pod-1"),
+        pvc_uid: PvcUid::new("pvc-1"),
+        initialization_id: derive_initialization_id(
+            &ResourceUid::new("resource-1"),
+            primary.replica_id,
+            &PodUid::new("pod-1"),
+            &PvcUid::new("pvc-1"),
+        ),
+        local_identity: primary.clone(),
+        effective_policy: if pc_cc_installed {
+            current_policy.clone()
+        } else {
+            previous_policy.clone()
+        },
+    };
+    let build_command = EnsureReplicaBuild {
+        operation_id: build_id.clone(),
+        local_replica_id: primary.replica_id,
+        expected_instance_id: primary.instance_id.clone(),
+        expected_agent_generation: primary.agent_generation.clone(),
+        target: target.clone(),
+        authority: None,
+        source_session_id: None,
+        retire: false,
+    };
+    let mut state = AgentState::new(storage);
+    state.highest_epoch = if pc_cc_installed {
+        current.epoch
+    } else {
+        previous.epoch
+    };
+    state.current_configuration = Some(if pc_cc_installed {
+        current.clone()
+    } else {
+        previous.clone()
+    });
+    state.previous_configuration = pc_cc_installed.then(|| previous.clone());
+    state.role = ReplicaRole::Primary;
+    state.read_status = AccessStatus::Granted;
+    state.write_status = AccessStatus::Granted;
+    state.admitted_policy = Some(if pc_cc_installed {
+        current_policy.clone()
+    } else {
+        previous_policy.clone()
+    });
+    state.previous_policy = pc_cc_installed.then(|| previous_policy.clone());
+    state.scale_up_evidence = pc_cc_installed.then(|| Box::new(evidence.clone()));
+    state.build_commands.insert(build_id.clone(), build_command);
+    let path = SqliteStore::metadata_database_path(data_root);
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let build_authority = BuildAuthority {
+        build_id: build_id.clone(),
+        kind: BuildAuthorityKind::Provisioning,
+        source: primary.clone(),
+        target: target.clone(),
+        current_configuration: previous.clone(),
+        replication_boundary_lsn: 0,
+    };
+    store.admit_build(&build_authority).await.unwrap();
+    store
+        .record_build_progress(&DurableBuildProgress {
+            authority: build_authority,
+            last_sequence: u64::from(build_completed),
+            durable_lsn: 0,
+            completed: build_completed,
+            catch_up_boundary_lsn: build_completed.then_some(0),
+        })
+        .await
+        .unwrap();
+    store
+        .admit(&AdmittedAuthority {
+            local_identity: primary.clone(),
+            transition_kind: pc_cc_installed.then_some(TransitionKind::ScaleUp),
+            previous_configuration: pc_cc_installed.then(|| previous.clone()),
+            current_configuration: if pc_cc_installed {
+                current.clone()
+            } else {
+                previous
+            },
+            switchover_handoff: None,
+            scale_up: pc_cc_installed.then(|| Box::new(evidence.clone())),
+            secondary_removal: None,
+        })
+        .await
+        .unwrap();
+    let current_only = EnsureConfiguration {
+        operation_id: intent.command_operation_id(ScaleUpStage::CurrentOnly, &primary, &current),
+        previous_configuration: None,
+        current_configuration: current.clone(),
+        previous_epoch: None,
+        current_epoch: current.epoch,
+        effective_policy: current_policy,
+        previous_policy: Some(previous_policy),
+        secondary_removal_evidence: None,
+        scale_up_evidence: Some(Box::new(evidence)),
+        local_replica_id: primary.replica_id,
+        expected_instance_id: primary.instance_id.clone(),
+        expected_agent_generation: primary.agent_generation.clone(),
+        transition_kind: TransitionKind::ScaleUp,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::Granted,
+        current_only: true,
+        retire_build_ids: vec![build_id.clone()],
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    ScaleUpSourceFixture {
+        store,
+        primary,
+        target,
+        build_id,
+        current_only,
+    }
+}
+
+fn authorized_request(
+    resource_uid: &str,
+    target: &ReplicaIdentity,
+    session: &str,
+    command: proto::execute_command_request::Command,
+) -> Request<proto::ExecuteCommandRequest> {
+    let mut request = Request::new(proto::ExecuteCommandRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: resource_uid.into(),
+        target: Some(target.clone().into()),
+        expected_process_session_id: session.into(),
+        command: Some(command),
+    });
+    request.metadata_mut().insert(
+        "authorization",
+        format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    request
+}
+
 fn free_address() -> SocketAddr {
     let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
     listener.local_addr().unwrap()
+}
+
+#[derive(Clone)]
+struct UnreachableResolver;
+
+impl ReplicaEndpointResolver for UnreachableResolver {
+    fn control_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+        "http://127.0.0.1:9".into()
+    }
+
+    fn replication_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+        "http://127.0.0.1:9".into()
+    }
+}
+
+async fn service_status(control: SocketAddr, target: &ReplicaIdentity) -> proto::AgentStatusReport {
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    let mut request = Request::new(proto::GetAgentStatusRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-1".into(),
+        replica_id: target.replica_id.value(),
+        expected_instance_id: target.instance_id.to_string(),
+    });
+    request.metadata_mut().insert(
+        "authorization",
+        format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    client.get_status(request).await.unwrap().into_inner()
+}
+
+#[tokio::test]
+async fn scale_up_source_service_startup_restores_completed_evidence_without_replaying_delivery() {
+    let directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(directory.path(), true, true).await;
+    let runtime = Arc::new(PodRuntime::new(
+        fixture.primary.clone(),
+        Arc::new(ReplayApplication),
+        fixture.store.clone(),
+    ));
+    let service = AgentService::new(
+        fixture.store.clone(),
+        runtime.clone(),
+        runtime.clone(),
+        "token",
+    )
+    .unwrap();
+    let control = free_address();
+    let replication = free_address();
+    let (ready, mut ready_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ready_rx.wait_for(|ready| *ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let status = service_status(control, &fixture.primary).await;
+    assert_eq!(status.write_status, proto::AccessStatus::Granted as i32);
+    assert!(status.builds.iter().any(|build| {
+        build.build_id == fixture.build_id.as_str()
+            && build.completed
+            && build.catch_up_boundary_lsn == Some(0)
+    }));
+    assert!(
+        runtime.snapshot().await.builds.is_empty(),
+        "completed source evidence must not reopen outbound delivery"
+    );
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    let response = client
+        .execute(authorized_request(
+            "resource-1",
+            &fixture.primary,
+            &status.process_session_id,
+            proto::execute_command_request::Command::EnsureConfiguration(Box::new(
+                kuberic_wire::configuration_command_to_proto(fixture.current_only.clone()),
+            )),
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .observation
+        .unwrap();
+    assert_eq!(response.write_status, proto::AccessStatus::Granted as i32);
+    assert!(response.builds.is_empty());
+    assert!(
+        fixture
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .retired_builds
+            .contains(&fixture.build_id)
+    );
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn scale_up_source_startup_ignores_incomplete_abandoned_delivery_until_reissued() {
+    let directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(directory.path(), false, false).await;
+    let runtime = Arc::new(PodRuntime::new(
+        fixture.primary.clone(),
+        Arc::new(ReplayApplication),
+        fixture.store.clone(),
+    ));
+    let service = AgentService::new(
+        fixture.store.clone(),
+        runtime.clone(),
+        runtime.clone(),
+        "token",
+    )
+    .unwrap();
+    let control = free_address();
+    let replication = free_address();
+    let (ready, mut ready_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let status = service_status(control, &fixture.primary).await;
+    assert!(status.builds.iter().any(|build| {
+        build.build_id == fixture.build_id.as_str()
+            && !build.completed
+            && build.catch_up_boundary_lsn.is_none()
+    }));
+    assert!(
+        runtime.snapshot().await.builds.is_empty(),
+        "startup must not resurrect incomplete source delivery without a fresh controller command"
+    );
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn scale_up_source_service_retirement_survives_pre_admission_restart() {
+    let directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(directory.path(), false, true).await;
+    let start = |store: Arc<SqliteStore>| {
+        let primary = fixture.primary.clone();
+        async move {
+            let runtime = Arc::new(PodRuntime::new(
+                primary,
+                Arc::new(ReplayApplication),
+                store.clone(),
+            ));
+            let service = AgentService::new(store, runtime.clone(), runtime, "token").unwrap();
+            let control = free_address();
+            let replication = free_address();
+            let (ready, ready_rx) = watch::channel(false);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+            (control, ready_rx, shutdown, server)
+        }
+    };
+    let (control, mut ready_rx, shutdown, server) = start(fixture.store.clone()).await;
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let status = service_status(control, &fixture.primary).await;
+    assert!(
+        status
+            .builds
+            .iter()
+            .any(|build| build.build_id == fixture.build_id.as_str())
+    );
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    client
+        .execute(authorized_request(
+            "resource-1",
+            &fixture.primary,
+            &status.process_session_id,
+            proto::execute_command_request::Command::EnsureReplicaBuild(
+                proto::EnsureReplicaBuildCommand {
+                    operation_id: fixture.build_id.to_string(),
+                    local_replica_id: fixture.primary.replica_id.value(),
+                    expected_instance_id: fixture.primary.instance_id.to_string(),
+                    expected_agent_generation: fixture.primary.agent_generation.to_string(),
+                    target: Some(fixture.target.clone().into()),
+                    authority: None,
+                    source_session_id: String::new(),
+                    retire: true,
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+
+    let (control, mut ready_rx, shutdown, server) = start(fixture.store.clone()).await;
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let restarted = service_status(control, &fixture.primary).await;
+    assert!(restarted.builds.is_empty());
+    assert_eq!(restarted.write_status, proto::AccessStatus::Granted as i32);
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn replica_host_scale_up_source_recovery_covers_pc_cc_and_abandoned_build_cuts() {
+    let pc_cc_directory = tempdir().unwrap();
+    let pc_cc = scale_up_source_fixture(pc_cc_directory.path(), true, true).await;
+    let pc_cc_control = free_address();
+    let mut owner = ReplicaHost::new(
+        ReplicaProcessConfig {
+            resource_uid: ResourceUid::new("resource-1"),
+            replica_id: pc_cc.primary.replica_id,
+            pod_uid: PodUid::new(pc_cc.primary.instance_id.as_str()),
+            pvc_uid: PvcUid::new("pvc-1"),
+            data_root: pc_cc_directory.path().to_path_buf(),
+            control_address: pc_cc_control,
+            replication_address: free_address(),
+            bearer_token: "token".into(),
+            rpc_deadline: std::time::Duration::from_millis(50),
+            transport_window_capacity: 8,
+        },
+        Arc::new(ReplayApplication),
+        ApplicationStorageState::Established,
+        Arc::new(UnreachableResolver),
+    )
+    .start()
+    .await
+    .unwrap();
+    let diagnostics = owner.handle().diagnostics().await.unwrap();
+    assert_eq!(diagnostics.write_status, "Granted");
+    assert!(diagnostics.builds.is_empty());
+    let status = service_status(pc_cc_control, &pc_cc.primary).await;
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{pc_cc_control}"))
+            .await
+            .unwrap();
+    client
+        .execute(authorized_request(
+            "resource-1",
+            &pc_cc.primary,
+            &status.process_session_id,
+            proto::execute_command_request::Command::EnsureConfiguration(Box::new(
+                kuberic_wire::configuration_command_to_proto(pc_cc.current_only.clone()),
+            )),
+        ))
+        .await
+        .unwrap();
+    owner.shutdown();
+    owner.wait().await.unwrap();
+
+    let cleanup_directory = tempdir().unwrap();
+    let cleanup = scale_up_source_fixture(cleanup_directory.path(), false, true).await;
+    let cleanup_control = free_address();
+    let config = |control_address| ReplicaProcessConfig {
+        resource_uid: ResourceUid::new("resource-1"),
+        replica_id: cleanup.primary.replica_id,
+        pod_uid: PodUid::new(cleanup.primary.instance_id.as_str()),
+        pvc_uid: PvcUid::new("pvc-1"),
+        data_root: cleanup_directory.path().to_path_buf(),
+        control_address,
+        replication_address: free_address(),
+        bearer_token: "token".into(),
+        rpc_deadline: std::time::Duration::from_millis(50),
+        transport_window_capacity: 8,
+    };
+    let mut owner = ReplicaHost::new(
+        config(cleanup_control),
+        Arc::new(ReplayApplication),
+        ApplicationStorageState::Established,
+        Arc::new(UnreachableResolver),
+    )
+    .start()
+    .await
+    .unwrap();
+    let status = service_status(cleanup_control, &cleanup.primary).await;
+    let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
+        "http://{cleanup_control}"
+    ))
+    .await
+    .unwrap();
+    client
+        .execute(authorized_request(
+            "resource-1",
+            &cleanup.primary,
+            &status.process_session_id,
+            proto::execute_command_request::Command::EnsureReplicaBuild(
+                proto::EnsureReplicaBuildCommand {
+                    operation_id: cleanup.build_id.to_string(),
+                    local_replica_id: cleanup.primary.replica_id.value(),
+                    expected_instance_id: cleanup.primary.instance_id.to_string(),
+                    expected_agent_generation: cleanup.primary.agent_generation.to_string(),
+                    target: Some(cleanup.target.clone().into()),
+                    authority: None,
+                    source_session_id: String::new(),
+                    retire: true,
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    owner.shutdown();
+    owner.wait().await.unwrap();
+    let mut restarted = ReplicaHost::new(
+        config(free_address()),
+        Arc::new(ReplayApplication),
+        ApplicationStorageState::Established,
+        Arc::new(UnreachableResolver),
+    )
+    .start()
+    .await
+    .unwrap();
+    let diagnostics = restarted.handle().diagnostics().await.unwrap();
+    assert_eq!(diagnostics.write_status, "Granted");
+    assert!(diagnostics.builds.is_empty());
+    assert!(
+        cleanup
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .retired_builds
+            .contains(&cleanup.build_id)
+    );
+    restarted.shutdown();
+    restarted.wait().await.unwrap();
 }
 
 #[tokio::test]
@@ -1106,6 +1677,7 @@ async fn restarted_agent_rejects_old_session_commands_without_mutating_store() {
                 }),
                 authority: None,
                 source_session_id: String::new(),
+                retire: false,
             },
         ),
     ];

@@ -16,7 +16,9 @@ use crate::types::{
     derive_initialization_id, derive_switchover_preparation_operation_id, derive_transition_id,
 };
 use crate::validation::ValidationError;
-use crate::validation::{validate_report_internal, validate_snapshot};
+use crate::validation::{
+    validate_report_internal, validate_snapshot, validate_transition_relationship,
+};
 
 mod replacement_cleanup;
 mod scale_up;
@@ -75,10 +77,11 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         return switchover_unsafe(snapshot, message, config);
     }
     if let Err(error) = validate_snapshot(snapshot) {
-        let stale_correction_identity = config
-            .allow_scale_up
-            .then(|| scale_up_stale_correction_identity(snapshot))
-            .flatten();
+        let stale_correction_identities = if config.allow_scale_up {
+            scale_up_stale_correction_identities(snapshot)
+        } else {
+            Vec::new()
+        };
         let recoverable_failover_conflict_identity = if config.allow_scale_up
             && let ValidationError::ConflictingReplicaConfiguration { replica_id, .. } = &error
         {
@@ -89,16 +92,14 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         let exact_stale_correction = matches!(
             &error,
             ValidationError::StaleReplicaEpoch { replica_id, .. }
-                if stale_correction_identity
-                    .as_ref()
-                    .is_some_and(|identity| identity.replica_id.value() == *replica_id)
+                if stale_correction_identities
+                    .iter()
+                    .any(|identity| identity.replica_id.value() == *replica_id)
         );
         if exact_stale_correction {
-            if let Err(other_error) = validate_snapshot_around_authorized_correction(
+            if let Err(other_error) = validate_snapshot_around_authorized_corrections(
                 snapshot,
-                stale_correction_identity
-                    .as_ref()
-                    .expect("exact stale correction identity exists"),
+                &stale_correction_identities,
             ) {
                 return unsafe_plan(
                     snapshot.status.clone(),
@@ -109,8 +110,12 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             // Continue through protocol-version, invalid-agent, observation,
             // and primary-failure arbitration before dispatching correction.
         } else if let Some(identity) = recoverable_failover_conflict_identity.as_ref() {
+            let mut authorized = stale_correction_identities;
+            if !authorized.contains(identity) {
+                authorized.push(identity.clone());
+            }
             if let Err(other_error) =
-                validate_snapshot_around_authorized_correction(snapshot, identity)
+                validate_snapshot_around_authorized_corrections(snapshot, &authorized)
             {
                 return unsafe_plan(
                     snapshot.status.clone(),
@@ -184,6 +189,11 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         };
     }
     if config.allow_scale_up
+        && let Some(plan) = scale_up::recover_local_acceptance(snapshot, config)
+    {
+        return plan;
+    }
+    if config.allow_scale_up
         && let Some(plan) = scale_up_accepted_correction(snapshot, config)
     {
         let accepted = snapshot
@@ -246,12 +256,6 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
                 )),
             requeue_after_seconds: config.stable_resync_seconds,
         };
-    }
-
-    if config.allow_scale_up
-        && let Some(plan) = scale_up::recover_local_acceptance(snapshot, config)
-    {
-        return plan;
     }
 
     if let Some(plan) = secondary_scale_down::recover_local_acceptance(snapshot, config) {
@@ -325,60 +329,141 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     evaluate_never_initialized(snapshot, config)
 }
 
-fn scale_up_stale_correction_identity(snapshot: &ObservationSnapshot) -> Option<ReplicaIdentity> {
-    if !scale_up_authority_active(snapshot) {
-        return None;
+fn scale_up_stale_correction_identities(snapshot: &ObservationSnapshot) -> Vec<ReplicaIdentity> {
+    if !scale_up_authority_active(snapshot) && snapshot.status.last_scale_up.is_none() {
+        return Vec::new();
     }
-    let accepted = &snapshot.status.topology.as_ref()?.configuration;
-    accepted.members.iter().find_map(|member| {
-        if member.role == ReplicaRole::Primary {
-            return None;
-        }
+    let Some(accepted) = snapshot
+        .status
+        .topology
+        .as_ref()
+        .map(|topology| &topology.configuration)
+    else {
+        return Vec::new();
+    };
+    let Some(policy) = snapshot.status.effective_policy.as_ref() else {
+        return Vec::new();
+    };
+    accepted
+        .members
+        .iter()
+        .filter_map(|member| {
+            let report = snapshot
+                .observation_for_identity(&member.identity)
+                .and_then(|observation| match &observation.agent {
+                    AgentObservation::Report(report) => Some(report.as_ref()),
+                    _ => None,
+                })?;
+            let key = crate::observation::ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            );
+            let fresh_session_sequence =
+                snapshot
+                    .previous_report_watermarks
+                    .get(&key)
+                    .is_none_or(|previous| {
+                        previous.process_session_id != report.process_session_id
+                            || report.report_sequence > previous.report_sequence
+                    });
+            let accepted_operation_id = OperationId::new(format!(
+                "scale-up-accepted-correction:{}:{}",
+                accepted.configuration_id, member.identity.replica_id
+            ));
+            let previous = report.current_configuration.as_ref()?;
+            let exact_previous_member = previous.members.iter().any(|previous_member| {
+                previous_member.identity == member.identity && previous_member.role == report.role
+            });
+            let accepted_failover = member.role != ReplicaRole::Primary
+                && validate_transition_relationship(
+                    TransitionKind::Failover,
+                    Some(previous),
+                    accepted,
+                    policy,
+                )
+                .is_ok();
+            let receipt_pc_cc = snapshot
+                .status
+                .last_scale_up
+                .as_deref()
+                .is_some_and(|receipt| {
+                    receipt.accepted_configuration == *accepted
+                        && receipt
+                            .accepted_configuration
+                            .members
+                            .iter()
+                            .any(|receipt_member| receipt_member.identity == member.identity)
+                        && previous == &receipt.intent.previous_configuration
+                        && receipt.intent.previous_configuration.members.iter().any(
+                            |previous_member| {
+                                previous_member.identity == member.identity
+                                    && previous_member.role == report.role
+                            },
+                        )
+                        && report.pending_operation_id.as_ref().is_none_or(|pending| {
+                            pending
+                                == &receipt.intent.command_operation_id(
+                                    crate::types::ScaleUpStage::PreviousCurrent,
+                                    &member.identity,
+                                    &receipt.accepted_configuration,
+                                )
+                        })
+                });
+            let accepted_pending_is_exact =
+                report.pending_operation_id.as_ref().is_none_or(|pending| {
+                    if pending != &accepted_operation_id {
+                        return false;
+                    }
+                    let expected = failover_configuration_command(
+                        previous,
+                        accepted,
+                        member,
+                        policy,
+                        accepted_operation_id.clone(),
+                        Some(0),
+                        AccessStatus::ReconfigurationPending,
+                        false,
+                        Vec::new(),
+                    );
+                    report.pending_configuration.as_deref() == Some(&expected)
+                });
+            (report.identity == member.identity
+                && report.resource_uid == snapshot.resource_uid
+                && report.reported_fault != Some(crate::types::FaultType::Permanent)
+                && report.epoch < accepted.epoch
+                && fresh_session_sequence
+                && exact_previous_member
+                && ((accepted_failover && accepted_pending_is_exact) || receipt_pc_cc))
+                .then_some(member.identity.clone())
+        })
+        .collect()
+}
+
+fn validate_snapshot_around_authorized_corrections(
+    snapshot: &ObservationSnapshot,
+    identities: &[ReplicaIdentity],
+) -> Result<(), ValidationError> {
+    let mut remaining = snapshot.clone();
+    for identity in identities {
         let report = snapshot
-            .observation_for_identity(&member.identity)
+            .observation_for_identity(identity)
             .and_then(|observation| match &observation.agent {
                 AgentObservation::Report(report) => Some(report.as_ref()),
                 _ => None,
-            })?;
-        let operation_id = OperationId::new(format!(
-            "scale-up-accepted-correction:{}:{}",
-            accepted.configuration_id, member.identity.replica_id
-        ));
-        (report.identity == member.identity
-            && report.resource_uid == snapshot.resource_uid
-            && report.reported_fault != Some(crate::types::FaultType::Permanent)
-            && report.epoch < accepted.epoch
-            && report
-                .pending_operation_id
-                .as_ref()
-                .is_none_or(|pending| pending == &operation_id))
-        .then_some(member.identity.clone())
-    })
-}
-
-fn validate_snapshot_around_authorized_correction(
-    snapshot: &ObservationSnapshot,
-    identity: &ReplicaIdentity,
-) -> Result<(), ValidationError> {
-    let report = snapshot
-        .observation_for_identity(identity)
-        .and_then(|observation| match &observation.agent {
-            AgentObservation::Report(report) => Some(report.as_ref()),
-            _ => None,
-        })
-        .ok_or(ValidationError::InvalidScaleUp(
-            "stale correction report is unavailable",
-        ))?;
-    validate_report_internal(report)?;
-    let mut remaining = snapshot.clone();
-    remaining
-        .replicas
-        .get_mut(&crate::observation::ReplicaObservationKey::new(
-            identity.replica_id,
-            identity.instance_id.clone(),
-        ))
-        .expect("exact authorized correction observation exists")
-        .agent = AgentObservation::Absent;
+            })
+            .ok_or(ValidationError::InvalidScaleUp(
+                "stale correction report is unavailable",
+            ))?;
+        validate_report_internal(report)?;
+        remaining
+            .replicas
+            .get_mut(&crate::observation::ReplicaObservationKey::new(
+                identity.replica_id,
+                identity.instance_id.clone(),
+            ))
+            .expect("exact authorized correction observation exists")
+            .agent = AgentObservation::Absent;
+    }
     validate_snapshot(&remaining)
 }
 
@@ -3541,6 +3626,7 @@ fn evaluate_provisioning(
                         target: target_identity,
                         authority: None,
                         source_session_id: None,
+                        retire: false,
                     })),
                 };
             }
@@ -3918,6 +4004,7 @@ fn evaluate_failover_repair(
                 target: repair.target,
                 authority: None,
                 source_session_id: None,
+                retire: false,
             })),
         });
     }

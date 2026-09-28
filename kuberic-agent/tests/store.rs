@@ -717,6 +717,7 @@ async fn scale_up_build_journal_replays_current_session_and_fences_retirement() 
         target: identity.local_identity.clone(),
         authority: Some(authority),
         source_session_id: Some(kuberic_protocol::types::ProcessSessionId::new("source-1")),
+        retire: false,
     };
     store.journal_build(&command).await.unwrap();
     command.source_session_id = Some(kuberic_protocol::types::ProcessSessionId::new("source-2"));

@@ -2083,6 +2083,7 @@ fn ensure_build_command(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuil
         source_session_id: command
             .source_session_id
             .map_or_else(String::new, |session| session.to_string()),
+        retire: command.retire,
     }
 }
 
@@ -3625,6 +3626,7 @@ mod tests {
                     target,
                     authority: None,
                     source_session_id: None,
+                    retire: false,
                 })),
                 source,
             ),

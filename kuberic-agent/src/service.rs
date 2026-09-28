@@ -626,6 +626,9 @@ where
                 .retired_builds
                 .contains(&command.operation_id)
             {
+                if command.authority.is_none() {
+                    continue;
+                }
                 self.coordinator.ensure_build(command).await?;
             }
         }

@@ -515,6 +515,40 @@ pub(super) fn cleanup(
     ) {
         return plan;
     }
+    let scale_up = cleanup
+        .provisioning
+        .scale_up()
+        .expect("validated cleanup has scale-up provisioning");
+    let source = configuration_primary(&scale_up.previous_configuration);
+    if accepted
+        .members
+        .iter()
+        .any(|member| member.identity == source.identity)
+        && let Some(source_report) = report(snapshot, &source.identity)
+    {
+        let build_id = cleanup
+            .provisioning
+            .scale_up_build_id(&snapshot.resource_uid)
+            .expect("validated cleanup has deterministic build ID");
+        if source_report
+            .builds
+            .iter()
+            .any(|build| build.build_id == build_id && build.target == cleanup.target)
+        {
+            return Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
+                    operation_id: build_id,
+                    local_replica_id: source.identity.replica_id,
+                    expected_instance_id: source.identity.instance_id.clone(),
+                    expected_agent_generation: source.identity.agent_generation.clone(),
+                    target: cleanup.target.clone(),
+                    authority: None,
+                    source_session_id: None,
+                    retire: true,
+                })),
+            };
+        }
+    }
     let target = &cleanup.target;
     let Some(exact) = cleanup_observation(snapshot, target) else {
         return wait(
@@ -685,6 +719,7 @@ fn prior_receipt_settled(snapshot: &ObservationSnapshot, receipt: &ScaleUpReceip
             report.previous_configuration.is_none()
                 && report.current_configuration.as_ref() == Some(configuration)
                 && report.epoch >= configuration.epoch
+                && report.pending_operation_id.is_none()
         });
         accepted_newer
             || (report.role == member.role
@@ -893,6 +928,64 @@ pub(super) fn recover_local_acceptance(
                 });
         if advanced_to_newer_transition {
             continue;
+        }
+        if let Some(pending) = report.pending_operation_id.as_ref() {
+            let pc_cc = configuration_command(
+                evidence.clone(),
+                &receipt.accepted_configuration,
+                member,
+                false,
+                failover_safe_lsn,
+            );
+            let current_only = configuration_command(
+                evidence.clone(),
+                &receipt.accepted_configuration,
+                member,
+                true,
+                failover_safe_lsn,
+            );
+            let expected = if pending == &pc_cc.operation_id {
+                Some(pc_cc)
+            } else if pending == &current_only.operation_id {
+                Some(current_only)
+            } else {
+                None
+            };
+            let Some(expected) = expected else {
+                return Some(wait(
+                    snapshot,
+                    snapshot.status.clone(),
+                    "ScaleUpHistoricalAcceptancePending",
+                    "local-convergence",
+                    Some(&receipt.intent.target),
+                    Some(&receipt.intent.operation_id),
+                    "an unrelated durable operation must complete before historical scale-up correction",
+                    config,
+                ));
+            };
+            let Some(frozen) = report.pending_configuration.as_deref() else {
+                return Some(unsafe_plan(
+                    snapshot.status.clone(),
+                    UnsafeReason::ContradictoryReplicaEvidence(format!(
+                        "accepted member {} omitted its pending historical scale-up correction",
+                        member.identity.replica_id
+                    )),
+                    config,
+                ));
+            };
+            if frozen != &expected {
+                return Some(unsafe_plan(
+                    snapshot.status.clone(),
+                    UnsafeReason::ContradictoryReplicaEvidence(format!(
+                        "accepted member {} mutated its pending historical scale-up correction",
+                        member.identity.replica_id
+                    )),
+                    config,
+                ));
+            }
+            return Some(Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(frozen.clone())),
+            });
         }
         let missed_failover_expansion = receipt.failover_evidence.is_some()
             && report.previous_configuration.is_none()
@@ -1713,6 +1806,40 @@ pub(super) fn invalid_candidate_binding(
     key: &crate::observation::ReplicaObservationKey,
     observation: &crate::observation::ReplicaObservation,
 ) -> bool {
+    if snapshot
+        .status
+        .scale_up_cleanup
+        .as_deref()
+        .is_some_and(|cleanup| {
+            cleanup.target.replica_id == key.replica_id
+                && cleanup.target.instance_id == key.instance_id
+                && matches!(observation.agent, AgentObservation::Invalid { .. })
+        })
+    {
+        return true;
+    }
+    if let Some(provisioning) = snapshot
+        .status
+        .provisioning
+        .as_ref()
+        .filter(|provisioning| provisioning.scale_up().is_some())
+    {
+        let target = provisioning.target_identity(&snapshot.resource_uid);
+        let accepted_contains_target = snapshot.status.topology.as_ref().is_some_and(|topology| {
+            topology
+                .configuration
+                .members
+                .iter()
+                .any(|member| member.identity == target)
+        });
+        if !accepted_contains_target
+            && key.replica_id == target.replica_id
+            && key.instance_id == target.instance_id
+            && matches!(observation.agent, AgentObservation::Invalid { .. })
+        {
+            return true;
+        }
+    }
     let Some(allocation) = snapshot
         .status
         .scale_up_allocation
@@ -1992,6 +2119,7 @@ pub(super) fn provisioning(
                                 target,
                                 authority: None,
                                 source_session_id: None,
+                                retire: false,
                             },
                         )),
                     };
@@ -2048,6 +2176,7 @@ pub(super) fn provisioning(
                         target,
                         authority: None,
                         source_session_id: None,
+                        retire: false,
                     })),
                 };
             }

@@ -767,6 +767,33 @@ pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<(
         ));
     }
     let identity = &state.identity.local_identity;
+    if command.retire {
+        if command.authority.is_some() || command.source_session_id.is_some() {
+            return Err(AgentError::CommandRejected(
+                "build retirement cannot carry delivery authority".into(),
+            ));
+        }
+        let existing = state
+            .build_commands
+            .get(&command.operation_id)
+            .ok_or_else(|| {
+                AgentError::CommandRejected(
+                    "build retirement requires exact durable build authority".into(),
+                )
+            })?;
+        if existing.retire
+            || existing.local_replica_id != command.local_replica_id
+            || existing.expected_instance_id != command.expected_instance_id
+            || existing.expected_agent_generation != command.expected_agent_generation
+            || existing.target != command.target
+            || existing.authority.is_some()
+        {
+            return Err(AgentError::CommandRejected(
+                "build retirement differs from exact durable source authority".into(),
+            ));
+        }
+        return Ok(());
+    }
     if state.retired_builds.contains(&command.operation_id) {
         return Err(AgentError::CommandRejected(
             "retired build authority cannot be reopened".into(),

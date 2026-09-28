@@ -1032,6 +1032,13 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
             {
                 return Err(WireError::MissingField("ensure_build.fence"));
             }
+            if command.retire
+                && (command.authority.is_some() || !command.source_session_id.is_empty())
+            {
+                return Err(WireError::InvalidAuthority(
+                    "build retirement cannot carry delivery authority".to_string(),
+                ));
+            }
             if target.replica_id != ReplicaId::new(command.local_replica_id)
                 || target.instance_id.as_str() != command.expected_instance_id
                 || target.agent_generation.as_str() != command.expected_agent_generation
@@ -1255,6 +1262,7 @@ pub fn normalize_execute_request(
                     .transpose()?,
                 source_session_id: (!command.source_session_id.is_empty())
                     .then(|| ProcessSessionId::new(command.source_session_id)),
+                retire: command.retire,
             }))
         }
     };
