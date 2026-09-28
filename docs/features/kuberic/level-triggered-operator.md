@@ -140,10 +140,10 @@ it manually. Important projections include:
 
 The checked-in CRD is generated from the Rust type and verified byte-for-byte
 by `scripts/check_level_triggered_documentation.sh`.
-At the final-review baseline it is **398,033 bytes**, leaving **1,967 bytes** before
-the current strict-below-400,000-byte regression guard fails. Representative
+At the final-review baseline it is **344,907 bytes**, leaving **5,093 bytes** before
+the restored strict-below-350,000-byte regression guard fails. Representative
 serialized scale-up status guards cover 2, 3, 4, 6, 10, and 18 members; the
-largest current 18-member sample is carried failover at **38,767 bytes**.
+largest current 18-member sample is carried failover at **26,353 bytes**.
 These are schema/status growth guards, not a supported-cardinality or
 Kubernetes object-limit claim. No validated maximum replica-count budget exists.
 
@@ -497,9 +497,16 @@ Carried failover preserves the original PC/expanded-CC recovery witnesses and
 the exact provisional write-closed configuration. Final activation additionally
 requires a separate post-fence certificate with independently sufficient PC/CC
 read quorums, exact report sessions and progress, the selected final primary,
-final epoch, and safe prefix. The bounded completion receipt retains both
-authorities so an exact returning provisional member is corrected to final PC/CC
-and then current-only; unrelated provisional or stale authority remains fenced.
+final epoch, and safe prefix. The certificate stores one typed witness record per
+replica and quorum membership by replica ID; exact incarnations, roles,
+configuration IDs, resource/attempt/build bindings, and the deterministic fence
+operation are validated against the frozen intent and provisional authority.
+The final configuration and safe prefix are reconstructed canonically from that
+authority and the selected witness. The bounded completion receipt retains the
+original recovery proof plus only the provisional-primary reference needed to
+reconstruct the provisional configuration, so an exact returning provisional
+member is corrected to final PC/CC and then current-only; unrelated provisional
+or stale authority remains fenced.
 Retirement-started and terminal tombstone records both prevent application Open
 on restart: a fresh process finishes interrupted retirement without reopening
 the removed application, then reports the exact receipt. Frozen quorum proof

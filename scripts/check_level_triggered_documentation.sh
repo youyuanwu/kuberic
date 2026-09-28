@@ -38,8 +38,9 @@ if checked_crd != generated_crd:
         fromfile="checked-in CRD", tofile="generated CRD",
     ))
     raise SystemExit(1)
-crd_guard = 400_000
+crd_guard = 350_000
 assert len(checked_crd) < crd_guard
+assert len(checked_crd) <= 345_000
 crd_headroom = crd_guard - len(checked_crd)
 schema = json.loads(checked_crd)
 properties = schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
@@ -61,6 +62,20 @@ assert set(scale_up) == {
     "operationId", "resourceUid", "specGeneration", "desiredReplicas",
     "previousConfiguration", "currentConfiguration", "previousPolicy", "currentPolicy",
     "primary", "target", "buildId", "snapshotBoundaryLsn", "catchUpBoundaryLsn",
+}
+failover = status["transition"]["properties"]["scaleUpFailover"]["properties"]
+assert set(failover["finalElection"]["properties"]) == {
+    "selectedPrimaryReplicaId", "witnesses", "previousReadQuorum", "currentReadQuorum",
+}
+final_witness = failover["finalElection"]["properties"]["witnesses"]["items"]["properties"]
+assert set(final_witness) == {
+    "replicaId", "processSessionId", "reportSequence", "currentProgress",
+    "committedLsn", "deactivatedLsn", "fenceOperationId",
+}
+receipt_failover = status["lastScaleUp"]["properties"]["failoverEvidence"]["properties"]
+assert set(receipt_failover) == {
+    "provisionalPrimaryReplicaId", "previousReadQuorum", "currentReadQuorum",
+    "finalElection",
 }
 allocation_schema = status["scaleUpAllocation"]
 allocation = allocation_schema["properties"]

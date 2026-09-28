@@ -1592,8 +1592,11 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                         transition.current_configuration != evidence.provisional_configuration
                     }
                     (Some(election_lsn), Some(final_election)) => {
-                        transition.current_configuration != final_election.final_configuration
-                            || election_lsn != final_election.safe_lsn
+                        final_election
+                            .final_configuration(&evidence.provisional_configuration)
+                            .as_ref()
+                            != Some(&transition.current_configuration)
+                            || Some(election_lsn) != final_election.safe_lsn()
                     }
                     _ => true,
                 }

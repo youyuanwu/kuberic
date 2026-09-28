@@ -348,49 +348,59 @@ fn validate_failover_configuration(
 
 fn validate_final_witnesses(
     evidence: &ScaleUpFailoverEvidence,
-    eligible_members: &ConfigurationDescriptor,
-    witnesses: &[ScaleUpFinalWitness],
-    quorum: u32,
-    required_primary: Option<&ReplicaIdentity>,
+    final_election: &ScaleUpFinalElectionEvidence,
 ) -> Result {
     let intent = &evidence.intent;
     let provisional = &evidence.provisional_configuration;
     let mut identities = BTreeSet::new();
-    for witness in witnesses {
+    for witness in &final_election.witnesses {
         let provisional_member = provisional
             .members
             .iter()
-            .find(|member| member.identity == witness.identity);
-        if witness.resource_uid != intent.resource_uid
-            || witness.process_session_id.is_empty()
+            .find(|member| member.identity.replica_id == witness.replica_id);
+        if witness.process_session_id.is_empty()
             || witness.report_sequence == 0
-            || !eligible_members
-                .members
-                .iter()
-                .any(|member| member.identity == witness.identity)
-            || provisional_member.is_none_or(|member| member.role != witness.role)
-            || !identities.insert(witness.identity.clone())
-            || witness.epoch != provisional.epoch
-            || witness.previous_configuration_id != intent.previous_configuration.configuration_id
-            || witness.current_configuration_id != provisional.configuration_id
+            || provisional_member.is_none()
+            || !identities.insert(witness.replica_id)
             || witness.current_progress < intent.catch_up_boundary_lsn
             || witness.committed_lsn < 0
-            || witness.deactivation_epoch != provisional.epoch
             || witness.deactivated_lsn < 0
-            || witness.write_status == AccessStatus::Granted
-            || witness.pending_operation_id.is_some()
-            || witness.retained_operation_id.as_ref()
-                != Some(&intent.command_operation_id(
+            || witness.fence_operation_id
+                != intent.command_operation_id(
                     ScaleUpStage::PreviousCurrent,
-                    &witness.identity,
+                    &provisional_member
+                        .expect("checked final witness provisional member")
+                        .identity,
                     provisional,
-                ))
+                )
         {
             return Err(invalid("invalid exact final scale-up election witness"));
         }
     }
+    Ok(())
+}
+
+fn validate_final_quorum(
+    final_election: &ScaleUpFinalElectionEvidence,
+    eligible_members: &ConfigurationDescriptor,
+    witnesses: &[ReplicaId],
+    quorum: u32,
+    required_primary: Option<&ReplicaIdentity>,
+) -> Result {
+    let mut identities = BTreeSet::new();
+    for replica_id in witnesses {
+        if final_election.witness(*replica_id).is_none()
+            || !eligible_members
+                .members
+                .iter()
+                .any(|member| member.identity.replica_id == *replica_id)
+            || !identities.insert(*replica_id)
+        {
+            return Err(invalid("invalid exact final scale-up election quorum"));
+        }
+    }
     if identities.len() < quorum as usize
-        || required_primary.is_some_and(|primary| !identities.contains(primary))
+        || required_primary.is_some_and(|primary| !identities.contains(&primary.replica_id))
     {
         return Err(invalid(
             "insufficient exact final scale-up election witnesses",
@@ -404,19 +414,19 @@ fn validate_final_election(
     final_election: &ScaleUpFinalElectionEvidence,
 ) -> Result {
     let provisional = &evidence.provisional_configuration;
-    let final_configuration = &final_election.final_configuration;
+    let final_configuration = final_election
+        .final_configuration(provisional)
+        .ok_or_else(|| invalid("final scale-up election selected an unknown primary"))?;
+    let safe_lsn = final_election
+        .safe_lsn()
+        .ok_or_else(|| invalid("final scale-up election omitted the selected witness"))?;
     validate_failover_configuration(
         evidence,
-        final_configuration,
+        &final_configuration,
         &evidence.intent.current_policy,
     )?;
-    if provisional
-        .epoch
-        .configuration_number
-        .checked_add(1)
-        .is_none_or(|next| final_configuration.epoch.configuration_number != next)
-        || final_election.safe_lsn < evidence.intent.catch_up_boundary_lsn
-        || final_configuration.primary_id == evidence.intent.primary.replica_id
+    if safe_lsn < evidence.intent.catch_up_boundary_lsn
+        || final_election.selected_primary_replica_id == evidence.intent.primary.replica_id
     {
         return Err(invalid(
             "final scale-up election did not advance the provisional fence",
@@ -430,41 +440,45 @@ fn validate_final_election(
                 && member.role == ReplicaRole::Primary
         })
         .ok_or_else(|| invalid("final scale-up election has no primary"))?;
-    validate_final_witnesses(
-        evidence,
+    validate_final_witnesses(evidence, final_election)?;
+    validate_final_quorum(
+        final_election,
         &evidence.intent.previous_configuration,
         &final_election.previous_read_quorum,
         evidence.intent.previous_policy.read_quorum,
         None,
     )?;
-    validate_final_witnesses(
-        evidence,
+    validate_final_quorum(
+        final_election,
         provisional,
         &final_election.current_read_quorum,
         evidence.intent.current_policy.read_quorum,
         Some(&primary.identity),
     )?;
-    for previous in &final_election.previous_read_quorum {
-        if let Some(current) = final_election
-            .current_read_quorum
+    let referenced = final_election
+        .previous_read_quorum
+        .iter()
+        .chain(&final_election.current_read_quorum)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if referenced.len() != final_election.witnesses.len()
+        || final_election
+            .witnesses
             .iter()
-            .find(|current| current.identity == previous.identity)
-            && current != previous
-        {
-            return Err(invalid(
-                "final scale-up quorum witnesses disagree on one exact report",
-            ));
-        }
+            .any(|witness| !referenced.contains(&witness.replica_id))
+    {
+        return Err(invalid(
+            "final scale-up election contains unreferenced witnesses",
+        ));
     }
     let selected = final_election
-        .current_read_quorum
-        .iter()
-        .find(|witness| witness.identity == primary.identity)
+        .witness(final_election.selected_primary_replica_id)
         .expect("validated final current quorum contains selected primary");
     let expected = final_election
         .current_read_quorum
         .iter()
-        .filter(|witness| witness.identity != evidence.intent.primary)
+        .filter(|replica_id| **replica_id != evidence.intent.primary.replica_id)
+        .filter_map(|replica_id| final_election.witness(*replica_id))
         .max_by(|left, right| {
             let left_safe = left.current_progress.min(left.deactivated_lsn);
             let right_safe = right.current_progress.min(right.deactivated_lsn);
@@ -472,12 +486,10 @@ fn validate_final_election(
                 .cmp(&right_safe)
                 .then_with(|| left.current_progress.cmp(&right.current_progress))
                 .then_with(|| left.committed_lsn.cmp(&right.committed_lsn))
-                .then_with(|| right.identity.replica_id.cmp(&left.identity.replica_id))
+                .then_with(|| right.replica_id.cmp(&left.replica_id))
         })
         .ok_or_else(|| invalid("final scale-up election has no surviving candidate"))?;
-    if selected != expected
-        || selected.current_progress.min(selected.deactivated_lsn) != final_election.safe_lsn
-    {
+    if selected != expected {
         return Err(invalid(
             "selected final primary did not certify the exact safe prefix",
         ));
@@ -539,11 +551,18 @@ pub fn validate_scale_up_failover_transition(
     if current == &evidence.provisional_configuration {
         return Ok(());
     }
-    if evidence
+    let Some(final_configuration) = evidence
         .final_election
         .as_deref()
-        .is_none_or(|final_election| current != &final_election.final_configuration)
-    {
+        .and_then(|final_election| {
+            final_election.final_configuration(&evidence.provisional_configuration)
+        })
+    else {
+        return Err(invalid(
+            "failover authority differs from provisional and final election evidence",
+        ));
+    };
+    if current != &final_configuration {
         return Err(invalid(
             "failover authority differs from provisional and final election evidence",
         ));
@@ -592,17 +611,15 @@ pub fn validate_scale_up_receipt(receipt: &ScaleUpReceipt) -> Result {
                 && member.role == ReplicaRole::Primary
         })
         .ok_or_else(|| invalid("receipt accepted configuration has no primary"))?;
-    if let Some(evidence) = &receipt.failover_evidence {
-        if evidence.intent != receipt.intent {
-            return Err(invalid(
-                "receipt failover evidence belongs to another attempt",
-            ));
-        }
+    if receipt.failover_evidence.is_some() {
+        let evidence = receipt
+            .expanded_failover_evidence()
+            .ok_or_else(|| invalid("failover receipt has invalid provisional authority"))?;
         let safe_lsn = receipt
             .failover_safe_lsn
             .ok_or_else(|| invalid("failover receipt omitted its fenced safe LSN"))?;
         validate_scale_up_failover_transition(
-            evidence,
+            &evidence,
             &receipt.accepted_configuration,
             &receipt.intent.current_policy,
         )?;
@@ -610,8 +627,11 @@ pub fn validate_scale_up_receipt(receipt: &ScaleUpReceipt) -> Result {
             .final_election
             .as_deref()
             .ok_or_else(|| invalid("failover receipt omitted final election evidence"))?;
-        if final_election.final_configuration != receipt.accepted_configuration
-            || final_election.safe_lsn != safe_lsn
+        if final_election
+            .final_configuration(&evidence.provisional_configuration)
+            .as_ref()
+            != Some(&receipt.accepted_configuration)
+            || final_election.safe_lsn() != Some(safe_lsn)
         {
             return Err(invalid(
                 "failover receipt differs from final election evidence",
@@ -684,8 +704,11 @@ pub fn validate_scale_up_configuration(command: &EnsureConfiguration) -> Result 
                 .final_election
                 .as_deref()
                 .is_some_and(|final_election| {
-                    command.failover_safe_lsn == Some(final_election.safe_lsn)
-                        && command.current_configuration == final_election.final_configuration
+                    command.failover_safe_lsn == final_election.safe_lsn()
+                        && final_election
+                            .final_configuration(&evidence.provisional_configuration)
+                            .as_ref()
+                            == Some(&command.current_configuration)
                 });
             if command.transition_kind != TransitionKind::Failover
                 || command.current_epoch != command.current_configuration.epoch
@@ -913,30 +936,17 @@ mod tests {
         progress: i64,
     ) -> ScaleUpFinalWitness {
         ScaleUpFinalWitness {
-            resource_uid: intent.resource_uid.clone(),
-            role: provisional
-                .members
-                .iter()
-                .find(|member| member.identity == identity)
-                .unwrap()
-                .role,
-            retained_operation_id: Some(intent.command_operation_id(
+            replica_id: identity.replica_id,
+            fence_operation_id: intent.command_operation_id(
                 ScaleUpStage::PreviousCurrent,
                 &identity,
                 provisional,
-            )),
-            identity,
+            ),
             process_session_id: ProcessSessionId::new(format!("final-session-{sequence}")),
             report_sequence: sequence,
-            epoch: provisional.epoch,
-            previous_configuration_id: intent.previous_configuration.configuration_id.clone(),
-            current_configuration_id: provisional.configuration_id.clone(),
             current_progress: progress,
             committed_lsn: progress,
-            deactivation_epoch: provisional.epoch,
             deactivated_lsn: progress,
-            write_status: AccessStatus::ReconfigurationPending,
-            pending_operation_id: None,
         }
     }
 
@@ -1216,13 +1226,18 @@ mod tests {
             previous_read_quorum: vec![previous],
             current_read_quorum: current,
             final_election: Some(Box::new(ScaleUpFinalElectionEvidence {
-                final_configuration: final_configuration.clone(),
-                safe_lsn: 11,
-                previous_read_quorum: vec![provisional_witness.clone()],
-                current_read_quorum: vec![provisional_witness, selected_witness],
+                selected_primary_replica_id: final_configuration.primary_id,
+                witnesses: vec![provisional_witness, selected_witness],
+                previous_read_quorum: vec![provisional_primary.replica_id],
+                current_read_quorum: vec![provisional_primary.replica_id, final_primary.replica_id],
             })),
         };
         assert_eq!(validate_scale_up_failover_evidence(&evidence), Ok(()));
+        let receipt_evidence = ScaleUpFailoverReceiptEvidence::from_evidence(&evidence).unwrap();
+        assert_eq!(receipt_evidence.expand(&intent), Some(evidence.clone()));
+        let mut wrong_receipt_reference = receipt_evidence;
+        wrong_receipt_reference.provisional_primary_replica_id = ReplicaId::new(99);
+        assert!(wrong_receipt_reference.expand(&intent).is_none());
 
         let command = EnsureConfiguration {
             operation_id: intent.command_operation_id(
@@ -1263,37 +1278,27 @@ mod tests {
         missing_evidence.final_election = None;
         assert!(validate_scale_up_configuration(&missing).is_err());
 
-        let mut stale_epoch = evidence.clone();
-        stale_epoch
+        let mut stale_primary = evidence.clone();
+        stale_primary
             .final_election
             .as_mut()
             .unwrap()
-            .current_read_quorum[1]
-            .epoch = intent.current_configuration.epoch;
-        assert!(validate_scale_up_failover_evidence(&stale_epoch).is_err());
+            .selected_primary_replica_id = intent.primary.replica_id;
+        assert!(validate_scale_up_failover_evidence(&stale_primary).is_err());
 
-        let mut mismatched_session = evidence.clone();
-        mismatched_session
+        let mut duplicate_witness = evidence.clone();
+        let duplicate = duplicate_witness.final_election.as_ref().unwrap().witnesses[0].clone();
+        duplicate_witness
             .final_election
             .as_mut()
             .unwrap()
-            .previous_read_quorum[0]
-            .process_session_id = ProcessSessionId::new("other-session");
-        assert!(validate_scale_up_failover_evidence(&mismatched_session).is_err());
+            .witnesses
+            .push(duplicate);
+        assert!(validate_scale_up_failover_evidence(&duplicate_witness).is_err());
 
         let mut mismatched_lsn = evidence.clone();
-        mismatched_lsn
-            .final_election
-            .as_mut()
-            .unwrap()
-            .current_read_quorum[0]
-            .current_progress = 12;
-        mismatched_lsn
-            .final_election
-            .as_mut()
-            .unwrap()
-            .current_read_quorum[0]
-            .deactivated_lsn = 12;
+        mismatched_lsn.final_election.as_mut().unwrap().witnesses[0].current_progress = 12;
+        mismatched_lsn.final_election.as_mut().unwrap().witnesses[0].deactivated_lsn = 12;
         assert!(validate_scale_up_failover_evidence(&mismatched_lsn).is_err());
     }
 
@@ -1355,8 +1360,8 @@ mod tests {
             },
             FrozenGrowthGuard {
                 phase: "carried-failover",
-                fixed_bytes: 3_328,
-                per_member_bytes: 2_048,
+                fixed_bytes: 3_200,
+                per_member_bytes: 1_400,
             },
             FrozenGrowthGuard {
                 phase: "cleanup",
@@ -1376,6 +1381,7 @@ mod tests {
         ];
         const QUADRATIC_MUTATION_SAMPLE_MEMBERS: u32 = 18;
         const QUADRATIC_BYTES_PER_MEMBER_PAIR: usize = 128;
+        const COMPACT_CARRIED_FAILOVER_18_MAX_BYTES: usize = 27_000;
 
         fn bound(guard: FrozenGrowthGuard, members: u32) -> usize {
             guard.fixed_bytes + usize::try_from(members).unwrap() * guard.per_member_bytes
@@ -1623,7 +1629,7 @@ mod tests {
                 &intent.target,
                 failover.epoch.configuration_number + 1,
             );
-            let final_previous_read_quorum = intent
+            let final_previous_read_quorum: Vec<ScaleUpFinalWitness> = intent
                 .previous_configuration
                 .members
                 .iter()
@@ -1642,36 +1648,53 @@ mod tests {
                     )
                 })
                 .collect();
-            let final_current_read_quorum = std::iter::once(intent.target.clone())
-                .chain(
-                    intent
-                        .current_configuration
-                        .members
-                        .iter()
-                        .filter(|member| member.identity != intent.target)
-                        .map(|member| member.identity.clone()),
-                )
-                .take(intent.current_policy.read_quorum as usize)
-                .map(|identity| {
-                    let progress = if identity == intent.target {
-                        intent.catch_up_boundary_lsn + 1
-                    } else {
-                        intent.catch_up_boundary_lsn
-                    };
-                    let sequence = u64::try_from(identity.replica_id.value()).unwrap() + 60;
-                    final_witness(&intent, &failover, identity, sequence, progress)
-                })
-                .collect();
+            let final_current_read_quorum: Vec<ScaleUpFinalWitness> =
+                std::iter::once(intent.target.clone())
+                    .chain(
+                        intent
+                            .current_configuration
+                            .members
+                            .iter()
+                            .filter(|member| member.identity != intent.target)
+                            .map(|member| member.identity.clone()),
+                    )
+                    .take(intent.current_policy.read_quorum as usize)
+                    .map(|identity| {
+                        let progress = if identity == intent.target {
+                            intent.catch_up_boundary_lsn + 1
+                        } else {
+                            intent.catch_up_boundary_lsn
+                        };
+                        let sequence = u64::try_from(identity.replica_id.value()).unwrap() + 60;
+                        final_witness(&intent, &failover, identity, sequence, progress)
+                    })
+                    .collect();
             let failover_evidence = ScaleUpFailoverEvidence {
                 intent: intent.clone(),
                 provisional_configuration: failover.clone(),
                 previous_read_quorum,
                 current_read_quorum,
                 final_election: Some(Box::new(ScaleUpFinalElectionEvidence {
-                    final_configuration: final_configuration.clone(),
-                    safe_lsn: intent.catch_up_boundary_lsn + 1,
-                    previous_read_quorum: final_previous_read_quorum,
-                    current_read_quorum: final_current_read_quorum,
+                    selected_primary_replica_id: final_configuration.primary_id,
+                    witnesses: final_previous_read_quorum
+                        .iter()
+                        .chain(&final_current_read_quorum)
+                        .fold(Vec::new(), |mut witnesses, witness| {
+                            if !witnesses.iter().any(|existing: &ScaleUpFinalWitness| {
+                                existing.replica_id == witness.replica_id
+                            }) {
+                                witnesses.push(witness.clone());
+                            }
+                            witnesses
+                        }),
+                    previous_read_quorum: final_previous_read_quorum
+                        .iter()
+                        .map(|witness| witness.replica_id)
+                        .collect(),
+                    current_read_quorum: final_current_read_quorum
+                        .iter()
+                        .map(|witness| witness.replica_id)
+                        .collect(),
                 })),
             };
             validate_scale_up_failover_transition(
@@ -1753,6 +1776,13 @@ mod tests {
 
         assert_eq!(samples.len(), FROZEN_GROWTH_GUARDS.len());
         assert_eq!(quadratic_mutations.len(), FROZEN_GROWTH_GUARDS.len());
+        assert!(
+            samples["carried-failover"].iter().any(|&(members, bytes)| {
+                members == QUADRATIC_MUTATION_SAMPLE_MEMBERS
+                    && bytes <= COMPACT_CARRIED_FAILOVER_18_MAX_BYTES
+            }),
+            "18-member carried failover exceeded compact final-election status guard"
+        );
         for guard in FROZEN_GROWTH_GUARDS {
             let phase_samples = samples
                 .get(guard.phase)

@@ -942,35 +942,79 @@ pub struct ScaleUpWitness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScaleUpFinalWitness {
-    pub resource_uid: ResourceUid,
-    pub identity: ReplicaIdentity,
-    pub role: ReplicaRole,
+    pub replica_id: ReplicaId,
     pub process_session_id: ProcessSessionId,
     #[schemars(range(min = 1))]
     pub report_sequence: u64,
-    pub epoch: Epoch,
-    pub previous_configuration_id: ConfigurationId,
-    pub current_configuration_id: ConfigurationId,
     #[schemars(range(min = 0))]
     pub current_progress: i64,
     #[schemars(range(min = 0))]
     pub committed_lsn: i64,
-    pub deactivation_epoch: Epoch,
     #[schemars(range(min = 0))]
     pub deactivated_lsn: i64,
-    pub write_status: AccessStatus,
-    pub pending_operation_id: Option<OperationId>,
-    pub retained_operation_id: Option<OperationId>,
+    pub fence_operation_id: OperationId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScaleUpFinalElectionEvidence {
-    pub final_configuration: ConfigurationDescriptor,
-    #[schemars(range(min = 0))]
-    pub safe_lsn: i64,
-    pub previous_read_quorum: Vec<ScaleUpFinalWitness>,
-    pub current_read_quorum: Vec<ScaleUpFinalWitness>,
+    pub selected_primary_replica_id: ReplicaId,
+    pub witnesses: Vec<ScaleUpFinalWitness>,
+    pub previous_read_quorum: Vec<ReplicaId>,
+    pub current_read_quorum: Vec<ReplicaId>,
+}
+
+impl ScaleUpFinalElectionEvidence {
+    pub fn selected_primary<'a>(
+        &self,
+        provisional: &'a ConfigurationDescriptor,
+    ) -> Option<&'a ReplicaIdentity> {
+        provisional
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == self.selected_primary_replica_id)
+            .map(|member| &member.identity)
+    }
+
+    pub fn final_configuration(
+        &self,
+        provisional: &ConfigurationDescriptor,
+    ) -> Option<ConfigurationDescriptor> {
+        let selected = self.selected_primary(provisional)?;
+        let final_configuration_number = provisional.epoch.configuration_number.checked_add(1)?;
+        let members = provisional
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity == *selected {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect();
+        Some(ConfigurationDescriptor::new(
+            Epoch::new(
+                provisional.epoch.data_loss_number,
+                final_configuration_number,
+            ),
+            self.selected_primary_replica_id,
+            members,
+            provisional.write_quorum,
+        ))
+    }
+
+    pub fn witness(&self, replica_id: ReplicaId) -> Option<&ScaleUpFinalWitness> {
+        self.witnesses
+            .iter()
+            .find(|witness| witness.replica_id == replica_id)
+    }
+
+    pub fn safe_lsn(&self) -> Option<i64> {
+        self.witness(self.selected_primary_replica_id)
+            .map(|witness| witness.current_progress.min(witness.deactivated_lsn))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1019,16 +1063,86 @@ pub struct ScaleUpCleanup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct ScaleUpFailoverReceiptEvidence {
+    pub provisional_primary_replica_id: ReplicaId,
+    pub previous_read_quorum: Vec<ScaleUpWitness>,
+    pub current_read_quorum: Vec<ScaleUpWitness>,
+    pub final_election: Box<ScaleUpFinalElectionEvidence>,
+}
+
+impl ScaleUpFailoverReceiptEvidence {
+    pub fn from_evidence(evidence: &ScaleUpFailoverEvidence) -> Option<Self> {
+        Some(Self {
+            provisional_primary_replica_id: evidence.provisional_configuration.primary_id,
+            previous_read_quorum: evidence.previous_read_quorum.clone(),
+            current_read_quorum: evidence.current_read_quorum.clone(),
+            final_election: evidence.final_election.clone()?,
+        })
+    }
+
+    pub fn expand(&self, intent: &ScaleUpIntent) -> Option<ScaleUpFailoverEvidence> {
+        intent
+            .current_configuration
+            .members
+            .iter()
+            .any(|member| member.identity.replica_id == self.provisional_primary_replica_id)
+            .then_some(())?;
+        let provisional_configuration_number = intent
+            .current_configuration
+            .epoch
+            .configuration_number
+            .checked_add(1)?;
+        let provisional_configuration = ConfigurationDescriptor::new(
+            Epoch::new(
+                intent.current_configuration.epoch.data_loss_number,
+                provisional_configuration_number,
+            ),
+            self.provisional_primary_replica_id,
+            intent
+                .current_configuration
+                .members
+                .iter()
+                .map(|member| ConfigurationMember {
+                    identity: member.identity.clone(),
+                    role: if member.identity.replica_id == self.provisional_primary_replica_id {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect(),
+            intent.current_policy.write_quorum,
+        );
+        Some(ScaleUpFailoverEvidence {
+            intent: intent.clone(),
+            provisional_configuration,
+            previous_read_quorum: self.previous_read_quorum.clone(),
+            current_read_quorum: self.current_read_quorum.clone(),
+            final_election: Some(self.final_election.clone()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 /// One bounded completed-addition proof retained for late local convergence.
 pub struct ScaleUpReceipt {
     pub intent: ScaleUpIntent,
     pub accepted_configuration: ConfigurationDescriptor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failover_evidence: Option<ScaleUpFailoverEvidence>,
+    pub failover_evidence: Option<ScaleUpFailoverReceiptEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub failover_safe_lsn: Option<i64>,
     pub current_only_write_quorum: Vec<ScaleUpWitness>,
+}
+
+impl ScaleUpReceipt {
+    pub fn expanded_failover_evidence(&self) -> Option<ScaleUpFailoverEvidence> {
+        self.failover_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.expand(&self.intent))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

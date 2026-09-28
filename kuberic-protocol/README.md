@@ -149,9 +149,14 @@ candidate at a time. Carried primary failure installs a provisional election
 epoch write-closed, collects fresh independently sufficient PC/CC progress,
 then persists a separate exact post-fence election certificate containing the
 final primary, final epoch, report sessions/progress, and safe LSN before
-catch-up/current-only activation. The completion receipt retains the original
-recovery witnesses, provisional configuration, and final election so an exact
-returning provisional member is corrected through final PC/CC and current-only.
+catch-up/current-only activation. The certificate is compact and structural:
+one typed witness table is referenced by the PC/CC quorum replica IDs, while
+exact incarnations, roles, epochs, configuration IDs, policy, and deterministic
+fence-operation bindings are reconstructed and validated against the frozen
+intent and provisional authority. The completion receipt retains the original
+recovery witnesses, a provisional-primary reference, and the final election so
+an exact returning provisional member is corrected through final PC/CC and
+current-only without re-embedding the full intent or configuration.
 The canonical PVC is operation-annotated and frozen before
 the Pod; same-name resources without exact provenance are not adopted. The
 candidate remains outside accepted membership until snapshot copy and

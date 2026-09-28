@@ -203,9 +203,9 @@ classic `kuberic.io/v1` remains unchanged. Its as-built behavior is:
 
 Protocol 8 and agent schema 3 are exact coordinated-deployment boundaries.
 Protocol 7 and earlier, plus schema 2, are rejected with no migration,
-mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 349,003 bytes under a
+mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 344,907 bytes under a
 strict-below-350,000-byte regression guard; the largest current representative
-18-member serialized scale-up status sample is carried failover at 22,017
+18-member serialized scale-up status sample is carried failover at 26,353
 bytes. These are growth guards, not a supported maximum replica-count budget.
 
 Validation includes pure protocol/model traces, runtime and durable agent crash

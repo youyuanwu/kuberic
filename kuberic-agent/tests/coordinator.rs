@@ -1966,21 +1966,39 @@ async fn final_reselection_and_provisional_receipt_recovery_pass_real_agent_admi
                         && let Some(transition) = status.transition.as_ref()
                         && transition.election_lsn == Some(11)
                     {
-                        let final_election = transition
+                        let evidence = transition
                             .scale_up_failover
                             .as_deref()
-                            .and_then(|evidence| evidence.final_election.as_deref())
+                            .expect("carried scale-up failover evidence");
+                        let final_election = evidence
+                            .final_election
+                            .as_deref()
                             .expect("final post-fence election evidence");
                         assert_eq!(
-                            final_election.final_configuration.primary_id,
+                            final_election.selected_primary_replica_id,
                             ReplicaId::new(3)
                         );
-                        assert_eq!(final_election.safe_lsn, 11);
-                        assert!(final_election.current_read_quorum.iter().any(|witness| {
-                            witness.identity.replica_id == ReplicaId::new(3)
-                                && witness.current_progress == 11
-                                && witness.deactivated_lsn == 11
-                        }));
+                        assert_eq!(
+                            final_election
+                                .final_configuration(&evidence.provisional_configuration)
+                                .as_ref(),
+                            Some(&transition.current_configuration)
+                        );
+                        assert_eq!(final_election.safe_lsn(), Some(11));
+                        assert!(
+                            final_election
+                                .current_read_quorum
+                                .contains(&ReplicaId::new(3))
+                        );
+                        assert!(
+                            final_election
+                                .witness(ReplicaId::new(3))
+                                .is_some_and(|witness| {
+                                    witness.replica_id == ReplicaId::new(3)
+                                        && witness.current_progress == 11
+                                        && witness.deactivated_lsn == 11
+                                })
+                        );
                     }
                     model.apply(change);
                 }
@@ -2410,7 +2428,7 @@ fn active_carried_failover_repairs_returning_provisional_member_before_current_o
     assert_fenced(&wrong_attempt, "wrong provisional attempt");
 
     let mut wrong_final_witness = model.fork();
-    wrong_final_witness
+    let final_election = wrong_final_witness
         .snapshot
         .status
         .transition
@@ -2421,10 +2439,14 @@ fn active_carried_failover_repairs_returning_provisional_member_before_current_o
         .unwrap()
         .final_election
         .as_mut()
+        .unwrap();
+    let witness_replica_id = final_election.current_read_quorum[0];
+    final_election
+        .witnesses
+        .iter_mut()
+        .find(|witness| witness.replica_id == witness_replica_id)
         .unwrap()
-        .current_read_quorum[0]
-        .epoch
-        .configuration_number -= 1;
+        .fence_operation_id = OperationId::new("wrong-final-fence");
     assert_fenced(&wrong_final_witness, "wrong final election witness");
 
     let Plan::Execute {

@@ -583,13 +583,20 @@ fn admit_scale_up_configuration(
                 .final_election
                 .as_deref()
                 .is_some_and(|final_election| {
-                    final_election.final_configuration == command.current_configuration
-                        && command.failover_safe_lsn == Some(final_election.safe_lsn)
-                        && final_election.current_read_quorum.iter().any(|witness| {
-                            witness.identity == new_primary.identity
-                                && witness.current_progress.min(witness.deactivated_lsn)
-                                    == final_election.safe_lsn
-                        })
+                    final_election
+                        .final_configuration(&evidence.provisional_configuration)
+                        .as_ref()
+                        == Some(&command.current_configuration)
+                        && command.failover_safe_lsn == final_election.safe_lsn()
+                        && final_election
+                            .witness(new_primary.identity.replica_id)
+                            .is_some_and(|witness| {
+                                final_election
+                                    .current_read_quorum
+                                    .contains(&new_primary.identity.replica_id)
+                                    && Some(witness.current_progress.min(witness.deactivated_lsn))
+                                        == final_election.safe_lsn()
+                            })
                 })
         };
         let original_attempt_installed = matches!(

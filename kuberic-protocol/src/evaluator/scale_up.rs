@@ -4,8 +4,8 @@ use crate::observation::{AgentBuildReport, AgentReport, ExactResourceObservation
 use crate::types::{
     CleanupResourceIdentity, PodUid, ProvisioningPurpose, PvcUid, ReplicaId, ScaleUpAllocation,
     ScaleUpCleanup, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence,
-    ScaleUpFinalElectionEvidence, ScaleUpFinalWitness, ScaleUpIntent, ScaleUpProvisioning,
-    ScaleUpReceipt, ScaleUpStage, ScaleUpWitness,
+    ScaleUpFailoverReceiptEvidence, ScaleUpFinalElectionEvidence, ScaleUpFinalWitness,
+    ScaleUpIntent, ScaleUpProvisioning, ScaleUpReceipt, ScaleUpStage, ScaleUpWitness,
 };
 use crate::validation::{
     validate_scale_up, validate_scale_up_cleanup, validate_scale_up_failover_evidence,
@@ -1009,7 +1009,17 @@ pub(super) fn recover_local_acceptance(
     if prior_receipt_settled(snapshot, receipt) {
         return None;
     }
-    let evidence = receipt.failover_evidence.as_ref().map_or_else(
+    let failover_evidence = receipt.expanded_failover_evidence();
+    if receipt.failover_evidence.is_some() && failover_evidence.is_none() {
+        return Some(unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::InvalidAcceptedAuthority(
+                "scale-up receipt has invalid compact provisional authority".into(),
+            ),
+            config,
+        ));
+    }
+    let evidence = failover_evidence.as_ref().map_or_else(
         || ScaleUpConfigurationEvidence::Admission {
             intent: receipt.intent.clone(),
         },
@@ -1220,8 +1230,7 @@ pub(super) fn recover_local_acceptance(
                 ))),
             });
         }
-        let stale_provisional_failover_authority = receipt
-            .failover_evidence
+        let stale_provisional_failover_authority = failover_evidence
             .as_ref()
             .is_some_and(|failover| exact_provisional_failover_report(report, member, failover));
         if stale_provisional_failover_authority {
@@ -2605,29 +2614,13 @@ fn witness(report: &AgentReport) -> Option<ScaleUpWitness> {
 
 fn final_witness(report: &AgentReport) -> Option<ScaleUpFinalWitness> {
     Some(ScaleUpFinalWitness {
-        resource_uid: report.resource_uid.clone(),
-        identity: report.identity.clone(),
-        role: report.role,
+        replica_id: report.identity.replica_id,
         process_session_id: report.process_session_id.clone(),
         report_sequence: report.report_sequence,
-        epoch: report.epoch,
-        previous_configuration_id: report
-            .previous_configuration
-            .as_ref()?
-            .configuration_id
-            .clone(),
-        current_configuration_id: report
-            .current_configuration
-            .as_ref()?
-            .configuration_id
-            .clone(),
         current_progress: report.current_progress,
         committed_lsn: report.committed_lsn,
-        deactivation_epoch: report.deactivation_epoch?,
         deactivated_lsn: report.deactivated_lsn?,
-        write_status: report.write_status,
-        pending_operation_id: report.pending_operation_id.clone(),
-        retained_operation_id: report.retained_operation_id.clone(),
+        fence_operation_id: report.retained_operation_id.clone()?,
     })
 }
 
@@ -2691,14 +2684,18 @@ fn witnessed_provisional_session(evidence: &ScaleUpFailoverEvidence, report: &Ag
         .final_election
         .as_deref()
         .is_some_and(|final_election| {
-            final_election
-                .previous_read_quorum
-                .iter()
-                .chain(&final_election.current_read_quorum)
-                .any(|witness| {
-                    witness.identity == report.identity
-                        && witness.process_session_id == report.process_session_id
-                })
+            final_election.witnesses.iter().any(|witness| {
+                witness.replica_id == report.identity.replica_id
+                    && evidence
+                        .provisional_configuration
+                        .members
+                        .iter()
+                        .any(|member| {
+                            member.identity == report.identity
+                                && member.identity.replica_id == witness.replica_id
+                        })
+                    && witness.process_session_id == report.process_session_id
+            })
         });
     initial || final_election
 }
@@ -3088,17 +3085,29 @@ fn finalize_fenced_failover(
         &candidate.identity,
         Epoch::new(provisional.epoch.data_loss_number, configuration_number),
     );
+    let previous_read_quorum = previous_reports
+        .iter()
+        .map(|report| report.identity.replica_id)
+        .collect();
+    let current_read_quorum = current_reports
+        .iter()
+        .map(|report| report.identity.replica_id)
+        .collect();
+    let mut witnesses = Vec::new();
+    for report in previous_reports.iter().chain(&current_reports) {
+        if !witnesses
+            .iter()
+            .any(|witness: &ScaleUpFinalWitness| witness.replica_id == report.identity.replica_id)
+            && let Some(witness) = final_witness(report)
+        {
+            witnesses.push(witness);
+        }
+    }
     let final_election = ScaleUpFinalElectionEvidence {
-        final_configuration: finalized.clone(),
-        safe_lsn,
-        previous_read_quorum: previous_reports
-            .iter()
-            .filter_map(|report| final_witness(report))
-            .collect(),
-        current_read_quorum: current_reports
-            .iter()
-            .filter_map(|report| final_witness(report))
-            .collect(),
+        selected_primary_replica_id: candidate.identity.replica_id,
+        witnesses,
+        previous_read_quorum,
+        current_read_quorum,
     };
     let mut status = snapshot.status.clone();
     let mut finalized_transition = transition.clone();
@@ -3675,7 +3684,9 @@ pub(super) fn transition(
             accepted_configuration: current.clone(),
             failover_evidence: match &evidence {
                 ScaleUpConfigurationEvidence::Admission { .. } => None,
-                ScaleUpConfigurationEvidence::Failover { evidence } => Some(evidence.clone()),
+                ScaleUpConfigurationEvidence::Failover { evidence } => {
+                    ScaleUpFailoverReceiptEvidence::from_evidence(evidence)
+                }
             },
             failover_safe_lsn: transition.election_lsn,
             current_only_write_quorum: current_only_witnesses,

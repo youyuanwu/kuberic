@@ -155,9 +155,13 @@ remain authorized, and retries failed unadmitted candidates only after exact
 endpoint→Pod→PVC cleanup. Carried failover first installs a write-closed
 provisional epoch, then uses fresh fenced PC/CC progress for final primary and
 safe-prefix selection before activation. Final commands carry a separate exact
-post-fence election certificate; the completion receipt retains both provisional
-and final authority so a returning provisional member can advance through final
-PC/CC and current-only without accepting unrelated stale authority. Protocol
+post-fence election certificate. Its typed witness table records replica/session,
+sequence, durable progress, deactivation progress, and the deterministic fence
+operation; quorum IDs and frozen authority reconstruct exact incarnations,
+configuration, policy, final epoch, and safe prefix. The completion receipt keeps
+that proof with a provisional-primary reference instead of duplicating the full
+intent/configuration, so a returning provisional member can advance through
+final PC/CC and current-only without accepting unrelated stale authority. Protocol
 8/schema 3 require a fresh coordinated deployment; classic v1 remains unchanged.
 These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in

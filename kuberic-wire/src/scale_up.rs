@@ -197,25 +197,13 @@ impl TryFrom<proto::ScaleUpWitness> for ScaleUpWitness {
 impl From<ScaleUpFinalWitness> for proto::ScaleUpFinalWitness {
     fn from(value: ScaleUpFinalWitness) -> Self {
         Self {
-            resource_uid: value.resource_uid.to_string(),
-            identity: Some(value.identity.into()),
+            replica_id: value.replica_id.value(),
             process_session_id: value.process_session_id.to_string(),
             report_sequence: value.report_sequence,
-            epoch: Some(value.epoch.into()),
-            previous_configuration_id: value.previous_configuration_id.to_string(),
-            current_configuration_id: value.current_configuration_id.to_string(),
             current_progress: value.current_progress,
             committed_lsn: value.committed_lsn,
-            deactivation_epoch: Some(value.deactivation_epoch.into()),
             deactivated_lsn: value.deactivated_lsn,
-            write_status: crate::convert::access_status_to_proto(value.write_status) as i32,
-            pending_operation_id: value
-                .pending_operation_id
-                .map_or_else(String::new, |id| id.to_string()),
-            retained_operation_id: value
-                .retained_operation_id
-                .map_or_else(String::new, |id| id.to_string()),
-            role: crate::convert::role_to_proto(value.role) as i32,
+            fence_operation_id: value.fence_operation_id.to_string(),
         }
     }
 }
@@ -225,59 +213,24 @@ impl TryFrom<proto::ScaleUpFinalWitness> for ScaleUpFinalWitness {
 
     fn try_from(value: proto::ScaleUpFinalWitness) -> Result<Self, Self::Error> {
         let witness = Self {
-            resource_uid: ResourceUid::new(value.resource_uid),
-            identity: required(value.identity, "scale_up_final_witness.identity")?.try_into()?,
-            role: role_from_proto(proto::ReplicaRole::try_from(value.role).map_err(|_| {
-                WireError::InvalidEnum {
-                    field: "scale_up_final_witness.role",
-                    value: value.role,
-                }
-            })?)?,
+            replica_id: ReplicaId::new(value.replica_id),
             process_session_id: ProcessSessionId::new(value.process_session_id),
             report_sequence: value.report_sequence,
-            epoch: required(value.epoch, "scale_up_final_witness.epoch")?.into(),
-            previous_configuration_id: ConfigurationId::new(value.previous_configuration_id),
-            current_configuration_id: ConfigurationId::new(value.current_configuration_id),
             current_progress: value.current_progress,
             committed_lsn: value.committed_lsn,
-            deactivation_epoch: required(
-                value.deactivation_epoch,
-                "scale_up_final_witness.deactivation_epoch",
-            )?
-            .into(),
             deactivated_lsn: value.deactivated_lsn,
-            write_status: access_status_from_proto(
-                proto::AccessStatus::try_from(value.write_status).map_err(|_| {
-                    WireError::InvalidEnum {
-                        field: "scale_up_final_witness.write_status",
-                        value: value.write_status,
-                    }
-                })?,
-            )?,
-            pending_operation_id: (!value.pending_operation_id.is_empty())
-                .then(|| OperationId::new(value.pending_operation_id)),
-            retained_operation_id: (!value.retained_operation_id.is_empty())
-                .then(|| OperationId::new(value.retained_operation_id)),
+            fence_operation_id: OperationId::new(value.fence_operation_id),
         };
-        if witness.resource_uid.is_empty()
-            || witness.identity.replica_id.value() <= 0
-            || witness.identity.instance_id.is_empty()
-            || witness.identity.agent_generation.is_empty()
+        if witness.replica_id.value() <= 0
             || witness.process_session_id.is_empty()
             || witness.report_sequence == 0
-            || witness.epoch.data_loss_number < 0
-            || witness.epoch.configuration_number < 0
-            || witness.previous_configuration_id.is_empty()
-            || witness.current_configuration_id.is_empty()
             || witness.current_progress < 0
             || witness.committed_lsn < 0
-            || witness.deactivation_epoch.data_loss_number < 0
-            || witness.deactivation_epoch.configuration_number < 0
             || witness.deactivated_lsn < 0
+            || witness.fence_operation_id.is_empty()
         {
             return Err(WireError::InvalidAuthority(
-                "final scale-up witness contains invalid identity, epoch, sequence, or progress"
-                    .into(),
+                "final scale-up witness contains invalid replica, sequence, or progress".into(),
             ));
         }
         Ok(witness)
@@ -287,17 +240,17 @@ impl TryFrom<proto::ScaleUpFinalWitness> for ScaleUpFinalWitness {
 impl From<ScaleUpFinalElectionEvidence> for proto::ScaleUpFinalElectionEvidence {
     fn from(value: ScaleUpFinalElectionEvidence) -> Self {
         Self {
-            final_configuration: Some(value.final_configuration.into()),
-            safe_lsn: value.safe_lsn,
+            selected_primary_replica_id: value.selected_primary_replica_id.value(),
+            witnesses: value.witnesses.into_iter().map(Into::into).collect(),
             previous_read_quorum: value
                 .previous_read_quorum
                 .into_iter()
-                .map(Into::into)
+                .map(ReplicaId::value)
                 .collect(),
             current_read_quorum: value
                 .current_read_quorum
                 .into_iter()
-                .map(Into::into)
+                .map(ReplicaId::value)
                 .collect(),
         }
     }
@@ -307,24 +260,36 @@ impl TryFrom<proto::ScaleUpFinalElectionEvidence> for ScaleUpFinalElectionEviden
     type Error = WireError;
 
     fn try_from(value: proto::ScaleUpFinalElectionEvidence) -> Result<Self, Self::Error> {
-        Ok(Self {
-            final_configuration: required(
-                value.final_configuration,
-                "scale_up_final_election.final_configuration",
-            )?
-            .try_into()?,
-            safe_lsn: value.safe_lsn,
+        let evidence = Self {
+            selected_primary_replica_id: ReplicaId::new(value.selected_primary_replica_id),
+            witnesses: value
+                .witnesses
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             previous_read_quorum: value
                 .previous_read_quorum
                 .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
+                .map(ReplicaId::new)
+                .collect(),
             current_read_quorum: value
                 .current_read_quorum
                 .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
-        })
+                .map(ReplicaId::new)
+                .collect(),
+        };
+        if evidence.selected_primary_replica_id.value() <= 0
+            || evidence
+                .previous_read_quorum
+                .iter()
+                .chain(&evidence.current_read_quorum)
+                .any(|replica_id| replica_id.value() <= 0)
+        {
+            return Err(WireError::InvalidAuthority(
+                "final scale-up election contains invalid authority or progress".into(),
+            ));
+        }
+        Ok(evidence)
     }
 }
 
@@ -436,6 +401,58 @@ impl TryFrom<proto::ScaleUpCleanup> for ScaleUpCleanup {
         };
         validate_scale_up_cleanup(&cleanup).map_err(authority)?;
         Ok(cleanup)
+    }
+}
+
+impl From<ScaleUpFailoverReceiptEvidence> for proto::ScaleUpFailoverReceiptEvidence {
+    fn from(value: ScaleUpFailoverReceiptEvidence) -> Self {
+        Self {
+            provisional_primary_replica_id: value.provisional_primary_replica_id.value(),
+            previous_read_quorum: value
+                .previous_read_quorum
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            current_read_quorum: value
+                .current_read_quorum
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            final_election: Some((*value.final_election).into()),
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpFailoverReceiptEvidence> for ScaleUpFailoverReceiptEvidence {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpFailoverReceiptEvidence) -> Result<Self, Self::Error> {
+        let evidence = Self {
+            provisional_primary_replica_id: ReplicaId::new(value.provisional_primary_replica_id),
+            previous_read_quorum: value
+                .previous_read_quorum
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            current_read_quorum: value
+                .current_read_quorum
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            final_election: Box::new(
+                required(
+                    value.final_election,
+                    "scale_up_failover_receipt.final_election",
+                )?
+                .try_into()?,
+            ),
+        };
+        if evidence.provisional_primary_replica_id.value() <= 0 {
+            return Err(WireError::InvalidAuthority(
+                "scale-up failover receipt contains invalid provisional authority".into(),
+            ));
+        }
+        Ok(evidence)
     }
 }
 
@@ -835,42 +852,40 @@ mod tests {
             intent.current_policy.write_quorum,
         );
         let final_witness = |identity: ReplicaIdentity, sequence: u64| ScaleUpFinalWitness {
-            resource_uid: intent.resource_uid.clone(),
-            role: failover
-                .members
-                .iter()
-                .find(|member| member.identity == identity)
-                .unwrap()
-                .role,
+            replica_id: identity.replica_id,
             process_session_id: ProcessSessionId::new(format!("final-session-{sequence}")),
             report_sequence: sequence,
-            epoch: failover.epoch,
-            previous_configuration_id: intent.previous_configuration.configuration_id.clone(),
-            current_configuration_id: failover.configuration_id.clone(),
             current_progress: intent.catch_up_boundary_lsn,
             committed_lsn: intent.catch_up_boundary_lsn,
-            deactivation_epoch: failover.epoch,
             deactivated_lsn: intent.catch_up_boundary_lsn,
-            write_status: AccessStatus::ReconfigurationPending,
-            pending_operation_id: None,
-            retained_operation_id: Some(intent.command_operation_id(
+            fence_operation_id: intent.command_operation_id(
                 ScaleUpStage::PreviousCurrent,
                 &identity,
                 &failover,
-            )),
-            identity,
+            ),
         };
         let mut finalized_evidence = evidence.clone();
+        let previous_witness = final_witness(intent.primary.clone(), 3);
+        let current_witness = final_witness(intent.target.clone(), 4);
         finalized_evidence.final_election = Some(Box::new(ScaleUpFinalElectionEvidence {
-            final_configuration,
-            safe_lsn: intent.catch_up_boundary_lsn,
-            previous_read_quorum: vec![final_witness(intent.primary.clone(), 3)],
-            current_read_quorum: vec![final_witness(intent.target.clone(), 4)],
+            selected_primary_replica_id: final_configuration.primary_id,
+            witnesses: vec![previous_witness, current_witness],
+            previous_read_quorum: vec![intent.primary.replica_id],
+            current_read_quorum: vec![intent.target.replica_id],
         }));
         let final_wire: proto::ScaleUpFailoverEvidence = finalized_evidence.clone().into();
         assert_eq!(
             ScaleUpFailoverEvidence::try_from(final_wire).unwrap(),
             finalized_evidence
+        );
+        let receipt_evidence =
+            ScaleUpFailoverReceiptEvidence::from_evidence(&finalized_evidence).unwrap();
+        let receipt_wire: proto::ScaleUpFailoverReceiptEvidence = receipt_evidence.clone().into();
+        let decoded_receipt = ScaleUpFailoverReceiptEvidence::try_from(receipt_wire).unwrap();
+        assert_eq!(decoded_receipt, receipt_evidence);
+        assert_eq!(
+            decoded_receipt.expand(&intent),
+            Some(finalized_evidence.clone())
         );
 
         let target = intent.target.clone();

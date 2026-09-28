@@ -185,33 +185,66 @@ mod tests {
         }
         let final_election = &failover["finalElection"]["properties"];
         for field in [
-            "finalConfiguration",
-            "safeLsn",
+            "selectedPrimaryReplicaId",
+            "witnesses",
             "previousReadQuorum",
             "currentReadQuorum",
         ] {
             assert!(final_election.get(field).is_some(), "{field}");
         }
-        assert_eq!(final_election["safeLsn"]["minimum"], 0.0);
-        let final_witness = &final_election["currentReadQuorum"]["items"]["properties"];
+        assert!(final_election.get("finalConfiguration").is_none());
+        assert_eq!(final_election["selectedPrimaryReplicaId"]["minimum"], 1.0);
+        let final_witness = &final_election["witnesses"]["items"]["properties"];
         for field in [
+            "replicaId",
             "processSessionId",
             "reportSequence",
-            "epoch",
-            "previousConfigurationId",
-            "currentConfigurationId",
             "currentProgress",
             "committedLsn",
-            "deactivationEpoch",
             "deactivatedLsn",
-            "retainedOperationId",
+            "fenceOperationId",
         ] {
             assert!(final_witness.get(field).is_some(), "{field}");
         }
+        for duplicated in [
+            "resourceUid",
+            "identity",
+            "role",
+            "epoch",
+            "previousConfigurationId",
+            "currentConfigurationId",
+            "deactivationEpoch",
+            "writeStatus",
+            "writeClosed",
+            "pendingOperationId",
+            "retainedOperationId",
+        ] {
+            assert!(final_witness.get(duplicated).is_none(), "{duplicated}");
+        }
+        assert_eq!(final_witness["replicaId"]["minimum"], 1.0);
         assert_eq!(final_witness["reportSequence"]["minimum"], 1.0);
         assert_eq!(final_witness["currentProgress"]["minimum"], 0.0);
         assert_eq!(final_witness["committedLsn"]["minimum"], 0.0);
         assert_eq!(final_witness["deactivatedLsn"]["minimum"], 0.0);
+        for quorum in ["previousReadQuorum", "currentReadQuorum"] {
+            assert_eq!(final_election[quorum]["items"]["minimum"], 1.0);
+        }
+        let receipt_failover =
+            &status["lastScaleUp"]["properties"]["failoverEvidence"]["properties"];
+        for field in [
+            "provisionalPrimaryReplicaId",
+            "previousReadQuorum",
+            "currentReadQuorum",
+            "finalElection",
+        ] {
+            assert!(receipt_failover.get(field).is_some(), "{field}");
+        }
+        assert!(receipt_failover.get("intent").is_none());
+        assert!(receipt_failover.get("provisionalConfiguration").is_none());
+        assert_eq!(
+            receipt_failover["provisionalPrimaryReplicaId"]["minimum"],
+            1.0
+        );
         let allocation = &status["scaleUpAllocation"]["properties"];
         for field in [
             "resourceUid",
@@ -248,8 +281,13 @@ mod tests {
 
         let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
         assert!(
-            generated.len() < 400_000,
+            generated.len() < 350_000,
             "generated CRD unexpectedly grew to {} bytes",
+            generated.len()
+        );
+        assert!(
+            generated.len() <= 345_000,
+            "compact final-election schema lost its reviewed headroom at {} bytes",
             generated.len()
         );
     }

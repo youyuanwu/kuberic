@@ -1548,40 +1548,27 @@ fn scale_up_failover_crash_fixture() -> (AgentState, EnsureConfiguration) {
         current_policy.write_quorum,
     );
     let final_witness = |identity: ReplicaIdentity, sequence: u64| ScaleUpFinalWitness {
-        resource_uid: intent.resource_uid.clone(),
-        role: failover
-            .members
-            .iter()
-            .find(|member| member.identity == identity)
-            .unwrap()
-            .role,
+        replica_id: identity.replica_id,
         process_session_id: ProcessSessionId::new(format!("final-session-{sequence}")),
         report_sequence: sequence,
-        epoch: failover.epoch,
-        previous_configuration_id: previous.configuration_id.clone(),
-        current_configuration_id: failover.configuration_id.clone(),
         current_progress: 9,
         committed_lsn: 9,
-        deactivation_epoch: failover.epoch,
         deactivated_lsn: 9,
-        write_status: AccessStatus::ReconfigurationPending,
-        pending_operation_id: None,
-        retained_operation_id: Some(intent.command_operation_id(
+        fence_operation_id: intent.command_operation_id(
             ScaleUpStage::PreviousCurrent,
             &identity,
             &failover,
-        )),
-        identity,
+        ),
     };
     let mut final_evidence = provisional_evidence.clone();
     final_evidence.final_election = Some(Box::new(ScaleUpFinalElectionEvidence {
-        final_configuration: final_configuration.clone(),
-        safe_lsn: 9,
-        previous_read_quorum: vec![final_witness(identities[1].clone(), 4)],
-        current_read_quorum: vec![
+        selected_primary_replica_id: final_configuration.primary_id,
+        witnesses: vec![
             final_witness(identities[1].clone(), 4),
             final_witness(identities[2].clone(), 5),
         ],
+        previous_read_quorum: vec![identities[1].replica_id],
+        current_read_quorum: vec![identities[1].replica_id, identities[2].replica_id],
     }));
     let mut state = AgentState::new(StorageIdentity {
         resource_uid: intent.resource_uid.clone(),
