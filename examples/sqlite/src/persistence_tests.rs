@@ -67,6 +67,138 @@ fn operations() -> Vec<Operation> {
     .collect()
 }
 
+#[tokio::test]
+async fn shrinking_wal_transaction_retains_exact_bytes_and_reconstructs_final_image() {
+    let producer_dir = directory();
+    let producer_path = producer_dir.path().join("producer.sqlite");
+    let wal_path = producer_dir.path().join("producer.sqlite-wal");
+    let conn = Connection::open(&producer_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA page_size=512;
+         PRAGMA auto_vacuum=FULL;
+         PRAGMA journal_mode=WAL;
+         PRAGMA wal_autocheckpoint=0;
+         PRAGMA cache_size=8;
+         PRAGMA cache_spill=ON;",
+    )
+    .unwrap();
+    let capture = |offset: usize, lsn, committed_lsn| {
+        let wal = fs::read(&wal_path).unwrap();
+        let frames = frames_from_wal_bytes(offset as u64, &wal[offset..], 512);
+        let frame_set = WalFrameSet {
+            checksum: WalFrameSet::compute_checksum(&frames),
+            frames,
+            db_size_pages: conn
+                .pragma_query_value(None, "page_count", |row| row.get(0))
+                .unwrap(),
+        };
+        let operation = Operation {
+            lsn,
+            committed_lsn,
+            data: serde_json::to_vec(&frame_set).unwrap().into(),
+        };
+        (wal.len(), frame_set, operation)
+    };
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE data(id INTEGER PRIMARY KEY, value BLOB NOT NULL);
+         WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100)
+         INSERT INTO data SELECT i, zeroblob(1800) FROM n;
+         COMMIT;",
+    )
+    .unwrap();
+    let (offset, initial_frames, initial) = capture(0, 1, 0);
+    conn.execute_batch(
+        "BEGIN;
+         UPDATE data SET value=zeroblob(1801);
+         DELETE FROM data;
+         COMMIT;",
+    )
+    .unwrap();
+    let (_, shrinking_frames, shrinking) = capture(offset, 2, 1);
+    assert!(shrinking_frames.db_size_pages < initial_frames.db_size_pages);
+    assert!(
+        shrinking_frames
+            .frames
+            .iter()
+            .any(|frame| frame.page_number > shrinking_frames.db_size_pages),
+        "the real transaction must spill pages subsequently removed by auto-vacuum"
+    );
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let expected_image = fs::read(&producer_path).unwrap();
+    assert_eq!(
+        expected_image.len(),
+        shrinking_frames.db_size_pages as usize * 512
+    );
+
+    let state_dir = directory();
+    let state = open(&state_dir);
+    state.apply(initial).await.unwrap();
+    state.commit(1).await.unwrap();
+    assert_eq!(rows(&state), 100);
+    let original_snapshot = state.snapshot(1).unwrap();
+    assert_eq!(
+        state.apply(shrinking.clone()).await.unwrap(),
+        progress(2, 1)
+    );
+    assert_eq!(
+        state.apply(shrinking.clone()).await.unwrap(),
+        progress(2, 1)
+    );
+    assert_eq!(rows(&state), 100);
+    // Reopen while the shrinking transaction is still applied-only.
+    drop(state);
+    let state = open(&state_dir);
+    assert_eq!(state.recovery_state().unwrap(), RecoveryState::Healthy);
+    assert_eq!(state.durable_progress().await.unwrap(), progress(2, 1));
+    assert!(state.verify_applied(&shrinking).await.unwrap());
+    let retained = state
+        .get_replication_operations(2, 2)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(retained, vec![shrinking]);
+    state.commit(2).await.unwrap();
+    assert_eq!(rows(&state), 0);
+    assert_eq!(
+        fs::read(state.materialize_committed().unwrap()).unwrap(),
+        expected_image
+    );
+    assert_eq!(state.snapshot(1).unwrap(), original_snapshot);
+    let snapshot = state.snapshot(2).unwrap();
+    drop(state);
+    let state = open(&state_dir);
+    assert_eq!(state.snapshot(2).unwrap(), snapshot);
+
+    let target_dir = directory();
+    let target = open(&target_dir);
+    let build = OperationId::new("shrinking-copy");
+    stage(&target, &build, &snapshot).await;
+    target.finish_copy(&build, 2, 2).await.unwrap();
+    drop(target);
+    let target = open(&target_dir);
+    assert_eq!(target.durable_progress().await.unwrap(), progress(2, 2));
+    assert_eq!(target.snapshot(2).unwrap(), snapshot);
+    let materialized = target.materialize_committed().unwrap();
+    assert_eq!(fs::read(&materialized).unwrap(), expected_image);
+    let copied = Connection::open(materialized).unwrap();
+    assert_eq!(
+        copied
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        copied
+            .query_row("SELECT COUNT(*) FROM data", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
 fn rows(state: &SqlitePersistence) -> i64 {
     let conn = Connection::open(state.materialize_committed().unwrap()).unwrap();
     conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))

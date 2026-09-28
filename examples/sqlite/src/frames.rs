@@ -30,11 +30,10 @@ impl WalFrameSet {
             || !size.is_power_of_two()
             || self.db_size_pages == 0
             || !self.verify_checksum()
-            || self.frames.iter().any(|frame| {
-                frame.page_number == 0
-                    || frame.page_number > self.db_size_pages
-                    || frame.data.len() != size
-            })
+            || self
+                .frames
+                .iter()
+                .any(|frame| frame.page_number == 0 || frame.data.len() != size)
         {
             return Err(std::io::Error::other(
                 "invalid WAL transaction geometry or checksum",
@@ -58,8 +57,16 @@ impl WalFrameSet {
             .map_err(std::io::Error::other)?;
         image.resize(len, 0);
         for frame in &self.frames {
+            // A shrinking transaction may spill pages that are removed at commit.
+            // Retain and checksum those bytes, but never write beyond the final image.
+            if frame.page_number > self.db_size_pages {
+                continue;
+            }
             let offset = (frame.page_number as usize - 1) * page_size;
-            image[offset..offset + page_size].copy_from_slice(&frame.data);
+            image
+                .get_mut(offset..offset + page_size)
+                .ok_or_else(|| std::io::Error::other("WAL frame is outside the final image"))?
+                .copy_from_slice(&frame.data);
         }
         Ok(())
     }

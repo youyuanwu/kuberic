@@ -111,7 +111,15 @@ pub(crate) struct DurableFrameLog {
 
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    File::open(path)?.sync_all()?;
+    {
+        // Path::parent("data") is the empty path, which denotes the caller's cwd.
+        let directory = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        File::open(directory)?.sync_all()?;
+    }
     Ok(())
 }
 
