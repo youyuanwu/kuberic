@@ -39,7 +39,7 @@ fn scale_up_model_is_level_triggered_sequential_and_restart_deterministic() {
 #[test]
 fn restart_drops_volatile_build_execution_and_fences_queued_old_reports() {
     let mut model = scale_up_model::Model::new(1, 2);
-    let source_id = loop {
+    let build_command = loop {
         let plan = model.plan();
         model.step();
         if model.has_pending_build() {
@@ -49,9 +49,10 @@ fn restart_drops_volatile_build_execution_and_fences_queued_old_reports() {
             else {
                 continue;
             };
-            break command.local_replica_id.value();
+            break command;
         }
     };
+    let source_id = build_command.local_replica_id.value();
     let (source_key, queued_report) = model
         .snapshot
         .replicas
@@ -106,6 +107,15 @@ fn restart_drops_volatile_build_execution_and_fences_queued_old_reports() {
                 KubernetesChange::PersistStatus { status } if status.topology == accepted
             )
         })),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(replayed),
+        } => {
+            assert_eq!(
+                replayed, build_command,
+                "stale report may only trigger the exact deterministic durable build replay"
+            );
+            assert_eq!(delayed.status.topology, accepted);
+        }
         other => panic!("queued old-session report escaped its fence: {other:?}"),
     }
 

@@ -621,6 +621,9 @@ where
             self.store.abandon_build(&command).await?;
             self.runtime.cancel_build(&command.operation_id).await?;
             let _command = self.command_lock.lock().await;
+            self.runtime
+                .settle_abandoned_build(&command.operation_id)
+                .await?;
             let state = self.store.load_state().await?;
             if state.retired_builds.contains(&command.operation_id) {
                 return Ok(());

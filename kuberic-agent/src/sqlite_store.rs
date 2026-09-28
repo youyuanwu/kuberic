@@ -676,12 +676,6 @@ impl AgentStore for SqliteStore {
                         "build abandonment conflicts with unrelated pending work".into(),
                     ));
                 }
-                if matching_build {
-                    state.next_effect_sequence = state
-                        .next_effect_sequence
-                        .max(pending.effect.sequence.saturating_add(1));
-                    state.pending_effect = None;
-                }
             }
             state.abandoned_builds.insert(command.operation_id.clone());
             write_agent_state(transaction, &state)

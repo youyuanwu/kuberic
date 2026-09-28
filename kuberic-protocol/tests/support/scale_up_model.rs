@@ -882,6 +882,11 @@ impl Model {
                             report
                                 .builds
                                 .retain(|build| build.build_id != command.operation_id);
+                            let build_operation =
+                                OperationId::new(format!("{}:build-replica", command.operation_id));
+                            if report.pending_operation_id.as_ref() == Some(&build_operation) {
+                                report.pending_operation_id = None;
+                            }
                         }
                     }
                     self.pending_build = None;
@@ -993,6 +998,10 @@ impl Model {
                 {
                     source.builds = vec![build.clone()];
                 }
+                source.pending_operation_id = Some(OperationId::new(format!(
+                    "{}:build-replica",
+                    build.build_id
+                )));
                 source.report_sequence += 1;
                 self.pending_build = Some(PendingBuild {
                     build,
@@ -1259,6 +1268,7 @@ impl Model {
         // reconstructs execution from that evidence.
         self.pending_build = None;
         let report = self.report_mut(replica_id);
+        report.pending_operation_id = None;
         report.process_session_id =
             ProcessSessionId::new(format!("{}-restart", report.process_session_id));
         report.report_sequence = 1;
@@ -1479,6 +1489,20 @@ impl Model {
                     receiver.insert(lsn, value.clone());
                     incarnation.insert(lsn, value);
                 }
+                let AgentObservation::Report(source) = &mut self
+                    .snapshot
+                    .replicas
+                    .get_mut(&pending.source)
+                    .unwrap()
+                    .agent
+                else {
+                    panic!("build source report")
+                };
+                let build_operation =
+                    OperationId::new(format!("{}:build-replica", pending.build.build_id));
+                source.pending_operation_id = None;
+                source.retained_operation_id = Some(build_operation);
+                source.report_sequence += 1;
                 self.pending_build = None;
             }
             _ => unreachable!(),

@@ -602,7 +602,17 @@ where
                 kuberic_runtime_internal::effects::RuntimeEffectAction::WaitForCatchup
             )
         });
+        let pending_abandoned_build = state.pending_effect.as_ref().is_some_and(|pending| {
+            matches!(
+                &pending.effect.action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                    build_id,
+                    ..
+                } if state.abandoned_builds.contains(build_id)
+            )
+        });
         if !pending_catchup
+            && !pending_abandoned_build
             && let Err(error) = self.coordinator.resume_pending().await
             && !(pending_acceptance
                 && matches!(

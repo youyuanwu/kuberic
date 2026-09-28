@@ -256,6 +256,29 @@ fn exact_build_pair<'a>(
     Ok(BuildPair::Exact(source_build, target_build))
 }
 
+fn source_build_operation_id(build_id: &OperationId) -> OperationId {
+    OperationId::new(format!("{build_id}:build-replica"))
+}
+
+fn source_build_command(
+    primary: &ConfigurationMember,
+    target: &ReplicaIdentity,
+    build_id: &OperationId,
+) -> Plan {
+    Plan::Execute {
+        command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
+            operation_id: build_id.clone(),
+            local_replica_id: primary.identity.replica_id,
+            expected_instance_id: primary.identity.instance_id.clone(),
+            expected_agent_generation: primary.identity.agent_generation.clone(),
+            target: target.clone(),
+            authority: None,
+            source_session_id: None,
+            retire: false,
+        })),
+    }
+}
+
 fn cleanup_observation<'a>(
     snapshot: &'a ObservationSnapshot,
     target: &ReplicaIdentity,
@@ -2120,8 +2143,56 @@ pub(super) fn provisioning(
                     );
                 }
             };
+            let build_operation_id = source_build_operation_id(&build_id);
+            let build_active =
+                source_report.pending_operation_id.as_ref() == Some(&build_operation_id);
+            let source_busy = source_report.pending_operation_id.is_some() && !build_active;
+            let build_claimed_complete =
+                source_report.retained_operation_id.as_ref() == Some(&build_operation_id);
+            let source_build_evidence = build(source_report, &build_id, &target);
+            let target_build_evidence = build(target_report, &build_id, &target);
+            let source_build_completed = source_build_evidence.is_some_and(|build| {
+                build.completed
+                    && build.catch_up_boundary_lsn.is_some_and(|boundary| {
+                        build.durable_lsn >= boundary && boundary >= build.replication_boundary_lsn
+                    })
+            });
             let (source_build, target_build) = match pair {
                 BuildPair::Missing => {
+                    if build_active {
+                        return wait(
+                            snapshot,
+                            status,
+                            "ScaleUpCopyActive",
+                            "copying",
+                            Some(&target),
+                            Some(&build_id),
+                            "the exact source build operation is still active",
+                            config,
+                        );
+                    }
+                    if source_busy {
+                        return wait(
+                            snapshot,
+                            status,
+                            "ScaleUpSourceBusy",
+                            "copying",
+                            Some(&target),
+                            Some(&build_id),
+                            "the source has unrelated durable work before copy dispatch",
+                            config,
+                        );
+                    }
+                    if build_claimed_complete {
+                        return freeze_cleanup(
+                            snapshot,
+                            provisioning,
+                            status,
+                            "ScaleUpBuildLivenessAmbiguous",
+                            false,
+                            config,
+                        );
+                    }
                     if let Some(plan) = publish_phase_if_changed(
                         snapshot,
                         &snapshot.status,
@@ -2133,25 +2204,40 @@ pub(super) fn provisioning(
                     ) {
                         return plan;
                     }
-                    return Plan::Execute {
-                        command: ProtocolCommand::EnsureReplicaBuild(Box::new(
-                            EnsureReplicaBuild {
-                                operation_id: build_id,
-                                local_replica_id: primary.identity.replica_id,
-                                expected_instance_id: primary.identity.instance_id.clone(),
-                                expected_agent_generation: primary
-                                    .identity
-                                    .agent_generation
-                                    .clone(),
-                                target,
-                                authority: None,
-                                source_session_id: None,
-                                retire: false,
-                            },
-                        )),
-                    };
+                    return source_build_command(primary, &target, &build_id);
                 }
                 BuildPair::Propagating => {
+                    if build_active {
+                        return wait(
+                            snapshot,
+                            status,
+                            "ScaleUpBoundaryPropagationPending",
+                            "catch-up",
+                            Some(&target),
+                            Some(&build_id),
+                            "the exact source build operation is still propagating durable evidence",
+                            config,
+                        );
+                    }
+                    if source_build_evidence.is_some() && !source_busy && !build_claimed_complete {
+                        return source_build_command(primary, &target, &build_id);
+                    }
+                    if source_build_evidence.is_none() && target_build_evidence.is_none() {
+                        return source_build_command(primary, &target, &build_id);
+                    }
+                    if source_busy
+                        || (build_claimed_complete && !source_build_completed)
+                        || (source_build_evidence.is_none() && target_build_evidence.is_some())
+                    {
+                        return freeze_cleanup(
+                            snapshot,
+                            provisioning,
+                            status,
+                            "ScaleUpBuildLivenessAmbiguous",
+                            false,
+                            config,
+                        );
+                    }
                     return wait(
                         snapshot,
                         status,
@@ -2166,14 +2252,39 @@ pub(super) fn provisioning(
                 BuildPair::Exact(source_build, target_build) => (source_build, target_build),
             };
             let Some(catch_up_boundary) = source_build.catch_up_boundary_lsn else {
-                return wait(
+                if build_active {
+                    return wait(
+                        snapshot,
+                        status,
+                        "ScaleUpBoundaryPending",
+                        "catch-up",
+                        Some(&target),
+                        Some(&build_id),
+                        "post-enumeration catch-up boundary is not frozen",
+                        config,
+                    );
+                }
+                if build_claimed_complete && source_build.completed {
+                    return wait(
+                        snapshot,
+                        status,
+                        "ScaleUpCatchUpPending",
+                        "catch-up",
+                        Some(&target),
+                        Some(&build_id),
+                        "completed source build evidence is awaiting receiver report propagation",
+                        config,
+                    );
+                }
+                if !source_busy && !build_claimed_complete {
+                    return source_build_command(primary, &target, &build_id);
+                }
+                return freeze_cleanup(
                     snapshot,
+                    provisioning,
                     status,
-                    "ScaleUpBoundaryPending",
-                    "catch-up",
-                    Some(&target),
-                    Some(&build_id),
-                    "post-enumeration catch-up boundary is not frozen",
+                    "ScaleUpBuildLivenessAmbiguous",
+                    false,
                     config,
                 );
             };
@@ -2183,29 +2294,52 @@ pub(super) fn provisioning(
                 || source_build.durable_lsn < catch_up_boundary
                 || target_build.durable_lsn < catch_up_boundary
             {
-                if let Some(plan) = publish_phase_if_changed(
+                if build_active {
+                    if let Some(plan) = publish_phase_if_changed(
+                        snapshot,
+                        &snapshot.status,
+                        "ScaleUpCatchUpPending",
+                        "catch-up",
+                        Some(&target),
+                        Some(&build_id),
+                        "receiver durable progress has not reached the frozen catch-up boundary",
+                    ) {
+                        return plan;
+                    }
+                    return wait(
+                        snapshot,
+                        status,
+                        "ScaleUpCatchUpPending",
+                        "catch-up",
+                        Some(&target),
+                        Some(&build_id),
+                        "receiver durable progress has not reached the frozen catch-up boundary",
+                        config,
+                    );
+                }
+                if !source_busy && !build_claimed_complete {
+                    return source_build_command(primary, &target, &build_id);
+                }
+                return freeze_cleanup(
                     snapshot,
-                    &snapshot.status,
-                    "ScaleUpCatchUpPending",
+                    provisioning,
+                    status,
+                    "ScaleUpBuildLivenessAmbiguous",
+                    false,
+                    config,
+                );
+            }
+            if build_active {
+                return wait(
+                    snapshot,
+                    status,
+                    "ScaleUpBuildSettlementPending",
                     "catch-up",
                     Some(&target),
                     Some(&build_id),
-                    "receiver durable progress has not reached the frozen catch-up boundary",
-                ) {
-                    return plan;
-                }
-                return Plan::Execute {
-                    command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
-                        operation_id: build_id,
-                        local_replica_id: primary.identity.replica_id,
-                        expected_instance_id: primary.identity.instance_id.clone(),
-                        expected_agent_generation: primary.identity.agent_generation.clone(),
-                        target,
-                        authority: None,
-                        source_session_id: None,
-                        retire: false,
-                    })),
-                };
+                    "completed build evidence is waiting for the exact source operation to settle",
+                    config,
+                );
             }
             let Some(configuration_number) = previous.epoch.configuration_number.checked_add(1)
             else {

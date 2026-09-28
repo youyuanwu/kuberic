@@ -1,17 +1,24 @@
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream;
 use kuberic_agent::hosting::PodRuntime;
 use kuberic_agent::process::{ApplicationStorageState, ReplicaHost, ReplicaProcessConfig};
 use kuberic_agent::provisioning::ObservedStorageIdentity;
+use kuberic_agent::runtime_adapter::RuntimeAdapter;
 use kuberic_agent::service::AgentService;
 use kuberic_agent::service::InitializationService;
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_agent::store::AgentStore;
-use kuberic_agent::transport::ReplicaEndpointResolver;
+use kuberic_agent::transport::{
+    GrpcOutboundDispatcher, ReliableTransport, ReplicaEndpointResolver, run_outbound,
+};
+use kuberic_agent::{AgentError, Result as AgentResult};
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, EffectivePolicy,
@@ -21,8 +28,11 @@ use kuberic_protocol::types::{
     TransitionKind, derive_agent_generation, derive_initialization_id,
 };
 use kuberic_runtime::application::{
-    OpenContext, OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
+    CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext, Operation,
+    OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
 };
+use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
+use kuberic_runtime::replicator::stream::OperationMetadata;
 use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
     Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
@@ -36,7 +46,7 @@ use kuberic_runtime_internal::authority::{
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction};
 use kuberic_wire::proto;
 use tempfile::tempdir;
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tonic::{Code, Request};
 
 #[allow(dead_code)]
@@ -503,6 +513,50 @@ struct NoopFactory;
 
 struct ReplayApplication;
 
+struct LoseCancelledBuildReply {
+    runtime: Arc<PodRuntime>,
+    lose_once: AtomicBool,
+}
+
+#[async_trait]
+impl kuberic_agent::runtime_adapter::RuntimeEffectExecutor for LoseCancelledBuildReply {
+    async fn apply_runtime_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> AgentResult<kuberic_runtime_internal::effects::RuntimeEffectResult> {
+        <PodRuntime as kuberic_agent::runtime_adapter::RuntimeEffectExecutor>::apply_runtime_effect(
+            self.runtime.as_ref(),
+            effect,
+        )
+        .await
+    }
+
+    async fn consume_cancelled_build_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> AgentResult<kuberic_runtime_internal::effects::RuntimeEffectResult> {
+        let result = <PodRuntime as kuberic_agent::runtime_adapter::RuntimeEffectExecutor>::consume_cancelled_build_effect(
+            self.runtime.as_ref(),
+            effect,
+        )
+        .await?;
+        if self.lose_once.swap(false, Ordering::SeqCst) {
+            return Err(AgentError::SessionRejected(
+                "injected lost cancelled-build consumption reply".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn cancel_build(&self, build_id: &OperationId) -> AgentResult<()> {
+        <PodRuntime as kuberic_agent::runtime_adapter::RuntimeEffectExecutor>::cancel_build(
+            self.runtime.as_ref(),
+            build_id,
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl StatefulServiceReplica for ReplayApplication {
     async fn open(self: Arc<Self>, context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
@@ -589,6 +643,248 @@ impl kuberic_runtime::engine::DurableState for ReplayApplication {
     ) -> RuntimeResult<kuberic_runtime::application::DurableApplicationProgress> {
         assert_eq!(lsn, 0);
         Ok(Default::default())
+    }
+}
+
+#[derive(Default)]
+struct ResumableCopyApplication {
+    chunks: Mutex<BTreeMap<(String, u64), Bytes>>,
+    progress: Mutex<DurableApplicationProgress>,
+    first_chunk_applied: AtomicUsize,
+    pause_second_enumeration: AtomicBool,
+    first_chunk_notify: Arc<Notify>,
+    resume_second_notify: Arc<Notify>,
+}
+
+impl ResumableCopyApplication {
+    fn source() -> Self {
+        Self {
+            pause_second_enumeration: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    fn applied_chunks(&self, build_id: &OperationId) -> Vec<(u64, Bytes)> {
+        let mut chunks = self
+            .chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((id, _), _)| id == build_id.as_str())
+            .map(|((_, sequence), bytes)| (*sequence, bytes.clone()))
+            .collect::<Vec<_>>();
+        chunks.sort_by_key(|(sequence, _)| *sequence);
+        chunks
+    }
+}
+
+#[async_trait]
+impl StatefulServiceReplica for ResumableCopyApplication {
+    async fn open(self: Arc<Self>, context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
+        let interfaces = context
+            .partition
+            .with_factory(Arc::new(
+                kuberic_runtime::replicator::DefaultReplicatorFactory::new(self.clone()),
+            ))
+            .create_replicator(self.clone(), None)
+            .await?;
+        let state_replicator = interfaces.state_replicator();
+        for mut stream in [
+            state_replicator.get_replication_stream().await?,
+            state_replicator.get_copy_stream().await?,
+        ] {
+            let application = Arc::downgrade(&self);
+            tokio::spawn(async move {
+                while let Some(operation) = stream.get_operation().await.unwrap() {
+                    let Some(application) = application.upgrade() else {
+                        break;
+                    };
+                    let result = match &operation.metadata {
+                        OperationMetadata::Replication { lsn, committed_lsn } => {
+                            application
+                                .apply(Operation {
+                                    lsn: *lsn,
+                                    committed_lsn: *committed_lsn,
+                                    data: operation.data.clone(),
+                                })
+                                .await
+                        }
+                        OperationMetadata::Copy { build_id, sequence } => {
+                            match application
+                                .apply_copy_chunk(
+                                    build_id,
+                                    *sequence,
+                                    CopyChunk {
+                                        data: operation.data.clone(),
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(()) => application.durable_progress().await,
+                                Err(error) => Err(error),
+                            }
+                        }
+                        OperationMetadata::CopyComplete {
+                            build_id,
+                            up_to_lsn,
+                            committed_lsn,
+                        } => {
+                            application
+                                .finish_copy(build_id, *up_to_lsn, *committed_lsn)
+                                .await
+                        }
+                    };
+                    match result {
+                        Ok(progress) => {
+                            let _ = operation.acknowledge(progress);
+                        }
+                        Err(error) => {
+                            let _ = operation.reject(error);
+                        }
+                    }
+                }
+            });
+        }
+        Ok(interfaces.replicator())
+    }
+
+    async fn change_role(&self, _role: ReplicaRole) -> RuntimeResult<RoleChange> {
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
+
+    async fn close(&self) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn abort(&self) {}
+}
+
+#[async_trait]
+impl StateProvider for ResumableCopyApplication {
+    async fn update_epoch(
+        &self,
+        _epoch: Epoch,
+        _previous_epoch_last_lsn: i64,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    async fn last_committed_lsn(&self) -> RuntimeResult<i64> {
+        Ok(self.progress.lock().unwrap().committed_lsn)
+    }
+
+    async fn get_copy_context(&self) -> RuntimeResult<OperationDataStream> {
+        Ok(Box::pin(stream::empty()))
+    }
+
+    async fn get_copy_state(
+        &self,
+        _up_to_lsn: i64,
+        _copy_context: OperationDataStream,
+    ) -> RuntimeResult<OperationDataStream> {
+        let pause = self.pause_second_enumeration.swap(false, Ordering::SeqCst);
+        let resume = self.resume_second_notify.clone();
+        Ok(Box::pin(stream::unfold(0_u8, move |index| {
+            let resume = resume.clone();
+            async move {
+                match index {
+                    0 => Some((Ok(Bytes::from_static(b"partial-copy-first")), 1)),
+                    1 => {
+                        if pause {
+                            resume.notified().await;
+                        }
+                        Some((Ok(Bytes::from_static(b"partial-copy-second")), 2))
+                    }
+                    _ => None,
+                }
+            }
+        })))
+    }
+
+    async fn on_data_loss(&self) -> RuntimeResult<bool> {
+        Ok(false)
+    }
+}
+
+#[async_trait]
+impl DurableState for ResumableCopyApplication {
+    async fn get_replication_operations(
+        &self,
+        _from_lsn: i64,
+        _to_lsn: i64,
+    ) -> RuntimeResult<RetainedOperationStream> {
+        Ok(Box::pin(stream::empty()))
+    }
+
+    async fn apply_copy_chunk(
+        &self,
+        build_id: &OperationId,
+        sequence: u64,
+        chunk: CopyChunk,
+    ) -> RuntimeResult<()> {
+        let key = (build_id.to_string(), sequence);
+        let mut chunks = self.chunks.lock().unwrap();
+        if let Some(existing) = chunks.get(&key)
+            && existing != &chunk.data
+        {
+            return Err(RuntimeError::Application(
+                "copy retry changed durable bytes".into(),
+            ));
+        }
+        chunks.insert(key, chunk.data);
+        if self.first_chunk_applied.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_chunk_notify.notify_waiters();
+        }
+        Ok(())
+    }
+
+    async fn verify_copy_chunk(
+        &self,
+        build_id: &OperationId,
+        sequence: u64,
+        chunk: &CopyChunk,
+    ) -> RuntimeResult<bool> {
+        Ok(self
+            .chunks
+            .lock()
+            .unwrap()
+            .get(&(build_id.to_string(), sequence))
+            .is_some_and(|stored| stored == &chunk.data))
+    }
+
+    async fn finish_copy(
+        &self,
+        _build_id: &OperationId,
+        up_to_lsn: i64,
+        committed_lsn: i64,
+    ) -> RuntimeResult<DurableApplicationProgress> {
+        let mut progress = self.progress.lock().unwrap();
+        progress.applied_lsn = progress.applied_lsn.max(up_to_lsn);
+        progress.committed_lsn = progress.committed_lsn.max(committed_lsn);
+        Ok(*progress)
+    }
+
+    async fn apply(&self, operation: Operation) -> RuntimeResult<DurableApplicationAck> {
+        let mut progress = self.progress.lock().unwrap();
+        progress.applied_lsn = progress.applied_lsn.max(operation.lsn);
+        progress.committed_lsn = progress.committed_lsn.max(operation.committed_lsn);
+        Ok(*progress)
+    }
+
+    async fn durable_progress(&self) -> RuntimeResult<DurableApplicationProgress> {
+        Ok(*self.progress.lock().unwrap())
+    }
+
+    async fn verify_applied(&self, operation: &Operation) -> RuntimeResult<bool> {
+        Ok(self.progress.lock().unwrap().applied_lsn >= operation.lsn)
+    }
+
+    async fn commit(&self, committed_lsn: i64) -> RuntimeResult<DurableApplicationProgress> {
+        let mut progress = self.progress.lock().unwrap();
+        progress.committed_lsn = progress.committed_lsn.max(committed_lsn);
+        Ok(*progress)
     }
 }
 
@@ -758,6 +1054,8 @@ struct ScaleUpSourceFixture {
     primary: ReplicaIdentity,
     target: ReplicaIdentity,
     build_id: OperationId,
+    provisioning: ProvisioningIntent,
+    current_policy: EffectivePolicy,
     current_only: EnsureConfiguration,
 }
 
@@ -941,7 +1239,7 @@ async fn scale_up_source_fixture(
         current_configuration: current.clone(),
         previous_epoch: None,
         current_epoch: current.epoch,
-        effective_policy: current_policy,
+        effective_policy: current_policy.clone(),
         previous_policy: Some(previous_policy),
         secondary_removal_evidence: None,
         scale_up_evidence: Some(Box::new(evidence)),
@@ -961,6 +1259,8 @@ async fn scale_up_source_fixture(
         primary,
         target,
         build_id,
+        provisioning,
+        current_policy: current_policy.clone(),
         current_only,
     }
 }
@@ -1000,6 +1300,32 @@ impl ReplicaEndpointResolver for UnreachableResolver {
 
     fn replication_endpoint(&self, _identity: &ReplicaIdentity) -> String {
         "http://127.0.0.1:9".into()
+    }
+}
+
+#[derive(Clone, Default)]
+struct MutableResolver {
+    endpoints: Arc<RwLock<BTreeMap<ReplicaIdentity, (SocketAddr, SocketAddr)>>>,
+}
+
+impl MutableResolver {
+    fn set(&self, identity: ReplicaIdentity, control: SocketAddr, replication: SocketAddr) {
+        self.endpoints
+            .write()
+            .unwrap()
+            .insert(identity, (control, replication));
+    }
+}
+
+impl ReplicaEndpointResolver for MutableResolver {
+    fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
+        let endpoint = self.endpoints.read().unwrap()[identity].0;
+        format!("http://{endpoint}")
+    }
+
+    fn replication_endpoint(&self, identity: &ReplicaIdentity) -> String {
+        let endpoint = self.endpoints.read().unwrap()[identity].1;
+        format!("http://{endpoint}")
     }
 }
 
@@ -1131,6 +1457,230 @@ async fn scale_up_source_startup_ignores_incomplete_abandoned_delivery_until_rei
 }
 
 #[tokio::test]
+async fn scale_up_transport_cancellation_reissues_exact_build_and_resumes_partial_copy() {
+    let source_directory = tempdir().unwrap();
+    let target_directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(source_directory.path(), false, false).await;
+
+    let mut target_state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("resource-1"),
+        pod_uid: fixture.provisioning.pod_uid.clone(),
+        pvc_uid: fixture.provisioning.pvc_uid.clone(),
+        initialization_id: fixture
+            .provisioning
+            .initialization_id(&ResourceUid::new("resource-1")),
+        local_identity: fixture.target.clone(),
+        effective_policy: fixture.current_policy.clone(),
+    });
+    target_state.scale_up_initialization = Some(fixture.provisioning.clone());
+    let target_store = Arc::new(
+        SqliteStore::create_authorized(
+            SqliteStore::metadata_database_path(target_directory.path()),
+            target_state,
+        )
+        .unwrap(),
+    );
+
+    let target_application = Arc::new(ResumableCopyApplication::default());
+    let target_runtime = Arc::new(PodRuntime::new(
+        fixture.target.clone(),
+        target_application.clone(),
+        target_store.clone(),
+    ));
+    let target_service = AgentService::new(
+        target_store.clone(),
+        target_runtime.clone(),
+        target_runtime.clone(),
+        "token",
+    )
+    .unwrap();
+    let target_control = free_address();
+    let target_replication = free_address();
+    let (target_ready, mut target_ready_rx) = watch::channel(false);
+    let (target_shutdown, target_shutdown_rx) = watch::channel(false);
+    let target_server = tokio::spawn(target_service.serve(
+        target_control,
+        target_replication,
+        target_ready,
+        target_shutdown_rx,
+    ));
+    target_ready_rx.wait_for(|ready| *ready).await.unwrap();
+
+    let source_application = Arc::new(ResumableCopyApplication::source());
+    let source_runtime = Arc::new(PodRuntime::new(
+        fixture.primary.clone(),
+        source_application.clone(),
+        fixture.store.clone(),
+    ));
+    let source_service = AgentService::new(
+        fixture.store.clone(),
+        source_runtime.clone(),
+        source_runtime.clone(),
+        "token",
+    )
+    .unwrap();
+    let source_session = source_service.sessions().local_session().clone();
+    let source_control = free_address();
+    let source_replication = free_address();
+    let (source_ready, mut source_ready_rx) = watch::channel(false);
+    let (source_shutdown, source_shutdown_rx) = watch::channel(false);
+    let source_server = tokio::spawn(source_service.serve(
+        source_control,
+        source_replication,
+        source_ready,
+        source_shutdown_rx,
+    ));
+    source_ready_rx.wait_for(|ready| *ready).await.unwrap();
+
+    let resolver = Arc::new(MutableResolver::default());
+    resolver.set(fixture.target.clone(), target_control, target_replication);
+    let transport = Arc::new(AsyncMutex::new(
+        ReliableTransport::new(source_session, 64).unwrap(),
+    ));
+    let dispatcher = Arc::new(
+        GrpcOutboundDispatcher::new(
+            source_runtime.clone(),
+            transport.clone(),
+            resolver.clone(),
+            "resource-1",
+            "token",
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap(),
+    );
+    let (outbound_shutdown, outbound_shutdown_rx) = watch::channel(false);
+    let outbound = tokio::spawn(run_outbound(
+        source_runtime.clone(),
+        transport,
+        dispatcher,
+        outbound_shutdown_rx,
+    ));
+
+    let source_status = service_status(source_control, &fixture.primary).await;
+    let exact_build = proto::EnsureReplicaBuildCommand {
+        operation_id: fixture.build_id.to_string(),
+        local_replica_id: fixture.primary.replica_id.value(),
+        expected_instance_id: fixture.primary.instance_id.to_string(),
+        expected_agent_generation: fixture.primary.agent_generation.to_string(),
+        target: Some(fixture.target.clone().into()),
+        authority: None,
+        source_session_id: String::new(),
+        retire: false,
+    };
+    let first_request = authorized_request(
+        "resource-1",
+        &fixture.primary,
+        &source_status.process_session_id,
+        proto::execute_command_request::Command::EnsureReplicaBuild(exact_build.clone()),
+    );
+    let first = tokio::spawn(async move {
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{source_control}"))
+            .await
+            .unwrap()
+            .execute(first_request)
+            .await
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        target_application.first_chunk_notify.notified(),
+    )
+    .await
+    .expect("candidate durably accepted the first copy chunk");
+    let partial = target_application.applied_chunks(&fixture.build_id);
+    assert_eq!(partial.len(), 1);
+    let first_bytes = partial[0].1.clone();
+    resolver.set(
+        fixture.target.clone(),
+        "127.0.0.1:9".parse().unwrap(),
+        "127.0.0.1:9".parse().unwrap(),
+    );
+    source_application.resume_second_notify.notify_waiters();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("cancelled source build request completed")
+            .unwrap()
+            .is_err()
+    );
+    let cancelled = fixture.store.load_state().await.unwrap();
+    assert!(
+        cancelled.pending_effect.is_none(),
+        "retryable transport cancellation must clear the active source effect"
+    );
+    assert!(!cancelled.abandoned_builds.contains(&fixture.build_id));
+    let source_partial = service_status(source_control, &fixture.primary).await;
+    let source_build = source_partial
+        .builds
+        .iter()
+        .find(|build| build.build_id == fixture.build_id.as_str())
+        .unwrap();
+    let frozen_snapshot_boundary = source_build.replication_boundary_lsn;
+    assert!(!source_build.completed);
+
+    resolver.set(fixture.target.clone(), target_control, target_replication);
+    let mut retry_client = proto::agent_control_client::AgentControlClient::connect(format!(
+        "http://{source_control}"
+    ))
+    .await
+    .unwrap();
+    let retried = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        retry_client.execute(authorized_request(
+            "resource-1",
+            &fixture.primary,
+            &source_status.process_session_id,
+            proto::execute_command_request::Command::EnsureReplicaBuild(exact_build),
+        )),
+    )
+    .await
+    .expect("exact build retry completed")
+    .unwrap()
+    .into_inner()
+    .observation
+    .unwrap();
+    let completed_source = retried
+        .builds
+        .iter()
+        .find(|build| build.build_id == fixture.build_id.as_str())
+        .unwrap();
+    assert!(completed_source.completed);
+    assert_eq!(
+        completed_source.replication_boundary_lsn,
+        frozen_snapshot_boundary
+    );
+    assert_eq!(completed_source.catch_up_boundary_lsn, Some(0));
+
+    let completed_target = service_status(target_control, &fixture.target).await;
+    let target_build = completed_target
+        .builds
+        .iter()
+        .find(|build| build.build_id == fixture.build_id.as_str())
+        .unwrap();
+    assert!(target_build.completed);
+    assert_eq!(
+        target_build.replication_boundary_lsn,
+        frozen_snapshot_boundary
+    );
+    assert_eq!(
+        target_build.catch_up_boundary_lsn,
+        completed_source.catch_up_boundary_lsn
+    );
+    let copied = target_application.applied_chunks(&fixture.build_id);
+    assert_eq!(copied.len(), 2);
+    assert_eq!(copied[0].1, first_bytes);
+    assert_eq!(copied[1].1, Bytes::from_static(b"partial-copy-second"));
+
+    outbound_shutdown.send_replace(true);
+    outbound.await.unwrap().unwrap();
+    source_shutdown.send_replace(true);
+    target_shutdown.send_replace(true);
+    source_server.await.unwrap().unwrap();
+    target_server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn scale_up_source_service_abandons_an_in_flight_copy_and_restarts_retired() {
     let directory = tempdir().unwrap();
     let fixture = scale_up_source_fixture(directory.path(), false, false).await;
@@ -1142,17 +1692,32 @@ async fn scale_up_source_service_abandons_an_in_flight_copy_and_restarts_retired
                 Arc::new(ReplayApplication),
                 store.clone(),
             ));
-            let service = AgentService::new(store, runtime.clone(), runtime, "token").unwrap();
+            let service =
+                AgentService::new(store, runtime.clone(), runtime.clone(), "token").unwrap();
             let control = free_address();
             let replication = free_address();
             let (ready, ready_rx) = watch::channel(false);
             let (shutdown, shutdown_rx) = watch::channel(false);
             let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
-            (control, ready_rx, shutdown, server)
+            (control, ready_rx, shutdown, server, runtime)
         }
     };
-    let (control, mut ready_rx, shutdown, server) = start(fixture.store.clone()).await;
+    let (control, mut ready_rx, shutdown, server, runtime) = start(fixture.store.clone()).await;
     ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let prior_sequence = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .next_effect_sequence;
+    RuntimeAdapter::new(fixture.store.clone(), runtime.clone())
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new("pre-abandonment-refresh"),
+            sequence: prior_sequence,
+            action: RuntimeEffectAction::RefreshApplicationProgress,
+        })
+        .await
+        .unwrap();
     let status = service_status(control, &fixture.primary).await;
     let build_request = proto::EnsureReplicaBuildCommand {
         operation_id: fixture.build_id.to_string(),
@@ -1240,10 +1805,28 @@ async fn scale_up_source_service_abandons_an_in_flight_copy_and_restarts_retired
     assert!(retired.pending_effect.is_none());
     assert!(retired.abandoned_builds.contains(&fixture.build_id));
     assert!(retired.retired_builds.contains(&fixture.build_id));
+    let retirement = retired.retained_result.as_ref().unwrap();
+    assert!(matches!(
+        &retirement.effect.action,
+        RuntimeEffectAction::RetireBuild(build_id) if build_id == &fixture.build_id
+    ));
+    assert_eq!(
+        retired.next_effect_sequence,
+        retirement.effect.sequence + 1,
+        "cancelled build and retirement must consume contiguous durable sequences"
+    );
+    RuntimeAdapter::new(fixture.store.clone(), runtime)
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new("post-abandonment-refresh"),
+            sequence: retired.next_effect_sequence,
+            action: RuntimeEffectAction::RefreshApplicationProgress,
+        })
+        .await
+        .expect("future runtime work must follow the consumed cancellation sequence");
     shutdown.send_replace(true);
     server.await.unwrap().unwrap();
 
-    let (control, mut ready_rx, shutdown, server) = start(fixture.store.clone()).await;
+    let (control, mut ready_rx, shutdown, server, _runtime) = start(fixture.store.clone()).await;
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         ready_rx.wait_for(|ready| *ready),
@@ -1254,6 +1837,151 @@ async fn scale_up_source_service_abandons_an_in_flight_copy_and_restarts_retired
     let restarted = service_status(control, &fixture.primary).await;
     assert!(restarted.builds.is_empty());
     assert_eq!(restarted.write_status, proto::AccessStatus::Granted as i32);
+    shutdown.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn scale_up_retirement_replays_lost_runtime_cancellation_consumption_reply() {
+    let directory = tempdir().unwrap();
+    let fixture = scale_up_source_fixture(directory.path(), false, false).await;
+    let runtime = Arc::new(PodRuntime::new(
+        fixture.primary.clone(),
+        Arc::new(ReplayApplication),
+        fixture.store.clone(),
+    ));
+    let executor = Arc::new(LoseCancelledBuildReply {
+        runtime: runtime.clone(),
+        lose_once: AtomicBool::new(true),
+    });
+    let service =
+        AgentService::new(fixture.store.clone(), runtime.clone(), executor, "token").unwrap();
+    let control = free_address();
+    let replication = free_address();
+    let (ready, mut ready_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+
+    let prior_sequence = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .next_effect_sequence;
+    RuntimeAdapter::new(fixture.store.clone(), runtime)
+        .execute(RuntimeEffect {
+            operation_id: OperationId::new("pre-lost-cancellation-refresh"),
+            sequence: prior_sequence,
+            action: RuntimeEffectAction::RefreshApplicationProgress,
+        })
+        .await
+        .unwrap();
+    let status = service_status(control, &fixture.primary).await;
+    let build_request = proto::EnsureReplicaBuildCommand {
+        operation_id: fixture.build_id.to_string(),
+        local_replica_id: fixture.primary.replica_id.value(),
+        expected_instance_id: fixture.primary.instance_id.to_string(),
+        expected_agent_generation: fixture.primary.agent_generation.to_string(),
+        target: Some(fixture.target.clone().into()),
+        authority: None,
+        source_session_id: String::new(),
+        retire: false,
+    };
+    let mut build_client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    let build_primary = fixture.primary.clone();
+    let build_session = status.process_session_id.clone();
+    let pending_build = build_request.clone();
+    let build = tokio::spawn(async move {
+        build_client
+            .execute(authorized_request(
+                "resource-1",
+                &build_primary,
+                &build_session,
+                proto::execute_command_request::Command::EnsureReplicaBuild(pending_build),
+            ))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if fixture
+                .store
+                .load_state()
+                .await
+                .unwrap()
+                .pending_effect
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(
+                        &pending.effect.action,
+                        RuntimeEffectAction::BuildReplica { build_id, .. }
+                            if build_id == &fixture.build_id
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source build became pending");
+
+    let retirement_request = || {
+        authorized_request(
+            "resource-1",
+            &fixture.primary,
+            &status.process_session_id,
+            proto::execute_command_request::Command::EnsureReplicaBuild(
+                proto::EnsureReplicaBuildCommand {
+                    retire: true,
+                    ..build_request.clone()
+                },
+            ),
+        )
+    };
+    let mut retire_client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    assert!(
+        retire_client.execute(retirement_request()).await.is_err(),
+        "the injected lost reply must leave retirement incomplete"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), build)
+            .await
+            .expect("cancelled build request completed")
+            .unwrap()
+            .is_err()
+    );
+    let lost = fixture.store.load_state().await.unwrap();
+    assert!(lost.abandoned_builds.contains(&fixture.build_id));
+    assert!(lost.pending_effect.as_ref().is_some_and(|pending| {
+        matches!(
+            &pending.effect.action,
+            RuntimeEffectAction::BuildReplica { build_id, .. }
+                if build_id == &fixture.build_id
+        )
+    }));
+    assert!(!lost.retired_builds.contains(&fixture.build_id));
+
+    retire_client
+        .execute(retirement_request())
+        .await
+        .expect("retry must replay the consumed runtime sequence")
+        .into_inner();
+    let retired = fixture.store.load_state().await.unwrap();
+    assert!(retired.pending_effect.is_none());
+    assert!(retired.retired_builds.contains(&fixture.build_id));
+    assert_eq!(
+        retired.next_effect_sequence,
+        retired.retained_result.as_ref().unwrap().effect.sequence + 1
+    );
+
     shutdown.send_replace(true);
     server.await.unwrap().unwrap();
 }
@@ -1292,7 +2020,13 @@ async fn scale_up_source_startup_finishes_retirement_after_abandonment_reply_los
         .await
         .unwrap();
     let abandoned = fixture.store.load_state().await.unwrap();
-    assert!(abandoned.pending_effect.is_none());
+    assert_eq!(
+        abandoned
+            .pending_effect
+            .as_ref()
+            .map(|pending| &pending.effect),
+        Some(&pending)
+    );
     assert!(abandoned.abandoned_builds.contains(&fixture.build_id));
     assert!(!abandoned.retired_builds.contains(&fixture.build_id));
 

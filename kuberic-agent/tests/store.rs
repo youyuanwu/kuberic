@@ -790,9 +790,15 @@ async fn source_build_abandonment_resolves_only_the_exact_pending_copy_effect() 
     };
     store.abandon_build(&retirement).await.unwrap();
     let abandoned = store.load_state().await.unwrap();
-    assert!(abandoned.pending_effect.is_none());
+    assert_eq!(
+        abandoned
+            .pending_effect
+            .as_ref()
+            .map(|pending| &pending.effect),
+        Some(&pending)
+    );
     assert!(abandoned.abandoned_builds.contains(&build_id));
-    assert_eq!(abandoned.next_effect_sequence, 8);
+    assert_eq!(abandoned.next_effect_sequence, 1);
     assert!(store.journal_build(&build).await.is_err());
 
     let unrelated_path = directory.path().join("unrelated.db");

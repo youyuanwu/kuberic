@@ -14,6 +14,15 @@ use crate::{AgentError, Result};
 pub trait RuntimeEffectExecutor: Send + Sync {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult>;
 
+    async fn consume_cancelled_build_effect(
+        &self,
+        _effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectResult> {
+        Err(AgentError::EffectConflict(
+            "runtime cannot consume a cancelled build effect".into(),
+        ))
+    }
+
     async fn cancel_configuration_work(&self) -> Result<()> {
         Ok(())
     }
@@ -27,6 +36,13 @@ pub trait RuntimeEffectExecutor: Send + Sync {
 impl RuntimeEffectExecutor for PodRuntime {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         Ok(self.apply_effect(effect).await?)
+    }
+
+    async fn consume_cancelled_build_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectResult> {
+        Ok(PodRuntime::consume_cancelled_build_effect(self, effect).await?)
     }
 
     async fn cancel_configuration_work(&self) -> Result<()> {
@@ -102,6 +118,55 @@ where
             return Ok(state.retained_result.map(|retained| retained.result));
         };
         self.execute(pending.effect).await.map(Some)
+    }
+
+    pub async fn settle_abandoned_build(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<RuntimeEffectResult>> {
+        let state = self.store.load_state().await?;
+        if !state.abandoned_builds.contains(build_id) {
+            return Err(AgentError::EffectConflict(
+                "build cancellation lacks durable abandonment".into(),
+            ));
+        }
+        let Some(pending) = state.pending_effect else {
+            return Ok(None);
+        };
+        let matching_build = matches!(
+            &pending.effect.action,
+            kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                build_id: pending_build_id,
+                ..
+            } if pending_build_id == build_id
+                && pending.effect.operation_id
+                    == OperationId::new(format!("{build_id}:build-replica"))
+        );
+        let matching_retirement = matches!(
+            &pending.effect.action,
+            kuberic_runtime_internal::effects::RuntimeEffectAction::RetireBuild(
+                pending_build_id
+            ) if pending_build_id == build_id
+                && pending.effect.operation_id
+                    == OperationId::new(format!("{build_id}:retire-abandoned-build"))
+        );
+        if matching_retirement {
+            return Ok(None);
+        }
+        if !matching_build {
+            return Err(AgentError::EffectConflict(
+                "build cancellation would consume unrelated pending work".into(),
+            ));
+        }
+        let effect = pending.effect;
+        let result = self
+            .executor
+            .consume_cancelled_build_effect(effect.clone())
+            .await?;
+        require_matching_result(&effect, &result)?;
+        self.store.mark_effect_applied(&effect).await?;
+        self.store.complete_effect(&result).await?;
+        Ok(Some(result))
     }
 
     pub async fn cancel_configuration_work(&self) -> Result<()> {

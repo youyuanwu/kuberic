@@ -10634,8 +10634,16 @@ fn scale_up_copy_model_closes_concurrent_writes_across_source_and_candidate_rest
 
     model.restart(build_command.local_replica_id.value());
     model.restart(target.replica_id.value());
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureReplicaBuild(replayed),
+    } = model.plan()
+    else {
+        panic!("source-only durable build evidence must reissue the exact command")
+    };
+    assert_eq!(*replayed, *build_command);
+    model.execute(ProtocolCommand::EnsureReplicaBuild(replayed));
     let Plan::Wait { status, .. } = model.plan() else {
-        panic!("source-only build evidence must wait")
+        panic!("an active exact build must not be dispatched twice")
     };
     model.apply_wait(status);
     let candidate = model.report_mut(target.replica_id.value()).clone();
@@ -10662,10 +10670,31 @@ fn scale_up_copy_model_closes_concurrent_writes_across_source_and_candidate_rest
     assert_eq!(candidate.builds[0].catch_up_boundary_lsn, None);
 
     model.restart(build_command.local_replica_id.value());
+    let frozen_snapshot_boundary = source.builds[0].replication_boundary_lsn;
+    let frozen_catch_up_boundary = source.builds[0].catch_up_boundary_lsn;
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureReplicaBuild(replayed),
+    } = model.plan()
+    else {
+        panic!("cancelled catch-up delivery must reissue the exact command")
+    };
+    assert_eq!(*replayed, *build_command);
+    model.execute(ProtocolCommand::EnsureReplicaBuild(replayed));
     let Plan::Wait { status, .. } = model.plan() else {
-        panic!("receiver boundary delivery must remain incomplete")
+        panic!("resumed exact build must remain single-dispatch")
     };
     model.apply_wait(status);
+    let source = model
+        .report_mut(build_command.local_replica_id.value())
+        .clone();
+    assert_eq!(
+        source.builds[0].replication_boundary_lsn,
+        frozen_snapshot_boundary
+    );
+    assert_eq!(
+        source.builds[0].catch_up_boundary_lsn,
+        frozen_catch_up_boundary
+    );
     let candidate = model.report_mut(target.replica_id.value()).clone();
     assert_eq!(candidate.current_progress, 12);
     assert_eq!(candidate.builds[0].durable_lsn, 12);
@@ -10678,6 +10707,20 @@ fn scale_up_copy_model_closes_concurrent_writes_across_source_and_candidate_rest
     for lsn in 1..=12 {
         assert_eq!(copied.get(&lsn), model.durable_source.get(&lsn));
     }
+
+    let build_operation = OperationId::new(format!("{}:build-replica", build_command.operation_id));
+    model
+        .report_mut(build_command.local_replica_id.value())
+        .pending_operation_id = Some(build_operation);
+    assert!(matches!(
+        model.plan(),
+        Plan::Wait { status, .. }
+            if status.conditions.iter().any(|condition|
+                condition.reason == "ScaleUpBuildSettlementPending")
+    ));
+    model
+        .report_mut(build_command.local_replica_id.value())
+        .pending_operation_id = None;
 
     let before = model.plan();
     assert_eq!(before, model.plan());
@@ -10692,6 +10735,56 @@ fn scale_up_copy_model_closes_concurrent_writes_across_source_and_candidate_rest
 }
 
 #[test]
+fn scale_up_partial_copy_with_ambiguous_source_operation_freezes_exact_cleanup() {
+    use scale_up_model::Model;
+    let mut model = Model::new(2, 3);
+    let build_command = loop {
+        match model.plan() {
+            Plan::Execute {
+                command: ProtocolCommand::EnsureReplicaBuild(command),
+            } => break command,
+            Plan::Execute { command } => model.execute(command),
+            Plan::Apply { changes } => {
+                for change in changes {
+                    model.apply(change);
+                }
+            }
+            other => panic!("copy setup: {other:?}"),
+        }
+    };
+    let target = build_command.target.clone();
+    model.execute(ProtocolCommand::EnsureReplicaBuild(build_command.clone()));
+    let Plan::Wait { status, .. } = model.plan() else {
+        panic!("active source build should wait")
+    };
+    model.apply_wait(status);
+    assert!(
+        !model
+            .report_mut(target.replica_id.value())
+            .builds
+            .is_empty(),
+        "receiver must retain partial durable evidence"
+    );
+    model
+        .report_mut(build_command.local_replica_id.value())
+        .pending_operation_id = Some(OperationId::new("unrelated-source-operation"));
+
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("ambiguous partial copy must freeze exact cleanup")
+    };
+    let cleanup = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => status.scale_up_cleanup.map(|c| *c),
+        _ => None,
+    });
+    let cleanup = cleanup.expect("exact authorized cleanup");
+    assert_eq!(cleanup.target, target);
+    assert_eq!(cleanup.provisioning.operation_id, {
+        let provisioning = model.snapshot.status.provisioning.as_ref().unwrap();
+        provisioning.operation_id.clone()
+    });
+}
+
+#[test]
 fn scale_up_permanent_candidate_failure_before_fence_freezes_cleanup() {
     use scale_up_model::Model;
     let mut model = Model::new(3, 4);
@@ -10701,6 +10794,7 @@ fn scale_up_permanent_candidate_failure_before_fence_freezes_cleanup() {
     assert!(model.snapshot.status.scale_up_admission_started.is_none());
     model.report_mut(4).healthy = false;
     model.report_mut(4).reported_fault = Some(FaultType::Permanent);
+    let failed_target = model.report_mut(4).identity.clone();
     let Plan::Apply { changes } = model.plan() else {
         panic!("permanent pre-admission candidate failure must freeze cleanup")
     };
@@ -10721,6 +10815,17 @@ fn scale_up_permanent_candidate_failure_before_fence_freezes_cleanup() {
             .members
             .len(),
         3
+    );
+    model.snapshot.status = status;
+    model.run(120);
+    let replacement = model.snapshot.status.last_scale_up.as_ref().unwrap();
+    assert_eq!(
+        replacement.intent.target.replica_id,
+        failed_target.replica_id
+    );
+    assert_ne!(
+        replacement.intent.target.instance_id,
+        failed_target.instance_id
     );
 }
 
