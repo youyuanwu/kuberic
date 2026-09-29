@@ -48,6 +48,10 @@ full-copy build before current-only completion.
 
 Serving starts fail-closed listeners before reconstructing live hosting from
 durable authority, role, access, pending effects, and retained stage evidence.
+An interrupted planned primary demotion restores only the fenced target
+replicator role until the journal completes the application transition. It must
+not reactivate the old Primary after handoff authority has replaced it; genuine
+Primary activation still settles the authority-verified prefix before its callback.
 Session replacement holds a delivery lease through runtime mutation. Shutdown
 revokes readiness and aborts the owned runtime and workers.
 
