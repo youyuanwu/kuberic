@@ -49,12 +49,20 @@ static NEXT_VFS: AtomicU64 = AtomicU64::new(1);
 
 impl ReplicationBarrier {
     pub fn register(persistence: Arc<SqlitePersistence>) -> std::io::Result<(Arc<Self>, String)> {
+        let committed_lsn = persistence.progress()?.committed_lsn;
+        Self::register_with_lsn(persistence, committed_lsn)
+    }
+
+    pub(crate) fn register_with_lsn(
+        persistence: Arc<SqlitePersistence>,
+        committed_lsn: i64,
+    ) -> std::io::Result<(Arc<Self>, String)> {
         let id = NEXT_VFS
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| std::io::Error::other("VFS instance counter exhausted"))?;
         let name = format!("kuberic-sqlite-{}-{id}", std::process::id());
         let barrier = Arc::new(Self {
-            last_lsn: AtomicI64::new(persistence.progress()?.committed_lsn),
+            last_lsn: AtomicI64::new(committed_lsn),
             persistence,
             worker: Mutex::new(None),
             fault_context: Mutex::new(None),

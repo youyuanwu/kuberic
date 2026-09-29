@@ -1,7 +1,7 @@
 //! Application-owned durable history, independent of the live SQL connection.
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use kuberic_protocol::types::OperationId;
 use kuberic_runtime::application::{
@@ -14,7 +14,8 @@ use crate::framelog::durable::{DurableFrameLog, replace, sync_directory};
 
 pub struct SqlitePersistence {
     root: PathBuf,
-    log: Mutex<DurableFrameLog>,
+    log: OnceLock<Mutex<DurableFrameLog>>,
+    opening: Mutex<()>,
     #[cfg(any(test, feature = "testing"))]
     fault: std::sync::atomic::AtomicU8,
     #[cfg(any(test, feature = "testing"))]
@@ -53,11 +54,16 @@ impl SqlitePersistence {
 
     /// Open fresh-v2 storage; classic data and missing established metadata are never imported.
     pub fn open(root: PathBuf) -> io::Result<Self> {
-        let root = std::path::absolute(root)?;
-        let log = DurableFrameLog::open(root.clone())?;
+        let persistence = Self::deferred(root)?;
+        persistence.initialize()?;
+        Ok(persistence)
+    }
+
+    pub(crate) fn deferred(root: PathBuf) -> io::Result<Self> {
         Ok(Self {
-            root,
-            log: Mutex::new(log),
+            root: std::path::absolute(root)?,
+            log: OnceLock::new(),
+            opening: Mutex::new(()),
             #[cfg(any(test, feature = "testing"))]
             fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -65,8 +71,29 @@ impl SqlitePersistence {
         })
     }
 
+    pub(crate) fn initialize(&self) -> io::Result<()> {
+        let _opening = self
+            .opening
+            .lock()
+            .map_err(|_| io::Error::other("SQLite initialization mutex poisoned"))?;
+        if self.log.get().is_none() {
+            let log = DurableFrameLog::open(self.root.clone())?;
+            self.log
+                .set(Mutex::new(log))
+                .map_err(|_| io::Error::other("SQLite persistence already initialized"))?;
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, DurableFrameLog>> {
         self.log
+            .get()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "SQLite persistence is not open",
+                )
+            })?
             .lock()
             .map_err(|_| io::Error::other("SQLite persistence mutex poisoned"))
     }

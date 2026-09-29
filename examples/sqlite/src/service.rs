@@ -1,4 +1,5 @@
 //! Public v2 lifecycle/provider adapter. Authority stays in ReplicaHost.
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -83,7 +84,27 @@ impl SqliteService {
         persistence: Arc<SqlitePersistence>,
         replication_address: String,
     ) -> std::io::Result<Self> {
-        let (barrier, vfs_name) = ReplicationBarrier::register(persistence.clone())?;
+        let committed_lsn = persistence.progress()?.committed_lsn;
+        Self::with_persistence(persistence, replication_address, committed_lsn)
+    }
+
+    /// Construct without touching application files. ReplicaHost must authorize
+    /// agent storage before invoking Open, which opens application persistence.
+    pub fn deferred(root: PathBuf, replication_address: String) -> std::io::Result<Self> {
+        Self::with_persistence(
+            Arc::new(SqlitePersistence::deferred(root)?),
+            replication_address,
+            0,
+        )
+    }
+
+    fn with_persistence(
+        persistence: Arc<SqlitePersistence>,
+        replication_address: String,
+        committed_lsn: i64,
+    ) -> std::io::Result<Self> {
+        let (barrier, vfs_name) =
+            ReplicationBarrier::register_with_lsn(persistence.clone(), committed_lsn)?;
         Ok(Self {
             sql: Arc::new(Mutex::new(SqliteConnection::default())),
             request_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -193,6 +214,13 @@ impl SqliteService {
 #[async_trait]
 impl StatefulServiceReplica for SqliteService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        self.persistence.initialize().map_err(persistence_error)?;
+        self.barrier.reset_receipt(
+            self.persistence
+                .progress()
+                .map_err(persistence_error)?
+                .committed_lsn,
+        );
         *self.partition.lock().expect("partition") = Some(context.partition.clone());
         let interfaces = context
             .partition

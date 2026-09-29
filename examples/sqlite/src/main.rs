@@ -57,9 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         ApplicationStorageState::Established
     };
-    let persistence = Arc::new(SqlitePersistence::open(application_root)?);
-    let application = Arc::new(SqliteService::new(
-        persistence,
+    let application = Arc::new(SqliteService::deferred(
+        application_root,
         format!(
             "http://{}",
             SocketAddr::new(config.pod_ip, config.replication_address.port())
@@ -146,6 +145,8 @@ mod tests {
             .unwrap();
         assert!(source.contains("ReplicaHost::new("));
         assert!(source.contains("SqlitePersistence::is_fresh_empty"));
+        assert!(source.contains("SqliteService::deferred("));
+        assert!(!source.contains("SqlitePersistence::open("));
     }
     use clap::CommandFactory;
 }

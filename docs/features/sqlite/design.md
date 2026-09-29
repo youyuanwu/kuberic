@@ -215,7 +215,14 @@ controls are absent from production-default builds.
 
 There is no `--demo` or application-owned self-promotion. `ReplicaHost` needs
 agent-authorized fresh initialization or matching established metadata; running
-the binary does not grant SQL access. The
+the binary does not grant SQL access. Startup classifies application storage
+without creating files and constructs a deferred service. Only its v2 `Open`
+callback opens SQLite persistence, after `ReplicaHost` has initialized or
+validated agent metadata. An interruption while waiting for
+`InitializeAgentStore` therefore leaves fresh application storage empty and
+retryable. Genuinely established application data without agent metadata still
+reports `Unsafe` and rejects initialization; it is never reclassified as fresh.
+The
 [entry point](../../../examples/sqlite/src/main.rs) accepts resource/replica,
 Pod/PVC identity, namespace, advertised Pod IP, bearer token, data root and
 control/replication/application listener settings. Listener defaults are
