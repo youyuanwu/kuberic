@@ -133,6 +133,21 @@ remain retained for executable completion, even if the initiating future was
 dropped. A successfully cancelled `initdb` and its descendants therefore cannot
 resume PGDATA writes after host exit.
 
+Each process run owns a distinct generation of postmaster handles, helper
+registry, monitors, lifecycle state and retained cleanup result. Cleanup captures
+that generation and its exact helper IDs before executor submission. Cancelling
+unstarted cleanup revokes the ticket and restores only that generation's launch
+gate/status. Once cleanup starts, it can retire only its captured generation,
+even if its waiter disappears. A later lifecycle call can finish that same
+retirement on another executor before installing replacement ownership.
+
+Completion publishes a fresh stopped generation only if the captured generation
+is still current and explicit abort has not sealed launches. Delayed workers
+cannot inspect replacement process/helper slots or overwrite their state/errors.
+Startup and abort serialize ownership transfer; old monitors and cancellation
+tokens are generation-bound. Fatal cleanup errors remain attached to the failed
+generation and prevent replacement rather than being cleared by retry.
+
 Cancellation does not delete partially initialized storage or consume the durable
 first-open permission. An authorized retry can initialize still-empty PGDATA or
 reuse valid completed `initdb` output with its original system identifier;

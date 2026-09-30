@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::process::{ExitStatus, Output};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -13,6 +13,7 @@ use crate::owned_process::OwnedProcess;
 struct Commands {
     next_id: u64,
     closed: bool,
+    close_epoch: u64,
     running: BTreeMap<u64, OwnedProcess>,
     error: Option<PgError>,
 }
@@ -23,7 +24,44 @@ struct Commands {
 #[derive(Default)]
 pub(crate) struct OwnedCommands(Mutex<Commands>);
 
+pub(crate) struct CapturedCommands {
+    owner: Arc<OwnedCommands>,
+    ids: Vec<u64>,
+    close_epoch: u64,
+    was_closed: bool,
+}
+
+impl CapturedCommands {
+    pub(crate) fn cancel_unstarted(&self) {
+        let mut commands = self.owner.0.lock().unwrap();
+        if commands.close_epoch == self.close_epoch {
+            commands.closed = self.was_closed;
+        }
+    }
+
+    pub(crate) fn terminate(&self) -> Result<(), PgError> {
+        let mut commands = self.owner.0.lock().unwrap();
+        for &id in &self.ids {
+            OwnedCommands::remove(&mut commands, id);
+        }
+        commands.error.clone().map_or(Ok(()), Err)
+    }
+}
+
 impl OwnedCommands {
+    pub(crate) fn capture(self: &Arc<Self>) -> CapturedCommands {
+        let mut commands = self.0.lock().unwrap();
+        let was_closed = commands.closed;
+        commands.closed = true;
+        commands.close_epoch += 1;
+        CapturedCommands {
+            owner: self.clone(),
+            ids: commands.running.keys().copied().collect(),
+            close_epoch: commands.close_epoch,
+            was_closed,
+        }
+    }
+
     pub(crate) async fn output_with_timeout(
         &self,
         command: &mut Command,
@@ -108,23 +146,18 @@ impl OwnedCommands {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn terminate(&self, close: bool) -> Result<(), PgError> {
         let mut commands = self.0.lock().unwrap();
         commands.closed |= close;
+        if close {
+            commands.close_epoch += 1;
+        }
         let ids: Vec<_> = commands.running.keys().copied().collect();
         for id in ids {
             Self::remove(&mut commands, id);
         }
         commands.error.clone().map_or(Ok(()), Err)
-    }
-
-    pub(crate) fn reopen(&self) -> Result<(), PgError> {
-        let mut commands = self.0.lock().unwrap();
-        if let Some(error) = &commands.error {
-            return Err(error.clone());
-        }
-        commands.closed = false;
-        Ok(())
     }
 
     fn remove(commands: &mut Commands, id: u64) {
