@@ -178,6 +178,19 @@ not quorum credit. The `kuberic_<identity digest>` slot namespace is managed by
 the example. Current slots are preserved; consumers of retired slots are drained
 before those slots are removed on configuration reconciliation. Operators must budget WAL storage for unavailable
 configured replicas. Slot-retention capacity policy is not failover orchestration.
+Phase 4 does **not** configure a WAL-byte limit or enforce free-space headroom.
+Active admitted replicas and retryable, still-selected builds may therefore
+retain unbounded WAL under PostgreSQL's default slot settings. That capacity
+policy remains later work; it must not be confused with terminal-slot cleanup.
+Retirement drains and drops the slot in one server round trip, with bounded
+retries if a receiver reconnects. A slot is never reported retired on
+`OBJECT_IN_USE`. Configuration replay retries unfinished cleanup.
+
+`pg_controldata` uses a two-second owned-command deadline. Timeout or caller
+cancellation reaps the exact helper tree before returning; cleanup failure is
+retained rather than hidden as a retryable timeout. An ordinary helper timeout
+is transient, leaves a failed fence closed, and can be retried after the helper
+recovers. Malformed control data and ownership/cleanup failures remain permanent.
 
 ### Exact build receipts and catch-up
 
@@ -189,6 +202,22 @@ Private live receipts bind that selection to source/target process sessions and
 the local attempt generation. Progress persistence atomically checks the
 selection. One scalar observation is never applied to all described builds,
 and old scalar journals do not restore current-session completion after a crash.
+
+PostgreSQL keeps active outbound intents separate from suspended retryable work
+and compact terminal build-ID tombstones. Superseded/retired descriptions reclaim
+active capacity and associated slots; they cannot resurrect on reopen or accept
+late completion. A retryable transport cancellation preserves lineage for the
+same immutable work but removes its active attempt. Retrying allocates a new
+durable attempt generation, so an old RPC cannot publish into that attempt.
+The agent retains the full authority/selection audit. Tombstones do not expire.
+
+Metadata commits hold an owned state lock through file replacement, directory
+fsync and in-memory publication. Cancellation of a waiting caller is not a
+rollback: the owned commit finishes, and subsequent snapshots/revalidation join
+it and observe the committed version. An I/O failure remains an error; a visible
+rename is reconciled in memory even if the following durability step fails.
+Catch-up observations take the lifecycle lock only for each probe, avoiding both
+stale whole-state publication and an uncancellable lock across the full wait.
 
 `WriteQuorum` uses policy-certified replay. SF `All` additionally requires every
 current replica's exact session-qualified WAL receiver to report replay through
@@ -1426,12 +1455,14 @@ pods and the Service routes automatically. For local testing, clients
 connect to `localhost:<port>` — the test harness tracks which instance
 is primary.
 
-### ~~OQ-3: WAL Retention~~ (Resolved)
+### OQ-3: WAL byte limits and headroom (deferred)
 
-Use replication slots with `max_slot_wal_keep_size` (PG 13+). This
-provides reliable WAL retention with bounded disk usage. If a replica
-falls too far behind, the slot is invalidated and kuberic rebuilds the
-replica via `pg_basebackup` (copy protocol).
+Physical-slot lifecycle is implemented, but `max_slot_wal_keep_size` and
+free-space headroom admission are not configured by Phase 4. WAL bytes for
+needed slots remain unbounded. The later capacity design must combine a chosen
+limit with explicit invalidated-slot recovery/rebuild; this historical proposal
+is not an implemented bounded-disk guarantee. Terminal slots are reclaimed by
+the current build-retirement path independently of that future policy.
 
 ### ~~OQ-4: Read Replicas~~ (Resolved)
 

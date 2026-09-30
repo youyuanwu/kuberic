@@ -86,6 +86,7 @@ pub struct PgReplicator {
     initializing: bool,
     state: Mutex<DriverState>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
+    configuration_applied: RwLock<Option<ReplicaSetConfiguration>>,
     build_cancellation: std::sync::Mutex<CancellationToken>,
     catch_up_cancellation: std::sync::Mutex<CancellationToken>,
     #[cfg(feature = "testing")]
@@ -119,8 +120,8 @@ impl PgReplicator {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let fault = error.fault_type();
         let error = error.with_cleanup(self.instance.abort_owned());
+        let fault = error.fault_type();
         Err(self.report(fault, error).await)
     }
 
@@ -153,6 +154,7 @@ impl PgReplicator {
             coordination,
             initializing,
             configuration: RwLock::new(None),
+            configuration_applied: RwLock::new(None),
             build_cancellation: std::sync::Mutex::new(CancellationToken::new()),
             catch_up_cancellation: std::sync::Mutex::new(CancellationToken::new()),
             #[cfg(feature = "testing")]
@@ -189,7 +191,7 @@ impl PgReplicator {
                 ));
             }
             let (actual_system, timeline) = self
-                .permanent_result(self.instance.control_identity().await)
+                .pg_result(self.instance.control_identity().await)
                 .await?;
             if system != &actual_system || durable.timeline_id != Some(timeline) {
                 return Err(self
@@ -234,7 +236,7 @@ impl PgReplicator {
                         .await);
                 }
                 // An authorized retry may reuse completed initdb, never erase partial PGDATA.
-                self.permanent_result(self.instance.control_identity().await)
+                self.pg_result(self.instance.control_identity().await)
                     .await?;
             }
         }
@@ -365,6 +367,9 @@ impl PgReplicator {
             return Err(RuntimeError::OperationCancelled);
         }
         let durable = self.durable.snapshot().await;
+        if durable.retired_builds.contains(&request.authority.build_id) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let configuration = self.configuration.read().await;
         let configuration = configuration
             .as_ref()
@@ -785,6 +790,14 @@ impl PgReplicator {
         self.durable.snapshot().await
     }
 
+    #[cfg(feature = "testing")]
+    pub fn pause_catch_up_commit(
+        &self,
+        stage: crate::durable::CommitStage,
+    ) -> crate::durable::CommitGate {
+        self.durable.pause_commit(stage, true)
+    }
+
     async fn clear_pgdata(&self) -> Result<()> {
         if self.instance.is_running().await {
             return Err(application_error("cannot clear running PostgreSQL data"));
@@ -1142,7 +1155,7 @@ impl PgReplicator {
             }
         }
         let old = self.configuration.read().await.clone();
-        if old.as_ref() == Some(&current) {
+        if self.configuration_applied.read().await.as_ref() == Some(&current) {
             return Ok(());
         }
         self.cancel_catch_up();
@@ -1158,6 +1171,13 @@ impl PgReplicator {
             return Err(RuntimeError::Closed);
         }
         let durable = self.validate().await?;
+        if current
+            .replicas
+            .iter()
+            .any(|r| durable.retired_builds.contains(&r.build_id))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let local = &durable.identity.replica;
         let local_session = current
             .replicas
@@ -1178,15 +1198,16 @@ impl PgReplicator {
         });
         *self.configuration.write().await = Some(current.clone());
         *self.build_cancellation.lock().unwrap() = CancellationToken::new();
-        if member.is_some() {
-            self.durable
-                .update(|state| {
+        self.durable
+            .update(|state| {
+                state.reconcile_builds(&current);
+                if member.is_some() {
                     state.has_accepted_authority = true;
-                    Ok(())
-                })
-                .await
-                .map_err(application_error)?;
-        }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(application_error)?;
         if let Some(build) = &durable.native_build {
             let primary = current
                 .configuration
@@ -1238,6 +1259,7 @@ impl PgReplicator {
         if member.is_none_or(|m| m.role != ReplicaRole::Primary)
             || !self.instance.is_running().await
         {
+            *self.configuration_applied.write().await = Some(current);
             return Ok(());
         }
         self.pg_result(
@@ -1267,10 +1289,13 @@ impl PgReplicator {
         // Peer discovery follows process reconstruction. Incomplete current
         // sessions leave access closed, not a failed restart or an old quorum.
         let Ok(synchronous) = synchronous else {
+            *self.configuration_applied.write().await = Some(current);
             return Ok(());
         };
         self.pg_result(self.observer.apply_synchronous(synchronous).await)
-            .await
+            .await?;
+        *self.configuration_applied.write().await = Some(current);
+        Ok(())
     }
 
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
@@ -1320,6 +1345,7 @@ impl PgReplicator {
                     _ = self.cancellation.cancelled() => return Err(RuntimeError::OperationCancelled),
                     _ = cancelled.cancelled() => return Err(RuntimeError::OperationCancelled),
                     result = async {
+                        let _state = self.state.lock().await;
                         if self.configuration.read().await.as_ref() != Some(&installed) {
                             return Err(RuntimeError::AuthorityNotAdmitted);
                         }
@@ -1367,9 +1393,7 @@ impl PgReplicator {
         }
         self.durable
             .update(|state| {
-                state
-                    .outbound_builds
-                    .retain(|b| &b.request.authority.build_id != id);
+                state.suspend_build(id);
                 Ok(())
             })
             .await
@@ -1386,7 +1410,7 @@ impl PgReplicator {
                 "missing exact target replication endpoint",
             ));
         }
-        let request = {
+        let (request, attempt) = {
             let _state = self.state.lock().await;
             if self.cancellation.is_cancelled() {
                 return Err(RuntimeError::Closed);
@@ -1438,15 +1462,25 @@ impl PgReplicator {
             if let Some(previous) = durable
                 .outbound_builds
                 .iter()
+                .chain(&durable.suspended_builds)
                 .find(|b| b.request.authority.build_id == request.authority.build_id)
                 && !previous.request.same_work(&request)
             {
                 return Err(application_error("source build lineage changed"));
             }
-            self.durable
+            let updated = self
+                .durable
                 .update(|state| {
+                    if state.retired_builds.contains(&request.authority.build_id) {
+                        return Err(crate::durable::PgDurableError::Invalid(
+                            "terminal build cannot restart".into(),
+                        ));
+                    }
                     state
                         .outbound_builds
+                        .retain(|b| b.request.authority.build_id != request.authority.build_id);
+                    state
+                        .suspended_builds
                         .retain(|b| b.request.authority.build_id != request.authority.build_id);
                     if state.outbound_builds.len() >= MAX_BUILDS {
                         return Err(crate::durable::PgDurableError::Invalid(
@@ -1460,11 +1494,19 @@ impl PgReplicator {
                         sequence: 1,
                         evidence: None,
                     });
+                    let attempt = state.generation.checked_add(1).ok_or_else(|| {
+                        crate::durable::PgDurableError::Invalid(
+                            "build attempt generation exhausted".into(),
+                        )
+                    })?;
+                    state
+                        .outbound_attempts
+                        .insert(request.authority.build_id.clone(), attempt);
                     Ok(())
                 })
                 .await
                 .map_err(application_error)?;
-            request
+            (request, updated.generation)
         };
         let result = tokio::time::timeout(std::time::Duration::from_secs(65), async {
             let mut client =
@@ -1483,6 +1525,16 @@ impl PgReplicator {
         progress.validate().map_err(application_error)?;
         let _state = self.state.lock().await;
         self.validate_build(&request).await?;
+        if self
+            .durable
+            .snapshot()
+            .await
+            .outbound_attempts
+            .get(&request.authority.build_id)
+            != Some(&attempt)
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         if progress.request != request || progress.stage != PgBuildStage::Complete {
             return Err(application_error(
                 "native target returned non-exact completion",

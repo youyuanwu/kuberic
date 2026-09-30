@@ -681,7 +681,7 @@ impl ManagedReplicator for CustomReplicatorHost {
         {
             self.primary.remove_replica(build.target.replica_id).await?;
         }
-        Ok(())
+        self.configure().await
     }
     fn abort(&self) {
         self.control.abort();

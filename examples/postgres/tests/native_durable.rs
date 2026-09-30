@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -35,6 +36,229 @@ fn durable_identity(id: i64) -> PgDurableIdentity {
     PgDurableIdentity {
         resource_uid: ResourceUid::new("postgres-test"),
         replica: identity(id),
+    }
+}
+
+fn commit_stages() -> [postgres_replicated::durable::CommitStage; 3] {
+    use postgres_replicated::durable::CommitStage::*;
+    [BeforeRename, CommittedBeforePublish, Published]
+}
+
+#[tokio::test]
+async fn cancelled_metadata_commit_publishes_exactly_the_committed_state() {
+    for stage in commit_stages() {
+        let directory = TestDataDir::new("commit-cancel");
+        let root = directory.path().join("application");
+        let store = Arc::new(
+            PgDurableStore::open(&root, durable_identity(1), StorageMode::Fresh)
+                .await
+                .unwrap(),
+        );
+        let gate = store.pause_commit(stage, false);
+        let writing = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .update(|state| {
+                        state.has_accepted_authority = true;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        writing.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), writing)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        gate.release();
+        let committed = tokio::time::timeout(std::time::Duration::from_secs(5), store.revalidate())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(committed.has_accepted_authority);
+        assert_eq!(committed.generation, 2);
+        assert_eq!(store.snapshot().await, committed);
+        let reopened = PgDurableStore::open(&root, durable_identity(1), StorageMode::Established)
+            .await
+            .unwrap();
+        assert_eq!(reopened.revalidate().await.unwrap(), committed);
+    }
+}
+
+#[test]
+#[ignore = "subprocess helper for metadata_crash_boundaries_reopen_consistently"]
+fn metadata_crash_writer() {
+    let root = std::env::var_os("PG_METADATA_TEST_ROOT").unwrap();
+    let stage: usize = std::env::var("PG_METADATA_TEST_STAGE")
+        .unwrap()
+        .parse()
+        .unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let store = Arc::new(
+                PgDurableStore::open(
+                    PathBuf::from(root),
+                    durable_identity(1),
+                    StorageMode::Established,
+                )
+                .await
+                .unwrap(),
+            );
+            let gate = store.pause_commit(commit_stages()[stage], false);
+            tokio::spawn(async move {
+                store
+                    .update(|state| {
+                        state.has_accepted_authority = true;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            std::process::exit(73);
+        });
+}
+
+#[tokio::test]
+async fn metadata_crash_boundaries_reopen_consistently() {
+    for stage in 0..3 {
+        let directory = TestDataDir::new("commit-crash");
+        let root = directory.path().join("application");
+        drop(
+            PgDurableStore::open(&root, durable_identity(1), StorageMode::Fresh)
+                .await
+                .unwrap(),
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "metadata_crash_writer",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("PG_METADATA_TEST_ROOT", &root)
+            .env("PG_METADATA_TEST_STAGE", stage.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        let reopened = PgDurableStore::open(&root, durable_identity(1), StorageMode::Established)
+            .await
+            .unwrap();
+        let state = reopened.revalidate().await.unwrap();
+        assert_eq!(state.has_accepted_authority, stage != 0);
+        assert_eq!(state.generation, if stage == 0 { 1 } else { 2 });
+    }
+}
+
+#[tokio::test]
+async fn stalled_control_data_fence_is_bounded_reaped_and_retryable() {
+    use postgres_replicated::testing::{ProcessProbe, wrapped_pg_bin};
+    use std::time::Duration;
+    for cancel in [false, true] {
+        let directory = TestDataDir::new("control-gate");
+        let armed = directory.path().join("armed");
+        let marker = directory.path().join("control.pid");
+        let leaf = directory.path().join("leaf.pid");
+        let bin = wrapped_pg_bin(
+            directory.path(),
+            "pg_controldata",
+            &format!(
+                "#!/bin/sh\nif test -f '{}'; then\n echo $$ > '{}'\n sleep 30 &\n echo $! > '{}'\n wait\nelse\n exec '{}/pg_controldata' \"$@\"\nfi\n",
+                armed.display(),
+                marker.display(),
+                leaf.display(),
+                find_pg_bin().display()
+            ),
+        );
+        let instance =
+            PgInstanceManager::new(directory.path().join("pgdata"), bin, allocate_port().await);
+        instance.init_db().await.unwrap();
+        let (faults, mut reported) = mpsc::channel(8);
+        instance.start_native(faults).await.unwrap();
+        initialize_application_role(&instance).await.unwrap();
+        let access = PgAccessController::new(&instance);
+        access.grant_role_access().await.unwrap();
+        let (old, _) = instance.connect_application().await.unwrap();
+        old.batch_execute(
+            "CREATE TABLE timeout_receipt(id int); INSERT INTO timeout_receipt VALUES (1)",
+        )
+        .await
+        .unwrap();
+        std::fs::write(&armed, b"").unwrap();
+        let (helper, children) = {
+            let closing = access.close_external();
+            tokio::pin!(closing);
+            tokio::select! {
+                result = &mut closing => panic!("helper did not reach gate: {result:?}"),
+                ready = tokio::time::timeout(Duration::from_secs(5), async {
+                    while !marker.exists() || !leaf.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+                }) => { ready.unwrap(); }
+            }
+            let pid = std::fs::read_to_string(&marker)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let helper = ProcessProbe::process(pid);
+            let children = ProcessProbe::descendants(pid);
+            if !cancel {
+                let error = tokio::time::timeout(Duration::from_secs(8), &mut closing)
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert!(
+                    matches!(error, postgres_replicated::instance::PgError::Timeout(_)),
+                    "{error}"
+                );
+                assert_eq!(
+                    error.fault_type(),
+                    kuberic_protocol::types::FaultType::Transient
+                );
+                assert_eq!(
+                    reported.recv().await,
+                    Some(kuberic_protocol::types::FaultType::Transient)
+                );
+            }
+            (helper, children)
+        };
+        helper.assert_reaped();
+        children.assert_reaped();
+        assert!(!instance.is_running().await);
+        assert!(
+            old.simple_query("INSERT INTO timeout_receipt VALUES (2)")
+                .await
+                .is_err()
+        );
+        assert!(instance.connect_application().await.is_err());
+        std::fs::remove_file(armed).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), access.close_external())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(instance.connect_application().await.is_err());
+        access.grant_role_access().await.unwrap();
+        let (restored, _) = instance.connect_application().await.unwrap();
+        assert_eq!(
+            restored
+                .query_one("SELECT count(*) FROM timeout_receipt", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        instance.stop().await.unwrap();
     }
 }
 

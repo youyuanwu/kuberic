@@ -152,23 +152,7 @@ impl PgNativeObserver {
             let slot: String = row.get(0);
             present.insert(slot.clone());
             if !expected.contains(&slot) {
-                let terminated = client
-                    .query(
-                        "SELECT pg_terminate_backend(active_pid, 5000) FROM pg_replication_slots \
-                     WHERE slot_name = $1::name AND active_pid IS NOT NULL",
-                        &[&slot],
-                    )
-                    .await
-                    .map_err(|error| {
-                        PgError::Query(format!("drain retired physical slot: {error}"))
-                    })?;
-                if terminated.iter().any(|row| !row.get::<_, bool>(0)) {
-                    return Err(PgError::Query("retired physical slot did not drain".into()));
-                }
-                client
-                    .query_one("SELECT pg_drop_replication_slot($1::name)", &[&slot])
-                    .await
-                    .map_err(|error| PgError::Query(format!("retire physical slot: {error}")))?;
+                retire_slot(&client, &slot).await?;
             }
         }
         for slot in expected.difference(&present) {
@@ -585,6 +569,45 @@ pub fn compile_synchronous_configuration(
     };
     configuration.validate().map_err(PgError::Configuration)?;
     Ok(configuration)
+}
+
+async fn retire_slot(client: &tokio_postgres::Client, slot: &str) -> Result<(), PgError> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            // A walreceiver can reconnect after termination. Keep drain/drop in
+            // one server round trip and retry that race, never acknowledge it.
+            let result = client
+                .query(
+                    "WITH drained AS MATERIALIZED ( \
+                   SELECT slot_name, CASE WHEN active_pid IS NULL THEN true \
+                     ELSE pg_terminate_backend(active_pid, 1000) END AS stopped \
+                   FROM pg_replication_slots WHERE slot_name = $1::name) \
+                 SELECT stopped, CASE WHEN stopped THEN pg_drop_replication_slot(slot_name) END \
+                 FROM drained",
+                    &[&slot],
+                )
+                .await;
+            match result {
+                Ok(rows) if rows.iter().all(|row| row.get::<_, bool>(0)) => return Ok(()),
+                Ok(_) => {}
+                Err(error)
+                    if error.code() == Some(&tokio_postgres::error::SqlState::OBJECT_IN_USE) => {}
+                Err(error)
+                    if error.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_OBJECT) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(PgError::Query(format!(
+                        "retire physical slot {slot}: {error:?}"
+                    )));
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| PgError::Timeout(format!("retire physical slot {slot}")))?
 }
 
 pub(crate) fn replication_slot_name(identity: &ReplicaIdentity) -> String {

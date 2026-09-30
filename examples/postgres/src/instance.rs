@@ -209,10 +209,12 @@ impl PgInstanceManager {
     pub async fn control_identity(&self) -> Result<(String, u32), PgError> {
         let output = self
             .helpers
-            .output(
+            .output_with_timeout(
                 Command::new(self.pg_bin.join("pg_controldata"))
                     .arg(&self.data_dir)
                     .env("LC_ALL", "C"),
+                std::time::Duration::from_secs(2),
+                "pg_controldata",
             )
             .await?;
         if !output.status.success() {
@@ -269,7 +271,10 @@ impl PgInstanceManager {
         }
         .await;
         if let Err(error) = prepared {
-            fault_reporter(PgProcessFault::Permanent);
+            fault_reporter(match error.fault_type() {
+                kuberic_protocol::types::FaultType::Transient => PgProcessFault::Transient,
+                kuberic_protocol::types::FaultType::Permanent => PgProcessFault::Permanent,
+            });
             *self.process_state.lock().await = PgProcessState::Faulted;
             return Err(error);
         }
@@ -767,6 +772,8 @@ impl Drop for PgInstanceManager {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PgError {
+    #[error("operation timeout: {0}")]
+    Timeout(String),
     #[error("process error: {0}")]
     Process(String),
     #[error("connection error: {0}")]
@@ -796,7 +803,9 @@ impl PgError {
 
     pub fn fault_type(&self) -> kuberic_protocol::types::FaultType {
         match self {
-            Self::Connection(_) | Self::Query(_) => kuberic_protocol::types::FaultType::Transient,
+            Self::Connection(_) | Self::Query(_) | Self::Timeout(_) => {
+                kuberic_protocol::types::FaultType::Transient
+            }
             Self::Process(_) | Self::Configuration(_) => {
                 kuberic_protocol::types::FaultType::Permanent
             }

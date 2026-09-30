@@ -24,6 +24,23 @@ struct Commands {
 pub(crate) struct OwnedCommands(Mutex<Commands>);
 
 impl OwnedCommands {
+    pub(crate) async fn output_with_timeout(
+        &self,
+        command: &mut Command,
+        timeout: Duration,
+        operation: &'static str,
+    ) -> Result<Output, PgError> {
+        match tokio::time::timeout(timeout, self.output(command)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Dropping output reaps its exact command tree. Retained cleanup
+                // failure takes precedence over a retryable helper deadline.
+                let cleanup = self.0.lock().unwrap().error.clone().map_or(Ok(()), Err);
+                Err(PgError::Timeout(format!("{operation} command timeout")).with_cleanup(cleanup))
+            }
+        }
+    }
+
     pub(crate) async fn output(&self, command: &mut Command) -> Result<Output, PgError> {
         let (id, mut stdout, mut stderr, started) = {
             let mut commands = self.0.lock().unwrap();

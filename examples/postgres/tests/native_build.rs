@@ -451,6 +451,227 @@ async fn write_source(source: &PgPod) {
 }
 
 #[tokio::test]
+async fn all_wait_cancellation_reconciles_committed_metadata_without_permanent_fault() {
+    use kuberic_runtime::replicator::ReplicaSetQuorumMode;
+    use postgres_replicated::durable::CommitStage;
+    let root = TestDataDir::new("all-commit");
+    let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
+    source.singleton().await;
+    write_source(&source).await;
+    for (index, stage) in [
+        CommitStage::BeforeRename,
+        CommitStage::CommittedBeforePublish,
+        CommitStage::Published,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        source
+            .admit(postgres_replicated::testing::native_configuration(
+                std::slice::from_ref(&source.identity),
+                0,
+                index as i64 + 2,
+            ))
+            .await;
+        let gate = source
+            .application
+            .native_driver()
+            .pause_catch_up_commit(stage);
+        let primary = source.runtime.primary_replicator().await.unwrap();
+        let waiter = tokio::spawn({
+            let primary = primary.clone();
+            async move {
+                primary
+                    .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        waiter.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        gate.release();
+        let state = source.application.native_driver().durable_state().await;
+        assert!(state.catch_up.is_some());
+        source.refresh().await;
+        assert_ne!(
+            source.runtime.partition_report().await.reported_fault,
+            Some(kuberic_protocol::types::FaultType::Permanent)
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            primary.wait_for_catch_up_quorum(ReplicaSetQuorumMode::All),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn more_than_sixteen_terminal_builds_reclaim_capacity_and_slots_across_reopen() {
+    use kuberic_protocol::types::OperationId;
+    use kuberic_runtime::replicator::ReplicaInformation;
+    let root = TestDataDir::new("many-builds");
+    let mut source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
+    let target = PgPod::new(root.path().join("t"), native_identity(2, "target")).await;
+    source.singleton().await;
+    write_source(&source).await;
+    let mut old_request = None;
+    for index in 0..20 {
+        let authority = source.authorize(&target, &format!("bounded-{index}")).await;
+        if [0, 16, 19].contains(&index) {
+            source.build(&target, &authority).await.unwrap();
+            if index == 0 {
+                old_request = Some(
+                    target
+                        .application
+                        .native_driver()
+                        .durable_state()
+                        .await
+                        .native_build
+                        .unwrap()
+                        .request,
+                );
+            }
+        } else {
+            let result = source
+                .runtime
+                .execute_custom_build(ReplicaInformation::new(
+                    authority.build_id.clone(),
+                    target.identity.clone(),
+                    "http://127.0.0.1:0".into(),
+                ))
+                .await;
+            assert!(result.is_err());
+        }
+        source
+            .runtime
+            .cancel_outbound_build(&authority.build_id)
+            .await
+            .unwrap();
+        let state = source.application.native_driver().durable_state().await;
+        assert!(state.outbound_builds.is_empty());
+        assert!(state.outbound_attempts.is_empty());
+        assert_eq!(state.suspended_builds.len(), 1);
+        if index % 2 == 1 || index == 0 {
+            source
+                .effect(RuntimeEffectAction::RetireBuild(authority.build_id.clone()))
+                .await
+                .unwrap();
+            target
+                .effect(RuntimeEffectAction::RetireBuild(authority.build_id.clone()))
+                .await
+                .unwrap();
+            let (sql, _) = source.application.instance().connect().await.unwrap();
+            assert_eq!(
+                sql.query_one(
+                    "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'kuberic_%'",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+                0
+            );
+        }
+        if index == 10 {
+            source = source.reopen().await;
+        }
+    }
+    let source = source.reopen().await;
+    let state = source.application.native_driver().durable_state().await;
+    assert!(state.outbound_builds.is_empty());
+    assert!(state.suspended_builds.is_empty());
+    assert_eq!(state.retired_builds.len(), 20);
+    assert!(
+        source
+            .runtime
+            .execute_custom_build(ReplicaInformation::new(
+                OperationId::new("bounded-0"),
+                target.identity.clone(),
+                target.endpoint.clone()
+            ))
+            .await
+            .is_err()
+    );
+    let target = target.reopen().await;
+    assert!(target.inject(&old_request.unwrap()).await.is_err());
+}
+
+#[tokio::test]
+async fn cancelled_attempt_cannot_publish_after_same_build_retry() {
+    let root = TestDataDir::new("retry-attempt");
+    let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
+    let target = PgPod::new(root.path().join("t"), native_identity(2, "target")).await;
+    source.singleton().await;
+    write_source(&source).await;
+    let authority = source.authorize(&target, "same-build").await;
+    let gate = target
+        .application
+        .native_driver()
+        .pause_build(PgBuildStage::Complete);
+    let first = source.build(&target, &authority);
+    tokio::pin!(first);
+    tokio::select! {
+        result = &mut first => panic!("unexpected early completion: {result:?}"),
+        entered = tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()) => entered.unwrap(),
+    }
+    source
+        .runtime
+        .cancel_outbound_build(&authority.build_id)
+        .await
+        .unwrap();
+    assert!(
+        source
+            .application
+            .native_driver()
+            .durable_state()
+            .await
+            .outbound_builds
+            .is_empty()
+    );
+    gate.release.notify_one();
+    assert!(first.await.is_err());
+    gate.release.notify_one();
+    source.build(&target, &authority).await.unwrap();
+    assert_eq!(
+        source
+            .application
+            .native_driver()
+            .durable_state()
+            .await
+            .outbound_builds
+            .len(),
+        1
+    );
+    source
+        .effect(RuntimeEffectAction::RetireBuild(authority.build_id.clone()))
+        .await
+        .unwrap();
+    target
+        .effect(RuntimeEffectAction::RetireBuild(authority.build_id.clone()))
+        .await
+        .unwrap();
+    assert!(
+        source
+            .application
+            .native_driver()
+            .durable_state()
+            .await
+            .retired_builds
+            .contains(&authority.build_id)
+    );
+}
+
+#[tokio::test]
 async fn completion_is_exact_to_the_selected_build_across_reopen() {
     use kuberic_runtime_internal::authority::BuildAuthorityStore;
     let root = TestDataDir::new("exact-receipt");
