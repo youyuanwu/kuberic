@@ -50,6 +50,9 @@ const REPLICATOR_CREATION_RESERVED: u8 = 1;
 const REPLICATOR_CREATION_REGISTERED: u8 = 2;
 const REPLICATOR_RESERVATION_ID: u64 = 1;
 
+#[path = "custom.rs"]
+mod custom;
+
 #[async_trait]
 pub trait RuntimeControlPlane: Send {
     async fn next_effect(&mut self) -> Result<Option<RuntimeEffect>>;
@@ -113,8 +116,50 @@ struct HostState {
 struct RegisteredReplicator {
     control: Arc<dyn Replicator>,
     primary: Option<Arc<dyn PrimaryReplicator>>,
-    provider: Arc<dyn StateProvider>,
+    provider: Option<Arc<dyn StateProvider>>,
     managed: Option<Arc<dyn ManagedReplicator>>,
+    custom: Option<Arc<custom::CustomReplicatorHost>>,
+}
+
+impl RegisteredReplicator {
+    fn managed(&self) -> Option<Arc<dyn ManagedReplicator>> {
+        self.managed.clone()
+    }
+    fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
+        self.primary.clone()
+    }
+    fn provider(&self) -> Result<&Arc<dyn StateProvider>> {
+        self.provider.as_ref().ok_or_else(|| {
+            RuntimeError::Application(
+                "custom replicator has no operation/copy state provider".into(),
+            )
+        })
+    }
+    async fn open(&self) -> Result<Option<String>> {
+        let address = self.control.open().await?;
+        if let Some(managed) = &self.managed {
+            managed.complete_open(address.clone()).await?;
+        }
+        Ok(Some(address))
+    }
+    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        self.control.change_role(epoch, role).await
+    }
+    async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        self.control.update_epoch(epoch).await
+    }
+    async fn close(&self) -> Result<()> {
+        self.control.close().await
+    }
+    async fn current_progress(&self) -> Result<i64> {
+        self.control.current_progress().await
+    }
+    async fn catch_up_capability(&self) -> Result<i64> {
+        self.control.catch_up_capability().await
+    }
+    fn abort(&self) {
+        self.control.abort();
+    }
 }
 
 pub struct PodRuntime {
@@ -203,6 +248,7 @@ impl PodRuntime {
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 replicator_creation: AtomicU8::new(REPLICATOR_CREATION_AVAILABLE),
+                replica_session: OnceLock::new(),
             }),
         }
     }
@@ -217,6 +263,40 @@ impl PodRuntime {
 
     pub async fn restore_authority(&self) -> Result<()> {
         self.host.managed()?.restore_authority().await
+    }
+
+    pub fn bind_replica_session(
+        &self,
+        resource: kuberic_protocol::types::ResourceUid,
+        session: kuberic_protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        let binding = (resource, session);
+        if self.host.replica_session.get() == Some(&binding) {
+            return Ok(());
+        }
+        // The operation engine already owns its stream-session lifetime. Existing
+        // hosts may attach a fresh control service during durable reconstruction.
+        if self
+            .host
+            .registered
+            .get()
+            .is_some_and(|r| r.custom.is_none())
+        {
+            return Ok(());
+        }
+        if self.host.registered.get().is_some() || binding.0.is_empty() || binding.1.is_empty() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let mut state = self
+            .host
+            .state
+            .try_write()
+            .map_err(|_| RuntimeError::ReconfigurationPending)?;
+        state.partition_information.partition_id = PartitionId::new(binding.0.as_str());
+        self.host
+            .replica_session
+            .set(binding)
+            .map_err(|_| RuntimeError::AuthorityNotAdmitted)
     }
 
     pub async fn authorize_build(
@@ -438,7 +518,7 @@ impl PodRuntime {
         self.host
             .registered
             .get()
-            .and_then(|registered| registered.primary.clone())
+            .and_then(|registered| registered.primary())
             .ok_or(RuntimeError::NotOpen)
     }
 
@@ -447,7 +527,6 @@ impl PodRuntime {
             .registered
             .get()
             .ok_or(RuntimeError::NotOpen)?
-            .control
             .catch_up_capability()
             .await
     }
@@ -469,6 +548,34 @@ impl PodRuntime {
             .managed()?
             .execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
             .await
+    }
+
+    pub(crate) async fn register_custom_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: kuberic_protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
+            custom
+                .execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn execute_custom_build(
+        &self,
+        replica: kuberic_runtime::replicator::ReplicaInformation,
+    ) -> Result<bool> {
+        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
+            custom.execute_build(replica).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
+        self.host.managed().ok()?.next_outbound().await
     }
 
     pub(crate) async fn observe_secondary_removal_witness(
@@ -507,7 +614,7 @@ impl PodRuntime {
 
 impl RuntimeDataPlane {
     pub async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
-        let pending = self.host.managed()?.begin_write(write).await?;
+        let pending = self.host.streams()?.begin_write(write).await?;
         Ok(PendingWrite {
             lsn: pending.lsn,
             replication_items: pending
@@ -535,7 +642,7 @@ impl RuntimeDataPlane {
         if !session.is_empty() {
             return self
                 .host
-                .managed()?
+                .streams()?
                 .execute_action(RuntimeEffectAction::ObserveReplicationAck {
                     acknowledgement: Box::new(acknowledgement),
                     session: kuberic_protocol::types::ProcessSessionId::new(session),
@@ -543,14 +650,14 @@ impl RuntimeDataPlane {
                 .await;
         }
         self.host
-            .managed()?
+            .streams()?
             .accept_acknowledgement(acknowledgement)
             .await
     }
 
     pub async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
         let RuntimePreparedCopy { authority, items } =
-            self.host.managed()?.prepare_copy(request).await?;
+            self.host.streams()?.prepare_copy(request).await?;
         Ok(PreparedCopy {
             authority,
             items: Box::pin(items.map(|item| item.map(copy_to_proto))),
@@ -559,14 +666,14 @@ impl RuntimeDataPlane {
 
     pub async fn accept_copy_acknowledgement(&self, ack: proto::CopyAck) -> Result<()> {
         self.host
-            .managed()?
+            .streams()?
             .accept_copy_acknowledgement(copy_ack_from_proto(ack)?)
             .await
     }
 
     pub async fn receive_copy_item(&self, item: proto::CopyItem) -> Result<proto::CopyAck> {
         self.host
-            .managed()?
+            .streams()?
             .receive_copy_item(copy_from_proto(item)?)
             .await
             .map(copy_ack_to_proto)
@@ -578,7 +685,7 @@ impl RuntimeDataPlane {
     ) -> Result<PendingReplication> {
         let pending = self
             .host
-            .managed()?
+            .streams()?
             .receive_replication(replication_from_proto(item)?)
             .await?;
         Ok(PendingReplication {
@@ -603,13 +710,13 @@ impl RuntimeDataPlane {
                 OutboundOperation::Evict(identity) => OutboundReplication::Evict(identity),
             })
     }
-
-    pub(crate) async fn next_domain_outbound(&self) -> Option<OutboundOperation> {
-        self.host.managed().ok()?.next_outbound().await
-    }
 }
 
 struct RuntimeHost {
+    replica_session: OnceLock<(
+        kuberic_protocol::types::ResourceUid,
+        kuberic_protocol::types::ProcessSessionId,
+    )>,
     identity: ReplicaIdentity,
     application: Arc<dyn StatefulServiceReplica>,
     default_dependencies: DefaultReplicatorDependencies,
@@ -636,12 +743,12 @@ impl PartitionAccessView for HostAccessView {
 
     async fn read_status(&self) -> Result<AccessStatus> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        Ok(host.snapshot().await.read_status)
+        Ok(host.state.read().await.fallback_snapshot.read_status)
     }
 
     async fn write_status(&self) -> Result<AccessStatus> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        Ok(host.snapshot().await.write_status)
+        Ok(host.state.read().await.fallback_snapshot.write_status)
     }
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
@@ -674,7 +781,9 @@ impl PartitionAccessView for HostAccessView {
         if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        state.reported_fault = Some(fault);
+        if state.reported_fault != Some(FaultType::Permanent) {
+            state.reported_fault = Some(fault);
+        }
         Ok(())
     }
 }
@@ -742,7 +851,7 @@ impl ReplicatorRegistration for RuntimeHost {
     async fn register_interfaces(
         &self,
         interfaces: &ReplicatorInterfaces,
-        provider: Arc<dyn StateProvider>,
+        provider: Option<Arc<dyn StateProvider>>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()> {
         if reservation.0 != REPLICATOR_RESERVATION_ID
@@ -752,7 +861,7 @@ impl ReplicatorRegistration for RuntimeHost {
                 "CreateReplicator reservation is not active".into(),
             ));
         }
-        let managed_replicator = self
+        let mut managed_replicator = self
             .pending_managed
             .lock()
             .map_err(|_| {
@@ -765,12 +874,27 @@ impl ReplicatorRegistration for RuntimeHost {
                 .attach_interfaces(interfaces.replicator(), interfaces.primary_replicator())
                 .await?;
         }
+        let custom = if managed_replicator.is_none() && interfaces.state_replicator().is_none() {
+            interfaces.primary_replicator().map(|primary| {
+                Arc::new(custom::CustomReplicatorHost::new(
+                    self.weak_self.clone(),
+                    interfaces.replicator(),
+                    primary,
+                ))
+            })
+        } else {
+            None
+        };
+        if let Some(custom) = &custom {
+            managed_replicator = Some(custom.clone());
+        }
         self.registered
             .set(RegisteredReplicator {
                 control: interfaces.replicator(),
                 primary: interfaces.primary_replicator(),
                 provider,
                 managed: managed_replicator,
+                custom,
             })
             .map_err(|_| {
                 RuntimeError::Application(
@@ -807,9 +931,18 @@ impl Drop for OpenAttempt<'_> {
 }
 
 impl RuntimeHost {
+    fn streams(&self) -> Result<Arc<dyn ManagedReplicator>> {
+        let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        if registered.custom.is_some() {
+            return Err(RuntimeError::Application(
+                "custom replicator has no operation/copy capability".into(),
+            ));
+        }
+        self.managed()
+    }
     fn managed(&self) -> Result<Arc<dyn ManagedReplicator>> {
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
-        registered.managed.clone().ok_or_else(|| {
+        registered.managed().ok_or_else(|| {
             RuntimeError::Application(
                 "the selected replicator does not expose Kuberic managed data-plane capabilities"
                     .into(),
@@ -822,7 +955,7 @@ impl RuntimeHost {
             return;
         }
         if let Some(registered) = self.registered.get() {
-            registered.control.abort();
+            registered.abort();
         } else if let Ok(mut pending) = self.pending_managed.lock()
             && let Some((_, managed)) = pending.take()
         {
@@ -953,16 +1086,26 @@ impl RuntimeHost {
                 target,
                 replication_address,
             } => {
-                self.registered
-                    .get()
-                    .and_then(|registered| registered.primary.clone())
-                    .ok_or(RuntimeError::NotPrimary)?
-                    .build_replica(kuberic_runtime::replicator::ReplicaInformation {
-                        build_id,
-                        identity: target,
-                        replication_address,
-                    })
-                    .await?
+                if let Some(custom) = self.registered.get().and_then(|r| r.custom.as_ref()) {
+                    custom
+                        .enqueue_build(ReplicaEndpoint {
+                            build_id,
+                            identity: target,
+                            replication_address,
+                        })
+                        .await?;
+                } else {
+                    self.registered
+                        .get()
+                        .and_then(|registered| registered.primary())
+                        .ok_or(RuntimeError::NotPrimary)?
+                        .build_replica(kuberic_runtime::replicator::ReplicaInformation::new(
+                            build_id,
+                            target,
+                            replication_address,
+                        ))
+                        .await?;
+                }
             }
             RuntimeEffectAction::Close => self.close().await?,
             RuntimeEffectAction::Abort => self.abort_action().await,
@@ -1084,7 +1227,7 @@ impl RuntimeHost {
             registration.clone(),
             self.default_dependencies.clone(),
         );
-        let control = self
+        let registration = self
             .application
             .clone()
             .open(OpenContext {
@@ -1098,19 +1241,17 @@ impl RuntimeHost {
             })
             .await?;
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
-        if !Arc::ptr_eq(&control, &registered.control) {
-            control.abort();
+        if !Arc::ptr_eq(&registration, &registered.control) {
             return Err(RuntimeError::Application(
-                "Open returned a different replicator than CreateReplicator".into(),
+                "Open returned a different replica than its registration".into(),
             ));
         }
-        let address = registered.control.open().await?;
-        if let Some(managed) = registered.managed.as_ref() {
-            managed.complete_open(address.clone()).await?;
+        let address = registered.open().await?;
+        if let Some(managed) = registered.managed().as_ref() {
             self.sync_access_projection(managed.as_ref()).await;
         } else {
-            let progress = registered.control.current_progress().await?;
-            let committed = registered.provider.last_committed_lsn().await?;
+            let progress = registered.current_progress().await?;
+            let committed = registered.provider()?.last_committed_lsn().await?;
             let mut state = self.state.write().await;
             state.fallback_snapshot.open = true;
             state.fallback_snapshot.current_progress = progress;
@@ -1119,7 +1260,7 @@ impl RuntimeHost {
         {
             let mut state = self.state.write().await;
             state.fallback_snapshot.open = true;
-            state.fallback_snapshot.replication_address = Some(address);
+            state.fallback_snapshot.replication_address = address;
         }
         attempt.complete = true;
         Ok(())
@@ -1181,7 +1322,7 @@ impl RuntimeHost {
         self.state.write().await.fallback_snapshot.read_status =
             AccessStatus::ReconfigurationPending;
         if !transition.replicator_completed {
-            registered.control.change_role(epoch, role).await?;
+            registered.change_role(epoch, role).await?;
             let mut state = self.state.write().await;
             state
                 .fallback_snapshot
@@ -1215,7 +1356,7 @@ impl RuntimeHost {
                 .map_or_else(Epoch::default, |authority| {
                     authority.current_configuration.epoch
                 });
-            registered.control.update_epoch(epoch).await?;
+            registered.update_epoch(epoch).await?;
             let mut state = self.state.write().await;
             state
                 .fallback_snapshot
@@ -1244,7 +1385,7 @@ impl RuntimeHost {
         }
         if !transition.application_completed {
             if role == ReplicaRole::Primary
-                && let Some(managed) = self.registered.get().and_then(|r| r.managed.as_ref())
+                && let Some(managed) = self.registered.get().and_then(|r| r.managed())
             {
                 managed.settle_primary_prefix().await?;
             }
@@ -1273,7 +1414,7 @@ impl RuntimeHost {
         if let Ok(managed) = self.managed() {
             managed.fence_writes().await?;
         }
-        if let Err(error) = registered.control.close().await {
+        if let Err(error) = registered.close().await {
             self.abort();
             return Err(error);
         }
@@ -1331,8 +1472,8 @@ impl RuntimeHost {
                 self.state.write().await.fallback_snapshot.write_status = status;
             }
             RuntimeEffectAction::RefreshApplicationProgress => {
-                let current = registered.control.current_progress().await?;
-                let committed = registered.provider.last_committed_lsn().await?;
+                let current = registered.current_progress().await?;
+                let committed = registered.provider()?.last_committed_lsn().await?;
                 let mut state = self.state.write().await;
                 state.fallback_snapshot.current_progress = current;
                 state.fallback_snapshot.committed_lsn = committed;
@@ -1403,7 +1544,7 @@ impl RuntimeHost {
     }
 }
 
-fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
+pub(crate) fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
     RuntimeSnapshot {
         identity,
         open: false,
@@ -1418,6 +1559,7 @@ fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
         accepted_secondary_removal: None,
         current_progress: 0,
         verified_replication_lsn: None,
+        live_builds_only: false,
         committed_lsn: 0,
         current_configuration_quorum_progress: 0,
         catch_up_boundary: None,

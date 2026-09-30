@@ -202,11 +202,12 @@ assert "PVC object deletion" in sample and "PVC object deletion" in guide_text
 
 protocol = (root / "kuberic-protocol/src/lib.rs").read_text()
 store = (root / "kuberic-agent/src/state.rs").read_text()
-assert re.search(r"pub const PROTOCOL_VERSION: u32 = 8;", protocol)
-assert re.search(r"pub const SCHEMA_VERSION: u32 = 4;", store)
-assert "Protocol version 8" in guide_text and "schema 4" in guide_text
-assert "Protocol version 8" in (root / "kuberic-wire/README.md").read_text()
-assert "Protocol 8" in sample and "schema 4" in sample
+assert re.search(r"pub const PROTOCOL_VERSION: u32 = 9;", protocol)
+assert re.search(r"pub const SCHEMA_VERSION: u32 = 5;", store)
+assert "Protocol version 9" in guide_text and "schema 5" in guide_text
+assert "The current schema is **5**" in guide_text
+assert "Protocol version 9" in (root / "kuberic-wire/README.md").read_text()
+assert "Protocol 9" in sample and "schema 5" in sample
 current_requirement_documents = [
     root / "docs/Dev.md",
     root / "docs/features/kuberic/level-triggered-operator.md",
@@ -216,10 +217,10 @@ current_requirement_documents = [
 for document in current_requirement_documents:
     text = document.read_text()
     normalized = " ".join(text.split()).lower()
-    assert "protocol 8" in normalized or "protocol-8" in normalized, \
-        f"{document.relative_to(root)}: current deployment requirement must name protocol 8"
-    assert "schema 4" in normalized or "schema-4" in normalized, \
-        f"{document.relative_to(root)}: current deployment requirement must name schema 4"
+    assert "protocol 9" in normalized or "protocol-9" in normalized, \
+        f"{document.relative_to(root)}: current deployment requirement must name protocol 9"
+    assert "schema 5" in normalized or "schema-5" in normalized, \
+        f"{document.relative_to(root)}: current deployment requirement must name schema 5"
     for stale in (
         "fresh protocol-7/schema-3",
         "fresh coordinated protocol-7/schema-3",
@@ -341,7 +342,7 @@ for document in summary_documents:
                   "write closure", "sequential cleanup", "kubernetes resource deletion",
                   "independently configurable"):
         assert claim in text, f"{document.relative_to(root)}: missing narrowed claim: {claim}"
-    for claim in ("sequential scale-up", "protocol 8", "schema 4"):
+    for claim in ("sequential scale-up", "protocol 9", "schema 5"):
         assert claim in text, f"{document.relative_to(root)}: missing scale-up claim: {claim}"
 
 scale_up_text = prose(guide_text.split("## Sequential Scale-Up\n", 1)[1]
@@ -385,7 +386,7 @@ for claim in ("sequential scale-up and secondary scale-down",
               "production v2 controller configuration",
               "classic kuberic.io/v1 remains unchanged",
               "pvc-before-pod", "post-enumeration catch-up boundary",
-              "protocol 8 and agent schema 4",
+              "protocol 9 and agent schema 5",
               "direct primary removal is deferred",
               "completes workstream 2"):
     assert claim in retirement_text, f"Retirement plan missing scale-up status: {claim}"

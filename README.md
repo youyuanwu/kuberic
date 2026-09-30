@@ -105,7 +105,7 @@ secondary scale-down. An independent minimum replica count, a validated
 maximum replica count, and the PostgreSQL port remain future work. SQLite is
 ported in place and validated without Kubernetes; its distribution remains
 separate from the existing KVStore2 live deployment.
-Protocol 8 / agent schema 4 require a fresh coordinated v2 deployment.
+Protocol 9 / agent schema 5 require a fresh coordinated v2 deployment.
 
 ## Continuous Delivery
 

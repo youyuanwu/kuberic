@@ -173,7 +173,7 @@ means a retirement tombstone exists. The JSON field is additive; older diagnosti
 responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
-Use a fresh coordinated protocol-8/schema-4 deployment, not a rolling upgrade.
+Use a fresh coordinated protocol-9/schema-5 deployment, not a rolling upgrade.
 Exact original PVC provenance must be reconstructable before admission; if Pod
 and PVC already disappeared without that provenance, scale-down waits/fails
 closed rather than treating list omission as absence. Unavailable-target support
@@ -182,7 +182,7 @@ has no retention or import path, not a physical storage erasure guarantee.
 Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequential
 cleanup must finish, and every retained member needs its original completed
 current-only witness or fresh completed local acceptance before superseding the
-bounded receipt. Sequential scale-up uses durable schema-4 build and admission
+bounded receipt. Sequential scale-up uses durable schema-5 build and admission
 authority, preserves healthy same-primary writes only while both PC/CC quorums
 remain authorized, and retries failed unadmitted candidates only after exact
 endpoint→Pod→PVC cleanup. Carried failover first installs a write-closed
@@ -195,7 +195,7 @@ configuration, policy, final epoch, and safe prefix. The completion receipt keep
 that proof with a provisional-primary reference instead of duplicating the full
 intent/configuration, so a returning provisional member can advance through
 final PC/CC and current-only without accepting unrelated stale authority. Protocol
-8/schema 4 require a fresh coordinated deployment; classic v1 remains unchanged.
+9/schema 5 require a fresh coordinated deployment; classic v1 remains unchanged.
 These limits and the explicitly deferred
 durable primary-agent phase coordinator are recorded in
 [scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).

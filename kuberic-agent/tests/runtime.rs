@@ -598,11 +598,11 @@ mod in_process_transport_tests {
         let before = source.snapshot().await.authority;
         let primary = source.primary_replicator().await.unwrap();
         let target = identity(2, "replacement");
-        let info = ReplicaInformation {
-            build_id: OperationId::new("control-build"),
-            identity: target.clone(),
-            replication_address: "in-process://replacement".into(),
-        };
+        let info = ReplicaInformation::new(
+            OperationId::new("control-build"),
+            target.clone(),
+            "in-process://replacement".into(),
+        );
         let mut transport = InProcessTransport::new();
         transport
             .register(source.clone(), ProcessSessionId::new("source"))
@@ -3332,7 +3332,7 @@ impl ReplicatorFactory for PausingFactory {
     async fn create_replicator(
         &self,
         context: ReplicatorFactoryContext,
-        provider: Arc<dyn StateProvider>,
+        provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         let interfaces =
@@ -3351,7 +3351,7 @@ impl ReplicatorFactory for CountingFactory {
     async fn create_replicator(
         &self,
         context: ReplicatorFactoryContext,
-        provider: Arc<dyn StateProvider>,
+        provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         let interfaces =
@@ -3457,8 +3457,8 @@ impl PrimaryReplicator for CountingReplicator {
 
     async fn update_catch_up_replica_set_configuration(
         &self,
-        current: ConfigurationDescriptor,
-        previous: ConfigurationDescriptor,
+        current: kuberic_runtime::replicator::ReplicaSetConfiguration,
+        previous: kuberic_runtime::replicator::ReplicaSetConfiguration,
     ) -> Result<()> {
         self.primary
             .update_catch_up_replica_set_configuration(current, previous)
@@ -3471,7 +3471,7 @@ impl PrimaryReplicator for CountingReplicator {
 
     async fn update_current_replica_set_configuration(
         &self,
-        current: ConfigurationDescriptor,
+        current: kuberic_runtime::replicator::ReplicaSetConfiguration,
     ) -> Result<()> {
         self.primary
             .update_current_replica_set_configuration(current)
@@ -3516,8 +3516,12 @@ impl StatefulServiceReplica for TestApplication {
             factory.unwrap_or_else(|| Arc::new(DefaultReplicatorFactory::new(self.clone())));
         let partition = context.partition.with_factory(factory);
         let settings = self.settings.lock().unwrap().clone();
-        let interfaces = partition.create_replicator(self.clone(), settings).await?;
-        let state_replicator = interfaces.state_replicator();
+        let interfaces = partition
+            .create_replicator(Some(self.clone()), settings)
+            .await?;
+        let state_replicator = interfaces
+            .state_replicator()
+            .expect("default operation/copy capability");
         let replication = state_replicator.get_replication_stream().await?;
         let copy = state_replicator.get_copy_stream().await?;
         self.streams_taken.fetch_add(2, Ordering::SeqCst);
@@ -5086,11 +5090,11 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         let target = replacement.clone();
         tokio::spawn(async move {
             control
-                .build_replica(kuberic_runtime::replicator::ReplicaInformation {
-                    build_id: OperationId::new("sf-build"),
-                    identity: target,
-                    replication_address: "target".into(),
-                })
+                .build_replica(ReplicaInformation::new(
+                    OperationId::new("sf-build"),
+                    target,
+                    "target".into(),
+                ))
                 .await
         })
     };
@@ -5304,7 +5308,7 @@ async fn quorum_modes_data_loss_and_configuration_methods_use_the_default_engine
     invalid.epoch = Epoch::new(0, 3);
     assert!(matches!(
         control
-            .update_current_replica_set_configuration(invalid)
+            .update_current_replica_set_configuration(invalid.into())
             .await,
         Err(RuntimeError::AuthorityMismatch(_))
     ));
@@ -5686,11 +5690,11 @@ async fn removing_a_replica_terminates_its_pending_build_wait() {
         let target = target.clone();
         tokio::spawn(async move {
             control
-                .build_replica(kuberic_runtime::replicator::ReplicaInformation {
-                    build_id: OperationId::new("removed-build"),
-                    identity: target,
-                    replication_address: "target".into(),
-                })
+                .build_replica(ReplicaInformation::new(
+                    OperationId::new("removed-build"),
+                    target,
+                    "target".into(),
+                ))
                 .await
         })
     };
@@ -5722,11 +5726,11 @@ async fn cancelling_an_exact_outbound_build_terminates_only_its_pending_wait() {
         let build_id = cancelled_id.clone();
         tokio::spawn(async move {
             control
-                .build_replica(kuberic_runtime::replicator::ReplicaInformation {
+                .build_replica(ReplicaInformation::new(
                     build_id,
-                    identity: identity(2, "cancelled-target"),
-                    replication_address: "cancelled-target".into(),
-                })
+                    identity(2, "cancelled-target"),
+                    "cancelled-target".into(),
+                ))
                 .await
         })
     };
@@ -5758,11 +5762,11 @@ async fn bounded_outbound_build_queue_is_cancelled_by_abort() {
         let control = control.clone();
         builds.push(tokio::spawn(async move {
             control
-                .build_replica(kuberic_runtime::replicator::ReplicaInformation {
-                    build_id: OperationId::new(format!("bounded-build-{id}")),
-                    identity: identity(id, &format!("target-{id}")),
-                    replication_address: format!("target-{id}"),
-                })
+                .build_replica(ReplicaInformation::new(
+                    OperationId::new(format!("bounded-build-{id}")),
+                    identity(id, &format!("target-{id}")),
+                    format!("target-{id}"),
+                ))
                 .await
         }));
     }
@@ -5924,7 +5928,7 @@ impl ReplicatorFactory for ExternalFactory {
     async fn create_replicator(
         &self,
         _context: ReplicatorFactoryContext,
-        _provider: Arc<dyn StateProvider>,
+        _provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         let (replication_tx, replication) = OperationStream::channel(1);
@@ -5938,7 +5942,7 @@ impl ReplicatorFactory for ExternalFactory {
         });
         Ok(ReplicatorInterfaces::secondary(
             replicator.clone(),
-            replicator,
+            Some(replicator),
         ))
     }
 }
@@ -5952,7 +5956,7 @@ impl ReplicatorFactory for CountingExternalFactory {
     async fn create_replicator(
         &self,
         context: ReplicatorFactoryContext,
-        provider: Arc<dyn StateProvider>,
+        provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -5981,11 +5985,11 @@ impl StatefulServiceReplica for DoubleCreateService {
                 calls: self.factory_calls.clone(),
             }));
         let first = partition
-            .create_replicator(Arc::new(TestApplication::default()), None)
+            .create_replicator(Some(Arc::new(TestApplication::default())), None)
             .await?;
         assert!(matches!(
             partition
-                .create_replicator(Arc::new(TestApplication::default()), None)
+                .create_replicator(Some(Arc::new(TestApplication::default())), None)
                 .await,
             Err(RuntimeError::Application(_))
         ));
@@ -6011,9 +6015,11 @@ impl StatefulServiceReplica for ExternalService {
         let interfaces = context
             .partition
             .with_factory(Arc::new(ExternalFactory))
-            .create_replicator(Arc::new(TestApplication::default()), None)
+            .create_replicator(Some(Arc::new(TestApplication::default())), None)
             .await?;
-        let state_replicator = interfaces.state_replicator();
+        let state_replicator = interfaces
+            .state_replicator()
+            .expect("operation/copy capability");
         let streams = vec![
             state_replicator.get_replication_stream().await?,
             state_replicator.get_copy_stream().await?,

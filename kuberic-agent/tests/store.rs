@@ -96,7 +96,7 @@ fn pending_acceptance_fixture() -> (
                 local_identity: local,
                 transition_kind: None,
                 previous_configuration: None,
-                current_configuration: intent.current_configuration,
+                current_configuration: intent.current_configuration.clone(),
                 switchover_handoff: None,
                 scale_up: None,
                 secondary_removal: Some(committed.evidence.clone()),
@@ -348,7 +348,7 @@ async fn schema_two_is_rejected_without_migration_or_provenance_changes() {
     assert!(matches!(
         SqliteStore::open_existing(&path, None),
         Err(AgentError::SchemaMismatch {
-            expected: 4,
+            expected: 5,
             observed: 2
         })
     ));
@@ -659,7 +659,7 @@ fn fresh_scale_up_store_requires_exact_frozen_authority() {
         InitializationAuthority::ScaleUp(&provisioning),
     )
     .unwrap();
-    assert_eq!(identity.schema_version, 4);
+    assert_eq!(identity.schema_version, 5);
 
     for mutation in 0..6 {
         let mut stale = command.clone();
@@ -800,6 +800,18 @@ async fn source_build_abandonment_resolves_only_the_exact_pending_copy_effect() 
     assert!(abandoned.abandoned_builds.contains(&build_id));
     assert_eq!(abandoned.next_effect_sequence, 1);
     assert!(store.journal_build(&build).await.is_err());
+    let authority = BuildAuthority {
+        build_id: build_id.clone(),
+        kind: BuildAuthorityKind::Provisioning,
+        source: identity.local_identity.clone(),
+        target: target.clone(),
+        current_configuration: initialize.bootstrap_configuration.clone(),
+        replication_boundary_lsn: 0,
+    };
+    authority.validate().unwrap();
+    assert!(store.admit_build(&authority).await.is_err());
+    assert!(store.load_build(&build_id).await.unwrap().is_none());
+    assert!(store.load_builds().await.unwrap().is_empty());
 
     let unrelated_path = directory.path().join("unrelated.db");
     let unrelated =
@@ -925,6 +937,42 @@ async fn committed_snapshot_boundary_is_durable_write_once_before_first_chunk() 
         assert!(store.admit_build(&changed).await.is_err());
     }
     store.record_build_progress(&progress).await.unwrap();
+}
+
+#[tokio::test]
+async fn application_creation_permission_is_durable_one_way_and_opt_in() {
+    use kuberic_agent::state::ApplicationStorageBinding;
+    use std::collections::BTreeMap;
+
+    for opt_in in [false, true] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let (command, observed, transition) = bootstrap_fixture();
+        let identity = authorize_initialization(
+            &command,
+            &observed,
+            InitializationAuthority::Bootstrap(&transition),
+        )
+        .unwrap();
+        let mut state = AgentState::new(identity.clone());
+        state.application_storage = opt_in.then(|| ApplicationStorageBinding {
+            paths: BTreeMap::from([("database".into(), directory.path().join("application"))]),
+            initializing: true,
+        });
+        let store = SqliteStore::create_authorized(&path, state.clone()).unwrap();
+        drop(store);
+        let store = SqliteStore::open_existing(&path, Some(&identity)).unwrap();
+        assert_eq!(store.load_state().await.unwrap(), state);
+        store.complete_application_initialization().await.unwrap();
+        store.complete_application_initialization().await.unwrap();
+        if let Some(binding) = &mut state.application_storage {
+            binding.initializing = false;
+        }
+        drop(store);
+        let store = SqliteStore::open_existing(&path, Some(&identity)).unwrap();
+        assert_eq!(store.load_state().await.unwrap(), state);
+        assert!(!directory.path().join("application").exists());
+    }
 }
 
 #[tokio::test]

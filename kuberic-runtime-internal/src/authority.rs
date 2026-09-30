@@ -556,6 +556,10 @@ pub trait LocalWriteJournal: Send + Sync {
 pub trait BuildAuthorityStore: Send + Sync {
     async fn load_build(&self, build_id: &OperationId) -> Result<Option<BuildAuthority>>;
 
+    async fn load_builds(&self) -> Result<Vec<BuildAuthority>> {
+        Ok(Vec::new())
+    }
+
     async fn admit_build(&self, authority: &BuildAuthority) -> Result<()>;
 }
 

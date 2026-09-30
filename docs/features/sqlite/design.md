@@ -6,7 +6,7 @@ and no classic runtime/operator dependency. The primary serves SQL over gRPC;
 secondaries retain durable WAL-frame history but do not serve client SQL.
 
 This is an experimental source/runtime migration, not a deployed-data upgrade.
-Use fresh v2 storage with protocol 8 / agent schema 4. There is no v1 data,
+Use fresh v2 storage with protocol 9 / agent schema 5. There is no v1 data,
 authority, or metadata import path. SQLite-specific images, manifests, published
 deployment assets, and live-cluster validation remain separate distribution work.
 

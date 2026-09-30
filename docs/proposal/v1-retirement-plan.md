@@ -204,7 +204,7 @@ classic `kuberic.io/v1` remains unchanged. Its as-built behavior is:
   UID/resource-version provenance and authoritative absence. Different-UID
   resources survive, and partial PVCs are not resumed.
 
-Protocol 8 and agent schema 4 are exact coordinated-deployment boundaries.
+Protocol 9 and agent schema 5 are exact coordinated-deployment boundaries.
 Protocol 7 and earlier, plus schemas 2 and 3, are rejected with no migration,
 mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 344,907 bytes under a
 strict-below-350,000-byte regression guard; the largest current representative
@@ -249,7 +249,7 @@ sequential cleanup, and Kubernetes resource deletion.
   cleanup identity.
 - Schema-3 retirement-started/tombstone recovery prevents application Open
   after retirement begins and additionally persists scale-up build/admission
-  authority. Protocol 8/store schema 4 require fresh deployment, without
+  authority. Protocol 9/store schema 5 require fresh deployment, without
   migration or mixed-version support.
 - Active removal cannot be cancelled or retargeted. Cleanup serializes later
   removals and other authority work. Primary loss or missing evidence waits
@@ -342,7 +342,7 @@ alive during handoff. All restart fixtures reopen durable agent and application
 state with fresh sessions. No SQLite KinD, Kubernetes, container, or subprocess
 test is part of this migration.
 
-Fresh v2 application storage and protocol 8 / schema 4 agent metadata are
+Fresh v2 application storage and protocol 9 / schema 5 agent metadata are
 required. This does not import deployed v1 SQLite data, create a second
 application, or establish rolling-upgrade support. Image publication, SQLite
 deployment assets, and live-cluster validation remain separate distribution work.

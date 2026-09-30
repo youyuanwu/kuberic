@@ -89,8 +89,9 @@ previous/reduced policies, and durable preparation, acceptance, and retirement
 evidence. Protocol version 7 added sequential scale-up with exact allocation,
 build, admission, completion, and cleanup authority. **Protocol version 8**
 adds epoch-fenced carried-failover election and persists its exact final safe
-LSN in the completion receipt; all level-triggered components must use that
-exact version.
+LSN in the completion receipt. **Protocol version 9** adds the service-created
+replicator's advertised endpoint to agent status; all
+level-triggered components must use that exact version.
 The current primary revalidates the progress certificate
 before it can contribute remote quorum credit.
 
@@ -488,8 +489,8 @@ scheduling are [deferred](../../proposal/v1-retirement-plan.md#deferred-scale-do
 Scale-up is sequential and restores the first missing positive logical ordinal
 outside accepted authority before allocating a new highest ordinal.
 
-Protocol 8 and agent store schema 4 require a **fresh coordinated deployment**;
-protocol 7 and earlier are rejected, as are schemas 2 and 3, with no migration or
+Protocol 9 and agent store schema 5 require a **fresh coordinated deployment**;
+protocol 8 and earlier are rejected, as are older schemas, with no migration or
 mixed-version mode.
 Schema 3 persists scale-up build and admission authority in addition to the
 schema-2 initialization provenance and admitted policies.
@@ -694,12 +695,13 @@ semantics. Filesystems that cannot provide those semantics, including
 unsupported network-filesystem arrangements, are not valid production
 storage.
 
-The current schema is **4** and accepts only its exact version. The migration hook records
+The current schema is **5** and accepts only its exact version. The migration hook records
 an idempotent current-version migration; it does not upgrade older schemas.
-Schemas 2 and 3 are rejected without conversion. Schema 4 uses committed
-snapshot boundaries for replica builds; the applied suffix follows as retained
-catch-up. Use a fresh deployment for protocol 8 / schema 4; no rolling upgrade
-or existing-data migration is provided.
+Older schemas are rejected without conversion. Schema 5 retains committed
+snapshot boundaries for default-engine replica builds and adds durable
+application-path binding and one-way initialization permission. The applied suffix
+follows as retained catch-up. Use a fresh deployment for protocol 9 / schema 5;
+no rolling upgrade or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 `KUBERIC_CRASH_BOUNDARY` are consumed only by the
