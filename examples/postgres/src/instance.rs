@@ -1,14 +1,34 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as ProcessMutex};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::PgConfig;
+use crate::owned_command::OwnedCommands;
+use crate::owned_process::OwnedProcess;
 
-use kuberic_core::types::{CancellationToken, FaultType};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgProcessFault {
+    Transient,
+    Permanent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgProcessState {
+    Stopped,
+    Initialized,
+    Starting,
+    Running,
+    Stopping,
+    Faulted,
+}
+
+type FaultReporter = Arc<dyn Fn(PgProcessFault) + Send + Sync>;
 
 /// Manages a PostgreSQL instance as a child process.
 ///
@@ -19,10 +39,16 @@ pub struct PgInstanceManager {
     data_dir: PathBuf,
     pg_bin: PathBuf,
     port: u16,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<ProcessMutex<Option<OwnedProcess>>>,
+    helpers: Arc<OwnedCommands>,
+    shutdown_error: Arc<ProcessMutex<Option<PgError>>>,
     config: PgConfig,
     /// Cancelled by stop() to signal health monitor to exit quietly.
     shutdown: Mutex<CancellationToken>,
+    monitor_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    process_state: Arc<Mutex<PgProcessState>>,
+    run_generation: AtomicU64,
+    lifecycle_lock: Mutex<()>,
 }
 
 impl PgInstanceManager {
@@ -32,9 +58,15 @@ impl PgInstanceManager {
             data_dir,
             pg_bin,
             port,
-            child: Arc::new(Mutex::new(None)),
+            child: Arc::new(ProcessMutex::new(None)),
+            helpers: Arc::new(OwnedCommands::default()),
+            shutdown_error: Arc::new(ProcessMutex::new(None)),
             config,
             shutdown: Mutex::new(CancellationToken::new()),
+            monitor_tasks: Mutex::new(Vec::new()),
+            process_state: Arc::new(Mutex::new(PgProcessState::Stopped)),
+            run_generation: AtomicU64::new(0),
+            lifecycle_lock: Mutex::new(()),
         }
     }
 
@@ -67,28 +99,40 @@ impl PgInstanceManager {
         )
     }
 
+    pub fn application_connection_string(&self) -> String {
+        format!(
+            "host={} port={} dbname={} user={}",
+            self.data_dir.display(),
+            self.port,
+            crate::access::APPLICATION_DATABASE,
+            crate::access::APPLICATION_ROLE,
+        )
+    }
+
     /// Initialize a new PG cluster with data checksums.
     pub async fn init_db(&self) -> Result<(), PgError> {
-        let output = Command::new(self.pg_bin.join("initdb"))
-            .args([
-                "--data-checksums",
-                "-D",
-                &self.data_dir.to_string_lossy(),
-                "--auth=trust",
-                "--no-instructions",
-            ])
-            .env("LC_ALL", "C")
-            .output()
-            .await
-            .map_err(|e| PgError::Process(format!("initdb spawn: {e}")))?;
+        let output = self
+            .helpers
+            .output(
+                Command::new(self.pg_bin.join("initdb"))
+                    .args([
+                        "--data-checksums",
+                        "-D",
+                        &self.data_dir.to_string_lossy(),
+                        "--auth=trust",
+                        "--no-instructions",
+                    ])
+                    .env("LC_ALL", "C"),
+            )
+            .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(PgError::Process(format!("initdb failed: {stderr}")));
+            return Err(PgError::command_failed("initdb failed", &output));
         }
 
         // Write required config
         self.config.write_initial(&self.data_dir).await?;
+        *self.process_state.lock().await = PgProcessState::Initialized;
 
         tracing::info!(
             data_dir = %self.data_dir.display(),
@@ -103,27 +147,121 @@ impl PgInstanceManager {
         &self.config
     }
 
-    /// Start PostgreSQL. Pipes stdout/stderr through tracing.
-    /// Spawns a child process monitor that reports fault on unexpected exit.
-    pub async fn start(&self, fault_tx: mpsc::Sender<FaultType>) -> Result<(), PgError> {
-        {
-            let guard = self.child.lock().await;
-            if guard.is_some() {
-                return Ok(()); // already running
+    pub async fn start_native(
+        &self,
+        fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
+    ) -> Result<(), PgError> {
+        let reporter: FaultReporter = Arc::new(move |fault| {
+            let fault = match fault {
+                PgProcessFault::Transient => kuberic_protocol::types::FaultType::Transient,
+                PgProcessFault::Permanent => kuberic_protocol::types::FaultType::Permanent,
+            };
+            let fault_tx = fault_tx.clone();
+            tokio::spawn(async move {
+                let _ = fault_tx.send(fault).await;
+            });
+        });
+        self.start_with_fault_reporter(reporter).await
+    }
+
+    pub async fn start_native_with_cancellation(
+        self: &Arc<Self>,
+        fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<(), PgError> {
+        self.start_native(fault_tx).await?;
+        let generation = self.run_generation.load(Ordering::Acquire);
+        let instance = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            cancellation.cancelled().await;
+            if let Some(instance) = instance.upgrade() {
+                let _lifecycle = instance.lifecycle_lock.lock().await;
+                if instance.run_generation.load(Ordering::Acquire) == generation {
+                    let result = instance.abort_owned();
+                    *instance.process_state.lock().await = if result.is_ok() {
+                        PgProcessState::Stopped
+                    } else {
+                        PgProcessState::Faulted
+                    };
+                }
             }
+        });
+        self.monitor_tasks.lock().await.push(task);
+        Ok(())
+    }
+
+    pub async fn control_identity(&self) -> Result<(String, u32), PgError> {
+        let output = self
+            .helpers
+            .output(
+                Command::new(self.pg_bin.join("pg_controldata"))
+                    .arg(&self.data_dir)
+                    .env("LC_ALL", "C"),
+            )
+            .await?;
+        if !output.status.success() {
+            return Err(PgError::command_failed(
+                "cannot inspect PostgreSQL control data",
+                &output,
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+                .ok_or_else(|| PgError::Process(format!("missing control field {name}")))
+        };
+        let system = field("Database system identifier:")?.to_owned();
+        let timeline = field("Latest checkpoint's TimeLineID:")?
+            .parse()
+            .map_err(|_| PgError::Process("invalid control timeline".into()))?;
+        Ok((system, timeline))
+    }
+
+    async fn start_with_fault_reporter(
+        &self,
+        fault_reporter: FaultReporter,
+    ) -> Result<(), PgError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        if self.is_running().await {
+            return Ok(());
+        }
+        *self.shutdown_error.lock().unwrap() = None;
+        self.finish_owned().await?;
+        self.shutdown.lock().await.cancel();
+        for task in std::mem::take(&mut *self.monitor_tasks.lock().await) {
+            task.abort();
+            let _ = task.await;
+        }
+        self.helpers.reopen()?;
+        self.run_generation.fetch_add(1, Ordering::AcqRel);
+        *self.process_state.lock().await = PgProcessState::Starting;
+        let prepared = async {
+            OwnedProcess::check_support()?;
+            self.control_identity().await?;
+            self.config.write_initial(&self.data_dir).await
+        }
+        .await;
+        if let Err(error) = prepared {
+            fault_reporter(PgProcessFault::Permanent);
+            *self.process_state.lock().await = PgProcessState::Faulted;
+            return Err(error);
         }
 
-        let mut child = Command::new(self.pg_bin.join("postgres"))
-            .args(["-D", &self.data_dir.to_string_lossy()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| PgError::Process(format!("postgres spawn: {e}")))?;
+        let (stdout, stderr) = match self.spawn_owned() {
+            Ok(streams) => streams,
+            Err(error) => {
+                fault_reporter(PgProcessFault::Permanent);
+                *self.process_state.lock().await = PgProcessState::Faulted;
+                return Err(error);
+            }
+        };
 
         // Forward stdout + stderr through tracing in one task
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let stderr = BufReader::new(child.stderr.take().unwrap());
-        tokio::spawn(async move {
+        let stdout = BufReader::new(stdout);
+        let stderr = BufReader::new(stderr);
+        let log_task = tokio::spawn(async move {
             let mut stdout_lines = stdout.lines();
             let mut stderr_lines = stderr.lines();
             loop {
@@ -143,85 +281,91 @@ impl PgInstanceManager {
                 }
             }
         });
-
-        *self.child.lock().await = Some(child);
+        self.monitor_tasks.lock().await.push(log_task);
 
         // Fresh shutdown token for this run
         let shutdown = CancellationToken::new();
         *self.shutdown.lock().await = shutdown.clone();
 
         // Wait for PG to be ready
-        self.wait_ready().await?;
+        if let Err(error) = self.wait_ready().await {
+            fault_reporter(PgProcessFault::Permanent);
+            let cleanup = self.finish_owned().await;
+            for task in std::mem::take(&mut *self.monitor_tasks.lock().await) {
+                task.abort();
+            }
+            *self.process_state.lock().await = PgProcessState::Faulted;
+            return Err(error.with_cleanup(cleanup));
+        }
 
-        // Spawn process exit monitor — detects PG crash immediately via
-        // try_wait() and clears the child field (prevents stale state in
-        // start()). Also reports FaultType::Permanent unless shutdown was
-        // intentional (KP-9 fix).
+        // Observe without reaping: shutdown retains ownership of any descendants.
         {
             let child_mutex = self.child.clone();
             let exit_shutdown = shutdown.clone();
-            let exit_ft = fault_tx.clone();
+            let exit_fault_reporter = fault_reporter.clone();
             let exit_port = self.port;
-            tokio::spawn(async move {
+            let exit_state = self.process_state.clone();
+            let exit_task = tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = exit_shutdown.cancelled() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
                     }
-                    let mut guard = child_mutex.lock().await;
-                    if let Some(child) = guard.as_mut() {
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                // PG exited — reap immediately
-                                guard.take();
-                                drop(guard);
+                    let exited = match child_mutex.try_lock() {
+                        Ok(guard) => guard.as_ref().map(OwnedProcess::exited),
+                        Err(_) => continue,
+                    };
+                    if let Some(exited) = exited {
+                        match exited {
+                            Ok(true) => {
                                 if !exit_shutdown.is_cancelled() {
                                     tracing::error!(
                                         port = exit_port,
-                                        ?status,
                                         "PostgreSQL exited unexpectedly"
                                     );
-                                    let _ = exit_ft.send(FaultType::Permanent).await;
+                                    exit_fault_reporter(PgProcessFault::Permanent);
+                                    *exit_state.lock().await = PgProcessState::Faulted;
                                 }
                                 break;
                             }
-                            Ok(None) => {} // still running
+                            Ok(false) => {}
                             Err(e) => {
-                                tracing::warn!("try_wait error: {}", e);
+                                tracing::warn!("process observation error: {}", e);
                             }
                         }
                     } else {
-                        // child was taken by stop() — exit quietly
                         break;
                     }
                 }
             });
+            self.monitor_tasks.lock().await.push(exit_task);
         }
 
         // Spawn pg_isready health monitor — catches PG hung but process alive
         // (complements the exit monitor above). Exits quietly on shutdown.
         let port = self.port;
-        let ft = fault_tx;
+        let health_fault_reporter = fault_reporter;
         let data_dir = self.data_dir.clone();
         let pg_bin = self.pg_bin.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        let health_state = self.process_state.clone();
+        let helpers = self.helpers.clone();
+        let health_task = tokio::spawn(async move {
             let mut consecutive_failures: u32 = 0;
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                 }
-                let status = Command::new(pg_bin.join("pg_isready"))
-                    .args([
+                let status = helpers
+                    .output(Command::new(pg_bin.join("pg_isready")).args([
                         "-h",
                         &data_dir.to_string_lossy(),
                         "-p",
                         &port.to_string(),
                         "-d",
                         "postgres",
-                    ])
-                    .output()
+                    ]))
                     .await;
                 match status {
                     Ok(output) if output.status.success() => {
@@ -235,7 +379,8 @@ impl PgInstanceManager {
                                     port,
                                     "PostgreSQL unresponsive (3 consecutive pg_isready failures)"
                                 );
-                                let _ = ft.send(FaultType::Permanent).await;
+                                health_fault_reporter(PgProcessFault::Permanent);
+                                *health_state.lock().await = PgProcessState::Faulted;
                             }
                             break;
                         }
@@ -243,30 +388,82 @@ impl PgInstanceManager {
                 }
             }
         });
+        self.monitor_tasks.lock().await.push(health_task);
 
+        *self.process_state.lock().await = PgProcessState::Running;
         tracing::info!(port = self.port, "PostgreSQL started");
         Ok(())
+    }
+
+    fn spawn_owned(
+        &self,
+    ) -> Result<(tokio::process::ChildStdout, tokio::process::ChildStderr), PgError> {
+        // Registration and spawn are indivisible with respect to synchronous abort.
+        let mut owned = self.child.lock().unwrap();
+        let mut process = OwnedProcess::spawn(
+            Command::new(self.pg_bin.join("postgres"))
+                .args(["-D", &self.data_dir.to_string_lossy()]),
+        )?;
+        let streams = process.take_output();
+        *owned = Some(process);
+        owned.as_mut().unwrap().start()?;
+        Ok(streams)
     }
 
     /// Wait for PG to accept connections.
     async fn wait_ready(&self) -> Result<(), PgError> {
         for i in 0..60 {
-            let output = Command::new(self.pg_bin.join("pg_isready"))
-                .args([
-                    "-h",
-                    &self.data_dir.to_string_lossy(),
-                    "-p",
-                    &self.port.to_string(),
-                    "-d",
-                    "postgres",
-                ])
-                .output()
-                .await
-                .map_err(|e| PgError::Process(format!("pg_isready: {e}")))?;
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.helpers
+                    .output(Command::new(self.pg_bin.join("pg_isready")).args([
+                        "-h",
+                        &self.data_dir.to_string_lossy(),
+                        "-p",
+                        &self.port.to_string(),
+                        "-d",
+                        "postgres",
+                    ])),
+            )
+            .await
+            .map_err(|_| PgError::Process("pg_isready command timeout".into()))??;
 
             if output.status.success() {
+                // Readiness must belong to our launch, not another server using
+                // this socket. Keep the backend alive while validating its parent.
+                let timeout = std::time::Duration::from_secs(2);
+                let (client, connection) =
+                    tokio::time::timeout(timeout, self.connect())
+                        .await
+                        .map_err(|_| PgError::Process("postmaster connection timeout".into()))??;
+                let backend =
+                    tokio::time::timeout(timeout, client.query_one("SELECT pg_backend_pid()", &[]))
+                        .await
+                        .map_err(|_| PgError::Process("postmaster identity timeout".into()))
+                        .and_then(|result| {
+                            result.map_err(|error| {
+                                PgError::Process(format!("identify postmaster: {error}"))
+                            })
+                        });
+                let bound = backend.and_then(|row| {
+                    let backend: i32 = row.get(0);
+                    self.child
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .ok_or_else(|| PgError::Process("PostgreSQL ownership lost".into()))?
+                        .bind_postmaster(backend as u32)
+                });
+                drop(client);
+                connection.abort();
+                bound?;
                 tracing::debug!(attempt = i, "pg_isready: accepting connections");
                 return Ok(());
+            }
+            if !self.is_running().await {
+                return Err(PgError::Process(
+                    "PostgreSQL exited before becoming ready".into(),
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
@@ -275,57 +472,63 @@ impl PgInstanceManager {
 
     /// Stop PostgreSQL (fast mode).
     pub async fn stop(&self) -> Result<(), PgError> {
+        self.stop_generation(None).await
+    }
+
+    async fn stop_generation(&self, expected_generation: Option<u64>) -> Result<(), PgError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        if expected_generation
+            .is_some_and(|expected| self.run_generation.load(Ordering::Acquire) != expected)
+        {
+            return Ok(());
+        }
+        self.run_generation.fetch_add(1, Ordering::AcqRel);
+        *self.process_state.lock().await = PgProcessState::Stopping;
         // Signal health monitor to exit quietly before stopping PG
         self.shutdown.lock().await.cancel();
 
-        let output = Command::new(self.pg_bin.join("pg_ctl"))
-            .args([
-                "stop",
-                "-D",
-                &self.data_dir.to_string_lossy(),
-                "-m",
-                "fast",
-                "-w",
-            ])
-            .output()
-            .await
-            .map_err(|e| PgError::Process(format!("pg_ctl stop: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Not running is OK
-            if !stderr.contains("not running") {
-                return Err(PgError::Process(format!("pg_ctl stop failed: {stderr}")));
-            }
+        for task in std::mem::take(&mut *self.monitor_tasks.lock().await) {
+            task.abort();
+            let _ = task.await;
+        }
+        let result = self.finish_owned().await;
+        if result.is_err() {
+            *self.process_state.lock().await = PgProcessState::Faulted;
+            return result;
         }
 
-        // Reap child process if we have one
-        if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.wait().await;
-        }
-
+        *self.process_state.lock().await = PgProcessState::Stopped;
         tracing::info!(port = self.port, "PostgreSQL stopped");
         Ok(())
     }
 
+    pub async fn is_running(&self) -> bool {
+        let child = self.child.lock().unwrap();
+        child
+            .as_ref()
+            .is_some_and(|child| !child.exited().unwrap_or(false))
+    }
+
+    pub async fn process_state(&self) -> PgProcessState {
+        *self.process_state.lock().await
+    }
+
     /// Promote standby to primary.
     pub async fn promote(&self) -> Result<(), PgError> {
-        let output = Command::new(self.pg_bin.join("pg_ctl"))
-            .args([
+        let output = self
+            .helpers
+            .output(Command::new(self.pg_bin.join("pg_ctl")).args([
                 "promote",
                 "-D",
                 &self.data_dir.to_string_lossy(),
                 "-w",
                 "-t",
                 "60",
-            ])
-            .output()
-            .await
-            .map_err(|e| PgError::Process(format!("pg_ctl promote: {e}")))?;
+            ]))
+            .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(PgError::Process(format!("pg_ctl promote failed: {stderr}")));
+            return Err(PgError::command_failed("pg_ctl promote failed", &output));
         }
 
         tracing::info!(port = self.port, "PostgreSQL promoted to primary");
@@ -334,8 +537,9 @@ impl PgInstanceManager {
 
     /// Run pg_basebackup from a source to initialize this replica.
     pub async fn base_backup(&self, source_host: &str, source_port: u16) -> Result<(), PgError> {
-        let output = Command::new(self.pg_bin.join("pg_basebackup"))
-            .args([
+        let output = self
+            .helpers
+            .output(Command::new(self.pg_bin.join("pg_basebackup")).args([
                 "-D",
                 &self.data_dir.to_string_lossy(),
                 "-h",
@@ -346,15 +550,14 @@ impl PgInstanceManager {
                 &whoami::username().unwrap_or_else(|_| "postgres".to_string()),
                 "-Fp",
                 "-Xs",
+                "-c",
+                "fast",
                 "-R", // creates standby.signal + primary_conninfo
-            ])
-            .output()
-            .await
-            .map_err(|e| PgError::Process(format!("pg_basebackup: {e}")))?;
+            ]))
+            .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(PgError::Process(format!("pg_basebackup failed: {stderr}")));
+            return Err(PgError::command_failed("pg_basebackup failed", &output));
         }
 
         tracing::info!(
@@ -369,24 +572,52 @@ impl PgInstanceManager {
     pub async fn rewind(&self, source_host: &str, source_port: u16) -> Result<(), PgError> {
         let source_conn = format!("host={source_host} port={source_port} dbname=postgres");
 
-        let output = Command::new(self.pg_bin.join("pg_rewind"))
-            .args([
+        let output = self
+            .helpers
+            .output(Command::new(self.pg_bin.join("pg_rewind")).args([
                 "--target-pgdata",
                 &self.data_dir.to_string_lossy(),
                 "--source-server",
                 &source_conn,
-            ])
-            .output()
-            .await
-            .map_err(|e| PgError::Process(format!("pg_rewind: {e}")))?;
+            ]))
+            .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(PgError::Process(format!("pg_rewind failed: {stderr}")));
+            return Err(PgError::command_failed("pg_rewind failed", &output));
         }
 
         tracing::info!(port = self.port, "pg_rewind complete");
         Ok(())
+    }
+
+    pub(crate) async fn prepare_native_build(&self) -> Result<(), PgError> {
+        self.stop().await?;
+        self.helpers.reopen()
+    }
+
+    pub(crate) async fn rewind_for_build(
+        &self,
+        source_host: &str,
+        source_port: u16,
+    ) -> Result<bool, PgError> {
+        let output = self
+            .helpers
+            .output(
+                Command::new(self.pg_bin.join("pg_rewind"))
+                    .arg("--target-pgdata")
+                    .arg(&self.data_dir)
+                    .arg("--source-server")
+                    .arg(format!(
+                        "host={source_host} port={source_port} dbname=postgres user=kuberic_rewind"
+                    ))
+                    .arg("--no-ensure-shutdown"),
+            )
+            .await?;
+        if !output.status.success() {
+            tracing::warn!(error = %PgError::command_failed("pg_rewind requires fresh backup", &output), "native rewind fallback");
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Connect to the local PG instance via UDS.
@@ -409,41 +640,89 @@ impl PgInstanceManager {
 
         Ok((client, handle))
     }
+
+    pub async fn connect_application(
+        &self,
+    ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), PgError> {
+        let connection_string = self.application_connection_string();
+        let (client, connection) =
+            tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| {
+                    PgError::Connection(format!("connect to {connection_string}: {error}"))
+                })?;
+        let handle = tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!("PG application connection closed: {}", error);
+            }
+        });
+        Ok((client, handle))
+    }
+
+    async fn finish_owned(&self) -> Result<(), PgError> {
+        let child = self.child.clone();
+        let error = self.shutdown_error.clone();
+        let data_dir = self.data_dir.clone();
+        let helpers = self.helpers.clone();
+        tokio::task::spawn_blocking(move || {
+            let commands = helpers.terminate(false);
+            let postgres = Self::terminate_owned(&child, &error, &data_dir);
+            match commands {
+                Ok(()) => postgres,
+                Err(error) => Err(error.with_cleanup(postgres)),
+            }
+        })
+        .await
+        .map_err(|error| PgError::Process(format!("join PostgreSQL cleanup: {error}")))?
+    }
+
+    fn terminate_owned(
+        child: &ProcessMutex<Option<OwnedProcess>>,
+        error: &ProcessMutex<Option<PgError>>,
+        data_dir: &Path,
+    ) -> Result<(), PgError> {
+        let mut child = child.lock().unwrap();
+        if let Some(owned) = child.as_mut() {
+            let result = owned.stop(data_dir);
+            // Even a failed graceful stop can have fully cleaned up. Retain its error
+            // across runtime abort / cancellation / application close callers.
+            if result.is_ok() {
+                child.take();
+            }
+            if let Err(cleanup) = result {
+                *error.lock().unwrap() = Some(cleanup);
+            }
+        }
+        error.lock().unwrap().clone().map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn abort_owned(&self) -> Result<(), PgError> {
+        if let Ok(shutdown) = self.shutdown.try_lock() {
+            shutdown.cancel();
+        }
+        let helpers = self.helpers.terminate(true);
+        let postgres = Self::terminate_owned(&self.child, &self.shutdown_error, &self.data_dir);
+        match helpers {
+            Ok(()) => postgres,
+            Err(error) => Err(error.with_cleanup(postgres)),
+        }
+    }
 }
 
 impl Drop for PgInstanceManager {
     fn drop(&mut self) {
         // Cancel health monitor + process exit monitor
         self.shutdown.get_mut().cancel();
-        // Best-effort stop: check if child exists via try_lock
-        if let Ok(guard) = self.child.try_lock() {
-            if guard.is_some() {
-                let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))
-                    .args([
-                        "stop",
-                        "-D",
-                        &self.data_dir.to_string_lossy(),
-                        "-m",
-                        "immediate",
-                    ])
-                    .output();
-            }
-        } else {
-            // Lock held by exit monitor — still try to stop PG
-            let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))
-                .args([
-                    "stop",
-                    "-D",
-                    &self.data_dir.to_string_lossy(),
-                    "-m",
-                    "immediate",
-                ])
-                .output();
+        for task in self.monitor_tasks.get_mut().drain(..) {
+            task.abort();
+        }
+        if let Err(error) = self.abort_owned() {
+            tracing::error!(%error, "PostgreSQL drop cleanup failed");
         }
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PgError {
     #[error("process error: {0}")]
     Process(String),
@@ -451,4 +730,33 @@ pub enum PgError {
     Connection(String),
     #[error("query error: {0}")]
     Query(String),
+    #[error("configuration error: {0}")]
+    Configuration(String),
+}
+
+impl PgError {
+    fn command_failed(context: &str, output: &std::process::Output) -> Self {
+        Self::Process(format!(
+            "{context} ({}); stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+    }
+
+    pub(crate) fn with_cleanup(self, cleanup: Result<(), PgError>) -> Self {
+        match cleanup {
+            Ok(()) => self,
+            Err(cleanup) => Self::Process(format!("{self}; owned process cleanup: {cleanup}")),
+        }
+    }
+
+    pub fn fault_type(&self) -> kuberic_protocol::types::FaultType {
+        match self {
+            Self::Connection(_) | Self::Query(_) => kuberic_protocol::types::FaultType::Transient,
+            Self::Process(_) | Self::Configuration(_) => {
+                kuberic_protocol::types::FaultType::Permanent
+            }
+        }
+    }
 }

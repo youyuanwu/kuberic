@@ -102,7 +102,9 @@ the production v2 controller configuration enables
 one fresh incarnation at a time. Classic v1 remains unchanged. Automatic
 direct-primary removal is deferred; use planned switchover followed by
 secondary scale-down. An independent minimum replica count, a validated
-maximum replica count, and the PostgreSQL port remain future work. SQLite is
+maximum replica count, and PostgreSQL failover/scaling orchestration remain future work. PostgreSQL
+now uses the SF-shaped custom replicator for local lifecycle, fencing, exact builds
+and restart recovery; it owns WAL and does not use operation/copy streams. SQLite is
 ported in place and validated without Kubernetes; its distribution remains
 separate from the existing KVStore2 live deployment.
 Protocol 9 / agent schema 5 require a fresh coordinated v2 deployment.

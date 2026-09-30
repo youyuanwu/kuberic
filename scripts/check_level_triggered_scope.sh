@@ -10,8 +10,10 @@ if ! git rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null; then
 fi
 
 merge_base=$(git merge-base "$base_ref" HEAD)
-changed=$(mktemp)
-trap 'rm -f -- "$changed"' EXIT
+scratch="target/level-scope-$$"
+mkdir -p "$scratch"
+changed="$scratch/changed"
+trap 'rm -rf -- "$scratch"' EXIT
 
 {
     git diff --no-renames --name-only -z "$merge_base"...HEAD
@@ -21,11 +23,11 @@ trap 'rm -f -- "$changed"' EXIT
 } | sort -zu > "$changed"
 
 violations=()
-# examples/sqlite is the in-place v2 application; the remaining classic paths stay protected.
+# SQLite and PostgreSQL are migrated in place; remaining classic paths stay protected.
 while IFS= read -r -d '' path; do
     case "$path" in
         kuberic-core/* | kuberic-operator/* | examples/kvstore/* | \
-            examples/postgres/* | kuberic-tests/*)
+            kuberic-tests/*)
             violations+=("$path")
             ;;
     esac

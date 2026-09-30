@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
-temporary=$(mktemp -d)
+temporary="$repo_root/target/level-guards-$$"
+mkdir -p "$temporary"
 trap 'rm -rf -- "$temporary"' EXIT
 
 new_git_repo() {
@@ -205,5 +206,44 @@ sqlite_symlink="$temporary/sqlite-symlink"
 new_sqlite_repo "$sqlite_symlink"
 ln -s ../../../kuberic-core/src/types.rs "$sqlite_symlink/examples/sqlite/src/classic.rs"
 expect_dependency_failure "$sqlite_symlink"
+
+postgres_scope="$temporary/postgres-scope"
+new_git_repo "$postgres_scope"
+mkdir -p "$postgres_scope/examples/postgres/src"
+printf 'pub fn postgres() {}\n' > "$postgres_scope/examples/postgres/src/lib.rs"
+(cd "$postgres_scope" && scripts/check_level_triggered_scope.sh HEAD)
+(cd "$postgres_scope" && git add examples/postgres/src/lib.rs && scripts/check_level_triggered_scope.sh HEAD)
+
+new_postgres_repo() {
+    local directory=$1
+    new_sqlite_repo "$directory"
+    mv "$directory/examples/sqlite" "$directory/examples/postgres"
+    sed -i 's/examples\/sqlite/examples\/postgres/' "$directory/Cargo.toml"
+    sed -i 's/sqlite-replicated/postgres-replicated/' "$directory/examples/postgres/Cargo.toml"
+}
+
+for dependency in kuberic-core kuberic-operator; do
+    postgres_dependency="$temporary/postgres-$dependency"
+    new_postgres_repo "$postgres_dependency"
+    (cd "$postgres_dependency" && scripts/check_level_triggered_dependencies.sh)
+    mkdir -p "$postgres_dependency/$dependency/src"
+    printf '\nexclude = ["%s"]\n' "$dependency" >> "$postgres_dependency/Cargo.toml"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2024"\n' "$dependency" \
+        > "$postgres_dependency/$dependency/Cargo.toml"
+    printf 'pub fn classic() {}\n' > "$postgres_dependency/$dependency/src/lib.rs"
+    printf '\n[dev-dependencies]\n%s = { path = "../../%s" }\n' "$dependency" "$dependency" \
+        >> "$postgres_dependency/examples/postgres/Cargo.toml"
+    expect_dependency_failure "$postgres_dependency"
+done
+
+postgres_source="$temporary/postgres-source"
+new_postgres_repo "$postgres_source"
+printf 'use kuberic_core::types::Role;\n' > "$postgres_source/examples/postgres/src/lib.rs"
+expect_dependency_failure "$postgres_source"
+printf 'include!("../../../kuberic-core/src/types.rs");\n' > "$postgres_source/examples/postgres/src/lib.rs"
+expect_dependency_failure "$postgres_source"
+printf 'pub fn postgres() {}\n' > "$postgres_source/examples/postgres/src/lib.rs"
+ln -s ../../../kuberic-core/src/types.rs "$postgres_source/examples/postgres/src/classic.rs"
+expect_dependency_failure "$postgres_source"
 
 echo "Level-triggered guard regression tests passed."

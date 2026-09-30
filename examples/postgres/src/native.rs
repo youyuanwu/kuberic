@@ -1,0 +1,754 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use kuberic_protocol::types::{
+    ConfigurationDescriptor, ConfigurationId, ProcessSessionId, ReplicaIdentity,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, RwLock};
+
+use crate::durable::{PgDurableStore, PgRecoveryState};
+use crate::instance::{PgError, PgInstanceManager};
+use crate::monitor::parse_pg_lsn;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcknowledgingReplica {
+    pub identity: ReplicaIdentity,
+    pub process_session_id: ProcessSessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcknowledgementPolicy {
+    pub configuration_generation: u64,
+    pub configuration_id: ConfigurationId,
+    pub valid: bool,
+    pub write_acknowledgements: u32,
+    pub eligible_standbys: Vec<AcknowledgingReplica>,
+}
+
+impl AcknowledgementPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.configuration_generation == 0
+            || self.configuration_id.is_empty()
+            || self.configuration_id.as_str().len() > 128
+            || self.eligible_standbys.len() > 16
+        {
+            return Err("invalid PostgreSQL synchronous configuration".into());
+        }
+        let mut identities = BTreeSet::new();
+        let mut sessions = BTreeSet::new();
+        for replica in &self.eligible_standbys {
+            if replica.process_session_id.is_empty()
+                || replica.process_session_id.as_str().len() > 128
+                || replica.identity.instance_id.as_str().len() > 128
+                || replica.identity.agent_generation.as_str().len() > 128
+                || !identities.insert(&replica.identity)
+                || !sessions.insert(&replica.process_session_id)
+            {
+                return Err("invalid PostgreSQL synchronous replica session".into());
+            }
+        }
+        if self.valid {
+            if self.write_acknowledgements as usize > self.eligible_standbys.len()
+                || (self.write_acknowledgements == 0 && !self.eligible_standbys.is_empty())
+            {
+                return Err("invalid PostgreSQL synchronous acknowledgement count".into());
+            }
+        } else if self.write_acknowledgements != 0 {
+            return Err("invalid PostgreSQL policy cannot grant acknowledgements".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PgReplicationEvidence {
+    pub engine: String,
+    pub system_identifier: String,
+    pub timeline_id: u32,
+    pub in_recovery: bool,
+    pub flush_lsn: i64,
+    pub received_lsn: Option<i64>,
+    pub replay_lsn: Option<i64>,
+    pub metadata_generation: u64,
+    pub synchronous: Option<AcknowledgementPolicy>,
+    #[serde(default)]
+    pub wal_receiver_stopped: bool,
+}
+
+impl PgReplicationEvidence {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.engine != "postgres-physical"
+            || self.system_identifier.is_empty()
+            || self.system_identifier.len() > 128
+            || self.timeline_id == 0
+            || self.metadata_generation == 0
+            || self.flush_lsn < 0
+            || self.received_lsn.is_some_and(|p| p < 0)
+            || self.replay_lsn.is_some_and(|p| p < 0)
+            || self
+                .received_lsn
+                .zip(self.replay_lsn)
+                .is_some_and(|(received, replay)| replay > received)
+            || !self.in_recovery
+                && (self.received_lsn.is_some()
+                    || self.replay_lsn.is_some()
+                    || self.wal_receiver_stopped)
+        {
+            return Err("invalid PostgreSQL recovery evidence".into());
+        }
+        if let Some(policy) = &self.synchronous {
+            policy.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PgObservation {
+    pub current_lsn: i64,
+    pub committed_lsn: i64,
+    pub current_configuration_quorum_lsn: i64,
+    pub catch_up_boundary: Option<i64>,
+    pub catch_up_complete: bool,
+    pub evidence: Option<PgReplicationEvidence>,
+}
+
+pub struct PgNativeObserver {
+    instance: Arc<PgInstanceManager>,
+    synchronous: RwLock<Option<AcknowledgementPolicy>>,
+    metadata_generation: RwLock<u64>,
+    durable: Option<Arc<PgDurableStore>>,
+    configuration_lock: Mutex<()>,
+}
+
+impl PgNativeObserver {
+    pub fn new(instance: Arc<PgInstanceManager>) -> Self {
+        Self {
+            instance,
+            synchronous: RwLock::new(None),
+            metadata_generation: RwLock::new(1),
+            durable: None,
+            configuration_lock: Mutex::new(()),
+        }
+    }
+
+    pub async fn with_store(
+        instance: Arc<PgInstanceManager>,
+        durable: Arc<PgDurableStore>,
+    ) -> Self {
+        let state = durable.snapshot().await;
+        Self {
+            instance,
+            synchronous: RwLock::new(state.synchronous),
+            metadata_generation: RwLock::new(state.generation),
+            durable: Some(durable),
+            configuration_lock: Mutex::new(()),
+        }
+    }
+
+    pub async fn set_synchronous(&self, synchronous: AcknowledgementPolicy) -> Result<(), PgError> {
+        let _configuration = self.configuration_lock.lock().await;
+        if synchronous.valid {
+            return Err(PgError::Configuration(
+                "valid synchronous metadata requires native apply/read-back".into(),
+            ));
+        }
+        self.publish_synchronous(synchronous).await
+    }
+
+    async fn publish_synchronous(&self, synchronous: AcknowledgementPolicy) -> Result<(), PgError> {
+        synchronous.validate().map_err(PgError::Configuration)?;
+        if let Some(durable) = &self.durable {
+            durable
+                .update(|state| {
+                    state.synchronous = Some(synchronous.clone());
+                    Ok(())
+                })
+                .await
+                .map_err(|error| PgError::Configuration(error.to_string()))?;
+        }
+        *self.synchronous.write().await = Some(synchronous);
+        let mut generation = self.metadata_generation.write().await;
+        *generation = generation
+            .checked_add(1)
+            .ok_or_else(|| PgError::Configuration("metadata generation overflow".into()))?;
+        Ok(())
+    }
+
+    pub async fn apply_synchronous(
+        &self,
+        synchronous: AcknowledgementPolicy,
+    ) -> Result<(), PgError> {
+        let _configuration = self.configuration_lock.lock().await;
+        synchronous.validate().map_err(PgError::Configuration)?;
+        if !synchronous.valid {
+            return self.publish_synchronous(synchronous).await;
+        }
+        let mut invalid = synchronous.clone();
+        invalid.valid = false;
+        invalid.write_acknowledgements = 0;
+        self.publish_synchronous(invalid).await?;
+        let setting = if synchronous.write_acknowledgements == 0 {
+            String::new()
+        } else {
+            let names = synchronous
+                .eligible_standbys
+                .iter()
+                .map(|standby| {
+                    replication_application_name(&standby.identity, &standby.process_session_id)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("ANY {} ({names})", synchronous.write_acknowledgements)
+        };
+        let (client, _connection) = self.instance.connect().await?;
+        client
+            .simple_query(&format!(
+                "ALTER SYSTEM SET synchronous_standby_names = '{}'",
+                setting.replace('\'', "''")
+            ))
+            .await
+            .map_err(|error| {
+                PgError::Query(format!("configure synchronous_standby_names: {error}"))
+            })?;
+        client
+            .query_one("SELECT pg_reload_conf()", &[])
+            .await
+            .map_err(|error| PgError::Query(format!("reload PostgreSQL config: {error}")))?;
+        let mut observed = String::new();
+        for _ in 0..40 {
+            observed = client
+                .query_one("SHOW synchronous_standby_names", &[])
+                .await
+                .map_err(|error| {
+                    PgError::Query(format!("read synchronous_standby_names: {error}"))
+                })?
+                .get(0);
+            if observed == setting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if observed != setting {
+            return Err(PgError::Configuration(format!(
+                "effective synchronous_standby_names differs: expected {setting:?}, observed {observed:?}"
+            )));
+        }
+        self.publish_synchronous(synchronous).await
+    }
+
+    pub async fn snapshot(&self) -> Result<PgObservation, PgError> {
+        let (client, _connection) = self.instance.connect().await?;
+        let system_identifier: String = client
+            .query_one(
+                "SELECT system_identifier::text FROM pg_control_system()",
+                &[],
+            )
+            .await
+            .map_err(|error| PgError::Query(format!("pg_control_system: {error}")))?
+            .get(0);
+        let timeline_id: i32 = client
+            .query_one(
+                "SELECT GREATEST(c.timeline_id, r.min_recovery_end_timeline)::int \
+                        FROM pg_control_checkpoint() c, pg_control_recovery() r",
+                &[],
+            )
+            .await
+            .map_err(|error| PgError::Query(format!("pg_control_checkpoint: {error}")))?
+            .get(0);
+        let in_recovery: bool = client
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await
+            .map_err(|error| PgError::Query(format!("pg_is_in_recovery: {error}")))?
+            .get(0);
+        let synchronous = if in_recovery {
+            None
+        } else {
+            self.synchronous.read().await.clone()
+        };
+        let (current_lsn, flush_lsn, received_lsn, replay_lsn, policy_certified_lsn) =
+            if in_recovery {
+                let row = client
+                    .query_one(
+                        "SELECT pg_last_wal_replay_lsn()::text, pg_last_wal_receive_lsn()::text",
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| PgError::Query(format!("standby WAL progress: {error}")))?;
+                let received = row
+                    .get::<_, Option<&str>>(1)
+                    .map(parse_pg_lsn)
+                    .transpose()?;
+                let replay = row
+                    .get::<_, Option<&str>>(0)
+                    .map(parse_pg_lsn)
+                    .transpose()?;
+                let current = received.unwrap_or_default();
+                (
+                    current,
+                    received.unwrap_or_default(),
+                    received,
+                    replay,
+                    replay.unwrap_or_default(),
+                )
+            } else {
+                let row = client
+                    .query_one(
+                        "SELECT pg_current_wal_lsn()::text, pg_current_wal_flush_lsn()::text",
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| PgError::Query(format!("primary WAL progress: {error}")))?;
+                let current: &str = row.get(0);
+                let flush: &str = row.get(1);
+                let current = parse_pg_lsn(current)?;
+                let flush = parse_pg_lsn(flush)?;
+                let certified =
+                    certify_primary_progress(&client, flush, synchronous.as_ref()).await?;
+                (current, flush, None, None, certified)
+            };
+        let wal_receiver_stopped = if in_recovery {
+            let count: i64 = client
+                .query_one("SELECT count(*) FROM pg_stat_wal_receiver", &[])
+                .await
+                .map_err(|error| PgError::Query(format!("pg_stat_wal_receiver: {error}")))?
+                .get(0);
+            count == 0
+        } else {
+            false
+        };
+        Ok(PgObservation {
+            current_lsn,
+            committed_lsn: policy_certified_lsn,
+            current_configuration_quorum_lsn: policy_certified_lsn,
+            catch_up_boundary: None,
+            catch_up_complete: false,
+            evidence: Some(PgReplicationEvidence {
+                engine: "postgres-physical".into(),
+                system_identifier,
+                timeline_id: u32::try_from(timeline_id)
+                    .map_err(|_| PgError::Query("negative PostgreSQL timeline".into()))?,
+                in_recovery,
+                flush_lsn,
+                received_lsn,
+                replay_lsn,
+                metadata_generation: *self.metadata_generation.read().await,
+                synchronous,
+                wal_receiver_stopped,
+            }),
+        })
+    }
+
+    pub async fn snapshot_and_persist(&self) -> Result<PgObservation, PgError> {
+        let _configuration = self.configuration_lock.lock().await;
+        let snapshot = self.snapshot().await?;
+        if let (Some(durable), Some(evidence)) = (&self.durable, snapshot.evidence.as_ref()) {
+            let history_digest =
+                timeline_history_digest(self.instance.data_dir(), evidence).await?;
+            durable
+                .update(|state| {
+                    state.system_identifier = Some(evidence.system_identifier.clone());
+                    state.timeline_id = Some(evidence.timeline_id);
+                    state.timeline_history_digest = Some(history_digest);
+                    state.recovery_state = PgRecoveryState::Ready;
+                    state.role = if evidence.in_recovery {
+                        crate::durable::PgDurableRole::Standby
+                    } else {
+                        crate::durable::PgDurableRole::Primary
+                    };
+                    state.current_lsn = snapshot.current_lsn;
+                    state.flush_lsn = evidence.flush_lsn;
+                    state.received_lsn = evidence.received_lsn;
+                    state.replay_lsn = evidence.replay_lsn;
+                    state.policy_certified_lsn = snapshot.committed_lsn;
+                    state.synchronous = evidence.synchronous.clone();
+                    state.postgres_stopped = false;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| PgError::Configuration(error.to_string()))?;
+        }
+
+        Ok(snapshot)
+    }
+}
+
+pub(crate) async fn timeline_history_digest(
+    data_dir: &std::path::Path,
+    evidence: &PgReplicationEvidence,
+) -> Result<String, PgError> {
+    let mut entries = tokio::fs::read_dir(data_dir.join("pg_wal"))
+        .await
+        .map_err(|error| PgError::Process(format!("read pg_wal: {error}")))?;
+    let mut history = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| PgError::Process(format!("read pg_wal entry: {error}")))?
+    {
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "history")
+        {
+            history.push(entry.path());
+        }
+    }
+    history.sort();
+    let mut hasher = Sha256::new();
+    hasher.update((evidence.system_identifier.len() as u64).to_be_bytes());
+    hasher.update(evidence.system_identifier.as_bytes());
+    hasher.update(evidence.timeline_id.to_be_bytes());
+    for path in history {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| PgError::Process("non-UTF8 PostgreSQL history filename".into()))?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|error| PgError::Process(format!("read timeline history: {error}")))?;
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub fn compile_synchronous_configuration(
+    previous: Option<&ConfigurationDescriptor>,
+    current: &ConfigurationDescriptor,
+    local: &ReplicaIdentity,
+    sessions: &BTreeMap<ReplicaIdentity, ProcessSessionId>,
+    valid: bool,
+) -> Result<AcknowledgementPolicy, PgError> {
+    let current_requirement = requirement(current, local)?;
+    let expected = match previous {
+        Some(previous) => {
+            let previous_requirement = requirement(previous, local)?;
+            match (previous_requirement.1, current_requirement.1) {
+                (0, _) => current_requirement,
+                (_, 0) => previous_requirement,
+                (previous_count, current_count) => (
+                    previous_requirement
+                        .0
+                        .intersection(&current_requirement.0)
+                        .cloned()
+                        .collect(),
+                    previous_count.max(current_count),
+                ),
+            }
+        }
+        None => current_requirement,
+    };
+    if expected.0.len() < expected.1 {
+        return Err(PgError::Configuration(
+            "PC/CC policies have no safe PostgreSQL synchronous intersection".into(),
+        ));
+    }
+    let eligible_standbys = expected
+        .0
+        .into_iter()
+        .map(|identity| {
+            let process_session_id = sessions.get(&identity).cloned().ok_or_else(|| {
+                PgError::Configuration(format!(
+                    "missing process session for synchronous standby {}",
+                    identity.replica_id.value()
+                ))
+            })?;
+            Ok(AcknowledgingReplica {
+                identity,
+                process_session_id,
+            })
+        })
+        .collect::<Result<Vec<_>, PgError>>()?;
+    let configuration = AcknowledgementPolicy {
+        configuration_generation: u64::try_from(current.epoch.configuration_number)
+            .map_err(|_| PgError::Configuration("negative configuration generation".into()))?,
+        configuration_id: current.configuration_id.clone(),
+        valid,
+        write_acknowledgements: if valid {
+            u32::try_from(expected.1)
+                .map_err(|_| PgError::Configuration("write quorum overflow".into()))?
+        } else {
+            0
+        },
+        eligible_standbys,
+    };
+    configuration.validate().map_err(PgError::Configuration)?;
+    Ok(configuration)
+}
+
+pub fn replication_application_name(
+    identity: &ReplicaIdentity,
+    session: &ProcessSessionId,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(identity.replica_id.value().to_be_bytes());
+    for value in [
+        identity.instance_id.as_str(),
+        identity.agent_generation.as_str(),
+        session.as_str(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("kr{}_{}", identity.replica_id.value(), suffix)
+}
+
+fn requirement(
+    configuration: &ConfigurationDescriptor,
+    local: &ReplicaIdentity,
+) -> Result<(BTreeSet<ReplicaIdentity>, usize), PgError> {
+    if configuration.primary_id != local.replica_id || configuration.write_quorum == 0 {
+        return Err(PgError::Configuration(
+            "synchronous policy requires the exact local primary".into(),
+        ));
+    }
+    if !configuration.members.iter().any(|member| {
+        member.identity == *local && member.role == kuberic_protocol::types::ReplicaRole::Primary
+    }) {
+        return Err(PgError::Configuration(
+            "synchronous policy primary incarnation differs from the local replica".into(),
+        ));
+    }
+    Ok((
+        configuration
+            .members
+            .iter()
+            .filter(|member| member.identity != *local)
+            .map(|member| member.identity.clone())
+            .collect(),
+        configuration.write_quorum.saturating_sub(1) as usize,
+    ))
+}
+
+async fn certify_primary_progress(
+    client: &tokio_postgres::Client,
+    local_flush_lsn: i64,
+    synchronous: Option<&AcknowledgementPolicy>,
+) -> Result<i64, PgError> {
+    let Some(synchronous) = synchronous else {
+        return Ok(0);
+    };
+    if !synchronous.valid {
+        return Ok(0);
+    }
+    if synchronous.write_acknowledgements == 0 {
+        return Ok(local_flush_lsn);
+    }
+    let expected = synchronous
+        .eligible_standbys
+        .iter()
+        .map(|standby| {
+            (
+                replication_application_name(&standby.identity, &standby.process_session_id),
+                standby,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let rows = client
+        .query(
+            "SELECT application_name, replay_lsn::text FROM pg_stat_replication \
+             WHERE replay_lsn IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|error| PgError::Query(format!("pg_stat_replication: {error}")))?;
+    let mut replay = BTreeMap::new();
+    for row in rows {
+        let name: &str = row.get(0);
+        let lsn: &str = row.get(1);
+        if expected.contains_key(name)
+            && replay
+                .insert(name.to_string(), parse_pg_lsn(lsn)?)
+                .is_some()
+        {
+            return Err(PgError::Query(format!(
+                "duplicate synchronous application_name {name}"
+            )));
+        }
+    }
+    let mut replay = replay.into_values().collect::<Vec<_>>();
+    replay.sort_unstable_by(|left, right| right.cmp(left));
+    let required = synchronous.write_acknowledgements as usize;
+    let certified = replay.get(required - 1).copied().unwrap_or_default();
+    Ok(local_flush_lsn.min(certified))
+}
+
+#[cfg(test)]
+mod tests {
+    use kuberic_protocol::types::{
+        AgentGeneration, ConfigurationMember, Epoch, ReplicaId, ReplicaInstanceId, ReplicaRole,
+    };
+
+    use super::*;
+
+    fn identity(id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{id}")),
+        }
+    }
+
+    fn configuration(
+        ids: &[i64],
+        primary: i64,
+        write_quorum: u32,
+        epoch: i64,
+    ) -> ConfigurationDescriptor {
+        ConfigurationDescriptor::new(
+            Epoch::new(0, epoch),
+            ReplicaId::new(primary),
+            ids.iter()
+                .map(|id| ConfigurationMember {
+                    identity: identity(*id),
+                    role: if *id == primary {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect(),
+            write_quorum,
+        )
+    }
+
+    fn sessions(ids: &[i64]) -> BTreeMap<ReplicaIdentity, ProcessSessionId> {
+        ids.iter()
+            .map(|id| {
+                (
+                    identity(*id),
+                    ProcessSessionId::new(format!("session-{id}")),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn application_names_are_bounded_and_session_unique() {
+        let first = replication_application_name(&identity(2), &ProcessSessionId::new("session-a"));
+        let second =
+            replication_application_name(&identity(2), &ProcessSessionId::new("session-b"));
+        assert!(first.len() <= 63);
+        assert_ne!(first, second);
+        let mut ambiguous_left = identity(2);
+        ambiguous_left.instance_id = ReplicaInstanceId::new("pod:a");
+        ambiguous_left.agent_generation = AgentGeneration::new("b");
+        let mut ambiguous_right = identity(2);
+        ambiguous_right.instance_id = ReplicaInstanceId::new("pod");
+        ambiguous_right.agent_generation = AgentGeneration::new("a");
+        assert_ne!(
+            replication_application_name(&ambiguous_left, &ProcessSessionId::new("c")),
+            replication_application_name(&ambiguous_right, &ProcessSessionId::new("b:c"))
+        );
+    }
+
+    #[test]
+    fn zero_secondary_policy_is_identity_and_joint_policy_is_conservative() {
+        let singleton = configuration(&[1], 1, 1, 1);
+        let expanded = configuration(&[1, 2], 1, 2, 2);
+        let compiled = compile_synchronous_configuration(
+            Some(&singleton),
+            &expanded,
+            &identity(1),
+            &sessions(&[2]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(compiled.write_acknowledgements, 1);
+        assert_eq!(compiled.eligible_standbys[0].identity, identity(2));
+
+        let previous = configuration(&[1, 2, 3], 1, 2, 3);
+        let current = configuration(&[1, 2, 4], 1, 2, 4);
+        let compiled = compile_synchronous_configuration(
+            Some(&previous),
+            &current,
+            &identity(1),
+            &sessions(&[2, 3, 4]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(compiled.write_acknowledgements, 1);
+        assert_eq!(
+            compiled
+                .eligible_standbys
+                .iter()
+                .map(|standby| standby.identity.clone())
+                .collect::<Vec<_>>(),
+            vec![identity(2)]
+        );
+
+        let reduced = configuration(&[1], 1, 1, 5);
+        let compiled = compile_synchronous_configuration(
+            Some(&expanded),
+            &reduced,
+            &identity(1),
+            &sessions(&[2]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(compiled.write_acknowledgements, 1);
+        assert_eq!(compiled.eligible_standbys[0].identity, identity(2));
+
+        let incompatible_previous = configuration(&[1, 2], 1, 2, 6);
+        let incompatible_current = configuration(&[1, 3], 1, 2, 7);
+        assert!(
+            compile_synchronous_configuration(
+                Some(&incompatible_previous),
+                &incompatible_current,
+                &identity(1),
+                &sessions(&[2, 3]),
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            compile_synchronous_configuration(
+                None,
+                &expanded,
+                &identity(1),
+                &BTreeMap::new(),
+                true,
+            )
+            .is_err()
+        );
+
+        let mut wrong_primary = identity(1);
+        wrong_primary.instance_id = ReplicaInstanceId::new("other-primary");
+        let wrong = ConfigurationDescriptor::new(
+            Epoch::new(0, 8),
+            ReplicaId::new(1),
+            vec![
+                ConfigurationMember {
+                    identity: wrong_primary,
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: identity(2),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        assert!(
+            compile_synchronous_configuration(None, &wrong, &identity(1), &sessions(&[2]), true,)
+                .is_err()
+        );
+    }
+}

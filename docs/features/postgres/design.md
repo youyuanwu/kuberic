@@ -1,10 +1,231 @@
 # PostgreSQL: Replicated PostgreSQL on Kuberic
 
-A replicated PostgreSQL database orchestrated by kuberic-core. Unlike the
-kvstore and SQLite examples, PostgreSQL has its own battle-tested streaming
-replication — kuberic's WalReplicator data plane is **not used**. Instead,
-kuberic provides lifecycle management, failover orchestration, and
-epoch-based fencing while PostgreSQL handles the data plane natively.
+A PostgreSQL database hosted by the v2 `ReplicaHost`. Its service creates a
+`PgReplicator` through the existing `ReplicatorFactory` and returns it from
+`StatefulServiceReplica::open`. PostgreSQL owns SQL and WAL; its
+`ReplicatorInterfaces` has no operation/copy `StateReplicator` or `StateProvider`.
+
+> **V2 migration status (native build/recovery):** The existing
+> `postgres-replicated` package no longer depends on the classic runtime or
+> operator. Supported operations are authorized singleton initialization,
+> restart, read/write access, fencing, exact native secondary builds, replay
+> catch-up, and interrupted-build recovery. Failover, switchover and
+> scaling orchestration remain disabled; the broader
+> architecture below remains historical/planned until those phases ship.
+> Ordinary application clients use the managed
+> `kuberic_app` non-superuser role with `synchronous_commit=remote_apply`;
+> clients that deliberately override that durability setting are outside the
+> acknowledged-data guarantee. Validation is unit/host-local only and adds no
+> KinD dependency.
+
+## Running the singleton host
+
+Install local PostgreSQL binaries and run as an unprivileged OS account:
+
+```sh
+cargo run -p postgres-replicated -- \
+  --resource-uid example --replica-id 1 --pod-uid replica-1 --pvc-uid storage-1 \
+  --data-root ./postgres-state --pg-bin /usr/lib/postgresql/16/bin \
+  --bearer-token "$KUBERIC_AGENT_BEARER_TOKEN"
+```
+
+`--help` lists the equivalent environment variables, PostgreSQL data directory
+and port, application metadata directory, control/replication/coordination
+listeners, and advertised control/replication endpoints.
+`--application-endpoint` (`KUBERIC_APPLICATION_ENDPOINT`) overrides the advertised
+custom-replication address when it differs from the local listener.
+Optional `--peer-routes`
+(`KUBERIC_PEER_ROUTES`) reads a bounded JSON array of exact `identity`, `control`,
+and agent `replication` routes. Identities include `replicaId`,
+`instanceId`, and `agentGeneration`; duplicate exact routes are rejected. Control
+and replication routes belong to the agent; PostgreSQL's coordination endpoint
+is advertised by its custom replicator in the exact target's status report.
+There is no ordinal-only fallback. Fresh startup waits for authenticated v2
+`InitializeAgentStore`, then `EnsureConfiguration` installs exact authority;
+a separate write-grant command opens SQL access. Service role notifications
+cannot grant access. Established startup validates both agent and application
+identity plus PostgreSQL lineage before touching PGDATA, and starts with
+external SQL access closed before restoring accepted authority.
+
+Authorized initialization durably binds the application metadata and PGDATA paths
+in the agent store before either is created. Creation permission survives an
+interrupted first open, but is consumed before the host becomes ready for commands.
+Retries may create still-empty storage or reuse a completed `initdb`; partial or
+invalid PGDATA is never erased. Every accepted PostgreSQL startup repairs the
+managed port/socket/durability settings idempotently and installs closed access
+rules before spawning the server. This includes interruption after raw `initdb`
+success but before configuration: repair preserves the database identity and data.
+Configuration files are replaced atomically so interrupted repairs can be retried.
+Once initialized, missing application storage,
+changed paths (including changed symlink targets), and absent legacy bindings
+permanently reject startup without creating application files. Restoring matching
+storage is required; directory emptiness is not permission to reinitialize.
+
+Driver failures await partition fault acknowledgement (bounded to five seconds)
+before returning; they do not depend on the cancellable process-monitor queue.
+Permanent faults cannot be downgraded within the same runtime. Agent shutdown
+persists accepted faults before completion, including rejected/cancelled startup,
+and the host waits for that acknowledgement rather than aborting the reporter.
+Persistence and shutdown waits are bounded; failure remains an explicit error.
+The executable exits nonzero when this durable acknowledgement fails, including
+when a signal or coordination listener initiates shutdown. It still drains or
+cancels companion tasks and stops PostgreSQL; additional cleanup errors retain
+the acknowledgement failure as the primary diagnostic.
+
+Startup runs in an owned task that is joined, not dropped, on SIGINT/SIGTERM.
+Cancellation stops either the initialization listener or agent reconstruction,
+joins the agent acknowledgement and transport tasks, and closes the application
+even if its driver never reached readiness. A signal racing readiness shuts down
+and waits for the returned replica instead. Clean early signal cancellation exits
+zero; startup, acknowledgement, task-join, or process cleanup failures exit nonzero,
+retaining the primary error and additional cleanup diagnostics. The same signal
+future spans startup and running operation. The coordination listener is started
+only after host readiness, so it cannot terminate first during startup.
+
+On Linux, each run re-executes `postgres-replicated` in an internal, single-threaded
+subreaper mode before launching PostgreSQL. It starts in a separate process group,
+so terminal-style group SIGINT/SIGTERM reaches the host without killing its
+ownership root. The subreaper also catches direct SIGINT/SIGTERM without exiting;
+these handlers are confined to the re-exec and reset when launching PostgreSQL.
+They do not change the host's handlers or PostgreSQL's explicit shutdown signals.
+A socket handshake prevents launch before the owner retains the subreaper's pidfd.
+An undispatched run can complete through a socket stop command without signalling
+the root; cancellation racing a launch still captures and reaps the launched tree.
+This dedicated ownership root adopts and reaps only that launch's descendants,
+including double-forked daemons and backends in separate sessions; short-lived
+launchers cannot erase ownership.
+Readiness validates a live SQL backend and its postmaster parent against this
+lineage while parents are stopped. The retained postmaster pidfd, not the
+launcher or a mutable PID file, then drives lifetime monitoring. Loss of the
+supervisor is also a fault, even while the retained postmaster is still alive.
+
+Shutdown sends fast-stop SIGINT through that postmaster pidfd with a bounded
+wait. A missing/foreign PID file remains an explicit error, but is never a
+signal target. PID-file-independent cleanup captures the remaining tree, sends
+immediate-shutdown signals and escalates to SIGKILL with bounded waits. The
+subreaper remains alive to reap orphans and exits only when no children remain.
+Successful shutdown requires the supervisor's normal zero exit after `wait`
+reports no children, plus pidfd `POLLHUP` for every retained identity (including
+the reaped supervisor). Merely observing exit (`POLLIN`) is insufficient because
+it includes zombies. Unexpected or signalled supervisor exit is a cleanup failure;
+retained postmaster/descendant identities still receive best-effort termination,
+but no success claims descendants reparented outside the lost root were reaped.
+Before readiness binds the postmaster, unexpected root loss can also orphan
+identities the host has not yet captured. This explicitly fails cleanup and
+executable completion; neither an early signal nor a successful application close
+can hide the retained failure. A healthy root can cancel and reap an unready
+launch without a postmaster identity or PID file.
+Abort, interrupted startup, cancellation and drop share this cleanup; repeated calls
+cannot target a reused PID. `pg_ctl stop` is deliberately not used: it would
+reopen the mutable PID file after ownership validation.
+
+The same owned-command mechanism covers `initdb`, `pg_controldata`, readiness and
+health `pg_isready` probes, and the existing `pg_ctl promote`, `pg_basebackup` and
+`pg_rewind` helpers. Each helper
+gets its own registered subreaper before launch, retains ownership while stdout
+and stderr are collected concurrently, and returns the launcher's original exit
+status over the socket separately from the supervisor's reaping acknowledgement.
+Dropping a helper future, including a readiness timeout or reconstruction
+cancellation, synchronously terminates and reaps that exact tree. Host abort also
+seals the registry against new helper launches and drains it; close after abort
+joins cleanup without starting new control-data validation. Helper cleanup errors
+remain retained for executable completion, even if the initiating future was
+dropped. A successfully cancelled `initdb` and its descendants therefore cannot
+resume PGDATA writes after host exit.
+
+Cancellation does not delete partially initialized storage or consume the durable
+first-open permission. An authorized retry can initialize still-empty PGDATA or
+reuse valid completed `initdb` output with its original system identifier;
+nonempty output must pass control-data validation and closed startup, never a
+second `initdb` or automatic erasure. Invalid partial output fails closed and
+requires storage recovery. These boundaries also apply when cancellation happened
+after the launcher exited or before managed configuration was written.
+
+Linux pidfds, child-subreaper support and readable `/proc` are required. Library
+hosts must install `postgres-replicated` beside their executable; Cargo integration
+tests use the package binary beside `deps/`. There is no extra installed helper
+binary and no process-wide subreaper setting in the application host. Abrupt
+supervisor SIGKILL and hostile administrators remain outside the guarantee.
+
+Native coordination uses `pgdata.v2` `Build` and `InspectSource`, with the same
+bearer credential as the agent. The protobuf messages carry canonical JSON
+envelopes capped at 64 KiB. Strict decoding rejects omitted, duplicate, unknown,
+noncanonical, oversized, and wrong-version fields. Envelopes bind the resource,
+full source/target identities, both agent-created process sessions, immutable
+agent build authority, frozen recovery boundary, and bounded system/timeline
+history (at most 64 ancestors and 16 KiB of history).
+
+The private agent host installs exact replica/session descriptions through the
+SF-shaped replica-set configuration callbacks, never passing an authority store
+or admission token to the application. The PostgreSQL replicator serializes
+storage mutation with configuration changes and cancels stale work before
+installing a new configuration. The agent first admits the target build, then dispatches custom work
+instead of operation-stream copy. The receiver revalidates local admission and
+the source's persisted exact build/lineage before destructive work. Durable stages
+are `Intent`, `Copying`, `Installed`, `Recovering`, and `Complete`. Interrupted
+copy/rewind is discarded only under re-admitted authority; installed data is reused.
+Reopen never reconnects a previous session: it stays stopped until a fresh exact
+source/target session pair resumes the persisted intent.
+
+Matching system identities and compatible timeline histories permit `pg_rewind`.
+Fresh, never-admitted initialization is distinguished from established data by
+durable authority history, not by comparing LSN magnitudes.
+Failure to rewind is explicitly logged and durably switches to a fresh
+`pg_basebackup`; an unrelated database or incompatible timeline is rejected,
+not ranked by scalar LSN. Rewind uses the internal loopback-only `kuberic_rewind`
+role with file-reading privileges, separate from the application role.
+The source's validated timeline history is installed before pinned-timeline
+recovery. Standby configuration is atomically replaced with the exact
+identity/session-derived replication name and external access closed.
+
+Completion requires compatible recovery lineage and both flushed WAL and replay
+at or beyond the frozen boundary, including equality. Backup success, process
+readiness, WAL receipt, or flush without replay is insufficient. Completion is
+persisted before returning structured evidence; only the managed adapter can
+publish it into the agent's build journal. Scalar journals do not restore native
+completion on restart. Retired authority, changed identities, and replaced process
+sessions lose completion credit. The supported crash cuts, same-ordinal replacement,
+rewind/fresh fallback, and exact replay boundaries are covered by real host-local
+PostgreSQL tests.
+
+All process tests use repository-local directories and local listeners.
+The host reserves 16 MiB worker stacks for authority/effect futures,
+matching the large agent RPC test fixtures.
+
+### Phase 4 custom-replicator boundary audit
+
+PostgreSQL's custom `PgReplicator` owns the build. Its `build_replica`
+callback uses the exact target's advertised replication endpoint, freezes PostgreSQL lineage,
+persists application intent, invokes the PostgreSQL RPC, and validates the
+returned PostgreSQL recovery certificate. `examples/postgres` alone contains
+the `pgdata.v2` protocol, backup/rewind commands, timeline/history compatibility,
+replay/flush completion policy, staged metadata, source changes and crash recovery.
+The agent neither sends PostgreSQL RPCs nor selects a native recovery method.
+
+The public mapping follows the repository's
+[SF references](../../background/service-fabric/references.md):
+`StatefulServiceReplica` corresponds to `IStatefulServiceReplica`,
+`Replicator` to `IReplicator`, and `PrimaryReplicator` to
+`IPrimaryReplicator`. The existing factory selects the service-created
+replicator. `StateReplicator` is a separate optional operation/copy capability,
+present for the default engine and absent here.
+
+Configuration callbacks install exact incarnation/session/endpoint descriptions
+and frozen build boundaries. The target validates its local role, epoch,
+configuration and both sessions before backup/rewind. Role notifications do not
+grant SQL access: progress observation reconciles the retained partition handle's
+read/write statuses and acknowledges completed closure before the agent records
+an access effect. Startup config repair always begins externally closed.
+
+The private agent wrapper owns authority stores, effect replay, registration,
+peer-session replacement, durable build progress and retirement tombstones.
+It rejects stale completion before journaling; reporting does not resurrect
+custom build credit from an old scalar journal after process/session replacement.
+Build retirement does not stop an already admitted active standby.
+`pgdata.v2`, lineage, timelines, WAL receipt/flush/replay and recovery stages
+remain exclusively in `examples/postgres`. Shared code contains no database
+branches. Protocol 9 carries only the generic replicator endpoint, and schema 5
+binds application storage paths/initialization permission.
 
 ---
 
@@ -40,7 +261,7 @@ initdb --data-checksums
 
 # Required runtime settings (postgresql.conf)
 wal_log_hints = on              # Enables pg_rewind (belt-and-suspenders with checksums)
-synchronous_commit = on         # Writes durable on sync standbys before client ACK
+synchronous_commit = remote_apply # Writes replayed on sync standbys before client ACK
 hot_standby = on                # Allows PgMonitor to query standbys via SQL
 logging_collector = off         # Logs go to stderr, piped through tracing
 ```

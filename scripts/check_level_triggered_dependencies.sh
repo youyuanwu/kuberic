@@ -3,8 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-metadata=$(mktemp)
-trap 'rm -f -- "$metadata"' EXIT
+scratch="target/level-dependencies-$$"
+mkdir -p "$scratch"
+metadata="$scratch/metadata.json"
+trap 'rm -rf -- "$scratch"' EXIT
 cargo metadata --format-version 1 --no-deps > "$metadata"
 
 python3 - "$metadata" <<'PY'
@@ -25,6 +27,7 @@ new_packages = {
     "kuberic-controller",
     "kvstore2",
     "sqlite-replicated",  # Migrated in place; never allow classic dependencies back in.
+    "postgres-replicated",
     "sqlite-commit-barrier",
     "kuberic-level-tests",
 }
@@ -32,7 +35,6 @@ protected_packages = {
     "kuberic-core",
     "kuberic-operator",
     "kvstore",
-    "postgres-replicated",
     "kuberic-tests",
 }
 
@@ -50,14 +52,12 @@ protected_roots = [
     (workspace_root / "kuberic-core").resolve(),
     (workspace_root / "kuberic-operator").resolve(),
     (workspace_root / "examples" / "kvstore").resolve(),
-    (workspace_root / "examples" / "postgres").resolve(),
     (workspace_root / "kuberic-tests").resolve(),
 ]
 protected_tokens = {
     "kuberic-core",
     "kuberic-operator",
     "examples/kvstore",
-    "examples/postgres",
     "kuberic-tests",
 }
 attribute = re.compile(r'#\s*\[(.*?)\]', re.DOTALL)
@@ -141,6 +141,8 @@ for package in metadata["packages"]:
             )
     for source in package_root.rglob("*.rs"):
         text = source.read_text(errors="replace")
+        if re.search(r'\bkuberic_(?:core|operator)\s*::', text):
+            violations.append(f"{package['name']} imports a classic crate via {source}")
         for body in attribute.findall(text):
             for relative in path_assignment.findall(body):
                 if is_protected(source.parent / relative):

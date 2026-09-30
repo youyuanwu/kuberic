@@ -2,8 +2,9 @@
 
 > **Status:** In progress — Workstreams 1, 2 and 3 are implemented and validated.
 > SQLite is migrated in place to v2 with unit/in-process validation.
-> Direct primary-removal composition is deferred; the PostgreSQL port,
-> distribution, deprecation, and broader retirement remain outstanding.
+> PostgreSQL lifecycle/build/recovery is ported in place; its failover/scaling
+> orchestration, direct primary-removal composition, distribution, deprecation,
+> and broader retirement remain outstanding.
 >
 > **Goal:** Make the level-triggered stack the default Kuberic implementation,
 > deprecate the classic v1 stack, and eventually remove it.
@@ -106,7 +107,7 @@ The principal retirement gaps are:
 | Scale up/down | Supported | Sequential scale-up and secondary-only scale-down implemented/validated; planned switchover composes with removal | Workstream 2 complete; direct primary removal deferred |
 | KVStore | Supported | `kvstore2` supported | Make v2 the default |
 | SQLite | Existing deployed v1 data has no import path | Existing `sqlite-replicated` package migrated in place; unit/in-process scenarios validated | Workstream 3 complete; distribution remains separate |
-| PostgreSQL | Depends on `kuberic-core` and `kuberic-operator` | Not ported | Move to v2 before deprecation |
+| PostgreSQL | Ported in place to the SF-shaped v2 custom replicator | Local lifecycle/build/recovery supported | Complete failover/scaling and distribution before deprecation |
 | Destructive data-loss recovery | Supported | Fails closed | Keep v2 behavior |
 | API and status compatibility | Existing v1 contract | Independent contract | No compatibility required |
 | Data migration | Existing data remains in v1 | No import path | No migration required |
@@ -205,7 +206,7 @@ classic `kuberic.io/v1` remains unchanged. Its as-built behavior is:
   resources survive, and partial PVCs are not resumed.
 
 Protocol 9 and agent schema 5 are exact coordinated-deployment boundaries.
-Protocol 7 and earlier, plus schemas 2 and 3, are rejected with no migration,
+Protocol 8 and earlier, plus older schemas, are rejected with no migration,
 mixed-version mode, or rolling-upgrade contract. The generated CRD is currently 344,907 bytes under a
 strict-below-350,000-byte regression guard; the largest current representative
 18-member serialized scale-up status sample is carried failover at 26,353
@@ -351,9 +352,14 @@ See the [SQLite design](../features/sqlite/design.md) and
 
 ## Workstream 4: PostgreSQL on V2
 
-The PostgreSQL application currently depends directly on `kuberic-core`, and
-its tests depend on `kuberic-operator`. It must move to the level-triggered
-runtime before those packages can be deprecated or removed.
+The PostgreSQL application is ported in place without `kuberic-core` or
+`kuberic-operator` dependencies. It uses the existing service-created custom
+`Replicator`/`PrimaryReplicator` interfaces, with no operation/copy capability.
+Phases 1–4 provide durable lifecycle, SQL fencing, exact session-bound physical
+builds, rewind/catch-up and restart recovery. Failover, planned switchover, scaling
+orchestration and distribution remain future work; this is not completion of
+the full retirement workstream. Validation remains host-local without cluster
+or container dependencies.
 
 The v2 PostgreSQL application must:
 
@@ -423,8 +429,8 @@ Final removal must be a separately reviewed change. It may delete:
 
 - `kuberic-core`;
 - `kuberic-operator`;
-- remaining classic KVStore and PostgreSQL examples (the in-place v2 SQLite
-  package is not a classic deletion candidate);
+- remaining classic KVStore example (the in-place v2 SQLite and PostgreSQL
+  packages are not classic deletion candidates);
 - classic CRDs, manifests, image publication, and integration tests;
 - compatibility documentation and CI paths that only exercise v1.
 
