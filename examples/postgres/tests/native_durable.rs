@@ -224,10 +224,7 @@ async fn stalled_control_data_fence_is_bounded_reaped_and_retryable() {
                     .await
                     .unwrap()
                     .unwrap_err();
-                assert!(
-                    matches!(error, postgres_replicated::instance::PgError::Timeout(_)),
-                    "{error}"
-                );
+                assert!(error.is_timeout(), "{error}");
                 assert_eq!(
                     error.fault_type(),
                     kuberic_protocol::types::FaultType::Transient

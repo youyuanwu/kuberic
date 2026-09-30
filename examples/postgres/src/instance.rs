@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as ProcessMutex, Weak};
@@ -9,6 +10,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::config::PgConfig;
 use crate::owned_command::{CapturedCommands, OwnedCommands};
 use crate::owned_process::OwnedProcess;
+use kuberic_runtime::replicator::StatefulServicePartition;
 
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +34,11 @@ pub enum PgProcessState {
 struct StartParameters {
     fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
     cancellation: Option<(Weak<PgInstanceManager>, CancellationToken)>,
+}
+
+pub(crate) struct GenerationFault {
+    generation: u64,
+    fault: kuberic_protocol::types::FaultType,
 }
 
 struct ProcessGeneration {
@@ -119,6 +126,24 @@ struct CleanupTicket {
 
 struct CleanupWaiter(Arc<CleanupTicket>);
 
+struct Lifecycle<'a> {
+    instance: &'a PgInstanceManager,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for Lifecycle<'_> {
+    fn drop(&mut self) {
+        let mut current = self.instance.current.lock().unwrap();
+        let retired = matches!(*current.cleanup_result.lock().unwrap(), Some(Ok(())))
+            && *current.state.lock().unwrap() == PgProcessState::Stopped;
+        if retired && !self.instance.launches_closed.load(Ordering::Acquire) {
+            *current = Arc::new(ProcessGeneration::new(
+                self.instance.next_generation.fetch_add(1, Ordering::AcqRel),
+            ));
+        }
+    }
+}
+
 impl Drop for CleanupWaiter {
     fn drop(&mut self) {
         if self
@@ -151,12 +176,17 @@ pub struct PgInstanceManager {
     launches_closed: Arc<AtomicBool>,
     abort_generation: AtomicU64,
     config: PgConfig,
-    lifecycle_lock: Mutex<()>,
+    lifecycle_lock: Arc<Mutex<()>>,
+    fault_sink: ProcessMutex<Option<mpsc::Sender<GenerationFault>>>,
     start_parameters: Mutex<Option<StartParameters>>,
     pub(crate) access_lock: Mutex<()>,
     pub(crate) access_state: AtomicU8,
     #[cfg(feature = "testing")]
     cleanup_hook: ProcessMutex<Option<CleanupHook>>,
+    #[cfg(feature = "testing")]
+    error_hook: ProcessMutex<Option<Arc<ErrorGate>>>,
+    #[cfg(feature = "testing")]
+    fault_hook: ProcessMutex<Option<Arc<ErrorGate>>>,
 }
 
 #[cfg(feature = "testing")]
@@ -164,6 +194,12 @@ pub struct CleanupGate {
     pub entered: Arc<tokio::sync::Notify>,
     pub finished: Arc<tokio::sync::Notify>,
     release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(feature = "testing")]
+pub struct ErrorGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 #[cfg(feature = "testing")]
@@ -181,6 +217,26 @@ struct CleanupHook {
 }
 
 impl PgInstanceManager {
+    #[cfg(feature = "testing")]
+    pub fn pause_error_handling(&self) -> Arc<ErrorGate> {
+        let gate = Arc::new(ErrorGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.error_hook.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn pause_fault_delivery(&self) -> Arc<ErrorGate> {
+        let gate = Arc::new(ErrorGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.fault_hook.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
     #[cfg(feature = "testing")]
     pub fn pause_cleanup(&self) -> CleanupGate {
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -209,17 +265,167 @@ impl PgInstanceManager {
             launches_closed: Arc::new(AtomicBool::new(false)),
             abort_generation: AtomicU64::new(0),
             config,
-            lifecycle_lock: Mutex::new(()),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            fault_sink: ProcessMutex::new(None),
             start_parameters: Mutex::new(None),
             access_lock: Mutex::new(()),
             access_state: AtomicU8::new(crate::access::CLOSED),
             #[cfg(feature = "testing")]
             cleanup_hook: ProcessMutex::new(None),
+            #[cfg(feature = "testing")]
+            error_hook: ProcessMutex::new(None),
+            #[cfg(feature = "testing")]
+            fault_hook: ProcessMutex::new(None),
         }
     }
 
     fn generation(&self) -> Arc<ProcessGeneration> {
         self.current.lock().unwrap().clone()
+    }
+
+    async fn lifecycle(&self) -> Lifecycle<'_> {
+        Lifecycle {
+            instance: self,
+            _guard: self.lifecycle_lock.lock().await,
+        }
+    }
+
+    pub(crate) fn bind_fault_sink(&self, sink: mpsc::Sender<GenerationFault>) {
+        *self.fault_sink.lock().unwrap() = Some(sink);
+    }
+
+    pub(crate) async fn deliver_fault(
+        &self,
+        notice: GenerationFault,
+        partition: &StatefulServicePartition,
+    ) {
+        #[cfg(feature = "testing")]
+        {
+            let gate = self.fault_hook.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        let _lifecycle = self.lifecycle().await;
+        let generation = self.generation();
+        if generation.id == notice.generation
+            && !matches!(
+                *generation.state.lock().unwrap(),
+                PgProcessState::Stopping | PgProcessState::Stopped
+            )
+        {
+            let _ = partition.report_fault(notice.fault).await;
+        }
+    }
+
+    pub(crate) fn generation_id(&self) -> u64 {
+        self.generation().id
+    }
+
+    pub(crate) async fn generation_operation<T>(
+        &self,
+        operation: impl Future<Output = Result<T, PgError>>,
+    ) -> Result<T, PgError> {
+        let generation = self.generation();
+        self.complete_generation(&generation, operation.await)
+    }
+
+    fn complete_generation<T>(
+        &self,
+        generation: &Arc<ProcessGeneration>,
+        result: Result<T, PgError>,
+    ) -> Result<T, PgError> {
+        let result = result.and_then(|value| {
+            if !Arc::ptr_eq(&self.generation(), generation)
+                || generation.cleanup_result.lock().unwrap().is_some()
+            {
+                Err(PgError::Process(
+                    "operation completed after its generation retired".into(),
+                ))
+            } else {
+                Ok(value)
+            }
+        });
+        result.map_err(|error| error.with_generation(generation.id))
+    }
+
+    async fn command_output(
+        &self,
+        generation: &Arc<ProcessGeneration>,
+        command: &mut Command,
+        deadline: Option<(std::time::Duration, &'static str)>,
+    ) -> Result<std::process::Output, PgError> {
+        let result = match deadline {
+            Some((duration, name)) => {
+                generation
+                    .helpers
+                    .output_with_timeout(command, duration, name)
+                    .await
+            }
+            None => generation.helpers.output(command).await,
+        };
+        self.complete_generation(generation, result)
+    }
+
+    pub(crate) async fn handle_error<F, Fut>(
+        &self,
+        error: PgError,
+        report: F,
+    ) -> kuberic_runtime::RuntimeError
+    where
+        F: FnOnce(kuberic_protocol::types::FaultType, PgError) -> Fut,
+        Fut: Future<Output = kuberic_runtime::RuntimeError>,
+    {
+        #[cfg(feature = "testing")]
+        {
+            let gate = self.error_hook.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        let _lifecycle = self.lifecycle().await;
+        let generation = self.generation();
+        let state = *generation.state.lock().unwrap();
+        let retired = state == PgProcessState::Stopping
+            || (state == PgProcessState::Stopped && generation.shutdown.is_cancelled());
+        if error.origin().is_some_and(|origin| origin != generation.id)
+            || (error.origin().is_some() && retired)
+        {
+            tracing::debug!(%error, current_generation = generation.id, "ignoring retired operation fault");
+            return kuberic_runtime::RuntimeError::Application(format!(
+                "{error}; fault acknowledgement skipped for retired generation"
+            ));
+        }
+        let transient = error.is_timeout();
+        let cleanup = if transient {
+            self.retire_generation(generation.clone(), false).await
+        } else {
+            let Some(result) = self.abort_generation(&generation) else {
+                return kuberic_runtime::RuntimeError::Application(format!(
+                    "{error}; fault acknowledgement skipped for replaced generation"
+                ));
+            };
+            result
+        };
+        if !Arc::ptr_eq(&self.generation(), &generation) {
+            return kuberic_runtime::RuntimeError::Application(format!(
+                "{error}; fault acknowledgement skipped for replaced generation"
+            ));
+        }
+        let error = error.with_cleanup(cleanup);
+        let recovered = transient && error.is_timeout();
+        let result = report(error.fault_type(), error).await;
+        if recovered {
+            let mut current = self.current.lock().unwrap();
+            if Arc::ptr_eq(&current, &generation) && !self.launches_closed.load(Ordering::Acquire) {
+                *current = Arc::new(ProcessGeneration::new(
+                    self.next_generation.fetch_add(1, Ordering::AcqRel),
+                ));
+            }
+        }
+        result
     }
 
     fn replace_retired(&self, expected_abort: u64) -> Result<Arc<ProcessGeneration>, PgError> {
@@ -278,11 +484,11 @@ impl PgInstanceManager {
 
     /// Initialize a new PG cluster with data checksums.
     pub async fn init_db(&self) -> Result<(), PgError> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        let _lifecycle = self.lifecycle().await;
         let generation = self.generation();
-        let output = generation
-            .helpers
-            .output(
+        let output = self
+            .command_output(
+                &generation,
                 Command::new(self.pg_bin.join("initdb"))
                     .args([
                         "--data-checksums",
@@ -292,15 +498,21 @@ impl PgInstanceManager {
                         "--no-instructions",
                     ])
                     .env("LC_ALL", "C"),
+                None,
             )
             .await?;
 
         if !output.status.success() {
-            return Err(PgError::command_failed("initdb failed", &output));
+            return Err(
+                PgError::command_failed("initdb failed", &output).with_generation(generation.id)
+            );
         }
 
         // Write required config
-        self.config.write_initial(&self.data_dir).await?;
+        self.config
+            .write_initial(&self.data_dir)
+            .await
+            .map_err(|error| error.with_generation(generation.id))?;
         *generation.state.lock().unwrap() = PgProcessState::Initialized;
 
         tracing::info!(
@@ -333,6 +545,7 @@ impl PgInstanceManager {
         generation: &Arc<ProcessGeneration>,
     ) -> Arc<dyn Fn(PgProcessFault) + Send + Sync> {
         let current = Arc::downgrade(&self.current);
+        let sink = self.fault_sink.lock().unwrap().clone();
         let generation = Arc::downgrade(generation);
         Arc::new(move |fault| {
             let fault = match fault {
@@ -342,6 +555,22 @@ impl PgInstanceManager {
             if let (Some(current), Some(generation)) = (current.upgrade(), generation.upgrade())
                 && Arc::ptr_eq(&current.lock().unwrap(), &generation)
             {
+                if let Some(sink) = &sink {
+                    let notice = GenerationFault {
+                        generation: generation.id,
+                        fault,
+                    };
+                    match sink.try_send(notice) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        Err(mpsc::error::TrySendError::Full(notice)) => {
+                            let sink = sink.clone();
+                            tokio::spawn(async move {
+                                let _ = sink.send(notice).await;
+                            });
+                        }
+                    }
+                    return;
+                }
                 match fault_tx.try_send(fault) {
                     Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
                     Err(mpsc::error::TrySendError::Full(fault)) => {
@@ -383,39 +612,42 @@ impl PgInstanceManager {
     }
 
     pub async fn control_identity(&self) -> Result<(String, u32), PgError> {
-        let output = self
-            .generation()
-            .helpers
-            .output_with_timeout(
-                Command::new(self.pg_bin.join("pg_controldata"))
-                    .arg(&self.data_dir)
-                    .env("LC_ALL", "C"),
-                std::time::Duration::from_secs(2),
-                "pg_controldata",
-            )
-            .await?;
-        if !output.status.success() {
-            return Err(PgError::command_failed(
-                "cannot inspect PostgreSQL control data",
-                &output,
-            ));
+        let generation = self.generation();
+        let result = async {
+            let output = self
+                .command_output(
+                    &generation,
+                    Command::new(self.pg_bin.join("pg_controldata"))
+                        .arg(&self.data_dir)
+                        .env("LC_ALL", "C"),
+                    Some((std::time::Duration::from_secs(2), "pg_controldata")),
+                )
+                .await?;
+            if !output.status.success() {
+                return Err(PgError::command_failed(
+                    "cannot inspect PostgreSQL control data",
+                    &output,
+                ));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .map(str::trim)
+                    .ok_or_else(|| PgError::Process(format!("missing control field {name}")))
+            };
+            let system = field("Database system identifier:")?.to_owned();
+            let timeline = field("Latest checkpoint's TimeLineID:")?
+                .parse()
+                .map_err(|_| PgError::Process("invalid control timeline".into()))?;
+            Ok((system, timeline))
         }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let field = |name: &str| {
-            text.lines()
-                .find_map(|line| line.strip_prefix(name))
-                .map(str::trim)
-                .ok_or_else(|| PgError::Process(format!("missing control field {name}")))
-        };
-        let system = field("Database system identifier:")?.to_owned();
-        let timeline = field("Latest checkpoint's TimeLineID:")?
-            .parse()
-            .map_err(|_| PgError::Process("invalid control timeline".into()))?;
-        Ok((system, timeline))
+        .await;
+        self.complete_generation(&generation, result)
     }
 
     async fn start_with_parameters(&self, parameters: StartParameters) -> Result<(), PgError> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        let _lifecycle = self.lifecycle().await;
         let expected_abort = self.abort_generation.load(Ordering::Acquire);
         if parameters
             .cancellation
@@ -426,7 +658,7 @@ impl PgInstanceManager {
         }
         let existing = self.generation();
         if let Some(Err(error)) = existing.cleanup_result.lock().unwrap().clone() {
-            return Err(error);
+            return Err(error.with_generation(existing.id));
         }
         if existing.running() && *existing.state.lock().unwrap() == PgProcessState::Running {
             return Ok(());
@@ -451,7 +683,7 @@ impl PgInstanceManager {
                 kuberic_protocol::types::FaultType::Permanent => PgProcessFault::Permanent,
             });
             *generation.state.lock().unwrap() = PgProcessState::Faulted;
-            return Err(error);
+            return Err(error.with_generation(generation.id));
         }
 
         let (stdout, stderr) = match self.spawn_owned(&generation) {
@@ -459,7 +691,7 @@ impl PgInstanceManager {
             Err(error) => {
                 fault_reporter(PgProcessFault::Permanent);
                 *generation.state.lock().unwrap() = PgProcessState::Faulted;
-                return Err(error);
+                return Err(error.with_generation(generation.id));
             }
         };
 
@@ -496,7 +728,7 @@ impl PgInstanceManager {
             fault_reporter(PgProcessFault::Permanent);
             let cleanup = self.retire_owned(false).await;
             *generation.state.lock().unwrap() = PgProcessState::Faulted;
-            return Err(error.with_cleanup(cleanup));
+            return Err(error.with_cleanup(cleanup).with_generation(generation.id));
         }
 
         // Observe without reaping: shutdown retains ownership of any descendants.
@@ -599,7 +831,7 @@ impl PgInstanceManager {
             let task = tokio::spawn(async move {
                 cancellation.cancelled().await;
                 if let Some(instance) = instance.upgrade() {
-                    let _lifecycle = instance.lifecycle_lock.lock().await;
+                    let _lifecycle = instance.lifecycle().await;
                     if Arc::ptr_eq(&instance.generation(), &observed) {
                         let result = instance.abort_owned();
                         *observed.state.lock().unwrap() = if result.is_ok() {
@@ -704,7 +936,7 @@ impl PgInstanceManager {
 
     /// Stop PostgreSQL (fast mode).
     pub async fn stop(&self) -> Result<(), PgError> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        let _lifecycle = self.lifecycle().await;
         let result = self.finish_owned().await;
         if result.is_ok() {
             tracing::info!(port = self.port, "PostgreSQL stopped");
@@ -722,21 +954,25 @@ impl PgInstanceManager {
 
     /// Promote standby to primary.
     pub async fn promote(&self) -> Result<(), PgError> {
+        let generation = self.generation();
         let output = self
-            .generation()
-            .helpers
-            .output(Command::new(self.pg_bin.join("pg_ctl")).args([
-                "promote",
-                "-D",
-                &self.data_dir.to_string_lossy(),
-                "-w",
-                "-t",
-                "60",
-            ]))
+            .command_output(
+                &generation,
+                Command::new(self.pg_bin.join("pg_ctl")).args([
+                    "promote",
+                    "-D",
+                    &self.data_dir.to_string_lossy(),
+                    "-w",
+                    "-t",
+                    "60",
+                ]),
+                None,
+            )
             .await?;
 
         if !output.status.success() {
-            return Err(PgError::command_failed("pg_ctl promote failed", &output));
+            return Err(PgError::command_failed("pg_ctl promote failed", &output)
+                .with_generation(generation.id));
         }
 
         tracing::info!(port = self.port, "PostgreSQL promoted to primary");
@@ -745,28 +981,32 @@ impl PgInstanceManager {
 
     /// Run pg_basebackup from a source to initialize this replica.
     pub async fn base_backup(&self, source_host: &str, source_port: u16) -> Result<(), PgError> {
+        let generation = self.generation();
         let output = self
-            .generation()
-            .helpers
-            .output(Command::new(self.pg_bin.join("pg_basebackup")).args([
-                "-D",
-                &self.data_dir.to_string_lossy(),
-                "-h",
-                source_host,
-                "-p",
-                &source_port.to_string(),
-                "-U",
-                &whoami::username().unwrap_or_else(|_| "postgres".to_string()),
-                "-Fp",
-                "-Xs",
-                "-c",
-                "fast",
-                "-R", // creates standby.signal + primary_conninfo
-            ]))
+            .command_output(
+                &generation,
+                Command::new(self.pg_bin.join("pg_basebackup")).args([
+                    "-D",
+                    &self.data_dir.to_string_lossy(),
+                    "-h",
+                    source_host,
+                    "-p",
+                    &source_port.to_string(),
+                    "-U",
+                    &whoami::username().unwrap_or_else(|_| "postgres".to_string()),
+                    "-Fp",
+                    "-Xs",
+                    "-c",
+                    "fast",
+                    "-R", // creates standby.signal + primary_conninfo
+                ]),
+                None,
+            )
             .await?;
 
         if !output.status.success() {
-            return Err(PgError::command_failed("pg_basebackup failed", &output));
+            return Err(PgError::command_failed("pg_basebackup failed", &output)
+                .with_generation(generation.id));
         }
 
         tracing::info!(
@@ -781,19 +1021,24 @@ impl PgInstanceManager {
     pub async fn rewind(&self, source_host: &str, source_port: u16) -> Result<(), PgError> {
         let source_conn = format!("host={source_host} port={source_port} dbname=postgres");
 
+        let generation = self.generation();
         let output = self
-            .generation()
-            .helpers
-            .output(Command::new(self.pg_bin.join("pg_rewind")).args([
-                "--target-pgdata",
-                &self.data_dir.to_string_lossy(),
-                "--source-server",
-                &source_conn,
-            ]))
+            .command_output(
+                &generation,
+                Command::new(self.pg_bin.join("pg_rewind")).args([
+                    "--target-pgdata",
+                    &self.data_dir.to_string_lossy(),
+                    "--source-server",
+                    &source_conn,
+                ]),
+                None,
+            )
             .await?;
 
         if !output.status.success() {
-            return Err(PgError::command_failed("pg_rewind failed", &output));
+            return Err(
+                PgError::command_failed("pg_rewind failed", &output).with_generation(generation.id)
+            );
         }
 
         tracing::info!(port = self.port, "pg_rewind complete");
@@ -801,7 +1046,7 @@ impl PgInstanceManager {
     }
 
     pub(crate) async fn prepare_native_build(&self) -> Result<(), PgError> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        let _lifecycle = self.lifecycle().await;
         let expected_abort = self.abort_generation.load(Ordering::Acquire);
         self.finish_owned().await?;
         self.replace_retired(expected_abort)?;
@@ -813,10 +1058,10 @@ impl PgInstanceManager {
         source_host: &str,
         source_port: u16,
     ) -> Result<bool, PgError> {
+        let generation = self.generation();
         let output = self
-            .generation()
-            .helpers
-            .output(
+            .command_output(
+                &generation,
                 Command::new(self.pg_bin.join("pg_rewind"))
                     .arg("--target-pgdata")
                     .arg(&self.data_dir)
@@ -825,6 +1070,7 @@ impl PgInstanceManager {
                         "host={source_host} port={source_port} dbname=postgres user=kuberic_rewind"
                     ))
                     .arg("--no-ensure-shutdown"),
+                None,
             )
             .await?;
         if !output.status.success() {
@@ -838,11 +1084,13 @@ impl PgInstanceManager {
     pub async fn connect(
         &self,
     ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), PgError> {
+        let generation = self.generation();
         let (client, connection) =
             tokio_postgres::connect(&self.connection_string(), tokio_postgres::NoTls)
                 .await
                 .map_err(|e| {
                     PgError::Connection(format!("connect to {}: {e}", self.connection_string()))
+                        .with_generation(generation.id)
                 })?;
 
         let handle = tokio::spawn(async move {
@@ -852,25 +1100,27 @@ impl PgInstanceManager {
             }
         });
 
-        Ok((client, handle))
+        self.complete_generation(&generation, Ok((client, handle)))
     }
 
     pub async fn connect_application(
         &self,
     ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), PgError> {
+        let generation = self.generation();
         let connection_string = self.application_connection_string();
         let (client, connection) =
             tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
                 .await
                 .map_err(|error| {
                     PgError::Connection(format!("connect to {connection_string}: {error}"))
+                        .with_generation(generation.id)
                 })?;
         let handle = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::debug!("PG application connection closed: {}", error);
             }
         });
-        Ok((client, handle))
+        self.complete_generation(&generation, Ok((client, handle)))
     }
 
     async fn finish_owned(&self) -> Result<(), PgError> {
@@ -879,6 +1129,14 @@ impl PgInstanceManager {
 
     async fn retire_owned(&self, publish_stopped: bool) -> Result<(), PgError> {
         let generation = self.generation();
+        self.retire_generation(generation, publish_stopped).await
+    }
+
+    async fn retire_generation(
+        &self,
+        generation: Arc<ProcessGeneration>,
+        publish_stopped: bool,
+    ) -> Result<(), PgError> {
         let previous = *generation.state.lock().unwrap();
         *generation.state.lock().unwrap() = PgProcessState::Stopping;
         let ticket = Arc::new(CleanupTicket {
@@ -893,6 +1151,8 @@ impl PgInstanceManager {
         let current = self.current.clone();
         let next = self.next_generation.clone();
         let closed = self.launches_closed.clone();
+        let lifecycle = self.lifecycle_lock.clone();
+        let retired = generation.clone();
         #[cfg(feature = "testing")]
         let hook = self.cleanup_hook.lock().unwrap().take();
         let result = tokio::task::spawn_blocking(move || {
@@ -908,10 +1168,15 @@ impl PgInstanceManager {
                 hook.entered.notify_one();
                 let _ = hook.release.recv();
             }
-            let result = generation.retire(&ticket.commands, &data_dir);
-            if result.is_ok() && publish_stopped {
+            let result = retired
+                .retire(&ticket.commands, &data_dir)
+                .map_err(|error| error.with_generation(retired.id));
+            if result.is_ok()
+                && publish_stopped
+                && let Ok(_lifecycle) = lifecycle.try_lock()
+            {
                 let mut current = current.lock().unwrap();
-                if Arc::ptr_eq(&current, &generation) && !closed.load(Ordering::Acquire) {
+                if Arc::ptr_eq(&current, &retired) && !closed.load(Ordering::Acquire) {
                     *current =
                         Arc::new(ProcessGeneration::new(next.fetch_add(1, Ordering::AcqRel)));
                 }
@@ -924,6 +1189,17 @@ impl PgInstanceManager {
         })
         .await
         .map_err(|error| PgError::Process(format!("join PostgreSQL cleanup: {error}")))?;
+        // A live caller already owns lifecycle_lock. A detached completion may
+        // publish only after acquiring it, so fault acknowledgement and process
+        // replacement cannot interleave across the generation check.
+        if result.is_ok() && publish_stopped {
+            let mut current = self.current.lock().unwrap();
+            if Arc::ptr_eq(&current, &generation) && !self.launches_closed.load(Ordering::Acquire) {
+                *current = Arc::new(ProcessGeneration::new(
+                    self.next_generation.fetch_add(1, Ordering::AcqRel),
+                ));
+            }
+        }
         drop(waiter);
         result
     }
@@ -938,6 +1214,19 @@ impl PgInstanceManager {
         let commands = generation.helpers.capture();
         generation.retire(&commands, &self.data_dir)
     }
+
+    fn abort_generation(&self, generation: &Arc<ProcessGeneration>) -> Option<Result<(), PgError>> {
+        {
+            let current = self.current.lock().unwrap();
+            if !Arc::ptr_eq(&current, generation) {
+                return None;
+            }
+            self.abort_generation.fetch_add(1, Ordering::AcqRel);
+            self.launches_closed.store(true, Ordering::Release);
+        }
+        let commands = generation.helpers.capture();
+        Some(generation.retire(&commands, &self.data_dir))
+    }
 }
 
 impl Drop for PgInstanceManager {
@@ -950,6 +1239,11 @@ impl Drop for PgInstanceManager {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PgError {
+    #[error("{source} [originating process generation {generation}]")]
+    Generation {
+        generation: u64,
+        source: Box<PgError>,
+    },
     #[error("operation timeout: {0}")]
     Timeout(String),
     #[error("process error: {0}")]
@@ -963,6 +1257,31 @@ pub enum PgError {
 }
 
 impl PgError {
+    pub(crate) fn with_generation(self, generation: u64) -> Self {
+        if matches!(self, Self::Generation { .. }) {
+            self
+        } else {
+            Self::Generation {
+                generation,
+                source: Box::new(self),
+            }
+        }
+    }
+
+    fn origin(&self) -> Option<u64> {
+        match self {
+            Self::Generation { generation, .. } => Some(*generation),
+            _ => None,
+        }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Self::Generation { source, .. } => source.is_timeout(),
+            Self::Timeout(_) => true,
+            _ => false,
+        }
+    }
     fn command_failed(context: &str, output: &std::process::Output) -> Self {
         Self::Process(format!(
             "{context} ({}); stdout: {}; stderr: {}",
@@ -973,6 +1292,9 @@ impl PgError {
     }
 
     pub(crate) fn with_cleanup(self, cleanup: Result<(), PgError>) -> Self {
+        if let Self::Generation { generation, source } = self {
+            return source.with_cleanup(cleanup).with_generation(generation);
+        }
         match cleanup {
             Ok(()) => self,
             Err(cleanup) => Self::Process(format!("{self}; owned process cleanup: {cleanup}")),
@@ -981,6 +1303,7 @@ impl PgError {
 
     pub fn fault_type(&self) -> kuberic_protocol::types::FaultType {
         match self {
+            Self::Generation { source, .. } => source.fault_type(),
             Self::Connection(_) | Self::Query(_) | Self::Timeout(_) => {
                 kuberic_protocol::types::FaultType::Transient
             }

@@ -148,6 +148,24 @@ Startup and abort serialize ownership transfer; old monitors and cancellation
 tokens are generation-bound. Fatal cleanup errors remain attached to the failed
 generation and prevent replacement rather than being cleared by retry.
 
+Helper outcomes also retain their originating generation through output parsing,
+error classification and cleanup. A result from retired work may finish its own
+caller, but cannot abort/close a replacement or report Permanent against it.
+Error handling takes the lifecycle lock, revalidates that origin, retires only
+current ownership and acknowledges the fault before permitting replacement.
+Cleanup-result publication uses that same lifecycle barrier; a cancelled
+waiter cannot make a stopped replacement generation appear between validation
+and acknowledgement. Destructive error actions receive the captured generation,
+not a second lookup of the mutable current slot.
+Genuine current-generation fatal errors still seal launches and remain fatal;
+transient timeout cleanup preserves its existing closed, retryable behavior.
+
+The service's monitor-fault channel carries the generation to the receiving end,
+not just to enqueue. Delivery revalidates it under the lifecycle lock before
+calling the partition fault API. Queued notices from replaced generations are
+discarded. PostgreSQL SQL observation/apply failures use the same origin binding;
+the public SF service/replicator API is unchanged.
+
 Cancellation does not delete partially initialized storage or consume the durable
 first-open permission. An authorized retry can initialize still-empty PGDATA or
 reuse valid completed `initdb` output with its original system identifier;

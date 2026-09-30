@@ -141,6 +141,8 @@ impl StatefulServiceReplica for PgService {
             }
         };
         let (fault_tx, mut fault_rx) = tokio::sync::mpsc::channel(8);
+        let (generation_fault_tx, mut generation_fault_rx) = tokio::sync::mpsc::channel(8);
+        self.instance.bind_fault_sink(generation_fault_tx);
         // The reporting task owns the partition lifetime; the driver must not
         // form a strong host -> driver -> partition -> host cycle.
         let partition = Arc::new(context.partition.clone());
@@ -163,14 +165,22 @@ impl StatefulServiceReplica for PgService {
             .set(driver.clone())
             .map_err(|_| RuntimeError::Closed)?;
         let cancellation = self.cancellation.clone();
+        let instance = Arc::downgrade(&self.instance);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
-                    fault = fault_rx.recv() => match fault {
-                        Some(fault) => { let _ = partition.report_fault(fault).await; }
+                    fault = generation_fault_rx.recv() => match fault {
+                        Some(fault) => {
+                            if let Some(instance) = instance.upgrade() {
+                                instance.deliver_fault(fault, &partition).await;
+                            }
+                        }
                         None => break,
-                    }
+                    },
+                    // Only the standalone instance API uses the untagged sink.
+                    // Keep its receiver alive without forwarding stale notices.
+                    _ = fault_rx.recv() => {}
                 }
             }
         });

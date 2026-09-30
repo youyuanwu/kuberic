@@ -180,6 +180,16 @@ impl PgNativeObserver {
         local: &ReplicaIdentity,
         configuration: &kuberic_runtime::replicator::ReplicaSetConfiguration,
     ) -> Result<(), PgError> {
+        self.instance
+            .generation_operation(self.reconcile_slots_inner(local, configuration))
+            .await
+    }
+
+    async fn reconcile_slots_inner(
+        &self,
+        local: &ReplicaIdentity,
+        configuration: &kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<(), PgError> {
         let expected = configuration
             .replicas
             .iter()
@@ -218,6 +228,16 @@ impl PgNativeObserver {
     }
 
     pub(crate) async fn all_replayed(
+        &self,
+        required: &BTreeMap<ReplicaIdentity, ProcessSessionId>,
+        boundary: i64,
+    ) -> Result<bool, PgError> {
+        self.instance
+            .generation_operation(self.all_replayed_inner(required, boundary))
+            .await
+    }
+
+    async fn all_replayed_inner(
         &self,
         required: &BTreeMap<ReplicaIdentity, ProcessSessionId>,
         boundary: i64,
@@ -283,6 +303,15 @@ impl PgNativeObserver {
     }
 
     pub async fn set_synchronous(&self, synchronous: AcknowledgementPolicy) -> Result<(), PgError> {
+        self.instance
+            .generation_operation(self.set_synchronous_inner(synchronous))
+            .await
+    }
+
+    async fn set_synchronous_inner(
+        &self,
+        synchronous: AcknowledgementPolicy,
+    ) -> Result<(), PgError> {
         let _configuration = self.configuration_lock.lock().await;
         if synchronous.valid {
             return Err(PgError::Configuration(
@@ -363,6 +392,15 @@ impl PgNativeObserver {
     }
 
     pub async fn apply_synchronous(
+        &self,
+        synchronous: AcknowledgementPolicy,
+    ) -> Result<(), PgError> {
+        self.instance
+            .generation_operation(self.apply_synchronous_inner(synchronous))
+            .await
+    }
+
+    async fn apply_synchronous_inner(
         &self,
         synchronous: AcknowledgementPolicy,
     ) -> Result<(), PgError> {
@@ -455,6 +493,12 @@ impl PgNativeObserver {
     }
 
     async fn snapshot_locked(&self) -> Result<PgObservation, PgError> {
+        self.instance
+            .generation_operation(self.snapshot_inner())
+            .await
+    }
+
+    async fn snapshot_inner(&self) -> Result<PgObservation, PgError> {
         let (client, _connection) = self.instance.connect().await?;
         let system_identifier: String = client
             .query_one(

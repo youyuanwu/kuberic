@@ -111,8 +111,17 @@ impl PgReplicator {
     }
 
     async fn permanent(&self, error: impl std::fmt::Display) -> RuntimeError {
-        let error = PgError::Process(error.to_string()).with_cleanup(self.instance.abort_owned());
-        self.report(FaultType::Permanent, error).await
+        self.permanent_at(self.instance.generation_id(), error)
+            .await
+    }
+
+    async fn permanent_at(&self, generation: u64, error: impl std::fmt::Display) -> RuntimeError {
+        self.instance
+            .handle_error(
+                PgError::Process(error.to_string()).with_generation(generation),
+                |fault, error| self.report(fault, error),
+            )
+            .await
     }
 
     async fn pg_result<T>(&self, result: std::result::Result<T, PgError>) -> Result<T> {
@@ -120,17 +129,10 @@ impl PgReplicator {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let cleanup = if matches!(error, PgError::Timeout(_)) {
-            // A bounded helper failure revokes SQL/process access but is not a
-            // terminal service abort. stop() joins the exact run and keeps the
-            // helper registry usable; retained cleanup errors are never reset.
-            self.instance.stop().await
-        } else {
-            self.instance.abort_owned()
-        };
-        let error = error.with_cleanup(cleanup);
-        let fault = error.fault_type();
-        Err(self.report(fault, error).await)
+        Err(self
+            .instance
+            .handle_error(error, |fault, error| self.report(fault, error))
+            .await)
     }
 
     async fn permanent_result<T>(
@@ -176,11 +178,15 @@ impl PgReplicator {
     }
 
     async fn validate(&self) -> Result<PgDurableState> {
-        let durable = self
-            .permanent_result(self.durable.revalidate().await)
-            .await?;
+        let generation = self.instance.generation_id();
+        let durable = match self.durable.revalidate().await {
+            Ok(durable) => durable,
+            Err(error) => return Err(self.permanent_at(generation, error).await),
+        };
         if durable.recovery_state == PgRecoveryState::Unsafe {
-            return Err(self.permanent("unsafe PostgreSQL durable state").await);
+            return Err(self
+                .permanent_at(generation, "unsafe PostgreSQL durable state")
+                .await);
         }
         if durable.native_build.is_some() {
             return Ok(durable);
@@ -203,7 +209,7 @@ impl PgReplicator {
                 .await?;
             if system != &actual_system || durable.timeline_id != Some(timeline) {
                 return Err(self
-                    .permanent("PostgreSQL system identity/timeline mismatch")
+                    .permanent_at(generation, "PostgreSQL system identity/timeline mismatch")
                     .await);
             }
             let evidence = PgReplicationEvidence {
@@ -218,18 +224,19 @@ impl PgReplicator {
                 synchronous: durable.synchronous.clone(),
                 wal_receiver_stopped: false,
             };
-            let digest = self
-                .permanent_result(
-                    timeline_history_digest(self.instance.data_dir(), &evidence).await,
-                )
-                .await?;
+            let digest = match timeline_history_digest(self.instance.data_dir(), &evidence).await {
+                Ok(digest) => digest,
+                Err(error) => return Err(self.permanent_at(generation, error).await),
+            };
             if durable.timeline_history_digest.as_ref() != Some(&digest) {
-                return Err(self.permanent("PostgreSQL timeline history mismatch").await);
+                return Err(self
+                    .permanent_at(generation, "PostgreSQL timeline history mismatch")
+                    .await);
             }
         } else {
             if !self.initializing {
                 return Err(self
-                    .permanent("established PostgreSQL lacks durable lineage")
+                    .permanent_at(generation, "established PostgreSQL lacks durable lineage")
                     .await);
             }
             if !self
@@ -240,7 +247,7 @@ impl PgReplicator {
                     || self.instance.data_dir().join("recovery.signal").exists()
                 {
                     return Err(self
-                        .permanent("initial PostgreSQL storage is in recovery")
+                        .permanent_at(generation, "initial PostgreSQL storage is in recovery")
                         .await);
                 }
                 // An authorized retry may reuse completed initdb, never erase partial PGDATA.
