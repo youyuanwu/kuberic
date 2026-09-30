@@ -166,6 +166,36 @@ calling the partition fault API. Queued notices from replaced generations are
 discarded. PostgreSQL SQL observation/apply failures use the same origin binding;
 the public SF service/replicator API is unchanged.
 
+Retired operations return the existing SF `OperationCancelled` classification
+through the outer custom-replicator effect host. The host's effect/configuration
+gate serializes authority and session changes, but cancellation is not permission
+to abort a successor. Cancelled effects do not publish success or change access;
+the agent durably cancels only their matching pending intent. Other failed
+current-generation fence postconditions retain fail-closed abort behavior.
+
+Policy invalidation, connection acquisition, each SQL mutation, reload, readback
+and durable publication use the captured process lease under the lifecycle
+barrier. The shared configuration lock and exact policy version serialize policy
+transactions. Retirement may occur between steps, but every following step then
+rejects the old lease before acting. SQL steps have bounded deadlines so a stalled
+backend cannot indefinitely retain the lifecycle barrier. Policy validity and its
+process generation are published by the same joined metadata commit, including postcommit caller
+cancellation. A restarted process needs fresh current-configuration apply/readback
+before a partition grant can reopen SQL; old metadata alone is not native proof.
+
+Production process generations consume a checksummed 40-byte
+`process-generation-v2` high-water mark in the application metadata directory.
+Allocation synchronously renames and fsyncs it before publishing ownership, under
+the existing exclusive store owner, after startup storage/lineage validation.
+Metadata records initialization so loss or
+corruption cannot silently reset the clock. A retired manager cannot access a
+reopened owner's clock. `u64::MAX` is terminal: exhaustion seals launches, retains
+the fatal error, and remains exhausted after reopen. Helper identities and cleanup
+epochs are checked within their retained process owner; neither wraps or reopens
+an exhausted registry. Policy/metadata increments are checked as well. The agent
+reserves its maximum next-effect sequence as a durable exhausted state, rejecting
+new effects while retaining exact prior receipts for replay.
+
 Cancellation does not delete partially initialized storage or consume the durable
 first-open permission. An authorized retry can initialize still-empty PGDATA or
 reuse valid completed `initdb` output with its original system identifier;

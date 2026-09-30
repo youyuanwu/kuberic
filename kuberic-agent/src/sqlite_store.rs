@@ -204,6 +204,11 @@ impl AgentStore for SqliteStore {
                 }
                 return Ok(BeginEffect::Completed(Box::new(retained.result.clone())));
             }
+            if state.next_effect_sequence == u64::MAX || effect.sequence == u64::MAX {
+                return Err(AgentError::EffectConflict(
+                    "effect sequence exhausted".into(),
+                ));
+            }
             if let Some(pending) = state.pending_effect.as_mut() {
                 if pending.effect != *effect {
                     match (&pending.effect.action, &effect.action) {
@@ -521,7 +526,11 @@ impl AgentStore for SqliteStore {
                     .insert(retained.operation_id.clone(), retained.clone());
             }
             state.retained_result = Some(retained);
-            state.next_effect_sequence = state.next_effect_sequence.max(result.sequence + 1);
+            let next = result
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| AgentError::EffectConflict("effect sequence exhausted".into()))?;
+            state.next_effect_sequence = state.next_effect_sequence.max(next);
             write_agent_state(transaction, &state)
         })
     }

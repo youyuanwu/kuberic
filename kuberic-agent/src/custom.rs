@@ -290,9 +290,19 @@ impl CustomReplicatorHost {
         // The application observes partition access while reporting progress.
         // Never publish an effect receipt before that observation has completed.
         if let Err(error) = self.control.current_progress().await {
+            // The effect/configuration gate serializes platform ownership.
+            // A custom replicator can also retire its own work while this call
+            // is pending. SF cancellation is not authority to abort its successor.
+            if matches!(error, RuntimeError::OperationCancelled) {
+                return Err(error);
+            }
             let mut state = host.state.write().await;
             state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
             state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+            drop(state);
+            let mut state = self.state.write().await;
+            state.read_status = AccessStatus::ReconfigurationPending;
+            state.write_status = AccessStatus::ReconfigurationPending;
             drop(state);
             self.control.abort();
             return Err(error);

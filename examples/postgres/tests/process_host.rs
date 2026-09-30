@@ -1431,7 +1431,8 @@ async fn unsafe_evidence_reports_permanent_fault_and_stops_granted_sql() {
         .expect("stopped fault consumer must not deadlock the driver")
         .unwrap_err();
     assert!(
-        error.to_string().contains("fault acknowledgement"),
+        matches!(error, kuberic_runtime::RuntimeError::OperationCancelled)
+            || error.to_string().contains("fault acknowledgement"),
         "{error}"
     );
     std::fs::write(metadata, saved).unwrap();

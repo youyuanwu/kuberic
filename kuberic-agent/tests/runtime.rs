@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use kuberic_agent::coordinator::Coordinator;
 use kuberic_agent::hosting::{OutboundReplication, PodRuntime, PreparedCopy, RuntimeControlPlane};
-use kuberic_agent::runtime_adapter::RuntimeAdapter;
+use kuberic_agent::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use kuberic_agent::service::AgentService;
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, CoordinatorStage, SCHEMA_VERSION, StorageIdentity};
@@ -6942,6 +6942,37 @@ fn retry_item(
         data: b"value".to_vec(),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn effect_sequence_exhaustion_rejects_wrap_without_mutating_ownership() {
+    let runtime = PodRuntime::new(
+        identity(1, "sequence-max"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let open = effect(u64::MAX, RuntimeEffectAction::Open(OpenMode::New));
+    let result = runtime.apply_effect(open.clone()).await.unwrap();
+    assert_eq!(runtime.apply_effect(open).await.unwrap(), result);
+    assert!(matches!(
+        runtime.apply_effect(effect(0, RuntimeEffectAction::Abort)).await,
+        Err(RuntimeError::InvalidReplication(message)) if message.contains("exhausted")
+    ));
+    assert!(runtime.snapshot().await.open);
+    assert!(
+        runtime
+            .consume_cancelled_build_effect(effect(
+                0,
+                RuntimeEffectAction::BuildReplica {
+                    build_id: OperationId::new("wrapped"),
+                    target: identity(2, "wrapped"),
+                    replication_address: String::new(),
+                }
+            ))
+            .await
+            .is_err()
+    );
+    assert!(runtime.snapshot().await.open);
 }
 
 #[tokio::test]

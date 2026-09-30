@@ -183,7 +183,10 @@ async fn derived_helper_error_is_revalidated_after_a_replacement_race() {
         .unwrap();
     gate.release.notify_one();
     let result = old.await.unwrap().unwrap_err();
-    assert!(result.to_string().contains("missing control field"));
+    assert!(matches!(
+        result,
+        kuberic_runtime::RuntimeError::OperationCancelled
+    ));
     sql.simple_query("SELECT 1").await.unwrap();
     assert!(pod.application.instance().is_running().await);
     assert_eq!(pod.runtime.partition_report().await.reported_fault, before);
@@ -268,13 +271,20 @@ async fn current_generation_malformed_control_data_remains_fatal_and_acknowledge
     let owned = ProcessProbe::postgres(pod.application.instance().data_dir());
     std::fs::write(&armed, b"").unwrap();
     assert!(
-        pod.effect(RuntimeEffectAction::RefreshApplicationProgress)
-            .await
-            .is_err()
+        pod.effect(RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        })
+        .await
+        .is_err()
     );
     assert_eq!(
         pod.runtime.partition_report().await.reported_fault,
         Some(FaultType::Permanent)
+    );
+    assert_eq!(
+        pod.runtime.partition_report().await.write_status,
+        AccessStatus::ReconfigurationPending
     );
     assert!(!pod.application.instance().is_running().await);
     assert!(sql.simple_query("SELECT 1").await.is_err());

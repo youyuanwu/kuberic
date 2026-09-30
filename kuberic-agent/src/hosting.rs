@@ -1003,7 +1003,12 @@ impl RuntimeHost {
             let expected = state
                 .effects
                 .last_key_value()
-                .map_or(effect.sequence, |(sequence, _)| sequence + 1);
+                .map_or(Some(effect.sequence), |(sequence, _)| {
+                    sequence.checked_add(1)
+                })
+                .ok_or_else(|| {
+                    RuntimeError::InvalidReplication("effect sequence exhausted".into())
+                })?;
             if effect.sequence != expected {
                 return Err(RuntimeError::EffectOutOfOrder {
                     expected,
@@ -1152,7 +1157,6 @@ impl RuntimeHost {
                 ));
             }
         };
-        self.managed()?.cancel_outbound_build(build_id).await?;
         let _guard = self.effect_lock.lock().await;
         {
             let state = self.state.read().await;
@@ -1167,7 +1171,12 @@ impl RuntimeHost {
             let expected = state
                 .effects
                 .last_key_value()
-                .map_or(effect.sequence, |(sequence, _)| sequence + 1);
+                .map_or(Some(effect.sequence), |(sequence, _)| {
+                    sequence.checked_add(1)
+                })
+                .ok_or_else(|| {
+                    RuntimeError::InvalidReplication("effect sequence exhausted".into())
+                })?;
             if effect.sequence != expected {
                 return Err(RuntimeError::EffectOutOfOrder {
                     expected,
@@ -1175,6 +1184,7 @@ impl RuntimeHost {
                 });
             }
         }
+        self.managed()?.cancel_outbound_build(build_id).await?;
         let snapshot = self.snapshot().await;
         if snapshot
             .builds

@@ -61,6 +61,8 @@ pub struct PgDurableState {
     pub version: u32,
     pub identity: PgDurableIdentity,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub process_clock_initialized: bool,
     pub system_identifier: Option<String>,
     pub timeline_id: Option<u32>,
     pub timeline_history_digest: Option<String>,
@@ -76,6 +78,8 @@ pub struct PgDurableState {
     pub synchronous: Option<AcknowledgementPolicy>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub synchronous_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronous_process_generation: Option<u64>,
     pub accepted_build: Option<BuildAuthority>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_accepted_authority: bool,
@@ -103,6 +107,7 @@ impl PgDurableState {
             version: STATE_VERSION,
             identity,
             generation: 1,
+            process_clock_initialized: false,
             system_identifier: None,
             timeline_id: None,
             timeline_history_digest: None,
@@ -117,6 +122,7 @@ impl PgDurableState {
             policy_certified_lsn: 0,
             synchronous: None,
             synchronous_generation: 0,
+            synchronous_process_generation: None,
             accepted_build: None,
             has_accepted_authority: false,
             native_build: None,
@@ -489,6 +495,74 @@ impl Drop for PgDurableStore {
 }
 
 impl PgDurableStore {
+    pub(crate) async fn prepare_process_clock(&self) -> Result<u64, crate::instance::PgError> {
+        let initialized = self.snapshot().await.process_clock_initialized;
+        let path = self.root.join("process-generation-v2");
+        if !initialized && !path.exists() {
+            self.write_process_clock(0)?;
+        }
+        let value = self.read_process_clock()?;
+        if !initialized {
+            self.update(|state| {
+                state.process_clock_initialized = true;
+                Ok(())
+            })
+            .await
+            .map_err(|error| crate::instance::PgError::Process(error.to_string()))?;
+        }
+        Ok(value)
+    }
+
+    fn read_process_clock(&self) -> Result<u64, crate::instance::PgError> {
+        use std::io::Read;
+        let read = || -> std::io::Result<u64> {
+            let mut file = File::open(self.root.join("process-generation-v2"))?;
+            let mut data = [0; 40];
+            file.read_exact(&mut data)?;
+            let mut extra = [0];
+            if file.read(&mut extra)? != 0 || Sha256::digest(&data[..8])[..] != data[8..] {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid process generation checksum/length",
+                ));
+            }
+            Ok(u64::from_be_bytes(data[..8].try_into().unwrap()))
+        };
+        read().map_err(|error| {
+            crate::instance::PgError::Process(format!("read process generation: {error}"))
+        })
+    }
+
+    fn write_process_clock(&self, value: u64) -> Result<(), crate::instance::PgError> {
+        use std::io::Write;
+        let write = || -> std::io::Result<()> {
+            let bytes = value.to_be_bytes();
+            let path = self.root.join("process-generation-v2.next");
+            let mut file = File::create(&path)?;
+            file.write_all(&bytes)?;
+            file.write_all(&Sha256::digest(bytes))?;
+            file.sync_all()?;
+            std::fs::rename(path, self.root.join("process-generation-v2"))?;
+            File::open(&self.root)?.sync_all()
+        };
+        write().map_err(|error| {
+            crate::instance::PgError::Process(format!("persist process generation: {error}"))
+        })
+    }
+
+    pub(crate) fn advance_process_clock(
+        &self,
+        expected: u64,
+        next: u64,
+    ) -> Result<(), crate::instance::PgError> {
+        if self.read_process_clock()? != expected || next <= expected {
+            return Err(crate::instance::PgError::Process(
+                "process generation changed outside its owner".into(),
+            ));
+        }
+        self.write_process_clock(next)
+    }
+
     #[cfg(feature = "testing")]
     pub fn pause_commit(&self, stage: CommitStage, catch_up_only: bool) -> CommitGate {
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -855,6 +929,93 @@ mod tests {
                 agent_generation: AgentGeneration::new("generation-1"),
             },
         }
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn exhausted_policy_and_metadata_generations_remain_fenced_after_reopen() {
+        use crate::instance::PgInstanceManager;
+        use crate::native::{PgNativeObserver, compile_synchronous_configuration};
+        use crate::testing::{TestDataDir, allocate_port, find_pg_bin, native_configuration};
+        let root = TestDataDir::new("policy-max");
+        let store = Arc::new(
+            PgDurableStore::open(root.path().join("meta"), identity(), StorageMode::Fresh)
+                .await
+                .unwrap(),
+        );
+        let instance = Arc::new(PgInstanceManager::new(
+            root.path().join("pgdata"),
+            find_pg_bin(),
+            allocate_port().await,
+        ));
+        instance.init_db().await.unwrap();
+        let (faults, _rx) = tokio::sync::mpsc::channel(8);
+        instance.start_native(faults).await.unwrap();
+        let policy = compile_synchronous_configuration(
+            None,
+            &native_configuration(std::slice::from_ref(&identity().replica), 0, 1),
+            &identity().replica,
+            &BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+        let observer = PgNativeObserver::with_store(instance.clone(), store.clone()).await;
+        observer.apply_synchronous(policy.clone()).await.unwrap();
+        {
+            let mut state = store.state.lock().await;
+            state.generation = u64::MAX;
+            state.synchronous_generation = u64::MAX;
+            write_state(
+                &store.root.join(STATE_FILE),
+                &state,
+                &mut false,
+                || Ok(()),
+                |_| {},
+            )
+            .unwrap();
+        }
+        assert!(observer.apply_synchronous(policy.clone()).await.is_err());
+        assert!(
+            !observer
+                .snapshot()
+                .await
+                .unwrap()
+                .evidence
+                .unwrap()
+                .synchronous
+                .unwrap()
+                .valid
+        );
+        assert_eq!(store.revalidate().await.unwrap().generation, u64::MAX);
+        drop(observer);
+        drop(store);
+        let store = Arc::new(
+            PgDurableStore::open(
+                root.path().join("meta"),
+                identity(),
+                StorageMode::Established,
+            )
+            .await
+            .unwrap(),
+        );
+        let observer = PgNativeObserver::with_store(instance.clone(), store.clone()).await;
+        assert!(
+            !observer
+                .snapshot()
+                .await
+                .unwrap()
+                .evidence
+                .unwrap()
+                .synchronous
+                .unwrap()
+                .valid
+        );
+        assert!(observer.apply_synchronous(policy).await.is_err());
+        assert_eq!(
+            store.revalidate().await.unwrap().synchronous_generation,
+            u64::MAX
+        );
+        instance.stop().await.unwrap();
     }
 
     #[test]

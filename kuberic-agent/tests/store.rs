@@ -117,6 +117,48 @@ fn pending_acceptance_fixture() -> (
 }
 
 #[tokio::test]
+async fn exhausted_effect_sequence_persists_and_rejects_new_intents_after_reopen() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (mut state, _, _, mut result) = pending_acceptance_fixture();
+    state.pending_effect = None;
+    state.next_effect_sequence = u64::MAX - 1;
+    let effect = RuntimeEffect {
+        sequence: u64::MAX - 1,
+        operation_id: OperationId::new("last-effect"),
+        action: RuntimeEffectAction::RefreshApplicationProgress,
+    };
+    result.sequence = effect.sequence;
+    result.operation_id = effect.operation_id.clone();
+    let store = SqliteStore::create_authorized(&path, state).unwrap();
+    store.begin_effect(&effect).await.unwrap();
+    store.mark_effect_applied(&effect).await.unwrap();
+    store.complete_effect(&result).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open_existing(&path, None).unwrap();
+    assert_eq!(
+        store.load_state().await.unwrap().next_effect_sequence,
+        u64::MAX
+    );
+    assert!(matches!(
+        store.begin_effect(&effect).await.unwrap(),
+        BeginEffect::Completed(_)
+    ));
+    for sequence in [u64::MAX, 0, 1] {
+        let next = RuntimeEffect {
+            sequence,
+            operation_id: OperationId::new(format!("overflow-{sequence}")),
+            action: RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        };
+        assert!(matches!(store.begin_effect(&next).await,
+            Err(AgentError::EffectConflict(message)) if message.contains("exhausted")));
+    }
+    let state = store.load_state().await.unwrap();
+    assert_eq!(state.next_effect_sequence, u64::MAX);
+    assert!(state.pending_effect.is_none());
+}
+
+#[tokio::test]
 async fn pending_acceptance_conversion_is_atomic_one_way_and_preserves_stage_and_results() {
     for stage in [EffectStage::IntentCommitted, EffectStage::EffectApplied] {
         let directory = tempdir().unwrap();

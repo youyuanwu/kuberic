@@ -34,7 +34,7 @@ pub(crate) struct CapturedCommands {
 impl CapturedCommands {
     pub(crate) fn cancel_unstarted(&self) {
         let mut commands = self.owner.0.lock().unwrap();
-        if commands.close_epoch == self.close_epoch {
+        if commands.close_epoch == self.close_epoch && commands.error.is_none() {
             commands.closed = self.was_closed;
         }
     }
@@ -53,7 +53,14 @@ impl OwnedCommands {
         let mut commands = self.0.lock().unwrap();
         let was_closed = commands.closed;
         commands.closed = true;
-        commands.close_epoch += 1;
+        match commands.close_epoch.checked_add(1) {
+            Some(next) => commands.close_epoch = next,
+            None => {
+                commands.error.get_or_insert_with(|| {
+                    PgError::GenerationExhausted("helper cleanup epoch".into())
+                });
+            }
+        }
         CapturedCommands {
             owner: self.clone(),
             ids: commands.running.keys().copied().collect(),
@@ -88,6 +95,14 @@ impl OwnedCommands {
             if let Some(error) = &commands.error {
                 return Err(error.clone());
             }
+            let id = commands.next_id;
+            let Some(next) = id.checked_add(1) else {
+                let error = PgError::GenerationExhausted("helper identity".into());
+                commands.closed = true;
+                commands.error = Some(error.clone());
+                return Err(error);
+            };
+            commands.next_id = next;
             let mut process = match OwnedProcess::spawn(command) {
                 Ok(process) => process,
                 Err(error) => {
@@ -98,8 +113,6 @@ impl OwnedCommands {
                 }
             };
             let (stdout, stderr) = process.take_output();
-            let id = commands.next_id;
-            commands.next_id += 1;
             commands.running.insert(id, process);
             // Ownership is registered before the supervisor may launch.
             let started = commands.running.get(&id).unwrap().start();
@@ -151,7 +164,14 @@ impl OwnedCommands {
         let mut commands = self.0.lock().unwrap();
         commands.closed |= close;
         if close {
-            commands.close_epoch += 1;
+            match commands.close_epoch.checked_add(1) {
+                Some(next) => commands.close_epoch = next,
+                None => {
+                    commands.error.get_or_insert_with(|| {
+                        PgError::GenerationExhausted("helper cleanup epoch".into())
+                    });
+                }
+            }
         }
         let ids: Vec<_> = commands.running.keys().copied().collect();
         for id in ids {
@@ -214,6 +234,36 @@ impl Drop for CommandGuard<'_> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[tokio::test]
+    async fn helper_identity_and_cleanup_epoch_exhaustion_remain_closed() {
+        let commands = Arc::new(OwnedCommands::default());
+        commands.0.lock().unwrap().next_id = u64::MAX;
+        let error = commands
+            .output(Command::new("sh").arg("-c").arg("exit 0"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PgError::GenerationExhausted(_)));
+        assert!(commands.0.lock().unwrap().running.is_empty());
+        let capture = commands.capture();
+        capture.cancel_unstarted();
+        assert!(commands.0.lock().unwrap().closed);
+        assert!(capture.terminate().is_err());
+
+        let commands = Arc::new(OwnedCommands::default());
+        commands.0.lock().unwrap().close_epoch = u64::MAX - 1;
+        let old = commands.capture();
+        assert_eq!(commands.0.lock().unwrap().close_epoch, u64::MAX);
+        let exhausted = commands.capture();
+        exhausted.cancel_unstarted();
+        old.cancel_unstarted();
+        assert!(commands.0.lock().unwrap().closed);
+        assert!(matches!(
+            exhausted.terminate(),
+            Err(PgError::GenerationExhausted(_))
+        ));
+        assert_eq!(commands.0.lock().unwrap().close_epoch, u64::MAX);
+    }
 
     #[tokio::test]
     async fn helper_output_preserves_streams_status_and_environment() {

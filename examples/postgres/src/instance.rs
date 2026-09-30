@@ -8,6 +8,7 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::PgConfig;
+use crate::generation::GenerationClock;
 use crate::owned_command::{CapturedCommands, OwnedCommands};
 use crate::owned_process::OwnedProcess;
 use kuberic_runtime::replicator::StatefulServicePartition;
@@ -39,6 +40,15 @@ struct StartParameters {
 pub(crate) struct GenerationFault {
     generation: u64,
     fault: kuberic_protocol::types::FaultType,
+}
+
+#[derive(Clone)]
+pub(crate) struct GenerationLease(Arc<ProcessGeneration>);
+
+impl GenerationLease {
+    pub(crate) fn id(&self) -> u64 {
+        self.0.id
+    }
 }
 
 struct ProcessGeneration {
@@ -133,15 +143,41 @@ struct Lifecycle<'a> {
 
 impl Drop for Lifecycle<'_> {
     fn drop(&mut self) {
-        let mut current = self.instance.current.lock().unwrap();
-        let retired = matches!(*current.cleanup_result.lock().unwrap(), Some(Ok(())))
-            && *current.state.lock().unwrap() == PgProcessState::Stopped;
-        if retired && !self.instance.launches_closed.load(Ordering::Acquire) {
-            *current = Arc::new(ProcessGeneration::new(
-                self.instance.next_generation.fetch_add(1, Ordering::AcqRel),
-            ));
+        if let Err(error) = publish_stopped_generation(
+            &self.instance.current,
+            &self.instance.next_generation,
+            &self.instance.launches_closed,
+            None,
+        ) {
+            tracing::error!(%error, "process generation publication failed closed");
         }
     }
+}
+
+fn publish_stopped_generation(
+    current: &ProcessMutex<Arc<ProcessGeneration>>,
+    next: &GenerationClock,
+    closed: &AtomicBool,
+    expected: Option<&Arc<ProcessGeneration>>,
+) -> Result<(), PgError> {
+    let mut current = current.lock().unwrap();
+    if expected.is_some_and(|expected| !Arc::ptr_eq(&current, expected)) {
+        return Ok(());
+    }
+    let retired = matches!(*current.cleanup_result.lock().unwrap(), Some(Ok(())))
+        && *current.state.lock().unwrap() == PgProcessState::Stopped;
+    if retired && !closed.load(Ordering::Acquire) && !next.is_retired() {
+        match next.allocate() {
+            Ok(id) => *current = Arc::new(ProcessGeneration::new(id)),
+            Err(error) => {
+                closed.store(true, Ordering::Release);
+                *current.state.lock().unwrap() = PgProcessState::Faulted;
+                *current.cleanup_result.lock().unwrap() = Some(Err(error.clone()));
+                return Err(error.with_generation(current.id));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Drop for CleanupWaiter {
@@ -172,7 +208,7 @@ pub struct PgInstanceManager {
     pg_bin: PathBuf,
     port: u16,
     current: Arc<ProcessMutex<Arc<ProcessGeneration>>>,
-    next_generation: Arc<AtomicU64>,
+    next_generation: Arc<GenerationClock>,
     launches_closed: Arc<AtomicBool>,
     abort_generation: AtomicU64,
     config: PgConfig,
@@ -261,7 +297,7 @@ impl PgInstanceManager {
             pg_bin,
             port,
             current: Arc::new(ProcessMutex::new(Arc::new(ProcessGeneration::new(0)))),
-            next_generation: Arc::new(AtomicU64::new(1)),
+            next_generation: Arc::new(GenerationClock::default()),
             launches_closed: Arc::new(AtomicBool::new(false)),
             abort_generation: AtomicU64::new(0),
             config,
@@ -323,6 +359,52 @@ impl PgInstanceManager {
         self.generation().id
     }
 
+    pub(crate) async fn bind_generation_store(
+        &self,
+        store: &Arc<crate::durable::PgDurableStore>,
+    ) -> Result<(), PgError> {
+        let _lifecycle = self.lifecycle().await;
+        self.next_generation.bind(store).await?;
+        let id = self.next_generation.allocate()?;
+        *self.current.lock().unwrap() = Arc::new(ProcessGeneration::new(id));
+        Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn advance_generation_for_test(&self, value: u64) -> Result<(), PgError> {
+        self.next_generation.advance_for_test(value)
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn process_generation_for_test(&self) -> u64 {
+        self.generation_id()
+    }
+
+    pub(crate) fn generation_lease(&self) -> GenerationLease {
+        GenerationLease(self.generation())
+    }
+
+    pub(crate) fn generation_is_current(&self, lease: &GenerationLease) -> bool {
+        Arc::ptr_eq(&self.generation(), &lease.0)
+            && lease.0.cleanup_result.lock().unwrap().is_none()
+            && *lease.0.state.lock().unwrap() != PgProcessState::Stopping
+    }
+
+    pub(crate) async fn generation_step<T>(
+        &self,
+        lease: &GenerationLease,
+        operation: impl Future<Output = Result<T, PgError>>,
+    ) -> Result<T, PgError> {
+        let _lifecycle = self.lifecycle().await;
+        if !self.generation_is_current(lease) {
+            return Err(
+                PgError::Process("operation generation retired before mutation".into())
+                    .with_generation(lease.id()),
+            );
+        }
+        self.complete_generation(&lease.0, operation.await)
+    }
+
     pub(crate) async fn generation_operation<T>(
         &self,
         operation: impl Future<Output = Result<T, PgError>>,
@@ -374,7 +456,7 @@ impl PgInstanceManager {
         report: F,
     ) -> kuberic_runtime::RuntimeError
     where
-        F: FnOnce(kuberic_protocol::types::FaultType, PgError) -> Fut,
+        F: Fn(kuberic_protocol::types::FaultType, PgError) -> Fut,
         Fut: Future<Output = kuberic_runtime::RuntimeError>,
     {
         #[cfg(feature = "testing")]
@@ -394,50 +476,57 @@ impl PgInstanceManager {
             || (error.origin().is_some() && retired)
         {
             tracing::debug!(%error, current_generation = generation.id, "ignoring retired operation fault");
-            return kuberic_runtime::RuntimeError::Application(format!(
-                "{error}; fault acknowledgement skipped for retired generation"
-            ));
+            return kuberic_runtime::RuntimeError::OperationCancelled;
         }
         let transient = error.is_timeout();
         let cleanup = if transient {
             self.retire_generation(generation.clone(), false).await
         } else {
             let Some(result) = self.abort_generation(&generation) else {
-                return kuberic_runtime::RuntimeError::Application(format!(
-                    "{error}; fault acknowledgement skipped for replaced generation"
-                ));
+                tracing::debug!(%error, "ignoring replaced operation fault");
+                return kuberic_runtime::RuntimeError::OperationCancelled;
             };
             result
         };
         if !Arc::ptr_eq(&self.generation(), &generation) {
-            return kuberic_runtime::RuntimeError::Application(format!(
-                "{error}; fault acknowledgement skipped for replaced generation"
-            ));
+            tracing::debug!(%error, "ignoring replaced operation fault");
+            return kuberic_runtime::RuntimeError::OperationCancelled;
         }
         let error = error.with_cleanup(cleanup);
         let recovered = transient && error.is_timeout();
         let result = report(error.fault_type(), error).await;
         if recovered {
-            let mut current = self.current.lock().unwrap();
-            if Arc::ptr_eq(&current, &generation) && !self.launches_closed.load(Ordering::Acquire) {
-                *current = Arc::new(ProcessGeneration::new(
-                    self.next_generation.fetch_add(1, Ordering::AcqRel),
-                ));
+            if let Err(error) = publish_stopped_generation(
+                &self.current,
+                &self.next_generation,
+                &self.launches_closed,
+                Some(&generation),
+            ) {
+                return report(error.fault_type(), error).await;
             }
+            tracing::warn!(%result, generation = generation.id, "failed operation retired; successor cleanup is not authorized");
+            return kuberic_runtime::RuntimeError::OperationCancelled;
         }
         result
     }
 
     fn replace_retired(&self, expected_abort: u64) -> Result<Arc<ProcessGeneration>, PgError> {
         let mut current = self.current.lock().unwrap();
+        if expected_abort == u64::MAX {
+            return Err(PgError::GenerationExhausted("process abort epoch".into()));
+        }
         if self.abort_generation.load(Ordering::Acquire) != expected_abort {
             return Err(PgError::Process(
                 "owned PostgreSQL startup was aborted".into(),
             ));
         }
-        let generation = Arc::new(ProcessGeneration::new(
-            self.next_generation.fetch_add(1, Ordering::AcqRel),
-        ));
+        let id = self.next_generation.allocate().map_err(|error| {
+            self.launches_closed.store(true, Ordering::Release);
+            *current.state.lock().unwrap() = PgProcessState::Faulted;
+            *current.cleanup_result.lock().unwrap() = Some(Err(error.clone()));
+            error.with_generation(current.id)
+        })?;
+        let generation = Arc::new(ProcessGeneration::new(id));
         *current = generation.clone();
         self.launches_closed.store(false, Ordering::Release);
         Ok(generation)
@@ -1168,18 +1257,14 @@ impl PgInstanceManager {
                 hook.entered.notify_one();
                 let _ = hook.release.recv();
             }
-            let result = retired
+            let mut result = retired
                 .retire(&ticket.commands, &data_dir)
                 .map_err(|error| error.with_generation(retired.id));
             if result.is_ok()
                 && publish_stopped
                 && let Ok(_lifecycle) = lifecycle.try_lock()
             {
-                let mut current = current.lock().unwrap();
-                if Arc::ptr_eq(&current, &retired) && !closed.load(Ordering::Acquire) {
-                    *current =
-                        Arc::new(ProcessGeneration::new(next.fetch_add(1, Ordering::AcqRel)));
-                }
+                result = publish_stopped_generation(&current, &next, &closed, Some(&retired));
             }
             #[cfg(feature = "testing")]
             if let Some(hook) = hook {
@@ -1188,44 +1273,70 @@ impl PgInstanceManager {
             result
         })
         .await
-        .map_err(|error| PgError::Process(format!("join PostgreSQL cleanup: {error}")))?;
+        .map_err(|error| {
+            PgError::Process(format!("join PostgreSQL cleanup: {error}"))
+                .with_generation(generation.id)
+        })?;
         // A live caller already owns lifecycle_lock. A detached completion may
         // publish only after acquiring it, so fault acknowledgement and process
         // replacement cannot interleave across the generation check.
         if result.is_ok() && publish_stopped {
-            let mut current = self.current.lock().unwrap();
-            if Arc::ptr_eq(&current, &generation) && !self.launches_closed.load(Ordering::Acquire) {
-                *current = Arc::new(ProcessGeneration::new(
-                    self.next_generation.fetch_add(1, Ordering::AcqRel),
-                ));
-            }
+            publish_stopped_generation(
+                &self.current,
+                &self.next_generation,
+                &self.launches_closed,
+                Some(&generation),
+            )?;
         }
         drop(waiter);
         result
     }
 
     pub(crate) fn abort_owned(&self) -> Result<(), PgError> {
-        let generation = {
+        let (generation, advanced) = {
             let current = self.current.lock().unwrap();
-            self.abort_generation.fetch_add(1, Ordering::AcqRel);
+            let advanced =
+                self.abort_generation
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_add(1)
+                    });
             self.launches_closed.store(true, Ordering::Release);
-            current.clone()
+            (current.clone(), advanced)
         };
         let commands = generation.helpers.capture();
-        generation.retire(&commands, &self.data_dir)
+        let cleanup = generation.retire(&commands, &self.data_dir);
+        match advanced {
+            Ok(_) => cleanup,
+            Err(_) => {
+                Err(PgError::GenerationExhausted("process abort epoch".into())
+                    .with_cleanup(cleanup))
+            }
+        }
     }
 
     fn abort_generation(&self, generation: &Arc<ProcessGeneration>) -> Option<Result<(), PgError>> {
-        {
+        let advanced = {
             let current = self.current.lock().unwrap();
             if !Arc::ptr_eq(&current, generation) {
                 return None;
             }
-            self.abort_generation.fetch_add(1, Ordering::AcqRel);
+            let advanced =
+                self.abort_generation
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_add(1)
+                    });
             self.launches_closed.store(true, Ordering::Release);
-        }
+            advanced
+        };
         let commands = generation.helpers.capture();
-        Some(generation.retire(&commands, &self.data_dir))
+        let cleanup = generation.retire(&commands, &self.data_dir);
+        Some(match advanced {
+            Ok(_) => cleanup,
+            Err(_) => {
+                Err(PgError::GenerationExhausted("process abort epoch".into())
+                    .with_cleanup(cleanup))
+            }
+        })
     }
 }
 
@@ -1239,6 +1350,8 @@ impl Drop for PgInstanceManager {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PgError {
+    #[error("generation exhausted: {0}")]
+    GenerationExhausted(String),
     #[error("{source} [originating process generation {generation}]")]
     Generation {
         generation: u64,
@@ -1307,7 +1420,7 @@ impl PgError {
             Self::Connection(_) | Self::Query(_) | Self::Timeout(_) => {
                 kuberic_protocol::types::FaultType::Transient
             }
-            Self::Process(_) | Self::Configuration(_) => {
+            Self::Process(_) | Self::Configuration(_) | Self::GenerationExhausted(_) => {
                 kuberic_protocol::types::FaultType::Permanent
             }
         }

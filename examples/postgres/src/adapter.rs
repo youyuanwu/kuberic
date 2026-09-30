@@ -914,6 +914,8 @@ impl PgReplicator {
             return Err(RuntimeError::Closed);
         }
         let durable = self.validate().await?;
+        self.pg_result(self.instance.bind_generation_store(&self.durable).await)
+            .await?;
         if durable.native_build.is_some() {
             // No old session is allowed to reconnect a receiver on reopen.
             // Exact re-admission resumes installed data without initializing it.
@@ -1131,8 +1133,16 @@ impl PgReplicator {
         ) else {
             return self.close_access().await;
         };
-        if evidence.in_recovery || evidence.synchronous.as_ref() != Some(&expected) {
-            return self.close_access().await;
+        if evidence.in_recovery {
+            self.close_access().await?;
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        if evidence.synchronous.as_ref() != Some(&expected) {
+            // A process replacement invalidates native readback, even when its
+            // SF configuration is unchanged. This current grant must reinstall
+            // and verify that exact configuration before opening SQL.
+            self.pg_result(self.observer.apply_synchronous(expected).await)
+                .await?;
         }
         PgAccessController::new(&self.instance)
             .grant_role_access()
