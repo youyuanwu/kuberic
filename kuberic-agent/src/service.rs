@@ -528,20 +528,29 @@ where
         let result = tokio::select! {
             result = &mut control => {
                 replication.abort();
+                let _ = (&mut replication).await;
                 flatten_server_result(result)
             }
             result = &mut replication => {
                 control.abort();
+                let _ = (&mut control).await;
                 flatten_server_result(result)
             }
             _ = wait_for_shutdown(&mut shutdown) => {
-                let results = tokio::join!(&mut control, &mut replication);
-                flatten_server_result(results.0).and_then(|_| flatten_server_result(results.1))
+                self.ready_state.store(false, Ordering::Release);
+                ready.send_replace(false);
+                // A retained HTTP/2 stream must not delay the durable shutdown
+                // acknowledgement. Interrupted command intents are replayable.
+                control.abort();
+                replication.abort();
+                let _ = tokio::join!(&mut control, &mut replication);
+                Ok(())
             }
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
         recovery_task.abort();
+        let _ = recovery_task.await;
         let persisted = self.persist_partition_fault().await;
         self.runtime.abort();
         persisted?;

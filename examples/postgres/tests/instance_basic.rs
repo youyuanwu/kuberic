@@ -199,8 +199,8 @@ async fn owned_cleanup_preserves_unrelated_postgres_and_rejects_foreign_pid_file
     instance.init_db().await.unwrap();
     let socket = format!(".s.PGSQL.{}", unrelated.port());
     std::os::unix::fs::symlink(
-        unrelated.data_dir().join(&socket),
-        instance.data_dir().join(&socket),
+        unrelated.socket_dir().join(&socket),
+        instance.socket_dir().join(&socket),
     )
     .unwrap();
     let error = instance.start_native(faults).await.unwrap_err();

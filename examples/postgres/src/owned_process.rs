@@ -83,6 +83,7 @@ pub(crate) struct OwnedProcess {
     channel: UnixStream,
     processes: Vec<Process>,
     postmaster: Option<usize>,
+    postmaster_ancestors: Vec<usize>,
 }
 
 impl OwnedProcess {
@@ -133,6 +134,7 @@ impl OwnedProcess {
                 channel,
                 processes: vec![process],
                 postmaster: None,
+                postmaster_ancestors: Vec::new(),
             }),
             Err(error) => {
                 // The unreaped child reserves this PID. The supervisor cannot
@@ -320,6 +322,17 @@ impl OwnedProcess {
                 return Err(io::Error::other("postmaster identity is not live"));
             }
             self.postmaster = Some(index);
+            self.postmaster_ancestors.clear();
+            let mut parent = self.processes[index].stat()?.1;
+            while parent != self.processes[0].pid {
+                let ancestor = self
+                    .processes
+                    .iter()
+                    .position(|process| process.pid == parent)
+                    .ok_or_else(|| io::Error::other("postmaster ancestor is not owned"))?;
+                self.postmaster_ancestors.push(ancestor);
+                parent = self.processes[ancestor].stat()?.1;
+            }
             Ok(())
         })();
         let resumed = self.signal_all(Signal::CONT);
@@ -359,9 +372,36 @@ impl OwnedProcess {
             {
                 Ok(())
             } else {
-                Err(PgError::Process(
-                    "fast PostgreSQL shutdown timed out".into(),
-                ))
+                let pending = self
+                    .processes
+                    .iter()
+                    .filter(|process| !process.reaped().unwrap_or(false))
+                    .map(|process| {
+                        let state = process.stat().map(|(state, _)| state).unwrap_or('?');
+                        let wait = std::fs::read_to_string(format!("/proc/{}/wchan", process.pid))
+                            .unwrap_or_default();
+                        format!("{}:{state}:{}", process.pid, wait.trim())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                tracing::warn!(%pending,
+                    "fast PostgreSQL shutdown budget exhausted; escalating owned cleanup");
+                if self.processes[postmaster]
+                    .exited()
+                    .map_err(|error| PgError::Process(error.to_string()))?
+                    && self
+                        .postmaster_ancestors
+                        .iter()
+                        .any(|index| !self.processes[*index].exited().unwrap_or(false))
+                {
+                    return Err(PgError::Process(format!(
+                        "fast PostgreSQL shutdown timed out; launcher outlived stopped postmaster: {pending}"
+                    )));
+                }
+                // The grace budget is not the fence proof. terminate() below
+                // must still prove successful supervisor exit and reaping of
+                // every descendant; otherwise shutdown remains an error.
+                Ok(())
             }
         })();
         let cleanup = self.terminate();
@@ -459,6 +499,49 @@ mod tests {
 
     fn supervisor(script: &str) -> OwnedProcess {
         OwnedProcess::spawn(Command::new("sh").args(["-c", script])).unwrap()
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn exhausted_fast_shutdown_budget_requires_proven_escalation() {
+        let data = crate::testing::TestDataDir::new("stop-budget");
+        let mut owned = supervisor("trap '' INT; echo $$; exec sleep 30");
+        let (stdout, _stderr) = owned.take_output();
+        owned.start().unwrap();
+        let pid: u32 = BufReader::new(stdout)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        owned.remember_descendants().unwrap();
+        owned.postmaster = Some(
+            owned
+                .processes
+                .iter()
+                .position(|process| process.pid == pid)
+                .unwrap(),
+        );
+        std::fs::write(data.path().join("postmaster.pid"), format!("{pid}\n")).unwrap();
+        let start = Instant::now();
+        owned.stop(data.path()).unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_secs(2),
+            "the mocked postmaster ignores fast shutdown"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "existing escalation budgets remain bounded"
+        );
+        assert!(
+            owned
+                .processes
+                .iter()
+                .all(|process| process.reaped().unwrap())
+        );
+        owned.stop(data.path()).unwrap();
     }
 
     #[tokio::test]

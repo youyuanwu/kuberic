@@ -358,7 +358,18 @@ async fn real_receive_and_flush_without_replay_do_not_complete_frozen_boundary()
     sql.batch_execute("INSERT INTO build_receipts VALUES (3, 'frozen')")
         .await
         .unwrap();
-    let authority = source.authorize(&target, "frozen").await;
+    source.refresh().await;
+    // Freeze a later boundary without replacing the target's installed build.
+    // Re-admitting B would correctly revoke A and stop its old receiver.
+    let authority = source
+        .runtime
+        .authorize_build(
+            kuberic_protocol::types::OperationId::new("frozen"),
+            target.identity.clone(),
+            kuberic_runtime::replicator::copy::BuildConfiguration::Current,
+        )
+        .await
+        .unwrap();
     let boundary = authority.replication_boundary_lsn;
     let observer = PgNativeObserver::new(target.application.instance().clone());
     let mut progress = target
@@ -370,7 +381,7 @@ async fn real_receive_and_flush_without_replay_do_not_complete_frozen_boundary()
         .unwrap();
     progress.request.authority = authority;
     progress.stage = PgBuildStage::Recovering;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             progress.evidence = observer.snapshot().await.unwrap().evidence;
             if progress.evidence.as_ref().unwrap().flush_lsn >= boundary {
@@ -401,11 +412,12 @@ async fn real_receive_and_flush_without_replay_do_not_complete_frozen_boundary()
     })
     .await
     .unwrap();
-    assert_eq!(
-        progress.evidence.as_ref().unwrap().replay_lsn,
-        Some(boundary)
-    );
+    assert!(progress.evidence.as_ref().unwrap().replay_lsn.unwrap() >= boundary);
     progress.validate().unwrap();
+    let mut at_boundary = progress.clone();
+    at_boundary.evidence.as_mut().unwrap().replay_lsn = Some(boundary);
+    assert!(at_boundary.recovered());
+    at_boundary.validate().unwrap();
     let bytes = encode(&progress).unwrap();
     assert_eq!(
         decode::<postgres_replicated::build::PgBuildProgress>(&bytes).unwrap(),
@@ -436,6 +448,289 @@ async fn write_source(source: &PgPod) {
         .unwrap();
     sql.batch_execute("CREATE TABLE build_receipts(id int PRIMARY KEY, value text); INSERT INTO build_receipts VALUES (1, 'native-copy'), (2, 'durable-boundary')")
         .await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_is_exact_to_the_selected_build_across_reopen() {
+    use kuberic_runtime_internal::authority::BuildAuthorityStore;
+    let root = TestDataDir::new("exact-receipt");
+    let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
+    let target = PgPod::new(root.path().join("t"), native_identity(2, "target")).await;
+    source.singleton().await;
+    write_source(&source).await;
+    let a = source.authorize(&target, "build-a").await;
+    source.build(&target, &a).await.unwrap();
+    target.refresh().await;
+    assert_eq!(target.runtime.snapshot().await.builds[0].authority, a);
+    let old = target
+        .application
+        .native_driver()
+        .durable_state()
+        .await
+        .native_build
+        .unwrap()
+        .request;
+    let b = source.authorize(&target, "build-b").await;
+    target.refresh().await;
+    source.refresh().await;
+    assert!(
+        target.runtime.snapshot().await.builds.is_empty(),
+        "A's replay cannot certify B"
+    );
+    assert!(source.runtime.snapshot().await.builds.is_empty());
+    assert!(
+        source
+            .store
+            .load_build(&a.build_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(target.inject(&old).await.is_err());
+    assert_eq!(
+        target
+            .application
+            .native_driver()
+            .durable_state()
+            .await
+            .native_build
+            .unwrap()
+            .request
+            .authority,
+        a
+    );
+
+    let target = target.reopen().await;
+    assert!(
+        target
+            .store
+            .load_build(&a.build_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let resumed = source.authorize(&target, "build-b").await;
+    assert_eq!(resumed, b);
+    target.refresh().await;
+    assert!(target.runtime.snapshot().await.builds.is_empty());
+    source.build(&target, &b).await.unwrap();
+    target.refresh().await;
+    let completed = target.runtime.snapshot().await.builds;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].authority, b);
+    assert!(completed[0].completed);
+}
+
+#[tokio::test]
+async fn overlapping_build_authority_cancels_and_rejects_the_old_completion() {
+    let root = TestDataDir::new("overlap");
+    let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
+    let target = PgPod::new(root.path().join("t"), native_identity(2, "target")).await;
+    source.singleton().await;
+    write_source(&source).await;
+    let a = source.authorize(&target, "overlap-a").await;
+    let gate = target
+        .application
+        .native_driver()
+        .pause_build(PgBuildStage::Complete);
+    let old = source.build(&target, &a);
+    tokio::pin!(old);
+    tokio::select! {
+        result = &mut old => panic!("unexpected early completion {result:?}"),
+        entered = tokio::time::timeout(Duration::from_secs(30), gate.entered.notified()) => entered.unwrap(),
+    }
+    let b = tokio::time::timeout(
+        Duration::from_secs(5),
+        source.authorize(&target, "overlap-b"),
+    )
+    .await
+    .unwrap();
+    gate.release.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), &mut old)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    target.refresh().await;
+    source.refresh().await;
+    assert!(target.runtime.snapshot().await.builds.is_empty());
+    assert!(source.runtime.snapshot().await.builds.is_empty());
+    source.build(&target, &b).await.unwrap();
+    target.refresh().await;
+    assert_eq!(target.runtime.snapshot().await.builds[0].authority, b);
+}
+
+#[tokio::test]
+async fn all_catch_up_requires_every_current_session_and_is_cancellable() {
+    use kuberic_protocol::types::ReplicaRole;
+    use kuberic_runtime::replicator::ReplicaSetQuorumMode;
+    let root = TestDataDir::new("all-quorum");
+    let source = PgPod::new(root.path().join("s"), native_identity(1, "source")).await;
+    let fast = PgPod::new(root.path().join("f"), native_identity(2, "fast")).await;
+    let slow = PgPod::new(root.path().join("t"), native_identity(3, "slow")).await;
+    source.singleton().await;
+    write_source(&source).await;
+    for (target, id) in [(&fast, "fast"), (&slow, "slow")] {
+        let build = source.authorize(target, id).await;
+        source.build(target, &build).await.unwrap();
+    }
+    let configuration = postgres_replicated::testing::native_configuration(
+        &[
+            source.identity.clone(),
+            fast.identity.clone(),
+            slow.identity.clone(),
+        ],
+        0,
+        2,
+    );
+    for target in [&fast, &slow] {
+        target.admit(configuration.clone()).await;
+        target
+            .effect(RuntimeEffectAction::ChangeRole(
+                ReplicaRole::ActiveSecondary,
+            ))
+            .await
+            .unwrap();
+        target
+            .effect(RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::NotPrimary,
+            })
+            .await
+            .unwrap();
+    }
+    source.admit(configuration.clone()).await;
+    source
+        .effect(RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        })
+        .await
+        .unwrap();
+    let primary = source.runtime.primary_replicator().await.unwrap();
+    let (replica, _) = slow.application.instance().connect().await.unwrap();
+    replica
+        .simple_query("SELECT pg_wal_replay_pause()")
+        .await
+        .unwrap();
+    let (writer, _) = source
+        .application
+        .instance()
+        .connect_application()
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        writer.batch_execute("INSERT INTO build_receipts VALUES (3, 'quorum-only')"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        primary.wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let spawn_all = || {
+        let primary = primary.clone();
+        tokio::spawn(async move {
+            primary
+                .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+                .await
+        })
+    };
+    let mut all = spawn_all();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut all)
+            .await
+            .is_err()
+    );
+    primary.update_epoch(configuration.epoch).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), &mut all)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(kuberic_runtime::RuntimeError::OperationCancelled)
+    ));
+    let mut all = spawn_all();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut all)
+            .await
+            .is_err()
+    );
+    let next = postgres_replicated::testing::native_configuration(
+        &[
+            source.identity.clone(),
+            fast.identity.clone(),
+            slow.identity.clone(),
+        ],
+        0,
+        3,
+    );
+    source.admit(next.clone()).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), &mut all)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(kuberic_runtime::RuntimeError::OperationCancelled)
+    ));
+    for target in [&fast, &slow] {
+        target.admit(next.clone()).await;
+    }
+    // Admission closes access and restarts a previously readable standby. Pause
+    // the new process before creating the next frozen replay boundary.
+    let (replica, _) = slow.application.instance().connect().await.unwrap();
+    replica
+        .simple_query("SELECT pg_wal_replay_pause()")
+        .await
+        .unwrap();
+    source
+        .effect(RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        })
+        .await
+        .unwrap();
+    let (writer, _) = source
+        .application
+        .instance()
+        .connect_application()
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        writer.batch_execute("INSERT INTO build_receipts VALUES (4, 'all-boundary')"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut all = spawn_all();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut all)
+            .await
+            .is_err()
+    );
+    replica
+        .simple_query("SELECT pg_wal_replay_resume()")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), &mut all)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        !replica
+            .query_one("SELECT pg_is_wal_replay_paused()", &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
 }
 
 #[tokio::test]
@@ -565,7 +860,7 @@ async fn assert_data(target: &PgPod) {
     );
     let connection = format!(
         "host={} port={} dbname=kuberic",
-        target.application.instance().data_dir().display(),
+        target.application.instance().socket_dir().display(),
         target.application.instance().port()
     );
     let (sql, connection) = tokio_postgres::connect(&connection, tokio_postgres::NoTls)

@@ -340,6 +340,9 @@ impl PodRuntime {
                     "build ID is already bound to different exact authority".into(),
                 ));
             }
+            if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
+                custom.select_build(&existing).await?;
+            }
             return Ok(existing);
         }
         let authority = BuildAuthority {
@@ -356,6 +359,9 @@ impl PodRuntime {
             .build_authority_store
             .admit_build(&authority)
             .await?;
+        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
+            custom.select_build(&authority).await?;
+        }
         Ok(authority)
     }
 

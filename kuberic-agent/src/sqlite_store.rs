@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaRole,
-    SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
+    AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaIdentity,
+    ReplicaRole, SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
 };
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityStore, BuildProgressStore,
@@ -1424,6 +1424,80 @@ impl LocalWriteJournal for SqliteStore {
 
 #[async_trait]
 impl BuildAuthorityStore for SqliteStore {
+    async fn select_build(
+        &self,
+        authority: &BuildAuthority,
+    ) -> ContractResult<kuberic_runtime_internal::authority::BuildSelection> {
+        use kuberic_runtime_internal::authority::BuildSelection;
+        self.contract_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            let admitted: Option<BuildAuthority> = load_json_optional(
+                transaction,
+                "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                [authority.build_id.as_str()],
+            )?;
+            if admitted.as_ref() != Some(authority)
+                || state.retired_builds.contains(&authority.build_id)
+                || state.abandoned_builds.contains(&authority.build_id)
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "custom build authority is not admitted".into(),
+                ));
+            }
+            let key = build_selection_key(&authority.target)?;
+            let previous: Option<BuildSelection> = load_lifecycle(transaction, &key)?;
+            if let Some(previous) = &previous {
+                if previous.authority == *authority {
+                    return Ok(previous.clone());
+                }
+                if previous.authority.current_configuration.epoch
+                    > authority.current_configuration.epoch
+                {
+                    return Err(ContractError::AuthorityMismatch(
+                        "custom build epoch regressed".into(),
+                    ));
+                }
+                state
+                    .abandoned_builds
+                    .insert(previous.authority.build_id.clone());
+            }
+            let generation = previous
+                .map_or(Some(1), |previous| previous.generation.checked_add(1))
+                .ok_or_else(|| {
+                    ContractError::AuthorityMismatch("build selection generation exhausted".into())
+                })?;
+            let selection = BuildSelection {
+                authority: authority.clone(),
+                generation,
+            };
+            write_lifecycle(transaction, &key, &selection)?;
+            write_agent_state(transaction, &state)
+                .map_err(|error| ContractError::Persistence(error.to_string()))?;
+            Ok(selection)
+        })
+    }
+
+    async fn load_build_selection(
+        &self,
+        target: &ReplicaIdentity,
+    ) -> ContractResult<Option<kuberic_runtime_internal::authority::BuildSelection>> {
+        let connection = self.connection.lock().map_err(|_| {
+            ContractError::Persistence("agent database connection mutex was poisoned".into())
+        })?;
+        let selection: Option<kuberic_runtime_internal::authority::BuildSelection> =
+            load_lifecycle(&connection, &build_selection_key(target)?)?;
+        let state = load_state_from_connection(&connection)
+            .map_err(|error| ContractError::Persistence(error.to_string()))?;
+        Ok(selection.filter(|selection| {
+            selection.authority.target == *target
+                && !state.retired_builds.contains(&selection.authority.build_id)
+                && !state
+                    .abandoned_builds
+                    .contains(&selection.authority.build_id)
+        }))
+    }
+
     async fn load_build(&self, build_id: &OperationId) -> ContractResult<Option<BuildAuthority>> {
         let connection = self.connection.lock().map_err(|_| {
             ContractError::Persistence("agent database connection mutex was poisoned".into())
@@ -1523,7 +1597,53 @@ impl BuildProgressStore for SqliteStore {
     }
 
     async fn record_build_progress(&self, progress: &DurableBuildProgress) -> ContractResult<()> {
+        self.record_build_progress_inner(progress, None)
+    }
+
+    async fn record_selected_build_progress(
+        &self,
+        selection: &kuberic_runtime_internal::authority::BuildSelection,
+        progress: &DurableBuildProgress,
+    ) -> ContractResult<()> {
+        self.record_build_progress_inner(progress, Some(selection))
+    }
+}
+
+fn build_selection_key(target: &ReplicaIdentity) -> ContractResult<String> {
+    Ok(format!("build-selection/{}", target.replica_id))
+}
+
+fn load_lifecycle<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    key: &str,
+) -> ContractResult<Option<T>> {
+    load_json_optional(
+        connection,
+        "SELECT value_json FROM runtime_lifecycle WHERE kind = ?1",
+        [key],
+    )
+}
+
+impl SqliteStore {
+    fn record_build_progress_inner(
+        &self,
+        progress: &DurableBuildProgress,
+        selection: Option<&kuberic_runtime_internal::authority::BuildSelection>,
+    ) -> ContractResult<()> {
         self.contract_transaction(|transaction| {
+            if let Some(selection) = selection {
+                let current: Option<kuberic_runtime_internal::authority::BuildSelection> =
+                    load_lifecycle(
+                        transaction,
+                        &build_selection_key(&progress.authority.target)?,
+                    )?;
+                if current.as_ref() != Some(selection) || selection.authority != progress.authority
+                {
+                    return Err(ContractError::AuthorityMismatch(
+                        "custom build selection was superseded".into(),
+                    ));
+                }
+            }
             let state = load_state_from_connection(transaction)
                 .map_err(|error| ContractError::Persistence(error.to_string()))?;
             if state.retired_builds.contains(&progress.authority.build_id)

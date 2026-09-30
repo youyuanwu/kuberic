@@ -1,5 +1,17 @@
 # kuberic-agent
 
+Custom-replicator build receipts are bound to a durably selected immutable
+authority and generation for one logical target slot. Selection supersedes old
+builds/incarnations atomically; live session/attempt bindings are checked before
+progress persistence and reporting. Restart never promotes old scalar build
+journals into current-session completion. This hosting support is private and
+uses the existing SF replica-set configuration and build callbacks.
+
+On shutdown, retained control/replication streams are cancelled and joined before
+the durable fault acknowledgement. Peer-controlled graceful connection draining
+must not delay that acknowledgement; interrupted durable command intents remain
+replayable.
+
 Replica-local hosting and durable authority for the level-triggered Kuberic
 stack.
 

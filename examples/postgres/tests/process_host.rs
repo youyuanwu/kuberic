@@ -900,7 +900,7 @@ async fn authorized_initialization_retries_at_storage_boundaries() {
                     .await
                     .unwrap()
                     .get::<_, String>(0),
-                retry.application.instance().data_dir().to_str().unwrap()
+                retry.application.instance().socket_dir().to_str().unwrap()
             );
         }
         let (mut client, report) = status(retry.address).await;
@@ -1885,7 +1885,7 @@ async fn delayed_readiness_binary(root: &Path) -> BinaryHost {
                 && std::process::Command::new(find_pg_bin().join("pg_isready"))
                     .args([
                         "-h",
-                        binary.pgdata.to_str().unwrap(),
+                        binary.pgdata.join("pg_stat_tmp").to_str().unwrap(),
                         "-p",
                         &binary.pgport.to_string(),
                     ])
@@ -2194,7 +2194,10 @@ async fn executable_shutdown_signals_preserve_supervisor_reaping() {
                     .is_err()
                 );
                 assert!(instance.connect_application().await.is_err());
-                let socket = binary.pgdata.join(format!(".s.PGSQL.{}", binary.pgport));
+                let socket = binary
+                    .pgdata
+                    .join("pg_stat_tmp")
+                    .join(format!(".s.PGSQL.{}", binary.pgport));
                 assert!(tokio::net::UnixStream::connect(&socket).await.is_err());
                 assert!(!socket.exists());
                 tokio::time::timeout(Duration::from_secs(2), connection)
@@ -2483,7 +2486,10 @@ async fn executable_shutdown_terminates_owned_tree_without_pid_file() {
             .is_err()
         );
         assert!(instance.connect_application().await.is_err());
-        let socket = binary.pgdata.join(format!(".s.PGSQL.{}", binary.pgport));
+        let socket = binary
+            .pgdata
+            .join("pg_stat_tmp")
+            .join(format!(".s.PGSQL.{}", binary.pgport));
         assert!(tokio::net::UnixStream::connect(&socket).await.is_err());
         assert!(!socket.exists(), "PostgreSQL must remove its owned socket");
         tokio::time::timeout(Duration::from_secs(2), connection)
@@ -2589,7 +2595,10 @@ async fn executable_launcher_exit_keeps_owned_postmaster_until_shutdown() {
             );
             binary.assert_stopped().await;
             assert!(instance.connect_application().await.is_err());
-            let socket = binary.pgdata.join(format!(".s.PGSQL.{}", binary.pgport));
+            let socket = binary
+                .pgdata
+                .join("pg_stat_tmp")
+                .join(format!(".s.PGSQL.{}", binary.pgport));
             assert!(tokio::net::UnixStream::connect(&socket).await.is_err());
             assert!(!socket.exists());
             tokio::time::timeout(Duration::from_secs(2), connection)
@@ -2626,6 +2635,190 @@ fn executable_exposes_v2_host_configuration() {
         "--replication-endpoint",
     ] {
         assert!(text.contains(argument), "{argument}");
+    }
+}
+
+async fn retained_pre_authentication(port: u16) -> std::io::Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    socket.write_all(&[0, 0, 0, 8, 4, 210, 22, 47]).await?;
+    let mut reply = [0];
+    socket.read_exact(&mut reply).await?;
+    assert_eq!(
+        reply, *b"N",
+        "the accepted PostgreSQL backend is awaiting startup, not authentication"
+    );
+    Ok(socket)
+}
+
+async fn preauthentication_sockets_are_drained_before_fence_receipt() {
+    let root = TestDataDir::new("host-preauth");
+    let mut host = HostAttempt::start(root.path()).await;
+    let mut running = host.bootstrap(root.path()).await;
+    let (mut control, report) = status(host.address).await;
+    control
+        .execute(configure(
+            &report.process_session_id,
+            "preauth-install",
+            false,
+        ))
+        .await
+        .unwrap();
+    control
+        .execute(configure(&report.process_session_id, "preauth-grant", true))
+        .await
+        .unwrap();
+    let (sql, _) = host
+        .application
+        .instance()
+        .connect_application()
+        .await
+        .unwrap();
+    sql.batch_execute("CREATE TABLE preauth_receipts(id int)")
+        .await
+        .unwrap();
+    drop(sql);
+    for round in 0..8 {
+        let retained = retained_pre_authentication(host.application.instance().port())
+            .await
+            .unwrap();
+        let retained_through_regrant =
+            retained_pre_authentication(host.application.instance().port())
+                .await
+                .unwrap();
+        let port = host.application.instance().port();
+        let accepting = async move {
+            let mut attempts = tokio::task::JoinSet::new();
+            for _ in 0..12 {
+                attempts.spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(2), retained_pre_authentication(port))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                });
+            }
+            let mut accepted = Vec::new();
+            while let Some(result) = attempts.join_next().await {
+                accepted.push(result.unwrap());
+            }
+            accepted
+        };
+        let (closed, accepted) = tokio::join!(
+            control.execute(configure(
+                &report.process_session_id,
+                &format!("preauth-close-{round}"),
+                false
+            )),
+            accepting
+        );
+        closed.unwrap();
+        for (index, socket) in std::iter::once(retained)
+            .chain(accepted.into_iter().flatten())
+            .enumerate()
+        {
+            let mut config = tokio_postgres::Config::new();
+            config
+                .user("kuberic_app")
+                .dbname("kuberic")
+                .ssl_mode(tokio_postgres::config::SslMode::Disable);
+            let attempted = tokio::time::timeout(
+                Duration::from_secs(2),
+                config.connect_raw(socket, tokio_postgres::NoTls),
+            )
+            .await
+            .unwrap();
+            if let Ok((client, connection)) = attempted {
+                let task = tokio::spawn(connection);
+                let result = client
+                    .batch_execute(&format!(
+                        "INSERT INTO preauth_receipts VALUES ({})",
+                        round * 100 + index
+                    ))
+                    .await;
+                drop(client);
+                task.abort();
+                let _ = task.await;
+                panic!("pre-authentication socket authenticated after closure: write={result:?}");
+            }
+        }
+        assert!(
+            host.application
+                .instance()
+                .connect_application()
+                .await
+                .is_err()
+        );
+        let (admin, _) = host.application.instance().connect().await.unwrap();
+        // Internal administration remains available after the acknowledged fence.
+        admin.simple_query("SELECT 1").await.unwrap();
+        control
+            .execute(configure(
+                &report.process_session_id,
+                &format!("preauth-grant-{round}"),
+                true,
+            ))
+            .await
+            .unwrap();
+        let mut startup = tokio_postgres::Config::new();
+        startup
+            .user("kuberic_app")
+            .dbname("kuberic")
+            .ssl_mode(tokio_postgres::config::SslMode::Disable);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                startup.connect_raw(retained_through_regrant, tokio_postgres::NoTls)
+            )
+            .await
+            .unwrap()
+            .is_err(),
+            "a new grant must not revive a socket from before the fence"
+        );
+        let (client, _) = host
+            .application
+            .instance()
+            .connect_application()
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .query_one("SELECT count(*) FROM preauth_receipts", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+    }
+    stop(&mut running, &host.application).await;
+}
+
+async fn executable_shutdown_cancels_retained_transport_handshakes() {
+    use tokio::io::AsyncWriteExt;
+    for round in 0..4 {
+        let root = TestDataDir::new("host-drain");
+        let (mut binary, client) = start_binary(root.path()).await;
+        let mut retained = Vec::new();
+        for address in [binary.control, binary.replication, binary.coordination] {
+            for _ in 0..4 {
+                let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+                socket.write_all(b"PRI * HTTP/2.0\r\n").await.unwrap();
+                retained.push(socket);
+            }
+        }
+        let descendants = ProcessProbe::descendants(binary.child.id());
+        binary.signal(rustix::process::Signal::TERM, round % 2 == 0);
+        let exit = tokio::time::timeout(Duration::from_secs(5), binary.wait())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "shutdown depends on retained transport handshakes: {}",
+                    binary.output()
+                )
+            });
+        assert!(exit.success(), "{}", binary.output());
+        descendants.assert_reaped();
+        binary.assert_stopped().await;
+        drop((retained, client));
     }
 }
 
@@ -2676,4 +2869,6 @@ mod tests {
     host_test!(executable_owned_helpers_root_loss_is_failure);
     host_test!(established_agent_and_postgres_lineage_mismatches_are_non_mutating);
     host_test!(unsafe_evidence_reports_permanent_fault_and_stops_granted_sql);
+    host_test!(preauthentication_sockets_are_drained_before_fence_receipt);
+    host_test!(executable_shutdown_cancels_retained_transport_handshakes);
 }

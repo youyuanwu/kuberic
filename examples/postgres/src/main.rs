@@ -301,14 +301,13 @@ async fn finish_shutdown(
         None => replica.wait().await,
     };
     let mut result = with_cleanup(completion.map_err(Into::into), trigger, "shutdown trigger");
-    if let Some(mut coordination) = coordination {
-        let cleanup = match tokio::time::timeout(CLEANUP_TIMEOUT, &mut coordination).await {
-            Ok(result) => flatten_coordination(result),
-            Err(_) => {
-                coordination.abort();
-                let _ = coordination.await;
-                Err("coordination shutdown timed out".into())
-            }
+    if let Some(coordination) = coordination {
+        // Runtime shutdown has revoked process authority. Cancel retained RPCs,
+        // join their cleanup, and do not wait on a peer to close an HTTP/2 stream.
+        coordination.abort();
+        let cleanup = match coordination.await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            result => flatten_coordination(result),
         };
         result = with_cleanup(result, cleanup, "coordination shutdown");
     }

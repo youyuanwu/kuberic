@@ -16,7 +16,7 @@ impl PgConfig {
     pub fn new(port: u16, data_dir: &Path) -> Self {
         Self {
             port,
-            socket_dir: data_dir.to_string_lossy().to_string(),
+            socket_dir: data_dir.join("pg_stat_tmp").to_string_lossy().to_string(),
         }
     }
 
@@ -26,6 +26,7 @@ impl PgConfig {
         host: &str,
         port: u16,
         application_name: &str,
+        slot: &str,
         lineage: &crate::build::PgLineage,
     ) -> Result<(), PgError> {
         lineage.validate().map_err(PgError::Configuration)?;
@@ -38,6 +39,9 @@ impl PgConfig {
             || !application_name
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            || !slot.starts_with("kuberic_")
+            || slot.len() != 40
+            || !slot[8..].bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err(PgError::Configuration(
                 "invalid exact standby source".into(),
@@ -64,6 +68,7 @@ impl PgConfig {
             "primary_conninfo = 'host={host} port={port} application_name={application_name}'"
         ));
         lines.push(format!("recovery_target_timeline = '{timeline}'"));
+        lines.push(format!("primary_slot_name = '{slot}'"));
         lines.push("synchronous_standby_names = ''".into());
         Self::replace_config(&path, &(lines.join("\n") + "\n")).await?;
         if timeline > 1 {
@@ -80,6 +85,11 @@ impl PgConfig {
 
     /// Idempotently repair managed settings and close external access before startup.
     pub async fn write_initial(&self, data_dir: &Path) -> Result<(), PgError> {
+        // PostgreSQL backup/rewind exclude this transient directory. Live socket
+        // files in PGDATA itself otherwise make a real divergent rewind fail.
+        tokio::fs::create_dir_all(&self.socket_dir)
+            .await
+            .map_err(|error| PgError::Configuration(format!("create socket directory: {error}")))?;
         self.write_postgresql_conf(data_dir).await?;
         self.write_pg_hba_conf(data_dir).await?;
         Ok(())
@@ -141,7 +151,7 @@ logging_collector = off
 listen_addresses = '*'
 wal_level = replica
 max_wal_senders = 10
-max_replication_slots = 10
+max_replication_slots = 32
 "#,
             port = self.port,
             socket_dir = encode_postgres_setting(&self.socket_dir),
@@ -165,22 +175,19 @@ max_replication_slots = 10
     }
 
     async fn replace_config(path: &Path, content: &str) -> Result<(), PgError> {
-        use tokio::io::AsyncWriteExt;
+        use std::io::Write;
 
-        // A stopped instance owns this path. Interrupted repairs leave the original
-        // intact, and the next startup replaces any unfinished sibling file.
+        // Keep the bounded file replacement within one poll. A cancelled grant
+        // must not leave a background rename that can overwrite a later closed
+        // HBA generation after its access lock has been released.
         let pending = path.with_extension("conf.pending");
-        let result = async {
-            let mut file = tokio::fs::File::create(&pending).await?;
-            file.write_all(content.as_bytes()).await?;
-            file.sync_all().await?;
-            tokio::fs::rename(&pending, path).await?;
-            tokio::fs::File::open(path.parent().expect("configuration has a parent"))
-                .await?
-                .sync_all()
-                .await
-        }
-        .await;
+        let result = (|| {
+            let mut file = std::fs::File::create(&pending)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&pending, path)?;
+            std::fs::File::open(path.parent().expect("configuration has a parent"))?.sync_all()
+        })();
         result.map_err(|e: std::io::Error| {
             PgError::Process(format!("repair {}: {e}", path.display()))
         })

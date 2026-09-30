@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as ProcessMutex};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as ProcessMutex, Weak};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -30,11 +30,17 @@ pub enum PgProcessState {
 
 type FaultReporter = Arc<dyn Fn(PgProcessFault) + Send + Sync>;
 
+#[derive(Clone)]
+struct StartParameters {
+    reporter: FaultReporter,
+    cancellation: Option<(Weak<PgInstanceManager>, CancellationToken)>,
+}
+
 /// Manages a PostgreSQL instance as a child process.
 ///
 /// Wraps pg_ctl, initdb, pg_basebackup, pg_rewind, and the postgres
-/// server process. Each instance gets its own data_dir which doubles
-/// as the Unix socket directory for isolation in tests.
+/// server process. Each instance keeps its Unix sockets in PGDATA/pg_stat_tmp,
+/// a transient directory excluded by PostgreSQL backup and rewind.
 pub struct PgInstanceManager {
     data_dir: PathBuf,
     pg_bin: PathBuf,
@@ -49,6 +55,9 @@ pub struct PgInstanceManager {
     process_state: Arc<Mutex<PgProcessState>>,
     run_generation: AtomicU64,
     lifecycle_lock: Mutex<()>,
+    start_parameters: Mutex<Option<StartParameters>>,
+    pub(crate) access_lock: Mutex<()>,
+    pub(crate) access_state: AtomicU8,
 }
 
 impl PgInstanceManager {
@@ -67,6 +76,9 @@ impl PgInstanceManager {
             process_state: Arc::new(Mutex::new(PgProcessState::Stopped)),
             run_generation: AtomicU64::new(0),
             lifecycle_lock: Mutex::new(()),
+            start_parameters: Mutex::new(None),
+            access_lock: Mutex::new(()),
+            access_state: AtomicU8::new(crate::access::CLOSED),
         }
     }
 
@@ -84,9 +96,9 @@ impl PgInstanceManager {
         "127.0.0.1"
     }
 
-    /// Socket directory — same as data_dir for test isolation.
+    /// Transient socket directory within the owned data directory.
     pub fn socket_dir(&self) -> &Path {
-        &self.data_dir
+        Path::new(&self.config.socket_dir)
     }
 
     /// Connection string for local UDS access.
@@ -94,7 +106,7 @@ impl PgInstanceManager {
     pub fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname=postgres",
-            self.data_dir.display(),
+            self.socket_dir().display(),
             self.port,
         )
     }
@@ -102,7 +114,7 @@ impl PgInstanceManager {
     pub fn application_connection_string(&self) -> String {
         format!(
             "host={} port={} dbname={} user={}",
-            self.data_dir.display(),
+            self.socket_dir().display(),
             self.port,
             crate::access::APPLICATION_DATABASE,
             crate::access::APPLICATION_ROLE,
@@ -151,7 +163,15 @@ impl PgInstanceManager {
         &self,
         fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
     ) -> Result<(), PgError> {
-        let reporter: FaultReporter = Arc::new(move |fault| {
+        self.start_with_parameters(StartParameters {
+            reporter: Self::fault_reporter(fault_tx),
+            cancellation: None,
+        })
+        .await
+    }
+
+    fn fault_reporter(fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>) -> FaultReporter {
+        Arc::new(move |fault| {
             let fault = match fault {
                 PgProcessFault::Transient => kuberic_protocol::types::FaultType::Transient,
                 PgProcessFault::Permanent => kuberic_protocol::types::FaultType::Permanent,
@@ -160,8 +180,7 @@ impl PgInstanceManager {
             tokio::spawn(async move {
                 let _ = fault_tx.send(fault).await;
             });
-        });
-        self.start_with_fault_reporter(reporter).await
+        })
     }
 
     pub async fn start_native_with_cancellation(
@@ -169,25 +188,22 @@ impl PgInstanceManager {
         fault_tx: mpsc::Sender<kuberic_protocol::types::FaultType>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<(), PgError> {
-        self.start_native(fault_tx).await?;
-        let generation = self.run_generation.load(Ordering::Acquire);
-        let instance = Arc::downgrade(self);
-        let task = tokio::spawn(async move {
-            cancellation.cancelled().await;
-            if let Some(instance) = instance.upgrade() {
-                let _lifecycle = instance.lifecycle_lock.lock().await;
-                if instance.run_generation.load(Ordering::Acquire) == generation {
-                    let result = instance.abort_owned();
-                    *instance.process_state.lock().await = if result.is_ok() {
-                        PgProcessState::Stopped
-                    } else {
-                        PgProcessState::Faulted
-                    };
-                }
-            }
-        });
-        self.monitor_tasks.lock().await.push(task);
-        Ok(())
+        self.start_with_parameters(StartParameters {
+            reporter: Self::fault_reporter(fault_tx),
+            cancellation: Some((Arc::downgrade(self), cancellation)),
+        })
+        .await
+    }
+
+    pub(crate) async fn restart_access_closed(&self) -> Result<(), PgError> {
+        let parameters = self
+            .start_parameters
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| PgError::Process("no owned PostgreSQL run to fence".into()))?;
+        self.stop().await?;
+        self.start_with_parameters(parameters).await
     }
 
     pub async fn control_identity(&self) -> Result<(String, u32), PgError> {
@@ -219,14 +235,20 @@ impl PgInstanceManager {
         Ok((system, timeline))
     }
 
-    async fn start_with_fault_reporter(
-        &self,
-        fault_reporter: FaultReporter,
-    ) -> Result<(), PgError> {
+    async fn start_with_parameters(&self, parameters: StartParameters) -> Result<(), PgError> {
         let _lifecycle = self.lifecycle_lock.lock().await;
+        if parameters
+            .cancellation
+            .as_ref()
+            .is_some_and(|(_, token)| token.is_cancelled())
+        {
+            return Err(PgError::Process("PostgreSQL run was cancelled".into()));
+        }
         if self.is_running().await {
             return Ok(());
         }
+        let fault_reporter = parameters.reporter.clone();
+        *self.start_parameters.lock().await = Some(parameters.clone());
         *self.shutdown_error.lock().unwrap() = None;
         self.finish_owned().await?;
         self.shutdown.lock().await.cancel();
@@ -240,7 +262,10 @@ impl PgInstanceManager {
         let prepared = async {
             OwnedProcess::check_support()?;
             self.control_identity().await?;
-            self.config.write_initial(&self.data_dir).await
+            self.config.write_initial(&self.data_dir).await?;
+            self.access_state
+                .store(crate::access::CLOSED, Ordering::Release);
+            Ok::<_, PgError>(())
         }
         .await;
         if let Err(error) = prepared {
@@ -345,7 +370,7 @@ impl PgInstanceManager {
         // (complements the exit monitor above). Exits quietly on shutdown.
         let port = self.port;
         let health_fault_reporter = fault_reporter;
-        let data_dir = self.data_dir.clone();
+        let data_dir = self.socket_dir().to_path_buf();
         let pg_bin = self.pg_bin.clone();
         let shutdown = shutdown.clone();
         let health_state = self.process_state.clone();
@@ -391,6 +416,24 @@ impl PgInstanceManager {
         self.monitor_tasks.lock().await.push(health_task);
 
         *self.process_state.lock().await = PgProcessState::Running;
+        if let Some((instance, cancellation)) = parameters.cancellation {
+            let generation = self.run_generation.load(Ordering::Acquire);
+            let task = tokio::spawn(async move {
+                cancellation.cancelled().await;
+                if let Some(instance) = instance.upgrade() {
+                    let _lifecycle = instance.lifecycle_lock.lock().await;
+                    if instance.run_generation.load(Ordering::Acquire) == generation {
+                        let result = instance.abort_owned();
+                        *instance.process_state.lock().await = if result.is_ok() {
+                            PgProcessState::Stopped
+                        } else {
+                            PgProcessState::Faulted
+                        };
+                    }
+                }
+            });
+            self.monitor_tasks.lock().await.push(task);
+        }
         tracing::info!(port = self.port, "PostgreSQL started");
         Ok(())
     }
@@ -418,7 +461,7 @@ impl PgInstanceManager {
                 self.helpers
                     .output(Command::new(self.pg_bin.join("pg_isready")).args([
                         "-h",
-                        &self.data_dir.to_string_lossy(),
+                        &self.socket_dir().to_string_lossy(),
                         "-p",
                         &self.port.to_string(),
                         "-d",

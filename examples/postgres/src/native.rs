@@ -127,6 +127,102 @@ pub struct PgNativeObserver {
 }
 
 impl PgNativeObserver {
+    pub(crate) async fn reconcile_replication_slots(
+        &self,
+        local: &ReplicaIdentity,
+        configuration: &kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<(), PgError> {
+        let expected = configuration
+            .replicas
+            .iter()
+            .filter(|r| &r.identity != local)
+            .map(|r| replication_slot_name(&r.identity))
+            .collect::<BTreeSet<_>>();
+        let (client, _connection) = self.instance.connect().await?;
+        let existing = client
+            .query(
+                "SELECT slot_name, active FROM pg_replication_slots \
+             WHERE slot_type = 'physical' AND slot_name ~ '^kuberic_[0-9a-f]{32}$'",
+                &[],
+            )
+            .await
+            .map_err(|error| PgError::Query(format!("read managed physical slots: {error}")))?;
+        let mut present = BTreeSet::new();
+        for row in existing {
+            let slot: String = row.get(0);
+            present.insert(slot.clone());
+            if !expected.contains(&slot) {
+                let terminated = client
+                    .query(
+                        "SELECT pg_terminate_backend(active_pid, 5000) FROM pg_replication_slots \
+                     WHERE slot_name = $1::name AND active_pid IS NOT NULL",
+                        &[&slot],
+                    )
+                    .await
+                    .map_err(|error| {
+                        PgError::Query(format!("drain retired physical slot: {error}"))
+                    })?;
+                if terminated.iter().any(|row| !row.get::<_, bool>(0)) {
+                    return Err(PgError::Query("retired physical slot did not drain".into()));
+                }
+                client
+                    .query_one("SELECT pg_drop_replication_slot($1::name)", &[&slot])
+                    .await
+                    .map_err(|error| PgError::Query(format!("retire physical slot: {error}")))?;
+            }
+        }
+        for slot in expected.difference(&present) {
+            client
+                .query_one(
+                    "SELECT pg_create_physical_replication_slot($1::name, true)",
+                    &[slot],
+                )
+                .await
+                .map_err(|error| {
+                    PgError::Query(format!("reserve physical replica WAL: {error}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn all_replayed(
+        &self,
+        required: &BTreeMap<ReplicaIdentity, ProcessSessionId>,
+        boundary: i64,
+    ) -> Result<bool, PgError> {
+        let expected = required
+            .iter()
+            .map(|(identity, session)| replication_application_name(identity, session))
+            .collect::<BTreeSet<_>>();
+        let (client, _connection) = self.instance.connect().await?;
+        let rows = client
+            .query(
+                "SELECT application_name, replay_lsn::text FROM pg_stat_replication",
+                &[],
+            )
+            .await
+            .map_err(|error| PgError::Query(format!("all-replica replay: {error}")))?;
+        let mut observed = BTreeSet::new();
+        let mut complete = true;
+        for row in rows {
+            let name: String = row.get(0);
+            if !expected.contains(&name) {
+                continue;
+            }
+            if !observed.insert(name) {
+                return Err(PgError::Query(
+                    "duplicate exact replica session during All catch-up".into(),
+                ));
+            }
+            let replay: Option<&str> = row.get(1);
+            complete &= replay
+                .map(parse_pg_lsn)
+                .transpose()?
+                .is_some_and(|lsn| lsn >= boundary);
+        }
+        Ok(complete && observed == expected)
+    }
+
     pub fn new(instance: Arc<PgInstanceManager>) -> Self {
         Self {
             instance,
@@ -288,6 +384,9 @@ impl PgNativeObserver {
                     .get::<_, Option<&str>>(0)
                     .map(parse_pg_lsn)
                     .transpose()?;
+                // The streaming receiver's position resets on restart, whereas
+                // replayed local WAL is already durable and recoverable.
+                let received = received.into_iter().chain(replay).max();
                 let current = received.unwrap_or_default();
                 (
                     current,
@@ -486,6 +585,14 @@ pub fn compile_synchronous_configuration(
     };
     configuration.validate().map_err(PgError::Configuration)?;
     Ok(configuration)
+}
+
+pub(crate) fn replication_slot_name(identity: &ReplicaIdentity) -> String {
+    let name = replication_application_name(identity, &ProcessSessionId::new("physical-slot"));
+    format!(
+        "kuberic_{}",
+        name.rsplit_once('_').expect("hashed replication name").1
+    )
 }
 
 pub fn replication_application_name(

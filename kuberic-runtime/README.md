@@ -171,6 +171,15 @@ The private agent wrapper retains all durable authority/effect/store capabilitie
 An unmanaged custom factory without that hosting support remains rejected for
 managed admission.
 
+Private custom hosting durably selects one build per logical target slot.
+Descriptions for superseded builds are withdrawn, and callback receipts bind
+the full authority/generation to both process sessions and the local attempt.
+An idle custom replicator must withhold build-ready progress until its durable
+copy certificate matches that exact installed description; unrelated existing
+data is not completion of a newly selected build. The platform never fans one
+scalar out as completion of every described build. The default operation engine
+continues to use its own per-build copy acknowledgements.
+
 Custom services retain the partition handle and reconcile direct-client access
 against its read/write statuses, never role notifications alone. Progress
 observation must finish that reconciliation before returning; hosting awaits it

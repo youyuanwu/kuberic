@@ -155,6 +155,48 @@ full source/target identities, both agent-created process sessions, immutable
 agent build authority, frozen recovery boundary, and bounded system/timeline
 history (at most 64 ancestors and 16 KiB of history).
 
+### Acknowledged access fencing
+
+HBA reload plus terminating authenticated application backends is not a fence:
+an accepted TCP socket can delay its startup packet and retain pre-reload HBA
+rules. Closing previously granted access therefore drains and reaps the entire
+owned PostgreSQL run using fast shutdown, then starts it with closed managed HBA
+rules before acknowledging the partition-access effect. Every old socket is
+dead, including SSL-negotiated connections that have not authenticated. A later
+grant cannot revive them. Grant/close operations are serialized, and grants
+acknowledge a real application-role login rather than only `pg_reload_conf()`.
+Cancellation of an unfinished grant still requires the full closing fence.
+
+This deliberately interrupts existing internal SQL/replication connections.
+Their loopback/Unix endpoints reopen, and physical replication reconnects.
+Unix sockets live in `PGDATA/pg_stat_tmp`, which backup and rewind exclude;
+live sockets must not become input files to a real divergent rewind.
+The custom replicator reserves physical WAL slots before build for each exact
+replica incarnation, retaining WAL through these reconnects and process restart.
+Session-qualified application names remain the acknowledgement gate; a slot is
+not quorum credit. The `kuberic_<identity digest>` slot namespace is managed by
+the example. Current slots are preserved; consumers of retired slots are drained
+before those slots are removed on configuration reconciliation. Operators must budget WAL storage for unavailable
+configured replicas. Slot-retention capacity policy is not failover orchestration.
+
+### Exact build receipts and catch-up
+
+The private agent store selects one immutable build and durable generation per
+logical target slot. Selecting another build or replacement incarnation
+durably abandons the old selection. Configuration callbacks describe only that
+selected build; incomplete peer-session descriptions confer no build permission.
+Private live receipts bind that selection to source/target process sessions and
+the local attempt generation. Progress persistence atomically checks the
+selection. One scalar observation is never applied to all described builds,
+and old scalar journals do not restore current-session completion after a crash.
+
+`WriteQuorum` uses policy-certified replay. SF `All` additionally requires every
+current replica's exact session-qualified WAL receiver to report replay through
+the frozen boundary; missing, duplicate or behind receivers cannot satisfy it.
+The bounded wait releases the lifecycle lock, and epoch, configuration, access
+closure and shutdown cancel it. Joint-configuration transitions remain outside
+this phase and are rejected explicitly.
+
 The private agent host installs exact replica/session descriptions through the
 SF-shaped replica-set configuration callbacks, never passing an authority store
 or admission token to the application. The PostgreSQL replicator serializes
@@ -226,6 +268,17 @@ Build retirement does not stop an already admitted active standby.
 remain exclusively in `examples/postgres`. Shared code contains no database
 branches. Protocol 9 carries only the generic replicator endpoint, and schema 5
 binds application storage paths/initialization permission.
+
+Shutdown cancels and joins agent and coordination transports instead of waiting
+for peers to finish retained HTTP/2 handshakes/streams. The agent still persists
+accepted faults before acknowledging shutdown; transport cancellation does not
+turn persistence or owned-process cleanup failure into success.
+Exhausting the unchanged fast-shutdown grace budget triggers the existing
+QUIT/KILL escalation rather than falsely reporting a failed fence after cleanup
+was proved. Success still requires normal supervisor completion and reaping of
+every descendant. Missing/foreign ownership, non-cooperating launchers,
+supervisor loss and incomplete
+reaping remain errors; no shutdown sleep or timeout was increased.
 
 ---
 

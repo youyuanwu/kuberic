@@ -891,6 +891,86 @@ async fn durable_build_catch_up_boundary_is_write_once() {
 }
 
 #[tokio::test]
+async fn custom_build_selection_fences_superseded_and_replacement_receipts_durably() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (command, observed, transition) = bootstrap_fixture();
+    let storage_identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let store =
+        SqliteStore::create_authorized(&path, AgentState::new(storage_identity.clone())).unwrap();
+    let a = BuildAuthority {
+        build_id: OperationId::new("selected-a"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: storage_identity.local_identity.clone(),
+        target: identity(2, "target", "target-generation"),
+        current_configuration: transition.current_configuration,
+        replication_boundary_lsn: 0,
+    };
+    store.admit_build(&a).await.unwrap();
+    let selected_a = store.select_build(&a).await.unwrap();
+    let receipt_a = DurableBuildProgress {
+        authority: a.clone(),
+        last_sequence: 1,
+        durable_lsn: 0,
+        completed: true,
+        catch_up_boundary_lsn: Some(0),
+    };
+    store
+        .record_selected_build_progress(&selected_a, &receipt_a)
+        .await
+        .unwrap();
+    let b = BuildAuthority {
+        build_id: OperationId::new("selected-b"),
+        ..a.clone()
+    };
+    store.admit_build(&b).await.unwrap();
+    let selected_b = store.select_build(&b).await.unwrap();
+    assert!(selected_b.generation > selected_a.generation);
+    assert!(store.load_build(&a.build_id).await.unwrap().is_none());
+    assert!(store.select_build(&a).await.is_err());
+    assert!(
+        store
+            .record_selected_build_progress(&selected_a, &receipt_a)
+            .await
+            .is_err()
+    );
+    assert!(store.record_build_progress(&receipt_a).await.is_err());
+    drop(store);
+    let store = SqliteStore::open_existing(&path, Some(&storage_identity)).unwrap();
+    assert_eq!(
+        store.load_build_selection(&b.target).await.unwrap(),
+        Some(selected_b.clone())
+    );
+    let receipt_b = DurableBuildProgress {
+        authority: b.clone(),
+        ..receipt_a.clone()
+    };
+    store
+        .record_selected_build_progress(&selected_b, &receipt_b)
+        .await
+        .unwrap();
+    let replacement = BuildAuthority {
+        build_id: OperationId::new("selected-replacement"),
+        target: identity(2, "replacement", "new-generation"),
+        ..b.clone()
+    };
+    store.admit_build(&replacement).await.unwrap();
+    store.select_build(&replacement).await.unwrap();
+    assert!(
+        store
+            .record_selected_build_progress(&selected_b, &receipt_b)
+            .await
+            .is_err()
+    );
+    assert!(store.admit_build(&b).await.is_err());
+}
+
+#[tokio::test]
 async fn committed_snapshot_boundary_is_durable_write_once_before_first_chunk() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());

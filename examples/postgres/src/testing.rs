@@ -734,8 +734,10 @@ pub fn temp_data_dir(name: &str) -> PathBuf {
         .join("postgresql-v2-tests");
     std::fs::create_dir_all(&root).expect("create PostgreSQL test root");
     let root = std::fs::canonicalize(root).expect("resolve PostgreSQL test root");
+    // Leave room for pg_stat_tmp/.s.PGSQL.<port> within Linux's Unix socket limit.
+    let prefix = name.chars().take(8).collect::<String>();
     let dir = root.join(format!(
-        "{name}-{}-{}",
+        "{prefix}-{}-{}",
         std::process::id(),
         DIRECTORY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));

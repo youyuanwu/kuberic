@@ -13,7 +13,7 @@ use kuberic_runtime::replicator::{
     ReplicaSetQuorumMode, Replicator,
 };
 use kuberic_runtime::{Result, RuntimeError};
-use kuberic_runtime_internal::authority::{BuildAuthority, DurableBuildProgress};
+use kuberic_runtime_internal::authority::{BuildAuthority, BuildSelection, DurableBuildProgress};
 use kuberic_runtime_internal::effects::{BuildPostcondition, RuntimeEffectAction, RuntimeSnapshot};
 use kuberic_runtime_internal::transport::{
     CopyAck, CopyItem, OutboundOperation, ReplicaEndpoint, ReplicationAck, ReplicationItem,
@@ -21,6 +21,14 @@ use kuberic_runtime_internal::transport::{
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 use super::{RuntimeHost, empty_snapshot};
+
+#[derive(Clone, PartialEq, Eq)]
+struct BuildReceipt {
+    selection: BuildSelection,
+    source_session: ProcessSessionId,
+    target_session: ProcessSessionId,
+    attempt_generation: u64,
+}
 
 pub(super) struct CustomReplicatorHost {
     host: Weak<RuntimeHost>,
@@ -32,6 +40,7 @@ pub(super) struct CustomReplicatorHost {
     retired_sessions: RwLock<BTreeSet<(ReplicaIdentity, ProcessSessionId)>>,
     retired_builds: RwLock<BTreeSet<OperationId>>,
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
+    receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
     outbound: mpsc::Sender<OutboundOperation>,
     receiver: Mutex<mpsc::Receiver<OutboundOperation>>,
@@ -61,6 +70,7 @@ impl CustomReplicatorHost {
             retired_sessions: RwLock::default(),
             retired_builds: RwLock::default(),
             build_generations: RwLock::default(),
+            receipts: RwLock::default(),
             configuration: RwLock::default(),
             outbound,
             receiver: Mutex::new(receiver),
@@ -73,6 +83,66 @@ impl CustomReplicatorHost {
             return Err(RuntimeError::Closed);
         }
         Ok(host)
+    }
+
+    pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        self.select_build_inner(authority).await?;
+        self.configure().await
+    }
+
+    async fn select_build_inner(&self, authority: &BuildAuthority) -> Result<()> {
+        self.host()?
+            .default_dependencies
+            .build_authority_store
+            .select_build(authority)
+            .await?;
+        self.state.write().await.builds.retain(|build| {
+            build.authority.target.replica_id != authority.target.replica_id
+                || build.authority == *authority
+        });
+        self.receipts.write().await.retain(|_, receipt| {
+            receipt.selection.authority.target.replica_id != authority.target.replica_id
+                || receipt.selection.authority == *authority
+        });
+        Ok(())
+    }
+
+    async fn receipt(&self, authority: &BuildAuthority) -> Result<BuildReceipt> {
+        let host = self.host()?;
+        let selection = host
+            .default_dependencies
+            .build_authority_store
+            .load_build_selection(&authority.target)
+            .await?
+            .filter(|selection| selection.authority == *authority)
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let sessions = self.sessions.read().await;
+        let local_session = &host
+            .replica_session
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?
+            .1;
+        let session = |identity: &ReplicaIdentity| {
+            if identity == &host.identity {
+                Some(local_session.clone())
+            } else {
+                sessions.get(identity).cloned()
+            }
+            .ok_or(RuntimeError::AuthorityNotAdmitted)
+        };
+        Ok(BuildReceipt {
+            selection,
+            source_session: session(&authority.source)?,
+            target_session: session(&authority.target)?,
+            attempt_generation: self
+                .build_generations
+                .read()
+                .await
+                .get(&authority.build_id)
+                .copied()
+                .unwrap_or_default(),
+        })
     }
 
     async fn descriptions(&self) -> Result<Option<ReplicaSetConfiguration>> {
@@ -141,18 +211,21 @@ impl CustomReplicatorHost {
             {
                 continue;
             }
-            if sessions.get(&build.source).is_none_or(|s| s.is_empty()) {
+            if host
+                .default_dependencies
+                .build_authority_store
+                .load_build_selection(&build.target)
+                .await?
+                .is_none_or(|selection| selection.authority != build)
+            {
                 continue;
             }
-            let Some(target_session) = sessions.get(&build.target).filter(|s| !s.is_empty()) else {
-                continue;
-            };
             if !replicas.iter().any(|r| r.identity == build.source) {
                 continue;
             }
             let mut target =
                 ReplicaInformation::new(build.build_id, build.target.clone(), String::new());
-            target.process_session_id = target_session.clone();
+            target.process_session_id = sessions.get(&build.target).cloned().unwrap_or_default();
             target.current_progress = build.replication_boundary_lsn;
             target.catch_up_capability = build.replication_boundary_lsn;
             if build.target == host.identity {
@@ -230,8 +303,12 @@ impl CustomReplicatorHost {
         Ok(())
     }
 
-    async fn record_completion(&self, authority: BuildAuthority) -> Result<()> {
+    async fn record_completion(&self, receipt: BuildReceipt) -> Result<()> {
+        let authority = receipt.selection.authority.clone();
         let host = self.host()?;
+        if self.receipt(&authority).await? != receipt {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         if self
             .retired_builds
             .read()
@@ -277,8 +354,12 @@ impl CustomReplicatorHost {
         };
         host.default_dependencies
             .build_progress_store
-            .record_build_progress(&progress)
+            .record_selected_build_progress(&receipt.selection, &progress)
             .await?;
+        self.receipts
+            .write()
+            .await
+            .insert(progress.authority.build_id.clone(), receipt);
         let mut state = self.state.write().await;
         state
             .builds
@@ -294,44 +375,46 @@ impl CustomReplicatorHost {
     }
 
     async fn refresh(&self) -> Result<()> {
+        let host = self.host()?;
+        let incoming = match host
+            .default_dependencies
+            .build_authority_store
+            .load_build_selection(&host.identity)
+            .await?
+        {
+            Some(selection) => self.receipt(&selection.authority).await.ok(),
+            None => None,
+        };
         let progress = self.control.current_progress().await?;
         if progress < 0 {
             return Err(RuntimeError::InvalidReplication(
                 "negative custom replicator progress".into(),
             ));
         }
-        let host = self.host()?;
-        let builds = host
-            .default_dependencies
-            .build_authority_store
-            .load_builds()
-            .await?;
         let described = self.configuration.read().await.clone();
-        for build in builds {
-            if self.retired_builds.read().await.contains(&build.build_id)
-                || described.as_ref().is_none_or(|c| {
-                    c.configuration != build.current_configuration
-                        || !c
-                            .replicas
-                            .iter()
-                            .any(|r| r.build_id == build.build_id && r.identity == build.target)
-                })
-            {
-                continue;
-            }
-            if build.target == host.identity
+        if let Some(receipt) = incoming {
+            let build = &receipt.selection.authority;
+            let exact_description = described.as_ref().is_some_and(|c| {
+                c.configuration == build.current_configuration
+                    && c.replicas
+                        .iter()
+                        .filter(|r| r.identity == host.identity && !r.build_id.is_empty())
+                        .count()
+                        == 1
+                    && c.replicas.iter().any(|r| {
+                        r.build_id == build.build_id
+                            && r.identity == build.target
+                            && r.process_session_id == receipt.target_session
+                            && r.current_progress == build.replication_boundary_lsn
+                    })
+            });
+            if exact_description
+                && !self.retired_builds.read().await.contains(&build.build_id)
                 && progress > 0
                 && progress >= build.replication_boundary_lsn
-                && self.sessions.read().await.contains_key(&build.source)
-                && !self
-                    .state
-                    .read()
-                    .await
-                    .builds
-                    .iter()
-                    .any(|b| b.authority == build)
+                && self.receipts.read().await.get(&build.build_id) != Some(&receipt)
             {
-                self.record_completion(build).await?;
+                self.record_completion(receipt).await?;
             }
         }
         let mut state = self.state.write().await;
@@ -350,7 +433,7 @@ impl CustomReplicatorHost {
 
     pub(super) async fn execute_build(&self, mut replica: ReplicaInformation) -> Result<()> {
         let host = self.host()?;
-        let (authority, sessions, generation) = {
+        let receipt = {
             let _gate = self.gate.lock().await;
             let authority = host
                 .default_dependencies
@@ -389,16 +472,12 @@ impl CustomReplicatorHost {
             *generation = generation
                 .checked_add(1)
                 .ok_or(RuntimeError::OperationCancelled)?;
-            (authority, sessions, *generation)
+            drop(generations);
+            self.receipt(&authority).await?
         };
         self.primary.build_replica(replica).await?;
         let _gate = self.gate.lock().await;
-        if *self.sessions.read().await != sessions
-            || self.build_generations.read().await.get(&authority.build_id) != Some(&generation)
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        self.record_completion(authority).await?;
+        self.record_completion(receipt).await?;
         self.refresh().await
     }
 }
@@ -419,6 +498,17 @@ impl ManagedReplicator for CustomReplicatorHost {
         Ok(())
     }
     async fn fence_writes(&self) -> Result<()> {
+        let configuration = self.configuration.read().await.clone();
+        if let Some(configuration) = configuration {
+            for generation in self.build_generations.write().await.values_mut() {
+                *generation = generation
+                    .checked_add(1)
+                    .ok_or(RuntimeError::OperationCancelled)?;
+            }
+            self.control
+                .update_epoch(configuration.configuration.epoch)
+                .await?;
+        }
         self.set_access(
             AccessStatus::ReconfigurationPending,
             AccessStatus::ReconfigurationPending,
@@ -430,22 +520,7 @@ impl ManagedReplicator for CustomReplicatorHost {
     }
     async fn cancel_configuration_work(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
-        for generation in self.build_generations.write().await.values_mut() {
-            *generation = generation
-                .checked_add(1)
-                .ok_or(RuntimeError::OperationCancelled)?;
-        }
-        self.fence_writes().await?;
-        self.control
-            .update_epoch(
-                self.state
-                    .read()
-                    .await
-                    .authority
-                    .as_ref()
-                    .map_or_else(Default::default, |a| a.current_configuration.epoch),
-            )
-            .await
+        self.fence_writes().await
     }
     async fn restore_authority(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
@@ -492,6 +567,7 @@ impl ManagedReplicator for CustomReplicatorHost {
                     .build_authority_store
                     .admit_build(&authority)
                     .await?;
+                self.select_build_inner(&authority).await?;
                 self.configure().await?;
             }
             RuntimeEffectAction::RegisterPeerSession { identity, session } => {
@@ -565,7 +641,23 @@ impl ManagedReplicator for CustomReplicatorHost {
         Ok(())
     }
     async fn snapshot(&self) -> RuntimeSnapshot {
-        self.state.read().await.clone()
+        let mut snapshot = self.state.read().await.clone();
+        let receipts = self.receipts.read().await.clone();
+        let mut current = Vec::new();
+        for build in snapshot.builds {
+            if let Some(receipt) = receipts.get(&build.authority.build_id)
+                && self.receipt(&build.authority).await.as_ref().ok() == Some(receipt)
+                && !self
+                    .retired_builds
+                    .read()
+                    .await
+                    .contains(&build.authority.build_id)
+            {
+                current.push(build);
+            }
+        }
+        snapshot.builds = current;
+        snapshot
     }
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
         let _gate = self.gate.lock().await;

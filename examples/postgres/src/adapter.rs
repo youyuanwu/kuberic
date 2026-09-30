@@ -87,11 +87,18 @@ pub struct PgReplicator {
     state: Mutex<DriverState>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
     build_cancellation: std::sync::Mutex<CancellationToken>,
+    catch_up_cancellation: std::sync::Mutex<CancellationToken>,
     #[cfg(feature = "testing")]
     build_gate: std::sync::Mutex<Option<Arc<crate::build::BuildGate>>>,
 }
 
 impl PgReplicator {
+    fn cancel_catch_up(&self) {
+        let mut cancellation = self.catch_up_cancellation.lock().unwrap();
+        cancellation.cancel();
+        *cancellation = CancellationToken::new();
+    }
+
     async fn report(&self, fault: FaultType, error: impl std::fmt::Display) -> RuntimeError {
         match self.partition.upgrade() {
             Some(partition) => report_failure(&partition, fault, error).await,
@@ -147,6 +154,7 @@ impl PgReplicator {
             initializing,
             configuration: RwLock::new(None),
             build_cancellation: std::sync::Mutex::new(CancellationToken::new()),
+            catch_up_cancellation: std::sync::Mutex::new(CancellationToken::new()),
             #[cfg(feature = "testing")]
             build_gate: std::sync::Mutex::new(None),
             state: Mutex::new(DriverState {
@@ -662,6 +670,7 @@ impl PgReplicator {
                         &request.authority.target,
                         &request.target_session,
                     ),
+                    &crate::native::replication_slot_name(&request.authority.target),
                     &request.lineage,
                 )
                 .await,
@@ -809,6 +818,14 @@ impl PgReplicator {
 
     async fn close_access(&self) -> Result<()> {
         self.validate().await?;
+        if self
+            .instance
+            .access_state
+            .load(std::sync::atomic::Ordering::Acquire)
+            != crate::access::CLOSED
+        {
+            self.cancel_catch_up();
+        }
         if self.instance.is_running().await {
             self.pg_result(
                 PgAccessController::new(&self.instance)
@@ -959,16 +976,23 @@ impl PgReplicator {
             }
         }
         state.role = role;
+        if role == ReplicaRole::IdleSecondary {
+            *self.build_cancellation.lock().unwrap() = CancellationToken::new();
+        }
         Ok(())
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
-        let state = self.state.lock().await;
+        let _state = self.state.lock().await;
         self.validate().await?;
-        if state
-            .authority
+        if self
+            .configuration
+            .read()
+            .await
             .as_ref()
-            .is_none_or(|a| a.current_configuration.epoch != epoch)
+            .map_or(epoch != Epoch::default(), |c| {
+                c.configuration.epoch != epoch
+            })
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -1103,10 +1127,25 @@ impl PgReplicator {
     async fn install_configuration(&self, current: ReplicaSetConfiguration) -> Result<()> {
         kuberic_protocol::validation::validate_configuration(&current.configuration, None)
             .map_err(application_error)?;
+        let mut builds = BTreeMap::new();
+        for replica in current.replicas.iter().filter(|r| !r.build_id.is_empty()) {
+            if builds
+                .insert(
+                    replica.identity.replica_id,
+                    (&replica.identity, &replica.build_id),
+                )
+                .is_some()
+            {
+                return Err(application_error(
+                    "multiple build descriptions for one replica slot",
+                ));
+            }
+        }
         let old = self.configuration.read().await.clone();
         if old.as_ref() == Some(&current) {
             return Ok(());
         }
+        self.cancel_catch_up();
         if old
             .as_ref()
             .is_some_and(|old| old.configuration.epoch > current.configuration.epoch)
@@ -1178,6 +1217,7 @@ impl PgReplicator {
                             &build.request.source_host,
                             build.request.source_port,
                             &crate::native::replication_application_name(local, &local_session),
+                            &crate::native::replication_slot_name(local),
                             &build.request.lineage,
                         )
                         .await,
@@ -1200,6 +1240,12 @@ impl PgReplicator {
         {
             return Ok(());
         }
+        self.pg_result(
+            self.observer
+                .reconcile_replication_slots(local, &current)
+                .await,
+        )
+        .await?;
         let sessions = self
             .current_sessions(&current.configuration)
             .await
@@ -1227,11 +1273,22 @@ impl PgReplicator {
             .await
     }
 
-    async fn wait_for_catch_up_quorum(&self, _: ReplicaSetQuorumMode) -> Result<()> {
-        let _state = self.state.lock().await;
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+        let state = self.state.lock().await;
         if self.cancellation.is_cancelled() {
             return Err(RuntimeError::Closed);
         }
+        if state.role != ReplicaRole::Primary {
+            return Err(RuntimeError::NotPrimary);
+        }
+        let installed = self
+            .configuration
+            .read()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let required = self.current_sessions(&installed.configuration).await?;
+        let cancelled = self.catch_up_cancellation.lock().unwrap().clone();
         let snapshot = self.observe_pg().await?;
         let configuration = evidence_configuration(&snapshot)
             .cloned()
@@ -1255,16 +1312,32 @@ impl PgReplicator {
                 boundary
             }
         };
+        drop(state);
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
-                if self.cancellation.is_cancelled() {
-                    return Err(RuntimeError::OperationCancelled);
-                }
-                let snapshot = self.observe_pg().await?;
-                if evidence_configuration(&snapshot) != Some(&configuration) {
-                    return Err(RuntimeError::AuthorityNotAdmitted);
-                }
-                if snapshot.committed_lsn >= boundary {
+                let complete = tokio::select! {
+                    biased;
+                    _ = self.cancellation.cancelled() => return Err(RuntimeError::OperationCancelled),
+                    _ = cancelled.cancelled() => return Err(RuntimeError::OperationCancelled),
+                    result = async {
+                        if self.configuration.read().await.as_ref() != Some(&installed) {
+                            return Err(RuntimeError::AuthorityNotAdmitted);
+                        }
+                        let snapshot = self.observe_pg().await?;
+                        if evidence_configuration(&snapshot) != Some(&configuration) {
+                            return Err(RuntimeError::AuthorityNotAdmitted);
+                        }
+                        match mode {
+                            ReplicaSetQuorumMode::WriteQuorum => Ok(snapshot.committed_lsn >= boundary),
+                            ReplicaSetQuorumMode::All => {
+                                let local_replayed = snapshot.evidence.as_ref()
+                                    .is_some_and(|e| !e.in_recovery && e.flush_lsn >= boundary);
+                                Ok(local_replayed && self.observer.all_replayed(&required, boundary).await.map_err(application_error)?)
+                            }
+                        }
+                    } => result?,
+                };
+                if complete {
                     return Ok(());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1443,6 +1516,7 @@ impl Replicator for PgReplicator {
         PgReplicator::change_role(self, epoch, role).await
     }
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        self.cancel_catch_up();
         self.build_cancellation.lock().unwrap().cancel();
         PgReplicator::update_epoch(self, epoch).await
     }
