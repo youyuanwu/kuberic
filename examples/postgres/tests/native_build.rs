@@ -477,6 +477,12 @@ async fn all_wait_cancellation_reconciles_committed_metadata_without_permanent_f
             .application
             .native_driver()
             .pause_catch_up_commit(stage);
+        let before = source
+            .application
+            .native_driver()
+            .durable_state()
+            .await
+            .catch_up;
         let primary = source.runtime.primary_replicator().await.unwrap();
         let waiter = tokio::spawn({
             let primary = primary.clone();
@@ -499,7 +505,12 @@ async fn all_wait_cancellation_reconciles_committed_metadata_without_permanent_f
         );
         gate.release();
         let state = source.application.native_driver().durable_state().await;
-        assert!(state.catch_up.is_some());
+        if stage == CommitStage::BeforeRename {
+            assert_eq!(state.catch_up, before);
+        } else {
+            assert!(state.catch_up.is_some());
+            assert_ne!(state.catch_up, before);
+        }
         source.refresh().await;
         assert_ne!(
             source.runtime.partition_report().await.reported_fault,

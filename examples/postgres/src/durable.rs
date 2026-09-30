@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+#[cfg(feature = "testing")]
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use crate::native::AcknowledgementPolicy;
-use kuberic_protocol::types::{BuildAuthority, OperationId, ReplicaIdentity, ResourceUid};
+use kuberic_protocol::types::{BuildAuthority, Epoch, OperationId, ReplicaIdentity, ResourceUid};
 use kuberic_runtime::replicator::ReplicaSetConfiguration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,9 +15,15 @@ use tokio::sync::Mutex;
 
 const STATE_VERSION: u32 = 1;
 const STATE_FILE: &str = "state-v2.json";
+pub const MAX_RETAINED_BUILD_IDS: usize = 64;
+pub const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BUILD_ID_BYTES: usize = 512;
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +74,8 @@ pub struct PgDurableState {
     pub replay_lsn: Option<i64>,
     pub policy_certified_lsn: i64,
     pub synchronous: Option<AcknowledgementPolicy>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub synchronous_generation: u64,
     pub accepted_build: Option<BuildAuthority>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_accepted_authority: bool,
@@ -80,6 +91,10 @@ pub struct PgDurableState {
     pub retired_builds: BTreeSet<OperationId>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outbound_attempts: BTreeMap<OperationId, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_epoch: Option<Epoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_build_epoch: Option<Epoch>,
 }
 
 impl PgDurableState {
@@ -101,6 +116,7 @@ impl PgDurableState {
             replay_lsn: None,
             policy_certified_lsn: 0,
             synchronous: None,
+            synchronous_generation: 0,
             accepted_build: None,
             has_accepted_authority: false,
             native_build: None,
@@ -109,6 +125,8 @@ impl PgDurableState {
             suspended_builds: Vec::new(),
             retired_builds: BTreeSet::new(),
             outbound_attempts: BTreeMap::new(),
+            build_epoch: None,
+            retired_build_epoch: None,
         }
     }
 
@@ -123,6 +141,7 @@ impl PgDurableState {
             return Err(PgDurableError::IdentityMismatch);
         }
         if self.generation == 0
+            || self.synchronous_generation > self.generation
             || self.current_lsn < 0
             || self.flush_lsn < 0
             || self.flush_lsn > self.current_lsn
@@ -142,8 +161,18 @@ impl PgDurableState {
         if let Some(synchronous) = &self.synchronous {
             synchronous.validate().map_err(PgDurableError::Invalid)?;
         }
-        if self.outbound_builds.len() > crate::build::MAX_BUILDS {
+        if self.outbound_builds.len() + self.suspended_builds.len() > crate::build::MAX_BUILDS {
             return Err(PgDurableError::Invalid("too many native builds".into()));
+        }
+        if self.retired_builds.len() > MAX_RETAINED_BUILD_IDS
+            || self.retired_builds.iter().any(|id| !bounded_build_id(id))
+            || self
+                .retired_build_epoch
+                .is_some_and(|retired| self.build_epoch.is_none_or(|current| retired >= current))
+        {
+            return Err(PgDurableError::Invalid(
+                "invalid bounded build history".into(),
+            ));
         }
         let mut ids = std::collections::BTreeSet::new();
         for build in self.outbound_builds.iter().chain(&self.suspended_builds) {
@@ -151,26 +180,30 @@ impl PgDurableState {
             if build.request.resource_uid != self.identity.resource_uid
                 || build.request.authority.source != self.identity.replica
                 || !ids.insert(build.request.authority.build_id.clone())
-                || self
-                    .retired_builds
-                    .contains(&build.request.authority.build_id)
+                || self.build_is_terminal(&build.request.authority)
             {
                 return Err(PgDurableError::Invalid(
                     "invalid outbound native build".into(),
                 ));
             }
-            if self.outbound_attempts.iter().any(|(id, generation)| {
-                *generation == 0
-                    || *generation > self.generation
-                    || !self
-                        .outbound_builds
-                        .iter()
-                        .any(|b| &b.request.authority.build_id == id)
-            }) {
-                return Err(PgDurableError::Invalid(
-                    "invalid outbound build attempt".into(),
-                ));
-            }
+        }
+        if self.outbound_attempts.iter().any(|(id, generation)| {
+            *generation == 0
+                || *generation > self.generation
+                || !self
+                    .outbound_builds
+                    .iter()
+                    .any(|b| &b.request.authority.build_id == id)
+        }) {
+            return Err(PgDurableError::Invalid(
+                "invalid outbound build attempt".into(),
+            ));
+        }
+        ids.extend(self.retired_builds.iter().cloned());
+        if ids.len() > MAX_RETAINED_BUILD_IDS {
+            return Err(PgDurableError::Invalid(
+                "build history bound exceeded".into(),
+            ));
         }
         if let Some(build) = &self.native_build {
             build.validate().map_err(PgDurableError::Invalid)?;
@@ -193,6 +226,13 @@ impl PgDurableState {
         Ok(())
     }
 
+    pub(crate) fn build_is_terminal(&self, authority: &BuildAuthority) -> bool {
+        self.retired_builds.contains(&authority.build_id)
+            || self
+                .retired_build_epoch
+                .is_some_and(|epoch| authority.current_configuration.epoch <= epoch)
+    }
+
     pub(crate) fn suspend_build(&mut self, id: &OperationId) {
         if let Some(index) = self
             .outbound_builds
@@ -207,27 +247,65 @@ impl PgDurableState {
         self.outbound_attempts.remove(id);
     }
 
-    pub(crate) fn reconcile_builds(&mut self, current: &ReplicaSetConfiguration) {
+    pub(crate) fn reconcile_builds(
+        &mut self,
+        current: &ReplicaSetConfiguration,
+    ) -> Result<(), PgDurableError> {
+        let epoch = current.configuration.epoch;
+        if self.build_epoch.is_some_and(|previous| epoch < previous) {
+            return Err(PgDurableError::Invalid(
+                "build configuration is older than its durable epoch".into(),
+            ));
+        }
+        if let Some(previous) = self.build_epoch
+            && epoch > previous
+        {
+            self.retired_build_epoch = Some(previous);
+            self.retired_builds.clear();
+            self.outbound_builds
+                .retain(|build| build.request.authority.current_configuration.epoch > previous);
+            self.suspended_builds
+                .retain(|build| build.request.authority.current_configuration.epoch > previous);
+        }
+        self.build_epoch = Some(epoch);
         let selected = current
             .replicas
             .iter()
             .filter(|r| !r.build_id.is_empty())
             .map(|r| &r.build_id)
             .collect::<BTreeSet<_>>();
+        if selected.len() > crate::build::MAX_BUILDS
+            || selected.iter().any(|id| !bounded_build_id(id))
+        {
+            return Err(PgDurableError::Invalid(
+                "selected build descriptions exceed their bound".into(),
+            ));
+        }
         for build in &self.outbound_builds {
-            if !selected.contains(&build.request.authority.build_id) {
+            if !selected.contains(&build.request.authority.build_id)
+                && !self.retired_build_epoch.is_some_and(|floor| {
+                    build.request.authority.current_configuration.epoch <= floor
+                })
+            {
                 self.retired_builds
                     .insert(build.request.authority.build_id.clone());
             }
         }
         for build in &self.suspended_builds {
-            if !selected.contains(&build.request.authority.build_id) {
+            if !selected.contains(&build.request.authority.build_id)
+                && !self.retired_build_epoch.is_some_and(|floor| {
+                    build.request.authority.current_configuration.epoch <= floor
+                })
+            {
                 self.retired_builds
                     .insert(build.request.authority.build_id.clone());
             }
         }
         if let Some(build) = &self.native_build
             && !selected.contains(&build.request.authority.build_id)
+            && !self
+                .retired_build_epoch
+                .is_some_and(|floor| build.request.authority.current_configuration.epoch <= floor)
         {
             self.retired_builds
                 .insert(build.request.authority.build_id.clone());
@@ -241,7 +319,27 @@ impl PgDurableState {
                 .iter()
                 .any(|b| &b.request.authority.build_id == id)
         });
+        let mut known = self.retired_builds.clone();
+        known.extend(selected.into_iter().cloned());
+        known.extend(
+            self.outbound_builds
+                .iter()
+                .chain(&self.suspended_builds)
+                .map(|build| build.request.authority.build_id.clone()),
+        );
+        if known.len() > MAX_RETAINED_BUILD_IDS {
+            return Err(PgDurableError::Invalid(
+                "build history bound reached; a newer admitted epoch is required".into(),
+            ));
+        }
+        Ok(())
     }
+}
+
+fn bounded_build_id(id: &OperationId) -> bool {
+    !id.is_empty()
+        && id.as_str().len() <= MAX_BUILD_ID_BYTES
+        && !id.as_str().chars().any(char::is_control)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -254,6 +352,10 @@ struct StateEnvelope {
 pub struct PgDurableStore {
     root: PathBuf,
     state: Arc<Mutex<PgDurableState>>,
+    workers: StdMutex<Vec<Weak<CommitWorker>>>,
+    ownership: Arc<File>,
+    pub(crate) policy_lock: Arc<Mutex<()>>,
+    pub(crate) policy_fence: std::sync::atomic::AtomicU64,
     #[cfg(feature = "testing")]
     commit_hook: std::sync::Mutex<Option<CommitHook>>,
 }
@@ -269,14 +371,28 @@ pub enum CommitStage {
 #[cfg(feature = "testing")]
 pub struct CommitGate {
     pub entered: Arc<tokio::sync::Notify>,
-    resume: std::sync::mpsc::Sender<()>,
+    state: Arc<GateState>,
 }
 
 #[cfg(feature = "testing")]
 impl CommitGate {
     pub fn release(&self) {
-        let _ = self.resume.send(());
+        *self.state.released.lock().unwrap() = true;
+        self.state.changed.notify_all();
     }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for CommitGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(feature = "testing")]
+struct GateState {
+    released: StdMutex<bool>,
+    changed: Condvar,
 }
 
 #[cfg(feature = "testing")]
@@ -284,15 +400,90 @@ struct CommitHook {
     stage: CommitStage,
     catch_up_only: bool,
     entered: Arc<tokio::sync::Notify>,
-    resume: std::sync::mpsc::Receiver<()>,
+    state: Arc<GateState>,
 }
 
 #[cfg(feature = "testing")]
 impl CommitHook {
-    fn checkpoint(&self, stage: CommitStage) {
+    fn checkpoint(&self, stage: CommitStage, control: &CommitControl) {
         if self.stage == stage {
             self.entered.notify_one();
-            let _ = self.resume.recv();
+            let mut released = self.state.released.lock().unwrap();
+            while !*released && !control.cancel_requested.load(Ordering::Acquire) {
+                released = self.state.changed.wait(released).unwrap();
+            }
+        }
+    }
+}
+
+struct CommitControl {
+    // Cancellation and the non-cancellable rename/publication section arbitrate
+    // once: 0=pending, 1=committing, 2=cancelled.
+    phase: AtomicU8,
+    cancel_requested: AtomicBool,
+    #[cfg(feature = "testing")]
+    gate: Option<Arc<GateState>>,
+}
+
+impl CommitControl {
+    fn cancel(&self) {
+        self.cancel_requested.store(true, Ordering::Release);
+        let _ = self
+            .phase
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+        #[cfg(feature = "testing")]
+        if let Some(gate) = &self.gate {
+            let _released = gate.released.lock().unwrap();
+            gate.changed.notify_all();
+        }
+    }
+
+    fn begin_commit(&self) -> Result<(), PgDurableError> {
+        self.phase
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| PgDurableError::Cancelled)
+    }
+}
+
+struct CommitWorker {
+    control: Arc<CommitControl>,
+    thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl CommitWorker {
+    fn cancel_and_join(&self) {
+        self.control.cancel();
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for CommitWorker {
+    fn drop(&mut self) {
+        self.cancel_and_join();
+    }
+}
+
+struct CommitWaiter(Arc<CommitWorker>);
+
+impl Drop for CommitWaiter {
+    fn drop(&mut self) {
+        self.0.cancel_and_join();
+    }
+}
+
+impl Drop for PgDurableStore {
+    fn drop(&mut self) {
+        for worker in self
+            .workers
+            .get_mut()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            worker.cancel_and_join();
         }
     }
 }
@@ -301,14 +492,17 @@ impl PgDurableStore {
     #[cfg(feature = "testing")]
     pub fn pause_commit(&self, stage: CommitStage, catch_up_only: bool) -> CommitGate {
         let entered = Arc::new(tokio::sync::Notify::new());
-        let (resume, receiver) = std::sync::mpsc::channel();
+        let state = Arc::new(GateState {
+            released: StdMutex::new(false),
+            changed: Condvar::new(),
+        });
         *self.commit_hook.lock().unwrap() = Some(CommitHook {
             stage,
             catch_up_only,
             entered: entered.clone(),
-            resume: receiver,
+            state: state.clone(),
         });
-        CommitGate { entered, resume }
+        CommitGate { entered, state }
     }
 
     pub async fn open(
@@ -335,9 +529,36 @@ impl PgDurableStore {
             (true, StorageMode::Established) => read_state(&path).await?,
         };
         state.validate(&expected)?;
+        let ownership = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("state-v2.owner"))
+            .map_err(PgDurableError::Io)?;
+        ownership.try_lock().map_err(|error| {
+            let error: std::io::Error = error.into();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                PgDurableError::AlreadyOwned
+            } else {
+                PgDurableError::Io(error)
+            }
+        })?;
+        let state = if mode == StorageMode::Established {
+            let current = read_state(&path).await?;
+            current.validate(&expected)?;
+            current
+        } else {
+            state
+        };
+        let policy_generation = state.synchronous_generation;
         let store = Self {
             root,
             state: Arc::new(Mutex::new(state)),
+            workers: StdMutex::new(Vec::new()),
+            ownership: Arc::new(ownership),
+            policy_lock: Arc::new(Mutex::new(())),
+            policy_fence: std::sync::atomic::AtomicU64::new(policy_generation),
             #[cfg(feature = "testing")]
             commit_hook: std::sync::Mutex::new(None),
         };
@@ -405,50 +626,144 @@ impl PgDurableStore {
                 None
             }
         };
-        // The worker owns the state lock through publication. Dropping the
-        // caller cannot leave the committed file ahead of the owner's memory.
-        tokio::task::spawn_blocking(move || {
-            let mut renamed = false;
-            let result = write_state(&path, &next, &mut renamed, |stage| {
-                #[cfg(feature = "testing")]
-                if let Some(hook) = &hook {
-                    hook.checkpoint(stage);
-                }
-                #[cfg(not(feature = "testing"))]
-                let _ = stage;
-            });
-            if renamed {
-                *state = next.clone();
-                #[cfg(feature = "testing")]
-                if let Some(hook) = &hook {
-                    hook.checkpoint(CommitStage::Published);
-                }
-            }
-            result?;
-            Ok(next)
-        })
-        .await
-        .map_err(|error| {
-            PgDurableError::Io(std::io::Error::other(format!(
-                "metadata commit worker: {error}"
-            )))
-        })?
+        let control = Arc::new(CommitControl {
+            phase: AtomicU8::new(0),
+            cancel_requested: AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            gate: hook.as_ref().map(|hook| hook.state.clone()),
+        });
+        let worker = Arc::new(CommitWorker {
+            control: control.clone(),
+            thread: StdMutex::new(None),
+        });
+        let waiter = CommitWaiter(worker.clone());
+        let (completed, result) = tokio::sync::oneshot::channel();
+        let ownership = self.ownership.clone();
+        let thread = std::thread::Builder::new()
+            .name("postgres-metadata-commit".into())
+            .spawn(move || {
+                let _ownership = ownership;
+                let committed = (|| {
+                    let _file_lock = lock_metadata(&path, Some(&control))?;
+                    if read_state_sync(&path)? != *state {
+                        return Err(PgDurableError::Invalid(
+                            "metadata generation changed outside its owner".into(),
+                        ));
+                    }
+                    let mut renamed = false;
+                    let result = write_state(
+                        &path,
+                        &next,
+                        &mut renamed,
+                        || control.begin_commit(),
+                        |stage| {
+                            #[cfg(feature = "testing")]
+                            if let Some(hook) = &hook {
+                                hook.checkpoint(stage, &control);
+                            }
+                            #[cfg(not(feature = "testing"))]
+                            let _ = stage;
+                        },
+                    );
+                    if renamed {
+                        *state = next.clone();
+                        #[cfg(feature = "testing")]
+                        if let Some(hook) = &hook {
+                            hook.checkpoint(CommitStage::Published, &control);
+                        }
+                    }
+                    result?;
+                    Ok(next)
+                })();
+                drop(state);
+                let _ = completed.send(committed);
+            })
+            .map_err(PgDurableError::Io)?;
+        *worker.thread.lock().unwrap() = Some(thread);
+        {
+            let mut workers = self.workers.lock().unwrap();
+            workers.retain(|worker| worker.strong_count() != 0);
+            workers.push(Arc::downgrade(&worker));
+        }
+        let committed = result.await.map_err(|_| {
+            PgDurableError::Invalid("metadata worker did not publish an outcome".into())
+        })?;
+        drop(waiter);
+        committed
     }
 
     async fn persist(&self) -> Result<(), PgDurableError> {
         let state = self.state.lock().await.clone();
-        write_state(&self.root.join(STATE_FILE), &state, &mut false, |_| {})
+        let path = self.root.join(STATE_FILE);
+        let _file_lock = lock_metadata(&path, None)?;
+        if path.exists() {
+            return Err(PgDurableError::AlreadyExists);
+        }
+        write_state(&path, &state, &mut false, || Ok(()), |_| {})
     }
 }
 
 async fn read_state(path: &Path) -> Result<PgDurableState, PgDurableError> {
-    let bytes = tokio::fs::read(path).await.map_err(PgDurableError::Io)?;
-    let envelope: StateEnvelope = serde_json::from_slice(&bytes).map_err(PgDurableError::Json)?;
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(PgDurableError::Io)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(PgDurableError::Io)?;
+    decode_state(&bytes)
+}
+
+fn read_state_sync(path: &Path) -> Result<PgDurableState, PgDurableError> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(PgDurableError::Io)?
+        .take(MAX_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(PgDurableError::Io)?;
+    decode_state(&bytes)
+}
+
+fn decode_state(bytes: &[u8]) -> Result<PgDurableState, PgDurableError> {
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(PgDurableError::Invalid(
+            "metadata byte bound exceeded".into(),
+        ));
+    }
+    let envelope: StateEnvelope = serde_json::from_slice(bytes).map_err(PgDurableError::Json)?;
     let checksum = checksum(&envelope.state)?;
     if checksum != envelope.checksum {
         return Err(PgDurableError::Checksum);
     }
     Ok(envelope.state)
+}
+
+fn lock_metadata(path: &Path, control: Option<&CommitControl>) -> Result<File, PgDurableError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))
+        .map_err(PgDurableError::Io)?;
+    loop {
+        if control.is_some_and(|control| control.cancel_requested.load(Ordering::Acquire)) {
+            return Err(PgDurableError::Cancelled);
+        }
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(error) => {
+                let error: std::io::Error = error.into();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(PgDurableError::Io(error));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "testing"))]
@@ -461,6 +776,7 @@ fn write_state(
     path: &Path,
     state: &PgDurableState,
     renamed: &mut bool,
+    begin_commit: impl FnOnce() -> Result<(), PgDurableError>,
     checkpoint: impl Fn(CommitStage),
 ) -> Result<(), PgDurableError> {
     let envelope = StateEnvelope {
@@ -468,12 +784,21 @@ fn write_state(
         checksum: checksum(state)?,
     };
     let bytes = serde_json::to_vec_pretty(&envelope).map_err(PgDurableError::Json)?;
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(PgDurableError::Invalid(
+            "metadata byte bound exceeded".into(),
+        ));
+    }
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, bytes).map_err(PgDurableError::Io)?;
     File::open(&temporary)
         .and_then(|file| file.sync_all())
         .map_err(PgDurableError::Io)?;
     checkpoint(CommitStage::BeforeRename);
+    if let Err(error) = begin_commit() {
+        std::fs::remove_file(&temporary).map_err(PgDurableError::Io)?;
+        return Err(error);
+    }
     std::fs::rename(&temporary, path).map_err(PgDurableError::Io)?;
     *renamed = true;
     if let Some(parent) = path.parent() {
@@ -493,6 +818,10 @@ fn checksum(state: &PgDurableState) -> Result<String, PgDurableError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PgDurableError {
+    #[error("PostgreSQL durable state already has a live owner")]
+    AlreadyOwned,
+    #[error("PostgreSQL metadata update cancelled before commit")]
+    Cancelled,
     #[error("PostgreSQL durable state already exists")]
     AlreadyExists,
     #[error("PostgreSQL durable state is missing")]

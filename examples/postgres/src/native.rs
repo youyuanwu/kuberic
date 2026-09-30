@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kuberic_protocol::types::{
     ConfigurationDescriptor, ConfigurationId, ProcessSessionId, ReplicaIdentity,
@@ -120,13 +121,60 @@ pub struct PgObservation {
 
 pub struct PgNativeObserver {
     instance: Arc<PgInstanceManager>,
-    synchronous: RwLock<Option<AcknowledgementPolicy>>,
-    metadata_generation: RwLock<u64>,
+    policy: RwLock<(u64, Option<AcknowledgementPolicy>)>,
+    policy_fence: AtomicU64,
     durable: Option<Arc<PgDurableStore>>,
-    configuration_lock: Mutex<()>,
+    configuration_lock: Arc<Mutex<()>>,
+    #[cfg(feature = "testing")]
+    policy_hook: std::sync::Mutex<Option<(PolicyStage, Arc<PolicyGate>)>>,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyStage {
+    InvalidationStarted,
+    Invalidated,
+    Applied,
+    ReadBack,
+    Published,
+}
+
+#[cfg(feature = "testing")]
+pub struct PolicyGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 impl PgNativeObserver {
+    #[cfg(feature = "testing")]
+    pub fn pause_policy(&self, stage: PolicyStage) -> Arc<PolicyGate> {
+        let gate = Arc::new(PolicyGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.policy_hook.lock().unwrap() = Some((stage, gate.clone()));
+        gate
+    }
+
+    #[cfg(feature = "testing")]
+    async fn policy_checkpoint(&self, stage: PolicyStage) {
+        let gate = {
+            let mut hook = self.policy_hook.lock().unwrap();
+            if hook
+                .as_ref()
+                .is_some_and(|(expected, _)| *expected == stage)
+            {
+                hook.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     pub(crate) async fn reconcile_replication_slots(
         &self,
         local: &ReplicaIdentity,
@@ -210,10 +258,12 @@ impl PgNativeObserver {
     pub fn new(instance: Arc<PgInstanceManager>) -> Self {
         Self {
             instance,
-            synchronous: RwLock::new(None),
-            metadata_generation: RwLock::new(1),
+            policy: RwLock::new((1, None)),
+            policy_fence: AtomicU64::new(0),
             durable: None,
-            configuration_lock: Mutex::new(()),
+            configuration_lock: Arc::new(Mutex::new(())),
+            #[cfg(feature = "testing")]
+            policy_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -221,13 +271,14 @@ impl PgNativeObserver {
         instance: Arc<PgInstanceManager>,
         durable: Arc<PgDurableStore>,
     ) -> Self {
-        let state = durable.snapshot().await;
         Self {
             instance,
-            synchronous: RwLock::new(state.synchronous),
-            metadata_generation: RwLock::new(state.generation),
+            policy: RwLock::new((1, None)),
+            policy_fence: AtomicU64::new(0),
+            configuration_lock: durable.policy_lock.clone(),
+            #[cfg(feature = "testing")]
+            policy_hook: std::sync::Mutex::new(None),
             durable: Some(durable),
-            configuration_lock: Mutex::new(()),
         }
     }
 
@@ -238,26 +289,77 @@ impl PgNativeObserver {
                 "valid synchronous metadata requires native apply/read-back".into(),
             ));
         }
-        self.publish_synchronous(synchronous).await
+        let version = self.fence_policy().await;
+        #[cfg(feature = "testing")]
+        self.policy_checkpoint(PolicyStage::InvalidationStarted)
+            .await;
+        self.publish_synchronous(synchronous, version).await?;
+        #[cfg(feature = "testing")]
+        self.policy_checkpoint(PolicyStage::Invalidated).await;
+        Ok(())
     }
 
-    async fn publish_synchronous(&self, synchronous: AcknowledgementPolicy) -> Result<(), PgError> {
+    async fn committed_policy(&self) -> (u64, u64, Option<AcknowledgementPolicy>) {
+        if let Some(durable) = &self.durable {
+            let state = durable.snapshot().await;
+            (
+                state.synchronous_generation,
+                state.generation,
+                state.synchronous,
+            )
+        } else {
+            let policy = self.policy.read().await;
+            (policy.0, policy.0, policy.1.clone())
+        }
+    }
+
+    async fn fence_policy(&self) -> u64 {
+        let (version, _, _) = self.committed_policy().await;
+        if let Some(durable) = &self.durable {
+            durable.policy_fence.store(version, Ordering::Release);
+        } else {
+            self.policy_fence.store(version, Ordering::Release);
+        }
+        version
+    }
+
+    async fn publish_synchronous(
+        &self,
+        synchronous: AcknowledgementPolicy,
+        expected: u64,
+    ) -> Result<u64, PgError> {
         synchronous.validate().map_err(PgError::Configuration)?;
         if let Some(durable) = &self.durable {
-            durable
+            let committed = durable
                 .update(|state| {
+                    if state.synchronous_generation != expected {
+                        return Err(crate::durable::PgDurableError::Invalid(
+                            "synchronous policy generation changed".into(),
+                        ));
+                    }
                     state.synchronous = Some(synchronous.clone());
+                    state.synchronous_generation = expected.checked_add(1).ok_or_else(|| {
+                        crate::durable::PgDurableError::Invalid(
+                            "policy generation exhausted".into(),
+                        )
+                    })?;
                     Ok(())
                 })
                 .await
                 .map_err(|error| PgError::Configuration(error.to_string()))?;
+            return Ok(committed.synchronous_generation);
         }
-        *self.synchronous.write().await = Some(synchronous);
-        let mut generation = self.metadata_generation.write().await;
-        *generation = generation
+        let mut policy = self.policy.write().await;
+        if policy.0 != expected {
+            return Err(PgError::Configuration(
+                "synchronous policy generation changed".into(),
+            ));
+        }
+        let version = expected
             .checked_add(1)
-            .ok_or_else(|| PgError::Configuration("metadata generation overflow".into()))?;
-        Ok(())
+            .ok_or_else(|| PgError::Configuration("policy generation exhausted".into()))?;
+        *policy = (version, Some(synchronous));
+        Ok(version)
     }
 
     pub async fn apply_synchronous(
@@ -266,13 +368,32 @@ impl PgNativeObserver {
     ) -> Result<(), PgError> {
         let _configuration = self.configuration_lock.lock().await;
         synchronous.validate().map_err(PgError::Configuration)?;
+        let version = self.fence_policy().await;
         if !synchronous.valid {
-            return self.publish_synchronous(synchronous).await;
+            return self
+                .publish_synchronous(synchronous, version)
+                .await
+                .map(|_| ());
         }
+        #[cfg(feature = "testing")]
+        self.policy_checkpoint(PolicyStage::InvalidationStarted)
+            .await;
         let mut invalid = synchronous.clone();
         invalid.valid = false;
         invalid.write_acknowledgements = 0;
-        self.publish_synchronous(invalid).await?;
+        let version = self.publish_synchronous(invalid, version).await?;
+        #[cfg(feature = "testing")]
+        self.policy_checkpoint(PolicyStage::Invalidated).await;
+        let (client, _connection) = self.instance.connect().await?;
+        // Acquire the SQL session lock before any native mutation. Invalidation
+        // is already durable, including when connection or lock acquisition fails.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.query_one("SELECT pg_advisory_lock(1729364819)", &[]),
+        )
+        .await
+        .map_err(|_| PgError::Timeout("synchronous configuration lock".into()))?
+        .map_err(|error| PgError::Query(format!("lock synchronous configuration: {error}")))?;
         let setting = if synchronous.write_acknowledgements == 0 {
             String::new()
         } else {
@@ -286,7 +407,6 @@ impl PgNativeObserver {
                 .join(",");
             format!("ANY {} ({names})", synchronous.write_acknowledgements)
         };
-        let (client, _connection) = self.instance.connect().await?;
         client
             .simple_query(&format!(
                 "ALTER SYSTEM SET synchronous_standby_names = '{}'",
@@ -300,6 +420,8 @@ impl PgNativeObserver {
             .query_one("SELECT pg_reload_conf()", &[])
             .await
             .map_err(|error| PgError::Query(format!("reload PostgreSQL config: {error}")))?;
+        #[cfg(feature = "testing")]
+        self.policy_checkpoint(PolicyStage::Applied).await;
         let mut observed = String::new();
         for _ in 0..40 {
             observed = client
@@ -319,10 +441,20 @@ impl PgNativeObserver {
                 "effective synchronous_standby_names differs: expected {setting:?}, observed {observed:?}"
             )));
         }
-        self.publish_synchronous(synchronous).await
+        #[cfg(feature = "testing")]
+        self.policy_checkpoint(PolicyStage::ReadBack).await;
+        self.publish_synchronous(synchronous, version).await?;
+        #[cfg(feature = "testing")]
+        self.policy_checkpoint(PolicyStage::Published).await;
+        Ok(())
     }
 
     pub async fn snapshot(&self) -> Result<PgObservation, PgError> {
+        let _configuration = self.configuration_lock.lock().await;
+        self.snapshot_locked().await
+    }
+
+    async fn snapshot_locked(&self) -> Result<PgObservation, PgError> {
         let (client, _connection) = self.instance.connect().await?;
         let system_identifier: String = client
             .query_one(
@@ -346,11 +478,19 @@ impl PgNativeObserver {
             .await
             .map_err(|error| PgError::Query(format!("pg_is_in_recovery: {error}")))?
             .get(0);
-        let synchronous = if in_recovery {
-            None
-        } else {
-            self.synchronous.read().await.clone()
-        };
+        let (policy_generation, metadata_generation, mut synchronous) =
+            self.committed_policy().await;
+        let fence = self.durable.as_ref().map_or_else(
+            || self.policy_fence.load(Ordering::Acquire),
+            |durable| durable.policy_fence.load(Ordering::Acquire),
+        );
+        if policy_generation <= fence
+            && let Some(policy) = &mut synchronous
+        {
+            policy.valid = false;
+            policy.write_acknowledgements = 0;
+        }
+        let synchronous = if in_recovery { None } else { synchronous };
         let (current_lsn, flush_lsn, received_lsn, replay_lsn, policy_certified_lsn) =
             if in_recovery {
                 let row = client
@@ -420,7 +560,7 @@ impl PgNativeObserver {
                 flush_lsn,
                 received_lsn,
                 replay_lsn,
-                metadata_generation: *self.metadata_generation.read().await,
+                metadata_generation,
                 synchronous,
                 wal_receiver_stopped,
             }),
@@ -429,7 +569,7 @@ impl PgNativeObserver {
 
     pub async fn snapshot_and_persist(&self) -> Result<PgObservation, PgError> {
         let _configuration = self.configuration_lock.lock().await;
-        let snapshot = self.snapshot().await?;
+        let snapshot = self.snapshot_locked().await?;
         if let (Some(durable), Some(evidence)) = (&self.durable, snapshot.evidence.as_ref()) {
             let history_digest =
                 timeline_history_digest(self.instance.data_dir(), evidence).await?;
@@ -448,8 +588,8 @@ impl PgNativeObserver {
                     state.flush_lsn = evidence.flush_lsn;
                     state.received_lsn = evidence.received_lsn;
                     state.replay_lsn = evidence.replay_lsn;
-                    state.policy_certified_lsn = snapshot.committed_lsn;
-                    state.synchronous = evidence.synchronous.clone();
+                    state.policy_certified_lsn =
+                        state.policy_certified_lsn.max(snapshot.committed_lsn);
                     state.postgres_stopped = false;
                     Ok(())
                 })

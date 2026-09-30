@@ -190,7 +190,11 @@ retries if a receiver reconnects. A slot is never reported retired on
 cancellation reaps the exact helper tree before returning; cleanup failure is
 retained rather than hidden as a retryable timeout. An ordinary helper timeout
 is transient, leaves a failed fence closed, and can be retried after the helper
-recovers. Malformed control data and ownership/cleanup failures remain permanent.
+recovers on the same SF service. The transient path joins/stops the exact run
+without sealing helper launches; subsequent progress retries can run a fresh
+helper and report zero while SQL remains closed. Explicit abort and fatal
+ownership/cleanup errors still seal the registry. Malformed control data and
+ownership/cleanup failures remain permanent.
 
 ### Exact build receipts and catch-up
 
@@ -209,15 +213,35 @@ active capacity and associated slots; they cannot resurrect on reopen or accept
 late completion. A retryable transport cancellation preserves lineage for the
 same immutable work but removes its active attempt. Retrying allocates a new
 durable attempt generation, so an old RPC cannot publish into that attempt.
-The agent retains the full authority/selection audit. Tombstones do not expire.
+The agent retains the full authority/selection audit and immutable operation-ID
+bindings. PostgreSQL bounds active plus suspended work to 16, build IDs to 512
+bytes, retained IDs to 64 per admitted epoch, and its serialized metadata to
+4 MiB. The per-epoch budget reserves space for selected work's eventual
+retirement. Exhaustion rejects further distinct work without deleting relevant
+IDs; a newer admitted SF epoch is required. Advancing epoch compacts older IDs
+into a durable retired-epoch watermark. Requests at/below that watermark remain
+rejected after reopen, while current-epoch IDs and exact session/configuration
+descriptions reject recent late work. This is epoch compaction, not TTL deletion.
 
-Metadata commits hold an owned state lock through file replacement, directory
-fsync and in-memory publication. Cancellation of a waiting caller is not a
-rollback: the owned commit finishes, and subsequent snapshots/revalidation join
-it and observe the committed version. An I/O failure remains an error; a visible
-rename is reconciled in memory even if the following durability step fails.
+Metadata commits arbitrate cancellation before the rename/publication critical
+section. Precommit cancellation is a no-op; after the commit decision wins,
+rename/fsync and memory publication finish before cancellation acknowledges.
+Workers are synchronously cancelled/joined, not detached. The store retains
+exclusive root ownership, and commit locking plus generation comparison prevents
+an old owner from consuming or overwriting a reopened owner's staging state.
+An I/O failure remains an error; a visible rename is reconciled in memory even
+if the following durability step fails.
 Catch-up observations take the lifecycle lock only for each probe, avoiding both
 stale whole-state publication and an uncancellable lock across the full wait.
+
+Synchronous policy observations derive from committed metadata, not a second
+policy cache. A policy-specific version fences the previous valid policy as soon
+as invalidation starts; unrelated metadata generations cannot lift that fence.
+Invalidation, SQL apply/readback and snapshots are serialized, and the SQL
+configuration session holds an advisory lock so a cancelled old query cannot
+overtake a later apply. Valid policy is published only after readback, in the same
+durable update as its policy version. Cancellation at either publication boundary
+therefore cannot republish the preceding valid policy.
 
 `WriteQuorum` uses policy-certified replay. SF `All` additionally requires every
 current replica's exact session-qualified WAL receiver to report replay through

@@ -120,7 +120,15 @@ impl PgReplicator {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let error = error.with_cleanup(self.instance.abort_owned());
+        let cleanup = if matches!(error, PgError::Timeout(_)) {
+            // A bounded helper failure revokes SQL/process access but is not a
+            // terminal service abort. stop() joins the exact run and keeps the
+            // helper registry usable; retained cleanup errors are never reset.
+            self.instance.stop().await
+        } else {
+            self.instance.abort_owned()
+        };
+        let error = error.with_cleanup(cleanup);
         let fault = error.fault_type();
         Err(self.report(fault, error).await)
     }
@@ -367,7 +375,7 @@ impl PgReplicator {
             return Err(RuntimeError::OperationCancelled);
         }
         let durable = self.durable.snapshot().await;
-        if durable.retired_builds.contains(&request.authority.build_id) {
+        if durable.build_is_terminal(&request.authority) {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         let configuration = self.configuration.read().await;
@@ -1171,11 +1179,16 @@ impl PgReplicator {
             return Err(RuntimeError::Closed);
         }
         let durable = self.validate().await?;
-        if current
-            .replicas
-            .iter()
-            .any(|r| durable.retired_builds.contains(&r.build_id))
+        if durable
+            .build_epoch
+            .is_some_and(|epoch| current.configuration.epoch < epoch)
         {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if current.replicas.iter().any(|r| {
+            durable.build_epoch == Some(current.configuration.epoch)
+                && durable.retired_builds.contains(&r.build_id)
+        }) {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         let local = &durable.identity.replica;
@@ -1200,7 +1213,7 @@ impl PgReplicator {
         *self.build_cancellation.lock().unwrap() = CancellationToken::new();
         self.durable
             .update(|state| {
-                state.reconcile_builds(&current);
+                state.reconcile_builds(&current)?;
                 if member.is_some() {
                     state.has_accepted_authority = true;
                 }
@@ -1471,7 +1484,7 @@ impl PgReplicator {
             let updated = self
                 .durable
                 .update(|state| {
-                    if state.retired_builds.contains(&request.authority.build_id) {
+                    if state.build_is_terminal(&request.authority) {
                         return Err(crate::durable::PgDurableError::Invalid(
                             "terminal build cannot restart".into(),
                         ));

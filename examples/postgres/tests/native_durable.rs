@@ -82,9 +82,15 @@ async fn cancelled_metadata_commit_publishes_exactly_the_committed_state() {
             .await
             .unwrap()
             .unwrap();
-        assert!(committed.has_accepted_authority);
-        assert_eq!(committed.generation, 2);
+        let committed_before_cancel =
+            stage != postgres_replicated::durable::CommitStage::BeforeRename;
+        assert_eq!(committed.has_accepted_authority, committed_before_cancel);
+        assert_eq!(
+            committed.generation,
+            if committed_before_cancel { 2 } else { 1 }
+        );
         assert_eq!(store.snapshot().await, committed);
+        drop(store);
         let reopened = PgDurableStore::open(&root, durable_identity(1), StorageMode::Established)
             .await
             .unwrap();
