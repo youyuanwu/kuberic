@@ -1,23 +1,17 @@
-//! Private hosting of service-created SF replicators without operation/copy streams.
+//! Private SF lifecycle/effect hosting, independent of operation/copy capability.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
-use async_trait::async_trait;
 use kuberic_protocol::types::{AccessStatus, OperationId, ProcessSessionId, ReplicaIdentity};
-use kuberic_runtime::application::{ClientWrite, Lsn};
-use kuberic_runtime::internal::{PendingReplication, PendingWrite};
-use kuberic_runtime::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 use kuberic_runtime::replicator::{
-    ManagedReplicator, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
-    ReplicaSetQuorumMode, Replicator,
+    PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
+    Replicator,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{BuildAuthority, BuildSelection, DurableBuildProgress};
 use kuberic_runtime_internal::effects::{BuildPostcondition, RuntimeEffectAction, RuntimeSnapshot};
-use kuberic_runtime_internal::transport::{
-    CopyAck, CopyItem, OutboundOperation, ReplicaEndpoint, ReplicationAck, ReplicationItem,
-};
+use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 use super::{RuntimeHost, empty_snapshot};
@@ -558,22 +552,14 @@ impl CustomReplicatorHost {
     }
 }
 
-#[async_trait]
-impl ManagedReplicator for CustomReplicatorHost {
-    async fn attach_interfaces(
-        &self,
-        _: Arc<dyn Replicator>,
-        _: Option<Arc<dyn PrimaryReplicator>>,
-    ) -> Result<()> {
-        Ok(())
-    }
-    async fn complete_open(&self, address: String) -> Result<()> {
+impl CustomReplicatorHost {
+    pub(super) async fn complete_open(&self, address: String) -> Result<()> {
         let mut state = self.state.write().await;
         state.open = true;
         state.replication_address = Some(address);
         Ok(())
     }
-    async fn fence_writes(&self) -> Result<()> {
+    pub(super) async fn fence_writes(&self) -> Result<()> {
         let configuration = self.configuration.read().await.clone();
         if let Some(configuration) = configuration {
             for generation in self.build_generations.write().await.values_mut() {
@@ -591,14 +577,14 @@ impl ManagedReplicator for CustomReplicatorHost {
         )
         .await
     }
-    async fn settle_primary_prefix(&self) -> Result<()> {
+    pub(super) async fn settle_primary_prefix(&self) -> Result<()> {
         self.refresh().await
     }
-    async fn cancel_configuration_work(&self) -> Result<()> {
+    pub(super) async fn cancel_configuration_work(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
         self.fence_writes().await
     }
-    async fn restore_authority(&self) -> Result<()> {
+    pub(super) async fn restore_authority(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
         self.state.write().await.authority = self
             .host()?
@@ -609,13 +595,7 @@ impl ManagedReplicator for CustomReplicatorHost {
         self.configure().await?;
         self.refresh().await
     }
-    async fn recover_pending_writes(&self) -> Result<()> {
-        Ok(())
-    }
-    async fn repair_peer(&self, _: ReplicaIdentity, _: Lsn) -> Result<()> {
-        unavailable()
-    }
-    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
+    pub(super) async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
         let _gate = self.gate.lock().await;
         let host = self.host()?;
         match action {
@@ -761,7 +741,7 @@ impl ManagedReplicator for CustomReplicatorHost {
         }
         Ok(())
     }
-    async fn snapshot(&self) -> RuntimeSnapshot {
+    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
         let mut snapshot = self.state.read().await.clone();
         let receipts = self.receipts.read().await.clone();
         let mut current = Vec::new();
@@ -780,7 +760,7 @@ impl ManagedReplicator for CustomReplicatorHost {
         snapshot.builds = current;
         snapshot
     }
-    async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
+    pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
         let _gate = self.gate.lock().await;
         let mut generations = self.build_generations.write().await;
         let generation = generations.entry(id.clone()).or_default();
@@ -804,28 +784,7 @@ impl ManagedReplicator for CustomReplicatorHost {
         }
         self.configure().await
     }
-    fn abort(&self) {
-        self.control.abort();
-    }
-    async fn begin_write(&self, _: ClientWrite) -> Result<PendingWrite> {
-        unavailable()
-    }
-    async fn accept_acknowledgement(&self, _: ReplicationAck) -> Result<()> {
-        unavailable()
-    }
-    async fn prepare_copy(&self, _: PrepareCopyRequest) -> Result<PreparedCopy> {
-        unavailable()
-    }
-    async fn accept_copy_acknowledgement(&self, _: CopyAck) -> Result<()> {
-        unavailable()
-    }
-    async fn receive_copy_item(&self, _: CopyItem) -> Result<CopyAck> {
-        unavailable()
-    }
-    async fn receive_replication(&self, _: ReplicationItem) -> Result<PendingReplication> {
-        unavailable()
-    }
-    async fn next_outbound(&self) -> Option<OutboundOperation> {
+    pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
         self.receiver.lock().await.recv().await
     }
 }

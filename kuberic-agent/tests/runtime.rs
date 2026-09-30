@@ -3987,6 +3987,8 @@ struct CustomRoleGate {
     released: Notify,
     wait: AtomicBool,
     fail: AtomicBool,
+    configurations: Mutex<Vec<kuberic_runtime::replicator::ReplicaSetConfiguration>>,
+    operations: Mutex<Vec<Bytes>>,
 }
 
 #[async_trait]
@@ -4033,8 +4035,9 @@ impl PrimaryReplicator for CustomRoleGate {
     }
     async fn update_current_replica_set_configuration(
         &self,
-        _: kuberic_runtime::replicator::ReplicaSetConfiguration,
+        configuration: kuberic_runtime::replicator::ReplicaSetConfiguration,
     ) -> Result<()> {
+        self.configurations.lock().unwrap().push(configuration);
         Ok(())
     }
     async fn wait_for_catch_up_quorum(&self, _: ReplicaSetQuorumMode) -> Result<()> {
@@ -4044,6 +4047,32 @@ impl PrimaryReplicator for CustomRoleGate {
         Ok(())
     }
     async fn remove_replica(&self, _: ReplicaId) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StateReplicator for CustomRoleGate {
+    async fn replicate(&self, data: Bytes) -> Result<i64> {
+        let mut operations = self.operations.lock().unwrap();
+        operations.push(data);
+        i64::try_from(operations.len())
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    async fn get_replication_stream(&self) -> Result<OperationStream> {
+        let (sender, stream) = OperationStream::channel(1);
+        sender.close();
+        Ok(stream)
+    }
+
+    async fn get_copy_stream(&self) -> Result<OperationStream> {
+        let (sender, stream) = OperationStream::channel(1);
+        sender.close();
+        Ok(stream)
+    }
+
+    async fn update_replicator_settings(&self, _: ReplicatorSettings) -> Result<()> {
         Ok(())
     }
 }
@@ -4081,6 +4110,236 @@ impl StatefulServiceReplica for CustomRoleService {
         Ok(())
     }
     fn abort(&self) {}
+}
+
+struct StateCapableCustomService {
+    replicator: Arc<CustomRoleGate>,
+    state: Mutex<Option<Arc<dyn StateReplicator>>>,
+}
+
+#[async_trait]
+impl ReplicatorFactory for StateCapableCustomService {
+    async fn create_replicator(
+        &self,
+        _: ReplicatorFactoryContext,
+        _: Option<Arc<dyn StateProvider>>,
+        _: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces> {
+        Ok(ReplicatorInterfaces::primary(
+            self.replicator.clone(),
+            Some(self.replicator.clone()),
+        ))
+    }
+}
+
+#[async_trait]
+impl StatefulServiceReplica for StateCapableCustomService {
+    async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        let interfaces = context
+            .partition
+            .with_factory(self.clone())
+            .create_replicator(None, None)
+            .await?;
+        *self.state.lock().unwrap() = interfaces.state_replicator();
+        Ok(interfaces.replicator())
+    }
+    async fn change_role(&self, _: ReplicaRole) -> Result<RoleChange> {
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+    fn abort(&self) {}
+}
+
+#[tokio::test]
+async fn independent_custom_primary_with_state_capability_keeps_sf_effect_hosting() {
+    let directory = tempfile::tempdir().unwrap();
+    let local = identity(1, "state-capable");
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let control = Arc::new(CustomRoleGate::default());
+    let service = Arc::new(StateCapableCustomService {
+        replicator: control.clone(),
+        state: Mutex::new(None),
+    });
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        service.clone(),
+        store.clone(),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("frozen-copy"),
+            ProcessSessionId::new("state-capable-session"),
+        )
+        .unwrap();
+    let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
+    adapter
+        .execute(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    let state = service
+        .state
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("independent operation capability");
+    let admitted = authority(local.clone(), vec![local.clone()]);
+    adapter
+        .execute(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .configurations
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .configuration,
+        admitted.current_configuration
+    );
+    assert_ne!(
+        runtime.partition_report().await.write_status,
+        AccessStatus::Granted
+    );
+    control.fail.store(true, Ordering::SeqCst);
+    let role = effect(3, RuntimeEffectAction::ChangeRole(ReplicaRole::Primary));
+    assert!(adapter.execute(role.clone()).await.is_err());
+    assert_eq!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .pending_effect
+            .unwrap()
+            .effect,
+        role
+    );
+    assert_ne!(
+        runtime.partition_report().await.write_status,
+        AccessStatus::Granted
+    );
+    adapter.execute(role.clone()).await.unwrap();
+    assert_eq!(
+        adapter.execute(role.clone()).await.unwrap().sequence,
+        role.sequence
+    );
+    adapter
+        .execute(effect(4, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+    adapter
+        .execute(effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.partition_report().await.write_status,
+        AccessStatus::Granted
+    );
+    assert!(runtime.snapshot().await.catch_up_complete);
+    assert_eq!(
+        state
+            .replicate(Bytes::from_static(b"custom-owned"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        *control.operations.lock().unwrap(),
+        vec![Bytes::from_static(b"custom-owned")]
+    );
+    assert!(
+        state
+            .get_copy_stream()
+            .await
+            .unwrap()
+            .get_operation()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .get_replication_stream()
+            .await
+            .unwrap()
+            .get_operation()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let error = match runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("not-default"),
+            data: Bytes::new(),
+        })
+        .await
+    {
+        Ok(_) => panic!("custom operation capability is not the default engine"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("default-engine"));
+    runtime.cancel_configuration_work().await.unwrap();
+    assert!(
+        runtime
+            .bind_replica_session(
+                ResourceUid::new("frozen-copy"),
+                ProcessSessionId::new("replacement")
+            )
+            .is_err()
+    );
+    drop(adapter);
+    runtime.abort();
+    drop(runtime);
+    drop(service);
+    let reopened = Arc::new(
+        SqliteStore::open_existing(SqliteStore::metadata_database_path(directory.path()), None)
+            .unwrap(),
+    );
+    let recovered = Arc::new(CustomRoleGate::default());
+    let runtime = PodRuntime::new(
+        local,
+        Arc::new(StateCapableCustomService {
+            replicator: recovered.clone(),
+            state: Mutex::new(None),
+        }),
+        reopened,
+    );
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("frozen-copy"),
+            ProcessSessionId::new("fresh-host"),
+        )
+        .unwrap();
+    runtime
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            AccessStatus::ReconfigurationPending,
+            AccessStatus::ReconfigurationPending,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.snapshot().await.authority, Some(admitted));
+    assert!(!recovered.configurations.lock().unwrap().is_empty());
+    assert_ne!(
+        runtime.partition_report().await.write_status,
+        AccessStatus::Granted
+    );
 }
 
 #[tokio::test]

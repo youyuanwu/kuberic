@@ -33,11 +33,20 @@ Missing established metadata, corruption, incompatible schema, or identity
 mismatch fails closed instead of creating empty authority. SQLite uses WAL and
 `synchronous=FULL`; the agent is the single writer.
 
-Primary promotion follows the SF host sequence: replicator role, epoch and
-state-provider update, then application role. Abort stops the returned control
+Primary promotion follows the SF host sequence: replicator role and epoch,
+including any provider-specific work that replicator owns, then application role.
+Abort stops the returned control
 before application teardown. The default replicator's managed capability is
 transferred directly into agent registration and is not returned to
 application code.
+
+Lifecycle hosting is selected independently of the optional `StateReplicator`.
+Every independently implemented `PrimaryReplicator` receives the same private
+SF configuration, role, build, catch-up and durable-effect support, whether or
+not it also supplies operation/copy streams. Its application calls that optional
+state capability directly. Only the registered default engine supplies
+`ManagedReplicator` internals for Kuberic's operation transport and write journal;
+custom lifecycle hosting does not implement or impersonate that capability.
 
 The agent now owns fenced `EnsureConfiguration` admission, durable private
 Demote/GetLSN/Catchup/Deactivate/Activate stages, restart-safe runtime effect
