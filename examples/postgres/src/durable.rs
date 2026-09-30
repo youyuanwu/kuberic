@@ -99,6 +99,8 @@ pub struct PgDurableState {
     pub build_epoch: Option<Epoch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_build_epoch: Option<Epoch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery: Option<crate::adapter::recovery::Recovery>,
 }
 
 impl PgDurableState {
@@ -133,6 +135,7 @@ impl PgDurableState {
             outbound_attempts: BTreeMap::new(),
             build_epoch: None,
             retired_build_epoch: None,
+            recovery: None,
         }
     }
 
@@ -166,6 +169,11 @@ impl PgDurableState {
         }
         if let Some(synchronous) = &self.synchronous {
             synchronous.validate().map_err(PgDurableError::Invalid)?;
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery
+                .validate(&expected.replica)
+                .map_err(PgDurableError::Invalid)?;
         }
         if self.outbound_builds.len() + self.suspended_builds.len() > crate::build::MAX_BUILDS {
             return Err(PgDurableError::Invalid("too many native builds".into()));

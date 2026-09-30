@@ -726,10 +726,80 @@ impl PgInstanceManager {
                     .ok_or_else(|| PgError::Process(format!("missing control field {name}")))
             };
             let system = field("Database system identifier:")?.to_owned();
-            let timeline = field("Latest checkpoint's TimeLineID:")?
+            let timeline: u32 = field("Latest checkpoint's TimeLineID:")?
                 .parse()
                 .map_err(|_| PgError::Process("invalid control timeline".into()))?;
+            let recovery_timeline: u32 = field("Min recovery ending loc's timeline:")?
+                .parse()
+                .map_err(|_| PgError::Process("invalid recovery control timeline".into()))?;
+            let timeline = timeline.max(recovery_timeline);
             Ok((system, timeline))
+        }
+        .await;
+        self.complete_generation(&generation, result)
+    }
+
+    pub(crate) async fn retained_wal_boundary(&self) -> Result<i64, PgError> {
+        let generation = self.generation();
+        let result = async {
+            let output = self
+                .command_output(
+                    &generation,
+                    Command::new(self.pg_bin.join("pg_controldata"))
+                        .arg(&self.data_dir)
+                        .env("LC_ALL", "C"),
+                    Some((std::time::Duration::from_secs(2), "pg_controldata")),
+                )
+                .await?;
+            if !output.status.success() {
+                return Err(PgError::command_failed(
+                    "cannot inspect WAL segment size",
+                    &output,
+                ));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let size: u64 = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Bytes per WAL segment:"))
+                .and_then(|value| value.trim().parse().ok())
+                .filter(|size: &u64| {
+                    size.is_power_of_two() && *size >= 1024 * 1024 && *size <= 1024 * 1024 * 1024
+                })
+                .ok_or_else(|| PgError::Process("invalid WAL segment size".into()))?;
+            let mut entries = tokio::fs::read_dir(self.data_dir.join("pg_wal"))
+                .await
+                .map_err(|error| PgError::Process(format!("inspect retained WAL: {error}")))?;
+            let mut oldest = None;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|error| PgError::Process(format!("inspect WAL entry: {error}")))?
+            {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let name = name.strip_suffix(".partial").unwrap_or(name);
+                if name.len() != 24 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let log = u64::from_str_radix(&name[8..16], 16)
+                    .map_err(|error| PgError::Process(error.to_string()))?;
+                let segment = u64::from_str_radix(&name[16..24], 16)
+                    .map_err(|error| PgError::Process(error.to_string()))?;
+                if segment >= (1_u64 << 32) / size {
+                    return Err(PgError::Process("invalid retained WAL segment".into()));
+                }
+                let boundary = log
+                    .checked_mul(1_u64 << 32)
+                    .and_then(|log| {
+                        segment
+                            .checked_mul(size)
+                            .and_then(|segment| log.checked_add(segment))
+                    })
+                    .and_then(|position| i64::try_from(position).ok())
+                    .ok_or_else(|| PgError::Process("retained WAL position overflow".into()))?;
+                oldest = Some(oldest.map_or(boundary, |old: i64| old.min(boundary)));
+            }
+            oldest.ok_or_else(|| PgError::Process("no retained PostgreSQL WAL".into()))
         }
         .await;
         self.complete_generation(&generation, result)
@@ -1055,7 +1125,7 @@ impl PgInstanceManager {
                     "-t",
                     "60",
                 ]),
-                None,
+                Some((std::time::Duration::from_secs(60), "pg_ctl promote")),
             )
             .await?;
 

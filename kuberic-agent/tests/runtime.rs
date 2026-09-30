@@ -3981,6 +3981,286 @@ fn empty_copy_context() -> OperationDataStream {
     Box::pin(stream::empty())
 }
 
+#[derive(Default)]
+struct CustomRoleGate {
+    entered: Notify,
+    released: Notify,
+    wait: AtomicBool,
+    fail: AtomicBool,
+}
+
+#[async_trait]
+impl Replicator for CustomRoleGate {
+    async fn open(&self) -> Result<String> {
+        Ok("custom://role-gate".into())
+    }
+    async fn change_role(&self, _: Epoch, role: ReplicaRole) -> Result<()> {
+        if role == ReplicaRole::Primary && self.wait.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.released.notified().await;
+        }
+        if self.fail.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        Ok(())
+    }
+    async fn update_epoch(&self, _: Epoch) -> Result<()> {
+        Ok(())
+    }
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+    fn abort(&self) {}
+    async fn current_progress(&self) -> Result<i64> {
+        Ok(10)
+    }
+    async fn catch_up_capability(&self) -> Result<i64> {
+        Ok(1)
+    }
+}
+
+#[async_trait]
+impl PrimaryReplicator for CustomRoleGate {
+    async fn on_data_loss(&self) -> Result<bool> {
+        Ok(false)
+    }
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        _: kuberic_runtime::replicator::ReplicaSetConfiguration,
+        _: kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn update_current_replica_set_configuration(
+        &self,
+        _: kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn wait_for_catch_up_quorum(&self, _: ReplicaSetQuorumMode) -> Result<()> {
+        Ok(())
+    }
+    async fn build_replica(&self, _: ReplicaInformation) -> Result<()> {
+        Ok(())
+    }
+    async fn remove_replica(&self, _: ReplicaId) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct CustomRoleService(Arc<CustomRoleGate>);
+
+#[async_trait]
+impl ReplicatorFactory for CustomRoleService {
+    async fn create_replicator(
+        &self,
+        _: ReplicatorFactoryContext,
+        _: Option<Arc<dyn StateProvider>>,
+        _: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces> {
+        Ok(ReplicatorInterfaces::primary(self.0.clone(), None))
+    }
+}
+
+#[async_trait]
+impl StatefulServiceReplica for CustomRoleService {
+    async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        Ok(context
+            .partition
+            .with_factory(self)
+            .create_replicator(None, None)
+            .await?
+            .replicator())
+    }
+    async fn change_role(&self, _: ReplicaRole) -> Result<RoleChange> {
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+    fn abort(&self) {}
+}
+
+#[tokio::test]
+async fn newer_epoch_supersedes_failed_custom_primary_role_without_reusing_its_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let local = identity(1, "superseded-role");
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let gate = Arc::new(CustomRoleGate::default());
+    let runtime = PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(gate.clone())),
+        store,
+    );
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("frozen-copy"),
+            ProcessSessionId::new("role-session"),
+        )
+        .unwrap();
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    let mut admitted = authority(local.clone(), vec![local]);
+    runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        ))
+        .await
+        .unwrap();
+    gate.fail.store(true, Ordering::SeqCst);
+    assert!(
+        runtime
+            .apply_effect(effect(
+                3,
+                RuntimeEffectAction::ChangeRole(ReplicaRole::Primary)
+            ))
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .apply_effect(effect(
+                3,
+                RuntimeEffectAction::ChangeRole(ReplicaRole::None)
+            ))
+            .await
+            .is_err()
+    );
+    let old = admitted.current_configuration;
+    admitted.current_configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        old.primary_id,
+        old.members,
+        old.write_quorum,
+    );
+    runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::AdmitAuthority(Box::new(admitted)),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::None),
+        ))
+        .await
+        .unwrap();
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.role, ReplicaRole::None);
+    assert!(snapshot.role_transition.is_none());
+    assert_ne!(snapshot.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn custom_primary_role_completion_gates_writes_and_replays_only_its_durable_effect() {
+    let directory = tempfile::tempdir().unwrap();
+    let local = identity(1, "custom-role");
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let gate = Arc::new(CustomRoleGate::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(gate.clone())),
+        store.clone(),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("frozen-copy"),
+            ProcessSessionId::new("custom-session"),
+        )
+        .unwrap();
+    let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
+    adapter
+        .execute(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    adapter
+        .execute(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority(local.clone(), vec![local]))),
+        ))
+        .await
+        .unwrap();
+    gate.wait.store(true, Ordering::SeqCst);
+    gate.fail.store(true, Ordering::SeqCst);
+    let change = effect(3, RuntimeEffectAction::ChangeRole(ReplicaRole::Primary));
+    {
+        let execute = adapter.execute(change.clone());
+        tokio::pin!(execute);
+        tokio::select! {
+            result = &mut execute => panic!("role returned before callback completed: {result:?}"),
+            _ = gate.entered.notified() => {}
+        }
+        assert_ne!(
+            runtime.partition_report().await.write_status,
+            AccessStatus::Granted
+        );
+        assert_eq!(
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .pending_effect
+                .unwrap()
+                .effect,
+            change
+        );
+        gate.released.notify_one();
+        assert!(execute.await.is_err());
+    }
+    let reopened =
+        SqliteStore::open_existing(SqliteStore::metadata_database_path(directory.path()), None)
+            .unwrap();
+    assert_eq!(
+        reopened
+            .load_state()
+            .await
+            .unwrap()
+            .pending_effect
+            .unwrap()
+            .effect,
+        change
+    );
+    assert!(
+        adapter
+            .execute(effect(
+                3,
+                RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+            ))
+            .await
+            .is_err()
+    );
+    adapter.execute(change.clone()).await.unwrap();
+    assert!(store.load_state().await.unwrap().pending_effect.is_none());
+    assert_eq!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .retained_result
+            .unwrap()
+            .effect,
+        change
+    );
+    adapter
+        .execute(effect(
+            4,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.partition_report().await.write_status,
+        AccessStatus::Granted
+    );
+}
+
 fn fresh_disk_store(root: &Path, local: ReplicaIdentity) -> Arc<SqliteStore> {
     Arc::new(
         SqliteStore::create_authorized(

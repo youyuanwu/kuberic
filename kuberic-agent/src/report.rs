@@ -29,6 +29,7 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub async fn report(&self, runtime: &PodRuntime) -> Result<proto::AgentStatusReport> {
+        runtime.refresh_custom_progress().await?;
         let partition = runtime.partition_report().await;
         self.store
             .record_partition_reports(partition.load_metrics.clone(), partition.reported_fault)

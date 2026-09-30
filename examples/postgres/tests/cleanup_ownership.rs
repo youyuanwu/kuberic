@@ -140,7 +140,7 @@ async fn queued_cancelled_stop_cannot_touch_a_restarted_generation() {
     replacement.assert_reaped();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn queued_cancelled_fence_cannot_touch_regranted_sql() {
     let root = TestDataDir::new("queue-fence");
     let (instance, _) = manager(root.path()).await;

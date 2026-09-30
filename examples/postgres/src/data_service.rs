@@ -48,6 +48,34 @@ impl PgDataServiceImpl {
 
 #[tonic::async_trait]
 impl PgDataService for PgDataServiceImpl {
+    async fn recover(
+        &self,
+        request: Request<crate::proto::RecoveryRequest>,
+    ) -> Result<Response<crate::proto::RecoveryResponse>, Status> {
+        if self.token.is_empty()
+            || request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                != Some(format!("Bearer {}", self.token).as_str())
+        {
+            return Err(Status::unauthenticated(
+                "invalid PostgreSQL coordination credentials",
+            ));
+        }
+        let request =
+            decode(&request.into_inner().envelope_json).map_err(Status::invalid_argument)?;
+        let observation = self
+            .service
+            .driver()?
+            .recovery_request(request)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(crate::proto::RecoveryResponse {
+            envelope_json: encode(&observation).map_err(Status::internal)?,
+        }))
+    }
+
     async fn build(
         &self,
         request: Request<NativeBuildRequest>,

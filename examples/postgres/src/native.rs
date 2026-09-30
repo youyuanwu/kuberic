@@ -146,6 +146,26 @@ pub struct PolicyGate {
 }
 
 impl PgNativeObserver {
+    pub(crate) async fn write_quorum_present(
+        &self,
+        policy: &AcknowledgementPolicy,
+    ) -> Result<bool, PgError> {
+        let lease = self.instance.generation_lease();
+        self.instance.generation_step(&lease, async {
+            let expected = policy.eligible_standbys.iter().map(|p| replication_application_name(&p.identity, &p.process_session_id))
+                .collect::<BTreeSet<_>>();
+            let (client, connection) = self.instance.connect().await?;
+            let rows = tokio::time::timeout(std::time::Duration::from_secs(5),
+                client.query("SELECT application_name FROM pg_stat_replication WHERE state = 'streaming' AND replay_lsn IS NOT NULL", &[]))
+                .await.map_err(|_| PgError::Timeout("write quorum observation".into()))?
+                .map_err(|error| PgError::Query(error.to_string()))?;
+            let matched = rows.iter().map(|row| row.get::<_, String>(0)).filter(|name| expected.contains(name)).collect::<BTreeSet<_>>();
+            drop(client);
+            connection.await.map_err(|error| PgError::Connection(error.to_string()))?;
+            Ok(matched.len() >= policy.write_acknowledgements as usize)
+        }).await
+    }
+
     #[cfg(feature = "testing")]
     pub fn pause_policy(&self, stage: PolicyStage) -> Arc<PolicyGate> {
         let gate = Arc::new(PolicyGate {
@@ -576,7 +596,8 @@ impl PgNativeObserver {
             .get(0);
         let timeline_id: i32 = client
             .query_one(
-                "SELECT GREATEST(c.timeline_id, r.min_recovery_end_timeline)::int \
+                "SELECT GREATEST(c.timeline_id, r.min_recovery_end_timeline, \
+                    COALESCE((SELECT received_tli FROM pg_stat_wal_receiver LIMIT 1), 0))::int \
                         FROM pg_control_checkpoint() c, pg_control_recovery() r",
                 &[],
             )
@@ -774,10 +795,10 @@ pub fn compile_synchronous_configuration(
     sessions: &BTreeMap<ReplicaIdentity, ProcessSessionId>,
     valid: bool,
 ) -> Result<AcknowledgementPolicy, PgError> {
-    let current_requirement = requirement(current, local)?;
+    let current_requirement = requirement(current, local, true)?;
     let expected = match previous {
         Some(previous) => {
-            let previous_requirement = requirement(previous, local)?;
+            let previous_requirement = requirement(previous, local, false)?;
             match (previous_requirement.1, current_requirement.1) {
                 (0, _) => current_requirement,
                 (_, 0) => previous_requirement,
@@ -903,15 +924,20 @@ pub fn replication_application_name(
 fn requirement(
     configuration: &ConfigurationDescriptor,
     local: &ReplicaIdentity,
+    current: bool,
 ) -> Result<(BTreeSet<ReplicaIdentity>, usize), PgError> {
-    if configuration.primary_id != local.replica_id || configuration.write_quorum == 0 {
+    if (current && configuration.primary_id != local.replica_id) || configuration.write_quorum == 0
+    {
         return Err(PgError::Configuration(
             "synchronous policy requires the exact local primary".into(),
         ));
     }
-    if !configuration.members.iter().any(|member| {
-        member.identity == *local && member.role == kuberic_protocol::types::ReplicaRole::Primary
-    }) {
+    if current
+        && !configuration.members.iter().any(|member| {
+            member.identity == *local
+                && member.role == kuberic_protocol::types::ReplicaRole::Primary
+        })
+    {
         return Err(PgError::Configuration(
             "synchronous policy primary incarnation differs from the local replica".into(),
         ));
@@ -923,7 +949,9 @@ fn requirement(
             .filter(|member| member.identity != *local)
             .map(|member| member.identity.clone())
             .collect(),
-        configuration.write_quorum.saturating_sub(1) as usize,
+        (configuration.write_quorum
+            - u32::from(configuration.members.iter().any(|m| m.identity == *local)))
+            as usize,
     ))
 }
 

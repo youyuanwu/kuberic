@@ -7,8 +7,11 @@ package pgdata.v2;
 service PgDataService {
   rpc Build(NativeBuildRequest) returns (NativeBuildResponse);
   rpc InspectSource(NativeBuildRequest) returns (NativeSourceResponse);
+  rpc Recover(RecoveryRequest) returns (RecoveryResponse);
 }
 
+message RecoveryRequest { bytes envelope_json = 1; }
+message RecoveryResponse { bytes envelope_json = 1; }
 message NativeBuildRequest {
   bytes envelope_json = 1;
 }

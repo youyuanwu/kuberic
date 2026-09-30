@@ -23,6 +23,8 @@ use crate::build::{
 use crate::durable::{PgDurableRole, PgDurableState, PgDurableStore, PgRecoveryState};
 use crate::instance::{PgError, PgInstanceManager};
 use crate::native::{PgNativeObserver, compile_synchronous_configuration, timeline_history_digest};
+#[path = "recovery.rs"]
+pub(crate) mod recovery;
 
 pub(crate) fn application_error(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Application(error.to_string())
@@ -91,6 +93,8 @@ pub struct PgReplicator {
     catch_up_cancellation: std::sync::Mutex<CancellationToken>,
     #[cfg(feature = "testing")]
     build_gate: std::sync::Mutex<Option<Arc<crate::build::BuildGate>>>,
+    #[cfg(feature = "testing")]
+    recovery_gate: std::sync::Mutex<Option<(recovery::RecoveryStage, Arc<recovery::RecoveryGate>)>>,
 }
 
 impl PgReplicator {
@@ -169,6 +173,8 @@ impl PgReplicator {
             catch_up_cancellation: std::sync::Mutex::new(CancellationToken::new()),
             #[cfg(feature = "testing")]
             build_gate: std::sync::Mutex::new(None),
+            #[cfg(feature = "testing")]
+            recovery_gate: std::sync::Mutex::new(None),
             state: Mutex::new(DriverState {
                 authority: None,
                 role: ReplicaRole::None,
@@ -271,6 +277,30 @@ impl PgReplicator {
                     self.peer_session(&member.identity).await?,
                 );
             }
+        }
+        Ok(sessions)
+    }
+
+    async fn policy_sessions(
+        &self,
+        configuration: &ConfigurationDescriptor,
+    ) -> Result<BTreeMap<ReplicaIdentity, kuberic_protocol::types::ProcessSessionId>> {
+        let durable = self.durable.snapshot().await;
+        let mut sessions = BTreeMap::new();
+        for member in &configuration.members {
+            if member.identity == durable.identity.replica {
+                continue;
+            }
+            let session = match self.peer_session(&member.identity).await {
+                Ok(session) => session,
+                Err(RuntimeError::AuthorityNotAdmitted) => {
+                    tracing::debug!(replica = ?member.identity, "using recovery metadata only for a nonvoting peer");
+                    self.nonvoting_recovery_session(configuration, &member.identity)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            sessions.insert(member.identity.clone(), session);
         }
         Ok(sessions)
     }
@@ -764,6 +794,9 @@ impl PgReplicator {
                     .update(|state| {
                         state.recovery_state = PgRecoveryState::Ready;
                         state.postgres_stopped = false;
+                        if let Some(recovery) = &mut state.recovery {
+                            recovery.rebuilt();
+                        }
                         Ok(())
                     })
                     .await
@@ -853,6 +886,13 @@ impl PgReplicator {
             != crate::access::CLOSED
         {
             self.cancel_catch_up();
+            self.durable
+                .update(|state| {
+                    state.catch_up = None;
+                    Ok(())
+                })
+                .await
+                .map_err(application_error)?;
         }
         if self.instance.is_running().await {
             self.pg_result(
@@ -922,6 +962,10 @@ impl PgReplicator {
             state.opened = true;
             return Ok(());
         }
+        if durable.recovery.as_ref().is_some_and(|r| r.former_primary) {
+            state.opened = true;
+            return Ok(());
+        }
         if self.initializing
             && durable.system_identifier.is_none()
             && self
@@ -970,6 +1014,16 @@ impl PgReplicator {
         self.validate().await?;
         match role {
             ReplicaRole::Primary => {
+                if self
+                    .durable
+                    .snapshot()
+                    .await
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|r| r.former_primary)
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
                 let authority = state
                     .authority
                     .as_ref()
@@ -977,17 +1031,40 @@ impl PgReplicator {
                 if authority.current_configuration.epoch != epoch {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
+                if authority.current_configuration.primary_id != authority.local_identity.replica_id
+                {
+                    return Err(RuntimeError::NotPrimary);
+                }
                 self.close_access().await?;
+                if !self.instance.is_running().await
+                    && self.durable.snapshot().await.native_build.is_some()
+                {
+                    self.finish_recovery(self.recover_primary().await).await?;
+                }
                 if self
                     .pg_result(self.observer.snapshot().await)
                     .await?
                     .evidence
                     .is_none_or(|e| e.in_recovery)
+                    || self.recovery_incomplete().await
                 {
-                    return unsupported("promotion");
+                    self.finish_recovery(self.recover_primary().await).await?;
                 }
             }
-            ReplicaRole::None => self.stop().await?,
+            ReplicaRole::None => {
+                if state.role == ReplicaRole::Primary {
+                    self.durable
+                        .update(|durable| {
+                            if let Some(recovery) = &mut durable.recovery {
+                                recovery.former_primary = true;
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .map_err(application_error)?;
+                }
+                self.stop().await?;
+            }
             ReplicaRole::IdleSecondary => self.close_access().await?,
             ReplicaRole::ActiveSecondary => {
                 let authority = state
@@ -1002,7 +1079,11 @@ impl PgReplicator {
                 {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
-                self.close_access().await?;
+                if self.durable.snapshot().await.role == PgDurableRole::Primary {
+                    self.finish_recovery(self.demote_postgres().await).await?;
+                } else {
+                    self.close_access().await?;
+                }
             }
         }
         state.role = role;
@@ -1073,13 +1154,14 @@ impl PgReplicator {
             && write != AccessStatus::Granted
             && state.role == ReplicaRole::ActiveSecondary
         {
-            let build = self
-                .durable
-                .snapshot()
-                .await
+            let durable = self.durable.snapshot().await;
+            if durable
                 .native_build
-                .ok_or(RuntimeError::ReconfigurationPending)?;
-            if build.stage != PgBuildStage::Complete || !self.instance.is_running().await {
+                .as_ref()
+                .is_some_and(|build| build.stage != PgBuildStage::Complete)
+                || durable.role != PgDurableRole::Standby
+                || !self.instance.is_running().await
+            {
                 return self.close_access().await;
             }
             let authority = state
@@ -1118,21 +1200,27 @@ impl PgReplicator {
         }
         let snapshot = self.observe_pg().await?;
         let evidence = snapshot.evidence.ok_or(RuntimeError::NotPrimary)?;
-        let Ok(sessions) = self
-            .current_sessions(&authority.current_configuration)
-            .await
-        else {
-            return self.close_access().await;
+        let Ok(sessions) = self.policy_sessions(&authority.current_configuration).await else {
+            self.close_access().await?;
+            return Err(RuntimeError::ReconfigurationPending);
         };
+        let previous = self
+            .durable
+            .snapshot()
+            .await
+            .recovery
+            .and_then(|r| r.previous);
         let Ok(expected) = compile_synchronous_configuration(
-            None,
+            previous.as_ref(),
             &authority.current_configuration,
             &authority.local_identity,
             &sessions,
             true,
         ) else {
-            return self.close_access().await;
+            self.close_access().await?;
+            return Err(RuntimeError::ReconfigurationPending);
         };
+        let expected = self.recovered_policy(expected).await?;
         if evidence.in_recovery {
             self.close_access().await?;
             return Err(RuntimeError::ReconfigurationPending);
@@ -1141,8 +1229,37 @@ impl PgReplicator {
             // A process replacement invalidates native readback, even when its
             // SF configuration is unchanged. This current grant must reinstall
             // and verify that exact configuration before opening SQL.
-            self.pg_result(self.observer.apply_synchronous(expected).await)
+            self.pg_result(self.observer.apply_synchronous(expected.clone()).await)
                 .await?;
+        }
+        let quorum = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if self
+                    .pg_result(self.observer.write_quorum_present(&expected).await)
+                    .await?
+                {
+                    return Ok::<_, RuntimeError>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        if let Ok(result) = quorum {
+            result?;
+        } else {
+            self.close_access().await?;
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        if let Err(error) = self.publish_recovery_policy().await {
+            self.close_access().await?;
+            if !matches!(
+                error,
+                RuntimeError::AuthorityNotAdmitted | RuntimeError::ReconfigurationPending
+            ) {
+                return Err(self.report(FaultType::Transient, &error).await);
+            }
+            tracing::warn!(%error, "PostgreSQL policy acceptance remains write-closed");
+            return Err(RuntimeError::ReconfigurationPending);
         }
         PgAccessController::new(&self.instance)
             .grant_role_access()
@@ -1163,6 +1280,14 @@ impl PgReplicator {
     }
 
     async fn install_configuration(&self, current: ReplicaSetConfiguration) -> Result<()> {
+        self.install_configuration_pair(current, None).await
+    }
+
+    async fn install_configuration_pair(
+        &self,
+        current: ReplicaSetConfiguration,
+        previous: Option<ConfigurationDescriptor>,
+    ) -> Result<()> {
         kuberic_protocol::validation::validate_configuration(&current.configuration, None)
             .map_err(application_error)?;
         let mut builds = BTreeMap::new();
@@ -1180,7 +1305,15 @@ impl PgReplicator {
             }
         }
         let old = self.configuration.read().await.clone();
-        if self.configuration_applied.read().await.as_ref() == Some(&current) {
+        if self.configuration_applied.read().await.as_ref() == Some(&current)
+            && self
+                .durable
+                .snapshot()
+                .await
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.previous == previous)
+        {
             return Ok(());
         }
         self.cancel_catch_up();
@@ -1216,6 +1349,9 @@ impl PgReplicator {
             .ok_or(RuntimeError::AuthorityNotAdmitted)?
             .process_session_id
             .clone();
+        let recovering_configuration = previous.is_some();
+        self.install_recovery_configuration(&current, previous)
+            .await?;
         self.close_access().await?;
         let member = current
             .configuration
@@ -1248,7 +1384,14 @@ impl PgReplicator {
             let admitted_standby = member.is_some_and(|m| m.role == ReplicaRole::ActiveSecondary)
                 && build.stage == PgBuildStage::Complete
                 && primary.identity == build.request.authority.source;
+            let becoming_primary = member.is_some_and(|m| m.role == ReplicaRole::Primary)
+                && build.stage == PgBuildStage::Complete;
+            let recovering_standby = recovering_configuration
+                && member.is_some()
+                && durable.role == PgDurableRole::Standby;
             if !admitted_standby
+                && !becoming_primary
+                && !recovering_standby
                 && !current
                     .replicas
                     .iter()
@@ -1256,24 +1399,43 @@ impl PgReplicator {
             {
                 self.stop().await?;
             }
-            if admitted_standby
+            if (admitted_standby || becoming_primary)
                 && self.peer_session(&primary.identity).await.is_ok()
                 && !self.instance.is_running().await
             {
-                self.pg_result(
-                    self.instance
-                        .config()
-                        .configure_standby(
-                            self.instance.data_dir(),
-                            &build.request.source_host,
-                            build.request.source_port,
-                            &crate::native::replication_application_name(local, &local_session),
-                            &crate::native::replication_slot_name(local),
-                            &build.request.lineage,
-                        )
-                        .await,
-                )
-                .await?;
+                let recovery_pending = durable
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|r| r.receiver_epoch.is_some() || r.pending.is_some());
+                if !recovery_pending {
+                    self.pg_result(
+                        self.instance
+                            .config()
+                            .configure_standby(
+                                self.instance.data_dir(),
+                                &build.request.source_host,
+                                build.request.source_port,
+                                &crate::native::replication_application_name(local, &local_session),
+                                &crate::native::replication_slot_name(local),
+                                &build.request.lineage,
+                            )
+                            .await,
+                    )
+                    .await?;
+                } else if durable
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|r| r.receiver_epoch.is_some())
+                    && self.instance.data_dir().join("standby.signal").exists()
+                {
+                    self.pg_result(
+                        self.instance
+                            .config()
+                            .disconnect_receiver(self.instance.data_dir())
+                            .await,
+                    )
+                    .await?;
+                }
                 self.pg_result(
                     self.instance
                         .start_native_with_cancellation(
@@ -1283,11 +1445,20 @@ impl PgReplicator {
                         .await,
                 )
                 .await?;
-                self.observe_pg().await?;
+                if self.recovery_progress_inner().await?.is_none() {
+                    self.observe_pg().await?;
+                }
             }
         }
         if member.is_none_or(|m| m.role != ReplicaRole::Primary)
             || !self.instance.is_running().await
+            || self
+                .observer
+                .snapshot()
+                .await
+                .map_err(application_error)?
+                .evidence
+                .is_some_and(|e| e.in_recovery)
         {
             *self.configuration_applied.write().await = Some(current);
             return Ok(());
@@ -1299,7 +1470,7 @@ impl PgReplicator {
         )
         .await?;
         let sessions = self
-            .current_sessions(&current.configuration)
+            .policy_sessions(&current.configuration)
             .await
             .unwrap_or_default();
         let invalid = crate::native::AcknowledgementPolicy {
@@ -1314,8 +1485,19 @@ impl PgReplicator {
         };
         self.pg_result(self.observer.set_synchronous(invalid).await)
             .await?;
-        let synchronous =
-            compile_synchronous_configuration(None, &current.configuration, local, &sessions, true);
+        let previous = self
+            .durable
+            .snapshot()
+            .await
+            .recovery
+            .and_then(|r| r.previous);
+        let synchronous = compile_synchronous_configuration(
+            previous.as_ref(),
+            &current.configuration,
+            local,
+            &sessions,
+            true,
+        );
         // Peer discovery follows process reconstruction. Incomplete current
         // sessions leave access closed, not a failed restart or an old quorum.
         let Ok(synchronous) = synchronous else {
@@ -1342,8 +1524,65 @@ impl PgReplicator {
             .await
             .clone()
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        let required = self.current_sessions(&installed.configuration).await?;
+        let required = match mode {
+            ReplicaSetQuorumMode::All => self.current_sessions(&installed.configuration).await?,
+            ReplicaSetQuorumMode::WriteQuorum => {
+                self.policy_sessions(&installed.configuration).await?
+            }
+        };
         let cancelled = self.catch_up_cancellation.lock().unwrap().clone();
+        if !self
+            .observer
+            .snapshot()
+            .await
+            .map_err(application_error)?
+            .evidence
+            .and_then(|e| e.synchronous)
+            .is_some_and(|p| p.valid)
+        {
+            let local = self.durable.snapshot().await.identity.replica;
+            let previous = self
+                .durable
+                .snapshot()
+                .await
+                .recovery
+                .and_then(|r| r.previous);
+            let policy = compile_synchronous_configuration(
+                previous.as_ref(),
+                &installed.configuration,
+                &local,
+                &required,
+                true,
+            )
+            .map_err(application_error)?;
+            let policy = self.recovered_policy(policy).await?;
+            self.pg_result(self.observer.apply_synchronous(policy).await)
+                .await?;
+        }
+        if mode == ReplicaSetQuorumMode::All && self.durable.snapshot().await.external_access_closed
+        {
+            let lease = self.instance.generation_lease();
+            self.pg_result(
+                self.instance
+                    .generation_step(&lease, async {
+                        let (client, connection) = self.instance.connect().await?;
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            client.simple_query("CHECKPOINT"),
+                        )
+                        .await
+                        .map_err(|_| PgError::Timeout("handoff checkpoint".into()))?
+                        .map_err(|error| PgError::Query(error.to_string()))?;
+                        drop(client);
+                        connection
+                            .await
+                            .map_err(|error| PgError::Connection(error.to_string()))?;
+                        Ok(())
+                    })
+                    .await,
+            )
+            .await?;
+        }
         let snapshot = self.observe_pg().await?;
         let configuration = evidence_configuration(&snapshot)
             .cloned()
@@ -1400,7 +1639,20 @@ impl PgReplicator {
             }
         })
         .await
-        .map_err(|_| application_error("native quorum replay timed out"))?
+        .map_err(|_| application_error("native quorum replay timed out"))??;
+        if mode == ReplicaSetQuorumMode::All {
+            let _state = self.state.lock().await;
+            if self.configuration.read().await.as_ref() != Some(&installed)
+                || cancelled.is_cancelled()
+            {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            if self.durable.snapshot().await.external_access_closed {
+                self.record_handoff_preparation(configuration, boundary)
+                    .await?;
+            }
+        }
+        Ok(())
     }
     async fn retire_build(&self, id: &OperationId) -> Result<()> {
         if self.cancellation.is_cancelled() {
@@ -1628,12 +1880,28 @@ impl Replicator for PgReplicator {
             }
         }
         if !self.instance.is_running().await {
-            return Ok(0);
+            return Ok(
+                if durable.recovery.as_ref().is_some_and(|r| r.former_primary) {
+                    durable.flush_lsn
+                } else {
+                    0
+                },
+            );
         }
-        Ok(self.observe().await?.committed_lsn)
+        if let Some(progress) = self.recovery_progress().await? {
+            return Ok(progress);
+        }
+        let observation = self.observe().await?;
+        Ok(observation
+            .evidence
+            .map_or(observation.current_lsn, |evidence| {
+                evidence.received_lsn.unwrap_or(evidence.flush_lsn)
+            }))
     }
     async fn catch_up_capability(&self) -> Result<i64> {
-        self.current_progress().await
+        let _state = self.state.lock().await;
+        self.pg_result(self.instance.retained_wal_boundary().await)
+            .await
     }
 }
 
@@ -1644,10 +1912,11 @@ impl PrimaryReplicator for PgReplicator {
     }
     async fn update_catch_up_replica_set_configuration(
         &self,
-        _: ReplicaSetConfiguration,
-        _: ReplicaSetConfiguration,
+        current: ReplicaSetConfiguration,
+        previous: ReplicaSetConfiguration,
     ) -> Result<()> {
-        unsupported("reconfiguration")
+        self.install_configuration_pair(current, Some(previous.configuration))
+            .await
     }
     async fn update_current_replica_set_configuration(
         &self,

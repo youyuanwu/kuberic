@@ -37,6 +37,7 @@ pub(super) struct CustomReplicatorHost {
     gate: Mutex<()>,
     state: RwLock<RuntimeSnapshot>,
     sessions: RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>,
+    addresses: RwLock<BTreeMap<ReplicaIdentity, (ProcessSessionId, String)>>,
     retired_sessions: RwLock<BTreeSet<(ReplicaIdentity, ProcessSessionId)>>,
     retired_builds: RwLock<BTreeSet<OperationId>>,
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
@@ -67,6 +68,7 @@ impl CustomReplicatorHost {
             gate: Mutex::new(()),
             state: RwLock::new(snapshot),
             sessions: RwLock::default(),
+            addresses: RwLock::default(),
             retired_sessions: RwLock::default(),
             retired_builds: RwLock::default(),
             build_generations: RwLock::default(),
@@ -83,6 +85,29 @@ impl CustomReplicatorHost {
             return Err(RuntimeError::Closed);
         }
         Ok(host)
+    }
+
+    pub(super) async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
+        self.execute_action(RuntimeEffectAction::RegisterPeerSession {
+            identity: replica.identity.clone(),
+            session: replica.process_session_id.clone(),
+        })
+        .await?;
+        let _gate = self.gate.lock().await;
+        if self.sessions.read().await.get(&replica.identity) != Some(&replica.process_session_id) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if replica.replication_address.is_empty() || replica.replication_address.len() > 512 {
+            return Err(RuntimeError::InvalidReplication(
+                "invalid replica address".into(),
+            ));
+        }
+        let value = (replica.process_session_id, replica.replication_address);
+        if self.addresses.read().await.get(&replica.identity) == Some(&value) {
+            return Ok(());
+        }
+        self.addresses.write().await.insert(replica.identity, value);
+        self.configure().await
     }
 
     pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
@@ -187,6 +212,7 @@ impl CustomReplicatorHost {
             .replication_address
             .clone()
             .unwrap_or_default();
+        let addresses = self.addresses.read().await.clone();
         let mut replicas = configuration
             .members
             .iter()
@@ -200,6 +226,10 @@ impl CustomReplicatorHost {
                 replica.process_session_id =
                     sessions.get(&member.identity).cloned().unwrap_or_default();
                 if member.identity == host.identity {
+                    replica.replication_address = address.clone();
+                } else if let Some((session, address)) = addresses.get(&member.identity)
+                    && session == &replica.process_session_id
+                {
                     replica.replication_address = address.clone();
                 }
                 replica
@@ -272,7 +302,22 @@ impl CustomReplicatorHost {
 
     async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         let host = self.host()?;
+        let faulted_grant = (read == AccessStatus::Granted || write == AccessStatus::Granted)
+            && host.state.read().await.reported_fault.is_some();
+        let (read, write) = if faulted_grant {
+            (
+                AccessStatus::ReconfigurationPending,
+                AccessStatus::ReconfigurationPending,
+            )
+        } else {
+            (read, write)
+        };
         if write == AccessStatus::Granted {
+            if host.state.read().await.fallback_snapshot.role
+                != kuberic_protocol::types::ReplicaRole::Primary
+            {
+                return Err(RuntimeError::NotPrimary);
+            }
             let state = self.state.read().await;
             let authority = state
                 .authority
@@ -304,13 +349,20 @@ impl CustomReplicatorHost {
             state.read_status = AccessStatus::ReconfigurationPending;
             state.write_status = AccessStatus::ReconfigurationPending;
             drop(state);
+            if matches!(error, RuntimeError::ReconfigurationPending) {
+                return Err(error);
+            }
             self.control.abort();
             return Err(error);
         }
         let mut state = self.state.write().await;
         state.read_status = read;
         state.write_status = write;
-        Ok(())
+        if faulted_grant {
+            Err(RuntimeError::ReconfigurationPending)
+        } else {
+            Ok(())
+        }
     }
 
     async fn record_completion(&self, receipt: BuildReceipt) -> Result<()> {
@@ -395,7 +447,20 @@ impl CustomReplicatorHost {
             Some(selection) => self.receipt(&selection.authority).await.ok(),
             None => None,
         };
-        let progress = self.control.current_progress().await?;
+        let progress = match self.control.current_progress().await {
+            Ok(progress) => progress,
+            Err(RuntimeError::ReconfigurationPending) => {
+                let mut state = self.state.write().await;
+                state.read_status = AccessStatus::ReconfigurationPending;
+                state.write_status = AccessStatus::ReconfigurationPending;
+                drop(state);
+                let mut state = host.state.write().await;
+                state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
+                state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+                return Err(RuntimeError::ReconfigurationPending);
+            }
+            Err(error) => return Err(error),
+        };
         if progress < 0 {
             return Err(RuntimeError::InvalidReplication(
                 "negative custom replicator progress".into(),
@@ -431,6 +496,7 @@ impl CustomReplicatorHost {
         state.current_progress = progress;
         state.committed_lsn = progress;
         state.current_configuration_quorum_progress = progress;
+        state.verified_replication_lsn = state.authority.as_ref().map(|_| progress);
         Ok(())
     }
 
@@ -644,6 +710,51 @@ impl ManagedReplicator for CustomReplicatorHost {
                 let mut state = self.state.write().await;
                 state.catch_up_boundary = Some(boundary);
                 state.catch_up_complete = true;
+            }
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
+                let progress = self.control.current_progress().await?;
+                if progress < boundary {
+                    return Err(RuntimeError::ReconfigurationPending);
+                }
+                self.state.write().await.verified_replication_lsn = Some(boundary);
+            }
+            RuntimeEffectAction::PrepareSwitchover {
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+                ..
+            } => {
+                let authority = self
+                    .state
+                    .read()
+                    .await
+                    .authority
+                    .clone()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                if source != host.identity
+                    || authority.current_configuration.configuration_id != starting_configuration_id
+                    || authority.current_configuration.epoch != starting_epoch
+                    || !authority
+                        .current_configuration
+                        .members
+                        .iter()
+                        .any(|m| m.identity == target)
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                self.primary
+                    .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+                    .await?;
+                self.set_access(
+                    AccessStatus::ReconfigurationPending,
+                    AccessStatus::ReconfigurationPending,
+                )
+                .await?;
+                self.primary
+                    .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+                    .await?;
+                self.refresh().await?;
             }
             RuntimeEffectAction::RefreshApplicationProgress => self.refresh().await?,
             _ => return unavailable(),

@@ -222,9 +222,10 @@ impl OwnedProcess {
         let mut pass_size = 0;
         while index < self.processes.len() {
             if Instant::now() >= deadline {
-                return Err(io::Error::other(
-                    "owned PostgreSQL tree discovery timed out",
-                ));
+                return Err(io::Error::other(format!(
+                    "owned PostgreSQL tree discovery timed out at {index}/{} processes",
+                    self.processes.len()
+                )));
             }
             let process = &self.processes[index];
             if !process.exited()? {
@@ -247,9 +248,11 @@ impl OwnedProcess {
                         let ids = std::fs::read_to_string(task.path().join("children"))?;
                         for pid in ids.split_whitespace() {
                             if Instant::now() >= deadline {
-                                return Err(io::Error::other(
-                                    "owned PostgreSQL tree discovery timed out",
-                                ));
+                                return Err(io::Error::other(format!(
+                                    "owned PostgreSQL tree discovery timed out while scanning {} at {index}/{} processes",
+                                    process.pid,
+                                    self.processes.len()
+                                )));
                             }
                             let pid = pid.parse().map_err(io::Error::other)?;
                             if known.insert(pid) {

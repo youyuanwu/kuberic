@@ -111,6 +111,7 @@ struct HostState {
     partition_information: PartitionInformation,
     load_metrics: BTreeMap<String, i64>,
     reported_fault: Option<FaultType>,
+    role_transition_epoch: Option<Epoch>,
 }
 
 struct RegisteredReplicator {
@@ -240,6 +241,7 @@ impl PodRuntime {
                     partition_information,
                     load_metrics: BTreeMap::new(),
                     reported_fault: None,
+                    role_transition_epoch: None,
                 }),
                 effect_lock: Mutex::new(()),
                 registered: OnceLock::new(),
@@ -564,6 +566,28 @@ impl PodRuntime {
         if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
             custom
                 .execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn describe_custom_peer(
+        &self,
+        replica: kuberic_runtime::replicator::ReplicaInformation,
+    ) -> Result<()> {
+        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
+            custom.describe_peer(replica).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_custom_progress(&self) -> Result<()> {
+        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
+            if !custom.snapshot().await.open {
+                return Ok(());
+            }
+            custom
+                .execute_action(RuntimeEffectAction::RefreshApplicationProgress)
                 .await?;
         }
         Ok(())
@@ -1315,6 +1339,9 @@ impl RuntimeHost {
         let transition = {
             let mut state = self.state.write().await;
             state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+            if state.role_transition_epoch.is_some_and(|old| epoch > old) {
+                state.fallback_snapshot.role_transition = None;
+            }
             if let Some(transition) = state.fallback_snapshot.role_transition.clone() {
                 if transition.target_role != role {
                     return Err(RuntimeError::ReconfigurationPending);
@@ -1329,6 +1356,7 @@ impl RuntimeHost {
                     application_completed: false,
                 };
                 state.fallback_snapshot.role_transition = Some(transition.clone());
+                state.role_transition_epoch = Some(epoch);
                 transition
             }
         };

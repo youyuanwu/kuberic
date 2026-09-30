@@ -909,6 +909,15 @@ fn startup_write_status(
 fn startup_transition(
     state: &AgentState,
 ) -> Option<(kuberic_protocol::types::ReplicaRole, bool, bool)> {
+    if let Some(pending) = &state.pending_effect {
+        match pending.effect.action {
+            kuberic_runtime_internal::effects::RuntimeEffectAction::ChangeRole(role)
+            | kuberic_runtime_internal::effects::RuntimeEffectAction::ChangeReplicatorRole(role) => {
+                return Some((role, false, false));
+            }
+            _ => {}
+        }
+    }
     let record = state.reconfiguration.as_ref()?;
     let target_role = record
         .command

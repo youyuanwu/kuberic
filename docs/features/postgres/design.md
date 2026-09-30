@@ -5,18 +5,73 @@ A PostgreSQL database hosted by the v2 `ReplicaHost`. Its service creates a
 `StatefulServiceReplica::open`. PostgreSQL owns SQL and WAL; its
 `ReplicatorInterfaces` has no operation/copy `StateReplicator` or `StateProvider`.
 
-> **V2 migration status (native build/recovery):** The existing
+> **V2 migration status (custom replication):** The existing
 > `postgres-replicated` package no longer depends on the classic runtime or
 > operator. Supported operations are authorized singleton initialization,
 > restart, read/write access, fencing, exact native secondary builds, replay
-> catch-up, and interrupted-build recovery. Failover, switchover and
-> scaling orchestration remain disabled; the broader
+> catch-up, interrupted-build recovery, failover and planned switchover.
+> Scaling orchestration remains outside this phase; the broader
 > architecture below remains historical/planned until those phases ship.
 > Ordinary application clients use the managed
 > `kuberic_app` non-superuser role with `synchronous_commit=remote_apply`;
 > clients that deliberately override that durability setting are outside the
 > acknowledged-data guarantee. Validation is unit/host-local only and adds no
 > KinD dependency.
+
+## SF failover and planned handoff
+
+The existing `Replicator` and `PrimaryReplicator` callbacks remain the only
+application extension point. Generic hosting installs exact replica addresses,
+sessions, PC/CC and epoch descriptions, journals role/catch-up effects, and
+withholds partition write access until the primary-role callback completes.
+Neither agent reports nor controller fields contain PostgreSQL policy generations,
+receiver receipts or lineage. `GetCurrentProgress` reports the durable WAL end
+for ordering, not replay completion; catch-up capability reports the beginning
+of locally retained WAL segments. See the
+[SF callback reference](../../background/service-fabric/references.md) and
+[reconfiguration ordering](../../background/service-fabric/failover.md).
+The generic custom-host scalar projections are not PostgreSQL replay receipts;
+successful recovery/catch-up callbacks, not those projections, authorize readiness.
+
+PostgreSQL's bounded, authenticated `pgdata.v2` recovery messages validate the
+locally installed resource, epoch/configuration, exact sender/receiver identity
+and process sessions. The custom replicator durably distributes an invalid
+policy before accepting fresh native apply/readback, and does not grant SQL
+until every eligible exact standby has accepted the matched policy.
+
+`ChangeRole(Primary)` owns two recovery rounds. A strict `R + W > N` initial
+responder set is journaled before receiver drain. Each responder persists its
+revocation, removes old-primary connection settings, verifies receiver exit,
+retains received/replay progress, and restarts closed. The final round must
+match those exact sessions, policy and compatible lineage. Selection orders
+received WAL, replay WAL, then exact identity. An unsafe/non-selected candidate
+refuses activation; it never treats a scalar rank as recovery proof. The
+selected candidate replays the selected boundary, promotes, checkpoints and
+revalidates lineage before completing its callback. Surviving exact responders
+follow the promoted timeline; former primaries require an authorized rewind or
+fresh build and remain stopped in the meantime.
+
+Planned preparation uses the existing two catch-up calls (`All`) around access
+revocation. Source demotion checkpoints and persists a handoff intent, performs
+verified owned shutdown, and distributes its durable stopped receipt before
+returning. Target recovery revalidates that receipt and its replay boundary.
+The generic platform persists only the successful SF callback/effect receipt.
+
+All recovery journals use the existing checksummed, generation-serialized store.
+Cancellation cannot grant access; replay revalidates installed sessions and
+lineage, including a promotion interrupted before metadata publication.
+Fresh-session recovery cannot reuse old receiver or election credit. Lost
+quorum keeps writes closed. A transaction already accepted locally but waiting
+for synchronous acknowledgement has an **unknown outcome** after disconnect;
+tests do not claim it rolled back. Writes attempted after a completed stop fence
+are definitively rejected and their unique rows remain absent.
+
+API unreachability is not proof that an old primary process was terminated.
+Draining an intersecting responder set prevents further supported synchronous
+acknowledgements; an explicit completed stop fence proves ordinary and retained
+administrative connections are disconnected. Clients intentionally changing
+durability settings and independently surviving orphan database processes are
+outside the managed acknowledgement contract.
 
 ## Running the singleton host
 

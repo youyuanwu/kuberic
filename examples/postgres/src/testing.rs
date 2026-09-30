@@ -303,6 +303,15 @@ impl PgPod {
         })
         .await
         .unwrap();
+        let mut description = ReplicaInformation::new(
+            OperationId::default(),
+            other.identity.clone(),
+            other.endpoint.clone(),
+        );
+        description.process_session_id = other.session.clone();
+        kuberic_agent::testing::describe_custom_peer(&self.runtime, description)
+            .await
+            .unwrap();
     }
 
     pub async fn authorize(&self, target: &Self, id: &str) -> BuildAuthority {
@@ -796,3 +805,4 @@ pub async fn allocate_port() -> u16 {
         }
     }
 }
+pub use crate::adapter::recovery::{RecoveryGate, RecoveryStage};

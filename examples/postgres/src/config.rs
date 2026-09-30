@@ -13,6 +13,24 @@ pub struct PgConfig {
 }
 
 impl PgConfig {
+    pub(crate) async fn disconnect_receiver(&self, data_dir: &Path) -> Result<(), PgError> {
+        let path = data_dir.join("postgresql.auto.conf");
+        let content = tokio::fs::read_to_string(&path).await.map_err(|error| {
+            PgError::Configuration(format!("read receiver configuration: {error}"))
+        })?;
+        let mut lines = content
+            .lines()
+            .filter(|line| {
+                !line.split_once('=').is_some_and(|(key, _)| {
+                    matches!(key.trim(), "primary_conninfo" | "primary_slot_name")
+                })
+            })
+            .collect::<Vec<_>>();
+        lines.push("primary_conninfo = ''");
+        lines.push("primary_slot_name = ''");
+        Self::replace_config(&path, &(lines.join("\n") + "\n")).await
+    }
+
     pub fn new(port: u16, data_dir: &Path) -> Self {
         Self {
             port,

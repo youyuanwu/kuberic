@@ -162,6 +162,7 @@ where
             .map_err(|_| AgentError::SessionRejected("peer status request timed out".into()))?
             .map_err(|error| AgentError::SessionRejected(error.to_string()))?
             .into_inner();
+        let address = report.replication_address.clone();
         let AgentObservation::Report(report) = kuberic_wire::normalize_agent_status_report(report)
             .map_err(|error| AgentError::SessionRejected(error.to_string()))?
         else {
@@ -173,6 +174,15 @@ where
             return Err(AgentError::SessionRejected(
                 "peer status returned another exact identity".into(),
             ));
+        }
+        if !address.is_empty() {
+            let mut description = kuberic_runtime::replicator::ReplicaInformation::new(
+                kuberic_protocol::types::OperationId::default(),
+                receiver.clone(),
+                address,
+            );
+            description.process_session_id = report.process_session_id.clone();
+            self.runtime.describe_custom_peer(description).await?;
         }
         Ok(*report)
     }
