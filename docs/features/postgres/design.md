@@ -73,6 +73,22 @@ administrative connections are disconnected. Clients intentionally changing
 durability settings and independently surviving orphan database processes are
 outside the managed acknowledgement contract.
 
+### Host-local failover and restart tests
+
+```sh
+cargo test -p postgres-replicated --all-features --test failover -- --test-threads=1
+```
+
+The fixture owns its explicit 16 MiB thread stack, following `process_host.rs`;
+the command does not require `RUST_MIN_STACK` or other runner overrides.
+Planned-handoff tests drop the old service and metadata owner, reopen the same
+agent/application files with a fresh session, and reconstruct through the real
+agent service. Source cuts cover pre-fence, authority installation, fence intent,
+durable shutdown, and completed demotion. Target cuts cover authority installation,
+promotion, completed activation, and a granted/acknowledged write. Each cut checks
+the exact retained/pending journal, disconnected old clients, continued closure
+without fresh admission, and preserved acknowledged rows on a surviving replica.
+
 ## Running the singleton host
 
 Install local PostgreSQL binaries and run as an unprivileged OS account:
