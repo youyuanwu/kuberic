@@ -543,12 +543,24 @@ impl PodRuntime {
                     )))
                     .await?;
             }
-            managed
-                .execute_action(RuntimeEffectAction::SetAccessStatus {
-                    read: read_status,
-                    write: write_status,
-                })
-                .await?;
+            match &managed {
+                HostedLifecycle::ServicePrimary(custom) => {
+                    match custom.restore_access(read_status, write_status).await {
+                        Err(RuntimeError::ReconfigurationPending) => {
+                            tracing::info!("custom replica access restoration deferred");
+                        }
+                        result => result?,
+                    }
+                }
+                HostedLifecycle::DefaultEngine(_) => {
+                    managed
+                        .execute_action(RuntimeEffectAction::SetAccessStatus {
+                            read: read_status,
+                            write: write_status,
+                        })
+                        .await?;
+                }
+            }
             self.host
                 .sync_access_projection(managed.snapshot().await)
                 .await;

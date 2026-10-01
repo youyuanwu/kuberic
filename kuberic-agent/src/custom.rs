@@ -39,6 +39,7 @@ pub(super) struct CustomReplicatorHost {
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
+    restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
     outbound: mpsc::Sender<OutboundOperation>,
@@ -72,6 +73,7 @@ impl CustomReplicatorHost {
             build_generations: RwLock::default(),
             receipts: RwLock::default(),
             configuration: RwLock::default(),
+            restored_access: RwLock::default(),
             removal_witnesses: RwLock::default(),
             outbound,
             receiver: Mutex::new(receiver),
@@ -481,6 +483,11 @@ impl CustomReplicatorHost {
 
     async fn refresh(&self) -> Result<()> {
         let host = self.host()?;
+        let restored = *self.restored_access.read().await;
+        if let Some((read, write)) = restored {
+            self.set_access(read, write).await?;
+            *self.restored_access.write().await = None;
+        }
         let incoming = match host
             .default_dependencies
             .build_authority_store
@@ -602,6 +609,21 @@ impl CustomReplicatorHost {
 }
 
 impl CustomReplicatorHost {
+    pub(super) async fn restore_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        let result = self.set_access(read, write).await;
+        if matches!(result, Err(RuntimeError::ReconfigurationPending)) {
+            // Retain the durable intent, not a successful effect receipt. Progress
+            // reconciliation retries it until discovery/application readiness converge.
+            *self.restored_access.write().await = Some((read, write));
+        }
+        result
+    }
+
     pub(super) async fn complete_open(&self, address: String) -> Result<()> {
         let mut state = self.state.write().await;
         state.open = true;
@@ -609,6 +631,7 @@ impl CustomReplicatorHost {
         Ok(())
     }
     pub(super) async fn fence_writes(&self) -> Result<()> {
+        *self.restored_access.write().await = None;
         self.removal_witnesses.write().await.clear();
         let configuration = self.configuration.read().await.clone();
         if let Some(configuration) = configuration {
@@ -765,13 +788,16 @@ impl CustomReplicatorHost {
                 self.refresh().await?;
             }
             RuntimeEffectAction::SetAccessStatus { read, write } => {
+                *self.restored_access.write().await = None;
                 self.set_access(read, write).await?
             }
             RuntimeEffectAction::SetReadStatus(read) => {
+                *self.restored_access.write().await = None;
                 let write = self.state.read().await.write_status;
                 self.set_access(read, write).await?;
             }
             RuntimeEffectAction::SetWriteStatus(write) => {
+                *self.restored_access.write().await = None;
                 let read = self.state.read().await.read_status;
                 self.set_access(read, write).await?;
             }
@@ -855,6 +881,7 @@ impl CustomReplicatorHost {
                 self.accept_removal(command.committed, true).await?;
             }
             RuntimeEffectAction::FenceRetirement(retired) => {
+                *self.restored_access.write().await = None;
                 retired.validate(&host.identity)?;
                 host.default_dependencies
                     .replica_authority_store

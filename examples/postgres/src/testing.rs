@@ -85,6 +85,15 @@ impl PgPod {
     }
 
     pub async fn with_bin(root: PathBuf, identity: ReplicaIdentity, pg_bin: PathBuf) -> Self {
+        Self::create(root, identity, pg_bin, true).await
+    }
+
+    async fn create(
+        root: PathBuf,
+        identity: ReplicaIdentity,
+        pg_bin: PathBuf,
+        fixture_reconstruction: bool,
+    ) -> Self {
         let path = SqliteStore::metadata_database_path(&root);
         let existing = path.exists();
         let store = Arc::new(if existing {
@@ -161,7 +170,9 @@ impl PgPod {
             endpoint,
             server,
         };
-        if existing {
+        if !fixture_reconstruction {
+            return pod;
+        } else if existing {
             let state = pod.store.load_state().await.unwrap();
             pod.runtime
                 .reconstruct(
@@ -444,6 +455,24 @@ impl PgPod {
         let pod = Self::new(root, identity).await;
         assert_ne!(pod.session, old);
         pod
+    }
+
+    pub async fn reopen_with_agent(self) -> (Self, std::net::SocketAddr) {
+        let identity = self.identity.clone();
+        let root = self.root.clone();
+        let old = self.session.clone();
+        self.runtime.abort();
+        drop(self);
+        let mut pod = Self::create(root, identity, find_pg_bin(), false).await;
+        assert_ne!(pod.session, old);
+        let address = pod.start_control().await;
+        (pod, address)
+    }
+
+    pub async fn status(&self) -> kuberic_agent::Result<kuberic_wire::proto::AgentStatusReport> {
+        kuberic_agent::report::AgentReporter::new(self.store.clone())
+            .report(&self.runtime)
+            .await
     }
 
     /// Models pre-existing promoted storage; promotion orchestration is deliberately

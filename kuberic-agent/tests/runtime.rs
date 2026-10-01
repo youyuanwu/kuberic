@@ -3987,6 +3987,8 @@ struct CustomRoleGate {
     released: Notify,
     wait: AtomicBool,
     fail: AtomicBool,
+    grant_error: AtomicUsize,
+    partition: Mutex<Option<StatefulServicePartition>>,
     configurations: Mutex<Vec<kuberic_runtime::replicator::ReplicaSetConfiguration>>,
     operations: Mutex<Vec<Bytes>>,
     catchups: Mutex<Vec<ReplicaSetQuorumMode>>,
@@ -4015,6 +4017,17 @@ impl Replicator for CustomRoleGate {
     }
     fn abort(&self) {}
     async fn current_progress(&self) -> Result<i64> {
+        let partition = self.partition.lock().unwrap().clone();
+        if let Some(partition) = partition
+            && partition.get_write_status().await? == AccessStatus::Granted
+        {
+            match self.grant_error.load(Ordering::SeqCst) {
+                1 => return Err(RuntimeError::ReconfigurationPending),
+                2 => return Err(RuntimeError::Application("grant failed".into())),
+                3 => return Err(RuntimeError::OperationCancelled),
+                _ => {}
+            }
+        }
         Ok(10)
     }
     async fn catch_up_capability(&self) -> Result<i64> {
@@ -4268,6 +4281,7 @@ impl ReplicatorFactory for CustomRoleService {
 #[async_trait]
 impl StatefulServiceReplica for CustomRoleService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        *self.0.partition.lock().unwrap() = Some(context.partition.clone());
         Ok(context
             .partition
             .with_factory(self)
@@ -4284,6 +4298,101 @@ impl StatefulServiceReplica for CustomRoleService {
         Ok(())
     }
     fn abort(&self) {}
+}
+
+#[tokio::test]
+async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it() {
+    for (error, supersede) in [(1, false), (1, true), (2, false), (3, false)] {
+        let directory = tempfile::tempdir().unwrap();
+        let local = identity(1, "restore-access");
+        let store = fresh_disk_store(directory.path(), local.clone());
+        let old = Arc::new(PodRuntime::new(
+            local.clone(),
+            Arc::new(CustomRoleService(Arc::new(CustomRoleGate::default()))),
+            store.clone(),
+        ));
+        old.bind_replica_session(
+            ResourceUid::new("frozen-copy"),
+            ProcessSessionId::new("old"),
+        )
+        .unwrap();
+        let adapter = RuntimeAdapter::new(store.clone(), old.clone());
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::New),
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+                local.clone(),
+                vec![local.clone()],
+            ))),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            adapter
+                .execute(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+        old.abort();
+        let gate = Arc::new(CustomRoleGate::default());
+        gate.grant_error.store(error, Ordering::SeqCst);
+        let runtime = Arc::new(PodRuntime::new(
+            local,
+            Arc::new(CustomRoleService(gate.clone())),
+            store.clone(),
+        ));
+        let agent =
+            AgentService::new(store.clone(), runtime.clone(), runtime.clone(), "token").unwrap();
+        let startup = agent.reconstruct_runtime().await;
+        if error != 1 {
+            assert!(matches!(
+                startup,
+                Err(kuberic_agent::AgentError::Runtime(
+                    RuntimeError::Application(_)
+                )) | Err(kuberic_agent::AgentError::Runtime(
+                    RuntimeError::OperationCancelled
+                ))
+            ));
+            continue;
+        }
+        startup.unwrap();
+        let reporter = kuberic_agent::report::AgentReporter::new(store.clone());
+        let report = reporter.report(&runtime).await.unwrap();
+        assert_eq!(
+            report.write_status,
+            proto::AccessStatus::ReconfigurationPending as i32
+        );
+        assert_eq!(
+            store.load_state().await.unwrap().write_status,
+            AccessStatus::Granted
+        );
+        if supersede {
+            RuntimeAdapter::new(store.clone(), runtime.clone())
+                .execute(effect(
+                    5,
+                    RuntimeEffectAction::SetAccessStatus {
+                        read: AccessStatus::ReconfigurationPending,
+                        write: AccessStatus::ReconfigurationPending,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        gate.grant_error.store(0, Ordering::SeqCst);
+        let report = reporter.report(&runtime).await.unwrap();
+        assert_eq!(
+            report.write_status,
+            if supersede {
+                proto::AccessStatus::ReconfigurationPending
+            } else {
+                proto::AccessStatus::Granted
+            } as i32
+        );
+    }
 }
 
 struct StateCapableCustomService {

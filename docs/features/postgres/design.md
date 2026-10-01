@@ -184,6 +184,13 @@ ambiguous evidence fail closed with explicit faults.
 
 Application-only and whole-agent-host restart reconstruct durable state with
 fresh sessions. Accepted standbys wait for validated current source connections.
+On whole-agent restart a persisted custom-replicator grant remains desired, not
+immediately effective: transient access reconciliation keeps the control service
+live and reports access pending while application SQL stays closed. Progress/status
+reconciliation retries that grant only under the restored authority until exact
+peer discovery, native policy readback and acknowledgement availability converge.
+New access/authority fencing supersedes the deferred grant; other startup errors
+remain fatal. The default replication engine's restart behavior is unchanged.
 Lost quorum closes writes without discarding acknowledged data; accepted
 secondary reads remain possible. Restoration requires fresh evidence and native
 policy readback, not old scalar journals.

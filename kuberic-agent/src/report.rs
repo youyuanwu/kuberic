@@ -29,7 +29,11 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub async fn report(&self, runtime: &PodRuntime) -> Result<proto::AgentStatusReport> {
-        runtime.refresh_custom_progress().await?;
+        if let Err(error) = runtime.refresh_custom_progress().await
+            && !matches!(error, kuberic_runtime::RuntimeError::ReconfigurationPending)
+        {
+            return Err(error.into());
+        }
         let partition = runtime.partition_report().await;
         self.store
             .record_partition_reports(partition.load_metrics.clone(), partition.reported_fault)
@@ -213,9 +217,15 @@ fn snapshot_matches_state(
         }
         None => state.previous_configuration.is_none() && state.current_configuration.is_none(),
     };
+    let access_matches = |projected, desired| {
+        projected == desired
+            || (snapshot.live_builds_only
+                && projected == AccessStatus::ReconfigurationPending
+                && desired == AccessStatus::Granted)
+    };
     snapshot.role == state.role
-        && snapshot.read_status == state.read_status
-        && snapshot.write_status == state.write_status
+        && access_matches(snapshot.read_status, state.read_status)
+        && access_matches(snapshot.write_status, state.write_status)
         && authority_matches
         && snapshot.retired_authority == state.retired_authority
 }
