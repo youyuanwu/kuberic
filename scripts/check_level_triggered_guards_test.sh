@@ -326,6 +326,7 @@ unit_error = "Test PostgreSQL unit and host-local subprocess suites: run must be
 deployment_error = "PostgreSQL fresh deployment must declare exactly protocol 9 / agent schema 5"
 live_recipe = "level-triggered-images: verify-kind-context"
 default_cargo_error = "Implicit/default workspace Cargo execution must not enter live recipe level-triggered-images"
+direct_command_error = "Live commands must be direct and statically inspectable"
 cases = (
     ("missing unit command", workflow, unit_command, "true", unit_error),
     ("disabled unit step", workflow, unit_step, unit_step + "\n        if: ${{ false }}",
@@ -433,6 +434,67 @@ cases += (
      live_recipe + '\n    cargo test --package="$package"',
      "Unresolved live Cargo package selection"),
 )
+cases += tuple(
+    (f"unsupported live evaluation {command}", "justfile", live_recipe,
+     live_recipe + "\n    " + command, direct_command_error)
+    for command in (
+        "eval 'cargo test'",
+        "@eval\t'cargo test'",
+        "command eval 'cargo test'",
+        "command -p -- eval 'cargo test'",
+        "builtin eval 'cargo test'",
+        "true;eval 'cargo test'",
+        "true&&eval 'cargo test'",
+        "false||eval 'cargo test'",
+        "eval \\\n        'cargo test'",
+        "bash -c 'cargo check'",
+        "sh -c 'cargo test'",
+        "/bin/bash -euc 'cargo check'",
+        "bash --noprofile --norc -c 'cargo check'",
+        "command bash -c 'cargo check'",
+        "env MODE=ci bash -c 'cargo check'",
+        "env -i MODE=ci /bin/sh -ec 'cargo test'",
+        "@env\tMODE=ci\tbash\t-c\t'cargo check'",
+        "bash \\\n        -c 'cargo check'",
+        "busybox sh -c 'cargo test'",
+        "env -S 'bash -c \"cargo check\"'",
+        "env --split-string='sh -c \"cargo test\"'",
+        "env -iS 'cargo test'",
+        "source ./hidden.sh",
+        "command source ./hidden.sh",
+        ". ./hidden.sh",
+        "command -p -- . ./hidden.sh",
+        "MODE=ci . ./hidden.sh",
+        "if . ./hidden.sh; then true; fi",
+        "2>/dev/null . ./hidden.sh",
+        ">/dev/null command -- . ./hidden.sh",
+        "&>/dev/null . ./hidden.sh",
+        'echo "$(cargo test)"',
+        "echo $(cargo test)",
+        'echo "$(just unit-only)"',
+        'echo "`cargo test`"',
+        "echo `cargo test`",
+        "cat <(cargo test)",
+        "cat <<<'cargo test'",
+        "printf 'cargo test' | bash",
+        "bash ./hidden.sh",
+    )
+)
+cases += tuple(
+    (f"unsupported live shell {shell}", "justfile", live_recipe,
+     live_recipe + f"\n    {shell} -c 'cargo test'", direct_command_error)
+    for shell in ("dash", "ash", "ksh", "ksh93", "mksh", "pdksh", "zsh",
+                  "csh", "tcsh", "fish", "yash")
+)
+cases += (
+    ("modified reviewed substitution", "justfile",
+     'config current-context)"', 'config current-context; cargo test)"', direct_command_error),
+    ("modified reviewed diagnostic program", "justfile",
+     "sort -h | tail -100' || true", "sort -h | tail -100; cargo test' || true",
+     direct_command_error),
+    ("evaluation in live CI job", workflow, "run: just level-triggered-kind-test bootstrap",
+     "run: env MODE=ci bash -c 'cargo check'", direct_command_error),
+)
 for name, relative, before, after, reason in cases:
     target = fixture / relative
     original = target.read_text()
@@ -491,6 +553,13 @@ for command in (
     "true;just verify-kind-context",
     "true&&just verify-kind-context||just verify-kind-ownership",
     "just level-triggered-kind-test bootstrap replacement",
+    "printf '%s\\n' 'cargo test is only text'",
+    "command cargo check -p kuberic-protocol",
+    "env MODE=ci cargo test -p kuberic-wire",
+    "env -i MODE=ci cargo build --package=kuberic-protocol",
+    "printf '%s\\n' .",
+    "cd .",
+    "true;printf '%s\\n' ok # eval, bash -c, $(cargo test), `just unit-only`",
 ):
     target = fixture / "justfile"
     original = target.read_text()

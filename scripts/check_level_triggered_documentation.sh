@@ -104,16 +104,50 @@ for line in recipes.splitlines():
     elif current and line.strip():
         recipe_graph[current][1].append(line)
 
-def live_commands(script, description):
+def live_tokens(line):
     # Keep quoted words/comments intact, but separate adjacent shell commands.
     # Just's leading @ suppresses echo; it is not part of the executable name.
+    lexer = shlex.shlex(line.lstrip().removeprefix("@"), posix=True,
+                        punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
+
+# Live commands must be direct and statically inspectable, with literal Cargo
+# packages and Just recipes. Never evaluate or recursively parse shell programs.
+# These exact existing data probes/read-only diagnostics are the only exceptions;
+# changing their payloads requires review, not a general shell-evaluation escape.
+reviewed_live_shell = {
+    tuple(live_tokens(line)) for line in (
+        'mkdir -p "$(dirname "$KUBECONFIG")"',
+        'test "$(kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" '
+        'config current-context)" = "{{ cluster_context }}"',
+        'for pod in $(kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" '
+        '-n default get pods -l operator.kuberic.io/set-name=kvstore2 -o name); do',
+        'echo "=== $scenario passed in $((SECONDS - started))s ==="',
+        'timeout --kill-after=2s 15s kubectl --kubeconfig "{{ kubeconfig }}" '
+        '--context "{{ cluster_context }}" -n default exec "${pod}" -- sh -c '
+        """'find /var/lib/kuberic -maxdepth 4 -printf "%y %s %p\\n" 2>/dev/null | sort; """
+        """du -ah /var/lib/kuberic 2>/dev/null | sort -h | tail -100' || true""",
+    )
+}
+shell_evaluators = {
+    "eval", "source", "sh", "bash", "dash", "ash", "ksh", "ksh93", "mksh",
+    "pdksh", "zsh", "csh", "tcsh", "fish", "yash",
+}
+
+def live_commands(script, description):
     commands = []
+    direct_error = f"Live commands must be direct and statically inspectable in {description}"
     for line in script.replace("\\\n", "").splitlines():
-        lexer = shlex.shlex(line.lstrip().removeprefix("@"), posix=True,
-                            punctuation_chars=True)
-        lexer.whitespace_split = True
+        line_tokens = live_tokens(line)
+        if tuple(line_tokens) in reviewed_live_shell:
+            continue
+        # Joining retains substitution markers that shlex splits at parentheses.
+        assert not any(marker in "".join(line_tokens)
+                       for marker in ("$(", "`", "<(", ">(", "<<")), \
+            f"{direct_error}: unsupported shell substitution or input program"
         command = []
-        for token in lexer:
+        for token in line_tokens:
             if re.fullmatch(r"[;&|()]+", token):
                 if command:
                     commands.append(command)
@@ -129,6 +163,30 @@ def live_commands(script, description):
     for command in commands:
         for index, token in enumerate(command):
             executable = pathlib.PurePosixPath(token).name
+            # Interpreter stdin and script-file programs are as opaque as -c.
+            assert executable not in shell_evaluators, \
+                f"{direct_error}: unsupported shell evaluator {token}"
+            # A dot is also the ordinary Docker build context. Reject only the
+            # builtin position, ignoring redirections and shell/wrapper prefixes.
+            if token == ".":
+                prefix = command[:index]
+                redirections = {i for i, word in enumerate(prefix)
+                                if re.fullmatch(r"[<>]+|[<>]&|&>>?|>\|", word)}
+                operands = {i + 1 for i in redirections}
+                descriptors = {i - 1 for i in redirections if i > 0 and prefix[i - 1].isdigit()}
+                assert not all(
+                    word in ("if", "then", "elif", "else", "while", "until", "do", "!",
+                             "{", "command", "builtin", "exec", "env", "time")
+                    or word.startswith("-") or re.match(r"[A-Za-z_]\w*=", word)
+                    for i, word in enumerate(prefix)
+                    if i not in redirections | operands | descriptors
+                ), f"{direct_error}: unsupported dot/source command"
+            if executable == "env":
+                assert not any(
+                    arg == "--split-string" or arg.startswith("--split-string=")
+                    or (arg.startswith("-") and not arg.startswith("--") and "S" in arg)
+                    for arg in command[index + 1:]
+                ), f"{direct_error}: unsupported env split-string program"
             if executable == "cargo":
                 arguments = command[index + 1:]
                 # Package-like arguments after -- belong to the test/compiler,
