@@ -12,6 +12,10 @@ use crate::build::{PgLineage, decode, encode};
 use crate::durable::{PgDurableError, PgDurableRole};
 use crate::native::{AcknowledgementPolicy, PgReplicationEvidence};
 
+#[cfg(all(test, feature = "testing"))]
+#[path = "promotion_status_tests.rs"]
+mod promotion_status_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryStage {
     PolicyInvalidated,
@@ -260,6 +264,15 @@ impl Recovery {
                 || election.boundary.is_some_and(|boundary| boundary < 0)
                 || election.ready && !election.promoted
                 || election.promoted && election.boundary.is_none()
+                || election.promotion.as_ref().is_some_and(|intent| {
+                    intent.process_generation == 0
+                        || election.boundary.is_none()
+                        || !election.responders.contains(&intent.candidate)
+                        || !election.configuration.members.iter().any(|member| {
+                            member.role == ReplicaRole::Primary
+                                && member.identity == intent.candidate.identity
+                        })
+                })
             {
                 return Err("invalid PostgreSQL election journal".into());
             }
@@ -516,6 +529,15 @@ pub(crate) struct Election {
     promoted: bool,
     #[serde(default)]
     ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promotion: Option<Promotion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Promotion {
+    candidate: Peer,
+    process_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +615,133 @@ impl PgReplicator {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         Ok(election.policy.membership.peer(identity)?.session.clone())
+    }
+
+    pub(super) async fn interrupted_promotion(
+        &self,
+        durable: &crate::durable::PgDurableState,
+        generation: u64,
+        reconcile_stopped: bool,
+    ) -> Result<bool> {
+        let lease = self.instance.generation_lease();
+        if lease.id() != generation {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        let Some(recovery) = &durable.recovery else {
+            return Ok(false);
+        };
+        let Some(election) = &recovery.pending else {
+            return Ok(false);
+        };
+        let Some(intent) = &election.promotion else {
+            return Ok(false);
+        };
+        let Some(boundary) = election.boundary else {
+            return Ok(false);
+        };
+        let local = recovery.membership.peer(&durable.identity.replica)?;
+        if !durable.has_accepted_authority
+            || !durable.external_access_closed
+            || recovery.former_primary
+            || election.promoted
+            || election.ready
+            || election.configuration != recovery.membership.configuration
+            || recovery.accepted_policy.as_ref() != Some(&election.policy)
+            || recovery.receiver_epoch != Some(election.configuration.epoch)
+            || &intent.candidate != local
+            || recovery.membership.primary()? != local
+            || election.policy.membership.peer(&local.identity)? != local
+            || !election.policy.policy.eligible_standbys.iter().any(|peer| {
+                peer.identity == local.identity && peer.process_session_id == local.session
+            })
+            || durable.system_identifier.as_ref()
+                != Some(&election.policy.lineage.system_identifier)
+            || durable.timeline_id != Some(election.policy.lineage.timeline)
+        {
+            return Ok(false);
+        }
+        for peer in &election.responders {
+            if recovery.membership.peer(&peer.identity)? != peer {
+                return Ok(false);
+            }
+        }
+        if let Some(fence) = &recovery.source_fence
+            && (fence.configuration != election.configuration
+                || !fence.stopped
+                || fence.source != *election.policy.membership.primary()?
+                || fence.lineage != election.policy.lineage
+                || boundary < fence.boundary)
+        {
+            return Ok(false);
+        }
+        let installed = self.configuration.read().await;
+        if installed.as_ref().is_some_and(|current| {
+            Membership::new(current, &durable.identity.replica) != recovery.membership
+        }) {
+            return Ok(false);
+        }
+        let running = self.instance.is_running().await;
+        if running && (installed.is_none() || intent.process_generation != generation) {
+            return Ok(false);
+        }
+        // Cold open may inspect the old journal, but cannot reuse its session to
+        // activate. Live retries additionally own the exact promoting generation.
+        if running {
+            self.recovery_checkpoint_sql().await?;
+        }
+        let lineage = self.lineage().await?;
+        let compatible = election.policy.lineage.can_rewind_from(&lineage)
+            && lineage.history.last().is_some_and(|fork| {
+                fork.timeline == election.policy.lineage.timeline && fork.end_lsn >= boundary
+            });
+        if !self.instance.generation_is_current(&lease) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        if compatible && !running && reconcile_stopped {
+            let mut evidence = election
+                .final_observations
+                .iter()
+                .find(|observation| &observation.peer == local)
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?
+                .evidence
+                .clone();
+            evidence.timeline_id = lineage.timeline;
+            evidence.in_recovery = false;
+            let digest =
+                crate::native::timeline_history_digest(self.instance.data_dir(), &evidence)
+                    .await
+                    .map_err(application_error)?;
+            self.pg_result(
+                self.instance
+                    .generation_step(&lease, async {
+                        self.durable
+                            .update(|state| {
+                                if state != durable {
+                                    return Err(PgDurableError::Invalid(
+                                        "interrupted promotion was superseded".into(),
+                                    ));
+                                }
+                                state.role = PgDurableRole::Primary;
+                                state.timeline_id = Some(lineage.timeline);
+                                state.timeline_history_digest = Some(digest);
+                                state
+                                    .recovery
+                                    .as_mut()
+                                    .unwrap()
+                                    .pending
+                                    .as_mut()
+                                    .unwrap()
+                                    .promoted = true;
+                                Ok(())
+                            })
+                            .await
+                            .map_err(|error| crate::instance::PgError::Process(error.to_string()))
+                    })
+                    .await,
+            )
+            .await?;
+        }
+        Ok(compatible)
     }
 
     pub(super) async fn recovery_progress(&self) -> Result<Option<i64>> {
@@ -864,6 +1013,7 @@ impl PgReplicator {
             return Ok(observation);
         }
         let _state = self.state.lock().await;
+        let _publication = self.role_publication.write().await;
         let _access = self.instance.access_lock.lock().await;
         self.recovery_request_inner(request).await
     }
@@ -1801,6 +1951,7 @@ impl PgReplicator {
                     boundary: None,
                     promoted: false,
                     ready: false,
+                    promotion: None,
                 };
                 self.persist_election(election.clone()).await?;
                 self.recovery_checkpoint(RecoveryStage::InitialRound).await;
@@ -1899,7 +2050,18 @@ impl PgReplicator {
             })
             .await
             .map_err(|_| application_error("PostgreSQL candidate replay deadline"))??;
-            self.pg_result(self.instance.promote().await).await?;
+            let lease = self.instance.generation_lease();
+            election.promotion = Some(Promotion {
+                candidate: local.clone(),
+                process_generation: lease.id(),
+            });
+            self.persist_election(election.clone()).await?;
+            self.pg_result(
+                self.instance
+                    .generation_step(&lease, self.instance.promote())
+                    .await,
+            )
+            .await?;
             self.recovery_checkpoint(RecoveryStage::Promoted).await;
         }
         self.recovery_checkpoint_sql().await?;

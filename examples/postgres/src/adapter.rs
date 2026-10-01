@@ -93,6 +93,7 @@ pub struct PgReplicator {
     coordination: crate::data_service::PgCoordination,
     initializing: bool,
     state: Mutex<DriverState>,
+    role_publication: RwLock<()>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
     configuration_applied: RwLock<Option<ReplicaSetConfiguration>>,
     build_cancellation: std::sync::Mutex<CancellationToken>,
@@ -173,6 +174,7 @@ impl PgReplicator {
             cancellation,
             coordination,
             initializing,
+            role_publication: RwLock::new(()),
             configuration: RwLock::new(None),
             configuration_applied: RwLock::new(None),
             build_cancellation: std::sync::Mutex::new(CancellationToken::new()),
@@ -190,6 +192,10 @@ impl PgReplicator {
     }
 
     async fn validate(&self) -> Result<PgDurableState> {
+        self.validate_inner(true).await
+    }
+
+    async fn validate_inner(&self, reconcile_stopped: bool) -> Result<PgDurableState> {
         let generation = self.instance.generation_id();
         let durable = match self.durable.revalidate().await {
             Ok(durable) => durable,
@@ -209,6 +215,22 @@ impl PgReplicator {
                 .await);
         }
         if let Some(system) = &durable.system_identifier {
+            if durable.role == PgDurableRole::Standby
+                && !self.instance.data_dir().join("standby.signal").exists()
+                && !self.instance.data_dir().join("recovery.signal").exists()
+            {
+                match self
+                    .interrupted_promotion(&durable, generation, reconcile_stopped)
+                    .await
+                {
+                    Ok(true) => return Ok(self.durable.snapshot().await),
+                    Ok(false) => {}
+                    Err(RuntimeError::OperationCancelled) => {
+                        return Err(RuntimeError::OperationCancelled);
+                    }
+                    Err(error) => return Err(self.permanent_at(generation, error).await),
+                }
+            }
             if durable.role == PgDurableRole::None
                 || (durable.role == PgDurableRole::Standby)
                     != self.instance.data_dir().join("standby.signal").exists()
@@ -591,6 +613,7 @@ impl PgReplicator {
 
     pub async fn receive_build(&self, request: PgBuildRequest) -> Result<PgBuildProgress> {
         let state = self.state.lock().await;
+        let _publication = self.role_publication.write().await;
         self.validate_build(&request).await?;
         let metadata = self.durable.snapshot().await;
         let admitted_storage = state.authority.is_some()
@@ -973,6 +996,7 @@ impl Drop for BuildCleanup {
 impl PgReplicator {
     async fn open(&self) -> Result<()> {
         let mut state = self.state.lock().await;
+        let _publication = self.role_publication.write().await;
         if state.opened || self.cancellation.is_cancelled() {
             return Err(RuntimeError::Closed);
         }
@@ -1038,6 +1062,7 @@ impl PgReplicator {
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
         let mut state = self.state.lock().await;
+        let _publication = self.role_publication.write().await;
         self.validate().await?;
         match role {
             ReplicaRole::Primary => {
@@ -1064,7 +1089,8 @@ impl PgReplicator {
                 }
                 self.close_access().await?;
                 if !self.instance.is_running().await
-                    && self.durable.snapshot().await.native_build.is_some()
+                    && (self.durable.snapshot().await.native_build.is_some()
+                        || self.recovery_incomplete().await)
                 {
                     self.finish_recovery(self.recover_primary().await).await?;
                 }
@@ -1352,6 +1378,7 @@ impl PgReplicator {
         }
         self.build_cancellation.lock().unwrap().cancel();
         let mut state = self.state.lock().await;
+        let _publication = self.role_publication.write().await;
         if self.cancellation.is_cancelled() {
             return Err(RuntimeError::Closed);
         }
@@ -1891,7 +1918,12 @@ impl Replicator for PgReplicator {
         PgReplicator::abort(self);
     }
     async fn current_progress(&self) -> Result<i64> {
-        self.validate().await?;
+        {
+            // Access regrant may retire a delayed reader's generation; role
+            // publication must finish before any reader inspects native signals.
+            let _publication = self.role_publication.read().await;
+            self.validate_inner(false).await?;
+        }
         let partition = self.partition.upgrade().ok_or(RuntimeError::Closed)?;
         self.set_access_status(
             partition.get_read_status().await?,

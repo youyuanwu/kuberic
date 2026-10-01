@@ -186,8 +186,18 @@ Missing files, changed paths/symlink targets, corrupt identity/lineage or
 ambiguous evidence fail closed with explicit faults.
 Unexpected durable-role/recovery-signal mismatches or incomplete recovery without
 an authorized native build stop and reap the captured PostgreSQL generation before
-publishing a permanent fault. Authorized build/promotion recovery is unchanged;
-a delayed mismatch from a retired generation cannot fence its successor.
+publishing a permanent fault. A private reader/writer gate serializes progress/status
+validation with native role changes and durable role publication, without blocking
+access regrant behind delivery of an old reader's helper error. Before
+native promotion, the private election journal records the exact candidate,
+process session and process generation after final quorum/replay verification.
+An interrupted role-publication gap is recognized only with that intent, unchanged
+authority and accepted policy, exact final responders/boundary, closed access and
+compatible promoted lineage. Same-generation retries complete the existing election;
+cold storage inspection does not authorize a retired session to activate. Build and
+demotion transitions retain their existing validation. A delayed mismatch from a
+retired generation cannot fence its successor, and unrelated recovery metadata
+never exempts a true role/signal mismatch.
 
 Application-only and whole-agent-host restart reconstruct durable state with
 fresh sessions. Accepted standbys wait for validated current source connections.
