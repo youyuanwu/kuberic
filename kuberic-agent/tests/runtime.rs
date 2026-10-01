@@ -4302,9 +4302,10 @@ impl StatefulServiceReplica for CustomRoleService {
 
 #[tokio::test]
 async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it() {
-    for (error, supersede) in [(1, false), (1, true), (2, false), (3, false)] {
+    for (error, supersede) in [(1, 0), (1, 1), (1, 2), (2, 0), (3, 0)] {
         let directory = tempfile::tempdir().unwrap();
         let local = identity(1, "restore-access");
+        let target = identity(2, "handoff-target");
         let store = fresh_disk_store(directory.path(), local.clone());
         let old = Arc::new(PodRuntime::new(
             local.clone(),
@@ -4321,7 +4322,7 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
             RuntimeEffectAction::Open(OpenMode::New),
             RuntimeEffectAction::AdmitAuthority(Box::new(authority(
                 local.clone(),
-                vec![local.clone()],
+                vec![local.clone(), target.clone()],
             ))),
             RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
             RuntimeEffectAction::SetAccessStatus {
@@ -4370,7 +4371,7 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
             store.load_state().await.unwrap().write_status,
             AccessStatus::Granted
         );
-        if supersede {
+        if supersede == 1 {
             RuntimeAdapter::new(store.clone(), runtime.clone())
                 .execute(effect(
                     5,
@@ -4381,12 +4382,28 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
                 ))
                 .await
                 .unwrap();
+        } else if supersede == 2 {
+            let authority = runtime.snapshot().await.authority.unwrap();
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::PrepareSwitchover {
+                        preparation_generation: 1,
+                        request_id: SwitchoverRequestId::new("superseding-handoff"),
+                        source: authority.local_identity,
+                        target,
+                        starting_configuration_id: authority.current_configuration.configuration_id,
+                        starting_epoch: authority.current_configuration.epoch,
+                    },
+                ))
+                .await
+                .unwrap();
         }
         gate.grant_error.store(0, Ordering::SeqCst);
         let report = reporter.report(&runtime).await.unwrap();
         assert_eq!(
             report.write_status,
-            if supersede {
+            if supersede != 0 {
                 proto::AccessStatus::ReconfigurationPending
             } else {
                 proto::AccessStatus::Granted

@@ -333,6 +333,7 @@ impl CustomReplicatorHost {
     }
 
     async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        *self.restored_access.write().await = None;
         let host = self.host()?;
         let faulted_grant = (read == AccessStatus::Granted || write == AccessStatus::Granted)
             && host.state.read().await.reported_fault.is_some();
@@ -485,8 +486,7 @@ impl CustomReplicatorHost {
         let host = self.host()?;
         let restored = *self.restored_access.read().await;
         if let Some((read, write)) = restored {
-            self.set_access(read, write).await?;
-            *self.restored_access.write().await = None;
+            self.try_restore_access(read, write).await?;
         }
         let incoming = match host
             .default_dependencies
@@ -615,6 +615,10 @@ impl CustomReplicatorHost {
         write: AccessStatus,
     ) -> Result<()> {
         let _gate = self.gate.lock().await;
+        self.try_restore_access(read, write).await
+    }
+
+    async fn try_restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         let result = self.set_access(read, write).await;
         if matches!(result, Err(RuntimeError::ReconfigurationPending)) {
             // Retain the durable intent, not a successful effect receipt. Progress
@@ -788,16 +792,13 @@ impl CustomReplicatorHost {
                 self.refresh().await?;
             }
             RuntimeEffectAction::SetAccessStatus { read, write } => {
-                *self.restored_access.write().await = None;
                 self.set_access(read, write).await?
             }
             RuntimeEffectAction::SetReadStatus(read) => {
-                *self.restored_access.write().await = None;
                 let write = self.state.read().await.write_status;
                 self.set_access(read, write).await?;
             }
             RuntimeEffectAction::SetWriteStatus(write) => {
-                *self.restored_access.write().await = None;
                 let read = self.state.read().await.read_status;
                 self.set_access(read, write).await?;
             }
@@ -881,7 +882,6 @@ impl CustomReplicatorHost {
                 self.accept_removal(command.committed, true).await?;
             }
             RuntimeEffectAction::FenceRetirement(retired) => {
-                *self.restored_access.write().await = None;
                 retired.validate(&host.identity)?;
                 host.default_dependencies
                     .replica_authority_store
