@@ -324,6 +324,8 @@ unit_command = "cargo test -p postgres-replicated --all-features -- --test-threa
 unit_step = "- name: Test PostgreSQL unit and host-local subprocess suites"
 unit_error = "Test PostgreSQL unit and host-local subprocess suites: run must be a shell string"
 deployment_error = "PostgreSQL fresh deployment must declare exactly protocol 9 / agent schema 5"
+live_recipe = "level-triggered-images: verify-kind-context"
+default_cargo_error = "Implicit/default workspace Cargo execution must not enter live recipe level-triggered-images"
 cases = (
     ("missing unit command", workflow, unit_command, "true", unit_error),
     ("disabled unit step", workflow, unit_step, unit_step + "\n        if: ${{ false }}",
@@ -359,6 +361,16 @@ cases = (
      "unit-only:\n    " + unit_command +
      "\n\nlevel-triggered-images: verify-kind-context\n    just verify-kind-context unit-only",
      "PostgreSQL must not enter live recipe unit-only"),
+    ("echo-suppressed live invocation", "justfile", live_recipe,
+     "unit-only:\n    " + unit_command + "\n\n" + live_recipe + "\n    @just unit-only",
+     "PostgreSQL must not enter live recipe unit-only"),
+    ("adjacent live invocation", "justfile", live_recipe,
+     "unit-only:\n    " + unit_command + "\n\n" + live_recipe + "\n    true;just unit-only",
+     "PostgreSQL must not enter live recipe unit-only"),
+    ("plain live cargo test", "justfile", live_recipe,
+     live_recipe + "\n    cargo test", default_cargo_error),
+    ("plain live job cargo test", workflow, "run: just level-triggered-kind-test bootstrap",
+     "run: cargo test", "Implicit/default workspace Cargo execution must not enter KinD/live job bootstrap-kind"),
     ("live selector", "justfile", 'bootstrap) test_name="level_triggered_k8s::',
      'postgres) test_name="level_triggered_k8s::',
      "PostgreSQL must not enter live recipe level-triggered-kind-test"),
@@ -379,6 +391,48 @@ cases = (
     ("schema constant", "kuberic-agent/src/state.rs", "SCHEMA_VERSION: u32 = 5",
      "SCHEMA_VERSION: u32 = 4", "AssertionError"),
 )
+cases += tuple(
+    (f"live invocation {invocation}", "justfile", live_recipe,
+     "unit-only:\n    " + unit_command + "\n\n" + live_recipe + "\n    " + invocation,
+     "PostgreSQL must not enter live recipe unit-only")
+    for invocation in (
+        "@just\tunit-only", "true && just unit-only", "true&&just unit-only",
+        "false || just unit-only", "false||just unit-only", "@true;just unit-only",
+        "just verify-kind-context;just unit-only", "/usr/bin/just unit-only",
+        "just \\\n        unit-only",
+    )
+)
+cases += tuple(
+    (f"unresolved live invocation {invocation}", "justfile", live_recipe,
+     live_recipe + "\n    " + invocation, "Unresolved live recipe call")
+    for invocation in ("@just \"$recipe\"", "true;just", "just --unknown unit-only")
+)
+cases += tuple(
+    (f"default live Cargo selection {command}", "justfile", live_recipe,
+     live_recipe + "\n    " + command, default_cargo_error)
+    for command in (
+        "cargo build", "cargo check", "cargo clippy", "cargo t", "cargo b", "cargo c",
+        "@cargo test", "true;cargo test", "cargo +stable test --all-features",
+        "cargo test -- -p kuberic-level-tests",
+        "cargo test;cargo test -p kuberic-level-tests",
+        "cargo test&&cargo test -p kuberic-level-tests",
+        "cargo test||cargo test -p kuberic-level-tests",
+    )
+)
+cases += (
+    ("workspace live Cargo selection", "justfile", live_recipe,
+     live_recipe + "\n    cargo test --workspace -p kuberic-level-tests",
+     "Workspace-wide Cargo execution must not enter live recipe level-triggered-images"),
+    ("all live Cargo selection", "justfile", live_recipe,
+     live_recipe + "\n    cargo clippy --all -p kuberic-protocol",
+     "Workspace-wide Cargo execution must not enter live recipe level-triggered-images"),
+    ("wildcard live Cargo selection", "justfile", live_recipe,
+     live_recipe + '\n    cargo test -p "*"',
+     "Unresolved live Cargo package selection"),
+    ("dynamic live Cargo selection", "justfile", live_recipe,
+     live_recipe + '\n    cargo test --package="$package"',
+     "Unresolved live Cargo package selection"),
+)
 for name, relative, before, after, reason in cases:
     target = fixture / relative
     original = target.read_text()
@@ -394,6 +448,7 @@ for name, relative, before, after, reason in cases:
 
 # Comments cannot supply executable coverage, nor should comments that merely
 # mention PostgreSQL create a false live execution finding.
+positive_checks = 1
 for relative, addition in (
     (workflow, "\n# PostgreSQL remains host-local only\n"),
     ("justfile", "\n# PostgreSQL remains host-local only\n"),
@@ -405,6 +460,46 @@ for relative, addition in (
         target.write_text(original + addition)
         result = check()
         assert result.returncode == 0, result.stdout
+        positive_checks += 1
+    finally:
+        target.write_text(original)
+
+# Keep targeted host-local PostgreSQL CI intact while checking safe live commands.
+target = fixture / workflow
+original = target.read_text()
+try:
+    target.write_text(original.replace("run: " + unit_command,
+                                      'run: "' + unit_command + ' # host-local only"'))
+    result = check()
+    assert result.returncode == 0, result.stdout
+    positive_checks += 1
+    print("Accepted executable targeted host-local PostgreSQL CI with an inline comment")
+finally:
+    target.write_text(original)
+
+for command in (
+    "cargo test -p kuberic-level-tests",
+    "@cargo build -p kuberic-controller -p kvstore2",
+    "true;cargo check --package kuberic-protocol",
+    "true&&cargo clippy --package=kuberic-protocol -- -D warnings",
+    "false||cargo test -pkuberic-level-tests -- --ignored --exact",
+    "cargo +stable test -p=kuberic-protocol",
+    "cargo test -p kuberic-protocol;cargo check -p kuberic-wire",
+    "cargo metadata --no-deps",
+    "@just verify-kind-context",
+    "@ just\tverify-kind-context",
+    "true;just verify-kind-context",
+    "true&&just verify-kind-context||just verify-kind-ownership",
+    "just level-triggered-kind-test bootstrap replacement",
+):
+    target = fixture / "justfile"
+    original = target.read_text()
+    try:
+        target.write_text(original.replace(live_recipe, live_recipe + "\n    " + command))
+        result = check()
+        assert result.returncode == 0, f"Rejected safe live command {command}\n{result.stdout}"
+        positive_checks += 1
+        print(f"Accepted safe live command with targeted PostgreSQL CI: {command}")
     finally:
         target.write_text(original)
 
@@ -413,7 +508,7 @@ live.write_text("use postgres_replicated::testing;\n")
 result = check()
 assert result.returncode != 0 and "PostgreSQL must not enter live tests" in result.stdout, result.stdout
 print(f"PostgreSQL classification, CI and documentation regression tests passed "
-      f"({len(cases) + 1} negative mutations, 4 positive checks).")
+      f"({len(cases) + 1} negative mutations, {positive_checks} positive checks).")
 PY
 
 echo "Level-triggered guard regression tests passed."

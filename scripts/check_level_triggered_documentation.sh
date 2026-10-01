@@ -105,17 +105,56 @@ for line in recipes.splitlines():
         recipe_graph[current][1].append(line)
 
 def live_commands(script, description):
-    commands = shell_commands(script)
+    # Keep quoted words/comments intact, but separate adjacent shell commands.
+    # Just's leading @ suppresses echo; it is not part of the executable name.
+    commands = []
+    for line in script.replace("\\\n", "").splitlines():
+        lexer = shlex.shlex(line.lstrip().removeprefix("@"), posix=True,
+                            punctuation_chars=True)
+        lexer.whitespace_split = True
+        command = []
+        for token in lexer:
+            if re.fullmatch(r"[;&|()]+", token):
+                if command:
+                    commands.append(command)
+                    command = []
+            else:
+                command.append(token)
+        if command:
+            commands.append(command)
     tokens = [token for command in commands for token in command]
     assert not any(re.search(r"postgres|pgdata", token, re.I) for token in tokens), \
         f"PostgreSQL must not enter {description}"
-    assert not ("cargo" in tokens and any(
-        token in tokens for token in ("--workspace", "--all")
-    )), f"Workspace-wide Cargo execution must not enter {description}"
     calls = []
     for command in commands:
         for index, token in enumerate(command):
-            if token == "just":
+            executable = pathlib.PurePosixPath(token).name
+            if executable == "cargo":
+                arguments = command[index + 1:]
+                # Package-like arguments after -- belong to the test/compiler,
+                # not Cargo, and must not make a default workspace run look safe.
+                if "--" in arguments:
+                    arguments = arguments[:arguments.index("--")]
+                assert not any(arg in ("--workspace", "--all") for arg in arguments), \
+                    f"Workspace-wide Cargo execution must not enter {description}"
+                if any(arg in ("test", "t", "build", "b", "check", "c", "clippy")
+                       for arg in arguments):
+                    packages = []
+                    for offset, argument in enumerate(arguments):
+                        if argument in ("-p", "--package"):
+                            assert offset + 1 < len(arguments), \
+                                f"Unresolved live Cargo package selection in {description}: {command}"
+                            packages.append(arguments[offset + 1])
+                        elif argument.startswith("--package="):
+                            packages.append(argument.partition("=")[2])
+                        elif argument.startswith("-p"):
+                            packages.append(argument[2:].removeprefix("="))
+                    assert packages, \
+                        f"Implicit/default workspace Cargo execution must not enter {description}"
+                    assert all(re.fullmatch(r"[A-Za-z0-9_-]+", package)
+                               for package in packages), \
+                        f"Unresolved live Cargo package selection in {description}: {command}"
+            if executable == "just":
                 assert index + 1 < len(command) and command[index + 1] in recipe_graph, \
                     f"Unresolved live recipe call in {description}: {command}"
                 # `just` can run multiple named recipes in one invocation.
