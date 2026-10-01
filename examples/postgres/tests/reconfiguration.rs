@@ -46,6 +46,8 @@ fn quorum_loss_keeps_secondary_reads_and_fresh_sessions_restore_writes() {
         group.fence_quorum_loss().await;
         ordinary.rejected(one).await;
         admin.rejected(two).await;
+        ordinary.disconnected().await;
+        admin.disconnected().await;
         for id in [2, 3] {
             let reader = group.session(id, false).await;
             assert_eq!(
@@ -58,6 +60,11 @@ fn quorum_loss_keeps_secondary_reads_and_fresh_sessions_restore_writes() {
                 group.expected.len()
             );
             reader.rejected(group.next_probe()).await;
+            reader
+                .client()
+                .simple_query("SELECT 1")
+                .await
+                .expect("readable secondary rejection is not a completed fence");
         }
         group.restart_peer(2).await;
         group.restart_peer(3).await;
@@ -68,16 +75,21 @@ fn quorum_loss_keeps_secondary_reads_and_fresh_sessions_restore_writes() {
 }
 
 #[test_log::test]
-fn application_restart_and_agent_metadata_reopen_preserve_committed_contents() {
+fn application_process_restart_and_metadata_connection_reopen_preserve_committed_contents() {
     run_pg_test(|| async {
         let mut group = PgGroup::singleton().await;
         group.add(2).await;
         group.add(3).await;
         let session = group.pod(1).session.clone();
         let sql = group.session(1, false).await;
+        let admin = group.session(1, true).await;
         let probe = group.next_probe();
+        let admin_probe = group.next_probe();
         group.pod(1).restart_application().await.unwrap();
         sql.rejected(probe).await;
+        admin.rejected(admin_probe).await;
+        sql.disconnected().await;
+        admin.disconnected().await;
         assert_eq!(group.pod(1).session, session);
         group.refresh_configuration().await;
         group.reopen_agent_metadata(1).await;
@@ -102,11 +114,7 @@ fn scaling_reopens_application_and_agent_state_at_each_durable_admission_boundar
             AdmissionCut::PreviousCurrent,
             AdmissionCut::CurrentOnly,
         ] {
-            for part in [
-                RestartPart::Application,
-                RestartPart::AgentMetadata,
-                RestartPart::AgentHost,
-            ] {
+            for part in [RestartPart::ApplicationProcess, RestartPart::AgentHost] {
                 tracing::info!(?cut, ?part, "restarting scale-up at a durable boundary");
                 let mut group = PgGroup::singleton().await;
                 group.add_with_restart(2, Some((cut, part))).await;

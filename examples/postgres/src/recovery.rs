@@ -315,17 +315,181 @@ impl Recovery {
             if *epoch > self.membership.configuration.epoch {
                 return Err("future PostgreSQL following receipt".into());
             }
-            if let Some(connection) = &self.connection {
-                connection.lineage.validate()?;
-                if connection.host.parse::<std::net::IpAddr>().is_err()
-                    || connection.port == 0
-                    || connection.receiver.is_empty()
-                {
-                    return Err("invalid PostgreSQL streaming connection".into());
-                }
+        }
+        if let Some(connection) = &self.connection {
+            connection.lineage.validate()?;
+            if connection.source.identity.replica_id.value() <= 0
+                || connection.source.identity.instance_id.is_empty()
+                || connection.source.identity.instance_id.as_str().len() > 128
+                || connection.source.identity.agent_generation.is_empty()
+                || connection.source.identity.agent_generation.as_str().len() > 128
+                || connection.source.session.is_empty()
+                || connection.source.session.as_str().len() > 128
+                || !connection.source.endpoint.starts_with("http://")
+                || connection.source.endpoint.len() > 512
+                || connection.host.parse::<std::net::IpAddr>().is_err()
+                || connection.port == 0
+                || connection.receiver.is_empty()
+                || connection.receiver.as_str().len() > 128
+            {
+                return Err("invalid PostgreSQL streaming connection".into());
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod connection_validation_tests {
+    use super::*;
+    use crate::build::PgLineage;
+    use crate::durable::{PgDurableIdentity, PgDurableStore, StorageMode};
+    use crate::testing::{TestDataDir, native_configuration, native_identity};
+
+    fn recovery(local: &ReplicaIdentity, followed: bool) -> Recovery {
+        let source = native_identity(1, "source");
+        let lineage = PgLineage {
+            system_identifier: "123456789".into(),
+            timeline: 1,
+            history: Vec::new(),
+            history_text: String::new(),
+        };
+        Recovery {
+            membership: Membership {
+                configuration: native_configuration(&[source.clone(), local.clone()], 0, 1),
+                peers: vec![
+                    Peer {
+                        identity: source.clone(),
+                        session: ProcessSessionId::new("source-session"),
+                        endpoint: "http://127.0.0.1:41001".into(),
+                    },
+                    Peer {
+                        identity: local.clone(),
+                        session: ProcessSessionId::new("local-session"),
+                        endpoint: "http://127.0.0.1:41002".into(),
+                    },
+                ],
+            },
+            previous: None,
+            accepted_policy: None,
+            pending: None,
+            source_fence: None,
+            former_primary: false,
+            receiver_epoch: None,
+            followed: followed
+                .then(|| (kuberic_protocol::types::Epoch::new(0, 1), lineage.clone())),
+            preparation: None,
+            connection: Some(Connection {
+                source: Peer {
+                    identity: source,
+                    session: ProcessSessionId::new("source-session"),
+                    endpoint: "http://127.0.0.1:41001".into(),
+                },
+                receiver: ProcessSessionId::new("local-session"),
+                host: "127.0.0.1".into(),
+                port: 5432,
+                lineage,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_streaming_connection_is_rejected_with_or_without_follow_receipt() {
+        for followed in [false, true] {
+            let directory = TestDataDir::new("invalid-streaming-connection");
+            let local = native_identity(2, "local");
+            let identity = PgDurableIdentity {
+                resource_uid: ResourceUid::new("postgres-native-test"),
+                replica: local.clone(),
+            };
+            let store = PgDurableStore::open(
+                directory.path().join("application"),
+                identity.clone(),
+                StorageMode::Fresh,
+            )
+            .await
+            .unwrap();
+            store
+                .update(|state| {
+                    state.recovery = Some(recovery(&local, followed));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            let invalid_host = store
+                .update(|state| {
+                    let connection = state
+                        .recovery
+                        .as_mut()
+                        .unwrap()
+                        .connection
+                        .as_mut()
+                        .unwrap();
+                    connection.host = "not-an-ip-address".into();
+                    Ok(())
+                })
+                .await;
+            assert!(
+                matches!(invalid_host, Err(PgDurableError::Invalid(message)) if message.contains("streaming connection"))
+            );
+            let invalid_port = store
+                .update(|state| {
+                    state
+                        .recovery
+                        .as_mut()
+                        .unwrap()
+                        .connection
+                        .as_mut()
+                        .unwrap()
+                        .port = 0;
+                    Ok(())
+                })
+                .await;
+            assert!(
+                matches!(invalid_port, Err(PgDurableError::Invalid(message)) if message.contains("streaming connection"))
+            );
+            let invalid_session = store
+                .update(|state| {
+                    state
+                        .recovery
+                        .as_mut()
+                        .unwrap()
+                        .connection
+                        .as_mut()
+                        .unwrap()
+                        .receiver = ProcessSessionId::default();
+                    Ok(())
+                })
+                .await;
+            assert!(
+                matches!(invalid_session, Err(PgDurableError::Invalid(message)) if message.contains("streaming connection"))
+            );
+
+            let mut malformed = store.snapshot().await;
+            let connection = malformed
+                .recovery
+                .as_mut()
+                .unwrap()
+                .connection
+                .as_mut()
+                .unwrap();
+            connection.receiver = ProcessSessionId::default();
+            connection.source.identity.agent_generation =
+                kuberic_protocol::types::AgentGeneration::default();
+            store.persist_unchecked_for_test(malformed).await.unwrap();
+            drop(store);
+
+            let reopened = PgDurableStore::open(
+                directory.path().join("application"),
+                identity,
+                StorageMode::Established,
+            )
+            .await;
+            assert!(
+                matches!(reopened, Err(PgDurableError::Invalid(message)) if message.contains("streaming connection"))
+            );
+        }
     }
 }
 

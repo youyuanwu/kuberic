@@ -25,9 +25,11 @@ mod scenarios {
     use kuberic_runtime_internal::authority::AdmittedAuthority;
     use kuberic_runtime_internal::effects::RuntimeEffectAction;
     use postgres_replicated::testing::{
-        PgPod, RecoveryStage, TestDataDir, native_configuration, native_identity,
+        PgPod, RecoveryStage, TestDataDir, definitive_fence_error, native_configuration,
+        native_identity,
     };
     use std::time::Duration;
+    use tokio_postgres::error::SqlState;
 
     #[derive(Clone, Copy)]
     enum Failure {
@@ -63,6 +65,32 @@ mod scenarios {
         explicit_demote: bool,
         alternate_candidate: bool,
         planned_restart: Option<PlannedRestart>,
+    }
+
+    async fn write_rejected(client: &tokio_postgres::Client, statement: &str) {
+        let error = tokio::time::timeout(Duration::from_secs(5), client.simple_query(statement))
+            .await
+            .expect("a timeout is not a fencing proof")
+            .expect_err("stale write succeeded");
+        assert!(
+            definitive_fence_error(&error),
+            "not a definitive fence: {error:?}"
+        );
+    }
+
+    async fn disconnected(client: &tokio_postgres::Client) {
+        let error = tokio::time::timeout(Duration::from_secs(5), client.simple_query("SELECT 1"))
+            .await
+            .expect("disconnect oracle cannot time out")
+            .expect_err("fenced SQL session remained connected");
+        assert!(
+            error.is_closed()
+                || error.code().is_some_and(|code| matches!(
+                    *code,
+                    SqlState::ADMIN_SHUTDOWN | SqlState::CRASH_SHUTDOWN
+                )),
+            "not a completed disconnect: {error:?}"
+        );
     }
 
     async fn exercise_primary_change(case: Case) {
@@ -444,11 +472,8 @@ mod scenarios {
             None
         };
         if !live_gap {
-            assert!(
-                sql.simple_query("INSERT INTO recovered VALUES(99)")
-                    .await
-                    .is_err()
-            );
+            write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+            disconnected(&sql).await;
         }
         let transition = if planned {
             TransitionKind::PlannedSwitchover
@@ -710,11 +735,8 @@ mod scenarios {
                 "no supported synchronous commit may finish after receiver drain"
             );
             source.application.instance().stop().await.unwrap();
-            assert!(
-                sql.simple_query("INSERT INTO recovered VALUES(99)")
-                    .await
-                    .is_err()
-            );
+            write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+            disconnected(&sql).await;
             drained.release.notify_one();
             role.await
         } else {
@@ -722,12 +744,8 @@ mod scenarios {
                 .effect(RuntimeEffectAction::ChangeRole(ReplicaRole::Primary))
                 .await
         };
-        assert!(
-            old_admin
-                .simple_query("INSERT INTO recovered VALUES(98)")
-                .await
-                .is_err()
-        );
+        write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+        disconnected(&old_admin).await;
         drop(old_admin);
         let _ = old_admin_connection.await.unwrap();
         if failure.is_some()

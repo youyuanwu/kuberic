@@ -783,6 +783,18 @@ impl PgDurableStore {
         }
         write_state(&path, &state, &mut false, || Ok(()), |_| {})
     }
+
+    #[cfg(test)]
+    pub(crate) async fn persist_unchecked_for_test(
+        &self,
+        state: PgDurableState,
+    ) -> Result<(), PgDurableError> {
+        let path = self.root.join(STATE_FILE);
+        let _file_lock = lock_metadata(&path, None)?;
+        write_state(&path, &state, &mut false, || Ok(()), |_| {})?;
+        *self.state.lock().await = state;
+        Ok(())
+    }
 }
 
 async fn read_state(path: &Path) -> Result<PgDurableState, PgDurableError> {

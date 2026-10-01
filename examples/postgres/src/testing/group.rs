@@ -111,8 +111,7 @@ pub enum AdmissionCut {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPart {
-    Application,
-    AgentMetadata,
+    ApplicationProcess,
     AgentHost,
 }
 
@@ -489,8 +488,7 @@ impl PgGroup {
     async fn restart_at(&mut self, part: RestartPart) {
         let id = self.primary_id();
         match part {
-            RestartPart::Application => self.pod(id).restart_application().await.unwrap(),
-            RestartPart::AgentMetadata => self.reopen_agent_metadata(id).await,
+            RestartPart::ApplicationProcess => self.pod(id).restart_application().await.unwrap(),
             RestartPart::AgentHost => {
                 let old = self.pods.remove(&id).unwrap();
                 let restarted = old.reopen().await;
