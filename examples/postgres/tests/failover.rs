@@ -588,7 +588,7 @@ mod scenarios {
             reopen_planned_host(target, &other, PlannedRestart::TargetAuthorityInstalled).await;
             write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
             disconnected(&old_admin).await;
-            rows_absent(&other, &[98]).await;
+            rows_absent(&other, &[98, 99]).await;
             assert!(!source.application.instance().is_running().await);
             return;
         }
@@ -597,7 +597,7 @@ mod scenarios {
             reopen_planned_host(target, &other, PlannedRestart::TargetPromotion).await;
             write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
             disconnected(&old_admin).await;
-            rows_absent(&other, &[98]).await;
+            rows_absent(&other, &[98, 99]).await;
             assert!(!source.application.instance().is_running().await);
             return;
         }
@@ -686,7 +686,7 @@ mod scenarios {
                 runtime.abort();
                 write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
                 disconnected(&old_admin).await;
-                rows_absent(&other, &[98]).await;
+                rows_absent(&other, &[98, 99]).await;
                 drop(old_admin);
                 let _ = old_admin_connection.await;
                 return;
