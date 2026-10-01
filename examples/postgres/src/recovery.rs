@@ -1753,6 +1753,13 @@ impl PgReplicator {
             }
         }
         let local = recovery.membership.peer(&durable.identity.replica)?.clone();
+        if policy.membership.peer(&local.identity)? != &local
+            || !policy.policy.eligible_standbys.iter().any(|standby| {
+                standby.identity == local.identity && standby.process_session_id == local.session
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let mut election = match recovery.pending {
             Some(election)
                 if election.configuration == recovery.membership.configuration
@@ -1764,20 +1771,24 @@ impl PgReplicator {
                 policy.quorum(policy.policy.eligible_standbys.len())?;
                 let mut responders = Vec::new();
                 for standby in &policy.policy.eligible_standbys {
-                    let peer = recovery.membership.peer(&standby.identity)?;
-                    if peer.session != standby.process_session_id {
-                        return Err(RuntimeError::AuthorityNotAdmitted);
-                    }
-                    match self
-                        .recovery_rpc(peer, Action::Observe, &recovery.membership)
-                        .await
+                    let Ok(peer) = recovery.membership.peer(&standby.identity) else {
+                        continue;
+                    };
+                    if peer.session != standby.process_session_id
+                        || policy.membership.peer(&standby.identity)? != peer
                     {
-                        Ok(observation) => {
-                            validate_observation(&policy, &observation, false)?;
-                            responders.push(peer.clone());
-                        }
+                        continue;
+                    }
+                    let observation = self
+                        .recovery_rpc(peer, Action::Observe, &recovery.membership)
+                        .await;
+                    let accepted = observation
+                        .and_then(|observation| validate_observation(&policy, &observation, false));
+                    match accepted {
+                        Ok(()) => responders.push(peer.clone()),
+                        Err(error) if peer == &local => return Err(error),
                         Err(error) => {
-                            tracing::warn!(%error, replica = ?peer.identity, "recovery initial responder unavailable")
+                            tracing::warn!(%error, replica = ?peer.identity, "recovery initial responder unavailable or incompatible")
                         }
                     }
                 }
@@ -2024,6 +2035,10 @@ fn validate_observation(policy: &Policy, observation: &Observation, drained: boo
 
     Ok(())
 }
+
+#[cfg(all(test, feature = "testing"))]
+#[path = "recovery_subset_tests.rs"]
+mod subset_tests;
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {

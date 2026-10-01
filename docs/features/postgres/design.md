@@ -136,6 +136,9 @@ role callback. PostgreSQL, not a shared native selector, performs recovery:
 1. Collect fresh exact-session observations for the last accepted synchronous
    policy. Require **`R + W > N`**: observed responders plus acknowledgement
    count must intersect every eligible synchronous standby acknowledgement set.
+   Missing, restarted or incompatible optional peers contribute nothing to `R`
+   but remain in persisted `N`; neither `N` nor `W` is reduced. Local authority
+   and policy must still be exact.
 2. Journal that initial set. Responders persist revocation, remove old-primary
    connection settings, verify WAL receiver exit, retain received/replay progress
    and restart closed.
