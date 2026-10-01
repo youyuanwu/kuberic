@@ -93,6 +93,23 @@ mod scenarios {
         );
     }
 
+    async fn rows_absent(pod: &PgPod, ids: &[i64]) {
+        let (client, connection) = admin(pod).await;
+        for id in ids {
+            let count = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.query_one("SELECT count(*) FROM recovered WHERE id=$1::bigint", &[id]),
+            )
+            .await
+            .expect("absence oracle cannot time out")
+            .unwrap()
+            .get::<_, i64>(0);
+            assert_eq!(count, 0, "fenced write {id} became visible");
+        }
+        drop(client);
+        connection.await.unwrap().unwrap();
+    }
+
     async fn exercise_primary_change(case: Case) {
         let Case {
             planned,
@@ -357,6 +374,11 @@ mod scenarios {
                 .unwrap();
             if planned_restart == Some(PlannedRestart::SourceAuthorityInstalled) {
                 reopen_planned_host(source, &other, PlannedRestart::SourceAuthorityInstalled).await;
+                write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+                disconnected(&sql).await;
+                write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+                disconnected(&old_admin).await;
+                rows_absent(&other, &[98, 99]).await;
                 assert!(
                     target
                         .application
@@ -378,6 +400,11 @@ mod scenarios {
                 };
                 cancel_role_at(&source, ReplicaRole::ActiveSecondary, stage).await;
                 reopen_planned_host(source, &other, point).await;
+                write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+                disconnected(&sql).await;
+                write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+                disconnected(&old_admin).await;
+                rows_absent(&other, &[98, 99]).await;
                 assert!(
                     target
                         .application
@@ -435,6 +462,11 @@ mod scenarios {
             assert!(!source.application.instance().is_running().await);
             if planned_restart == Some(PlannedRestart::SourceDemoted) {
                 reopen_planned_host(source, &other, PlannedRestart::SourceDemoted).await;
+                write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+                disconnected(&sql).await;
+                write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+                disconnected(&old_admin).await;
+                rows_absent(&other, &[98, 99]).await;
                 assert!(
                     target
                         .application
@@ -554,12 +586,18 @@ mod scenarios {
             .unwrap();
         if planned_restart == Some(PlannedRestart::TargetAuthorityInstalled) {
             reopen_planned_host(target, &other, PlannedRestart::TargetAuthorityInstalled).await;
+            write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+            disconnected(&old_admin).await;
+            rows_absent(&other, &[98]).await;
             assert!(!source.application.instance().is_running().await);
             return;
         }
         if planned_restart == Some(PlannedRestart::TargetPromotion) {
             cancel_role_at(&target, ReplicaRole::Primary, RecoveryStage::Promoted).await;
             reopen_planned_host(target, &other, PlannedRestart::TargetPromotion).await;
+            write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+            disconnected(&old_admin).await;
+            rows_absent(&other, &[98]).await;
             assert!(!source.application.instance().is_running().await);
             return;
         }
@@ -646,6 +684,9 @@ mod scenarios {
                     assert!(service.instance().connect_application().await.is_err());
                 }
                 runtime.abort();
+                write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+                disconnected(&old_admin).await;
+                rows_absent(&other, &[98]).await;
                 drop(old_admin);
                 let _ = old_admin_connection.await;
                 return;
