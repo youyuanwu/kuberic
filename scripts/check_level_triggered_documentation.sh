@@ -182,8 +182,11 @@ def live_commands(script, description):
                     if i not in redirections | operands | descriptors
                 ), f"{direct_error}: unsupported dot/source command"
             if executable == "env":
+                # GNU env accepts unambiguous long-option prefixes, including
+                # split-string payloads attached with = or passed separately.
                 assert not any(
-                    arg == "--split-string" or arg.startswith("--split-string=")
+                    (arg.startswith("--s")
+                     and "--split-string".startswith(arg.partition("=")[0]))
                     or (arg.startswith("-") and not arg.startswith("--") and "S" in arg)
                     for arg in command[index + 1:]
                 ), f"{direct_error}: unsupported env split-string program"

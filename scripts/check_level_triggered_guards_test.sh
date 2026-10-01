@@ -418,6 +418,10 @@ cases += tuple(
         "cargo test;cargo test -p kuberic-level-tests",
         "cargo test&&cargo test -p kuberic-level-tests",
         "cargo test||cargo test -p kuberic-level-tests",
+        "env MODE=ci cargo test",
+        "command env MODE=ci cargo check",
+        "env -- MODE=ci cargo check",
+        "command env -- MODE=ci cargo build",
     )
 )
 cases += (
@@ -479,6 +483,18 @@ cases += tuple(
         "printf 'cargo test' | bash",
         "bash ./hidden.sh",
     )
+)
+env_split_option = "--split-string"
+env_split_arguments = ("-S 'cargo test'", "-S'cargo check'", "-iS 'cargo test'") + tuple(
+    f"{env_split_option[:length]}{separator}'cargo test'"
+    for length in range(3, len(env_split_option) + 1)
+    for separator in ("=", " ")
+)
+cases += tuple(
+    (f"unsupported live env program {wrapper} {arguments}", "justfile", live_recipe,
+     live_recipe + f"\n    {wrapper} {arguments}", "unsupported env split-string program")
+    for wrapper in ("env", "command env")
+    for arguments in env_split_arguments
 )
 cases += tuple(
     (f"unsupported live shell {shell}", "justfile", live_recipe,
@@ -557,6 +573,11 @@ for command in (
     "command cargo check -p kuberic-protocol",
     "env MODE=ci cargo test -p kuberic-wire",
     "env -i MODE=ci cargo build --package=kuberic-protocol",
+    "command env MODE=ci cargo check -p kuberic-protocol",
+    "env MODE=ci LABEL='cargo test' cargo test -p kuberic-wire",
+    "command env MODE=ci LABEL='cargo check' cargo build --package=kuberic-protocol",
+    "env -- MODE=ci cargo check -p kuberic-protocol",
+    "command env -- MODE=ci cargo test -p kuberic-wire",
     "printf '%s\\n' .",
     "cd .",
     "true;printf '%s\\n' ok # eval, bash -c, $(cargo test), `just unit-only`",
