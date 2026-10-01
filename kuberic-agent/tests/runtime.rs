@@ -3989,6 +3989,7 @@ struct CustomRoleGate {
     fail: AtomicBool,
     configurations: Mutex<Vec<kuberic_runtime::replicator::ReplicaSetConfiguration>>,
     operations: Mutex<Vec<Bytes>>,
+    catchups: Mutex<Vec<ReplicaSetQuorumMode>>,
 }
 
 #[async_trait]
@@ -4040,7 +4041,8 @@ impl PrimaryReplicator for CustomRoleGate {
         self.configurations.lock().unwrap().push(configuration);
         Ok(())
     }
-    async fn wait_for_catch_up_quorum(&self, _: ReplicaSetQuorumMode) -> Result<()> {
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+        self.catchups.lock().unwrap().push(mode);
         Ok(())
     }
     async fn build_replica(&self, _: ReplicaInformation) -> Result<()> {
@@ -4078,6 +4080,178 @@ impl StateReplicator for CustomRoleGate {
 }
 
 struct CustomRoleService(Arc<CustomRoleGate>);
+
+#[tokio::test]
+async fn custom_removal_uses_sf_catchup_and_never_projects_raw_witness_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut intent = removal_fixture::intent(&[1, 2, 3], 1);
+    intent.resource_uid = ResourceUid::new("frozen-copy");
+    intent.cleanup.endpoint = kuberic_protocol::types::CleanupResourceIdentity::Present {
+        name: kuberic_protocol::types::derive_replica_endpoint_name(
+            &intent.resource_uid,
+            &intent.target,
+        ),
+        uid: "endpoint-3".into(),
+    };
+    intent.operation_id = intent.expected_operation_id();
+    let local = intent.primary.clone();
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let control = Arc::new(CustomRoleGate::default());
+    let runtime = PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        store.clone(),
+    );
+    runtime
+        .bind_replica_session(
+            intent.resource_uid.clone(),
+            ProcessSessionId::new("session-1"),
+        )
+        .unwrap();
+    let mut sequence = 1;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::Open(OpenMode::New),
+    )
+    .await;
+    let mut authority = AdmittedAuthority {
+        local_identity: local,
+        previous_configuration: None,
+        current_configuration: intent.previous_configuration.clone(),
+        transition_kind: None,
+        switchover_handoff: None,
+        secondary_removal: None,
+        scale_up: None,
+    };
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+    )
+    .await;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+    )
+    .await;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::PrepareSecondaryRemoval {
+            intent: Box::new(intent.clone()),
+            process_session_id: ProcessSessionId::new("session-1"),
+            report_sequence: 1,
+        },
+    )
+    .await;
+    let preparation = runtime.snapshot().await.prepared_secondary_removal.unwrap();
+    assert_eq!(preparation.boundary_lsn, 10);
+    let evidence = removal_fixture::evidence(&intent);
+    assert_eq!(evidence.preparation, preparation);
+    authority.previous_configuration = Some(intent.previous_configuration.clone());
+    authority.current_configuration = intent.current_configuration.clone();
+    authority.transition_kind = Some(TransitionKind::SecondaryScaleDown);
+    authority.secondary_removal = Some(evidence);
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+    )
+    .await;
+    authority.previous_configuration = None;
+    authority.transition_kind = None;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+    )
+    .await;
+    let committed = removal_fixture::cleanup(&intent);
+    let peer = committed.current_only_write_quorum[1].clone();
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::RegisterPeerSession {
+            identity: peer.identity.clone(),
+            session: peer.process_session_id.clone(),
+        },
+    )
+    .await;
+    let before = runtime.snapshot().await;
+    let mut stale = peer.clone();
+    stale.process_session_id = ProcessSessionId::new("stale");
+    assert!(
+        runtime
+            .apply_effect(effect(
+                sequence,
+                RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(stale))
+            ))
+            .await
+            .is_err()
+    );
+    assert_eq!(runtime.snapshot().await, before);
+    let mut raw = peer.clone();
+    raw.verified_replication_lsn = 999_999;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(raw)),
+    )
+    .await;
+    assert_eq!(
+        runtime
+            .snapshot()
+            .await
+            .current_configuration_quorum_progress,
+        before.current_configuration_quorum_progress
+    );
+    assert_eq!(runtime.snapshot().await.committed_lsn, before.committed_lsn);
+    assert!(
+        runtime
+            .apply_effect(effect(
+                sequence,
+                RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed.clone()))
+            ))
+            .await
+            .is_err()
+    );
+    // A different receipt at the same sequence is not a fresh witness.
+    assert!(
+        runtime
+            .apply_effect(effect(
+                sequence,
+                RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(peer.clone()))
+            ))
+            .await
+            .is_err()
+    );
+    let mut current = committed.clone();
+    current.current_only_write_quorum[1].report_sequence += 1;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(
+            current.current_only_write_quorum[1].clone(),
+        )),
+    )
+    .await;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(current.clone())),
+    )
+    .await;
+    assert_eq!(
+        store.load_secondary_removal_commit().await.unwrap(),
+        Some(current)
+    );
+    assert_eq!(
+        control.catchups.lock().unwrap().as_slice(),
+        &[ReplicaSetQuorumMode::All, ReplicaSetQuorumMode::All]
+    );
+}
 
 #[async_trait]
 impl ReplicatorFactory for CustomRoleService {

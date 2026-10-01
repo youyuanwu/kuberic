@@ -579,9 +579,15 @@ impl PgNativeObserver {
     }
 
     async fn snapshot_locked(&self) -> Result<PgObservation, PgError> {
-        self.instance
-            .generation_operation(self.snapshot_inner())
-            .await
+        let generation = self.instance.generation_id();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.instance.generation_operation(self.snapshot_inner()),
+        )
+        .await
+        .map_err(|_| {
+            PgError::Timeout("PostgreSQL observation".into()).with_generation(generation)
+        })?
     }
 
     async fn snapshot_inner(&self) -> Result<PgObservation, PgError> {

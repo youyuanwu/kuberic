@@ -26,6 +26,12 @@ use std::sync::Arc;
 
 const NATIVE_TOKEN: &str = "host-local-native-build";
 
+#[path = "testing/group.rs"]
+mod group;
+pub use group::{
+    AdmissionCut, PgGroup, PgSqlSession, RestartPart, definitive_fence_error, run_pg_test,
+};
+
 pub fn native_identity(id: i64, incarnation: &str) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(id),
@@ -246,14 +252,69 @@ impl PgPod {
 
     pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_agent::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
+        self.effect_as(
+            OperationId::new(format!("native-effect-{sequence}")),
+            action,
+        )
+        .await
+    }
+
+    pub async fn effect_as(
+        &self,
+        operation_id: OperationId,
+        action: RuntimeEffectAction,
+    ) -> kuberic_agent::Result<()> {
+        let sequence = self.store.load_state().await?.next_effect_sequence;
         RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
             .execute(RuntimeEffect {
-                operation_id: OperationId::new(format!("native-effect-{sequence}")),
+                operation_id,
                 sequence,
                 action,
             })
             .await?;
         Ok(())
+    }
+
+    pub async fn shutdown(&mut self) -> kuberic_runtime::Result<()> {
+        self.runtime.abort();
+        let result = self.application.abort_and_wait();
+        self.server.abort();
+        let mut server_errors = Vec::new();
+        if let Err(error) = (&mut self.server).await
+            && !error.is_cancelled()
+        {
+            server_errors.push(error.to_string());
+        }
+        if let Some(server) = self.control_server.take() {
+            server.abort();
+            match server.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => server_errors.push(error.to_string()),
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => server_errors.push(error.to_string()),
+            }
+        }
+        if server_errors.is_empty() {
+            result
+        } else {
+            Err(kuberic_runtime::RuntimeError::Application(format!(
+                "fixture server cleanup: {server_errors:?}; process cleanup: {result:?}"
+            )))
+        }
+    }
+
+    pub async fn restart_application(&self) -> Result<(), crate::instance::PgError> {
+        self.application.instance().restart_access_closed().await
+    }
+
+    pub async fn disconnect_receiver(&self) -> Result<(), crate::instance::PgError> {
+        self.application.instance().stop().await?;
+        self.application
+            .instance()
+            .config()
+            .disconnect_receiver(self.application.instance().data_dir())
+            .await?;
+        self.application.instance().restart_access_closed().await
     }
 
     pub async fn singleton(&self) {

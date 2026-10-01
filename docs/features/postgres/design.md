@@ -9,8 +9,9 @@ A PostgreSQL database hosted by the v2 `ReplicaHost`. Its service creates a
 > `postgres-replicated` package no longer depends on the classic runtime or
 > operator. Supported operations are authorized singleton initialization,
 > restart, read/write access, fencing, exact native secondary builds, replay
-> catch-up, interrupted-build recovery, failover and planned switchover.
-> Scaling orchestration remains outside this phase; the broader
+> catch-up, interrupted-build recovery, failover, planned switchover, sequential
+> scale-up, certified secondary removal, replacement and fresh-session recovery.
+> The broader
 > architecture below remains historical/planned until those phases ship.
 > Ordinary application clients use the managed
 > `kuberic_app` non-superuser role with `synchronous_commit=remote_apply`;
@@ -88,6 +89,39 @@ durable shutdown, and completed demotion. Target cuts cover authority installati
 promotion, completed activation, and a granted/acknowledged write. Each cut checks
 the exact retained/pending journal, disconnected old clients, continued closure
 without fresh admission, and preserved acknowledged rows on a surviving replica.
+
+### Scaling and adversarial local matrix
+
+`testing::PgGroup` drives the existing generic SF authority/build/configuration
+effects through real agent stores. It supplies controller decisions, not synthetic
+WAL or copy acknowledgements. Scale-up admits only the exact selected completed
+build, installs PC/CC before current-only authority, and leaves candidates fenced
+until admission. Secondary removal freezes a boundary under closed access and
+SF `All`, validates exact-session witnesses, persists the reduced commit, and
+records terminal retirement only after application Close. Raw witness progress
+never advances custom quorum progress.
+
+Replacement uses a new incarnation/root for the same ordinal. A former primary
+can rejoin only through a selected rebuild; rebuilding a configured member uses
+the existing repair-build authority. PostgreSQL checkpoints the installed copy's
+replay before completion so its timeline remains observable after a receiver
+disconnect. Fresh sessions reconnect using app-owned, revalidated source endpoint
+and lineage observations. A stopped replica may acknowledge durable policy
+metadata, but that acknowledgement is explicitly non-running and cannot earn
+recovery quorum credit.
+
+```sh
+cargo test -p postgres-replicated --all-features --test reconfiguration --test authority_races --test switchover_checkpoints --test validation_oracles -- --test-threads=1
+```
+
+These targets cover sequential 1-to-2-to-3 growth and 3-to-2-to-1 reduction,
+same-ordinal replacement, all identities as failover/switchover targets,
+quorum loss with readable secondaries, fresh-session restoration, and independent
+application/metadata/host reopen at admission boundaries. Oracles compare complete
+SQL contents and durable lineage/authority, use unique stale-write IDs, and accept
+only closed-connection, shutdown, or physical read-only errors. Syntax errors,
+duplicate keys and deadlines are not fencing evidence. Explicit teardown checks
+retained pidfds, every allocated listener address and the exact fixture root.
 
 ## Running the singleton host
 

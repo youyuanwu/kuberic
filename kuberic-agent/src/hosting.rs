@@ -391,8 +391,13 @@ impl PodRuntime {
                 let authority = snapshot
                     .authority
                     .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                let kind = if authority.transition_kind
-                    == Some(kuberic_protocol::types::TransitionKind::Failover)
+                let kind = if authority
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == target)
+                    || authority.transition_kind
+                        == Some(kuberic_protocol::types::TransitionKind::Failover)
                 {
                     BuildAuthorityKind::Failover
                 } else {
@@ -561,7 +566,7 @@ impl PodRuntime {
         historical: Option<kuberic_protocol::command::AcceptSecondaryRemovalCommit>,
     ) -> Result<()> {
         self.host
-            .managed()?
+            .lifecycle()?
             .execute_action(match historical {
                 Some(command) => {
                     RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command))
@@ -702,7 +707,7 @@ impl PodRuntime {
             },
             None => RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness)),
         };
-        self.host.managed()?.execute_action(action).await
+        self.host.lifecycle()?.execute_action(action).await
     }
 
     pub async fn partition_report(&self) -> PartitionReportSnapshot {
@@ -1162,7 +1167,7 @@ impl RuntimeHost {
                             "conflicting terminal retirement".into(),
                         ));
                     }
-                    if let Ok(managed) = self.managed() {
+                    if let Ok(managed) = self.lifecycle() {
                         managed
                             .execute_action(RuntimeEffectAction::CompleteRetirement(retired))
                             .await?;
@@ -1172,7 +1177,7 @@ impl RuntimeHost {
                         self.closed.store(true, Ordering::Release);
                     }
                 } else {
-                    let managed = self.managed()?;
+                    let managed = self.lifecycle()?;
                     if !self.closed.load(Ordering::Acquire) {
                         managed
                             .execute_action(RuntimeEffectAction::FenceRetirement(retired.clone()))

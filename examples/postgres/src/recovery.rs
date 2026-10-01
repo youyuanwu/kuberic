@@ -194,6 +194,18 @@ pub(crate) struct Recovery {
     followed: Option<(kuberic_protocol::types::Epoch, PgLineage)>,
     #[serde(default)]
     preparation: Option<(kuberic_protocol::types::ConfigurationId, i64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection: Option<Connection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Connection {
+    source: Peer,
+    receiver: ProcessSessionId,
+    host: String,
+    port: u16,
+    lineage: PgLineage,
 }
 
 impl Recovery {
@@ -205,6 +217,7 @@ impl Recovery {
         self.accepted_policy = None;
         self.followed = None;
         self.preparation = None;
+        self.connection = None;
     }
 
     pub(crate) fn validate(&self, local: &ReplicaIdentity) -> std::result::Result<(), String> {
@@ -302,6 +315,15 @@ impl Recovery {
             if *epoch > self.membership.configuration.epoch {
                 return Err("future PostgreSQL following receipt".into());
             }
+            if let Some(connection) = &self.connection {
+                connection.lineage.validate()?;
+                if connection.host.parse::<std::net::IpAddr>().is_err()
+                    || connection.port == 0
+                    || connection.receiver.is_empty()
+                {
+                    return Err("invalid PostgreSQL streaming connection".into());
+                }
+            }
         }
         Ok(())
     }
@@ -338,6 +360,22 @@ pub(crate) struct Observation {
     evidence: PgReplicationEvidence,
     source_fence: Option<SourceFence>,
     policy: Option<Policy>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    host: String,
+    #[serde(default, skip_serializing_if = "zero_port")]
+    port: u16,
+    #[serde(default = "legacy_running", skip_serializing_if = "is_running")]
+    running: bool,
+}
+
+fn legacy_running() -> bool {
+    true
+}
+fn is_running(value: &bool) -> bool {
+    *value
+}
+fn zero_port(value: &u16) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +558,7 @@ impl PgReplicator {
                 let receiver_epoch = old.as_ref().and_then(|r| r.receiver_epoch);
                 let followed = old.as_ref().and_then(|r| r.followed.clone());
                 let preparation = old.as_ref().and_then(|r| r.preparation.clone());
+                let connection = old.as_ref().and_then(|r| r.connection.clone());
                 state.recovery = Some(Recovery {
                     membership,
                     previous,
@@ -530,12 +569,39 @@ impl PgReplicator {
                     receiver_epoch,
                     followed,
                     preparation,
+                    connection,
                 });
                 Ok(())
             })
             .await
             .map_err(application_error)?;
         Ok(())
+    }
+
+    async fn stopped_policy_ack(&self, receiver: &Peer) -> Result<Observation> {
+        let state = self.durable.revalidate().await.map_err(application_error)?;
+        let lineage = self.lineage().await?;
+        Ok(Observation {
+            peer: receiver.clone(),
+            lineage: lineage.clone(),
+            evidence: PgReplicationEvidence {
+                engine: "postgres-physical".into(),
+                system_identifier: lineage.system_identifier,
+                timeline_id: lineage.timeline,
+                in_recovery: state.role == PgDurableRole::Standby,
+                flush_lsn: state.flush_lsn,
+                received_lsn: state.received_lsn,
+                replay_lsn: state.replay_lsn,
+                metadata_generation: state.generation,
+                synchronous: state.synchronous.clone(),
+                wal_receiver_stopped: state.role == PgDurableRole::Standby,
+            },
+            source_fence: state.recovery.as_ref().and_then(|r| r.source_fence.clone()),
+            policy: state.recovery.and_then(|r| r.accepted_policy),
+            host: self.instance.listen_host().into(),
+            port: self.instance.port(),
+            running: false,
+        })
     }
 
     async fn recovery_rpc(
@@ -609,6 +675,28 @@ impl PgReplicator {
     }
 
     pub(crate) async fn recovery_request(&self, request: Request) -> Result<Observation> {
+        if request.action == Action::Observe {
+            // Read-only discovery must remain available while the primary waits
+            // for the receiver whose fresh session is being reconstructed.
+            let before = self.durable.revalidate().await.map_err(application_error)?;
+            self.validate_recovery_request(&request, &before)?;
+            let generation = self.instance.generation_id();
+            let observation = self.recovery_observation(&request.receiver).await?;
+            let after = self.durable.revalidate().await.map_err(application_error)?;
+            self.validate_recovery_request(&request, &after)?;
+            if generation != self.instance.generation_id()
+                || observation.policy
+                    != after
+                        .recovery
+                        .as_ref()
+                        .and_then(|r| r.accepted_policy.clone())
+                || observation.source_fence
+                    != after.recovery.as_ref().and_then(|r| r.source_fence.clone())
+            {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            return Ok(observation);
+        }
         let _state = self.state.lock().await;
         let _access = self.instance.access_lock.lock().await;
         self.recovery_request_inner(request).await
@@ -616,16 +704,8 @@ impl PgReplicator {
 
     async fn recovery_request_inner(&self, request: Request) -> Result<Observation> {
         let durable = self.durable.revalidate().await.map_err(application_error)?;
+        self.validate_recovery_request(&request, &durable)?;
         let recovery = durable.recovery.ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        if self.cancellation.is_cancelled()
-            || request.version != crate::build::BUILD_PROTOCOL_VERSION
-            || request.resource != durable.identity.resource_uid
-            || request.configuration != recovery.membership.configuration
-            || recovery.membership.peer(&durable.identity.replica)? != &request.receiver
-            || recovery.membership.peer(&request.sender.identity)? != &request.sender
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
         match request.action {
             Action::Policy(policy) => {
                 policy.validate()?;
@@ -664,6 +744,9 @@ impl PgReplicator {
                     })
                     .await
                     .map_err(application_error)?;
+                if !self.instance.is_running().await {
+                    return self.stopped_policy_ack(&request.receiver).await;
+                }
             }
             Action::Drain => {
                 if recovery.membership.primary()? != &request.sender
@@ -813,6 +896,13 @@ impl PgReplicator {
                         state.role = PgDurableRole::Standby;
                         state.postgres_stopped = false;
                         let recovery = state.recovery.as_mut().unwrap();
+                        recovery.connection = Some(Connection {
+                            source: request.sender.clone(),
+                            receiver: request.receiver.session.clone(),
+                            host,
+                            port,
+                            lineage: lineage.clone(),
+                        });
                         recovery.followed = Some((request.configuration.epoch, lineage));
                         recovery.pending = None;
                         recovery.source_fence = None;
@@ -848,6 +938,9 @@ impl PgReplicator {
                 .filter(|f| f.stopped)
                 .ok_or(RuntimeError::ReconfigurationPending)?;
             return Ok(Observation {
+                host: self.instance.listen_host().into(),
+                port: self.instance.port(),
+                running: false,
                 peer: peer.clone(),
                 lineage: source.lineage.clone(),
                 source_fence: fence,
@@ -898,12 +991,191 @@ impl PgReplicator {
             )
             .await?;
         Ok(Observation {
+            host: self.instance.listen_host().into(),
+            port: self.instance.port(),
+            running: true,
             peer: peer.clone(),
             lineage,
             evidence,
             source_fence: fence,
             policy: durable.recovery.and_then(|r| r.accepted_policy),
         })
+    }
+
+    fn validate_recovery_request(
+        &self,
+        request: &Request,
+        durable: &crate::durable::PgDurableState,
+    ) -> Result<()> {
+        let recovery = durable
+            .recovery
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if self.cancellation.is_cancelled()
+            || request.version != crate::build::BUILD_PROTOCOL_VERSION
+            || request.resource != durable.identity.resource_uid
+            || request.configuration != recovery.membership.configuration
+            || recovery.membership.peer(&durable.identity.replica)? != &request.receiver
+            || recovery.membership.peer(&request.sender.identity)? != &request.sender
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn reconnect_receiver(&self) -> Result<bool> {
+        let _access = self.instance.access_lock.lock().await;
+        let durable = self.durable.revalidate().await.map_err(application_error)?;
+        let recovery = durable
+            .recovery
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if recovery.former_primary
+            || durable.role != PgDurableRole::Standby
+            || recovery.pending.as_ref().is_some_and(|e| !e.ready)
+        {
+            return Ok(false);
+        }
+        let source = match recovery.membership.primary() {
+            Ok(source) => source,
+            Err(RuntimeError::AuthorityNotAdmitted) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if source.identity == durable.identity.replica {
+            return Ok(false);
+        }
+        let receiver = recovery.membership.peer(&durable.identity.replica)?;
+        if recovery
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.source.identity != source.identity)
+            || (recovery.connection.is_none()
+                && durable
+                    .native_build
+                    .as_ref()
+                    .is_some_and(|build| build.request.authority.source != source.identity))
+        {
+            return Ok(false);
+        }
+        if self.instance.is_running().await
+            && recovery.connection.is_none()
+            && durable.native_build.as_ref().is_some_and(|build| {
+                build.stage == crate::build::PgBuildStage::Complete
+                    && build.request.source_session == source.session
+                    && build.request.target_session == receiver.session
+            })
+        {
+            return Ok(true);
+        }
+        if self.instance.is_running().await
+            && recovery
+                .connection
+                .as_ref()
+                .is_some_and(|c| c.source == *source && c.receiver == receiver.session)
+        {
+            return Ok(true);
+        }
+        let cached = recovery
+            .connection
+            .as_ref()
+            .filter(|connection| connection.source == *source)
+            .cloned()
+            .or_else(|| {
+                let build = durable.native_build.as_ref().filter(|build| {
+                    build.stage == crate::build::PgBuildStage::Complete
+                        && build.request.authority.source == source.identity
+                        && build.request.source_session == source.session
+                        && build.request.source_endpoint == source.endpoint
+                })?;
+                Some(Connection {
+                    source: source.clone(),
+                    receiver: receiver.session.clone(),
+                    host: build.request.source_host.clone(),
+                    port: build.request.source_port,
+                    lineage: build.request.lineage.clone(),
+                })
+            });
+        let mut connection = if let Some(cached) = cached {
+            cached
+        } else {
+            let observed = match self
+                .recovery_rpc(source, Action::Observe, &recovery.membership)
+                .await
+            {
+                Ok(observed) => observed,
+                Err(
+                    error @ (RuntimeError::AuthorityNotAdmitted
+                    | RuntimeError::ReconfigurationPending),
+                ) => {
+                    tracing::warn!(%error, "receiver reconnect awaits exact source observation");
+                    return Ok(false);
+                }
+                Err(RuntimeError::OperationCancelled) => {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                Err(error) => {
+                    return Err(self
+                        .report(kuberic_protocol::types::FaultType::Transient, error)
+                        .await);
+                }
+            };
+            if !observed.running || observed.evidence.in_recovery {
+                return Ok(false);
+            }
+            if observed.host.parse::<std::net::IpAddr>().is_err() || observed.port == 0 {
+                tracing::warn!("receiver reconnect source omitted a valid SQL endpoint");
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            Connection {
+                source: source.clone(),
+                receiver: receiver.session.clone(),
+                host: observed.host,
+                port: observed.port,
+                lineage: observed.lineage,
+            }
+        };
+        connection.receiver = receiver.session.clone();
+        let local_lineage = self.lineage().await?;
+        if local_lineage != connection.lineage {
+            return Err(self
+                .permanent("receiver restart requires matching admitted lineage or a new build")
+                .await);
+        }
+        self.pg_result(self.instance.stop().await).await?;
+        self.pg_result(
+            self.instance
+                .config()
+                .configure_standby(
+                    self.instance.data_dir(),
+                    &connection.host,
+                    connection.port,
+                    &crate::native::replication_application_name(
+                        &durable.identity.replica,
+                        &connection.receiver,
+                    ),
+                    &crate::native::replication_slot_name(&durable.identity.replica),
+                    &connection.lineage,
+                )
+                .await,
+        )
+        .await?;
+        self.pg_result(
+            self.instance
+                .start_native_with_cancellation(self.fault_tx.clone(), self.cancellation.clone())
+                .await,
+        )
+        .await?;
+        self.durable
+            .update(|state| {
+                state.recovery.as_mut().unwrap().connection = Some(connection);
+                state.postgres_stopped = false;
+                state.external_access_closed = true;
+                Ok(())
+            })
+            .await
+            .map_err(application_error)?;
+        self.observe_pg().await?;
+        Ok(true)
     }
 
     async fn drain_receiver(&self) -> Result<()> {
@@ -1545,7 +1817,7 @@ impl PgReplicator {
         Ok(())
     }
 
-    async fn recovery_checkpoint_sql(&self) -> Result<()> {
+    pub(super) async fn recovery_checkpoint_sql(&self) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (client, connection) = self.instance.connect().await.map_err(application_error)?;
             client
@@ -1564,7 +1836,8 @@ impl PgReplicator {
 fn validate_observation(policy: &Policy, observation: &Observation, drained: bool) -> Result<()> {
     observation.lineage.validate().map_err(application_error)?;
     observation.evidence.validate().map_err(application_error)?;
-    if !observation.evidence.in_recovery
+    if !observation.running
+        || !observation.evidence.in_recovery
         || observation.policy.as_ref() != Some(policy)
         || policy.membership.peer(&observation.peer.identity)? != &observation.peer
         || observation.lineage != policy.lineage
@@ -1635,6 +1908,9 @@ mod tests {
 
     fn observation(policy: &Policy) -> Observation {
         Observation {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            running: true,
             peer: policy.membership.peers[1].clone(),
             lineage: policy.lineage.clone(),
             source_fence: None,
@@ -1690,7 +1966,7 @@ mod tests {
         let good = observation(&policy);
         validate_observation(&policy, &good, true).unwrap();
         assert!(good.evidence.replay_lsn.unwrap() < good.evidence.received_lsn.unwrap());
-        for mutation in 0..7 {
+        for mutation in 0..8 {
             let mut bad = good.clone();
             match mutation {
                 0 => bad.peer.session = ProcessSessionId::new("replacement"),
@@ -1699,12 +1975,30 @@ mod tests {
                 3 => bad.evidence.wal_receiver_stopped = false,
                 4 => bad.policy = None,
                 5 => bad.policy.as_mut().unwrap().generation += 1,
-                _ => bad.evidence.replay_lsn = Some(101),
+                6 => bad.evidence.replay_lsn = Some(101),
+                _ => bad.running = false,
             }
             assert!(
                 validate_observation(&policy, &bad, true).is_err(),
                 "accepted observation mutation {mutation}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_running_receipts_keep_their_serialized_shape_and_stopped_acks_are_explicit() {
+        let policy = policy();
+        let mut legacy = serde_json::to_value(observation(&policy)).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("host");
+        object.remove("port");
+        object.remove("running");
+        let mut receipt: Observation = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(receipt.running);
+        assert_eq!(serde_json::to_value(&receipt).unwrap(), legacy);
+        validate_observation(&policy, &receipt, true).unwrap();
+        receipt.running = false;
+        assert_eq!(serde_json::to_value(&receipt).unwrap()["running"], false);
+        assert!(validate_observation(&policy, &receipt, true).is_err());
     }
 }

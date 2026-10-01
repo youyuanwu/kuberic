@@ -269,8 +269,25 @@ impl PgReplicator {
         configuration: &ConfigurationDescriptor,
     ) -> Result<BTreeMap<ReplicaIdentity, kuberic_protocol::types::ProcessSessionId>> {
         let local = self.durable.snapshot().await.identity.replica;
+        let mut members = configuration.members.clone();
+        if let Some(previous) = self
+            .durable
+            .snapshot()
+            .await
+            .recovery
+            .and_then(|r| r.previous)
+        {
+            for member in previous.members {
+                if !members
+                    .iter()
+                    .any(|current| current.identity == member.identity)
+                {
+                    members.push(member);
+                }
+            }
+        }
         let mut sessions = BTreeMap::new();
-        for member in &configuration.members {
+        for member in &members {
             if member.identity != local {
                 sessions.insert(
                     member.identity.clone(),
@@ -286,8 +303,19 @@ impl PgReplicator {
         configuration: &ConfigurationDescriptor,
     ) -> Result<BTreeMap<ReplicaIdentity, kuberic_protocol::types::ProcessSessionId>> {
         let durable = self.durable.snapshot().await;
+        let mut members = configuration.members.clone();
+        if let Some(previous) = durable.recovery.as_ref().and_then(|r| r.previous.as_ref()) {
+            for member in &previous.members {
+                if !members
+                    .iter()
+                    .any(|current| current.identity == member.identity)
+                {
+                    members.push(member.clone());
+                }
+            }
+        }
         let mut sessions = BTreeMap::new();
-        for member in &configuration.members {
+        for member in &members {
             if member.identity == durable.identity.replica {
                 continue;
             }
@@ -326,7 +354,7 @@ impl PgReplicator {
                     != build.request.lineage)
         {
             return Err(self
-                .permanent("native PostgreSQL build storage no longer matches frozen lineage")
+                .permanent(format!("native PostgreSQL build storage no longer matches frozen lineage: replica={:?}, expected={:?}, observed={evidence:?}", durable.identity.replica, build.request.lineage))
                 .await);
         }
         if durable.native_build.is_none()
@@ -788,6 +816,7 @@ impl PgReplicator {
                 progress
                     .advance(PgBuildStage::Complete)
                     .map_err(application_error)?;
+                self.recovery_checkpoint_sql().await?;
                 self.persist_build(&progress).await?;
                 self.observe_pg().await?;
                 self.durable
@@ -901,6 +930,8 @@ impl PgReplicator {
                     .await,
             )
             .await?;
+        } else {
+            self.pg_result(self.instance.stop().await).await?;
         }
         self.permanent_result(
             self.durable
@@ -959,6 +990,10 @@ impl PgReplicator {
         if durable.native_build.is_some() {
             // No old session is allowed to reconnect a receiver on reopen.
             // Exact re-admission resumes installed data without initializing it.
+            state.opened = true;
+            return Ok(());
+        }
+        if durable.role == PgDurableRole::Standby {
             state.opened = true;
             return Ok(());
         }
@@ -1399,7 +1434,7 @@ impl PgReplicator {
             {
                 self.stop().await?;
             }
-            if (admitted_standby || becoming_primary)
+            if becoming_primary
                 && self.peer_session(&primary.identity).await.is_ok()
                 && !self.instance.is_running().await
             {
@@ -1449,6 +1484,9 @@ impl PgReplicator {
                     self.observe_pg().await?;
                 }
             }
+        }
+        if member.is_some_and(|member| member.role == ReplicaRole::ActiveSecondary) {
+            self.reconnect_receiver().await?;
         }
         if member.is_none_or(|m| m.role != ReplicaRole::Primary)
             || !self.instance.is_running().await
@@ -1713,7 +1751,7 @@ impl PgReplicator {
                     .iter()
                     .any(|m| m.identity == replica.identity)
                 {
-                    kuberic_protocol::types::BuildAuthorityKind::Bootstrap
+                    kuberic_protocol::types::BuildAuthorityKind::Failover
                 } else {
                     kuberic_protocol::types::BuildAuthorityKind::Provisioning
                 },

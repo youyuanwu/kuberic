@@ -15,6 +15,8 @@ use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 use super::{RuntimeHost, empty_snapshot};
+#[path = "custom_removal.rs"]
+mod removal;
 
 #[derive(Clone, PartialEq, Eq)]
 struct BuildReceipt {
@@ -37,6 +39,8 @@ pub(super) struct CustomReplicatorHost {
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
+    removal_witnesses:
+        RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
     outbound: mpsc::Sender<OutboundOperation>,
     receiver: Mutex<mpsc::Receiver<OutboundOperation>>,
 }
@@ -68,6 +72,7 @@ impl CustomReplicatorHost {
             build_generations: RwLock::default(),
             receipts: RwLock::default(),
             configuration: RwLock::default(),
+            removal_witnesses: RwLock::default(),
             outbound,
             receiver: Mutex::new(receiver),
         }
@@ -172,6 +177,9 @@ impl CustomReplicatorHost {
             .load_builds()
             .await?;
         let authority = self.state.read().await.authority.clone();
+        let previous = authority
+            .as_ref()
+            .and_then(|a| a.previous_configuration.clone());
         let admitted = authority.map(|a| a.current_configuration);
         let incoming = builds
             .iter()
@@ -207,8 +215,18 @@ impl CustomReplicatorHost {
             .clone()
             .unwrap_or_default();
         let addresses = self.addresses.read().await.clone();
-        let mut replicas = configuration
-            .members
+        let mut members = configuration.members.clone();
+        if let Some(previous) = previous {
+            for member in previous.members {
+                if !members
+                    .iter()
+                    .any(|current| current.identity == member.identity)
+                {
+                    members.push(member);
+                }
+            }
+        }
+        let mut replicas = members
             .iter()
             .map(|member| {
                 let mut replica = ReplicaInformation::new(
@@ -282,7 +300,25 @@ impl CustomReplicatorHost {
             .and_then(|a| a.previous_configuration.clone())
         {
             self.primary
-                .update_catch_up_replica_set_configuration(current.clone(), previous.into())
+                .update_catch_up_replica_set_configuration(
+                    current.clone(),
+                    ReplicaSetConfiguration {
+                        replicas: current
+                            .replicas
+                            .iter()
+                            .filter_map(|replica| {
+                                let member = previous
+                                    .members
+                                    .iter()
+                                    .find(|m| m.identity == replica.identity)?;
+                                let mut replica = replica.clone();
+                                replica.role = member.role;
+                                Some(replica)
+                            })
+                            .collect(),
+                        configuration: previous,
+                    },
+                )
                 .await
         } else {
             self.primary
@@ -319,6 +355,19 @@ impl CustomReplicatorHost {
                 .ok_or(RuntimeError::AuthorityNotAdmitted)?;
             if authority.primary_identity() != &host.identity {
                 return Err(RuntimeError::NotPrimary);
+            }
+            if authority
+                .secondary_removal
+                .as_ref()
+                .is_some_and(|evidence| {
+                    authority.previous_configuration.is_some()
+                        || state
+                            .accepted_secondary_removal
+                            .as_ref()
+                            .is_none_or(|committed| &committed.evidence != evidence)
+                })
+            {
+                return Err(RuntimeError::ReconfigurationPending);
             }
         }
         {
@@ -560,6 +609,7 @@ impl CustomReplicatorHost {
         Ok(())
     }
     pub(super) async fn fence_writes(&self) -> Result<()> {
+        self.removal_witnesses.write().await.clear();
         let configuration = self.configuration.read().await.clone();
         if let Some(configuration) = configuration {
             for generation in self.build_generations.write().await.values_mut() {
@@ -592,6 +642,12 @@ impl CustomReplicatorHost {
             .replica_authority_store
             .load()
             .await?;
+        self.state.write().await.prepared_secondary_removal = self
+            .host()?
+            .default_dependencies
+            .replica_authority_store
+            .load_secondary_removal()
+            .await?;
         self.configure().await?;
         self.refresh().await
     }
@@ -601,6 +657,43 @@ impl CustomReplicatorHost {
         match action {
             RuntimeEffectAction::AdmitAuthority(authority) => {
                 authority.validate()?;
+                if let Some(evidence) = &authority.scale_up {
+                    let intent = evidence.intent();
+                    if intent.target == host.identity
+                        && self
+                            .state
+                            .read()
+                            .await
+                            .authority
+                            .as_ref()
+                            .is_none_or(|old| {
+                                old.current_configuration != authority.current_configuration
+                            })
+                    {
+                        let build = host
+                            .default_dependencies
+                            .build_authority_store
+                            .load_build(&intent.build_id)
+                            .await?
+                            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                        if build.source != intent.primary
+                            || build.target != intent.target
+                            || build.current_configuration != intent.previous_configuration
+                            || build.replication_boundary_lsn != intent.snapshot_boundary_lsn
+                            || self.receipts.read().await.get(&intent.build_id)
+                                != Some(&self.receipt(&build).await?)
+                            || !self.state.read().await.builds.iter().any(|progress| {
+                                progress.authority == build
+                                    && progress.completed
+                                    && progress.catch_up_boundary_lsn
+                                        == Some(intent.catch_up_boundary_lsn)
+                                    && progress.durable_lsn >= intent.catch_up_boundary_lsn
+                            })
+                        {
+                            return Err(RuntimeError::AuthorityNotAdmitted);
+                        }
+                    }
+                }
                 self.fence_writes().await?;
                 host.default_dependencies
                     .replica_authority_store
@@ -737,6 +830,59 @@ impl CustomReplicatorHost {
                 self.refresh().await?;
             }
             RuntimeEffectAction::RefreshApplicationProgress => self.refresh().await?,
+            RuntimeEffectAction::PrepareSecondaryRemoval {
+                intent,
+                process_session_id,
+                report_sequence,
+            } => {
+                self.prepare_removal(*intent, process_session_id, report_sequence)
+                    .await?;
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness) => {
+                self.observe_removal(*witness).await?
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
+                self.observe_removal_progress(*witness, *committed).await?;
+            }
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
+                self.accept_removal(*committed, false).await?
+            }
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
+                kuberic_protocol::validation::validate_accept_secondary_removal_commit(&command)?;
+                if !command.local_recovery || command.target != host.identity {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                self.accept_removal(command.committed, true).await?;
+            }
+            RuntimeEffectAction::FenceRetirement(retired) => {
+                retired.validate(&host.identity)?;
+                host.default_dependencies
+                    .replica_authority_store
+                    .record_retirement_started(&retired)
+                    .await?;
+                self.set_access(AccessStatus::NotPrimary, AccessStatus::NotPrimary)
+                    .await?;
+            }
+            RuntimeEffectAction::CompleteRetirement(retired) => {
+                retired.validate(&host.identity)?;
+                let closed = host.state.read().await.fallback_snapshot.clone();
+                if closed.open || closed.role != kuberic_protocol::types::ReplicaRole::None {
+                    return Err(RuntimeError::ReconfigurationPending);
+                }
+                host.default_dependencies
+                    .replica_authority_store
+                    .retire(&retired)
+                    .await?;
+                let mut state = self.state.write().await;
+                state.retired_authority = Some(*retired);
+                state.open = false;
+                state.authority = None;
+                state.builds.clear();
+                state.read_status = AccessStatus::NotPrimary;
+                state.write_status = AccessStatus::NotPrimary;
+                drop(state);
+                host.state.write().await.fallback_snapshot.authority = None;
+            }
             _ => return unavailable(),
         }
         Ok(())

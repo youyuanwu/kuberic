@@ -48,6 +48,14 @@ state capability directly. Only the registered default engine supplies
 `ManagedReplicator` internals for Kuberic's operation transport and write journal;
 custom lifecycle hosting does not implement or impersonate that capability.
 
+Custom-primary scaling uses the existing generic authority and effect records.
+Candidate admission checks the exact live build selection and boundary.
+Secondary-removal preparation and commit require SF catch-up callbacks; peer
+witnesses are session/configuration checked but never projected into application
+quorum progress. Retirement persists intent before Close and its tombstone only
+after the returned replicator and service have closed. These paths contain no
+database-specific evidence or protocol fields.
+
 The agent now owns fenced `EnsureConfiguration` admission, durable private
 Demote/GetLSN/Catchup/Deactivate/Activate stages, restart-safe runtime effect
 sequencing, independent read/write access, partition/load/fault reports,
