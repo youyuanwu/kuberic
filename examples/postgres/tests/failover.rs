@@ -278,17 +278,10 @@ mod scenarios {
         }
         if planned_restart == Some(PlannedRestart::SourcePreFence) {
             reopen_planned_host(source, &other, PlannedRestart::SourcePreFence).await;
-            assert!(
-                sql.simple_query("INSERT INTO recovered VALUES(99)")
-                    .await
-                    .is_err()
-            );
-            assert!(
-                old_admin
-                    .simple_query("INSERT INTO recovered VALUES(98)")
-                    .await
-                    .is_err()
-            );
+            write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+            disconnected(&sql).await;
+            write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+            disconnected(&old_admin).await;
             assert!(
                 target
                     .application
@@ -419,17 +412,10 @@ mod scenarios {
                     source.runtime.partition_report().await.reported_fault,
                     Some(kuberic_protocol::types::FaultType::Permanent)
                 );
-                assert!(
-                    sql.simple_query("INSERT INTO recovered VALUES(99)")
-                        .await
-                        .is_err()
-                );
-                assert!(
-                    old_admin
-                        .simple_query("INSERT INTO recovered VALUES(98)")
-                        .await
-                        .is_err()
-                );
+                write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+                disconnected(&sql).await;
+                write_rejected(&old_admin, "INSERT INTO recovered VALUES(98)").await;
+                disconnected(&old_admin).await;
                 assert!(
                     target
                         .application
@@ -846,17 +832,10 @@ mod scenarios {
             .unwrap();
         if planned_restart == Some(PlannedRestart::TargetGranted) {
             reopen_planned_host(target, &other, PlannedRestart::TargetGranted).await;
-            assert!(
-                sql.simple_query("INSERT INTO recovered VALUES(99)")
-                    .await
-                    .is_err()
-            );
-            assert!(
-                admin
-                    .simple_query("INSERT INTO recovered VALUES(98)")
-                    .await
-                    .is_err()
-            );
+            write_rejected(&sql, "INSERT INTO recovered VALUES(99)").await;
+            disconnected(&sql).await;
+            write_rejected(&admin, "INSERT INTO recovered VALUES(98)").await;
+            disconnected(&admin).await;
             assert!(!source.application.instance().is_running().await);
             return;
         }
@@ -876,17 +855,10 @@ mod scenarios {
                 target.runtime.partition_report().await.write_status,
                 AccessStatus::Granted
             );
-            assert!(
-                sql.simple_query("INSERT INTO recovered VALUES(77)")
-                    .await
-                    .is_err()
-            );
-            assert!(
-                admin
-                    .simple_query("INSERT INTO recovered VALUES(78)")
-                    .await
-                    .is_err()
-            );
+            write_rejected(&sql, "INSERT INTO recovered VALUES(77)").await;
+            disconnected(&sql).await;
+            write_rejected(&admin, "INSERT INTO recovered VALUES(78)").await;
+            disconnected(&admin).await;
             let (check, task) = self::admin(&target).await;
             assert_eq!(
                 check
@@ -1074,22 +1046,14 @@ mod scenarios {
             processes.assert_reaped();
         }
         if let Some((sql, task)) = ordinary {
-            assert!(
-                sql.simple_query("INSERT INTO recovered VALUES(9101)")
-                    .await
-                    .is_err(),
-                "{point:?}"
-            );
+            write_rejected(&sql, "INSERT INTO recovered VALUES(9101)").await;
+            disconnected(&sql).await;
             drop(sql);
             let _ = task.await;
         }
         if let Some((sql, task)) = administrative {
-            assert!(
-                sql.simple_query("INSERT INTO recovered VALUES(9102)")
-                    .await
-                    .is_err(),
-                "{point:?}"
-            );
+            write_rejected(&sql, "INSERT INTO recovered VALUES(9102)").await;
+            disconnected(&sql).await;
             drop(sql);
             let _ = task.await.unwrap();
         }

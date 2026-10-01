@@ -116,12 +116,15 @@ cargo test -p postgres-replicated --all-features --test reconfiguration --test a
 
 These targets cover sequential 1-to-2-to-3 growth and 3-to-2-to-1 reduction,
 same-ordinal replacement, all identities as failover/switchover targets,
-quorum loss with readable secondaries, fresh-session restoration, and independent
-application/metadata/host reopen at admission boundaries. Oracles compare complete
-SQL contents and durable lineage/authority, use unique stale-write IDs, and accept
-only closed-connection, shutdown, or physical read-only errors. Syntax errors,
-duplicate keys and deadlines are not fencing evidence. Explicit teardown checks
-retained pidfds, every allocated listener address and the exact fixture root.
+quorum loss with readable secondaries, fresh-session restoration, and the six
+application-process/whole-agent-host restart combinations at durable admission
+boundaries. Reopening the metadata connection is separate persistence coverage,
+not runtime-owner reconstruction. Oracles compare complete SQL contents and
+durable lineage/authority, use unique stale-write IDs, and distinguish definitive
+write rejection from completed ordinary/administrative session disconnection.
+Syntax errors, duplicate keys and deadlines are not fencing evidence. Explicit
+teardown checks retained pidfds, every allocated listener address and the exact
+fixture root.
 
 ## Running the singleton host
 

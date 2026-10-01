@@ -95,9 +95,14 @@ fn application_process_restart_and_metadata_connection_reopen_preserve_committed
         group.reopen_agent_metadata(1).await;
         group.write("metadata connection reopened").await;
         let retained = group.session(1, false).await;
+        let retained_admin = group.session(1, true).await;
         let agent_probe = group.next_probe();
+        let agent_admin_probe = group.next_probe();
         group.restart_peer(1).await;
         retained.rejected(agent_probe).await;
+        retained_admin.rejected(agent_admin_probe).await;
+        retained.disconnected().await;
+        retained_admin.disconnected().await;
         assert_ne!(group.pod(1).session, session);
         group.write("whole agent reopened").await;
         group.assert_contents().await;
