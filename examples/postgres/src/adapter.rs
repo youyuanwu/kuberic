@@ -28,6 +28,9 @@ use crate::native::{PgNativeObserver, compile_synchronous_configuration, timelin
 mod build_deletion_tests;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
+#[cfg(all(test, feature = "testing"))]
+#[path = "role_mismatch_tests.rs"]
+mod role_mismatch_tests;
 
 pub(crate) fn application_error(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Application(error.to_string())
@@ -201,7 +204,9 @@ impl PgReplicator {
             return Ok(durable);
         }
         if durable.recovery_state != PgRecoveryState::Ready || durable.accepted_build.is_some() {
-            return Err(application_error("incomplete PostgreSQL recovery metadata"));
+            return Err(self
+                .permanent_at(generation, "incomplete PostgreSQL recovery metadata")
+                .await);
         }
         if let Some(system) = &durable.system_identifier {
             if durable.role == PgDurableRole::None
@@ -209,9 +214,12 @@ impl PgReplicator {
                     != self.instance.data_dir().join("standby.signal").exists()
                 || self.instance.data_dir().join("recovery.signal").exists()
             {
-                return Err(application_error(
-                    "PostgreSQL durable recovery role differs from data",
-                ));
+                return Err(self
+                    .permanent_at(
+                        generation,
+                        "PostgreSQL durable recovery role differs from data",
+                    )
+                    .await);
             }
             let (actual_system, timeline) = self
                 .pg_result(self.instance.control_identity().await)

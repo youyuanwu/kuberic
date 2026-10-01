@@ -181,6 +181,10 @@ readiness. Valid completed `initdb` is reused and managed settings repaired;
 partial/invalid established storage is never silently erased or reinitialized.
 Missing files, changed paths/symlink targets, corrupt identity/lineage or
 ambiguous evidence fail closed with explicit faults.
+Unexpected durable-role/recovery-signal mismatches or incomplete recovery without
+an authorized native build stop and reap the captured PostgreSQL generation before
+publishing a permanent fault. Authorized build/promotion recovery is unchanged;
+a delayed mismatch from a retired generation cannot fence its successor.
 
 Application-only and whole-agent-host restart reconstruct durable state with
 fresh sessions. Accepted standbys wait for validated current source connections.
