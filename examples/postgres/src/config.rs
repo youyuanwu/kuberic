@@ -5,6 +5,11 @@ use crate::instance::PgError;
 const HBA_BEGIN: &str = "# --- kuberic managed access begin ---";
 const HBA_END: &str = "# --- kuberic managed access end ---";
 
+#[cfg(all(test, feature = "testing"))]
+tokio::task_local! {
+    pub(crate) static BEFORE_ACCESS_RULES_WRITE: Box<dyn Fn() + Send + Sync>;
+}
+
 /// All kuberic-required PostgreSQL configuration in one place.
 /// Handles initial setup (after initdb) and patching (after pg_basebackup).
 pub struct PgConfig {
@@ -193,22 +198,22 @@ max_replication_slots = 32
     }
 
     async fn replace_config(path: &Path, content: &str) -> Result<(), PgError> {
+        Self::replace_config_file(path, content)
+            .map_err(|e| PgError::Process(format!("repair {}: {e}", path.display())))
+    }
+
+    fn replace_config_file(path: &Path, content: &str) -> std::io::Result<()> {
         use std::io::Write;
 
         // Keep the bounded file replacement within one poll. A cancelled grant
         // must not leave a background rename that can overwrite a later closed
         // HBA generation after its access lock has been released.
         let pending = path.with_extension("conf.pending");
-        let result = (|| {
-            let mut file = std::fs::File::create(&pending)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&pending, path)?;
-            std::fs::File::open(path.parent().expect("configuration has a parent"))?.sync_all()
-        })();
-        result.map_err(|e: std::io::Error| {
-            PgError::Process(format!("repair {}: {e}", path.display()))
-        })
+        let mut file = std::fs::File::create(&pending)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&pending, path)?;
+        std::fs::File::open(path.parent().expect("configuration has a parent"))?.sync_all()
     }
 
     /// Fix port and socket_dir in postgresql.conf after pg_basebackup.
@@ -283,8 +288,9 @@ max_replication_slots = 32
             .map_err(|error| PgError::Process(format!("read pg_hba.conf: {error}")))?;
         let content =
             replace_managed_hba(&content, granted, application_role, application_database);
-        tokio::fs::write(&hba_path, content)
-            .await
+        #[cfg(all(test, feature = "testing"))]
+        let _ = BEFORE_ACCESS_RULES_WRITE.try_with(|before_write| before_write());
+        Self::replace_config_file(&hba_path, &content)
             .map_err(|error| PgError::Process(format!("write pg_hba.conf: {error}")))
     }
 }
@@ -482,6 +488,44 @@ fn replace_managed_hba(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn hba_access_rules_preserve_retained_content_and_error_context() {
+        let directory = crate::testing::TestDataDir::new("hba-rules");
+        let path = directory.path().join("pg_hba.conf");
+        let missing = PgConfig::write_access_rules(directory.path(), true, "test_app", "test_db")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing, PgError::Process(message) if message.starts_with("read pg_hba.conf: "))
+        );
+
+        let retained = "# operator-owned rule\nhost all auditor 192.0.2.0/24 reject\n";
+        std::fs::write(&path, retained).unwrap();
+        for granted in [true, false, true, false] {
+            PgConfig::write_access_rules(directory.path(), granted, "test_app", "test_db")
+                .await
+                .unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(content.ends_with(retained));
+            assert_eq!(content.matches(HBA_BEGIN).count(), 1);
+            assert_eq!(content.matches(HBA_END).count(), 1);
+            assert_eq!(content.contains("test_app"), granted);
+            assert_eq!(content.contains("test_db"), granted);
+            assert!(!path.with_extension("conf.pending").exists());
+        }
+
+        let closed = std::fs::read(&path).unwrap();
+        std::fs::create_dir(path.with_extension("conf.pending")).unwrap();
+        let failed = PgConfig::write_access_rules(directory.path(), true, "test_app", "test_db")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failed, PgError::Process(message) if message.starts_with("write pg_hba.conf: "))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), closed);
+    }
 
     #[test]
     fn exact_application_name_replaces_quoted_conninfo_value() {
