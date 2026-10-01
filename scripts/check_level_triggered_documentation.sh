@@ -25,6 +25,79 @@ import sys
 import urllib.parse
 
 root = pathlib.Path.cwd()
+
+def prose(text):
+    # Check claims across Markdown wrapping/emphasis, not incidental line layout.
+    return " ".join(re.sub(r"[`*>]", "", text).split()).lower()
+
+# This narrow mode lets regression fixtures exercise the same assertions without
+# repeatedly building rustdoc, generating the CRD or running status-size tests.
+postgres_only = sys.argv[1:] == ["--postgres-contract-only"]
+workflow = (root / ".github/workflows/level-triggered-CI.yml").read_text()
+targeted, live_jobs = workflow.split("\n  bootstrap-kind:", 1)
+postgres_unit_command = "cargo test -p postgres-replicated --all-features -- --test-threads=1"
+assert postgres_unit_command in targeted, "PostgreSQL serial unit selection is required"
+lint_command = targeted.split("- name: Lint level-triggered packages", 1)[1].split("- name:", 1)[0]
+assert "-p postgres-replicated" in lint_command, "PostgreSQL targeted lint is required"
+assert "cargo fmt --all -- --check" in targeted
+assert "runs-on: ubuntu-24.04" in targeted, "Use the Ubuntu PostgreSQL 16 package baseline"
+assert "sudo apt-get install -y postgresql-16 postgresql-client-16" in targeted
+assert "/usr/lib/postgresql/16/bin/postgres --version" in targeted
+assert 'run: mkdir -p "$TMPDIR"' in targeted
+assert "TMPDIR: ${{ github.workspace }}/target/paw-tmp" in targeted
+assert "docs/features/postgres/design.md" in targeted
+assert "postgres" not in live_jobs.lower(), "PostgreSQL must not enter KinD/live jobs"
+recipes = (root / "justfile").read_text()
+live_recipes = recipes.split("level-triggered-kind-test", 1)[1]
+assert "postgres" not in live_recipes.lower(), "No PostgreSQL live selector or recipe"
+for source in (root / "kuberic-level-tests").rglob("*"):
+    if source.is_file() and source.suffix in {".rs", ".toml"}:
+        assert not re.search(r"postgres[-_]replicated|examples/postgres|postgresql|pgdata", source.read_text(), re.I), \
+            f"PostgreSQL must not enter live tests: {source.relative_to(root)}"
+
+postgres_design = root / "docs/features/postgres/design.md"
+postgres_text = prose(postgres_design.read_text())
+for claim in (
+    "migrated in place", "workstream 4", "workstream 5", "protocol 9", "schema 5",
+    "fresh deployment", "no v1 data import", "statereplicator", "primaryreplicator",
+    "private agent", "pgdata.v2", "read-only", "pre-authentication", "remote_apply",
+    "receiver", "replay", "unknown outcome", "administrative trust",
+    "supervisor loss", "wal-retention", "headroom", "host-local", "no postgresql kind",
+):
+    assert claim in postgres_text, f"PostgreSQL design missing contract: {claim}"
+assert "R + W > N" in postgres_design.read_text(), "PostgreSQL failover intersection is required"
+assert not re.search(r"\b(?:protocol[ -][0-8]|schema[ -][0-4])\b", postgres_text), \
+    "PostgreSQL requires exact protocol 9 / schema 5, not an older deployment contract"
+for obsolete in (
+    "integration pattern: external replication", "pg-level write fencing not implemented",
+    "future: trait-based replicator", "joint-configuration transitions remain outside this phase",
+    "architecture below remains historical",
+):
+    assert obsolete not in postgres_text, f"PostgreSQL design retains classic/planned claim: {obsolete}"
+retirement_text = prose((root / "docs/proposal/v1-retirement-plan.md").read_text())
+assert "workstream 4 complete" in retirement_text
+workstream4 = retirement_text.split("## workstream 4:", 1)[1].split("## workstream 5:", 1)[0]
+assert "implemented and validated in place" in workstream4
+assert "images and deployment assets remain workstream 5" in workstream4
+assert "remain future work" not in workstream4
+for path in (
+    "README.md", "docs/Dev.md", "docs/features/kuberic/testing.md",
+    "docs/features/kuberic/level-triggered-operator.md",
+):
+    text = prose((root / path).read_text())
+    assert "workstream 4" in text and "workstream 5" in text, f"{path}: PostgreSQL classification"
+    assert "classic kvstore/postgresql" not in text
+    assert "remaining postgresql port" not in text
+testing = (root / "docs/features/kuberic/testing.md").read_text()
+assert postgres_unit_command in testing
+assert "### PostgreSQL V2 Host-Local Validation" in testing
+assert re.search(r"pub const PROTOCOL_VERSION: u32 = 9;", (root / "kuberic-protocol/src/lib.rs").read_text())
+assert re.search(r"pub const SCHEMA_VERSION: u32 = 5;", (root / "kuberic-agent/src/state.rs").read_text())
+assert "Protocol 9 / agent store schema 5" in (root / "examples/kvstore2/deploy/sample.yaml").read_text()
+if postgres_only:
+    print("PostgreSQL documentation and targeted-only CI contract is current.")
+    raise SystemExit(0)
+
 checked_crd = (root / "kuberic-controller/deploy/crd.json").read_bytes()
 generated_crd = subprocess.run(
     ["cargo", "run", "-p", "kuberic-controller", "--bin", "crdgen", "--quiet"],
@@ -293,6 +366,7 @@ documents = [
     root / "docs/features/kuberic/testing.md",
     root / "docs/features/kuberic/level-triggered-operator.md",
     root / "docs/features/sqlite/design.md",
+    root / "docs/features/postgres/design.md",
     root / "docs/proposal/level-triggered-operator-design.md",
     root / "docs/proposal/v1-retirement-plan.md",
     root / "examples/kvstore2/README.md",
@@ -325,10 +399,6 @@ for document in (root / "README.md", root / "examples/kvstore2/README.md",
                  root / "docs/proposal/v1-retirement-plan.md"):
     assert "level-triggered-operator.md#secondary-scale-down" in document.read_text()
     assert "level-triggered-operator.md#sequential-scale-up" in document.read_text()
-
-def prose(text):
-    # Check claims across Markdown wrapping/emphasis, not incidental line layout.
-    return " ".join(re.sub(r"[`*>]", "", text).split()).lower()
 
 summary_documents = [
     root / "README.md", guide, root / "docs/proposal/v1-retirement-plan.md",
@@ -428,6 +498,18 @@ assert "ReplicaHost::new(" in main and "SqlitePersistence::is_fresh_empty" in ma
 assert "demo" not in main
 assert "CopyBoundary" not in (root / "kuberic-runtime/src/application.rs").read_text()
 
+postgres = packages["postgres-replicated"]
+assert pathlib.Path(postgres["manifest_path"]).resolve() == root / "examples/postgres/Cargo.toml"
+assert {name for name in packages if "postgres" in name} == {"postgres-replicated"}
+assert "kuberic-agent/testing" in postgres["features"]["testing"]
+assert not postgres["features"].get("default", [])
+assert not {"kuberic-core", "kuberic-operator", "kube", "k8s-openapi", "kuberic-level-tests",
+            "testcontainers", "bollard"} & {dependency["name"] for dependency in postgres["dependencies"]}
+assert not (root / "examples/postgres/deploy").exists()
+assert not list((root / "examples/postgres").rglob("Dockerfile*"))
+for source in (root / "examples/postgres").rglob("*"):
+    assert source.suffix.lower() not in {".yaml", ".yml"}, "No PostgreSQL deployment manifests"
+
 sqlite_design = root / "docs/features/sqlite/design.md"
 sqlite_text = prose(sqlite_design.read_text())
 for claim in (
@@ -479,6 +561,10 @@ if failures:
     raise SystemExit(1)
 PY
 
+if [[ "${1:-}" == "--postgres-contract-only" && "$#" == 1 ]]; then
+    exit 0
+fi
+
 scripts/check_runtime_public_api.sh
 
-echo "Level-triggered links, examples, scaling/SQLite contracts, unit-only SQLite CI, live selector boundaries, protocol/schema versions, CRD/status size guards, and runtime API boundaries are current."
+echo "Level-triggered links, examples, scaling/SQLite/PostgreSQL contracts, targeted-only application CI, live selector boundaries, protocol/schema versions, CRD/status size guards, and runtime API boundaries are current."

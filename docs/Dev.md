@@ -26,3 +26,19 @@ selectors exercise secondary removal; `scale-up`, `scale-up-multi`, and
 needs a separate fresh cluster.
 See [tests and diagnostics](features/kuberic/level-triggered-operator.md#tests-and-diagnostics)
 for CI tiers, measurements, and cleanup.
+
+PostgreSQL v2 development is host-local, separate from that cluster setup.
+Use an unprivileged Linux account with PostgreSQL server/client binaries
+(validated with PostgreSQL 16), pidfds/subreapers and readable `/proc`:
+
+```sh
+mkdir -p target/paw-tmp
+export TMPDIR="$PWD/target/paw-tmp"
+cargo test -p postgres-replicated --all-features -- --test-threads=1
+scripts/check_level_triggered_documentation.sh docs/features/postgres/design.md
+```
+
+No PostgreSQL KinD or container test is required. See the
+[host-local test selections](features/kuberic/testing.md#postgresql-v2-host-local-validation)
+and [design/usage contract](features/postgres/design.md). Workstream 4 is complete;
+images and deployment assets remain Workstream 5.

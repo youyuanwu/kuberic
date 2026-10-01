@@ -1009,11 +1009,17 @@ scripts/check_level_triggered_documentation.sh
 ```
 
 Classic v1 remains the documented path for existing `kuberic.io/v1` resources
-and the classic KVStore/PostgreSQL examples. SQLite is migrated in place to v2;
-existing deployed SQLite data has no import path. V2 supports explicit planned switchover,
+and the classic KVStore example. SQLite and PostgreSQL are migrated in place to v2;
+existing deployed application data has no import path. PostgreSQL Workstream 4
+is complete with unit/host-local subprocess tests, not KinD/live coverage; its
+images and deployment assets remain Workstream 5. PostgreSQL owns native WAL and
+recovery behind ordinary custom-replicator callbacks; the shared controller
+does not carry database-native evidence. See the
+[PostgreSQL contract](../postgres/design.md) for trust and supervisor-loss limits.
+V2 supports explicit planned switchover,
 secondary-only scale-down, and sequential scale-up; no v1 conversion, data import, or
 classic-path removal is implied. The [retirement plan](../../proposal/v1-retirement-plan.md)
-keeps direct primary removal deferred and treats the remaining PostgreSQL port,
+keeps direct primary removal deferred and treats
 distribution, deprecation, and source removal as separate workstreams. To
 remove the physical replica currently hosting primary authority, complete a
 planned switchover first and then reduce membership after it becomes an eligible

@@ -804,17 +804,52 @@ pub fn temp_data_dir(name: &str) -> PathBuf {
         .join("postgresql-v2-tests");
     std::fs::create_dir_all(&root).expect("create PostgreSQL test root");
     let root = std::fs::canonicalize(root).expect("resolve PostgreSQL test root");
-    // Leave room for pg_stat_tmp/.s.PGSQL.<port> within Linux's Unix socket limit.
-    let prefix = name.chars().take(8).collect::<String>();
-    let dir = root.join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        DIRECTORY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    // Clean up any leftover from previous run
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create temp data dir");
-    dir
+    loop {
+        let counter = DIRECTORY_COUNTER
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |counter| (counter < 4096).then_some(counter + 1),
+            )
+            .expect("PostgreSQL fixture directory IDs exhausted");
+        let dir = root.join(fixture_directory_id(std::process::id(), counter));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                tracing::debug!(name, path = ?dir, "created PostgreSQL fixture");
+                return dir;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create PostgreSQL fixture {name}: {error}"),
+        }
+    }
+}
+
+fn fixture_directory_id(pid: u32, counter: u64) -> String {
+    // Seven base-36 bytes fit hosted CI's checkout plus replica/PG socket suffix.
+    // Linux PIDs use at most 22 bits; reserve 12 disjoint bits for fixture IDs.
+    assert!(pid < 1 << 22 && (1..4096).contains(&counter));
+    let mut value = (u64::from(pid) << 12) | counter;
+    let mut name = Vec::new();
+    while value != 0 {
+        name.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(value % 36) as usize] as char);
+        value /= 36;
+    }
+    name.into_iter().rev().collect()
+}
+
+#[test]
+fn compact_fixture_ids_are_unique_and_fit_hosted_ci_socket_paths() {
+    let mut names = HashSet::new();
+    for pid in [1, 1234, 1234567, (1 << 22) - 1] {
+        for counter in 1..4096 {
+            let name = fixture_directory_id(pid, counter);
+            let socket = format!(
+                "/home/runner/work/kuberic/kuberic/target/postgresql-v2-tests/{name}/r3x2/pgdata/pg_stat_tmp/.s.PGSQL.65535"
+            );
+            assert!(socket.len() <= 107, "{socket}");
+            assert!(names.insert(name));
+        }
+    }
 }
 
 pub struct TestDataDir {

@@ -213,6 +213,16 @@ mkdir -p "$postgres_scope/examples/postgres/src"
 printf 'pub fn postgres() {}\n' > "$postgres_scope/examples/postgres/src/lib.rs"
 (cd "$postgres_scope" && scripts/check_level_triggered_scope.sh HEAD)
 (cd "$postgres_scope" && git add examples/postgres/src/lib.rs && scripts/check_level_triggered_scope.sh HEAD)
+(cd "$postgres_scope" && git commit -q -m postgres-v2 && scripts/check_level_triggered_scope.sh HEAD~1)
+printf '// v2 edit\n' >> "$postgres_scope/examples/postgres/src/lib.rs"
+(cd "$postgres_scope" && scripts/check_level_triggered_scope.sh HEAD)
+mkdir -p "$postgres_scope/examples/postgres/deploy"
+printf 'kind: Pod\n' > "$postgres_scope/examples/postgres/deploy/sample.yaml"
+expect_scope_failure "$postgres_scope" HEAD
+rm "$postgres_scope/examples/postgres/deploy/sample.yaml"
+rmdir "$postgres_scope/examples/postgres/deploy"
+printf 'FROM postgres:16\n' > "$postgres_scope/examples/postgres/Dockerfile"
+expect_scope_failure "$postgres_scope" HEAD
 
 new_postgres_repo() {
     local directory=$1
@@ -245,5 +255,103 @@ expect_dependency_failure "$postgres_source"
 printf 'pub fn postgres() {}\n' > "$postgres_source/examples/postgres/src/lib.rs"
 ln -s ../../../kuberic-core/src/types.rs "$postgres_source/examples/postgres/src/classic.rs"
 expect_dependency_failure "$postgres_source"
+
+for dependency in kube k8s-openapi kuberic-level-tests testcontainers bollard; do
+    postgres_cluster="$temporary/postgres-cluster-$dependency"
+    new_postgres_repo "$postgres_cluster"
+    mkdir -p "$postgres_cluster/$dependency/src"
+    printf '\nexclude = ["%s"]\n' "$dependency" >> "$postgres_cluster/Cargo.toml"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2024"\n' "$dependency" \
+        > "$postgres_cluster/$dependency/Cargo.toml"
+    printf 'pub fn cluster() {}\n' > "$postgres_cluster/$dependency/src/lib.rs"
+    printf '\n[dev-dependencies]\ncluster = { package = "%s", path = "../../%s" }\n' "$dependency" "$dependency" \
+        >> "$postgres_cluster/examples/postgres/Cargo.toml"
+    expect_dependency_failure "$postgres_cluster"
+done
+
+postgres_live_source="$temporary/postgres-live-source"
+new_postgres_repo "$postgres_live_source"
+mkdir -p "$postgres_live_source/kuberic-level-tests/src"
+printf 'pub fn cluster() {}\n' > "$postgres_live_source/kuberic-level-tests/src/lib.rs"
+cat > "$postgres_live_source/examples/postgres/src/lib.rs" <<'EOF'
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../kuberic-level-tests/src/lib.rs"
+));
+EOF
+expect_dependency_failure "$postgres_live_source"
+printf 'fn main() { std::process::Command::new("docker"); }\n' \
+    > "$postgres_live_source/examples/postgres/src/lib.rs"
+expect_dependency_failure "$postgres_live_source"
+printf 'pub fn postgres() {}\n' > "$postgres_live_source/examples/postgres/src/lib.rs"
+ln -s ../../../kuberic-level-tests/src/lib.rs "$postgres_live_source/examples/postgres/src/live.rs"
+expect_dependency_failure "$postgres_live_source"
+
+python3 - "$repo_root" "$temporary/postgres-docs" <<'PY'
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+root, fixture = map(pathlib.Path, sys.argv[1:])
+paths = (
+    "scripts/check_level_triggered_documentation.sh",
+    ".github/workflows/level-triggered-CI.yml",
+    "README.md", "docs/Dev.md", "docs/features/postgres/design.md",
+    "docs/features/kuberic/testing.md", "docs/features/kuberic/level-triggered-operator.md",
+    "docs/proposal/v1-retirement-plan.md", "examples/kvstore2/deploy/sample.yaml",
+    "kuberic-protocol/src/lib.rs", "kuberic-agent/src/state.rs", "justfile",
+)
+for relative in paths:
+    target = fixture / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / relative, target)
+shutil.copytree(root / "kuberic-level-tests", fixture / "kuberic-level-tests")
+
+def check():
+    return subprocess.run(
+        ["bash", "scripts/check_level_triggered_documentation.sh", "--postgres-contract-only"],
+        cwd=fixture, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+
+baseline = check()
+assert baseline.returncode == 0, baseline.stdout
+workflow = ".github/workflows/level-triggered-CI.yml"
+design = "docs/features/postgres/design.md"
+for relative, before, after in (
+    (workflow, "cargo test -p postgres-replicated --all-features -- --test-threads=1", "true"),
+    (workflow, "          -p postgres-replicated\n", ""),
+    (workflow, "postgresql-16 postgresql-client-16", "postgresql-client-16"),
+    (workflow, "runs-on: ubuntu-24.04", "runs-on: ubuntu-latest"),
+    (workflow, "/usr/lib/postgresql/16/bin/postgres --version", "true"),
+    (workflow, "\n  bootstrap-kind:", "\n  bootstrap-kind:\n    # postgres-replicated"),
+    (workflow, "\n  full-kind:", "\n  full-kind:\n    # PostgreSQL"),
+    ("justfile", "level-triggered-kind-test", "level-triggered-kind-test postgres"),
+    (design, "protocol 9 / agent schema 5", "protocol 8 / agent schema 4"),
+    (design, "supervisor loss", "supervision"),
+    (design, "free-space headroom", "free-space"),
+    (design, "## Architecture and Authority", "## PG-level write fencing not implemented"),
+    ("docs/proposal/v1-retirement-plan.md", "Workstream 4 complete", "Workstream 4 pending"),
+    ("kuberic-protocol/src/lib.rs", "PROTOCOL_VERSION: u32 = 9", "PROTOCOL_VERSION: u32 = 8"),
+    ("kuberic-agent/src/state.rs", "SCHEMA_VERSION: u32 = 5", "SCHEMA_VERSION: u32 = 4"),
+):
+    target = fixture / relative
+    original = target.read_text()
+    assert before in original, (relative, before)
+    try:
+        target.write_text(re.sub(re.escape(before), lambda _: after, original, flags=re.I))
+        result = check()
+        assert result.returncode != 0 and "AssertionError" in result.stdout, \
+            f"Documentation guard accepted {relative}: {before}\n{result.stdout}"
+    finally:
+        target.write_text(original)
+
+live = fixture / "kuberic-level-tests/src/postgres.rs"
+live.write_text("use postgres_replicated::testing;\n")
+result = check()
+assert result.returncode != 0 and "PostgreSQL must not enter live tests" in result.stdout, result.stdout
+print("PostgreSQL classification, CI and documentation regression tests passed.")
+PY
 
 echo "Level-triggered guard regression tests passed."

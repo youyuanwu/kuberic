@@ -27,7 +27,7 @@ new_packages = {
     "kuberic-controller",
     "kvstore2",
     "sqlite-replicated",  # Migrated in place; never allow classic dependencies back in.
-    "postgres-replicated",
+    "postgres-replicated",  # Migrated in place; unit/host-local subprocesses only.
     "sqlite-commit-barrier",
     "kuberic-level-tests",
 }
@@ -36,6 +36,11 @@ protected_packages = {
     "kuberic-operator",
     "kvstore",
     "kuberic-tests",
+}
+cluster_packages = {
+    "kube", "kube-client", "kube-runtime", "kube-core", "k8s-openapi",
+    "kuberic-level-tests", "testcontainers", "testcontainers-modules",
+    "bollard", "shiplift", "dockertest",
 }
 
 violations = []
@@ -46,6 +51,10 @@ for package in metadata["packages"]:
         if dependency["name"] in protected_packages:
             violations.append(
                 f'{package["name"]} depends on protected package {dependency["name"]}'
+            )
+        if package["name"] == "postgres-replicated" and dependency["name"] in cluster_packages:
+            violations.append(
+                f'postgres-replicated has a cluster/container dependency: {dependency["name"]}'
             )
 
 protected_roots = [
@@ -65,11 +74,14 @@ path_assignment = re.compile(r'\bpath\s*=\s*"([^"]+)"')
 include_start = re.compile(r'(?:include|include_str|include_bytes)!\s*\(')
 string_literal = re.compile(r'"([^"]+)"')
 
-def is_protected(path):
+def is_protected(path, package_name):
     resolved = path.resolve()
+    roots = protected_roots
+    if package_name == "postgres-replicated":
+        roots = [*roots, (workspace_root / "kuberic-level-tests").resolve()]
     return any(
         resolved == root or root in resolved.parents
-        for root in protected_roots
+        for root in roots
     )
 
 def include_expressions(text):
@@ -135,17 +147,22 @@ for package in metadata["packages"]:
         continue
     package_root = pathlib.Path(package["manifest_path"]).parent
     for candidate in package_root.rglob("*"):
-        if candidate.is_symlink() and is_protected(candidate):
+        if candidate.is_symlink() and is_protected(candidate, package["name"]):
             violations.append(
                 f"{package['name']} links protected source via {candidate}"
             )
     for source in package_root.rglob("*.rs"):
         text = source.read_text(errors="replace")
+        if package["name"] == "postgres-replicated" and (
+            re.search(r'\b(?:kube|k8s_openapi|kuberic_level_tests|testcontainers|bollard|shiplift|dockertest)\s*::', text)
+            or re.search(r'Command\s*::\s*new\s*\(\s*"(?:kubectl|kind|docker|podman|nerdctl)"', text)
+        ):
+            violations.append(f"postgres-replicated uses cluster/container tooling via {source}")
         if re.search(r'\bkuberic_(?:core|operator)\s*::', text):
             violations.append(f"{package['name']} imports a classic crate via {source}")
         for body in attribute.findall(text):
             for relative in path_assignment.findall(body):
-                if is_protected(source.parent / relative):
+                if is_protected(source.parent / relative, package["name"]):
                     violations.append(
                         f"{package['name']} imports protected source via {source}: {relative}"
                     )
@@ -156,12 +173,13 @@ for package in metadata["packages"]:
             expressions = []
         for expression in expressions:
             literals = string_literal.findall(expression)
-            if any(is_protected(source.parent / relative) for relative in literals):
+            if any(is_protected(source.parent / relative, package["name"]) for relative in literals):
                 violations.append(
                     f"{package['name']} includes protected source via {source}"
                 )
             normalized = expression.replace("\\\\", "/")
-            if any(token in normalized for token in protected_tokens):
+            tokens = protected_tokens | ({"kuberic-level-tests"} if package["name"] == "postgres-replicated" else set())
+            if any(token in normalized for token in tokens):
                 violations.append(
                     f"{package['name']} references protected path in include expression {source}"
                 )
