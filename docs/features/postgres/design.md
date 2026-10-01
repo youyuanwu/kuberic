@@ -97,6 +97,13 @@ one scalar cannot certify multiple builds or resurrect completion after reopen.
 
 The target validates its locally installed SF description and source evidence
 before destructive work. Configuration replacement cancels and joins stale work.
+PGDATA clearing runs in a private generation-owned helper, not Tokio filesystem
+workers. Cancellation, timeout and dropped build futures terminate and reap that
+helper before releasing the build lock; failed cleanup remains retained and
+blocks replacement. Recursive directory removal, file unlinking and the final
+directory fsync share this ownership, so no stale deletion can resolve paths in
+a successor's live PGDATA. Interrupted clearing leaves `Copying` durable and
+re-admitted retries take a fresh backup, as with interrupted backup/rewind.
 `pgdata.v2` carries authenticated, canonical JSON envelopes bounded to 64 KiB,
 with exact resource, identities, sessions, build boundary and PostgreSQL lineage.
 Unknown, missing, duplicate, oversized and wrong-version fields are rejected.

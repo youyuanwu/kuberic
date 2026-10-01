@@ -23,6 +23,9 @@ use crate::build::{
 use crate::durable::{PgDurableRole, PgDurableState, PgDurableStore, PgRecoveryState};
 use crate::instance::{PgError, PgInstanceManager};
 use crate::native::{PgNativeObserver, compile_synchronous_configuration, timeline_history_digest};
+#[cfg(all(test, feature = "testing"))]
+#[path = "build_deletion_tests.rs"]
+mod build_deletion_tests;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
 
@@ -610,11 +613,16 @@ impl PgReplicator {
         };
         let cancellation = self.build_cancellation.lock().unwrap().clone();
         let work = self.receive_build_inner(request, admitted_storage);
+        let timeout = std::time::Duration::from_secs(60);
+        #[cfg(all(test, feature = "testing"))]
+        let timeout = build_deletion_tests::BUILD_TIMEOUT
+            .try_with(|value| *value)
+            .unwrap_or(timeout);
         let result = tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => Err(RuntimeError::OperationCancelled),
             _ = cancellation.cancelled() => Err(RuntimeError::OperationCancelled),
-            result = tokio::time::timeout(std::time::Duration::from_secs(60), work) =>
+            result = tokio::time::timeout(timeout, work) =>
                 result.unwrap_or_else(|_| Err(application_error("native build timed out"))),
         };
         if let Err(error) = &result
@@ -876,32 +884,8 @@ impl PgReplicator {
     }
 
     async fn clear_pgdata(&self) -> Result<()> {
-        if self.instance.is_running().await {
-            return Err(application_error("cannot clear running PostgreSQL data"));
-        }
-        tokio::fs::create_dir_all(self.instance.data_dir())
-            .await
-            .map_err(application_error)?;
-        let mut entries = tokio::fs::read_dir(self.instance.data_dir())
-            .await
-            .map_err(application_error)?;
-        while let Some(entry) = entries.next_entry().await.map_err(application_error)? {
-            let kind = entry.file_type().await.map_err(application_error)?;
-            if kind.is_dir() {
-                tokio::fs::remove_dir_all(entry.path())
-                    .await
-                    .map_err(application_error)?;
-            } else {
-                tokio::fs::remove_file(entry.path())
-                    .await
-                    .map_err(application_error)?;
-            }
-        }
-
-        tokio::fs::File::open(self.instance.data_dir())
-            .await
-            .map_err(application_error)?
-            .sync_all()
+        self.instance
+            .clear_pgdata()
             .await
             .map_err(application_error)
     }

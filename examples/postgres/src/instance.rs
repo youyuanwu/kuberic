@@ -223,6 +223,8 @@ pub struct PgInstanceManager {
     error_hook: ProcessMutex<Option<Arc<ErrorGate>>>,
     #[cfg(feature = "testing")]
     fault_hook: ProcessMutex<Option<Arc<ErrorGate>>>,
+    #[cfg(test)]
+    pub(crate) clear_pgdata_hook: ProcessMutex<Option<(String, PathBuf)>>,
 }
 
 #[cfg(feature = "testing")]
@@ -312,6 +314,8 @@ impl PgInstanceManager {
             error_hook: ProcessMutex::new(None),
             #[cfg(feature = "testing")]
             fault_hook: ProcessMutex::new(None),
+            #[cfg(test)]
+            clear_pgdata_hook: ProcessMutex::new(None),
         }
     }
 
@@ -1209,6 +1213,35 @@ impl PgInstanceManager {
         let expected_abort = self.abort_generation.load(Ordering::Acquire);
         self.finish_owned().await?;
         self.replace_retired(expected_abort)?;
+        Ok(())
+    }
+
+    pub(crate) async fn clear_pgdata(&self) -> Result<(), PgError> {
+        let _lifecycle = self.lifecycle().await;
+        let generation = self.generation();
+        if generation.running() {
+            return Err(
+                PgError::Process("cannot clear running PostgreSQL data".into())
+                    .with_generation(generation.id),
+            );
+        }
+        let executable = crate::process_supervisor::executable().map_err(|error| {
+            PgError::Process(format!("locate PGDATA deletion helper: {error}"))
+                .with_generation(generation.id)
+        })?;
+        let mut command = Command::new(executable);
+        command
+            .arg(crate::process_supervisor::CLEAR_PGDATA_ARGUMENT)
+            .arg(&self.data_dir);
+        #[cfg(test)]
+        if let Some((entry, marker)) = self.clear_pgdata_hook.lock().unwrap().take() {
+            command.arg(entry).arg(marker);
+        }
+        let output = self.command_output(&generation, &mut command, None).await?;
+        if !output.status.success() {
+            return Err(PgError::command_failed("clear PGDATA failed", &output)
+                .with_generation(generation.id));
+        }
         Ok(())
     }
 
