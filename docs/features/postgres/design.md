@@ -286,7 +286,7 @@ cargo test -p postgres-replicated --all-features -- --test-threads=1
 # Smaller native build/recovery and reconfiguration selections:
 cargo test -p postgres-replicated --all-features --test native_build --test failover -- --test-threads=1
 cargo test -p postgres-replicated --all-features --test reconfiguration --test authority_races --test switchover_checkpoints --test validation_oracles -- --test-threads=1
-scripts/check_level_triggered_documentation.sh docs/features/postgres/design.md
+cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
 Tests discover common PostgreSQL installation directories (16, 17, 15 in that

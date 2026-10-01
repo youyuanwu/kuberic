@@ -30,14 +30,12 @@ for CI tiers, measurements, and cleanup.
 PostgreSQL v2 development is host-local, separate from that cluster setup.
 Use an unprivileged Linux account with PostgreSQL server/client binaries
 (validated with PostgreSQL 16), pidfds/subreapers and readable `/proc`.
-The documentation/CI guards also require Python 3 with PyYAML
-(`python3-yaml` on Ubuntu) to validate workflow structure and active commands:
 
 ```sh
 mkdir -p target/paw-tmp
 export TMPDIR="$PWD/target/paw-tmp"
 cargo test -p postgres-replicated --all-features -- --test-threads=1
-scripts/check_level_triggered_documentation.sh docs/features/postgres/design.md
+cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
 No PostgreSQL KinD or container test is required. See the

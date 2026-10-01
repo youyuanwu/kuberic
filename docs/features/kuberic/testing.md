@@ -37,7 +37,6 @@ Retained-session and deleted-target rejection assertions remain strict.
 cargo test -p kuberic-protocol --test protocol --test model
 cargo test -p kuberic-agent --test crash_boundaries --test runtime -- --test-threads=1
 cargo test -p kuberic-controller --test controller
-scripts/check_level_triggered_documentation.sh
 # After the owned-cluster installation:
 just level-triggered-kind-test scale-down
 just level-triggered-kind-test scale-down-adversarial
@@ -79,7 +78,6 @@ cargo test -p kuberic-agent --features testing --lib --test runtime --test servi
 cargo test -p kuberic-protocol --lib --test protocol --test model -- --skip terminal_switchover_receipts_survive_process_exit_and_do_not_allocate_again
 cargo test -p kuberic-controller --lib --test controller
 cargo clippy -p kuberic-agent -p sqlite-replicated --all-targets --all-features -- -D warnings
-scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md
 ```
 
 These selections exclude the agent `crash_boundaries` executable and the two
@@ -133,18 +131,14 @@ cargo test -p kuberic-protocol --lib --test protocol --test model
 cargo test -p kuberic-controller --lib --test controller
 cargo fmt --all -- --check
 cargo clippy -p postgres-replicated -p kuberic-runtime -p kuberic-runtime-internal -p kuberic-agent -p kuberic-protocol -p kuberic-wire -p kvstore2 -p sqlite-replicated -p sqlite-commit-barrier --all-targets --all-features -- -D warnings
-scripts/check_runtime_public_api.sh
-scripts/check_level_triggered_scope.sh origin/main
-scripts/check_level_triggered_dependencies.sh
-scripts/check_level_triggered_guards_test.sh
-scripts/check_level_triggered_documentation.sh docs/features/postgres/design.md
+cargo test -p kuberic-runtime --test public_api_inventory
 ```
 
 These agent/protocol selections include their child-process crash tests (unlike
 the SQLite-only selection above). Top-level ignored child helpers are invoked
-by their parent tests. The documentation guard regenerates the CRD and runs the
-protocol status-size check; controller tests use local fakes, not a Kubernetes
-API. PostgreSQL fixtures own their worker stacks and isolated
+by their parent tests. Controller and protocol tests verify the checked-in CRD
+and representative status-size growth; controller tests use local fakes, not a
+Kubernetes API. PostgreSQL fixtures own their worker stacks and isolated
 `target/postgresql-v2-tests/<unique-id>` roots. Teardown verifies owned processes
 reaped, listeners released and fixture data removed.
 

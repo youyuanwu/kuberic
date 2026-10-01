@@ -193,10 +193,7 @@ From the repository root, with the pinned Rust toolchain and `protoc` available:
 ```bash
 cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
 cargo clippy -p kuberic-agent -p sqlite-replicated --all-targets --all-features -- -D warnings
-scripts/check_level_triggered_scope.sh origin/main
-scripts/check_level_triggered_dependencies.sh
-scripts/check_level_triggered_guards_test.sh
-scripts/check_level_triggered_documentation.sh docs/features/sqlite/design.md
+cargo test -p kuberic-runtime -p kuberic-runtime-internal -p kuberic-wire
 ```
 
 These SQLite tests require no KinD, Kubernetes API, container runtime, or child

@@ -140,7 +140,7 @@ it manually. Important projections include:
 - conditions describing waiting or unsafe observations.
 
 The checked-in CRD is generated from the Rust type and verified byte-for-byte
-by `scripts/check_level_triggered_documentation.sh`.
+by the `kuberic-controller` Rust tests.
 At the final-review baseline it is **344,907 bytes**, leaving **5,093 bytes** before
 the restored strict-below-350,000-byte regression guard fails. Representative
 serialized scale-up status guards cover 2, 3, 4, 6, 10, and 18 members; the
@@ -979,33 +979,24 @@ production identity or key-rotation design.
 
 ## API and Coexistence Guards
 
-The level-triggered crates have no source dependency on classic v1 crates.
-`scripts/check_level_triggered_scope.sh` rejects changes under protected v1
-paths, and `scripts/check_level_triggered_dependencies.sh` rejects manifest,
-source-link, and include-based dependencies on them.
+The Cargo workspace keeps the level-triggered and classic packages explicit.
+Package manifests and the compiled dependency graph are the source of truth for
+their dependencies.
 The existing `examples/sqlite` path and `sqlite-replicated` package are now v2,
-not protected classic source. SQLite and its standalone commit barrier are
-checked packages; regressions reject reintroduced classic dependencies and
-source includes. This reclassification does not authorize edits to other
-protected v1 paths.
+not protected classic source. This reclassification does not authorize edits
+to other classic v1 paths.
 
-The runtime API guard has two reviewed inventories:
+The runtime Rust tests maintain a reviewed source-public API inventory:
 
-- generated rustdoc for the intended application-facing surface;
 - an exhaustive `syn`-parsed inventory of every source `pub` signature,
   including declarations under private paths and `#[doc(hidden)]` paths.
 
-Compile-fail fixtures additionally prove that safe external application code
-cannot obtain the managed replicator, construct a host partition, inject
-agent authority dependencies, register a managed runtime directly, or access
-the private authority module. Hidden public declarations exist where Rust
-cross-crate hosting requires nameable signatures; `#[doc(hidden)]` is not
-treated as an access-control boundary.
-
-Run all documentation and API checks with:
+Run the API inventory and the generated-schema/status regressions with Cargo:
 
 ```bash
-scripts/check_level_triggered_documentation.sh
+cargo test -p kuberic-runtime --test public_api_inventory
+cargo test -p kuberic-controller --lib
+cargo test -p kuberic-protocol --lib representative_scale_up_status_variants
 ```
 
 Classic v1 remains the documented path for existing `kuberic.io/v1` resources
