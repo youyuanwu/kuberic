@@ -31,6 +31,10 @@ use tonic::{Request, transport::Channel};
 
 const TOKEN: &str = "host-local-postgres-test";
 
+#[path = "../src/testing/layout.rs"]
+mod layout;
+use layout::SINGLE_REPLICA_DIRECTORY;
+
 struct LocalResolver {
     control: SocketAddr,
     replication: SocketAddr,
@@ -1539,7 +1543,7 @@ async fn spawn_binary(root: &Path, pg_bin: &Path) -> BinaryHost {
             "--bearer-token",
             TOKEN,
             "--data-root",
-            "state",
+            SINGLE_REPLICA_DIRECTORY,
             "--pg-bin",
             pg_bin.to_str().unwrap(),
             "--pg-port",
@@ -1562,7 +1566,7 @@ async fn spawn_binary(root: &Path, pg_bin: &Path) -> BinaryHost {
         .unwrap();
     BinaryHost {
         child,
-        pgdata: root.join("state/pgdata"),
+        pgdata: root.join(SINGLE_REPLICA_DIRECTORY).join("pgdata"),
         pgport,
         control: control.parse().unwrap(),
         replication: replication.parse().unwrap(),
@@ -1573,7 +1577,7 @@ async fn spawn_binary(root: &Path, pg_bin: &Path) -> BinaryHost {
 
 async fn initialize_binary(binary: &BinaryHost, root: &Path) {
     let (mut client, waiting) = status(binary.control).await;
-    assert!(!root.join("state").exists());
+    assert!(!root.join(SINGLE_REPLICA_DIRECTORY).exists());
     client
         .execute(initialize(&waiting.process_session_id))
         .await
@@ -1595,7 +1599,7 @@ impl HelperGate {
         let release = root.join("helper-release");
         let armed = root.join("helper-armed");
         let script = root.join("helper-gate.sh");
-        let pgdata = root.join("state/pgdata");
+        let pgdata = root.join(SINGLE_REPLICA_DIRECTORY).join("pgdata");
         let real = find_pg_bin().join(command);
         let preparation = match stage {
             "partial" => format!(
@@ -1925,7 +1929,7 @@ async fn executable_pre_readiness_signals_join_startup_and_reap() {
         binary.signal(signal, true);
         let exit = binary.wait().await;
         assert!(exit.success(), "{exit}: {}", binary.output());
-        assert!(!root.path().join("state").exists());
+        assert!(!root.path().join(SINGLE_REPLICA_DIRECTORY).exists());
         binary.assert_stopped().await;
 
         let root = TestDataDir::new("pre-signal");
@@ -2352,7 +2356,8 @@ async fn executable_shutdown_requires_durable_fault_acknowledgement() {
         );
         let (mut binary, client) = start_binary_with(root.path(), &pg_bin).await;
         drop(client);
-        let database = SqliteStore::metadata_database_path(&root.path().join("state"));
+        let database =
+            SqliteStore::metadata_database_path(&root.path().join(SINGLE_REPLICA_DIRECTORY));
         let store = SqliteStore::open_existing(&database, None).unwrap();
         assert_eq!(store.load_state().await.unwrap().reported_fault, None);
         let lock = rusqlite::Connection::open(&database).unwrap();

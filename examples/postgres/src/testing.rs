@@ -28,6 +28,8 @@ const NATIVE_TOKEN: &str = "host-local-native-build";
 
 #[path = "testing/group.rs"]
 mod group;
+#[cfg(test)]
+pub(crate) mod layout;
 pub use group::{
     AdmissionCut, PgGroup, PgSqlSession, RestartPart, definitive_fence_error, run_pg_test,
 };
@@ -825,7 +827,7 @@ pub fn temp_data_dir(name: &str) -> PathBuf {
 }
 
 fn fixture_directory_id(pid: u32, counter: u64) -> String {
-    // Seven base-36 bytes fit hosted CI's checkout plus replica/PG socket suffix.
+    // Seven base-36 bytes leave room for the compact fixture layouts below.
     // Linux PIDs use at most 22 bits; reserve 12 disjoint bits for fixture IDs.
     assert!(pid < 1 << 22 && (1..4096).contains(&counter));
     let mut value = (u64::from(pid) << 12) | counter;
@@ -840,13 +842,33 @@ fn fixture_directory_id(pid: u32, counter: u64) -> String {
 #[test]
 fn compact_fixture_ids_are_unique_and_fit_hosted_ci_socket_paths() {
     let mut names = HashSet::new();
-    for pid in [1, 1234, 1234567, (1 << 22) - 1] {
+    for pid in [1, 1234, 1235, 1234567, 1234568, (1 << 22) - 1] {
         for counter in 1..4096 {
             let name = fixture_directory_id(pid, counter);
-            let socket = format!(
-                "/home/runner/work/kuberic/kuberic/target/postgresql-v2-tests/{name}/r3x2/pgdata/pg_stat_tmp/.s.PGSQL.65535"
-            );
-            assert!(socket.len() <= 107, "{socket}");
+            let root =
+                PathBuf::from("/home/runner/work/kuberic/kuberic/target/postgresql-v2-tests")
+                    .join(&name);
+            // Standalone instances, in-process hosts, SF library/executable hosts,
+            // native-build peers and group incarnations all use these layouts.
+            for data in [
+                root.join("pgdata"),
+                root.join("primary"),
+                root.join("standby"),
+                root.join(layout::SINGLE_REPLICA_DIRECTORY).join("pgdata"),
+                root.join("p/pgdata"),
+                root.join("s/pgdata"),
+                root.join("t/pgdata"),
+                root.join("f/pgdata"),
+                root.join("o/pgdata"),
+                root.join("old/pgdata"),
+                root.join("new/pgdata"),
+                root.join("r1/pgdata"),
+                root.join("r3x2/pgdata"),
+            ] {
+                let config = crate::config::PgConfig::new(65535, &data);
+                let socket = PathBuf::from(config.socket_dir).join(".s.PGSQL.65535");
+                assert!(socket.as_os_str().len() <= 107, "{}", socket.display());
+            }
             assert!(names.insert(name));
         }
     }

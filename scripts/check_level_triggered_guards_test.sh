@@ -300,6 +300,7 @@ paths = (
     ".github/workflows/level-triggered-CI.yml",
     "README.md", "docs/Dev.md", "docs/features/postgres/design.md",
     "docs/features/kuberic/testing.md", "docs/features/kuberic/level-triggered-operator.md",
+    "docs/features/sqlserver/design.md", "docs/features/kuberic/design-gaps.md",
     "docs/proposal/v1-retirement-plan.md", "examples/kvstore2/deploy/sample.yaml",
     "kuberic-protocol/src/lib.rs", "kuberic-agent/src/state.rs", "justfile",
 )
@@ -319,31 +320,91 @@ baseline = check()
 assert baseline.returncode == 0, baseline.stdout
 workflow = ".github/workflows/level-triggered-CI.yml"
 design = "docs/features/postgres/design.md"
-for relative, before, after in (
-    (workflow, "cargo test -p postgres-replicated --all-features -- --test-threads=1", "true"),
-    (workflow, "          -p postgres-replicated\n", ""),
-    (workflow, "postgresql-16 postgresql-client-16", "postgresql-client-16"),
-    (workflow, "runs-on: ubuntu-24.04", "runs-on: ubuntu-latest"),
-    (workflow, "/usr/lib/postgresql/16/bin/postgres --version", "true"),
-    (workflow, "\n  bootstrap-kind:", "\n  bootstrap-kind:\n    # postgres-replicated"),
-    (workflow, "\n  full-kind:", "\n  full-kind:\n    # PostgreSQL"),
-    ("justfile", "level-triggered-kind-test", "level-triggered-kind-test postgres"),
-    (design, "protocol 9 / agent schema 5", "protocol 8 / agent schema 4"),
-    (design, "supervisor loss", "supervision"),
-    (design, "free-space headroom", "free-space"),
-    (design, "## Architecture and Authority", "## PG-level write fencing not implemented"),
-    ("docs/proposal/v1-retirement-plan.md", "Workstream 4 complete", "Workstream 4 pending"),
-    ("kuberic-protocol/src/lib.rs", "PROTOCOL_VERSION: u32 = 9", "PROTOCOL_VERSION: u32 = 8"),
-    ("kuberic-agent/src/state.rs", "SCHEMA_VERSION: u32 = 5", "SCHEMA_VERSION: u32 = 4"),
-):
+unit_command = "cargo test -p postgres-replicated --all-features -- --test-threads=1"
+unit_step = "- name: Test PostgreSQL unit and host-local subprocess suites"
+unit_error = "Test PostgreSQL unit and host-local subprocess suites: run must be a shell string"
+deployment_error = "PostgreSQL fresh deployment must declare exactly protocol 9 / agent schema 5"
+cases = (
+    ("missing unit command", workflow, unit_command, "true", unit_error),
+    ("disabled unit step", workflow, unit_step, unit_step + "\n        if: ${{ false }}",
+     "Test PostgreSQL unit and host-local subprocess suites must be unconditional"),
+    ("comment-only unit command", workflow, "run: " + unit_command,
+     "run: true # " + unit_command, unit_error),
+    ("quoted comment-only command", workflow, "run: " + unit_command,
+     'run: "true # ' + unit_command + '"',
+     "PostgreSQL serial unit selection must execute the required command"),
+    ("missing lint", workflow, "          -p postgres-replicated\n", "",
+     "PostgreSQL targeted lint is required"),
+    ("missing server", workflow, "postgresql-16 postgresql-client-16", "postgresql-client-16",
+     "PostgreSQL 16 installation and version check must execute"),
+    ("wrong runner", workflow, "runs-on: ubuntu-24.04", "runs-on: ubuntu-latest",
+     "Use the Ubuntu PostgreSQL 16 package baseline"),
+    ("missing version check", workflow, "/usr/lib/postgresql/16/bin/postgres --version", "true",
+     "PostgreSQL 16 installation and version check must execute"),
+    ("live smoke command", workflow, "run: just level-triggered-kind-test bootstrap",
+     "run: " + unit_command, "PostgreSQL must not enter KinD/live job bootstrap-kind"),
+    ("live full command", workflow, "run: just level-triggered-kind-test all",
+     "run: " + unit_command, "PostgreSQL must not enter KinD/live job full-kind"),
+    ("live images command", "justfile", "level-triggered-images: verify-kind-context",
+     "level-triggered-images: verify-kind-context\n    " + unit_command,
+     "PostgreSQL must not enter live recipe level-triggered-images"),
+    ("transitive live dependency", "justfile", "verify-kind-ownership:",
+     "verify-kind-ownership: unit-only\n\nunit-only:\n    " + unit_command,
+     "PostgreSQL must not enter live recipe unit-only"),
+    ("nested live invocation", "justfile", "level-triggered-images: verify-kind-context",
+     "unit-only:\n    " + unit_command +
+     "\n\nlevel-triggered-images: verify-kind-context\n    just unit-only",
+     "PostgreSQL must not enter live recipe unit-only"),
+    ("multiple live invocations", "justfile", "level-triggered-images: verify-kind-context",
+     "unit-only:\n    " + unit_command +
+     "\n\nlevel-triggered-images: verify-kind-context\n    just verify-kind-context unit-only",
+     "PostgreSQL must not enter live recipe unit-only"),
+    ("live selector", "justfile", 'bootstrap) test_name="level_triggered_k8s::',
+     'postgres) test_name="level_triggered_k8s::',
+     "PostgreSQL must not enter live recipe level-triggered-kind-test"),
+    ("old deployment versions", design, "protocol 9 / agent schema 5",
+     "protocol 8 / agent schema 4", deployment_error),
+    ("new deployment versions", design, "protocol 9 / agent schema 5",
+     "protocol 10 / agent schema 6", deployment_error),
+    ("missing supervision boundary", design, "supervisor loss", "supervision",
+     "PostgreSQL design missing contract: supervisor loss"),
+    ("missing headroom", design, "free-space headroom", "free-space",
+     "PostgreSQL design missing contract: headroom"),
+    ("classic claim", design, "## Architecture and Authority", "## PG-level write fencing not implemented",
+     "PostgreSQL design retains classic/planned claim"),
+    ("retirement classification", "docs/proposal/v1-retirement-plan.md", "Workstream 4 complete",
+     "Workstream 4 pending", "AssertionError"),
+    ("protocol constant", "kuberic-protocol/src/lib.rs", "PROTOCOL_VERSION: u32 = 9",
+     "PROTOCOL_VERSION: u32 = 8", "AssertionError"),
+    ("schema constant", "kuberic-agent/src/state.rs", "SCHEMA_VERSION: u32 = 5",
+     "SCHEMA_VERSION: u32 = 4", "AssertionError"),
+)
+for name, relative, before, after, reason in cases:
     target = fixture / relative
     original = target.read_text()
     assert before in original, (relative, before)
     try:
         target.write_text(re.sub(re.escape(before), lambda _: after, original, flags=re.I))
         result = check()
-        assert result.returncode != 0 and "AssertionError" in result.stdout, \
-            f"Documentation guard accepted {relative}: {before}\n{result.stdout}"
+        assert result.returncode != 0 and reason in result.stdout, \
+            f"Documentation guard accepted {name} or failed for the wrong reason\n{result.stdout}"
+        print(f"Rejected {name}: {reason}")
+    finally:
+        target.write_text(original)
+
+# Comments cannot supply executable coverage, nor should comments that merely
+# mention PostgreSQL create a false live execution finding.
+for relative, addition in (
+    (workflow, "\n# PostgreSQL remains host-local only\n"),
+    ("justfile", "\n# PostgreSQL remains host-local only\n"),
+    ("justfile", "\nunit-only:\n    " + unit_command + "\n"),
+):
+    target = fixture / relative
+    original = target.read_text()
+    try:
+        target.write_text(original + addition)
+        result = check()
+        assert result.returncode == 0, result.stdout
     finally:
         target.write_text(original)
 
@@ -351,7 +412,8 @@ live = fixture / "kuberic-level-tests/src/postgres.rs"
 live.write_text("use postgres_replicated::testing;\n")
 result = check()
 assert result.returncode != 0 and "PostgreSQL must not enter live tests" in result.stdout, result.stdout
-print("PostgreSQL classification, CI and documentation regression tests passed.")
+print(f"PostgreSQL classification, CI and documentation regression tests passed "
+      f"({len(cases) + 1} negative mutations, 4 positive checks).")
 PY
 
 echo "Level-triggered guard regression tests passed."

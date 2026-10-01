@@ -242,12 +242,16 @@ impl PgReplicatorFactory {
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
-    use crate::testing::{PgPod, TestDataDir, native_identity};
+    use crate::testing::{PgPod, TestDataDir, layout::SINGLE_REPLICA_DIRECTORY, native_identity};
 
     #[tokio::test]
     async fn postgres_custom_factory_returns_no_operation_or_copy_state_replicator() {
         let directory = TestDataDir::new("sf-api");
-        let pod = PgPod::new(directory.path().join("replica"), native_identity(1, "api")).await;
+        let pod = PgPod::new(
+            directory.path().join(SINGLE_REPLICA_DIRECTORY),
+            native_identity(1, "api"),
+        )
+        .await;
         let factory = PgReplicatorFactory(pod.application.native_driver().clone());
         let interfaces = factory.interfaces();
         assert!(interfaces.state_replicator().is_none());

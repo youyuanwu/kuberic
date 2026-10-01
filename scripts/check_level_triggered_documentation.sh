@@ -20,9 +20,12 @@ import difflib
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import urllib.parse
+
+import yaml
 
 root = pathlib.Path.cwd()
 
@@ -34,22 +37,107 @@ def prose(text):
 # repeatedly building rustdoc, generating the CRD or running status-size tests.
 postgres_only = sys.argv[1:] == ["--postgres-contract-only"]
 workflow = (root / ".github/workflows/level-triggered-CI.yml").read_text()
-targeted, live_jobs = workflow.split("\n  bootstrap-kind:", 1)
+workflow_data = yaml.safe_load(workflow)
+jobs = workflow_data["jobs"]
+targeted_job = jobs["targeted"]
+
+def require_active(item, description):
+    assert item.get("if", True) in (True, "true", "${{ true }}"), \
+        f"{description} must be unconditional"
+    assert item.get("continue-on-error", False) is False, \
+        f"{description} must fail CI on error"
+
+def shell_commands(script):
+    # Only plain shell commands can satisfy required execution. shlex removes
+    # comments but keeps control operators, wrappers and quoted arguments.
+    assert isinstance(script, str), "CI run must be a shell string"
+    return [tokens for line in script.replace("\\\n", "").splitlines()
+            if (tokens := shlex.split(line, comments=True))]
+
+def required_step(name):
+    steps = [step for step in targeted_job["steps"] if step.get("name") == name]
+    assert len(steps) == 1, f"Required targeted step missing or duplicated: {name}"
+    step = steps[0]
+    require_active(step, name)
+    assert step.get("shell", "bash") in ("bash", "sh"), f"{name}: unsupported shell"
+    assert isinstance(step.get("run"), str), f"{name}: run must be a shell string"
+    return shell_commands(step.get("run"))
+
+require_active(targeted_job, "Targeted job")
+for defaults in (workflow_data.get("defaults", {}), targeted_job.get("defaults", {})):
+    assert defaults.get("run", {}).get("shell", "bash") in ("bash", "sh"), \
+        "Targeted checks require a real shell"
 postgres_unit_command = "cargo test -p postgres-replicated --all-features -- --test-threads=1"
-assert postgres_unit_command in targeted, "PostgreSQL serial unit selection is required"
-lint_command = targeted.split("- name: Lint level-triggered packages", 1)[1].split("- name:", 1)[0]
-assert "-p postgres-replicated" in lint_command, "PostgreSQL targeted lint is required"
-assert "cargo fmt --all -- --check" in targeted
-assert "runs-on: ubuntu-24.04" in targeted, "Use the Ubuntu PostgreSQL 16 package baseline"
-assert "sudo apt-get install -y postgresql-16 postgresql-client-16" in targeted
-assert "/usr/lib/postgresql/16/bin/postgres --version" in targeted
-assert 'run: mkdir -p "$TMPDIR"' in targeted
-assert "TMPDIR: ${{ github.workspace }}/target/paw-tmp" in targeted
-assert "docs/features/postgres/design.md" in targeted
-assert "postgres" not in live_jobs.lower(), "PostgreSQL must not enter KinD/live jobs"
+assert required_step("Test PostgreSQL unit and host-local subprocess suites") == [
+    shlex.split(postgres_unit_command)
+], "PostgreSQL serial unit selection must execute the required command"
+lint = required_step("Lint level-triggered packages")
+assert len(lint) == 1 and lint[0][:2] == ["cargo", "clippy"] \
+    and ["-p", "postgres-replicated"] in [lint[0][i:i+2] for i in range(len(lint[0]))] \
+    and lint[0][-5:] == ["--all-targets", "--all-features", "--", "-D", "warnings"] \
+    and not any(token in lint[0] for token in (";", "&&", "||", "|")), \
+    "PostgreSQL targeted lint is required"
+assert required_step("Format") == [shlex.split("cargo fmt --all -- --check")]
+assert targeted_job["runs-on"] == "ubuntu-24.04", "Use the Ubuntu PostgreSQL 16 package baseline"
+assert required_step("Install host-local PostgreSQL for unit tests") == [
+    shlex.split("sudo apt-get update -qq"),
+    shlex.split("sudo apt-get install -y postgresql-16 postgresql-client-16 python3-yaml"),
+    shlex.split("/usr/lib/postgresql/16/bin/postgres --version"),
+], "PostgreSQL 16 installation and version check must execute"
+assert required_step("Prepare repository-local scratch") == [["mkdir", "-p", "$TMPDIR"]]
+assert targeted_job["env"]["TMPDIR"] == "${{ github.workspace }}/target/paw-tmp"
+assert any(command[0] == "scripts/check_level_triggered_documentation.sh"
+           and "docs/features/postgres/design.md" in command
+           for command in required_step("Verify source and dependency isolation"))
+
+# Inspect the complete graph rooted in every non-targeted job, including recipe
+# dependencies and nested `just` calls. Do not execute any live tooling.
 recipes = (root / "justfile").read_text()
-live_recipes = recipes.split("level-triggered-kind-test", 1)[1]
-assert "postgres" not in live_recipes.lower(), "No PostgreSQL live selector or recipe"
+recipe_graph = {}
+current = None
+for line in recipes.splitlines():
+    if line and not line[0].isspace() and not line.startswith("#"):
+        declaration = re.fullmatch(r"([\w-]+)(?:\s+[^:]+)?:\s*(.*)", line)
+        current = declaration[1] if declaration else None
+        if current:
+            recipe_graph[current] = (shlex.split(declaration[2], comments=True), [])
+    elif current and line.strip():
+        recipe_graph[current][1].append(line)
+
+def live_commands(script, description):
+    commands = shell_commands(script)
+    tokens = [token for command in commands for token in command]
+    assert not any(re.search(r"postgres|pgdata", token, re.I) for token in tokens), \
+        f"PostgreSQL must not enter {description}"
+    assert not ("cargo" in tokens and any(
+        token in tokens for token in ("--workspace", "--all")
+    )), f"Workspace-wide Cargo execution must not enter {description}"
+    calls = []
+    for command in commands:
+        for index, token in enumerate(command):
+            if token == "just":
+                assert index + 1 < len(command) and command[index + 1] in recipe_graph, \
+                    f"Unresolved live recipe call in {description}: {command}"
+                # `just` can run multiple named recipes in one invocation.
+                calls.extend(token for token in command[index + 1:] if token in recipe_graph)
+    return calls
+
+pending = []
+for name, job in jobs.items():
+    if name != "targeted":
+        for step in job.get("steps", []):
+            if "run" in step:
+                pending.extend(live_commands(step["run"], f"KinD/live job {name}"))
+visited = set()
+while pending:
+    name = pending.pop()
+    if name in visited:
+        continue
+    assert name in recipe_graph, f"Unresolved live recipe dependency: {name}"
+    visited.add(name)
+    dependencies, body = recipe_graph[name]
+    pending.extend(dependencies)
+    pending.extend(live_commands("\n".join(body), f"live recipe {name}"))
 for source in (root / "kuberic-level-tests").rglob("*"):
     if source.is_file() and source.suffix in {".rs", ".toml"}:
         assert not re.search(r"postgres[-_]replicated|examples/postgres|postgresql|pgdata", source.read_text(), re.I), \
@@ -66,6 +154,9 @@ for claim in (
 ):
     assert claim in postgres_text, f"PostgreSQL design missing contract: {claim}"
 assert "R + W > N" in postgres_design.read_text(), "PostgreSQL failover intersection is required"
+assert re.findall(
+    r"use a fresh deployment with protocol (\d+) / agent schema (\d+)\.", postgres_text
+) == [("9", "5")], "PostgreSQL fresh deployment must declare exactly protocol 9 / agent schema 5"
 assert not re.search(r"\b(?:protocol[ -][0-8]|schema[ -][0-4])\b", postgres_text), \
     "PostgreSQL requires exact protocol 9 / schema 5, not an older deployment contract"
 for obsolete in (
@@ -88,6 +179,14 @@ for path in (
     assert "workstream 4" in text and "workstream 5" in text, f"{path}: PostgreSQL classification"
     assert "classic kvstore/postgresql" not in text
     assert "remaining postgresql port" not in text
+for path in ("docs/features/sqlserver/design.md", "docs/features/kuberic/design-gaps.md"):
+    text = (root / path).read_text()
+    assert "../postgres/design.md" in text and any(
+        claim in prose(text) for claim in ("retired classic", "classic correlated topology is retired")
+    ), \
+        f"{path}: distinguish retired classic behavior from implemented PostgreSQL v2"
+    assert "workstream 4" in prose(text) and "workstream 5" in prose(text), \
+        f"{path}: distinguish host-local validation from deployment"
 testing = (root / "docs/features/kuberic/testing.md").read_text()
 assert postgres_unit_command in testing
 assert "### PostgreSQL V2 Host-Local Validation" in testing
@@ -367,6 +466,8 @@ documents = [
     root / "docs/features/kuberic/level-triggered-operator.md",
     root / "docs/features/sqlite/design.md",
     root / "docs/features/postgres/design.md",
+    root / "docs/features/sqlserver/design.md",
+    root / "docs/features/kuberic/design-gaps.md",
     root / "docs/proposal/level-triggered-operator-design.md",
     root / "docs/proposal/v1-retirement-plan.md",
     root / "examples/kvstore2/README.md",
