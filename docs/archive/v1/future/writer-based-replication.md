@@ -1399,8 +1399,9 @@ in-flight invariant is per partition, not per cluster.
 
 If a workload requires both high throughput and the latency
 benefit, partitioning is necessary. If neither single-partition
-throughput nor latency are critical, prefer the existing leader-
-based system (which supports pipelined writes per partition).
+throughput nor latency were critical, the original proposal preferred
+the then-existing leader-based system because it supported pipelined
+writes per partition. That fallback implementation has since been removed.
 
 ---
 
