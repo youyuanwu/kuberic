@@ -6224,10 +6224,18 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         !include_str!("../src/transport.rs").contains(".record_durable_peer_progress("),
         "peer discovery may use reported progress for repair, never commit quorum credit"
     );
+    let backend_trait = lifecycle
+        .split_once("trait ReplicatorLifecycleBackend")
+        .unwrap()
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0;
     assert!(
         !replication.contains("async fn execute_action(&self, action: RuntimeEffectAction)")
             && !lifecycle.contains("async fn execute_action")
-            && !lifecycle.contains(".legacy.execute_action("),
+            && !lifecycle.contains(".legacy.execute_action(")
+            && !backend_trait.contains("fn owns_stream_session(&self) -> bool {"),
         "ordinary lifecycle work must use explicit common routing and private proof hooks"
     );
     for source in [hosting, lifecycle, report, service, transport] {

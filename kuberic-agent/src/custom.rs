@@ -37,9 +37,7 @@ pub(crate) enum BuildExecution {
 
 #[async_trait]
 trait ReplicatorLifecycleBackend: Send + Sync {
-    fn owns_stream_session(&self) -> bool {
-        false
-    }
+    fn owns_stream_session(&self) -> bool;
 
     async fn complete_open(&self, address: String) -> Result<()>;
     async fn complete_close(&self) -> Result<()>;
@@ -2240,6 +2238,10 @@ impl CustomReplicatorHost {
 
 #[async_trait]
 impl ReplicatorLifecycleBackend for CustomReplicatorHost {
+    fn owns_stream_session(&self) -> bool {
+        false
+    }
+
     async fn complete_open(&self, address: String) -> Result<()> {
         CustomReplicatorHost::complete_open(self, address).await
     }
