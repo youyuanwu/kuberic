@@ -1745,10 +1745,16 @@ impl RuntimeHost {
             managed.fence_writes().await?;
         }
         if let Err(error) = registered.close().await {
+            if let Ok(managed) = self.lifecycle() {
+                managed.complete_abort().await;
+            }
             self.abort();
             return Err(error);
         }
         if let Err(error) = self.application.close().await {
+            if let Ok(managed) = self.lifecycle() {
+                managed.complete_abort().await;
+            }
             self.application.abort();
             self.closed.store(true, Ordering::Release);
             let mut state = self.state.write().await;
@@ -1756,6 +1762,12 @@ impl RuntimeHost {
             state.fallback_snapshot.role_transition = None;
             state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+            return Err(error);
+        }
+        if let Ok(managed) = self.lifecycle()
+            && let Err(error) = managed.complete_close().await
+        {
+            self.abort();
             return Err(error);
         }
         self.closed.store(true, Ordering::Release);
@@ -1775,6 +1787,9 @@ impl RuntimeHost {
             state.fallback_snapshot.role_transition = None;
             state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+        }
+        if let Ok(managed) = self.lifecycle() {
+            managed.complete_abort().await;
         }
         self.abort();
     }

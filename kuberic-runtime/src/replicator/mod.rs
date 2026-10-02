@@ -16,6 +16,8 @@ use async_trait::async_trait;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
     PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
+    SecondaryRemovalPreparation, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
+    SecondaryScaleDownIntent,
 };
 use kuberic_runtime_internal::RuntimeHostToken;
 use tokio::sync::{Mutex, RwLock};
@@ -23,7 +25,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
     AdmittedAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
-    ReplicaAuthorityStore, ReplicationProgressStore,
+    ReplicaAuthorityStore, ReplicationProgressStore, RetiredAuthority,
 };
 use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
@@ -99,6 +101,29 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
         starting_configuration_id: kuberic_protocol::types::ConfigurationId,
         starting_epoch: Epoch,
     ) -> Result<()>;
+    async fn prepare_secondary_removal_proof(
+        &self,
+        intent: SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<SecondaryRemovalPreparation>;
+    async fn observe_secondary_removal_proof(&self, witness: SecondaryRemovalWitness)
+    -> Result<()>;
+    async fn observe_secondary_removal_progress_proof(
+        &self,
+        witness: SecondaryRemovalWitness,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()>;
+    async fn accept_secondary_removal_proof(
+        &self,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()>;
+    async fn accept_historical_secondary_removal_proof(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()>;
+    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
+    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;

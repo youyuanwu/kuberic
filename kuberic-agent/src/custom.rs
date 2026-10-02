@@ -36,6 +36,8 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     }
 
     async fn complete_open(&self, address: String) -> Result<()>;
+    async fn complete_close(&self) -> Result<()>;
+    async fn complete_abort(&self);
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
@@ -97,6 +99,14 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.sync_engine_proof().await
     }
 
+    async fn complete_close(&self) -> Result<()> {
+        self.common.terminate().await
+    }
+
+    async fn complete_abort(&self) {
+        self.common.terminate().await.ok();
+    }
+
     async fn fence_writes(&self) -> Result<()> {
         self.common.fence_managed_access().await?;
         self.legacy.fence_writes().await?;
@@ -132,6 +142,18 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        if matches!(
+            &action,
+            RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                | RuntimeEffectAction::ObserveSecondaryRemovalWitness(_)
+                | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
+                | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
+                | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
+                | RuntimeEffectAction::FenceRetirement(_)
+                | RuntimeEffectAction::CompleteRetirement(_)
+        ) {
+            return Box::pin(self.execute_removal_action(action)).await;
+        }
         match &action {
             RuntimeEffectAction::RegisterPeerSession { identity, .. } => {
                 let registered_engine_peer = self
@@ -233,19 +255,6 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
                 let result = self.legacy.authorize_failover_prefix_proof(*boundary).await;
                 self.sync_engine_proof().await?;
-                return result;
-            }
-            RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-            | RuntimeEffectAction::ObserveSecondaryRemovalWitness(_)
-            | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
-            | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
-            | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
-            | RuntimeEffectAction::FenceRetirement(_)
-            | RuntimeEffectAction::CompleteRetirement(_) => {
-                let result = self.legacy.execute_action(action).await;
-                self.common
-                    .restore_legacy_lifecycle_compat(self.legacy.snapshot().await)
-                    .await?;
                 return result;
             }
             _ => {}
@@ -365,6 +374,64 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 }
 
 impl ManagedLifecycleBackend {
+    async fn execute_removal_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        let result = match action {
+            RuntimeEffectAction::PrepareSecondaryRemoval {
+                intent,
+                process_session_id,
+                report_sequence,
+            } => {
+                self.common.fence_managed_access().await?;
+                self.legacy
+                    .prepare_secondary_removal_proof(*intent, process_session_id, report_sequence)
+                    .await
+                    .map(|_| ())
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness) => {
+                self.legacy.observe_secondary_removal_proof(*witness).await
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
+                self.legacy
+                    .observe_secondary_removal_progress_proof(*witness, *committed)
+                    .await
+            }
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
+                self.legacy.accept_secondary_removal_proof(*committed).await
+            }
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
+                self.legacy
+                    .accept_historical_secondary_removal_proof(*command)
+                    .await
+            }
+            RuntimeEffectAction::FenceRetirement(retired) => {
+                let result = self.legacy.fence_retirement_proof((*retired).clone()).await;
+                if result.is_ok() {
+                    self.common.fence_retirement_state(&retired).await?;
+                }
+                result
+            }
+            RuntimeEffectAction::CompleteRetirement(retired) => {
+                let result = self
+                    .legacy
+                    .complete_retirement_proof((*retired).clone())
+                    .await;
+                if result.is_ok() {
+                    self.common.complete_retirement_state(&retired).await?;
+                }
+                result
+            }
+            _ => {
+                return Err(RuntimeError::Application(
+                    "managed removal proof requires a removal action".into(),
+                ));
+            }
+        };
+        self.common
+            .install_engine_removal_proof(self.legacy.snapshot().await)
+            .await?;
+        result
+    }
+
     async fn execute_access_action(&self, action: RuntimeEffectAction) -> Result<()> {
         let snapshot = self.common.snapshot().await;
         let (read, write) = match action {
@@ -430,6 +497,14 @@ impl ReplicatorLifecycleHost {
 
     pub(super) async fn complete_open(&self, address: String) -> Result<()> {
         self.backend.complete_open(address).await
+    }
+
+    pub(super) async fn complete_close(&self) -> Result<()> {
+        self.backend.complete_close().await
+    }
+
+    pub(super) async fn complete_abort(&self) {
+        self.backend.complete_abort().await;
     }
 
     pub(super) async fn fence_writes(&self) -> Result<()> {
@@ -1132,6 +1207,23 @@ impl CustomReplicatorHost {
         state.replication_address = Some(address);
     }
 
+    async fn terminate(&self) -> Result<()> {
+        *self.restored_access.write().await = None;
+        self.removal_witnesses.write().await.clear();
+        self.invalidate_build_attempts().await?;
+        self.receiver.lock().await.close();
+        let mut state = self.state.write().await;
+        state.open = false;
+        state.role = kuberic_protocol::types::ReplicaRole::None;
+        state.role_transition = None;
+        state.read_status = AccessStatus::NotPrimary;
+        state.write_status = AccessStatus::NotPrimary;
+        state.builds.clear();
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
     async fn mark_not_open(&self) {
         self.state.write().await.open = false;
         if let Some(host) = self.host.upgrade() {
@@ -1269,14 +1361,9 @@ impl CustomReplicatorHost {
         Ok(())
     }
 
-    async fn restore_legacy_lifecycle_compat(&self, snapshot: RuntimeSnapshot) -> Result<()> {
+    async fn install_engine_removal_proof(&self, snapshot: RuntimeSnapshot) -> Result<()> {
         {
             let mut state = self.state.write().await;
-            state.open = snapshot.open;
-            state.replication_address = snapshot.replication_address.clone();
-            state.role = snapshot.role;
-            state.role_transition = snapshot.role_transition.clone();
-            state.authority = snapshot.authority.clone();
             state.prepared_secondary_removal = snapshot.prepared_secondary_removal;
             state.accepted_secondary_removal = snapshot.accepted_secondary_removal;
             state.retired_authority = snapshot.retired_authority;
@@ -1285,18 +1372,49 @@ impl CustomReplicatorHost {
             state.committed_lsn = snapshot.committed_lsn;
             state.current_configuration_quorum_progress =
                 snapshot.current_configuration_quorum_progress;
-            state.read_status = snapshot.read_status;
-            state.write_status = snapshot.write_status;
         }
+        Ok(())
+    }
+
+    async fn fence_retirement_state(
+        &self,
+        retired: &kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
         let host = self.host()?;
+        retired.validate(&host.identity)?;
+        *self.restored_access.write().await = None;
+        self.removal_witnesses.write().await.clear();
+        {
+            let mut state = self.state.write().await;
+            state.authority = None;
+            state.verified_replication_lsn = None;
+            state.read_status = AccessStatus::NotPrimary;
+            state.write_status = AccessStatus::NotPrimary;
+            state.builds.clear();
+        }
         let mut state = host.state.write().await;
-        state.fallback_snapshot.open = snapshot.open;
-        state.fallback_snapshot.replication_address = snapshot.replication_address;
-        state.fallback_snapshot.role = snapshot.role;
-        state.fallback_snapshot.role_transition = snapshot.role_transition;
-        state.fallback_snapshot.read_status = snapshot.read_status;
-        state.fallback_snapshot.write_status = snapshot.write_status;
-        state.fallback_snapshot.authority = snapshot.authority;
+        state.fallback_snapshot.authority = None;
+        state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
+        state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+        Ok(())
+    }
+
+    async fn complete_retirement_state(
+        &self,
+        retired: &kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        let host = self.host()?;
+        retired.validate(&host.identity)?;
+        let closed = host.state.read().await.fallback_snapshot.clone();
+        if closed.open || closed.role != kuberic_protocol::types::ReplicaRole::None {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        self.terminate().await?;
+        let mut state = self.state.write().await;
+        state.retired_authority = Some(retired.clone());
+        state.authority = None;
+        drop(state);
+        host.state.write().await.fallback_snapshot.authority = None;
         Ok(())
     }
 
@@ -1771,6 +1889,14 @@ impl CustomReplicatorHost {
 impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     async fn complete_open(&self, address: String) -> Result<()> {
         CustomReplicatorHost::complete_open(self, address).await
+    }
+
+    async fn complete_close(&self) -> Result<()> {
+        self.terminate().await
+    }
+
+    async fn complete_abort(&self) {
+        self.terminate().await.ok();
     }
 
     async fn fence_writes(&self) -> Result<()> {

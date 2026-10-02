@@ -3799,6 +3799,91 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         .await
     }
 
+    async fn prepare_secondary_removal_proof(
+        &self,
+        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<kuberic_protocol::types::SecondaryRemovalPreparation> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::PrepareSecondaryRemoval {
+                intent: Box::new(intent),
+                process_session_id,
+                report_sequence,
+            },
+        )
+        .await?;
+        self.snapshot()
+            .await
+            .prepared_secondary_removal
+            .ok_or(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    async fn observe_secondary_removal_proof(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness)),
+        )
+        .await
+    }
+
+    async fn observe_secondary_removal_progress_proof(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress {
+                witness: Box::new(witness),
+                committed: Box::new(committed),
+            },
+        )
+        .await
+    }
+
+    async fn accept_secondary_removal_proof(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed)),
+        )
+        .await
+    }
+
+    async fn accept_historical_secondary_removal_proof(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command)),
+        )
+        .await
+    }
+
+    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::FenceRetirement(Box::new(retired)),
+        )
+        .await
+    }
+
+    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::CompleteRetirement(Box::new(retired)),
+        )
+        .await
+    }
+
     async fn restore_authority(&self) -> Result<()> {
         self.restore_authority().await
     }

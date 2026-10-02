@@ -3505,6 +3505,67 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
+    async fn prepare_secondary_removal_proof(
+        &self,
+        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<kuberic_protocol::types::SecondaryRemovalPreparation> {
+        Ok(kuberic_protocol::types::SecondaryRemovalPreparation {
+            operation_id: intent.command_operation_id(
+                kuberic_protocol::types::SecondaryRemovalStage::Prepare,
+                &intent.primary,
+            ),
+            intent,
+            process_session_id,
+            report_sequence,
+            boundary_lsn: 0,
+        })
+    }
+
+    async fn observe_secondary_removal_proof(
+        &self,
+        _witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn observe_secondary_removal_progress_proof(
+        &self,
+        _witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn accept_secondary_removal_proof(
+        &self,
+        _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn accept_historical_secondary_removal_proof(
+        &self,
+        _command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn fence_retirement_proof(
+        &self,
+        _retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn complete_retirement_proof(
+        &self,
+        _retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn restore_authority(&self) -> Result<()> {
         Ok(())
     }

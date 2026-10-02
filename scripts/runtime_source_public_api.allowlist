@@ -258,16 +258,23 @@ public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn
 public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::async fn repair_peer (& self , identity : ReplicaIdentity , progress : Lsn) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorDataPlane::fn abort (& self)
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle: Send + Sync
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn accept_historical_secondary_removal_proof (& self , command : kuberic_protocol :: command :: AcceptSecondaryRemovalCommit ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn accept_secondary_removal_proof (& self , committed : SecondaryScaleDownCleanup ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn admit_authority_proof (& self , authority : AdmittedAuthority) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn attach_interfaces (& self , control : Arc < dyn Replicator > , primary : Option < Arc < dyn PrimaryReplicator > > ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn authorize_failover_prefix_proof (& self , boundary : Lsn) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_configuration_work (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_outbound_build (& self , build_id : & OperationId) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_open (& self , replication_address : String) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_retirement_proof (& self , retired : RetiredAuthority) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn execute_action (& self , action : RuntimeEffectAction) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn fence_retirement_proof (& self , retired : RetiredAuthority) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn fence_writes (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn next_outbound (& self) -> Option < OutboundOperation >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_progress_proof (& self , witness : SecondaryRemovalWitness , committed : SecondaryScaleDownCleanup ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_proof (& self , witness : SecondaryRemovalWitness) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_access (& self , read : AccessStatus , write : AccessStatus) -> Result < u64 >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_secondary_removal_proof (& self , intent : SecondaryScaleDownIntent , process_session_id : ProcessSessionId , report_sequence : u64 ,) -> Result < SecondaryRemovalPreparation >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_switchover_proof (& self , preparation_generation : u64 , request_id : kuberic_protocol :: types :: SwitchoverRequestId , source : ReplicaIdentity , target : ReplicaIdentity , starting_configuration_id : kuberic_protocol :: types :: ConfigurationId , starting_epoch : Epoch ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn publish_access (& self , read : AccessStatus , write : AccessStatus , generation : u64 ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn restore_authority (& self) -> Result < () >
