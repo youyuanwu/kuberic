@@ -4674,6 +4674,10 @@ async fn independent_custom_primary_with_state_capability_keeps_sf_effect_hostin
         .execute(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
         .await
         .unwrap();
+    assert_eq!(
+        runtime.testing_lifecycle_registration(),
+        (Some(false), false)
+    );
     let state = service
         .state
         .lock()
@@ -4857,6 +4861,10 @@ async fn newer_epoch_supersedes_failed_custom_primary_role_without_reusing_its_r
         .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
         .await
         .unwrap();
+    assert_eq!(
+        runtime.testing_lifecycle_registration(),
+        (Some(false), false)
+    );
     let mut admitted = authority(local.clone(), vec![local]);
     runtime
         .apply_effect(effect(
@@ -5628,6 +5636,7 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     let replication = include_str!("../../kuberic-runtime/src/replicator/mod.rs");
     let application = include_str!("../../kuberic-runtime/src/application.rs");
     let library = include_str!("../../kuberic-runtime/src/lib.rs");
+    let hosting = include_str!("../src/hosting.rs");
     assert!(
         replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorLifecycle")
             && replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorDataPlane"),
@@ -5643,6 +5652,12 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     );
     assert!(!replication.contains("fn managed_replicator("));
     assert!(!replication.contains("ReplicatorInterfaces::new"));
+    assert!(
+        hosting.contains("lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>")
+            && !hosting.contains("enum HostedLifecycle")
+            && !hosting.contains("custom: Option<Arc<custom::CustomReplicatorHost>>"),
+        "agent registration must retain one lifecycle facade rather than default/custom hosts"
+    );
     for internal_module in ["authority", "effects", "runtime"] {
         assert!(
             !library.contains(&format!("pub mod {internal_module};")),
@@ -6504,6 +6519,14 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
     registration.cancel_replicator_creation(retry);
 }
 
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn default_primary_registers_one_managed_lifecycle_facade() {
+    let local = identity(1, "managed-lifecycle-facade");
+    let runtime = open_primary(Arc::new(TestApplication::default()), vec![local]).await;
+    assert_eq!(runtime.testing_lifecycle_registration(), (Some(true), true));
+}
+
 #[tokio::test]
 async fn quorum_modes_data_loss_and_configuration_methods_use_the_default_engine() {
     use kuberic_runtime::replicator::ReplicaSetQuorumMode;
@@ -7266,6 +7289,7 @@ async fn custom_factory_does_not_require_the_default_engine_or_service_storage_t
         .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
         .await
         .unwrap();
+    assert_eq!(runtime.testing_lifecycle_registration(), (None, false));
     let snapshot = runtime.snapshot().await;
     assert_eq!(
         snapshot.replication_address.as_deref(),

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, future::BoxFuture};
+use futures::{Stream, StreamExt};
 use kuberic_protocol::types::{
     AccessStatus, Epoch, FaultType, LoadMetric, OperationId, PartitionId, PartitionInformation,
     ReplicaIdentity, ReplicaRole,
@@ -119,9 +119,8 @@ struct RegisteredReplicator {
     control: Arc<dyn Replicator>,
     primary: Option<Arc<dyn PrimaryReplicator>>,
     provider: Option<Arc<dyn StateProvider>>,
-    managed_lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
+    lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
-    custom: Option<Arc<custom::CustomReplicatorHost>>,
 }
 
 struct PendingManagedCapabilities {
@@ -167,87 +166,12 @@ impl Drop for ManagedCapabilityRegistrationGuard {
     }
 }
 
-enum HostedLifecycle {
-    DefaultEngine(Arc<dyn ManagedReplicatorLifecycle>),
-    ServicePrimary(Arc<custom::CustomReplicatorHost>),
-}
-
-impl HostedLifecycle {
-    // Keep the default engine's boxed-future boundary; custom control futures
-    // must not inflate every default-engine effect's stack frame.
-    fn complete_open(&self, address: String) -> BoxFuture<'_, Result<()>> {
-        match self {
-            Self::DefaultEngine(host) => host.complete_open(address),
-            Self::ServicePrimary(host) => Box::pin(host.complete_open(address)),
-        }
-    }
-
-    fn fence_writes(&self) -> BoxFuture<'_, Result<()>> {
-        match self {
-            Self::DefaultEngine(host) => host.fence_writes(),
-            Self::ServicePrimary(host) => Box::pin(host.fence_writes()),
-        }
-    }
-
-    fn restore_authority(&self) -> BoxFuture<'_, Result<()>> {
-        match self {
-            Self::DefaultEngine(host) => host.restore_authority(),
-            Self::ServicePrimary(host) => Box::pin(host.restore_authority()),
-        }
-    }
-
-    fn settle_primary_prefix(&self) -> BoxFuture<'_, Result<()>> {
-        match self {
-            Self::DefaultEngine(host) => host.settle_primary_prefix(),
-            Self::ServicePrimary(host) => Box::pin(host.settle_primary_prefix()),
-        }
-    }
-
-    fn cancel_configuration_work(&self) -> BoxFuture<'_, Result<()>> {
-        match self {
-            Self::DefaultEngine(host) => host.cancel_configuration_work(),
-            Self::ServicePrimary(host) => Box::pin(host.cancel_configuration_work()),
-        }
-    }
-
-    fn execute_action(&self, action: RuntimeEffectAction) -> BoxFuture<'_, Result<()>> {
-        match self {
-            Self::DefaultEngine(host) => host.execute_action(action),
-            Self::ServicePrimary(host) => Box::pin(host.execute_action(action)),
-        }
-    }
-
-    fn snapshot(&self) -> BoxFuture<'_, RuntimeSnapshot> {
-        match self {
-            Self::DefaultEngine(host) => host.snapshot(),
-            Self::ServicePrimary(host) => Box::pin(host.snapshot()),
-        }
-    }
-
-    fn cancel_outbound_build<'a>(&'a self, id: &'a OperationId) -> BoxFuture<'a, Result<()>> {
-        match self {
-            Self::DefaultEngine(host) => host.cancel_outbound_build(id),
-            Self::ServicePrimary(host) => Box::pin(host.cancel_outbound_build(id)),
-        }
-    }
-
-    fn next_outbound(&self) -> BoxFuture<'_, Option<OutboundOperation>> {
-        match self {
-            Self::DefaultEngine(host) => host.next_outbound(),
-            Self::ServicePrimary(host) => Box::pin(host.next_outbound()),
-        }
-    }
-}
-
 impl RegisteredReplicator {
     fn managed_data_plane(&self) -> Option<Arc<dyn ManagedReplicatorDataPlane>> {
         self.managed_data_plane.clone()
     }
-    fn lifecycle(&self) -> Option<HostedLifecycle> {
-        self.managed_lifecycle
-            .clone()
-            .map(HostedLifecycle::DefaultEngine)
-            .or_else(|| self.custom.clone().map(HostedLifecycle::ServicePrimary))
+    fn lifecycle(&self) -> Option<Arc<custom::ReplicatorLifecycleHost>> {
+        self.lifecycle.clone()
     }
     fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary.clone()
@@ -405,7 +329,8 @@ impl PodRuntime {
             .host
             .registered
             .get()
-            .is_some_and(|r| r.managed_lifecycle.is_some())
+            .and_then(|r| r.lifecycle.as_ref())
+            .is_some_and(|lifecycle| lifecycle.is_managed())
         {
             return Ok(());
         }
@@ -470,8 +395,8 @@ impl PodRuntime {
                     "build ID is already bound to different exact authority".into(),
                 ));
             }
-            if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
-                custom.select_build(&existing).await?;
+            if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
+                lifecycle.select_build(&existing).await?;
             }
             return Ok(existing);
         }
@@ -489,8 +414,8 @@ impl PodRuntime {
             .build_authority_store
             .admit_build(&authority)
             .await?;
-        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
-            custom.select_build(&authority).await?;
+        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
+            lifecycle.select_build(&authority).await?;
         }
         Ok(authority)
     }
@@ -588,23 +513,11 @@ impl PodRuntime {
                     )))
                     .await?;
             }
-            match &managed {
-                HostedLifecycle::ServicePrimary(custom) => {
-                    match custom.restore_access(read_status, write_status).await {
-                        Err(RuntimeError::ReconfigurationPending) => {
-                            tracing::info!("custom replica access restoration deferred");
-                        }
-                        result => result?,
-                    }
+            match managed.restore_access(read_status, write_status).await {
+                Err(RuntimeError::ReconfigurationPending) => {
+                    tracing::info!("replica access restoration deferred");
                 }
-                HostedLifecycle::DefaultEngine(_) => {
-                    managed
-                        .execute_action(RuntimeEffectAction::SetAccessStatus {
-                            read: read_status,
-                            write: write_status,
-                        })
-                        .await?;
-                }
+                result => result?,
             }
             self.host
                 .sync_access_projection(managed.snapshot().await)
@@ -667,6 +580,22 @@ impl PodRuntime {
         self.host.clone()
     }
 
+    #[cfg(feature = "testing")]
+    pub fn testing_lifecycle_registration(&self) -> (Option<bool>, bool) {
+        self.host
+            .registered
+            .get()
+            .map_or((None, false), |registered| {
+                (
+                    registered
+                        .lifecycle
+                        .as_ref()
+                        .map(|lifecycle| lifecycle.is_managed()),
+                    registered.managed_data_plane.is_some(),
+                )
+            })
+    }
+
     pub async fn snapshot(&self) -> RuntimeSnapshot {
         self.host.snapshot().await
     }
@@ -715,9 +644,9 @@ impl PodRuntime {
         identity: ReplicaIdentity,
         session: kuberic_protocol::types::ProcessSessionId,
     ) -> Result<()> {
-        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
-            custom
-                .execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
+        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
+            lifecycle
+                .register_custom_peer_session(identity, session)
                 .await?;
         }
         Ok(())
@@ -727,20 +656,15 @@ impl PodRuntime {
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
     ) -> Result<()> {
-        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
-            custom.describe_peer(replica).await?;
+        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
+            lifecycle.describe_custom_peer(replica).await?;
         }
         Ok(())
     }
 
     pub(crate) async fn refresh_custom_progress(&self) -> Result<()> {
-        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
-            if !custom.snapshot().await.open {
-                return Ok(());
-            }
-            custom
-                .execute_action(RuntimeEffectAction::RefreshApplicationProgress)
-                .await?;
+        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
+            lifecycle.refresh_custom_progress().await?;
         }
         Ok(())
     }
@@ -749,9 +673,8 @@ impl PodRuntime {
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
     ) -> Result<bool> {
-        if let Some(custom) = self.host.registered.get().and_then(|r| r.custom.as_ref()) {
-            custom.execute_build(replica).await?;
-            return Ok(true);
+        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
+            return lifecycle.execute_custom_build(replica).await;
         }
         Ok(false)
     }
@@ -1130,16 +1053,16 @@ impl ReplicatorRegistration for RuntimeHost {
                 .attach_interfaces(interfaces.replicator(), interfaces.primary_replicator())
                 .await?;
         }
-        let custom = if managed.lifecycle.is_none() {
-            interfaces.primary_replicator().map(|primary| {
-                Arc::new(custom::CustomReplicatorHost::new(
-                    self.weak_self.clone(),
-                    interfaces.replicator(),
-                    primary,
-                ))
-            })
-        } else {
-            None
+        let lifecycle = match (managed.lifecycle.as_ref(), interfaces.primary_replicator()) {
+            (Some(lifecycle), _) => Some(Arc::new(custom::ReplicatorLifecycleHost::managed(
+                lifecycle.clone(),
+            ))),
+            (None, Some(primary)) => Some(Arc::new(custom::ReplicatorLifecycleHost::service(
+                self.weak_self.clone(),
+                interfaces.replicator(),
+                primary,
+            ))),
+            (None, None) => None,
         };
         if self
             .registered
@@ -1147,9 +1070,8 @@ impl ReplicatorRegistration for RuntimeHost {
                 control: interfaces.replicator(),
                 primary: interfaces.primary_replicator(),
                 provider,
-                managed_lifecycle: managed.lifecycle.clone(),
+                lifecycle,
                 managed_data_plane: managed.data_plane.clone(),
-                custom,
             })
             .is_err()
         {
@@ -1191,7 +1113,7 @@ impl RuntimeHost {
     fn streams(&self) -> Result<Arc<dyn ManagedReplicatorDataPlane>> {
         self.managed_data_plane()
     }
-    fn lifecycle(&self) -> Result<HostedLifecycle> {
+    fn lifecycle(&self) -> Result<Arc<custom::ReplicatorLifecycleHost>> {
         self.registered
             .get()
             .ok_or(RuntimeError::NotOpen)?
@@ -1358,23 +1280,25 @@ impl RuntimeHost {
                 target,
                 replication_address,
             } => {
-                if let Some(custom) = self.registered.get().and_then(|r| r.custom.as_ref()) {
-                    custom
-                        .enqueue_build(ReplicaEndpoint {
-                            build_id,
-                            identity: target,
-                            replication_address,
-                        })
-                        .await?;
-                } else {
+                let endpoint = ReplicaEndpoint {
+                    build_id,
+                    identity: target,
+                    replication_address,
+                };
+                let dispatched = match self.lifecycle() {
+                    Ok(lifecycle) => lifecycle.enqueue_custom_build(endpoint.clone()).await?,
+                    Err(RuntimeError::Application(_)) => false,
+                    Err(error) => return Err(error),
+                };
+                if !dispatched {
                     self.registered
                         .get()
                         .and_then(|registered| registered.primary())
                         .ok_or(RuntimeError::NotPrimary)?
                         .build_replica(kuberic_runtime::replicator::ReplicaInformation::new(
-                            build_id,
-                            target,
-                            replication_address,
+                            endpoint.build_id,
+                            endpoint.identity,
+                            endpoint.replication_address,
                         ))
                         .await?;
                 }
