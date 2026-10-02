@@ -1,11 +1,14 @@
 # Kuberic: Operator Design
 
+> **Archived classic v1 design.** The operator and CRDs described here were
+> removed. This page preserves historical architecture only.
+
 The Kuberic operator acts as SF's Failover Manager on Kubernetes.
 It watches `KubericSet` CRDs and orchestrates pod lifecycle, failover,
 switchover, and scaling through CRD-backed durable workflows.
 
-> Part of the [Kuberic Design](../kuberic-replicator-design.md).
-> Failure scenarios documented in [operator-failure-scenarios.md](../operator-failure-scenarios.md).
+> Part of the [archived Kuberic design](README.md).
+> Failure scenarios documented in [operator-failure-scenarios.md](operator-failure-scenarios.md).
 
 ---
 

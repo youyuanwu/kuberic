@@ -1,12 +1,16 @@
 # Kuberic: SF-Style Stateful Replication on Kubernetes
 
+> **Archived classic v1 design.** The implementation described here was
+> removed. This page is retained only as architecture history and is not a
+> supported API, deployment or roadmap.
+
 High-level design for a Service Fabric–inspired stateful replication system
 running on Kubernetes. The operator acts as the Failover Manager; user
 application pods run an in-process replicator that reacts to operator signals.
 
-**Implementation:** `kuberic-core`, `kuberic-operator`, `kvstore` example.
-See [Status & Roadmap](kuberic/status.md) for LOC counts and
-[Testing](kuberic/testing.md) for test coverage.
+**Historical implementation:** `kuberic-core`, `kuberic-operator`, `kvstore`.
+See [Status & Roadmap](status.md) for historical source maps and the current
+[Testing strategy](../../features/kuberic/testing.md) for surviving coverage.
 
 ---
 
@@ -15,21 +19,19 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 | Document | Contents |
 |----------|----------|
 | **This file** | Architecture overview, key design decisions |
-| [Protocols](kuberic/protocols.md) | Failover, switchover, create, scale-up/down, restart, access status, epoch fencing, quorum model |
-| [Operator](kuberic/operator.md) | CRD spec/status, reconciler phases, healthy phase, gRPC tracking, scale-up/down, restart recovery |
-| [User API](kuberic/user-api.md) | Lifecycle events, state provider callbacks, dual-channel model, operation streams, copy protocol |
-| [Status & Roadmap](kuberic/status.md) | MVP simplifications, known gaps (SF + CNPG), degenerate configs, open questions, source code map |
-| [Testing](kuberic/testing.md) | Test layers (4), infrastructure, what's tested vs not, how to run |
-| [Design Gaps](kuberic/design-gaps.md) | 27 identified gaps: protocol safety (5), operational resilience (5), correctness (3), implementation-only (14) |
+| [Protocols](protocols.md) | Failover, switchover, create, scale-up/down, restart, access status, epoch fencing, quorum model |
+| [Operator](operator.md) | CRD spec/status, reconciler phases, healthy phase, gRPC tracking, scale-up/down, restart recovery |
+| [Status & Roadmap](status.md) | MVP simplifications, known gaps (SF + CNPG), degenerate configs, open questions, source code map |
+| [Current Testing](../../features/kuberic/testing.md) | Surviving v2, database, SQL Server and DEX validation |
+| [Design Gaps](design-gaps.md) | Historical protocol, resilience and implementation review |
 | [Failure Scenarios](operator-failure-scenarios.md) | 9 failure scenarios with detection + recovery design |
-| [KV Store Example](kvstore-design.md) | KV store example design and test listing |
 
 ### Background References
 
 | Document | Contents |
 |----------|----------|
-| [SF Architecture](../background/service-fabric/README.md) | SF replicator, failover, switchover, epochs, quorum, data loss, Rust API |
-| [CNPG Architecture](../background/cloudnative-pg-architecture.md) | CNPG operator, failover, fencing, failure scenarios, instance manager |
+| [SF Architecture](../../background/service-fabric/README.md) | SF replicator, failover, switchover, epochs, quorum, data loss, Rust API |
+| [CNPG Architecture](../../background/cloudnative-pg-architecture.md) | CNPG operator, failover, fencing, failure scenarios, instance manager |
 
 ---
 

@@ -1,6 +1,6 @@
 # ADR: State Provider Separation from Replicator
 
-> **Status:** Implemented  
+> **Status:** Archived — implemented in the removed classic v1 stack
 > **Date:** 2026-04-11
 
 Separated the state provider from the replicator by moving channel

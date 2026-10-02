@@ -1,5 +1,8 @@
 # Kuberic: Peer-Repair Replication
 
+> **Archived comparative proposal.** Its classic-operator baseline was removed.
+> The document remains design history and does not describe a supported stack.
+
 Design for a replication system where the Writer sends writes to a
 quorum of replicas, and replicas **repair each other** to fill in
 missing data. The Writer's job ends once W replicas ACK.
@@ -7,8 +10,8 @@ Replicas that missed the write (because they weren't in the W) or
 were temporarily down catch up by pulling from peers — not from the
 Writer.
 
-This is a separate system from both the existing leader-based
-operator (`kuberic-operator`) and the Writer-based design
+This is a separate system from both the former leader-based
+operator and the Writer-based design
 (`writer-based-replication.md`).
 
 > **Status:** Active design alternative. Shares the **API contract**
@@ -46,10 +49,10 @@ operator (`kuberic-operator`) and the Writer-based design
 > (matches writer-based scope). Multi-writer extensions are out of
 > scope.
 
-> Part of the [Kuberic Design](../kuberic-replicator-design.md).
+> Part of the [archived Kuberic design](../README.md).
 > Related: [Writer-Based Replication](writer-based-replication.md),
-> [Leaderless Quorum Research](../../background/leaderless-quorum-replication.md),
-> [Lazy Repair Research](../../background/lazy-repair-replication.md)
+> [Leaderless Quorum Research](../../../background/leaderless-quorum-replication.md),
+> [Lazy Repair Research](../../../background/lazy-repair-replication.md)
 
 ---
 
@@ -869,4 +872,4 @@ completes (operator signals readiness via config update).
 - Writer-based replication design:
   [writer-based-replication.md](writer-based-replication.md)
 - Leaderless quorum survey:
-  [leaderless-quorum-replication.md](../../background/leaderless-quorum-replication.md)
+  [leaderless-quorum-replication.md](../../../background/leaderless-quorum-replication.md)

@@ -1,11 +1,14 @@
 # Kuberic: WAL Persistent Storage Design
 
+> **Archived proposal based on the removed classic v1 replicator.** Retained
+> for historical design context; it is not current implementation guidance.
+
 Design for adding durable Write-Ahead Log (WAL) storage to the Kuberic
 replicator, enabling crash recovery without full replica rebuilds.
 
-> Part of the [Kuberic Design](../kuberic-replicator-design.md).
-> Related: [Protocols](protocols.md), [Design Gaps](design-gaps.md),
-> [SF Architecture](../../background/service-fabric/README.md)
+> Part of the [archived Kuberic design](../README.md).
+> Related: [Protocols](../protocols.md), [Design Gaps](../design-gaps.md),
+> [SF Architecture](../../../background/service-fabric/README.md)
 
 ---
 

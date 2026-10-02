@@ -1,5 +1,8 @@
 # Kuberic Operator: Failure Scenarios and Recovery
 
+> **Archived classic v1 design.** The operator described here was removed.
+> This document preserves historical failure analysis only.
+
 How the operator reconciler detects and handles various failure modes.
 Design informed by CNPG patterns (see `docs/background/cloudnative-pg-architecture.md`).
 

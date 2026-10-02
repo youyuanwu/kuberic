@@ -1,9 +1,12 @@
 # Kuberic: Replication Protocols
 
+> **Archived classic v1 design.** These protocols belonged to the removed
+> classic runtime/operator and are retained only as historical reference.
+
 Protocols implemented by the durable operator workflows, with
 `WalReplicatorActor` as the pod-side replication engine.
 
-> Part of the [Kuberic Design](../kuberic-replicator-design.md).
+> Part of the [archived Kuberic design](README.md).
 
 ---
 

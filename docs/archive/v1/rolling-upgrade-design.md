@@ -1,5 +1,8 @@
 # Rolling Upgrade Design
 
+> **Archived proposal based on the removed classic v1 stack.** It is not an
+> implemented or supported upgrade contract for the current v2 stack.
+
 Rolling upgrades for kuberic-managed stateful partitions. Supports
 application image updates, configuration changes, and PG major version
 upgrades — all with zero or minimal downtime.

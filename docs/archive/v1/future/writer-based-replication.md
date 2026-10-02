@@ -1,5 +1,8 @@
 # Kuberic: Writer-Based Replication
 
+> **Archived comparative proposal.** Its classic-operator baseline was removed.
+> The document remains design history and does not describe a supported stack.
+
 Design for a **new** operator and control system that decouples
 quorum coordination logic into a standalone **Writer** library. The
 Writer handles LSN assignment, fan-out to replicas, and quorum
@@ -7,8 +10,7 @@ tracking. It is embedded in the user application and communicates
 with an in-cluster **coordinator** for replica set discovery, epoch
 changes, and build coordination.
 
-The existing leader-based operator (`kuberic-operator`) is unchanged
-and continues to work for its use cases.
+The leader-based operator used as the comparison baseline was later removed.
 
 > **Scope:** Single writer only. **In-cluster Writer topology only**
 > — the Writer must run inside the same Kubernetes cluster as the
@@ -17,8 +19,8 @@ and continues to work for its use cases.
 > latency benefit does not hold across WAN. Multi-writer extensions
 > are out of scope.
 
-> Part of the [Kuberic Design](../kuberic-replicator-design.md).
-> Related: [Leaderless Quorum Research](../../background/leaderless-quorum-replication.md),
+> Part of the [archived Kuberic design](../README.md).
+> Related: [Leaderless Quorum Research](../../../background/leaderless-quorum-replication.md),
 > [WAL Persistence](wal-persistence.md)
 >
 > **This is a new, separate system.** The existing `kuberic-operator`
@@ -3214,4 +3216,4 @@ changes. The coordinator doesn't need to know about them.
   - `kuberic-core/src/replicator/quorum.rs` — `QuorumTracker`
   - `kuberic-core/proto/kuberic.proto:134-160` — data plane proto
 - Leaderless quorum survey:
-  [docs/background/leaderless-quorum-replication.md](../../background/leaderless-quorum-replication.md)
+  [docs/background/leaderless-quorum-replication.md](../../../background/leaderless-quorum-replication.md)

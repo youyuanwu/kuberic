@@ -1,8 +1,11 @@
 # Kuberic: Status and Roadmap
 
+> **Archived classic v1 status.** The implementation tracked here was removed.
+> Current behavior is documented in the level-triggered operator guide.
+
 Implementation status, known gaps, and open questions.
 
-> Part of the [Kuberic Design](../kuberic-replicator-design.md).
+> Part of the [archived Kuberic design](README.md).
 
 ---
 
@@ -223,7 +226,7 @@ examples/kvstore/
 └── proto/kvstore.proto              # Client KV API (Get/Put/Delete)
 ```
 
-**Tests:** See [Testing](testing.md) for full test strategy, layers, and listing.
+**Tests:** See the [current testing strategy](../../features/kuberic/testing.md).
 
 ---
 
@@ -234,7 +237,5 @@ examples/kvstore/
 - `docs/features/kuberic-replicator-design.md` — Main design (this doc's parent)
 - `docs/features/kuberic/protocols.md` — Replication protocols
 - `docs/features/kuberic/operator.md` — Operator design
-- `docs/features/kuberic/user-api.md` — User application model
 - `docs/features/kuberic/status.md` — Status and roadmap (this doc)
-- `docs/features/kvstore-design.md` — KV store example design
 - `docs/features/operator-failure-scenarios.md` — Failure scenarios + recovery

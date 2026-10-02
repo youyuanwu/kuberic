@@ -1,6 +1,6 @@
 # ADR: Agent-Owned Replica Add/Build Protocol
 
-> **Status:** Implemented
+> **Status:** Archived — implemented in the removed classic v1 stack
 > **Date:** 2026-09-01
 
 ## Problem

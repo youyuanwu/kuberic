@@ -1,6 +1,6 @@
 # ADR: Runtime–Replicator Separation
 
-> **Status:** Implemented  
+> **Status:** Archived — implemented in the removed classic v1 stack
 > **Date:** 2026-04-11
 
 Separated the replicator data plane from the runtime, aligning with

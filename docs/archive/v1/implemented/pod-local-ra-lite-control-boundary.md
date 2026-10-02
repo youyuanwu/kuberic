@@ -1,6 +1,6 @@
 # ADR: Pod-Local RA-Lite Control Boundary
 
-> **Status:** Implemented
+> **Status:** Archived — implemented in the removed classic v1 stack
 > **Date:** 2026-08-31
 
 ## Problem

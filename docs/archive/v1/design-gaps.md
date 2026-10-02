@@ -1,11 +1,15 @@
 # Kuberic: Design Gaps and Required Work
 
+> **Archived classic v1 review record.** The reviewed implementation was
+> removed. Resolved v2 behavior is documented by the current application and
+> level-triggered guides.
+
 Gaps identified by reviewing the design docs against the implementation.
 Categorized by severity and whether additional design work is needed
 vs simple implementation of existing designs.
 
 > Related: [Status & Roadmap](status.md),
-> [Failure Scenarios](../operator-failure-scenarios.md)
+> [Failure Scenarios](operator-failure-scenarios.md)
 
 ---
 
@@ -1065,7 +1069,7 @@ operator-sequenced local reconfiguration candidate.
 
 **Resolved in v2; classic correlated topology is retired.** The mutable-driver
 Postgres suites and proposed classic `ClusterApi` harness were not restored.
-The [implemented PostgreSQL v2 contract](../postgres/design.md) uses the
+The [implemented PostgreSQL v2 contract](../../features/postgres/design.md) uses the
 SF-style custom replicator and real host-local agents/PostgreSQL subprocesses
 to validate durable topology transitions, failover, switchover, scaling,
 replacement and restart without a public mutation bypass.
