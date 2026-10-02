@@ -2,6 +2,8 @@
 
 > **Archived comparative proposal.** Its classic-operator baseline was removed.
 > The document remains design history and does not describe a supported stack.
+> Present-tense technical statements below describe the proposed system model;
+> they do not indicate that either the proposal or classic baseline is available.
 
 Design for a **new** operator and control system that decouples
 quorum coordination logic into a standalone **Writer** library. The
@@ -1578,10 +1580,10 @@ implements this via two modes:
 - **Volatile mode** (`operation_tx` unset): replica auto-ACKs after
   in-memory acceptance. **This mode is NOT compatible with the
   In-Doubt contract** — it can violate `Ok(lsn) ⇒ data persists`
-  under correlated power-loss failures. It remains available for
-  workloads that explicitly opt out of durability (e.g., metrics,
-  ephemeral caches), but the writer-based system's correctness
-  claims do not apply.
+  under correlated power-loss failures. In the former classic implementation,
+  this mode was available to workloads that explicitly opted out of durability
+  (for example metrics or ephemeral caches); the proposal's correctness claims
+  did not apply to that mode.
 
 User-facing implication: a `StateProvider` for the writer-based
 system MUST persist (fsync) before calling `acknowledge()`.
