@@ -3341,6 +3341,8 @@ struct PausingFactory {
 #[derive(Default)]
 struct TrackingManagedCapability {
     aborts: AtomicUsize,
+    attach_entered: Option<Arc<Notify>>,
+    attach_resume: Option<Arc<Notify>>,
 }
 
 #[cfg(feature = "testing")]
@@ -3450,6 +3452,12 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         _control: Arc<dyn Replicator>,
         _primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()> {
+        if let Some(entered) = self.attach_entered.as_ref() {
+            entered.notify_one();
+        }
+        if let Some(resume) = self.attach_resume.as_ref() {
+            resume.notified().await;
+        }
         Ok(())
     }
 
@@ -6449,6 +6457,51 @@ async fn managed_capability_registration_is_exact_and_cleans_every_partial_state
             .await
             .is_err()
     );
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
+    let runtime = PodRuntime::new(
+        identity(1, "cancelled-interface-attachment"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let registration = runtime.testing_replicator_registration();
+    let reservation = registration.reserve_replicator_creation().unwrap();
+    let attach_entered = Arc::new(Notify::new());
+    let capability = Arc::new(TrackingManagedCapability {
+        aborts: AtomicUsize::new(0),
+        attach_entered: Some(attach_entered.clone()),
+        attach_resume: Some(Arc::new(Notify::new())),
+    });
+    registration
+        .register_managed_lifecycle(capability.clone(), reservation)
+        .await
+        .unwrap();
+    registration
+        .register_managed_data_plane(capability.clone(), reservation)
+        .await
+        .unwrap();
+    let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
+    let registering = {
+        let registration = registration.clone();
+        tokio::spawn(async move {
+            registration
+                .register_interfaces(&interfaces, None, reservation)
+                .await
+        })
+    };
+    attach_entered.notified().await;
+    registering.abort();
+    assert!(matches!(
+        registering.await,
+        Err(error) if error.is_cancelled()
+    ));
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 2);
+    registration.cancel_replicator_creation(reservation);
+    let retry = registration.reserve_replicator_creation().unwrap();
+    registration.cancel_replicator_creation(retry);
 }
 
 #[tokio::test]

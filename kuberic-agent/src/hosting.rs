@@ -130,6 +130,43 @@ struct PendingManagedCapabilities {
     data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
+struct ManagedCapabilityRegistrationGuard {
+    lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
+    data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
+    armed: bool,
+}
+
+impl ManagedCapabilityRegistrationGuard {
+    fn new(
+        lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
+        data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
+    ) -> Self {
+        Self {
+            lifecycle,
+            data_plane,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ManagedCapabilityRegistrationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(lifecycle) = self.lifecycle.as_ref() {
+            lifecycle.abort();
+        }
+        if let Some(data_plane) = self.data_plane.as_ref() {
+            data_plane.abort();
+        }
+    }
+}
+
 enum HostedLifecycle {
     DefaultEngine(Arc<dyn ManagedReplicatorLifecycle>),
     ServicePrimary(Arc<custom::CustomReplicatorHost>),
@@ -1086,18 +1123,14 @@ impl ReplicatorRegistration for RuntimeHost {
                 }
             }
         };
-        if let Some(lifecycle) = managed_lifecycle.as_ref()
-            && let Err(error) = lifecycle
+        let mut managed =
+            ManagedCapabilityRegistrationGuard::new(managed_lifecycle, managed_data_plane);
+        if let Some(lifecycle) = managed.lifecycle.as_ref() {
+            lifecycle
                 .attach_interfaces(interfaces.replicator(), interfaces.primary_replicator())
-                .await
-        {
-            lifecycle.abort();
-            if let Some(data_plane) = managed_data_plane.as_ref() {
-                data_plane.abort();
-            }
-            return Err(error);
+                .await?;
         }
-        let custom = if managed_lifecycle.is_none() {
+        let custom = if managed.lifecycle.is_none() {
             interfaces.primary_replicator().map(|primary| {
                 Arc::new(custom::CustomReplicatorHost::new(
                     self.weak_self.clone(),
@@ -1114,22 +1147,17 @@ impl ReplicatorRegistration for RuntimeHost {
                 control: interfaces.replicator(),
                 primary: interfaces.primary_replicator(),
                 provider,
-                managed_lifecycle: managed_lifecycle.clone(),
-                managed_data_plane: managed_data_plane.clone(),
+                managed_lifecycle: managed.lifecycle.clone(),
+                managed_data_plane: managed.data_plane.clone(),
                 custom,
             })
             .is_err()
         {
-            if let Some(lifecycle) = managed_lifecycle {
-                lifecycle.abort();
-            }
-            if let Some(data_plane) = managed_data_plane {
-                data_plane.abort();
-            }
             return Err(RuntimeError::Application(
                 "CreateReplicator may be called only once per Open".into(),
             ));
         }
+        managed.disarm();
         self.replicator_creation
             .compare_exchange(
                 REPLICATOR_CREATION_RESERVED,
