@@ -5658,6 +5658,10 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
             && !hosting.contains("custom: Option<Arc<custom::CustomReplicatorHost>>"),
         "agent registration must retain one lifecycle facade rather than default/custom hosts"
     );
+    assert!(
+        !include_str!("../src/custom.rs").contains("enum ReplicatorLifecycleBackend"),
+        "the lifecycle facade must use capability polymorphism rather than an origin enum"
+    );
     for internal_module in ["authority", "effects", "runtime"] {
         assert!(
             !library.contains(&format!("pub mod {internal_module};")),
@@ -7206,6 +7210,7 @@ impl ReplicatorFactory for CountingExternalFactory {
 
 #[derive(Default)]
 struct ExternalService {
+    control: Mutex<Option<Arc<dyn Replicator>>>,
     state: Mutex<Option<Arc<dyn StateReplicator>>>,
     streams: Mutex<Vec<OperationStream>>,
 }
@@ -7253,8 +7258,9 @@ impl StatefulServiceReplica for ExternalService {
         let interfaces = context
             .partition
             .with_factory(Arc::new(ExternalFactory))
-            .create_replicator(Some(Arc::new(TestApplication::default())), None)
+            .create_replicator(None, None)
             .await?;
+        *self.control.lock().unwrap() = Some(interfaces.replicator());
         let state_replicator = interfaces
             .state_replicator()
             .expect("operation/copy capability");
@@ -7296,16 +7302,53 @@ async fn custom_factory_does_not_require_the_default_engine_or_service_storage_t
         Some("external://replica")
     );
     assert_eq!(snapshot.current_progress, 7);
+    let control = service.control.lock().unwrap().clone().unwrap();
+    assert_eq!(control.current_progress().await.unwrap(), 7);
+    control.update_epoch(Epoch::new(0, 2)).await.unwrap();
     assert!(service.state.lock().unwrap().is_some());
     assert_eq!(service.streams.lock().unwrap().len(), 2);
     runtime
         .apply_effect(effect(2, RuntimeEffectAction::RefreshApplicationProgress))
         .await
         .unwrap();
+    runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+        ))
+        .await
+        .unwrap();
+    for action in [
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+            identity(1, "external"),
+            vec![identity(1, "external")],
+        ))),
+        RuntimeEffectAction::WaitForCatchup,
+        RuntimeEffectAction::BuildReplica {
+            build_id: OperationId::new("secondary-only-build"),
+            target: identity(2, "target"),
+            replication_address: "secondary://target".into(),
+        },
+        RuntimeEffectAction::RetireBuild(OperationId::new("secondary-only-retire")),
+    ] {
+        assert!(runtime.apply_effect(effect(4, action)).await.is_err());
+    }
+    assert!(runtime.cancel_configuration_work().await.is_err());
+    assert!(
+        runtime
+            .authorize_build(
+                OperationId::new("secondary-only-authority"),
+                identity(2, "target"),
+                BuildConfiguration::Current,
+            )
+            .await
+            .is_err()
+    );
+    assert!(runtime.primary_replicator().await.is_err());
     assert!(matches!(
         runtime
             .apply_effect(effect(
-                3,
+                4,
                 RuntimeEffectAction::PrepareSwitchover {
                     preparation_generation: 1,
                     request_id: SwitchoverRequestId::new("custom-request"),
@@ -7321,13 +7364,26 @@ async fn custom_factory_does_not_require_the_default_engine_or_service_storage_t
         Err(RuntimeError::Application(_))
     ));
     runtime
-        .apply_effect(effect(3, RuntimeEffectAction::Close))
+        .apply_effect(effect(4, RuntimeEffectAction::Close))
         .await
         .unwrap();
     let streams = std::mem::take(&mut *service.streams.lock().unwrap());
     for mut stream in streams {
         assert!(stream.get_operation().await.unwrap().is_none());
     }
+
+    let abort_service = Arc::new(ExternalService::default());
+    let abort_runtime = PodRuntime::new(
+        identity(1, "external-abort"),
+        abort_service.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    abort_runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    abort_runtime.abort();
+    assert!(!abort_runtime.snapshot().await.open);
 }
 
 #[tokio::test]

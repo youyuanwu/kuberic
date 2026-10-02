@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
+use async_trait::async_trait;
 use kuberic_protocol::types::{AccessStatus, OperationId, ProcessSessionId, ReplicaIdentity};
 use kuberic_runtime::replicator::{
     ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
@@ -26,19 +27,111 @@ struct BuildReceipt {
     attempt_generation: u64,
 }
 
-enum ReplicatorLifecycleBackend {
-    Managed(Arc<dyn ManagedReplicatorLifecycle>),
-    Service(Arc<CustomReplicatorHost>),
+#[async_trait]
+trait ReplicatorLifecycleBackend: Send + Sync {
+    fn owns_stream_session(&self) -> bool {
+        false
+    }
+
+    async fn complete_open(&self, address: String) -> Result<()>;
+    async fn fence_writes(&self) -> Result<()>;
+    async fn settle_primary_prefix(&self) -> Result<()>;
+    async fn cancel_configuration_work(&self) -> Result<()>;
+    async fn restore_authority(&self) -> Result<()>;
+    async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
+    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
+    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()>;
+    async fn next_outbound(&self) -> Option<OutboundOperation>;
+
+    async fn select_build(&self, _authority: &BuildAuthority) -> Result<()> {
+        Ok(())
+    }
+
+    async fn register_custom_peer_session(
+        &self,
+        _identity: ReplicaIdentity,
+        _session: ProcessSessionId,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn describe_custom_peer(&self, _replica: ReplicaInformation) -> Result<()> {
+        Ok(())
+    }
+
+    async fn refresh_custom_progress(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn execute_custom_build(&self, _replica: ReplicaInformation) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn enqueue_custom_build(&self, _endpoint: ReplicaEndpoint) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+struct ManagedLifecycleBackend(Arc<dyn ManagedReplicatorLifecycle>);
+
+#[async_trait]
+impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
+    fn owns_stream_session(&self) -> bool {
+        true
+    }
+
+    async fn complete_open(&self, address: String) -> Result<()> {
+        self.0.complete_open(address).await
+    }
+
+    async fn fence_writes(&self) -> Result<()> {
+        self.0.fence_writes().await
+    }
+
+    async fn settle_primary_prefix(&self) -> Result<()> {
+        self.0.settle_primary_prefix().await
+    }
+
+    async fn cancel_configuration_work(&self) -> Result<()> {
+        self.0.cancel_configuration_work().await
+    }
+
+    async fn restore_authority(&self) -> Result<()> {
+        self.0.restore_authority().await
+    }
+
+    async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        self.0
+            .execute_action(RuntimeEffectAction::SetAccessStatus { read, write })
+            .await
+    }
+
+    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        self.0.execute_action(action).await
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        self.0.snapshot().await
+    }
+
+    async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
+        self.0.cancel_outbound_build(id).await
+    }
+
+    async fn next_outbound(&self) -> Option<OutboundOperation> {
+        self.0.next_outbound().await
+    }
 }
 
 pub(super) struct ReplicatorLifecycleHost {
-    backend: ReplicatorLifecycleBackend,
+    backend: Arc<dyn ReplicatorLifecycleBackend>,
 }
 
 impl ReplicatorLifecycleHost {
     pub(super) fn managed(lifecycle: Arc<dyn ManagedReplicatorLifecycle>) -> Self {
         Self {
-            backend: ReplicatorLifecycleBackend::Managed(lifecycle),
+            backend: Arc::new(ManagedLifecycleBackend(lifecycle)),
         }
     }
 
@@ -48,49 +141,32 @@ impl ReplicatorLifecycleHost {
         primary: Arc<dyn PrimaryReplicator>,
     ) -> Self {
         Self {
-            backend: ReplicatorLifecycleBackend::Service(Arc::new(CustomReplicatorHost::new(
-                host, control, primary,
-            ))),
+            backend: Arc::new(CustomReplicatorHost::new(host, control, primary)),
         }
     }
 
     pub(super) fn is_managed(&self) -> bool {
-        matches!(self.backend, ReplicatorLifecycleBackend::Managed(_))
+        self.backend.owns_stream_session()
     }
 
     pub(super) async fn complete_open(&self, address: String) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.complete_open(address).await,
-            ReplicatorLifecycleBackend::Service(host) => host.complete_open(address).await,
-        }
+        self.backend.complete_open(address).await
     }
 
     pub(super) async fn fence_writes(&self) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.fence_writes().await,
-            ReplicatorLifecycleBackend::Service(host) => host.fence_writes().await,
-        }
+        self.backend.fence_writes().await
     }
 
     pub(super) async fn settle_primary_prefix(&self) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.settle_primary_prefix().await,
-            ReplicatorLifecycleBackend::Service(host) => host.settle_primary_prefix().await,
-        }
+        self.backend.settle_primary_prefix().await
     }
 
     pub(super) async fn cancel_configuration_work(&self) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.cancel_configuration_work().await,
-            ReplicatorLifecycleBackend::Service(host) => host.cancel_configuration_work().await,
-        }
+        self.backend.cancel_configuration_work().await
     }
 
     pub(super) async fn restore_authority(&self) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.restore_authority().await,
-            ReplicatorLifecycleBackend::Service(host) => host.restore_authority().await,
-        }
+        self.backend.restore_authority().await
     }
 
     pub(super) async fn restore_access(
@@ -98,48 +174,27 @@ impl ReplicatorLifecycleHost {
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => {
-                host.execute_action(RuntimeEffectAction::SetAccessStatus { read, write })
-                    .await
-            }
-            ReplicatorLifecycleBackend::Service(host) => host.restore_access(read, write).await,
-        }
+        self.backend.restore_access(read, write).await
     }
 
     pub(super) async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.execute_action(action).await,
-            ReplicatorLifecycleBackend::Service(host) => host.execute_action(action).await,
-        }
+        self.backend.execute_action(action).await
     }
 
     pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.snapshot().await,
-            ReplicatorLifecycleBackend::Service(host) => host.snapshot().await,
-        }
+        self.backend.snapshot().await
     }
 
     pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.cancel_outbound_build(id).await,
-            ReplicatorLifecycleBackend::Service(host) => host.cancel_outbound_build(id).await,
-        }
+        self.backend.cancel_outbound_build(id).await
     }
 
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(host) => host.next_outbound().await,
-            ReplicatorLifecycleBackend::Service(host) => host.next_outbound().await,
-        }
+        self.backend.next_outbound().await
     }
 
     pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(_) => Ok(()),
-            ReplicatorLifecycleBackend::Service(host) => host.select_build(authority).await,
-        }
+        self.backend.select_build(authority).await
     }
 
     pub(super) async fn register_custom_peer_session(
@@ -147,53 +202,25 @@ impl ReplicatorLifecycleHost {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(_) => Ok(()),
-            ReplicatorLifecycleBackend::Service(host) => {
-                host.execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
-                    .await
-            }
-        }
+        self.backend
+            .register_custom_peer_session(identity, session)
+            .await
     }
 
     pub(super) async fn describe_custom_peer(&self, replica: ReplicaInformation) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(_) => Ok(()),
-            ReplicatorLifecycleBackend::Service(host) => host.describe_peer(replica).await,
-        }
+        self.backend.describe_custom_peer(replica).await
     }
 
     pub(super) async fn refresh_custom_progress(&self) -> Result<()> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(_) => Ok(()),
-            ReplicatorLifecycleBackend::Service(host) => {
-                if !host.snapshot().await.open {
-                    return Ok(());
-                }
-                host.execute_action(RuntimeEffectAction::RefreshApplicationProgress)
-                    .await
-            }
-        }
+        self.backend.refresh_custom_progress().await
     }
 
     pub(super) async fn execute_custom_build(&self, replica: ReplicaInformation) -> Result<bool> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(_) => Ok(false),
-            ReplicatorLifecycleBackend::Service(host) => {
-                host.execute_build(replica).await?;
-                Ok(true)
-            }
-        }
+        self.backend.execute_custom_build(replica).await
     }
 
     pub(super) async fn enqueue_custom_build(&self, endpoint: ReplicaEndpoint) -> Result<bool> {
-        match &self.backend {
-            ReplicatorLifecycleBackend::Managed(_) => Ok(false),
-            ReplicatorLifecycleBackend::Service(host) => {
-                host.enqueue_build(endpoint).await?;
-                Ok(true)
-            }
-        }
+        self.backend.enqueue_custom_build(endpoint).await
     }
 }
 
@@ -1130,6 +1157,87 @@ impl CustomReplicatorHost {
     }
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
         self.receiver.lock().await.recv().await
+    }
+}
+
+#[async_trait]
+impl ReplicatorLifecycleBackend for CustomReplicatorHost {
+    async fn complete_open(&self, address: String) -> Result<()> {
+        CustomReplicatorHost::complete_open(self, address).await
+    }
+
+    async fn fence_writes(&self) -> Result<()> {
+        CustomReplicatorHost::fence_writes(self).await
+    }
+
+    async fn settle_primary_prefix(&self) -> Result<()> {
+        CustomReplicatorHost::settle_primary_prefix(self).await
+    }
+
+    async fn cancel_configuration_work(&self) -> Result<()> {
+        CustomReplicatorHost::cancel_configuration_work(self).await
+    }
+
+    async fn restore_authority(&self) -> Result<()> {
+        CustomReplicatorHost::restore_authority(self).await
+    }
+
+    async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        CustomReplicatorHost::restore_access(self, read, write).await
+    }
+
+    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        CustomReplicatorHost::execute_action(self, action).await
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        CustomReplicatorHost::snapshot(self).await
+    }
+
+    async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
+        CustomReplicatorHost::cancel_outbound_build(self, id).await
+    }
+
+    async fn next_outbound(&self) -> Option<OutboundOperation> {
+        CustomReplicatorHost::next_outbound(self).await
+    }
+
+    async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
+        CustomReplicatorHost::select_build(self, authority).await
+    }
+
+    async fn register_custom_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        CustomReplicatorHost::execute_action(
+            self,
+            RuntimeEffectAction::RegisterPeerSession { identity, session },
+        )
+        .await
+    }
+
+    async fn describe_custom_peer(&self, replica: ReplicaInformation) -> Result<()> {
+        CustomReplicatorHost::describe_peer(self, replica).await
+    }
+
+    async fn refresh_custom_progress(&self) -> Result<()> {
+        if !CustomReplicatorHost::snapshot(self).await.open {
+            return Ok(());
+        }
+        CustomReplicatorHost::execute_action(self, RuntimeEffectAction::RefreshApplicationProgress)
+            .await
+    }
+
+    async fn execute_custom_build(&self, replica: ReplicaInformation) -> Result<bool> {
+        CustomReplicatorHost::execute_build(self, replica).await?;
+        Ok(true)
+    }
+
+    async fn enqueue_custom_build(&self, endpoint: ReplicaEndpoint) -> Result<bool> {
+        CustomReplicatorHost::enqueue_build(self, endpoint).await?;
+        Ok(true)
     }
 }
 

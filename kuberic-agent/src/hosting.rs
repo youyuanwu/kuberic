@@ -176,13 +176,6 @@ impl RegisteredReplicator {
     fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary.clone()
     }
-    fn provider(&self) -> Result<&Arc<dyn StateProvider>> {
-        self.provider.as_ref().ok_or_else(|| {
-            RuntimeError::Application(
-                "custom replicator has no operation/copy state provider".into(),
-            )
-        })
-    }
     async fn open(&self) -> Result<Option<String>> {
         let address = self.control.open().await?;
         if let Some(hosted) = self.lifecycle() {
@@ -355,6 +348,7 @@ impl PodRuntime {
         target: ReplicaIdentity,
         configuration: BuildConfiguration,
     ) -> Result<BuildAuthority> {
+        let lifecycle = self.host.lifecycle()?;
         let snapshot = self.snapshot().await;
         let (kind, current_configuration) = match configuration {
             BuildConfiguration::Current => {
@@ -395,9 +389,7 @@ impl PodRuntime {
                     "build ID is already bound to different exact authority".into(),
                 ));
             }
-            if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-                lifecycle.select_build(&existing).await?;
-            }
+            lifecycle.select_build(&existing).await?;
             return Ok(existing);
         }
         let authority = BuildAuthority {
@@ -414,9 +406,7 @@ impl PodRuntime {
             .build_authority_store
             .admit_build(&authority)
             .await?;
-        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-            lifecycle.select_build(&authority).await?;
-        }
+        lifecycle.select_build(&authority).await?;
         Ok(authority)
     }
 
@@ -562,11 +552,7 @@ impl PodRuntime {
     }
 
     pub async fn cancel_configuration_work(&self) -> Result<()> {
-        if let Ok(managed) = self.host.lifecycle() {
-            managed.cancel_configuration_work().await
-        } else {
-            Ok(())
-        }
+        self.host.lifecycle()?.cancel_configuration_work().await
     }
 
     pub fn data_plane(&self) -> RuntimeDataPlane {
@@ -644,27 +630,26 @@ impl PodRuntime {
         identity: ReplicaIdentity,
         session: kuberic_protocol::types::ProcessSessionId,
     ) -> Result<()> {
-        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-            lifecycle
-                .register_custom_peer_session(identity, session)
-                .await?;
-        }
-        Ok(())
+        self.host
+            .lifecycle()?
+            .register_custom_peer_session(identity, session)
+            .await
     }
 
     pub(crate) async fn describe_custom_peer(
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
     ) -> Result<()> {
-        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-            lifecycle.describe_custom_peer(replica).await?;
-        }
-        Ok(())
+        self.host.lifecycle()?.describe_custom_peer(replica).await
     }
 
     pub(crate) async fn refresh_custom_progress(&self) -> Result<()> {
         if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
             lifecycle.refresh_custom_progress().await?;
+        } else {
+            self.host
+                .execute_custom_action(RuntimeEffectAction::RefreshApplicationProgress)
+                .await?;
         }
         Ok(())
     }
@@ -673,10 +658,7 @@ impl PodRuntime {
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
     ) -> Result<bool> {
-        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-            return lifecycle.execute_custom_build(replica).await;
-        }
-        Ok(false)
+        self.host.lifecycle()?.execute_custom_build(replica).await
     }
 
     pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
@@ -1452,7 +1434,10 @@ impl RuntimeHost {
             self.sync_access_projection(hosted.snapshot().await).await;
         } else {
             let progress = registered.current_progress().await?;
-            let committed = registered.provider()?.last_committed_lsn().await?;
+            let committed = match registered.provider.as_ref() {
+                Some(provider) => provider.last_committed_lsn().await?,
+                None => 0,
+            };
             let mut state = self.state.write().await;
             state.fallback_snapshot.open = true;
             state.fallback_snapshot.current_progress = progress;
@@ -1677,10 +1662,15 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::RefreshApplicationProgress => {
                 let current = registered.current_progress().await?;
-                let committed = registered.provider()?.last_committed_lsn().await?;
+                let committed = match registered.provider.as_ref() {
+                    Some(provider) => Some(provider.last_committed_lsn().await?),
+                    None => None,
+                };
                 let mut state = self.state.write().await;
                 state.fallback_snapshot.current_progress = current;
-                state.fallback_snapshot.committed_lsn = committed;
+                if let Some(committed) = committed {
+                    state.fallback_snapshot.committed_lsn = committed;
+                }
             }
             RuntimeEffectAction::AdmitAuthority(_)
             | RuntimeEffectAction::AuthorizeFailoverPrefix(_)
