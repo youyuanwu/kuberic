@@ -281,6 +281,11 @@ jobs:
       github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      KIND_CLUSTER_NAME: kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: ${{ github.workspace }}/target/kind/level-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig
+      KUBE_CONTEXT: kind-kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBERIC_AGENT_BEARER_TOKEN: level-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2

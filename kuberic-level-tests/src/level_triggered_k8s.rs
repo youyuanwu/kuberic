@@ -5189,6 +5189,21 @@ fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
     assert!(workflow.contains("just level-triggered-kind-test all"));
     assert!(workflow.contains("  bootstrap-kind:"));
     assert!(workflow.contains("  full-kind:"));
+    let bootstrap_job = workflow
+        .split("  bootstrap-kind:")
+        .nth(1)
+        .unwrap()
+        .split("  full-kind:")
+        .next()
+        .unwrap();
+    for required in [
+        "KIND_CLUSTER_NAME: kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}",
+        "KUBECONFIG: ${{ github.workspace }}/target/kind/level-${{ github.run_id }}-${{ github.run_attempt }}.kubeconfig",
+        "KUBE_CONTEXT: kind-kuberic-level-${{ github.run_id }}-${{ github.run_attempt }}",
+        "KUBERIC_AGENT_BEARER_TOKEN: level-${{ github.run_id }}-${{ github.run_attempt }}",
+    ] {
+        assert!(bootstrap_job.contains(required), "{required}");
+    }
     let postgres_job = workflow
         .split("  postgres-tests:")
         .nth(1)
