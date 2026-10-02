@@ -122,12 +122,13 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        self.legacy
-            .execute_action(RuntimeEffectAction::SetAccessStatus { read, write })
-            .await?;
-        let result = self.common.restore_access(read, write).await;
-        self.sync_engine_proof().await?;
-        result
+        let generation = self.legacy.prepare_access(read, write).await?;
+        self.common.restore_access(read, write).await?;
+        if let Err(error) = self.legacy.publish_access(read, write, generation).await {
+            self.common.fence_managed_access().await?;
+            return Err(error);
+        }
+        self.sync_engine_proof().await
     }
 
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {

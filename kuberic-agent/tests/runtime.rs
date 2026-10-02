@@ -4728,6 +4728,87 @@ async fn managed_pending_write_recovery_never_publishes_access_before_proof() {
 }
 
 #[tokio::test]
+async fn managed_restart_recovery_never_restores_access_before_proof() {
+    let local = identity(1, "managed-restart-primary");
+    let secondary = identity(2, "managed-restart-secondary");
+    let admitted = authority(local.clone(), vec![local.clone(), secondary.clone()]);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let application = Arc::new(TestApplication::default());
+    let old = PodRuntime::new(local.clone(), application.clone(), store.clone());
+    activate_test_primary(&old, admitted.clone(), true).await;
+    let pending = old
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("managed-restart-pending"),
+            data: Bytes::from_static(b"managed-restart-pending"),
+        })
+        .await
+        .unwrap();
+    old.abort();
+    *application.partition.lock().unwrap() = None;
+
+    let runtime = Arc::new(PodRuntime::new(local, application.clone(), store));
+    let recovery = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .reconstruct(
+                    OpenMode::Existing,
+                    ReplicaRole::Primary,
+                    AccessStatus::Granted,
+                    AccessStatus::Granted,
+                    None,
+                )
+                .await
+        })
+    };
+    let partition = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(partition) = application.partition.lock().unwrap().clone() {
+                break partition;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restarted default replica did not open");
+    for _ in 0..32 {
+        assert!(!recovery.is_finished());
+        assert_ne!(
+            partition.get_write_status().await.unwrap(),
+            AccessStatus::Granted
+        );
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        tokio::task::yield_now().await;
+    }
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&admitted, secondary.clone(), pending.lsn))
+        .await
+        .unwrap();
+    recovery.await.unwrap().unwrap();
+    assert_eq!(
+        partition.get_write_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+    let _ = pending.committed().await;
+    let fresh = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("managed-restart-fresh"),
+            data: Bytes::from_static(b"managed-restart-fresh"),
+        })
+        .await
+        .unwrap();
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&admitted, secondary, fresh.lsn))
+        .await
+        .unwrap();
+    assert_eq!(fresh.committed().await.unwrap().committed_lsn, 2);
+}
+
+#[tokio::test]
 async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it() {
     for (error, supersede) in [(1, 0), (1, 1), (1, 2), (2, 0), (3, 0)] {
         let directory = tempfile::tempdir().unwrap();
