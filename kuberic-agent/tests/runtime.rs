@@ -51,7 +51,7 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
-    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
+    BuildProgressStore, BuildSelection, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
@@ -86,10 +86,11 @@ mod in_process_transport_tests {
     ) -> (Arc<TestApplication>, Arc<PodRuntime>) {
         let application = Arc::new(TestApplication::default());
         application.manual_streams.store(manual, Ordering::SeqCst);
+        let store = Arc::new(MemoryAuthorityStore::default());
         let runtime = Arc::new(PodRuntime::new(
             local.clone(),
             application.clone(),
-            Arc::new(MemoryAuthorityStore::default()),
+            store.clone(),
         ));
         for (index, action) in [
             RuntimeEffectAction::Open(OpenMode::New),
@@ -2801,6 +2802,7 @@ struct MemoryAuthorityStore {
     replication_progress: Mutex<BTreeMap<AuthorityFence, ReplicationProgress>>,
     local_writes: Mutex<BTreeMap<OperationId, DurableLocalWrite>>,
     builds: Mutex<BTreeMap<OperationId, BuildAuthority>>,
+    build_selections: Mutex<BTreeMap<ReplicaIdentity, BuildSelection>>,
     build_progress: Mutex<BTreeMap<OperationId, DurableBuildProgress>>,
     admit_count: AtomicUsize,
     fail_after_admit: AtomicBool,
@@ -3108,6 +3110,26 @@ impl BuildAuthorityStore for MemoryAuthorityStore {
         builds.insert(authority.build_id.clone(), authority.clone());
         Ok(())
     }
+
+    async fn select_build(&self, authority: &BuildAuthority) -> ContractResult<BuildSelection> {
+        let mut selections = self.build_selections.lock().unwrap();
+        let generation = selections
+            .get(&authority.target)
+            .map_or(1, |selection| selection.generation + 1);
+        let selection = BuildSelection {
+            authority: authority.clone(),
+            generation,
+        };
+        selections.insert(authority.target.clone(), selection.clone());
+        Ok(selection)
+    }
+
+    async fn load_build_selection(
+        &self,
+        target: &ReplicaIdentity,
+    ) -> ContractResult<Option<BuildSelection>> {
+        Ok(self.build_selections.lock().unwrap().get(target).cloned())
+    }
 }
 
 #[async_trait]
@@ -3146,6 +3168,25 @@ impl BuildProgressStore for MemoryAuthorityStore {
         }
         builds.insert(progress.authority.build_id.clone(), progress.clone());
         Ok(())
+    }
+
+    async fn record_selected_build_progress(
+        &self,
+        selection: &BuildSelection,
+        progress: &DurableBuildProgress,
+    ) -> ContractResult<()> {
+        if self
+            .build_selections
+            .lock()
+            .unwrap()
+            .get(&selection.authority.target)
+            != Some(selection)
+        {
+            return Err(ContractError::AuthorityMismatch(
+                "test store rejected stale build selection".into(),
+            ));
+        }
+        self.record_build_progress(progress).await
     }
 }
 
@@ -6987,6 +7028,47 @@ async fn cancelling_an_exact_outbound_build_terminates_only_its_pending_wait() {
             .await
             .unwrap()
             .unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+}
+
+#[tokio::test]
+async fn default_build_effect_dispatches_before_waiting_for_copy_completion() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "primary")],
+    )
+    .await;
+    let build_id = OperationId::new("async-default-build");
+    let target = identity(2, "target");
+    let pending = {
+        let runtime = runtime.clone();
+        let build_id = build_id.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::BuildReplica {
+                        build_id,
+                        target,
+                        replication_address: "http://target".into(),
+                    },
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint))
+            if endpoint.build_id == build_id && endpoint.identity == target
+    ));
+    assert!(!pending.is_finished());
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(matches!(
+        pending.await.unwrap(),
         Err(RuntimeError::OperationCancelled)
     ));
 }

@@ -1036,9 +1036,19 @@ impl ReplicatorRegistration for RuntimeHost {
                 .await?;
         }
         let lifecycle = match (managed.lifecycle.as_ref(), interfaces.primary_replicator()) {
-            (Some(lifecycle), _) => Some(Arc::new(custom::ReplicatorLifecycleHost::managed(
-                lifecycle.clone(),
-            ))),
+            (Some(lifecycle), Some(primary)) => {
+                Some(Arc::new(custom::ReplicatorLifecycleHost::managed(
+                    self.weak_self.clone(),
+                    interfaces.replicator(),
+                    primary,
+                    lifecycle.clone(),
+                )))
+            }
+            (Some(_), None) => {
+                return Err(RuntimeError::Application(
+                    "managed lifecycle requires a primary replicator".into(),
+                ));
+            }
             (None, Some(primary)) => Some(Arc::new(custom::ReplicatorLifecycleHost::service(
                 self.weak_self.clone(),
                 interfaces.replicator(),
@@ -1272,7 +1282,11 @@ impl RuntimeHost {
                     Err(RuntimeError::Application(_)) => false,
                     Err(error) => return Err(error),
                 };
-                if !dispatched {
+                if dispatched {
+                    self.lifecycle()?
+                        .wait_for_build_completion(&endpoint.build_id, &endpoint.identity)
+                        .await?;
+                } else {
                     self.registered
                         .get()
                         .and_then(|registered| registered.primary())

@@ -202,6 +202,56 @@ impl InProcessTransport {
             }
             self.unregister(&identity, &existing.session.clone())?;
         }
+        for (peer_identity, endpoint) in &self.endpoints {
+            if runtime
+                .snapshot()
+                .await
+                .authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority
+                        .current_configuration
+                        .members
+                        .iter()
+                        .chain(
+                            authority
+                                .previous_configuration
+                                .iter()
+                                .flat_map(|configuration| &configuration.members),
+                        )
+                        .any(|member| &member.identity == peer_identity)
+                })
+            {
+                runtime
+                    .register_peer_session(peer_identity.clone(), endpoint.session.clone())
+                    .await?;
+            }
+            if endpoint
+                .runtime
+                .snapshot()
+                .await
+                .authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority
+                        .current_configuration
+                        .members
+                        .iter()
+                        .chain(
+                            authority
+                                .previous_configuration
+                                .iter()
+                                .flat_map(|configuration| &configuration.members),
+                        )
+                        .any(|member| member.identity == identity)
+                })
+            {
+                endpoint
+                    .runtime
+                    .register_peer_session(identity.clone(), session.clone())
+                    .await?;
+            }
+        }
         self.endpoints.insert(
             identity.clone(),
             Endpoint {
