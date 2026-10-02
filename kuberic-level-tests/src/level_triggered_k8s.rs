@@ -5164,7 +5164,7 @@ fn scale_up_multi() -> Result<()> {
 fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
     let recipes = include_str!("../../justfile");
     let nextest = include_str!("../../.config/nextest.toml");
-    let workflow = include_str!("../../.github/workflows/level-triggered-CI.yml");
+    let workflow = include_str!("../../.github/workflows/CI.yml");
     for (selector, test) in [
         ("scale-up", "scale_up"),
         ("scale-up-multi", "scale_up_multi"),
@@ -5187,6 +5187,21 @@ fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
     assert!(nextest.contains("test-group = 'kind-live'"));
     assert!(workflow.contains("just level-triggered-kind-test scale-up"));
     assert!(workflow.contains("just level-triggered-kind-test all"));
+    assert!(workflow.contains("  bootstrap-kind:"));
+    assert!(workflow.contains("  full-kind:"));
+    let postgres_job = workflow
+        .split("  postgres-tests:")
+        .nth(1)
+        .unwrap()
+        .split("  dex-live:")
+        .next()
+        .unwrap();
+    assert!(
+        postgres_job
+            .find("Prepare repository-local scratch")
+            .unwrap()
+            < postgres_job.find("Install pinned cargo-nextest").unwrap()
+    );
 }
 
 #[test]

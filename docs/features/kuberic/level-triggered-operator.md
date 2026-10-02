@@ -827,7 +827,7 @@ Start `all` from fresh bootstrap: replacement assumes the original primary.
 Standalone `failover` is not included in `all`; run it on a separate fresh
 cluster rather than prepending it to that matrix.
 
-The [PR workflow](../../../.github/workflows/level-triggered-CI.yml) separately
+The [CI workflow](../../../.github/workflows/CI.yml) separately
 runs bootstrap, replacement, failover, healthy switchover, and healthy scale-down
 plus healthy sequential scale-up smoke tests. The `kind` nextest profile and
 `kind-live` group select exactly the 12 ignored live scenarios and allow one
