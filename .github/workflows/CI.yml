@@ -233,6 +233,30 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" \
             --profile dex-live
 
+      - name: Collect DEX cluster diagnostics
+        if: failure()
+        timeout-minutes: 3
+        run: |
+          mkdir -p target
+          {
+            if test -f "${KUBECONFIG}.kuberic-owner"; then
+              just verify-kind-context
+              kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" get namespaces -o wide
+              kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" get all -A -o wide
+              kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+                get events -A --sort-by=.lastTimestamp
+            else
+              echo "owned cluster receipt was not created"
+            fi
+          } 2>&1 | tee target/dex-live-diagnostics.log
+
+      - name: Upload DEX cluster diagnostics
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: dex-live-diagnostics
+          path: target/dex-live-diagnostics.log
+
       - name: Delete owned cluster
         if: always()
         timeout-minutes: 3
