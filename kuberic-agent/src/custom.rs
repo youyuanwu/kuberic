@@ -29,6 +29,12 @@ struct BuildReceipt {
     attempt_generation: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildExecution {
+    ApplicationCompleted,
+    BuiltInCopyRequired,
+}
+
 #[async_trait]
 trait ReplicatorLifecycleBackend: Send + Sync {
     fn owns_stream_session(&self) -> bool {
@@ -44,7 +50,59 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     async fn cancel_configuration_work(&self) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
     async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
-    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
+    async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()>;
+    async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()>;
+    async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()>;
+    async fn retire_build(&self, build_id: OperationId) -> Result<()>;
+    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
+    async fn wait_for_catch_up(&self) -> Result<()>;
+    async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()>;
+    async fn prepare_switchover(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: kuberic_protocol::types::Epoch,
+    ) -> Result<()>;
+    async fn refresh_progress(&self) -> Result<()>;
+    async fn observe_progress(&self) -> Result<()>;
+    async fn prepare_secondary_removal(
+        &self,
+        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<()>;
+    async fn observe_secondary_removal(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()>;
+    async fn observe_secondary_removal_progress(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()>;
+    async fn accept_secondary_removal(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()>;
+    async fn accept_historical_secondary_removal(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()>;
+    async fn fence_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()>;
+    async fn complete_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()>;
     async fn next_outbound(&self) -> Option<OutboundOperation>;
@@ -55,39 +113,14 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     ) -> Result<()>;
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()>;
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()>;
-
-    async fn select_build(&self, _authority: &BuildAuthority) -> Result<()> {
-        Ok(())
-    }
-
-    async fn register_custom_peer_session(
-        &self,
-        _identity: ReplicaIdentity,
-        _session: ProcessSessionId,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn describe_custom_peer(&self, _replica: ReplicaInformation) -> Result<()> {
-        Ok(())
-    }
-
-    async fn refresh_custom_progress(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn execute_custom_build(&self, _replica: ReplicaInformation) -> Result<bool> {
-        Ok(false)
-    }
-
-    async fn enqueue_custom_build(&self, _endpoint: ReplicaEndpoint) -> Result<bool> {
-        Ok(false)
-    }
+    async fn select_build(&self, authority: &BuildAuthority) -> Result<()>;
+    async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()>;
+    async fn execute_build(&self, replica: ReplicaInformation) -> Result<BuildExecution>;
+    async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()>;
 }
 
 struct ManagedLifecycleBackend {
     legacy: Arc<dyn ManagedReplicatorLifecycle>,
-    data_plane: Arc<dyn kuberic_runtime::replicator::ManagedReplicatorDataPlane>,
     common: CustomReplicatorHost,
 }
 
@@ -150,141 +183,212 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.sync_engine_proof().await
     }
 
-    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        if matches!(
-            &action,
-            RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                | RuntimeEffectAction::ObserveSecondaryRemovalWitness(_)
-                | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
-                | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
-                | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
-                | RuntimeEffectAction::FenceRetirement(_)
-                | RuntimeEffectAction::CompleteRetirement(_)
-        ) {
-            return Box::pin(self.execute_removal_action(action)).await;
+    async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
+        self.common.prepare_authority_admission(&authority).await?;
+        if let Err(error) = self.legacy.admit_authority_proof(authority.clone()).await {
+            self.sync_engine_proof().await?;
+            return Err(error);
         }
-        match &action {
-            RuntimeEffectAction::RegisterPeerSession { identity, session } => {
-                let registered_engine_peer = self
-                    .legacy
-                    .snapshot()
-                    .await
-                    .authority
-                    .as_ref()
-                    .is_some_and(|authority| {
-                        authority
-                            .current_configuration
-                            .members
-                            .iter()
-                            .chain(
-                                authority
-                                    .previous_configuration
-                                    .iter()
-                                    .flat_map(|configuration| &configuration.members),
-                            )
-                            .any(|member| member.identity == *identity)
-                    });
-                if registered_engine_peer {
-                    self.legacy
-                        .register_peer_session_proof(identity.clone(), session.clone())
-                        .await?;
-                }
-                self.common
-                    .execute_common_build_action(action.clone())
-                    .await?;
-                return Ok(());
-            }
-            RuntimeEffectAction::AdmitAuthority(authority) => {
-                self.common.prepare_authority_admission(authority).await?;
-                let engine_result = self
-                    .legacy
-                    .admit_authority_proof((**authority).clone())
-                    .await;
-                if let Err(error) = engine_result {
-                    self.sync_engine_proof().await?;
-                    return Err(error);
-                }
-                let result = self.common.install_managed_authority(authority).await;
-                self.sync_engine_proof().await?;
-                result?;
-                return Ok(());
-            }
-            RuntimeEffectAction::AdmitBuildAuthority(authority) => {
-                self.legacy
-                    .admit_build_authority_proof((**authority).clone())
-                    .await?;
-                let result = self.common.install_managed_build(authority).await;
-                self.sync_engine_proof().await?;
-                result?;
-                return Ok(());
-            }
-            RuntimeEffectAction::RetireBuild(build_id) => {
-                self.legacy.retire_build_proof(build_id.clone()).await?;
-                self.common.retire_managed_build(build_id.clone()).await?;
-                self.sync_engine_proof().await?;
-                return Ok(());
-            }
-            RuntimeEffectAction::SetAccessStatus { .. }
-            | RuntimeEffectAction::SetReadStatus(_)
-            | RuntimeEffectAction::SetWriteStatus(_) => {
-                self.execute_access_action(action).await?;
-                return Ok(());
-            }
-            RuntimeEffectAction::RefreshApplicationProgress => {
-                self.legacy.refresh_progress_proof().await?;
-                let result = self.common.execute_action(action).await;
-                self.sync_engine_proof().await?;
-                result?;
-                return Ok(());
-            }
-            RuntimeEffectAction::PrepareSwitchover {
+        self.common.install_managed_authority(&authority).await?;
+        self.sync_engine_proof().await
+    }
+
+    async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()> {
+        self.legacy
+            .admit_build_authority_proof(authority.clone())
+            .await?;
+        self.common.install_managed_build(&authority).await?;
+        self.sync_engine_proof().await
+    }
+
+    async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        let registered_engine_peer =
+            self.legacy
+                .snapshot()
+                .await
+                .authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority
+                        .current_configuration
+                        .members
+                        .iter()
+                        .chain(
+                            authority
+                                .previous_configuration
+                                .iter()
+                                .flat_map(|configuration| &configuration.members),
+                        )
+                        .any(|member| member.identity == identity)
+                });
+        if registered_engine_peer {
+            self.legacy
+                .register_peer_session_proof(identity.clone(), session.clone())
+                .await?;
+        }
+        self.common
+            .execute_common_build_action(RuntimeEffectAction::RegisterPeerSession {
+                identity,
+                session,
+            })
+            .await
+    }
+
+    async fn retire_build(&self, build_id: OperationId) -> Result<()> {
+        self.legacy.retire_build_proof(build_id.clone()).await?;
+        self.common.retire_managed_build(build_id).await?;
+        self.sync_engine_proof().await
+    }
+
+    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        self.execute_access(read, write).await
+    }
+
+    async fn wait_for_catch_up(&self) -> Result<()> {
+        let result = self.legacy.wait_for_catch_up_proof().await;
+        self.sync_engine_proof().await?;
+        result
+    }
+
+    async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()> {
+        let result = self.legacy.authorize_failover_prefix_proof(boundary).await;
+        self.sync_engine_proof().await?;
+        result
+    }
+
+    async fn prepare_switchover(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: kuberic_protocol::types::Epoch,
+    ) -> Result<()> {
+        self.common.fence_managed_access().await?;
+        let result = self
+            .legacy
+            .prepare_switchover_proof(
                 preparation_generation,
                 request_id,
                 source,
                 target,
                 starting_configuration_id,
                 starting_epoch,
-            } => {
-                self.common.fence_managed_access().await?;
-                let result = self
-                    .legacy
-                    .prepare_switchover_proof(
-                        *preparation_generation,
-                        request_id.clone(),
-                        source.clone(),
-                        target.clone(),
-                        starting_configuration_id.clone(),
-                        *starting_epoch,
-                    )
-                    .await;
-                self.sync_engine_proof().await?;
-                return result;
-            }
-            RuntimeEffectAction::ObserveReplicationAck {
-                acknowledgement,
-                session,
-            } => {
-                self.data_plane
-                    .observe_acknowledgement((**acknowledgement).clone(), session.clone())
-                    .await?;
-                self.sync_engine_proof().await?;
-                return Ok(());
-            }
-            RuntimeEffectAction::WaitForCatchup => {
-                let result = self.legacy.wait_for_catch_up_proof().await;
-                self.sync_engine_proof().await?;
-                return result;
-            }
-            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
-                let result = self.legacy.authorize_failover_prefix_proof(*boundary).await;
-                self.sync_engine_proof().await?;
-                return result;
-            }
-            _ => {}
+            )
+            .await;
+        self.sync_engine_proof().await?;
+        result
+    }
+
+    async fn refresh_progress(&self) -> Result<()> {
+        self.legacy.refresh_progress_proof().await?;
+        self.common
+            .apply_common_action(RuntimeEffectAction::RefreshApplicationProgress)
+            .await?;
+        self.sync_engine_proof().await
+    }
+
+    async fn observe_progress(&self) -> Result<()> {
+        let snapshot = self.common.snapshot().await;
+        let terminal_transition = snapshot.role_transition.as_ref().is_some_and(|transition| {
+            transition.target_role == kuberic_protocol::types::ReplicaRole::None
+        });
+        if !snapshot.open
+            || snapshot.role == kuberic_protocol::types::ReplicaRole::None
+            || terminal_transition
+            || self.common.host_is_terminal()
+        {
+            return Ok(());
         }
-        Err(RuntimeError::Application(
-            "the selected managed engine does not expose this lifecycle proof".into(),
+        self.legacy.refresh_progress_proof().await?;
+        let result = self
+            .common
+            .apply_common_action(RuntimeEffectAction::RefreshApplicationProgress)
+            .await;
+        if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
+            self.common.fence_managed_access().await?;
+            self.common.mark_not_open().await;
+            return Ok(());
+        }
+        result?;
+        self.sync_engine_proof().await
+    }
+
+    async fn prepare_secondary_removal(
+        &self,
+        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<()> {
+        self.execute_removal_action(RuntimeEffectAction::PrepareSecondaryRemoval {
+            intent: Box::new(intent),
+            process_session_id,
+            report_sequence,
+        })
+        .await
+    }
+
+    async fn observe_secondary_removal(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.execute_removal_action(RuntimeEffectAction::ObserveSecondaryRemovalWitness(
+            Box::new(witness),
         ))
+        .await
+    }
+
+    async fn observe_secondary_removal_progress(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.execute_removal_action(RuntimeEffectAction::ObserveSecondaryRemovalProgress {
+            witness: Box::new(witness),
+            committed: Box::new(committed),
+        })
+        .await
+    }
+
+    async fn accept_secondary_removal(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.execute_removal_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(
+            committed,
+        )))
+        .await
+    }
+
+    async fn accept_historical_secondary_removal(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        self.execute_removal_action(RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(
+            Box::new(command),
+        ))
+        .await
+    }
+
+    async fn fence_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        self.execute_removal_action(RuntimeEffectAction::FenceRetirement(Box::new(retired)))
+            .await
+    }
+
+    async fn complete_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        self.execute_removal_action(RuntimeEffectAction::CompleteRetirement(Box::new(retired)))
+            .await
     }
 
     async fn snapshot(&self) -> RuntimeSnapshot {
@@ -366,53 +470,18 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.common.select_build_inner(authority).await
     }
 
-    async fn register_custom_peer_session(
-        &self,
-        identity: ReplicaIdentity,
-        session: ProcessSessionId,
-    ) -> Result<()> {
-        self.execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
-            .await
-    }
-
-    async fn describe_custom_peer(&self, replica: ReplicaInformation) -> Result<()> {
+    async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
         self.common.describe_peer(replica).await
     }
 
-    async fn refresh_custom_progress(&self) -> Result<()> {
-        let snapshot = self.common.snapshot().await;
-        let terminal_transition = snapshot.role_transition.as_ref().is_some_and(|transition| {
-            transition.target_role == kuberic_protocol::types::ReplicaRole::None
-        });
-        if !snapshot.open
-            || snapshot.role == kuberic_protocol::types::ReplicaRole::None
-            || terminal_transition
-            || self.common.host_is_terminal()
-        {
-            return Ok(());
-        }
-        let result = self
-            .common
-            .execute_action(RuntimeEffectAction::RefreshApplicationProgress)
-            .await;
-        if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
-            self.common.fence_managed_access().await?;
-            self.common.mark_not_open().await;
-            return Ok(());
-        }
-        result?;
-        self.sync_engine_proof().await
-    }
-
-    async fn execute_custom_build(&self, replica: ReplicaInformation) -> Result<bool> {
+    async fn execute_build(&self, replica: ReplicaInformation) -> Result<BuildExecution> {
         let mut replica = replica;
         self.common.prepare_build_description(&mut replica).await?;
-        Ok(false)
+        Ok(BuildExecution::BuiltInCopyRequired)
     }
 
-    async fn enqueue_custom_build(&self, endpoint: ReplicaEndpoint) -> Result<bool> {
-        self.common.enqueue_build(endpoint).await?;
-        Ok(true)
+    async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        self.common.enqueue_build(endpoint).await
     }
 }
 
@@ -475,21 +544,10 @@ impl ManagedLifecycleBackend {
         result
     }
 
-    async fn execute_access_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        let snapshot = self.common.snapshot().await;
-        let (read, write) = match action {
-            RuntimeEffectAction::SetAccessStatus { read, write } => (read, write),
-            RuntimeEffectAction::SetReadStatus(read) => (read, snapshot.write_status),
-            RuntimeEffectAction::SetWriteStatus(write) => (snapshot.read_status, write),
-            _ => {
-                return Err(RuntimeError::Application(
-                    "managed access preparation requires an access action".into(),
-                ));
-            }
-        };
+    async fn execute_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         let generation = self.legacy.prepare_access(read, write).await?;
         self.common
-            .execute_action(RuntimeEffectAction::SetAccessStatus { read, write })
+            .apply_common_action(RuntimeEffectAction::SetAccessStatus { read, write })
             .await?;
         if let Err(error) = self.legacy.publish_access(read, write, generation).await {
             self.common.fence_managed_access().await?;
@@ -515,12 +573,10 @@ impl ReplicatorLifecycleHost {
         control: Arc<dyn Replicator>,
         primary: Arc<dyn PrimaryReplicator>,
         lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
-        data_plane: Arc<dyn kuberic_runtime::replicator::ManagedReplicatorDataPlane>,
     ) -> Self {
         Self {
             backend: Arc::new(ManagedLifecycleBackend {
                 legacy: lifecycle,
-                data_plane,
                 common: CustomReplicatorHost::new(host, control, primary, false),
             }),
         }
@@ -580,8 +636,123 @@ impl ReplicatorLifecycleHost {
         self.backend.restore_access(read, write).await
     }
 
-    pub(super) async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        self.backend.execute_action(action).await
+    pub(super) async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
+        self.backend.admit_authority(authority).await
+    }
+
+    pub(super) async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()> {
+        self.backend.admit_build_authority(authority).await
+    }
+
+    pub(super) async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        self.backend.register_peer_session(identity, session).await
+    }
+
+    pub(super) async fn retire_build(&self, build_id: OperationId) -> Result<()> {
+        self.backend.retire_build(build_id).await
+    }
+
+    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        self.backend.set_access(read, write).await
+    }
+
+    pub(super) async fn wait_for_catch_up(&self) -> Result<()> {
+        self.backend.wait_for_catch_up().await
+    }
+
+    pub(super) async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()> {
+        self.backend.authorize_failover_prefix(boundary).await
+    }
+
+    pub(super) async fn prepare_switchover(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: kuberic_protocol::types::Epoch,
+    ) -> Result<()> {
+        self.backend
+            .prepare_switchover(
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            )
+            .await
+    }
+
+    pub(super) async fn refresh_progress(&self) -> Result<()> {
+        self.backend.refresh_progress().await
+    }
+
+    pub(super) async fn observe_progress(&self) -> Result<()> {
+        self.backend.observe_progress().await
+    }
+
+    pub(super) async fn prepare_secondary_removal(
+        &self,
+        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<()> {
+        self.backend
+            .prepare_secondary_removal(intent, process_session_id, report_sequence)
+            .await
+    }
+
+    pub(super) async fn observe_secondary_removal(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.backend.observe_secondary_removal(witness).await
+    }
+
+    pub(super) async fn observe_secondary_removal_progress(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.backend
+            .observe_secondary_removal_progress(witness, committed)
+            .await
+    }
+
+    pub(super) async fn accept_secondary_removal(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.backend.accept_secondary_removal(committed).await
+    }
+
+    pub(super) async fn accept_historical_secondary_removal(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        self.backend
+            .accept_historical_secondary_removal(command)
+            .await
+    }
+
+    pub(super) async fn fence_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        self.backend.fence_retirement(retired).await
+    }
+
+    pub(super) async fn complete_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        self.backend.complete_retirement(retired).await
     }
 
     pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
@@ -621,30 +792,19 @@ impl ReplicatorLifecycleHost {
         self.backend.select_build(authority).await
     }
 
-    pub(super) async fn register_custom_peer_session(
+    pub(super) async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
+        self.backend.describe_peer(replica).await
+    }
+
+    pub(super) async fn execute_build(
         &self,
-        identity: ReplicaIdentity,
-        session: ProcessSessionId,
-    ) -> Result<()> {
-        self.backend
-            .register_custom_peer_session(identity, session)
-            .await
+        replica: ReplicaInformation,
+    ) -> Result<BuildExecution> {
+        self.backend.execute_build(replica).await
     }
 
-    pub(super) async fn describe_custom_peer(&self, replica: ReplicaInformation) -> Result<()> {
-        self.backend.describe_custom_peer(replica).await
-    }
-
-    pub(super) async fn refresh_custom_progress(&self) -> Result<()> {
-        self.backend.refresh_custom_progress().await
-    }
-
-    pub(super) async fn execute_custom_build(&self, replica: ReplicaInformation) -> Result<bool> {
-        self.backend.execute_custom_build(replica).await
-    }
-
-    pub(super) async fn enqueue_custom_build(&self, endpoint: ReplicaEndpoint) -> Result<bool> {
-        self.backend.enqueue_custom_build(endpoint).await
+    pub(super) async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        self.backend.enqueue_build(endpoint).await
     }
 }
 
@@ -729,7 +889,7 @@ impl CustomReplicatorHost {
     }
 
     pub(super) async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
-        self.execute_action(RuntimeEffectAction::RegisterPeerSession {
+        self.apply_common_action(RuntimeEffectAction::RegisterPeerSession {
             identity: replica.identity.clone(),
             session: replica.process_session_id.clone(),
         })
@@ -1757,7 +1917,7 @@ impl CustomReplicatorHost {
         }
         self.refresh().await
     }
-    pub(super) async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
+    async fn apply_common_action(&self, action: RuntimeEffectAction) -> Result<()> {
         let _gate = self.gate.lock().await;
         let host = self.host()?;
         match action {
@@ -2117,8 +2277,192 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::restore_access(self, read, write).await
     }
 
-    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        CustomReplicatorHost::execute_action(self, action).await
+    async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+        )
+        .await
+    }
+
+    async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(authority)),
+        )
+        .await
+    }
+
+    async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::RegisterPeerSession { identity, session },
+        )
+        .await
+    }
+
+    async fn retire_build(&self, build_id: OperationId) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(self, RuntimeEffectAction::RetireBuild(build_id))
+            .await
+    }
+
+    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::SetAccessStatus { read, write },
+        )
+        .await
+    }
+
+    async fn wait_for_catch_up(&self) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(self, RuntimeEffectAction::WaitForCatchup).await
+    }
+
+    async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary),
+        )
+        .await
+    }
+
+    async fn prepare_switchover(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: kuberic_protocol::types::Epoch,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            },
+        )
+        .await
+    }
+
+    async fn refresh_progress(&self) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::RefreshApplicationProgress,
+        )
+        .await
+    }
+
+    async fn observe_progress(&self) -> Result<()> {
+        if !CustomReplicatorHost::snapshot(self).await.open {
+            return Ok(());
+        }
+        let result = CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::RefreshApplicationProgress,
+        )
+        .await;
+        if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
+            self.fence_managed_access().await?;
+            self.mark_not_open().await;
+            return Ok(());
+        }
+        result
+    }
+
+    async fn prepare_secondary_removal(
+        &self,
+        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::PrepareSecondaryRemoval {
+                intent: Box::new(intent),
+                process_session_id,
+                report_sequence,
+            },
+        )
+        .await
+    }
+
+    async fn observe_secondary_removal(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness)),
+        )
+        .await
+    }
+
+    async fn observe_secondary_removal_progress(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress {
+                witness: Box::new(witness),
+                committed: Box::new(committed),
+            },
+        )
+        .await
+    }
+
+    async fn accept_secondary_removal(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed)),
+        )
+        .await
+    }
+
+    async fn accept_historical_secondary_removal(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command)),
+        )
+        .await
+    }
+
+    async fn fence_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::FenceRetirement(Box::new(retired)),
+        )
+        .await
+    }
+
+    async fn complete_retirement(
+        &self,
+        retired: kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> Result<()> {
+        CustomReplicatorHost::apply_common_action(
+            self,
+            RuntimeEffectAction::CompleteRetirement(Box::new(retired)),
+        )
+        .await
     }
 
     async fn snapshot(&self) -> RuntimeSnapshot {
@@ -2170,47 +2514,17 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::select_build(self, authority).await
     }
 
-    async fn register_custom_peer_session(
-        &self,
-        identity: ReplicaIdentity,
-        session: ProcessSessionId,
-    ) -> Result<()> {
-        CustomReplicatorHost::execute_action(
-            self,
-            RuntimeEffectAction::RegisterPeerSession { identity, session },
-        )
-        .await
-    }
-
-    async fn describe_custom_peer(&self, replica: ReplicaInformation) -> Result<()> {
+    async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
         CustomReplicatorHost::describe_peer(self, replica).await
     }
 
-    async fn refresh_custom_progress(&self) -> Result<()> {
-        if !CustomReplicatorHost::snapshot(self).await.open {
-            return Ok(());
-        }
-        let result = CustomReplicatorHost::execute_action(
-            self,
-            RuntimeEffectAction::RefreshApplicationProgress,
-        )
-        .await;
-        if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
-            self.fence_managed_access().await?;
-            self.mark_not_open().await;
-            return Ok(());
-        }
-        result
-    }
-
-    async fn execute_custom_build(&self, replica: ReplicaInformation) -> Result<bool> {
+    async fn execute_build(&self, replica: ReplicaInformation) -> Result<BuildExecution> {
         CustomReplicatorHost::execute_build(self, replica).await?;
-        Ok(true)
+        Ok(BuildExecution::ApplicationCompleted)
     }
 
-    async fn enqueue_custom_build(&self, endpoint: ReplicaEndpoint) -> Result<bool> {
-        CustomReplicatorHost::enqueue_build(self, endpoint).await?;
-        Ok(true)
+    async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        CustomReplicatorHost::enqueue_build(self, endpoint).await
     }
 }
 

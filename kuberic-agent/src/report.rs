@@ -29,7 +29,7 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub async fn report(&self, runtime: &PodRuntime) -> Result<proto::AgentStatusReport> {
-        if let Err(error) = runtime.refresh_custom_progress().await
+        if let Err(error) = runtime.observe_progress().await
             && !matches!(error, kuberic_runtime::RuntimeError::ReconfigurationPending)
         {
             return Err(error.into());

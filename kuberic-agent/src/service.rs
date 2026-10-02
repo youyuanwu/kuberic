@@ -862,10 +862,7 @@ where
                         .register_peer(authority.source.clone(), source_session_id.clone())
                         .await;
                     self.runtime
-                        .register_custom_peer_session(
-                            authority.source.clone(),
-                            source_session_id.clone(),
-                        )
+                        .register_peer_session(authority.source.clone(), source_session_id.clone())
                         .await
                         .map_err(status_from_runtime)?;
                 }

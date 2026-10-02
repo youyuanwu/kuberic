@@ -53,6 +53,7 @@ const REPLICATOR_RESERVATION_ID: u64 = 1;
 
 #[path = "custom.rs"]
 mod custom;
+pub(crate) use custom::BuildExecution;
 
 #[async_trait]
 pub trait RuntimeControlPlane: Send {
@@ -578,11 +579,7 @@ impl PodRuntime {
                             && a.secondary_removal.as_ref() == Some(&committed.evidence)
                     })
             {
-                managed
-                    .execute_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(
-                        committed,
-                    )))
-                    .await?;
+                managed.accept_secondary_removal(committed).await?;
             }
             match managed.restore_access(read_status, write_status).await {
                 Err(RuntimeError::ReconfigurationPending) => {
@@ -606,15 +603,11 @@ impl PodRuntime {
         committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
         historical: Option<kuberic_protocol::command::AcceptSecondaryRemovalCommit>,
     ) -> Result<()> {
-        self.host
-            .lifecycle()?
-            .execute_action(match historical {
-                Some(command) => {
-                    RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command))
-                }
-                None => RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed)),
-            })
-            .await
+        let lifecycle = self.host.lifecycle()?;
+        match historical {
+            Some(command) => lifecycle.accept_historical_secondary_removal(command).await,
+            None => lifecycle.accept_secondary_removal(committed).await,
+        }
     }
 
     pub fn abort(&self) {
@@ -661,6 +654,25 @@ impl PodRuntime {
                     registered.managed_data_plane.is_some(),
                 )
             })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_provider_capability(&self) -> Result<()> {
+        self.host
+            .registered
+            .get()
+            .and_then(|registered| registered.provider.as_ref())
+            .map(|_| ())
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "the selected replicator does not expose default-engine provider access".into(),
+                )
+            })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_outbound_data_plane_capability(&self) -> Result<()> {
+        self.host.managed_data_plane().map(|_| ())
     }
 
     pub async fn snapshot(&self) -> RuntimeSnapshot {
@@ -731,7 +743,7 @@ impl PodRuntime {
             return Ok(());
         }
         lifecycle
-            .enqueue_custom_build(ReplicaEndpoint {
+            .enqueue_build(ReplicaEndpoint {
                 build_id,
                 identity: target,
                 replication_address,
@@ -754,35 +766,24 @@ impl PodRuntime {
     ) -> Result<()> {
         self.host
             .lifecycle()?
-            .execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
+            .register_peer_session(identity, session)
             .await
     }
 
-    pub(crate) async fn register_custom_peer_session(
-        &self,
-        identity: ReplicaIdentity,
-        session: kuberic_protocol::types::ProcessSessionId,
-    ) -> Result<()> {
-        self.host
-            .lifecycle()?
-            .register_custom_peer_session(identity, session)
-            .await
-    }
-
-    pub(crate) async fn describe_custom_peer(
+    pub(crate) async fn describe_peer(
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
     ) -> Result<()> {
-        self.host.lifecycle()?.describe_custom_peer(replica).await
+        self.host.lifecycle()?.describe_peer(replica).await
     }
 
-    pub(crate) async fn refresh_custom_progress(&self) -> Result<()> {
+    pub(crate) async fn observe_progress(&self) -> Result<()> {
         if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-            lifecycle.refresh_custom_progress().await?;
+            lifecycle.observe_progress().await?;
         } else {
             let result = self
                 .host
-                .execute_custom_action(RuntimeEffectAction::RefreshApplicationProgress)
+                .execute_secondary_action(RuntimeEffectAction::RefreshApplicationProgress)
                 .await;
             if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
                 self.host.state.write().await.fallback_snapshot.open = false;
@@ -793,11 +794,11 @@ impl PodRuntime {
         Ok(())
     }
 
-    pub async fn execute_custom_build(
+    pub(crate) async fn execute_build(
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
-    ) -> Result<bool> {
-        self.host.lifecycle()?.execute_custom_build(replica).await
+    ) -> Result<custom::BuildExecution> {
+        self.host.lifecycle()?.execute_build(replica).await
     }
 
     pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
@@ -820,14 +821,15 @@ impl PodRuntime {
         witness: kuberic_protocol::types::SecondaryRemovalWitness,
         committed: Option<kuberic_protocol::types::SecondaryScaleDownCleanup>,
     ) -> Result<()> {
-        let action = match committed {
-            Some(committed) => RuntimeEffectAction::ObserveSecondaryRemovalProgress {
-                witness: Box::new(witness),
-                committed: Box::new(committed),
-            },
-            None => RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness)),
-        };
-        self.host.lifecycle()?.execute_action(action).await
+        let lifecycle = self.host.lifecycle()?;
+        match committed {
+            Some(committed) => {
+                lifecycle
+                    .observe_secondary_removal_progress(witness, committed)
+                    .await
+            }
+            None => lifecycle.observe_secondary_removal(witness).await,
+        }
     }
 
     pub async fn partition_report(&self) -> PartitionReportSnapshot {
@@ -1199,11 +1201,6 @@ impl ReplicatorRegistration for RuntimeHost {
                     interfaces.replicator(),
                     primary,
                     lifecycle.clone(),
-                    managed
-                        .data_plane
-                        .as_ref()
-                        .expect("managed lifecycle includes data plane")
-                        .clone(),
                 )))
             }
             (Some(_), None) => {
@@ -1395,9 +1392,7 @@ impl RuntimeHost {
                         ));
                     }
                     if let Ok(managed) = self.lifecycle() {
-                        managed
-                            .execute_action(RuntimeEffectAction::CompleteRetirement(retired))
-                            .await?;
+                        managed.complete_retirement(*retired).await?;
                     } else {
                         self.state.write().await.fallback_snapshot.retired_authority =
                             Some(durable);
@@ -1406,9 +1401,7 @@ impl RuntimeHost {
                 } else {
                     let managed = self.lifecycle()?;
                     if !self.closed.load(Ordering::Acquire) {
-                        managed
-                            .execute_action(RuntimeEffectAction::FenceRetirement(retired.clone()))
-                            .await?;
+                        managed.fence_retirement(*retired.clone()).await?;
                         self.sync_access_projection(managed.snapshot().await).await;
                         self.change_replicator_role_at_epoch(
                             ReplicaRole::None,
@@ -1418,9 +1411,7 @@ impl RuntimeHost {
                         self.change_application_role(ReplicaRole::None).await?;
                         self.close().await?;
                     }
-                    managed
-                        .execute_action(RuntimeEffectAction::CompleteRetirement(retired))
-                        .await?;
+                    managed.complete_retirement(*retired).await?;
                 }
             }
             RuntimeEffectAction::Open(mode) => self.open(mode).await?,
@@ -1437,40 +1428,146 @@ impl RuntimeHost {
                 target,
                 replication_address,
             } => {
-                let endpoint = ReplicaEndpoint {
-                    build_id,
-                    identity: target,
-                    replication_address,
-                };
-                let dispatched = match self.lifecycle() {
-                    Ok(lifecycle) => lifecycle.enqueue_custom_build(endpoint.clone()).await?,
-                    Err(RuntimeError::Application(_)) => false,
-                    Err(error) => return Err(error),
-                };
-                if !dispatched {
-                    self.registered
-                        .get()
-                        .and_then(|registered| registered.primary())
-                        .ok_or(RuntimeError::NotPrimary)?
-                        .build_replica(kuberic_runtime::replicator::ReplicaInformation::new(
-                            endpoint.build_id,
-                            endpoint.identity,
-                            endpoint.replication_address,
-                        ))
+                self.lifecycle()?
+                    .enqueue_build(ReplicaEndpoint {
+                        build_id,
+                        identity: target,
+                        replication_address,
+                    })
+                    .await?;
+            }
+            RuntimeEffectAction::AdmitAuthority(authority) => {
+                let lifecycle = self.lifecycle()?;
+                lifecycle.admit_authority(*authority).await?;
+                self.sync_access_projection(lifecycle.snapshot().await)
+                    .await;
+            }
+            RuntimeEffectAction::AdmitBuildAuthority(authority) => {
+                self.lifecycle()?.admit_build_authority(*authority).await?;
+            }
+            RuntimeEffectAction::RegisterPeerSession { identity, session } => {
+                self.lifecycle()?
+                    .register_peer_session(identity, session)
+                    .await?;
+            }
+            RuntimeEffectAction::RetireBuild(build_id) => {
+                self.lifecycle()?.retire_build(build_id).await?;
+            }
+            RuntimeEffectAction::SetAccessStatus { read, write } => {
+                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
+                    lifecycle.set_access(read, write).await?;
+                    self.sync_access_projection(lifecycle.snapshot().await)
+                        .await;
+                } else {
+                    self.execute_secondary_action(RuntimeEffectAction::SetAccessStatus {
+                        read,
+                        write,
+                    })
+                    .await?;
+                }
+            }
+            RuntimeEffectAction::SetReadStatus(read) => {
+                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
+                    let write = lifecycle.snapshot().await.write_status;
+                    lifecycle.set_access(read, write).await?;
+                    self.sync_access_projection(lifecycle.snapshot().await)
+                        .await;
+                } else {
+                    self.execute_secondary_action(RuntimeEffectAction::SetReadStatus(read))
                         .await?;
                 }
             }
-            RuntimeEffectAction::Close => self.close().await?,
-            RuntimeEffectAction::Abort => self.abort_action().await,
-            action => {
-                if let Ok(managed) = self.lifecycle() {
-                    let result = managed.execute_action(action).await;
-                    self.sync_access_projection(managed.snapshot().await).await;
-                    result?;
+            RuntimeEffectAction::SetWriteStatus(write) => {
+                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
+                    let read = lifecycle.snapshot().await.read_status;
+                    lifecycle.set_access(read, write).await?;
+                    self.sync_access_projection(lifecycle.snapshot().await)
+                        .await;
                 } else {
-                    self.execute_custom_action(action).await?;
+                    self.execute_secondary_action(RuntimeEffectAction::SetWriteStatus(write))
+                        .await?;
                 }
             }
+            RuntimeEffectAction::WaitForCatchup => {
+                self.lifecycle()?.wait_for_catch_up().await?;
+            }
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
+                self.lifecycle()?
+                    .authorize_failover_prefix(boundary)
+                    .await?;
+            }
+            RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            } => {
+                self.lifecycle()?
+                    .prepare_switchover(
+                        preparation_generation,
+                        request_id,
+                        source,
+                        target,
+                        starting_configuration_id,
+                        starting_epoch,
+                    )
+                    .await?;
+            }
+            RuntimeEffectAction::RefreshApplicationProgress => {
+                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
+                    lifecycle.refresh_progress().await?;
+                } else {
+                    self.execute_secondary_action(RuntimeEffectAction::RefreshApplicationProgress)
+                        .await?;
+                }
+            }
+            RuntimeEffectAction::PrepareSecondaryRemoval {
+                intent,
+                process_session_id,
+                report_sequence,
+            } => {
+                self.lifecycle()?
+                    .prepare_secondary_removal(*intent, process_session_id, report_sequence)
+                    .await?;
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness) => {
+                self.lifecycle()?
+                    .observe_secondary_removal(*witness)
+                    .await?;
+            }
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
+                self.lifecycle()?
+                    .observe_secondary_removal_progress(*witness, *committed)
+                    .await?;
+            }
+            RuntimeEffectAction::ObserveReplicationAck {
+                acknowledgement,
+                session,
+            } => {
+                self.managed_data_plane()?
+                    .observe_acknowledgement(*acknowledgement, session)
+                    .await?;
+            }
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
+                self.lifecycle()?
+                    .accept_secondary_removal(*committed)
+                    .await?;
+            }
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
+                self.lifecycle()?
+                    .accept_historical_secondary_removal(*command)
+                    .await?;
+            }
+            RuntimeEffectAction::FenceRetirement(retired) => {
+                self.lifecycle()?.fence_retirement(*retired).await?;
+            }
+            RuntimeEffectAction::CompleteRetirement(retired) => {
+                self.lifecycle()?.complete_retirement(*retired).await?;
+            }
+            RuntimeEffectAction::Close => self.close().await?,
+            RuntimeEffectAction::Abort => self.abort_action().await,
         }
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
@@ -1912,7 +2009,7 @@ impl RuntimeHost {
         state.fallback_snapshot.authority = managed_snapshot.authority;
     }
 
-    async fn execute_custom_action(&self, action: RuntimeEffectAction) -> Result<()> {
+    async fn execute_secondary_action(&self, action: RuntimeEffectAction) -> Result<()> {
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
         match action {
             RuntimeEffectAction::SetAccessStatus { read, write } => {

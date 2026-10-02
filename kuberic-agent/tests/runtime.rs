@@ -5350,6 +5350,16 @@ async fn assert_default_data_plane_unavailable(
             .map(|_| ()),
     );
     assert_unavailable(runtime.repair_peer(peer, 0).await);
+    assert!(matches!(
+        runtime.testing_outbound_data_plane_capability(),
+        Err(RuntimeError::Application(message))
+            if message.contains("default-engine managed data-plane")
+    ));
+    assert!(matches!(
+        runtime.testing_provider_capability(),
+        Err(RuntimeError::Application(message))
+            if message.contains("default-engine provider access")
+    ));
     assert_eq!(
         runtime.testing_lifecycle_registration(),
         (Some(false), false)
@@ -6198,6 +6208,9 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     let library = include_str!("../../kuberic-runtime/src/lib.rs");
     let hosting = include_str!("../src/hosting.rs");
     let lifecycle = include_str!("../src/custom.rs");
+    let report = include_str!("../src/report.rs");
+    let service = include_str!("../src/service.rs");
+    let transport = include_str!("../src/transport.rs");
     assert!(
         replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorLifecycle")
             && replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorDataPlane"),
@@ -6213,9 +6226,24 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     );
     assert!(
         !replication.contains("async fn execute_action(&self, action: RuntimeEffectAction)")
+            && !lifecycle.contains("async fn execute_action")
             && !lifecycle.contains(".legacy.execute_action("),
         "ordinary lifecycle work must use explicit common routing and private proof hooks"
     );
+    for source in [hosting, lifecycle, report, service, transport] {
+        for origin_name in [
+            "refresh_custom_progress",
+            "register_custom_peer_session",
+            "describe_custom_peer",
+            "execute_custom_build",
+            "enqueue_custom_build",
+        ] {
+            assert!(
+                !source.contains(origin_name),
+                "ordinary lifecycle call sites must not dispatch by origin: {origin_name}"
+            );
+        }
+    }
     let managed_lifecycle = replication
         .split_once("pub trait ManagedReplicatorLifecycle")
         .unwrap()
