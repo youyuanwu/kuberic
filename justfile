@@ -5,8 +5,6 @@ kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-config.yaml")
 ownership_receipt := kubeconfig + ".kuberic-owner"
 level_token := env_var_or_default("KUBERIC_AGENT_BEARER_TOKEN", "")
 nextest_archive := env_var_or_default("NEXTEST_ARCHIVE", "target/nextest/kuberic-tests.tar.zst")
-ordinary_filter := "not package(=postgres-replicated) and not binary(=kubernetes_checkpoint_real)"
-postgres_filter := "package(=postgres-replicated)"
 
 # Build the retained level-triggered binaries.
 default: level-triggered-build
@@ -30,6 +28,23 @@ nextest-validate-archive: install-nextest
     python3 scripts/validate_nextest_partitions.py \
         --archive-file "{{ nextest_archive }}"
 
+# List one semantic repository tier: all, ordinary, postgres, kind, dex-live, helper, or external.
+nextest-list tier="all": install-nextest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ignored_args=()
+    case "{{ tier }}" in
+      all) profile=ci ;;
+      ordinary) profile=ordinary ;;
+      postgres) profile=postgres ;;
+      kind) profile=kind; ignored_args=(--run-ignored only) ;;
+      dex-live) profile=dex-live ;;
+      helper) profile=helper; ignored_args=(--run-ignored only) ;;
+      external) profile=external; ignored_args=(--run-ignored only) ;;
+      *) echo "unknown nextest tier: {{ tier }}" >&2; exit 2 ;;
+    esac
+    cargo nextest list --workspace --all-features --profile "$profile" "${ignored_args[@]}"
+
 # Run the cluster-free repository tier, optionally as slice N/M.
 nextest-test partition="": install-nextest
     #!/usr/bin/env bash
@@ -38,7 +53,7 @@ nextest-test partition="": install-nextest
     if [[ -n "{{ partition }}" ]]; then
       partition_args=(--partition "slice:{{ partition }}")
     fi
-    cargo nextest run --profile ci -E '{{ ordinary_filter }}' "${partition_args[@]}"
+    cargo nextest run --profile ordinary "${partition_args[@]}"
 
 # Run the PostgreSQL tier serially, optionally as hash shard N/M.
 nextest-postgres partition="": install-nextest
@@ -48,7 +63,7 @@ nextest-postgres partition="": install-nextest
     if [[ -n "{{ partition }}" ]]; then
       partition_args=(--partition "hash:{{ partition }}")
     fi
-    cargo nextest run --profile postgres -E '{{ postgres_filter }}' "${partition_args[@]}"
+    cargo nextest run --profile postgres "${partition_args[@]}"
 
 # Create the local Kind cluster and write its kubeconfig.
 create-kind-cluster:

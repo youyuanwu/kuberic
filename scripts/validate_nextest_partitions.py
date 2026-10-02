@@ -12,11 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ORDINARY_FILTER = (
-    "not package(=postgres-replicated) "
-    "and not binary(=kubernetes_checkpoint_real)"
-)
-POSTGRES_FILTER = "package(=postgres-replicated)"
 KIND_PACKAGE = "kuberic-level-tests"
 KIND_PREFIX = "level_triggered_k8s::"
 DEX_LIVE_BINARY = "kuberic-dex::kubernetes_checkpoint_real"
@@ -42,6 +37,185 @@ class ListedTest:
     test_id: TestId
     ignored: bool
     matches: bool
+
+
+def test_id(package: str, binary: str, name: str) -> TestId:
+    return TestId(package, binary, name)
+
+
+AGENT_CRASH_BINARY = "kuberic-agent::crash_boundaries"
+HELPER_PARENTS: dict[TestId, set[TestId]] = {
+    test_id("kuberic-agent", AGENT_CRASH_BINARY, "crash_boundary_writer_process"): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "configuration_boundaries_survive_process_termination_without_destructors",
+        )
+    },
+    test_id("kuberic-agent", AGENT_CRASH_BINARY, "crash_writer_process"): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "sqlite_commits_survive_process_termination_without_destructors",
+        )
+    },
+    test_id("kuberic-agent", AGENT_CRASH_BINARY, "local_write_recovery_writer_process"): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "local_write_recovery_boundaries_commit_fresh_writes_after_process_termination",
+        ),
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "repeated_preparation_retirement_fences_every_delayed_command_after_process_termination",
+        ),
+    },
+    test_id(
+        "kuberic-agent", AGENT_CRASH_BINARY, "real_handoff_configuration_writer_process"
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "real_handoff_configuration_boundaries_survive_process_termination",
+        )
+    },
+    test_id("kuberic-agent", AGENT_CRASH_BINARY, "real_runtime_effect_writer_process"): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "real_runtime_effect_recovers_and_completes_after_process_termination",
+        )
+    },
+    test_id(
+        "kuberic-agent",
+        AGENT_CRASH_BINARY,
+        "real_switchover_preparation_writer_process",
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "real_runtime_switchover_preparation_recovers_after_process_termination",
+        )
+    },
+    test_id(
+        "kuberic-agent",
+        AGENT_CRASH_BINARY,
+        "removal_crashes::quorum_crashes::history::pending_acceptance_writer",
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "removal_crashes::quorum_crashes::history::historical_local_acceptance_survives_sqlite_service_restart_and_newer_authority",
+        ),
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "removal_crashes::quorum_crashes::history::pending_ordinary_acceptance_recovers_after_cleanup_and_newer_authority",
+        ),
+    },
+    test_id(
+        "kuberic-agent",
+        AGENT_CRASH_BINARY,
+        "removal_crashes::quorum_crashes::writer",
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "removal_crashes::quorum_crashes::real_three_to_two_quorum_crashes_preserve_sessions_and_successful_writes",
+        )
+    },
+    test_id("kuberic-agent", AGENT_CRASH_BINARY, "removal_crashes::writer"): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "removal_crashes::real_process_removal_boundaries_preserve_exact_authority_and_values",
+        )
+    },
+    test_id(
+        "kuberic-agent", AGENT_CRASH_BINARY, "scale_up_active_secondary_cut_writer_process"
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "scale_up_exact_cut_matrix_survives_real_process_restart",
+        )
+    },
+    test_id(
+        "kuberic-agent", AGENT_CRASH_BINARY, "scale_up_configuration_cut_writer_process"
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "scale_up_exact_cut_matrix_survives_real_process_restart",
+        )
+    },
+    test_id(
+        "kuberic-agent", AGENT_CRASH_BINARY, "scale_up_failover_crash_writer_process"
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "scale_up_failover_replays_after_authority_and_completion_process_boundaries",
+        )
+    },
+    test_id("kuberic-agent", AGENT_CRASH_BINARY, "scale_up_store_cut_writer_process"): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "scale_up_exact_cut_matrix_survives_real_process_restart",
+        )
+    },
+    test_id(
+        "kuberic-agent", AGENT_CRASH_BINARY, "switchover_preparation_writer_process"
+    ): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "switchover_preparation_boundaries_survive_process_termination",
+        )
+    },
+    test_id("kuberic-agent", AGENT_CRASH_BINARY, "switchover_recovery_writer_process"): {
+        test_id(
+            "kuberic-agent",
+            AGENT_CRASH_BINARY,
+            "switchover_recovery_boundaries_survive_process_termination",
+        )
+    },
+    test_id(
+        "kuberic-protocol",
+        "kuberic-protocol::model",
+        "terminal_switchover_receipt_writer_process",
+    ): {
+        test_id(
+            "kuberic-protocol",
+            "kuberic-protocol::model",
+            "terminal_switchover_receipts_survive_process_exit_and_do_not_allocate_again",
+        )
+    },
+    test_id(
+        "postgres-replicated",
+        "postgres-replicated::native_durable",
+        "metadata_crash_writer",
+    ): {
+        test_id(
+            "postgres-replicated",
+            "postgres-replicated::native_durable",
+            "metadata_crash_boundaries_reopen_consistently",
+        )
+    },
+    test_id(
+        "postgres-replicated",
+        "postgres-replicated::validation_oracles",
+        "owned_fence_failure_child",
+    ): {
+        test_id(
+            "postgres-replicated",
+            "postgres-replicated::validation_oracles",
+            "unprovable_owned_fence_reports_permanent_and_reaps_in_an_isolated_process",
+        )
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,7 +308,7 @@ def validate_partitions(
     root: Path,
     extracted: Path | None,
     expected: set[TestId],
-    filterset: str,
+    profile: str,
     mode: str,
     count: int,
 ) -> list[int]:
@@ -145,8 +319,8 @@ def validate_partitions(
         document = nextest_json(
             root,
             extracted,
-            "-E",
-            filterset,
+            "--profile",
+            profile,
             "--partition",
             f"{mode}:{index}/{count}",
         )
@@ -199,26 +373,66 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
             f"KinD live selector expected {EXPECTED_KIND_LIVE_COUNT} tests, "
             f"found {len(kind_live)}"
         )
-    configured_kind_live = all_matching_ids(
-        nextest_json(
-            root,
-            extracted,
-            "--run-ignored",
-            "all",
-            "-E",
-            "group(=kind-live)",
-        )
-    )
-    if configured_kind_live != kind_live:
-        raise ValueError(
-            "configured kind-live group does not exactly match the live KinD inventory"
-        )
+    configured_profiles = {
+        "ordinary": matching_ids(
+            nextest_json(root, extracted, "--profile", "ordinary")
+        ),
+        "postgres": matching_ids(
+            nextest_json(root, extracted, "--profile", "postgres")
+        ),
+        "kind-live": all_matching_ids(
+            nextest_json(
+                root, extracted, "--profile", "kind", "--run-ignored", "only"
+            )
+        ),
+        "dex-live": matching_ids(
+            nextest_json(root, extracted, "--profile", "dex-live")
+        ),
+        "helper-parent": all_matching_ids(
+            nextest_json(
+                root, extracted, "--profile", "helper", "--run-ignored", "only"
+            )
+        ),
+        "external-manual": all_matching_ids(
+            nextest_json(
+                root, extracted, "--profile", "external", "--run-ignored", "only"
+            )
+        ),
+    }
+    for tier, configured in configured_profiles.items():
+        if configured != assignments[tier]:
+            raise ValueError(
+                f"configured {tier} profile does not exactly match its inventory"
+            )
+
+    helper_ids = assignments["helper-parent"]
+    if set(HELPER_PARENTS) != helper_ids:
+        raise ValueError("helper-parent mapping does not cover every helper exactly once")
+    inventory_by_id = {test.test_id: test for test in inventory}
+    for helper, parents in HELPER_PARENTS.items():
+        for parent in parents:
+            listed_parent = inventory_by_id.get(parent)
+            if listed_parent is None or listed_parent.ignored:
+                raise ValueError(f"helper {helper} maps to missing or ignored parent {parent}")
+            if classify(listed_parent) not in {"ordinary", "postgres"}:
+                raise ValueError(f"helper {helper} maps outside a direct CI tier: {parent}")
+
+    postgres_helpers = {
+        helper for helper in helper_ids if helper.package == "postgres-replicated"
+    }
+    postgres_inventory = {
+        test.test_id
+        for test in inventory
+        if test.test_id.package == "postgres-replicated"
+    }
+    if postgres_inventory != assignments["postgres"] | postgres_helpers:
+        raise ValueError("PostgreSQL direct and helper tiers do not cover its full inventory")
 
     ordinary_counts = validate_partitions(
         root,
         extracted,
         assignments["ordinary"],
-        ORDINARY_FILTER,
+        "ordinary",
         "slice",
         args.ordinary_partitions,
     )
@@ -226,7 +440,7 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
         root,
         extracted,
         assignments["postgres"],
-        POSTGRES_FILTER,
+        "postgres",
         "hash",
         args.postgres_partitions,
     )
@@ -236,6 +450,11 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
         print(f"{tier}: {len(assignments[tier])}")
     print(f"ordinary slice counts: {ordinary_counts}")
     print(f"postgres hash counts: {postgres_counts}")
+    print(
+        "postgres inventory: "
+        f"{len(postgres_inventory)} = {len(assignments['postgres'])} direct "
+        f"+ {len(postgres_helpers)} helper"
+    )
     print("exact-once tier and partition validation passed")
 
 
