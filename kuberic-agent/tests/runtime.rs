@@ -7318,6 +7318,16 @@ async fn custom_factory_does_not_require_the_default_engine_or_service_storage_t
         ))
         .await
         .unwrap();
+    assert!(
+        runtime
+            .apply_effect(effect(
+                4,
+                RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            ))
+            .await
+            .is_err()
+    );
+    let removal_intent = removal_fixture::intent(&[1, 2], 1);
     for action in [
         RuntimeEffectAction::AdmitAuthority(Box::new(authority(
             identity(1, "external"),
@@ -7330,6 +7340,7 @@ async fn custom_factory_does_not_require_the_default_engine_or_service_storage_t
             replication_address: "secondary://target".into(),
         },
         RuntimeEffectAction::RetireBuild(OperationId::new("secondary-only-retire")),
+        prepare_removal(&removal_intent),
     ] {
         assert!(runtime.apply_effect(effect(4, action)).await.is_err());
     }

@@ -1470,6 +1470,9 @@ impl RuntimeHost {
         retirement_epoch: Option<Epoch>,
     ) -> Result<()> {
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        if role == ReplicaRole::Primary && registered.primary().is_none() {
+            return Err(RuntimeError::NotPrimary);
+        }
         let snapshot = self.snapshot().await;
         if !snapshot.open {
             return Err(RuntimeError::NotOpen);
