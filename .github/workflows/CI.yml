@@ -124,10 +124,10 @@ jobs:
 
       - name: Run bounded ordinary partition
         run: |
-          mkdir -p target/nextest/extracted
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX")"
           cargo nextest run \
             --archive-file "$NEXTEST_ARCHIVE" \
-            --extract-to target/nextest/extracted \
+            --extract-to "$extract_dir" \
             --workspace-remap "$GITHUB_WORKSPACE" \
             --profile ordinary \
             --partition "slice:${{ matrix.partition }}/4"
@@ -174,10 +174,10 @@ jobs:
 
       - name: Run serial PostgreSQL partition
         run: |
-          mkdir -p target/nextest/extracted
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX")"
           cargo nextest run \
             --archive-file "$NEXTEST_ARCHIVE" \
-            --extract-to target/nextest/extracted \
+            --extract-to "$extract_dir" \
             --workspace-remap "$GITHUB_WORKSPACE" \
             --profile postgres \
             --partition "hash:${{ matrix.partition }}/4"
@@ -234,10 +234,10 @@ jobs:
 
       - name: Run DEX real Kubernetes test
         run: |
-          mkdir -p target/nextest/extracted
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX")"
           cargo nextest run \
             --archive-file "$NEXTEST_ARCHIVE" \
-            --extract-to target/nextest/extracted \
+            --extract-to "$extract_dir" \
             --workspace-remap "$GITHUB_WORKSPACE" \
             --profile dex-live
 

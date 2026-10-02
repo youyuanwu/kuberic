@@ -5189,6 +5189,11 @@ fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
     assert!(workflow.contains("just level-triggered-kind-test all"));
     assert!(workflow.contains("  bootstrap-kind:"));
     assert!(workflow.contains("  full-kind:"));
+    assert!(
+        workflow
+            .contains("extract_dir=\"$(mktemp -d \"$RUNNER_TEMP/nextest-extracted.XXXXXXXXXX\")\"")
+    );
+    assert!(!workflow.contains("--extract-to target/nextest/extracted"));
     let bootstrap_job = workflow
         .split("  bootstrap-kind:")
         .nth(1)
