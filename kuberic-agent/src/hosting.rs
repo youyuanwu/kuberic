@@ -123,6 +123,87 @@ struct RegisteredReplicator {
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
+struct HostedPrimaryReplicator {
+    inner: Arc<dyn PrimaryReplicator>,
+    lifecycle: Arc<custom::ReplicatorLifecycleHost>,
+}
+
+#[async_trait]
+impl Replicator for HostedPrimaryReplicator {
+    async fn open(&self) -> Result<String> {
+        self.inner.open().await
+    }
+
+    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        self.inner.change_role(epoch, role).await
+    }
+
+    async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        self.inner.update_epoch(epoch).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
+    }
+
+    fn abort(&self) {
+        self.lifecycle.notify_abort();
+        self.inner.abort();
+    }
+
+    async fn current_progress(&self) -> Result<i64> {
+        self.inner.current_progress().await
+    }
+
+    async fn catch_up_capability(&self) -> Result<i64> {
+        self.inner.catch_up_capability().await
+    }
+}
+
+#[async_trait]
+impl PrimaryReplicator for HostedPrimaryReplicator {
+    async fn on_data_loss(&self) -> Result<bool> {
+        self.inner.on_data_loss().await
+    }
+
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        current: kuberic_runtime::replicator::ReplicaSetConfiguration,
+        previous: kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        self.inner
+            .update_catch_up_replica_set_configuration(current, previous)
+            .await
+    }
+
+    async fn wait_for_catch_up_quorum(
+        &self,
+        mode: kuberic_runtime::replicator::ReplicaSetQuorumMode,
+    ) -> Result<()> {
+        self.inner.wait_for_catch_up_quorum(mode).await
+    }
+
+    async fn update_current_replica_set_configuration(
+        &self,
+        current: kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        self.inner
+            .update_current_replica_set_configuration(current)
+            .await
+    }
+
+    async fn build_replica(
+        &self,
+        replica: kuberic_runtime::replicator::ReplicaInformation,
+    ) -> Result<()> {
+        self.lifecycle.build_replica(replica).await
+    }
+
+    async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
+        self.lifecycle.remove_replica(replica_id).await
+    }
+}
+
 struct PendingManagedCapabilities {
     reservation: u64,
     lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
@@ -587,11 +668,15 @@ impl PodRuntime {
     }
 
     pub async fn primary_replicator(&self) -> Result<Arc<dyn PrimaryReplicator>> {
-        self.host
-            .registered
-            .get()
-            .and_then(|registered| registered.primary())
-            .ok_or(RuntimeError::NotOpen)
+        let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
+        let primary = registered.primary().ok_or(RuntimeError::NotPrimary)?;
+        match registered.lifecycle() {
+            Some(lifecycle) => Ok(Arc::new(HostedPrimaryReplicator {
+                inner: primary,
+                lifecycle,
+            })),
+            None => Ok(primary),
+        }
     }
 
     pub async fn catch_up_capability(&self) -> Result<i64> {
@@ -716,7 +801,18 @@ impl PodRuntime {
     }
 
     pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
-        self.host.lifecycle().ok()?.next_outbound().await
+        let registered = self.host.registered.get()?;
+        match (registered.lifecycle(), registered.managed_data_plane()) {
+            (Some(lifecycle), Some(data_plane)) => {
+                tokio::select! {
+                    item = lifecycle.next_outbound() => item,
+                    item = data_plane.next_outbound_item() => item,
+                }
+            }
+            (Some(lifecycle), None) => lifecycle.next_outbound().await,
+            (None, Some(data_plane)) => data_plane.next_outbound_item().await,
+            (None, None) => None,
+        }
     }
 
     pub(crate) async fn observe_secondary_removal_witness(
@@ -836,20 +932,27 @@ impl RuntimeDataPlane {
     }
 
     pub async fn next_outbound(&self) -> Option<OutboundReplication> {
-        self.host
-            .lifecycle()
-            .ok()?
-            .next_outbound()
-            .await
-            .map(|outbound| match outbound {
-                OutboundOperation::Replication(item) => {
-                    OutboundReplication::Replication(replication_to_proto(item))
+        let registered = self.host.registered.get()?;
+        let outbound = match (registered.lifecycle(), registered.managed_data_plane()) {
+            (Some(lifecycle), Some(data_plane)) => {
+                tokio::select! {
+                    item = lifecycle.next_outbound() => item,
+                    item = data_plane.next_outbound_item() => item,
                 }
-                OutboundOperation::Copy(item) => OutboundReplication::Copy(copy_to_proto(item)),
-                OutboundOperation::Build(replica) => OutboundReplication::Build(replica),
-                OutboundOperation::Remove(replica_id) => OutboundReplication::Remove(replica_id),
-                OutboundOperation::Evict(identity) => OutboundReplication::Evict(identity),
-            })
+            }
+            (Some(lifecycle), None) => lifecycle.next_outbound().await,
+            (None, Some(data_plane)) => data_plane.next_outbound_item().await,
+            (None, None) => None,
+        }?;
+        Some(match outbound {
+            OutboundOperation::Replication(item) => {
+                OutboundReplication::Replication(replication_to_proto(item))
+            }
+            OutboundOperation::Copy(item) => OutboundReplication::Copy(copy_to_proto(item)),
+            OutboundOperation::Build(replica) => OutboundReplication::Build(replica),
+            OutboundOperation::Remove(replica_id) => OutboundReplication::Remove(replica_id),
+            OutboundOperation::Evict(identity) => OutboundReplication::Evict(identity),
+        })
     }
 }
 
@@ -1096,6 +1199,11 @@ impl ReplicatorRegistration for RuntimeHost {
                     interfaces.replicator(),
                     primary,
                     lifecycle.clone(),
+                    managed
+                        .data_plane
+                        .as_ref()
+                        .expect("managed lifecycle includes data plane")
+                        .clone(),
                 )))
             }
             (Some(_), None) => {

@@ -24,10 +24,10 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
-    AdmittedAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
+    AdmittedAuthority, BuildAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
     ReplicaAuthorityStore, ReplicationProgressStore, RetiredAuthority,
 };
-use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
+use crate::effects::RuntimeSnapshot;
 use crate::engine::DurableState;
 use crate::internal::{DefaultReplicatorInner, PendingReplication, PendingWrite};
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -124,8 +124,17 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     ) -> Result<()>;
     async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
     async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
-    async fn restore_authority(&self) -> Result<()>;
-    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
+    async fn register_peer_session_proof(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()>;
+    async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()>;
+    async fn retire_build_proof(&self, build_id: OperationId) -> Result<()>;
+    async fn build_replica_proof(&self, replica: ReplicaInformation) -> Result<()>;
+    async fn remove_replica_proof(&self, replica_id: ReplicaId) -> Result<()>;
+    async fn refresh_progress_proof(&self) -> Result<()>;
+    async fn restore_engine_proof(&self) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
     async fn complete_open(&self, replication_address: String) -> Result<()>;
@@ -134,13 +143,13 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
         control: Arc<dyn Replicator>,
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()>;
-    async fn next_outbound(&self) -> Option<OutboundOperation>;
     fn abort(&self);
 }
 
 #[async_trait]
 #[doc(hidden)]
 pub trait ManagedReplicatorDataPlane: Send + Sync {
+    async fn next_outbound_item(&self) -> Option<OutboundOperation>;
     async fn recover_pending_writes(&self) -> Result<()>;
     async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()>;
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
@@ -638,11 +647,11 @@ impl PrimaryReplicator for DefaultReplicator {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.engine.wait_for_build(replica).await
+        self.engine.wait_for_build(replica, true).await
     }
 
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
-        self.engine.remove_replica(replica_id).await
+        self.engine.remove_replica(replica_id, true).await
     }
 }
 

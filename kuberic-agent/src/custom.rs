@@ -53,6 +53,8 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         build_id: &OperationId,
         target: &ReplicaIdentity,
     ) -> Result<()>;
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()>;
+    async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()>;
 
     async fn select_build(&self, _authority: &BuildAuthority) -> Result<()> {
         Ok(())
@@ -85,6 +87,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
 
 struct ManagedLifecycleBackend {
     legacy: Arc<dyn ManagedReplicatorLifecycle>,
+    data_plane: Arc<dyn kuberic_runtime::replicator::ManagedReplicatorDataPlane>,
     common: CustomReplicatorHost,
 }
 
@@ -105,6 +108,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn complete_abort(&self) {
+        self.common.notify_abort();
         self.common.terminate().await.ok();
     }
 
@@ -131,7 +135,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn restore_authority(&self) -> Result<()> {
-        self.legacy.restore_authority().await?;
+        self.legacy.restore_engine_proof().await?;
         self.common.restore_authority().await?;
         self.sync_engine_proof().await
     }
@@ -160,7 +164,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             return Box::pin(self.execute_removal_action(action)).await;
         }
         match &action {
-            RuntimeEffectAction::RegisterPeerSession { identity, .. } => {
+            RuntimeEffectAction::RegisterPeerSession { identity, session } => {
                 let registered_engine_peer = self
                     .legacy
                     .snapshot()
@@ -181,7 +185,9 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                             .any(|member| member.identity == *identity)
                     });
                 if registered_engine_peer {
-                    self.legacy.execute_action(action.clone()).await?;
+                    self.legacy
+                        .register_peer_session_proof(identity.clone(), session.clone())
+                        .await?;
                 }
                 self.common
                     .execute_common_build_action(action.clone())
@@ -204,15 +210,17 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 return Ok(());
             }
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
-                self.legacy.execute_action(action.clone()).await?;
+                self.legacy
+                    .admit_build_authority_proof((**authority).clone())
+                    .await?;
                 let result = self.common.install_managed_build(authority).await;
                 self.sync_engine_proof().await?;
                 result?;
                 return Ok(());
             }
-            RuntimeEffectAction::RetireBuild(_) => {
-                self.legacy.execute_action(action.clone()).await?;
-                self.common.execute_common_build_action(action).await?;
+            RuntimeEffectAction::RetireBuild(build_id) => {
+                self.legacy.retire_build_proof(build_id.clone()).await?;
+                self.common.retire_managed_build(build_id.clone()).await?;
                 self.sync_engine_proof().await?;
                 return Ok(());
             }
@@ -223,7 +231,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 return Ok(());
             }
             RuntimeEffectAction::RefreshApplicationProgress => {
-                self.legacy.execute_action(action.clone()).await?;
+                self.legacy.refresh_progress_proof().await?;
                 let result = self.common.execute_action(action).await;
                 self.sync_engine_proof().await?;
                 result?;
@@ -252,6 +260,16 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 self.sync_engine_proof().await?;
                 return result;
             }
+            RuntimeEffectAction::ObserveReplicationAck {
+                acknowledgement,
+                session,
+            } => {
+                self.data_plane
+                    .observe_acknowledgement((**acknowledgement).clone(), session.clone())
+                    .await?;
+                self.sync_engine_proof().await?;
+                return Ok(());
+            }
             RuntimeEffectAction::WaitForCatchup => {
                 let result = self.legacy.wait_for_catch_up_proof().await;
                 self.sync_engine_proof().await?;
@@ -264,7 +282,9 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             }
             _ => {}
         }
-        self.legacy.execute_action(action).await
+        Err(RuntimeError::Application(
+            "the selected managed engine does not expose this lifecycle proof".into(),
+        ))
     }
 
     async fn snapshot(&self) -> RuntimeSnapshot {
@@ -291,10 +311,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn next_outbound(&self) -> Option<OutboundOperation> {
-        tokio::select! {
-            item = self.common.next_outbound() => item,
-            item = self.legacy.next_outbound() => item,
-        }
+        self.common.next_outbound().await
     }
 
     async fn wait_for_build_completion(
@@ -313,6 +330,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             }) {
                 return Ok(());
             }
+
             self.common
                 .ensure_build_generation(build_id, generation)
                 .await?;
@@ -321,6 +339,26 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
             }
         }
+    }
+
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        let build_id = replica.build_id.clone();
+        let endpoint = ReplicaEndpoint {
+            build_id: build_id.clone(),
+            identity: replica.identity.clone(),
+            replication_address: replica.replication_address.clone(),
+        };
+        self.common.enqueue_build_wait(endpoint).await?;
+        if let Err(error) = self.legacy.build_replica_proof(replica).await {
+            self.common.cancel_common_build(&build_id).await?;
+            return Err(error);
+        }
+        self.sync_engine_proof().await
+    }
+
+    async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
+        self.legacy.remove_replica_proof(replica_id).await?;
+        self.common.remove_managed_replica(replica_id).await
     }
 
     async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
@@ -477,10 +515,12 @@ impl ReplicatorLifecycleHost {
         control: Arc<dyn Replicator>,
         primary: Arc<dyn PrimaryReplicator>,
         lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
+        data_plane: Arc<dyn kuberic_runtime::replicator::ManagedReplicatorDataPlane>,
     ) -> Self {
         Self {
             backend: Arc::new(ManagedLifecycleBackend {
                 legacy: lifecycle,
+                data_plane,
                 common: CustomReplicatorHost::new(host, control, primary, false),
             }),
         }
@@ -566,6 +606,17 @@ impl ReplicatorLifecycleHost {
             .await
     }
 
+    pub(super) async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        self.backend.build_replica(replica).await
+    }
+
+    pub(super) async fn remove_replica(
+        &self,
+        replica_id: kuberic_protocol::types::ReplicaId,
+    ) -> Result<()> {
+        self.backend.remove_replica(replica_id).await
+    }
+
     pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
         self.backend.select_build(authority).await
     }
@@ -602,6 +653,7 @@ pub(super) struct CustomReplicatorHost {
     control: Arc<dyn Replicator>,
     primary: Arc<dyn PrimaryReplicator>,
     native_receipts: bool,
+    abort_notified: std::sync::atomic::AtomicBool,
     gate: Mutex<()>,
     state: RwLock<RuntimeSnapshot>,
     sessions: RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>,
@@ -639,6 +691,7 @@ impl CustomReplicatorHost {
             control,
             primary,
             native_receipts,
+            abort_notified: std::sync::atomic::AtomicBool::new(false),
             gate: Mutex::new(()),
             state: RwLock::new(snapshot),
             sessions: RwLock::default(),
@@ -658,7 +711,11 @@ impl CustomReplicatorHost {
 
     fn host(&self) -> Result<Arc<RuntimeHost>> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        if host.aborted.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .abort_notified
+            .load(std::sync::atomic::Ordering::Acquire)
+            || host.aborted.load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(RuntimeError::Closed);
         }
         Ok(host)
@@ -1148,8 +1205,39 @@ impl CustomReplicatorHost {
             .checked_add(1)
             .ok_or(RuntimeError::OperationCancelled)?;
         drop(generations);
+        self.enqueue_outbound(OutboundOperation::Build(endpoint))
+    }
+
+    async fn enqueue_build_wait(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        let mut generations = self.build_generations.write().await;
+        let generation = generations.entry(endpoint.build_id.clone()).or_default();
+        *generation = generation
+            .checked_add(1)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        drop(generations);
+        let mut operation = OutboundOperation::Build(endpoint);
+        loop {
+            match self.outbound.try_send(operation) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    operation = returned;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(RuntimeError::Closed);
+                }
+            }
+            self.host()?;
+            let changed = self.changed.notified();
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+        }
+    }
+
+    fn enqueue_outbound(&self, operation: OutboundOperation) -> Result<()> {
         self.outbound
-            .try_send(OutboundOperation::Build(endpoint))
+            .try_send(operation)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => RuntimeError::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => RuntimeError::Closed,
@@ -1341,8 +1429,80 @@ impl CustomReplicatorHost {
     async fn install_managed_authority(&self, authority: &AdmittedAuthority) -> Result<()> {
         let _gate = self.gate.lock().await;
         authority.validate()?;
+        let previous = self.state.read().await.authority.clone();
         self.state.write().await.authority = Some(authority.clone());
+        if let Some(previous) = previous {
+            let retained = authority
+                .current_configuration
+                .members
+                .iter()
+                .chain(
+                    authority
+                        .previous_configuration
+                        .iter()
+                        .flat_map(|configuration| &configuration.members),
+                )
+                .map(|member| member.identity.clone())
+                .collect::<BTreeSet<_>>();
+            for identity in previous
+                .current_configuration
+                .members
+                .iter()
+                .chain(
+                    previous
+                        .previous_configuration
+                        .iter()
+                        .flat_map(|configuration| &configuration.members),
+                )
+                .map(|member| member.identity.clone())
+                .filter(|identity| !retained.contains(identity))
+            {
+                self.enqueue_outbound(OutboundOperation::Evict(identity))?;
+            }
+        }
         self.configure().await
+    }
+
+    async fn retire_managed_build(&self, build_id: OperationId) -> Result<()> {
+        let host = self.host()?;
+        let build = host
+            .default_dependencies
+            .build_authority_store
+            .load_build(&build_id)
+            .await?;
+        self.execute_common_build_action(RuntimeEffectAction::RetireBuild(build_id))
+            .await?;
+        if let Some(build) = build {
+            self.enqueue_outbound(OutboundOperation::Remove(build.target.replica_id))?;
+        }
+        Ok(())
+    }
+
+    async fn remove_managed_replica(
+        &self,
+        replica_id: kuberic_protocol::types::ReplicaId,
+    ) -> Result<()> {
+        let retired = self
+            .state
+            .read()
+            .await
+            .builds
+            .iter()
+            .filter(|build| build.authority.target.replica_id == replica_id)
+            .map(|build| build.authority.build_id.clone())
+            .collect::<Vec<_>>();
+        self.state
+            .write()
+            .await
+            .builds
+            .retain(|build| build.authority.target.replica_id != replica_id);
+        self.receipts
+            .write()
+            .await
+            .retain(|_, receipt| receipt.selection.authority.target.replica_id != replica_id);
+        self.retired_builds.write().await.extend(retired);
+        self.changed.notify_waiters();
+        self.enqueue_outbound(OutboundOperation::Remove(replica_id))
     }
 
     async fn install_managed_build(&self, authority: &BuildAuthority) -> Result<()> {
@@ -1891,10 +2051,14 @@ impl CustomReplicatorHost {
     }
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
         loop {
-            if self.host.upgrade().is_none_or(|host| {
-                host.aborted.load(std::sync::atomic::Ordering::Acquire)
-                    || host.closed.load(std::sync::atomic::Ordering::Acquire)
-            }) {
+            if self
+                .abort_notified
+                .load(std::sync::atomic::Ordering::Acquire)
+                || self.host.upgrade().is_none_or(|host| {
+                    host.aborted.load(std::sync::atomic::Ordering::Acquire)
+                        || host.closed.load(std::sync::atomic::Ordering::Acquire)
+                })
+            {
                 return None;
             }
             let changed = self.changed.notified();
@@ -1908,6 +2072,8 @@ impl CustomReplicatorHost {
     }
 
     fn notify_abort(&self) {
+        self.abort_notified
+            .store(true, std::sync::atomic::Ordering::Release);
         self.changed.notify_waiters();
     }
 }
@@ -1923,6 +2089,7 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     }
 
     async fn complete_abort(&self) {
+        self.notify_abort();
         self.terminate().await.ok();
     }
 
@@ -1982,12 +2149,21 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
             }) {
                 return Ok(());
             }
+
             self.ensure_build_generation(build_id, generation).await?;
             tokio::select! {
                 _ = changed => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
             }
         }
+    }
+
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        CustomReplicatorHost::execute_build(self, replica).await
+    }
+
+    async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
+        self.primary.remove_replica(replica_id).await
     }
 
     async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {

@@ -3566,11 +3566,35 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn restore_authority(&self) -> Result<()> {
+    async fn register_peer_session_proof(
+        &self,
+        _identity: ReplicaIdentity,
+        _session: ProcessSessionId,
+    ) -> Result<()> {
         Ok(())
     }
 
-    async fn execute_action(&self, _action: RuntimeEffectAction) -> Result<()> {
+    async fn admit_build_authority_proof(&self, _authority: BuildAuthority) -> Result<()> {
+        Ok(())
+    }
+
+    async fn retire_build_proof(&self, _build_id: OperationId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn build_replica_proof(&self, _replica: ReplicaInformation) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_replica_proof(&self, _replica_id: ReplicaId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn refresh_progress_proof(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn restore_engine_proof(&self) -> Result<()> {
         Ok(())
     }
 
@@ -3600,10 +3624,6 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn next_outbound(&self) -> Option<OutboundOperation> {
-        None
-    }
-
     fn abort(&self) {
         self.aborts.fetch_add(1, Ordering::SeqCst);
     }
@@ -3612,6 +3632,10 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
 #[cfg(feature = "testing")]
 #[async_trait]
 impl ManagedReplicatorDataPlane for TrackingManagedCapability {
+    async fn next_outbound_item(&self) -> Option<OutboundOperation> {
+        None
+    }
+
     async fn recover_pending_writes(&self) -> Result<()> {
         Err(RuntimeError::Closed)
     }
@@ -5263,6 +5287,119 @@ async fn independent_custom_primary_with_state_capability_keeps_sf_effect_hostin
     );
 }
 
+async fn assert_default_data_plane_unavailable(
+    runtime: &PodRuntime,
+    local: ReplicaIdentity,
+    peer: ReplicaIdentity,
+) {
+    let assert_unavailable = |result: Result<()>| {
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Application(message))
+                if message.contains("default-engine managed data-plane")
+        ));
+    };
+    assert_unavailable(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("unavailable-begin-write"),
+                data: Bytes::from_static(b"unavailable"),
+            })
+            .await
+            .map(|_| ()),
+    );
+    let admitted = authority(local.clone(), vec![local, peer.clone()]);
+    assert_unavailable(
+        runtime
+            .data_plane()
+            .accept_acknowledgement(acknowledgement(&admitted, peer.clone(), 1))
+            .await,
+    );
+    assert_unavailable(
+        runtime
+            .data_plane()
+            .prepare_copy(PrepareCopyRequest {
+                build_id: OperationId::new("unavailable-copy"),
+                target: peer.clone(),
+                configuration: BuildConfiguration::Current,
+                copy_context: empty_copy_context(),
+            })
+            .await
+            .map(|_| ()),
+    );
+    assert_unavailable(
+        runtime
+            .data_plane()
+            .accept_copy_acknowledgement(proto::CopyAck::default())
+            .await,
+    );
+    assert_unavailable(
+        runtime
+            .data_plane()
+            .receive_copy_item(proto::CopyItem::default())
+            .await
+            .map(|_| ()),
+    );
+    let ack = acknowledgement(&admitted, peer.clone(), 1);
+    assert_unavailable(
+        runtime
+            .data_plane()
+            .receive_replication(retry_item(&ack, peer.clone()))
+            .await
+            .map(|_| ()),
+    );
+    assert_unavailable(runtime.repair_peer(peer, 0).await);
+    assert_eq!(
+        runtime.testing_lifecycle_registration(),
+        (Some(false), false)
+    );
+}
+
+#[tokio::test]
+async fn unavailable_default_data_plane_never_returns_success_for_custom_primaries() {
+    let ordinary_local = identity(1, "unavailable-ordinary");
+    let ordinary_peer = identity(2, "unavailable-ordinary-peer");
+    let ordinary = PodRuntime::new(
+        ordinary_local.clone(),
+        Arc::new(CustomRoleService(Arc::new(CustomRoleGate::default()))),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    ordinary
+        .bind_replica_session(
+            ResourceUid::new("unavailable-ordinary"),
+            ProcessSessionId::new("ordinary-session"),
+        )
+        .unwrap();
+    ordinary
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    assert_default_data_plane_unavailable(&ordinary, ordinary_local, ordinary_peer).await;
+
+    let capable_local = identity(1, "unavailable-state-capable");
+    let capable_peer = identity(2, "unavailable-state-capable-peer");
+    let capable = PodRuntime::new(
+        capable_local.clone(),
+        Arc::new(StateCapableCustomService {
+            replicator: Arc::new(CustomRoleGate::default()),
+            state: Mutex::new(None),
+        }),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    capable
+        .bind_replica_session(
+            ResourceUid::new("unavailable-state-capable"),
+            ProcessSessionId::new("capable-session"),
+        )
+        .unwrap();
+    capable
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    assert_default_data_plane_unavailable(&capable, capable_local, capable_peer).await;
+}
+
 #[tokio::test]
 async fn newer_epoch_supersedes_failed_custom_primary_role_without_reusing_its_receipt() {
     let directory = tempfile::tempdir().unwrap();
@@ -6060,6 +6197,7 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     let application = include_str!("../../kuberic-runtime/src/application.rs");
     let library = include_str!("../../kuberic-runtime/src/lib.rs");
     let hosting = include_str!("../src/hosting.rs");
+    let lifecycle = include_str!("../src/custom.rs");
     assert!(
         replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorLifecycle")
             && replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorDataPlane"),
@@ -6072,6 +6210,23 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     assert!(
         !include_str!("../src/transport.rs").contains(".record_durable_peer_progress("),
         "peer discovery may use reported progress for repair, never commit quorum credit"
+    );
+    assert!(
+        !replication.contains("async fn execute_action(&self, action: RuntimeEffectAction)")
+            && !lifecycle.contains(".legacy.execute_action("),
+        "ordinary lifecycle work must use explicit common routing and private proof hooks"
+    );
+    let managed_lifecycle = replication
+        .split_once("pub trait ManagedReplicatorLifecycle")
+        .unwrap()
+        .1
+        .split_once("\n}")
+        .unwrap()
+        .0;
+    assert!(
+        replication.contains("async fn next_outbound_item(&self) -> Option<OutboundOperation>")
+            && !managed_lifecycle.contains("next_outbound"),
+        "only the optional built-in data plane may expose replication/copy outbound polling"
     );
     assert!(!replication.contains("fn managed_replicator("));
     assert!(!replication.contains("ReplicatorInterfaces::new"));
