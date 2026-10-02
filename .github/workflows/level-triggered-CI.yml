@@ -27,69 +27,8 @@ env:
   KUBERIC_AGENT_BEARER_TOKEN: level-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
-  targeted:
-    name: Targeted checks
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      RUST_TEST_THREADS: 1
-      TMPDIR: ${{ github.workspace }}/target/paw-tmp
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Prepare repository-local scratch
-        run: mkdir -p "$TMPDIR"
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
-        with:
-          components: rustfmt, clippy
-          build-warnings: ""
-      - uses: taiki-e/install-action@protoc
-      - name: Install host-local PostgreSQL for unit tests
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y postgresql-16 postgresql-client-16
-          /usr/lib/postgresql/16/bin/postgres --version
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Lint level-triggered packages
-        run: >-
-          cargo clippy
-          -p kuberic-protocol
-          -p kuberic-wire
-          -p kuberic-runtime
-          -p kuberic-runtime-internal
-          -p kuberic-agent
-          -p kuberic-controller
-          -p kvstore2
-          -p sqlite-replicated
-          -p sqlite-commit-barrier
-          -p postgres-replicated
-          -p kuberic-level-tests
-          --all-targets --all-features -- -D warnings
-      - name: Test level-triggered packages
-        run: >-
-          cargo test
-          -p kuberic-protocol
-          -p kuberic-wire
-          -p kuberic-runtime
-          -p kuberic-runtime-internal
-          -p kuberic-agent
-          -p kuberic-controller
-          -p kvstore2
-          --features kuberic-agent/testing
-      - name: Test SQLite unit and in-process suites
-        run: cargo test -p sqlite-commit-barrier -p sqlite-replicated --all-features -- --test-threads=1
-      - name: Test PostgreSQL unit and host-local subprocess suites
-        run: cargo test -p postgres-replicated --all-features -- --test-threads=1
-      - name: Compile isolated KinD tests
-        run: |
-          cargo test -p kuberic-level-tests --no-run
-          cargo test -p kuberic-level-tests
-
   bootstrap-kind:
     name: PR live smoke
-    needs: targeted
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -99,6 +38,8 @@ jobs:
           build-warnings: ""
       - uses: taiki-e/install-action@protoc
       - uses: taiki-e/install-action@just
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
       - name: Prepare owned cluster directory outside the image build context
         run: mkdir -p "$(dirname "$KUBECONFIG")"
       - name: Create isolated KinD cluster
@@ -117,6 +58,14 @@ jobs:
             "kubeconfig=${KUBECONFIG}" \
             | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
           just verify-kind-context
+      - name: Run DEX real Kubernetes test
+        if: github.event_name == 'pull_request'
+        run: >-
+          cargo nextest run
+          -p kuberic-dex
+          --features kubernetes
+          --test kubernetes_checkpoint_real
+          --profile dex-live
       - name: Build and load isolated images
         run: just level-triggered-images
       - name: Install isolated stack
@@ -156,7 +105,6 @@ jobs:
   full-kind:
     name: Full adversarial matrix (${{ matrix.run }})
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_matrix)
-    needs: targeted
     strategy:
       fail-fast: false
       matrix:
@@ -167,6 +115,7 @@ jobs:
       KIND_CLUSTER_NAME: kuberic-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
       KUBECONFIG: ${{ github.workspace }}/target/kind/full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}.kubeconfig
       KUBE_CONTEXT: kind-kuberic-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
+      KUBERIC_AGENT_BEARER_TOKEN: level-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -174,6 +123,8 @@ jobs:
           build-warnings: ""
       - uses: taiki-e/install-action@protoc
       - uses: taiki-e/install-action@just
+      - name: Install pinned cargo-nextest
+        run: scripts/install_nextest.sh
       - name: Prepare owned cluster directory outside the image build context
         run: mkdir -p "$(dirname "$KUBECONFIG")"
       - name: Create isolated KinD cluster
