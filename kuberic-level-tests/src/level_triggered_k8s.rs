@@ -3733,6 +3733,7 @@ fn scale_down_reduction_parser_rejects_skipped_epochs_primary_or_identity_change
 #[test]
 fn scale_down_selectors_are_exact_ignored_and_in_all() {
     let recipes = include_str!("../../justfile");
+    let nextest = include_str!("../../.config/nextest.toml");
     for (selector, test) in [
         ("scale-down", "scale_down"),
         ("scale-down-adversarial", "scale_down_adversarial"),
@@ -3746,7 +3747,11 @@ fn scale_down_selectors_are_exact_ignored_and_in_all() {
                 .any(|line| line.contains("expanded+=(") && line.contains(selector))
         );
     }
-    assert!(recipes.contains("-- --ignored --exact --nocapture"));
+    assert!(recipes.contains("cargo nextest run -p kuberic-level-tests"));
+    assert!(recipes.contains("--profile kind --run-ignored only"));
+    assert!(recipes.contains("group(=kind-live) and test(=${test_name})"));
+    assert!(nextest.contains("[profile.kind]"));
+    assert!(nextest.contains("test-group = 'kind-live'"));
 }
 
 struct CollectionWatch {
@@ -5158,6 +5163,7 @@ fn scale_up_multi() -> Result<()> {
 #[test]
 fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
     let recipes = include_str!("../../justfile");
+    let nextest = include_str!("../../.config/nextest.toml");
     let workflow = include_str!("../../.github/workflows/level-triggered-CI.yml");
     for (selector, test) in [
         ("scale-up", "scale_up"),
@@ -5174,7 +5180,11 @@ fn scale_up_selectors_are_exact_ignored_and_wired_to_ci() {
         );
     }
     assert!(recipes.contains("expanded+=(scale-up scale-up-multi scale-up-adversarial)"));
-    assert!(recipes.contains("-- --ignored --exact --nocapture"));
+    assert!(recipes.contains("cargo nextest run -p kuberic-level-tests"));
+    assert!(recipes.contains("--profile kind --run-ignored only"));
+    assert!(recipes.contains("group(=kind-live) and test(=${test_name})"));
+    assert!(nextest.contains("[profile.kind]"));
+    assert!(nextest.contains("test-group = 'kind-live'"));
     assert!(workflow.contains("just level-triggered-kind-test scale-up"));
     assert!(workflow.contains("just level-triggered-kind-test all"));
 }

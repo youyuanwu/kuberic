@@ -53,7 +53,7 @@ nextest-test partition="": install-nextest
     if [[ -n "{{ partition }}" ]]; then
       partition_args=(--partition "slice:{{ partition }}")
     fi
-    cargo nextest run --profile ordinary "${partition_args[@]}"
+    cargo nextest run --workspace --all-features --profile ordinary "${partition_args[@]}"
 
 # Run the PostgreSQL tier serially, optionally as hash shard N/M.
 nextest-postgres partition="": install-nextest
@@ -63,7 +63,7 @@ nextest-postgres partition="": install-nextest
     if [[ -n "{{ partition }}" ]]; then
       partition_args=(--partition "hash:{{ partition }}")
     fi
-    cargo nextest run --profile postgres "${partition_args[@]}"
+    cargo nextest run --workspace --all-features --profile postgres "${partition_args[@]}"
 
 # Create the local Kind cluster and write its kubeconfig.
 create-kind-cluster:
@@ -173,7 +173,7 @@ level-triggered-kind-test *scenarios: verify-kind-context
       esac
       started=$SECONDS
       echo "=== level-triggered scenario: $scenario ==="
-      cargo nextest run --profile kind --run-ignored only \
+      cargo nextest run -p kuberic-level-tests --profile kind --run-ignored only \
         -E "group(=kind-live) and test(=${test_name})" --no-capture
       echo "=== $scenario passed in $((SECONDS - started))s ==="
     done

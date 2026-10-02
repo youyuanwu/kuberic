@@ -829,9 +829,11 @@ cluster rather than prepending it to that matrix.
 
 The [PR workflow](../../../.github/workflows/level-triggered-CI.yml) separately
 runs bootstrap, replacement, failover, healthy switchover, and healthy scale-down
-plus healthy sequential scale-up smoke tests. Targeted tests run serially and
-scheduled and manually dispatched full CI runs the matrix twice on separate
-fresh clusters.
+plus healthy sequential scale-up smoke tests. The `kind` nextest profile and
+`kind-live` group select exactly the 12 ignored live scenarios and allow one
+scenario process at a time. Scheduled and manually dispatched full CI runs the
+matrix twice on separate fresh clusters; each matrix job has a distinct cluster,
+kubeconfig, context, bearer token and installation.
 
 `scale-down` covers healthy 3→2→1, singleton process restarts and new writes,
 plus a separate five-member set reduced sequentially to two. It checks every

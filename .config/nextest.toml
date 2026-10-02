@@ -43,6 +43,7 @@ test-threads = 1
 [test-groups]
 postgres = { max-threads = 1 }
 sqlite = { max-threads = 1 }
+process-boundaries = { max-threads = 1 }
 kind-live = { max-threads = 1 }
 
 [[profile.default.overrides]]
@@ -52,6 +53,11 @@ test-group = 'postgres'
 [[profile.default.overrides]]
 filter = 'package(=sqlite-replicated) or package(=sqlite-commit-barrier)'
 test-group = 'sqlite'
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kuberic-agent::crash_boundaries)'
+test-group = 'process-boundaries'
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = 'package(=kuberic-level-tests) and test(/^level_triggered_k8s::(adversarial_restart_partition_and_healing_preserve_single_writer|bootstrap_reaches_three_member_topology_and_quorum_write|failover_fences_old_primary_and_preserves_committed_data|planned_switchover(_adversarial)?|quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change|replacement_preserves_quorum_write_and_retires_old_incarnation|scale_down(_adversarial)?|scale_up(_multi|_adversarial)?)$/)'
