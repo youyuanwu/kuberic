@@ -3679,6 +3679,126 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         Ok(())
     }
 
+    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64> {
+        self.check_aborted()?;
+        let generation = self.fence_generation.load(Ordering::Acquire);
+        if write == AccessStatus::Granted {
+            self.validate_removal_write_grant().await?;
+        }
+        if write == AccessStatus::Granted
+            && self.state.read().await.write_status != AccessStatus::Granted
+        {
+            self.recover_pending_local_writes().await?;
+        }
+        let state = self.state.read().await;
+        if read == AccessStatus::Granted
+            && (!state.open
+                || !matches!(
+                    state.role,
+                    ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                ))
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "read access requires an open Primary or Active Secondary".into(),
+            ));
+        }
+        if write == AccessStatus::Granted {
+            if !state.open {
+                return Err(RuntimeError::NotOpen);
+            }
+            if state.role != ReplicaRole::Primary {
+                return Err(RuntimeError::NotPrimary);
+            }
+            let authority = state
+                .authority
+                .as_ref()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if authority.primary_identity() != &self.identity {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "write grant target is not the admitted primary".into(),
+                ));
+            }
+        }
+        let primary_read = read == AccessStatus::Granted && state.role == ReplicaRole::Primary;
+        drop(state);
+        if primary_read && !self.replicator.lock().await.catch_up_complete() {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        if generation != self.fence_generation.load(Ordering::Acquire) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        Ok(generation)
+    }
+
+    async fn publish_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+        generation: u64,
+    ) -> Result<()> {
+        let _effect = self.effect_lock.lock().await;
+        self.check_aborted()?;
+        if generation != self.fence_generation.load(Ordering::Acquire) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        if write != AccessStatus::Granted {
+            self.replicator.lock().await.fence_client_writes();
+        }
+        let mut state = self.state.write().await;
+        state.read_status = read;
+        state.write_status = write;
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+        )
+        .await
+    }
+
+    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary),
+        )
+        .await
+    }
+
+    async fn wait_for_catch_up_proof(&self) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::WaitForCatchup,
+        )
+        .await
+    }
+
+    async fn prepare_switchover_proof(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: Epoch,
+    ) -> Result<()> {
+        <Self as ManagedReplicatorLifecycle>::execute_action(
+            self,
+            RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            },
+        )
+        .await
+    }
+
     async fn restore_authority(&self) -> Result<()> {
         self.restore_authority().await
     }

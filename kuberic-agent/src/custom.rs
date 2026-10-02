@@ -162,7 +162,10 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             }
             RuntimeEffectAction::AdmitAuthority(authority) => {
                 self.common.prepare_authority_admission(authority).await?;
-                let engine_result = self.legacy.execute_action(action.clone()).await;
+                let engine_result = self
+                    .legacy
+                    .admit_authority_proof((**authority).clone())
+                    .await;
                 if let Err(error) = engine_result {
                     self.sync_engine_proof().await?;
                     return Err(error);
@@ -187,23 +190,47 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             }
             RuntimeEffectAction::SetAccessStatus { .. }
             | RuntimeEffectAction::SetReadStatus(_)
-            | RuntimeEffectAction::SetWriteStatus(_)
-            | RuntimeEffectAction::RefreshApplicationProgress => {
+            | RuntimeEffectAction::SetWriteStatus(_) => {
+                self.execute_access_action(action).await?;
+                return Ok(());
+            }
+            RuntimeEffectAction::RefreshApplicationProgress => {
                 self.legacy.execute_action(action.clone()).await?;
                 let result = self.common.execute_action(action).await;
                 self.sync_engine_proof().await?;
                 result?;
                 return Ok(());
             }
-            RuntimeEffectAction::PrepareSwitchover { .. } => {
+            RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            } => {
                 self.common.fence_managed_access().await?;
-                let result = self.legacy.execute_action(action).await;
+                let result = self
+                    .legacy
+                    .prepare_switchover_proof(
+                        *preparation_generation,
+                        request_id.clone(),
+                        source.clone(),
+                        target.clone(),
+                        starting_configuration_id.clone(),
+                        *starting_epoch,
+                    )
+                    .await;
                 self.sync_engine_proof().await?;
                 return result;
             }
-            RuntimeEffectAction::WaitForCatchup
-            | RuntimeEffectAction::AuthorizeFailoverPrefix(_) => {
-                let result = self.legacy.execute_action(action).await;
+            RuntimeEffectAction::WaitForCatchup => {
+                let result = self.legacy.wait_for_catch_up_proof().await;
+                self.sync_engine_proof().await?;
+                return result;
+            }
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
+                let result = self.legacy.authorize_failover_prefix_proof(*boundary).await;
                 self.sync_engine_proof().await?;
                 return result;
             }
@@ -337,6 +364,29 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 }
 
 impl ManagedLifecycleBackend {
+    async fn execute_access_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        let snapshot = self.common.snapshot().await;
+        let (read, write) = match action {
+            RuntimeEffectAction::SetAccessStatus { read, write } => (read, write),
+            RuntimeEffectAction::SetReadStatus(read) => (read, snapshot.write_status),
+            RuntimeEffectAction::SetWriteStatus(write) => (snapshot.read_status, write),
+            _ => {
+                return Err(RuntimeError::Application(
+                    "managed access preparation requires an access action".into(),
+                ));
+            }
+        };
+        let generation = self.legacy.prepare_access(read, write).await?;
+        self.common
+            .execute_action(RuntimeEffectAction::SetAccessStatus { read, write })
+            .await?;
+        if let Err(error) = self.legacy.publish_access(read, write, generation).await {
+            self.common.fence_managed_access().await?;
+            return Err(error);
+        }
+        self.sync_engine_proof().await
+    }
+
     async fn sync_engine_proof(&self) -> Result<()> {
         self.common
             .restore_engine_proof(self.legacy.snapshot().await)

@@ -22,8 +22,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
-    BuildAuthorityStore, BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore,
-    ReplicationProgressStore,
+    AdmittedAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
+    ReplicaAuthorityStore, ReplicationProgressStore,
 };
 use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
@@ -80,6 +80,25 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
+    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64>;
+    async fn publish_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+        generation: u64,
+    ) -> Result<()>;
+    async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
+    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()>;
+    async fn wait_for_catch_up_proof(&self) -> Result<()>;
+    async fn prepare_switchover_proof(
+        &self,
+        preparation_generation: u64,
+        request_id: kuberic_protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        starting_epoch: Epoch,
+    ) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;

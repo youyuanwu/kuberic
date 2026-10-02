@@ -3468,6 +3468,43 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
+    async fn prepare_access(&self, _read: AccessStatus, _write: AccessStatus) -> Result<u64> {
+        Ok(0)
+    }
+
+    async fn publish_access(
+        &self,
+        _read: AccessStatus,
+        _write: AccessStatus,
+        _generation: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn admit_authority_proof(&self, _authority: AdmittedAuthority) -> Result<()> {
+        Ok(())
+    }
+
+    async fn authorize_failover_prefix_proof(&self, _boundary: i64) -> Result<()> {
+        Ok(())
+    }
+
+    async fn wait_for_catch_up_proof(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn prepare_switchover_proof(
+        &self,
+        _preparation_generation: u64,
+        _request_id: SwitchoverRequestId,
+        _source: ReplicaIdentity,
+        _target: ReplicaIdentity,
+        _starting_configuration_id: kuberic_protocol::types::ConfigurationId,
+        _starting_epoch: Epoch,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn restore_authority(&self) -> Result<()> {
         Ok(())
     }
@@ -4614,6 +4651,80 @@ async fn blocked_progress_never_publishes_access_before_proof() {
         partition.get_write_status().await.unwrap(),
         AccessStatus::Granted
     );
+}
+
+#[tokio::test]
+async fn managed_pending_write_recovery_never_publishes_access_before_proof() {
+    let local = identity(1, "managed-proof-primary");
+    let secondary = identity(2, "managed-proof-secondary");
+    let members = vec![local.clone(), secondary.clone()];
+    let admitted = authority(local, members.clone());
+    let application = Arc::new(TestApplication::default());
+    let runtime = open_primary(application.clone(), members).await;
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("managed-proof-write"),
+            data: Bytes::from_static(b"managed-proof"),
+        })
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::ReconfigurationPending),
+        ))
+        .await
+        .unwrap();
+    let grant = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    6,
+                    RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+                ))
+                .await
+        })
+    };
+    let partition = application.partition.lock().unwrap().clone().unwrap();
+    for _ in 0..32 {
+        assert!(!grant.is_finished());
+        assert_ne!(
+            partition.get_write_status().await.unwrap(),
+            AccessStatus::Granted
+        );
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        tokio::task::yield_now().await;
+    }
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&admitted, secondary.clone(), pending.lsn))
+        .await
+        .unwrap();
+    grant.await.unwrap().unwrap();
+    assert_eq!(
+        partition.get_write_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+    assert!(matches!(
+        pending.committed().await,
+        Err(RuntimeError::WriteClosed(_))
+    ));
+    let fresh = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("managed-proof-fresh"),
+            data: Bytes::from_static(b"managed-proof-fresh"),
+        })
+        .await
+        .unwrap();
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&admitted, secondary, fresh.lsn))
+        .await
+        .unwrap();
+    assert_eq!(fresh.committed().await.unwrap().committed_lsn, 2);
 }
 
 #[tokio::test]
