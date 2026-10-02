@@ -35,12 +35,18 @@ use kuberic_runtime::application::{
     OpenMode, Operation, OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
-use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
+use kuberic_runtime::internal::{
+    PendingReplication as RuntimePendingReplication, PendingWrite as RuntimePendingWrite,
+};
+use kuberic_runtime::replicator::copy::{
+    BuildConfiguration, PrepareCopyRequest, PreparedCopy as RuntimePreparedCopy,
+};
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode,
-    Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
-    ReplicatorSettings, StateReplicator, StatefulServicePartition,
+    DefaultReplicatorFactory, ManagedReplicatorDataPlane, ManagedReplicatorLifecycle,
+    PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator,
+    ReplicatorCreationReservation, ReplicatorFactory, ReplicatorFactoryContext,
+    ReplicatorInterfaces, ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{
@@ -49,6 +55,10 @@ use kuberic_runtime_internal::authority::{
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
+use kuberic_runtime_internal::transport::{
+    CopyAck as RuntimeCopyAck, CopyItem as RuntimeCopyItem, OutboundOperation,
+    ReplicationAck as RuntimeReplicationAck, ReplicationItem as RuntimeReplicationItem,
+};
 use kuberic_runtime_internal::{ContractError, Result as ContractResult};
 use kuberic_wire::proto;
 use tokio::sync::Notify;
@@ -3327,6 +3337,182 @@ struct PausingFactory {
     resume: Arc<Notify>,
 }
 
+#[cfg(feature = "testing")]
+#[derive(Default)]
+struct TrackingManagedCapability {
+    aborts: AtomicUsize,
+}
+
+#[cfg(feature = "testing")]
+#[async_trait]
+impl Replicator for TrackingManagedCapability {
+    async fn open(&self) -> Result<String> {
+        Ok("tracking://replica".into())
+    }
+
+    async fn change_role(&self, _epoch: Epoch, _role: ReplicaRole) -> Result<()> {
+        Ok(())
+    }
+
+    async fn update_epoch(&self, _epoch: Epoch) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn abort(&self) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn current_progress(&self) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn catch_up_capability(&self) -> Result<i64> {
+        Ok(0)
+    }
+}
+
+#[cfg(feature = "testing")]
+#[async_trait]
+impl PrimaryReplicator for TrackingManagedCapability {
+    async fn on_data_loss(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        _current: kuberic_runtime::replicator::ReplicaSetConfiguration,
+        _previous: kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn wait_for_catch_up_quorum(&self, _mode: ReplicaSetQuorumMode) -> Result<()> {
+        Ok(())
+    }
+
+    async fn update_current_replica_set_configuration(
+        &self,
+        _current: kuberic_runtime::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn build_replica(&self, _replica: ReplicaInformation) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_replica(&self, _replica_id: ReplicaId) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "testing")]
+#[async_trait]
+impl ManagedReplicatorLifecycle for TrackingManagedCapability {
+    async fn fence_writes(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn settle_primary_prefix(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn cancel_configuration_work(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn restore_authority(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn execute_action(&self, _action: RuntimeEffectAction) -> Result<()> {
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> kuberic_runtime_internal::effects::RuntimeSnapshot {
+        panic!("registration tests do not request snapshots")
+    }
+
+    async fn cancel_outbound_build(&self, _build_id: &OperationId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn complete_open(&self, _replication_address: String) -> Result<()> {
+        Ok(())
+    }
+
+    async fn attach_interfaces(
+        &self,
+        _control: Arc<dyn Replicator>,
+        _primary: Option<Arc<dyn PrimaryReplicator>>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn next_outbound(&self) -> Option<OutboundOperation> {
+        None
+    }
+
+    fn abort(&self) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "testing")]
+#[async_trait]
+impl ManagedReplicatorDataPlane for TrackingManagedCapability {
+    async fn recover_pending_writes(&self) -> Result<()> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn repair_peer(&self, _identity: ReplicaIdentity, _progress: i64) -> Result<()> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn begin_write(&self, _write: ClientWrite) -> Result<RuntimePendingWrite> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn observe_acknowledgement(
+        &self,
+        _acknowledgement: RuntimeReplicationAck,
+        _session: ProcessSessionId,
+    ) -> Result<()> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn accept_acknowledgement(&self, _acknowledgement: RuntimeReplicationAck) -> Result<()> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn prepare_copy(&self, _request: PrepareCopyRequest) -> Result<RuntimePreparedCopy> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn accept_copy_acknowledgement(&self, _acknowledgement: RuntimeCopyAck) -> Result<()> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn receive_copy_item(&self, _item: RuntimeCopyItem) -> Result<RuntimeCopyAck> {
+        Err(RuntimeError::Closed)
+    }
+
+    async fn receive_replication(
+        &self,
+        _item: RuntimeReplicationItem,
+    ) -> Result<RuntimePendingReplication> {
+        Err(RuntimeError::Closed)
+    }
+
+    fn abort(&self) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[async_trait]
 impl ReplicatorFactory for PausingFactory {
     async fn create_replicator(
@@ -5435,8 +5621,9 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     let application = include_str!("../../kuberic-runtime/src/application.rs");
     let library = include_str!("../../kuberic-runtime/src/lib.rs");
     assert!(
-        replication.contains("#[doc(hidden)]\npub trait ManagedReplicator"),
-        "the cross-crate managed bridge must remain hidden from generated user documentation"
+        replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorLifecycle")
+            && replication.contains("#[doc(hidden)]\npub trait ManagedReplicatorDataPlane"),
+        "the cross-crate managed lifecycle and data-plane bridges must remain hidden from generated user documentation"
     );
     assert!(
         !replication.contains("record_durable_peer_progress"),
@@ -6126,6 +6313,142 @@ async fn cancelled_factory_creation_aborts_pending_managed_replicator() {
     assert!(matches!(open.await, Err(error) if error.is_cancelled()));
     let control = captured.lock().unwrap().clone().unwrap();
     assert!(matches!(control.open().await, Err(RuntimeError::Closed)));
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn managed_capability_registration_is_exact_and_cleans_every_partial_state() {
+    let runtime = PodRuntime::new(
+        identity(1, "managed-pre-reservation"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let registration = runtime.testing_replicator_registration();
+    let capability = Arc::new(TrackingManagedCapability::default());
+    let reservation = ReplicatorCreationReservation(1);
+    assert!(
+        registration
+            .register_managed_lifecycle(capability.clone(), reservation)
+            .await
+            .is_err()
+    );
+    assert!(
+        registration
+            .register_managed_data_plane(capability, reservation)
+            .await
+            .is_err()
+    );
+
+    let runtime = PodRuntime::new(
+        identity(1, "managed-duplicates"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let registration = runtime.testing_replicator_registration();
+    let reservation = registration.reserve_replicator_creation().unwrap();
+    let capability = Arc::new(TrackingManagedCapability::default());
+    registration
+        .register_managed_lifecycle(capability.clone(), reservation)
+        .await
+        .unwrap();
+    assert!(
+        registration
+            .register_managed_lifecycle(capability.clone(), reservation)
+            .await
+            .is_err()
+    );
+    registration
+        .register_managed_data_plane(capability.clone(), reservation)
+        .await
+        .unwrap();
+    assert!(
+        registration
+            .register_managed_data_plane(capability.clone(), reservation)
+            .await
+            .is_err()
+    );
+    registration.cancel_replicator_creation(reservation);
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 2);
+    assert!(
+        registration
+            .register_managed_lifecycle(capability.clone(), reservation)
+            .await
+            .is_err()
+    );
+    let retry = registration.reserve_replicator_creation().unwrap();
+    registration.cancel_replicator_creation(retry);
+
+    for lifecycle_only in [true, false] {
+        let runtime = PodRuntime::new(
+            identity(
+                1,
+                if lifecycle_only {
+                    "managed-lifecycle-only"
+                } else {
+                    "managed-data-plane-only"
+                },
+            ),
+            Arc::new(TestApplication::default()),
+            Arc::new(MemoryAuthorityStore::default()),
+        );
+        let registration = runtime.testing_replicator_registration();
+        let reservation = registration.reserve_replicator_creation().unwrap();
+        let capability = Arc::new(TrackingManagedCapability::default());
+        if lifecycle_only {
+            registration
+                .register_managed_lifecycle(capability.clone(), reservation)
+                .await
+                .unwrap();
+        } else {
+            registration
+                .register_managed_data_plane(capability.clone(), reservation)
+                .await
+                .unwrap();
+        }
+        let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
+        assert!(
+            registration
+                .register_interfaces(&interfaces, None, reservation)
+                .await
+                .is_err()
+        );
+        registration.cancel_replicator_creation(reservation);
+        assert_eq!(capability.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    let runtime = PodRuntime::new(
+        identity(1, "managed-late-registration"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let registration = runtime.testing_replicator_registration();
+    let reservation = registration.reserve_replicator_creation().unwrap();
+    let capability = Arc::new(TrackingManagedCapability::default());
+    registration
+        .register_managed_lifecycle(capability.clone(), reservation)
+        .await
+        .unwrap();
+    registration
+        .register_managed_data_plane(capability.clone(), reservation)
+        .await
+        .unwrap();
+    let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
+    registration
+        .register_interfaces(&interfaces, None, reservation)
+        .await
+        .unwrap();
+    assert!(
+        registration
+            .register_managed_lifecycle(capability.clone(), reservation)
+            .await
+            .is_err()
+    );
+    assert!(
+        registration
+            .register_managed_data_plane(capability, reservation)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

@@ -76,30 +76,41 @@ pub trait StateReplicator: Send + Sync {
 
 #[async_trait]
 #[doc(hidden)]
-pub trait ManagedReplicator: Send + Sync {
+pub trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
-    async fn recover_pending_writes(&self) -> Result<()>;
-    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()>;
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
-    fn abort(&self);
     async fn complete_open(&self, replication_address: String) -> Result<()>;
     async fn attach_interfaces(
         &self,
         control: Arc<dyn Replicator>,
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()>;
+    async fn next_outbound(&self) -> Option<OutboundOperation>;
+    fn abort(&self);
+}
+
+#[async_trait]
+#[doc(hidden)]
+pub trait ManagedReplicatorDataPlane: Send + Sync {
+    async fn recover_pending_writes(&self) -> Result<()>;
+    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()>;
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
+    async fn observe_acknowledgement(
+        &self,
+        acknowledgement: ReplicationAck,
+        session: ProcessSessionId,
+    ) -> Result<()>;
     async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()>;
     async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy>;
     async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()>;
     async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck>;
     async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication>;
-    async fn next_outbound(&self) -> Option<OutboundOperation>;
+    fn abort(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,12 +275,20 @@ impl ReplicatorFactoryContext {
         context
     }
 
-    async fn register_managed(&self, managed: Arc<dyn ManagedReplicator>) -> Result<()> {
+    async fn register_managed<T>(&self, managed: Arc<T>) -> Result<()>
+    where
+        T: ManagedReplicatorLifecycle + ManagedReplicatorDataPlane + 'static,
+    {
         let reservation = self.reservation.ok_or_else(|| {
             RuntimeError::Application("managed replicator registration is not reserved".into())
         })?;
+        let lifecycle: Arc<dyn ManagedReplicatorLifecycle> = managed.clone();
         self.registration
-            .register_managed(managed, reservation)
+            .register_managed_lifecycle(lifecycle, reservation)
+            .await?;
+        let data_plane: Arc<dyn ManagedReplicatorDataPlane> = managed;
+        self.registration
+            .register_managed_data_plane(data_plane, reservation)
             .await
     }
 }
@@ -308,9 +327,15 @@ pub trait ReplicatorRegistration: Send + Sync {
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
 
-    async fn register_managed(
+    async fn register_managed_lifecycle(
         &self,
-        managed: Arc<dyn ManagedReplicator>,
+        lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<()>;
+
+    async fn register_managed_data_plane(
+        &self,
+        data_plane: Arc<dyn ManagedReplicatorDataPlane>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()>;
 

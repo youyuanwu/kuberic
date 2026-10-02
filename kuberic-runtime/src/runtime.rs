@@ -7,8 +7,9 @@ use std::sync::{Arc, Weak};
 use bytes::Bytes;
 use futures::StreamExt;
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ReplicaId, ReplicaIdentity,
-    ReplicaRole, SecondaryRemovalPreparation, SecondaryRemovalStage, SecondaryScaleDownCleanup,
+    AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaId,
+    ReplicaIdentity, ReplicaRole, SecondaryRemovalPreparation, SecondaryRemovalStage,
+    SecondaryScaleDownCleanup,
 };
 use kuberic_protocol::validation::{
     validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
@@ -36,7 +37,8 @@ use crate::replicator::copy::{
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
 use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
 use crate::replicator::{
-    ManagedReplicator, PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator,
+    ManagedReplicatorDataPlane, ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation,
+    ReplicaSetQuorumMode, Replicator,
 };
 use crate::{Result, RuntimeError};
 
@@ -3562,7 +3564,7 @@ impl DefaultReplicatorInner {
 }
 
 #[async_trait::async_trait]
-impl ManagedReplicator for DefaultReplicatorInner {
+impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
     async fn complete_open(&self, replication_address: String) -> Result<()> {
         self.complete_open(replication_address).await
     }
@@ -3573,34 +3575,6 @@ impl ManagedReplicator for DefaultReplicatorInner {
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()> {
         self.attach_interfaces(control, primary).await
-    }
-
-    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
-        self.begin_write(write).await
-    }
-
-    async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
-        self.accept_acknowledgement(acknowledgement).await
-    }
-
-    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
-        self.prepare_copy(request).await
-    }
-
-    async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
-        self.accept_copy_acknowledgement(acknowledgement).await
-    }
-
-    async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck> {
-        self.receive_copy_item(item).await
-    }
-
-    async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication> {
-        self.weak_self
-            .upgrade()
-            .ok_or(RuntimeError::Closed)?
-            .receive_replication(item)
-            .await
     }
 
     async fn next_outbound(&self) -> Option<OutboundOperation> {
@@ -3709,14 +3683,6 @@ impl ManagedReplicator for DefaultReplicatorInner {
         self.restore_authority().await
     }
 
-    async fn recover_pending_writes(&self) -> Result<()> {
-        self.recover_pending_local_writes().await
-    }
-
-    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()> {
-        self.repair_peer_from_history(identity, progress).await
-    }
-
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
         if matches!(
             action,
@@ -3798,6 +3764,61 @@ impl ManagedReplicator for DefaultReplicatorInner {
         drop(state);
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    fn abort(&self) {
+        self.control_abort();
+    }
+}
+
+#[async_trait::async_trait]
+impl ManagedReplicatorDataPlane for DefaultReplicatorInner {
+    async fn recover_pending_writes(&self) -> Result<()> {
+        self.recover_pending_local_writes().await
+    }
+
+    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()> {
+        self.repair_peer_from_history(identity, progress).await
+    }
+
+    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
+        self.begin_write(write).await
+    }
+
+    async fn observe_acknowledgement(
+        &self,
+        acknowledgement: ReplicationAck,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        self.execute_action(RuntimeEffectAction::ObserveReplicationAck {
+            acknowledgement: Box::new(acknowledgement),
+            session,
+        })
+        .await
+    }
+
+    async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
+        self.accept_acknowledgement(acknowledgement).await
+    }
+
+    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        self.prepare_copy(request).await
+    }
+
+    async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
+        self.accept_copy_acknowledgement(acknowledgement).await
+    }
+
+    async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck> {
+        self.receive_copy_item(item).await
+    }
+
+    async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication> {
+        self.weak_self
+            .upgrade()
+            .ok_or(RuntimeError::Closed)?
+            .receive_replication(item)
+            .await
     }
 
     fn abort(&self) {
