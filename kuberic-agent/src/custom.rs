@@ -1902,6 +1902,7 @@ impl CustomReplicatorHost {
             tokio::select! {
                 item = receiver.recv() => return item,
                 _ = changed => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
             }
         }
     }
@@ -1982,7 +1983,10 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
                 return Ok(());
             }
             self.ensure_build_generation(build_id, generation).await?;
-            changed.await;
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
         }
     }
 
