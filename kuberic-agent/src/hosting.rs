@@ -1185,6 +1185,9 @@ impl RuntimeHost {
             return;
         }
         if let Some(registered) = self.registered.get() {
+            if let Some(lifecycle) = registered.lifecycle() {
+                lifecycle.notify_abort();
+            }
             registered.abort();
         } else if let Ok(mut pending) = self.pending_managed_capabilities.lock()
             && let Some(pending) = pending.take()

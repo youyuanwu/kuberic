@@ -38,6 +38,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     async fn complete_open(&self, address: String) -> Result<()>;
     async fn complete_close(&self) -> Result<()>;
     async fn complete_abort(&self);
+    fn notify_abort(&self);
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
@@ -105,6 +106,10 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 
     async fn complete_abort(&self) {
         self.common.terminate().await.ok();
+    }
+
+    fn notify_abort(&self) {
+        self.common.notify_abort();
     }
 
     async fn fence_writes(&self) -> Result<()> {
@@ -505,6 +510,10 @@ impl ReplicatorLifecycleHost {
 
     pub(super) async fn complete_abort(&self) {
         self.backend.complete_abort().await;
+    }
+
+    pub(super) fn notify_abort(&self) {
+        self.backend.notify_abort();
     }
 
     pub(super) async fn fence_writes(&self) -> Result<()> {
@@ -1881,7 +1890,24 @@ impl CustomReplicatorHost {
         self.configure().await
     }
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
-        self.receiver.lock().await.recv().await
+        loop {
+            if self.host.upgrade().is_none_or(|host| {
+                host.aborted.load(std::sync::atomic::Ordering::Acquire)
+                    || host.closed.load(std::sync::atomic::Ordering::Acquire)
+            }) {
+                return None;
+            }
+            let changed = self.changed.notified();
+            let mut receiver = self.receiver.lock().await;
+            tokio::select! {
+                item = receiver.recv() => return item,
+                _ = changed => {}
+            }
+        }
+    }
+
+    fn notify_abort(&self) {
+        self.changed.notify_waiters();
     }
 }
 
@@ -1897,6 +1923,10 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
 
     async fn complete_abort(&self) {
         self.terminate().await.ok();
+    }
+
+    fn notify_abort(&self) {
+        CustomReplicatorHost::notify_abort(self);
     }
 
     async fn fence_writes(&self) -> Result<()> {

@@ -4715,6 +4715,41 @@ async fn blocked_progress_never_publishes_access_before_proof() {
 }
 
 #[tokio::test]
+async fn direct_runtime_abort_terminates_common_outbound_poll() {
+    let local = identity(1, "custom-abort-outbound");
+    let control = Arc::new(CustomRoleGate::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local,
+        Arc::new(CustomRoleService(control)),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("custom-abort-outbound"),
+            ProcessSessionId::new("session-1"),
+        )
+        .unwrap();
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    let outbound = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.data_plane().next_outbound().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!outbound.is_finished());
+    runtime.abort();
+    assert!(
+        timeout(Duration::from_secs(1), outbound)
+            .await
+            .expect("common outbound poll remained blocked after abort")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn managed_pending_write_recovery_never_publishes_access_before_proof() {
     let local = identity(1, "managed-proof-primary");
     let secondary = identity(2, "managed-proof-secondary");
