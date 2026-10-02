@@ -607,6 +607,28 @@ impl PodRuntime {
         self.host.lifecycle()?.cancel_outbound_build(build_id).await
     }
 
+    pub async fn wait_for_build_completion(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<()> {
+        self.host
+            .lifecycle()?
+            .wait_for_build_completion(build_id, target)
+            .await
+    }
+
+    pub async fn observe_build_completion(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectResult> {
+        self.host.observe_build_completion(effect).await
+    }
+
+    pub async fn discard_cancelled_build_effect(&self, effect: &RuntimeEffect) -> Result<()> {
+        self.host.discard_cancelled_build_effect(effect).await
+    }
+
     pub async fn reissue_outbound_build(
         &self,
         build_id: OperationId,
@@ -673,9 +695,15 @@ impl PodRuntime {
         if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
             lifecycle.refresh_custom_progress().await?;
         } else {
-            self.host
+            let result = self
+                .host
                 .execute_custom_action(RuntimeEffectAction::RefreshApplicationProgress)
-                .await?;
+                .await;
+            if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
+                self.host.state.write().await.fallback_snapshot.open = false;
+                return Ok(());
+            }
+            result?;
         }
         Ok(())
     }
@@ -1365,26 +1393,28 @@ impl RuntimeHost {
             let state = self.state.read().await;
             if let Some(previous) = state.effects.get(&effect.sequence) {
                 if effect == previous.effect {
-                    return Ok(previous.result.clone());
+                    drop(state);
+                } else {
+                    return Err(RuntimeError::EffectConflict {
+                        sequence: effect.sequence,
+                    });
                 }
-                return Err(RuntimeError::EffectConflict {
-                    sequence: effect.sequence,
-                });
-            }
-            let expected = state
-                .effects
-                .last_key_value()
-                .map_or(Some(effect.sequence), |(sequence, _)| {
-                    sequence.checked_add(1)
-                })
-                .ok_or_else(|| {
-                    RuntimeError::InvalidReplication("effect sequence exhausted".into())
-                })?;
-            if effect.sequence != expected {
-                return Err(RuntimeError::EffectOutOfOrder {
-                    expected,
-                    observed: effect.sequence,
-                });
+            } else {
+                let expected = state
+                    .effects
+                    .last_key_value()
+                    .map_or(Some(effect.sequence), |(sequence, _)| {
+                        sequence.checked_add(1)
+                    })
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidReplication("effect sequence exhausted".into())
+                    })?;
+                if effect.sequence != expected {
+                    return Err(RuntimeError::EffectOutOfOrder {
+                        expected,
+                        observed: effect.sequence,
+                    });
+                }
             }
         }
         self.lifecycle()?.cancel_outbound_build(build_id).await?;
@@ -1394,6 +1424,77 @@ impl RuntimeHost {
             .iter()
             .any(|build| &build.authority.build_id == build_id)
         {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        let result = RuntimeEffectResult {
+            operation_id: effect.operation_id.clone(),
+            sequence: effect.sequence,
+            postcondition: snapshot_postcondition(snapshot),
+        };
+        self.state.write().await.effects.insert(
+            result.sequence,
+            AppliedEffect {
+                effect,
+                result: result.clone(),
+            },
+        );
+        Ok(result)
+    }
+
+    async fn discard_cancelled_build_effect(&self, effect: &RuntimeEffect) -> Result<()> {
+        if !matches!(effect.action, RuntimeEffectAction::BuildReplica { .. }) {
+            return Err(RuntimeError::Application(
+                "only a build effect can be discarded after cancellation".into(),
+            ));
+        }
+        let _guard = self.effect_lock.lock().await;
+        let mut state = self.state.write().await;
+        match state.effects.get(&effect.sequence) {
+            Some(previous) if previous.effect == *effect => {
+                state.effects.remove(&effect.sequence);
+                Ok(())
+            }
+            Some(_) => Err(RuntimeError::EffectConflict {
+                sequence: effect.sequence,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    async fn observe_build_completion(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        let (build_id, target) = match &effect.action {
+            RuntimeEffectAction::BuildReplica {
+                build_id, target, ..
+            } => (build_id, target),
+            _ => {
+                return Err(RuntimeError::Application(
+                    "only a build effect can observe build completion".into(),
+                ));
+            }
+        };
+        let _guard = self.effect_lock.lock().await;
+        let previous = self
+            .state
+            .read()
+            .await
+            .effects
+            .get(&effect.sequence)
+            .cloned()
+            .ok_or(RuntimeError::EffectOutOfOrder {
+                expected: effect.sequence,
+                observed: effect.sequence,
+            })?;
+        if previous.effect != effect {
+            return Err(RuntimeError::EffectConflict {
+                sequence: effect.sequence,
+            });
+        }
+        let snapshot = self.snapshot().await;
+        if !snapshot.builds.iter().any(|build| {
+            &build.authority.build_id == build_id
+                && &build.authority.target == target
+                && build.completed
+        }) {
             return Err(RuntimeError::ReconfigurationPending);
         }
         let result = RuntimeEffectResult {

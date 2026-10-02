@@ -4223,6 +4223,11 @@ struct CustomRoleGate {
     wait: AtomicBool,
     fail: AtomicBool,
     grant_error: AtomicUsize,
+    progress_calls: AtomicUsize,
+    observed_granted_progress: AtomicBool,
+    block_progress: AtomicBool,
+    progress_entered: Notify,
+    progress_released: Notify,
     partition: Mutex<Option<StatefulServicePartition>>,
     configurations: Mutex<Vec<kuberic_runtime::replicator::ReplicaSetConfiguration>>,
     operations: Mutex<Vec<Bytes>>,
@@ -4252,10 +4257,18 @@ impl Replicator for CustomRoleGate {
     }
     fn abort(&self) {}
     async fn current_progress(&self) -> Result<i64> {
+        let progress_call = self.progress_calls.fetch_add(1, Ordering::SeqCst);
+        if self.block_progress.swap(false, Ordering::SeqCst) {
+            self.progress_entered.notify_one();
+            self.progress_released.notified().await;
+        }
         let partition = self.partition.lock().unwrap().clone();
         if let Some(partition) = partition
             && partition.get_write_status().await? == AccessStatus::Granted
         {
+            self.observed_granted_progress.store(true, Ordering::SeqCst);
+        }
+        if progress_call > 1 {
             match self.grant_error.load(Ordering::SeqCst) {
                 1 => return Err(RuntimeError::ReconfigurationPending),
                 2 => return Err(RuntimeError::Application("grant failed".into())),
@@ -4536,6 +4549,74 @@ impl StatefulServiceReplica for CustomRoleService {
 }
 
 #[tokio::test]
+async fn blocked_progress_never_publishes_access_before_proof() {
+    let local = identity(1, "blocked-progress");
+    let control = Arc::new(CustomRoleGate::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("blocked-progress"),
+            ProcessSessionId::new("session-1"),
+        )
+        .unwrap();
+    let mut sequence = 1;
+    for action in [
+        RuntimeEffectAction::Open(OpenMode::New),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(local.clone(), vec![local]))),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+    ] {
+        recovery_action(&runtime, &mut sequence, action).await;
+    }
+    control.block_progress.store(true, Ordering::SeqCst);
+    let grant = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    4,
+                    RuntimeEffectAction::SetAccessStatus {
+                        read: AccessStatus::Granted,
+                        write: AccessStatus::Granted,
+                    },
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .expect("progress proof did not block");
+    let partition = control.partition.lock().unwrap().clone().unwrap();
+    for _ in 0..32 {
+        assert_ne!(
+            partition.get_read_status().await.unwrap(),
+            AccessStatus::Granted
+        );
+        assert_ne!(
+            partition.get_write_status().await.unwrap(),
+            AccessStatus::Granted
+        );
+        let snapshot = runtime.snapshot().await;
+        assert_ne!(snapshot.read_status, AccessStatus::Granted);
+        assert_ne!(snapshot.write_status, AccessStatus::Granted);
+        tokio::task::yield_now().await;
+    }
+    control.progress_released.notify_one();
+    grant.await.unwrap().unwrap();
+    assert_eq!(
+        partition.get_read_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+    assert_eq!(
+        partition.get_write_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+}
+
+#[tokio::test]
 async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it() {
     for (error, supersede) in [(1, 0), (1, 1), (1, 2), (2, 0), (3, 0)] {
         let directory = tempfile::tempdir().unwrap();
@@ -4606,6 +4687,11 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
             store.load_state().await.unwrap().write_status,
             AccessStatus::Granted
         );
+        assert!(
+            !gate.observed_granted_progress.load(Ordering::SeqCst),
+            "durable grant intent must not be visible while progress proof is pending"
+        );
+        gate.grant_error.store(0, Ordering::SeqCst);
         if supersede == 1 {
             RuntimeAdapter::new(store.clone(), runtime.clone())
                 .execute(effect(
@@ -4634,7 +4720,6 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
                 .await
                 .unwrap();
         }
-        gate.grant_error.store(0, Ordering::SeqCst);
         let report = reporter.report(&runtime).await.unwrap();
         assert_eq!(
             report.write_status,

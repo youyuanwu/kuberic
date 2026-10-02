@@ -41,7 +41,7 @@ impl<S: AgentStore> AgentReporter<S> {
         for _ in 0..3 {
             let state = self.store.load_state().await?;
             let snapshot = runtime.snapshot().await;
-            let catch_up_capability = if snapshot.open {
+            let catch_up_capability = if snapshot.open && snapshot.role != ReplicaRole::None {
                 Some(runtime.catch_up_capability().await?)
             } else {
                 None

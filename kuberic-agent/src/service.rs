@@ -842,9 +842,10 @@ where
                 }
             }
             ProtocolCommand::EnsureConfiguration(command) => {
-                self.coordinator
-                    .ensure_configuration(*command)
+                let coordinator = self.coordinator.clone();
+                tokio::spawn(async move { coordinator.ensure_configuration(*command).await })
                     .await
+                    .map_err(|error| Status::internal(error.to_string()))?
                     .map_err(status_from_agent)?;
             }
             ProtocolCommand::PrepareSwitchover(command) => {
@@ -868,9 +869,10 @@ where
                         .await
                         .map_err(status_from_runtime)?;
                 }
-                self.coordinator
-                    .ensure_build(*command)
+                let coordinator = self.coordinator.clone();
+                tokio::spawn(async move { coordinator.ensure_build(*command).await })
                     .await
+                    .map_err(|error| Status::internal(error.to_string()))?
                     .map_err(status_from_agent)?;
             }
         }
