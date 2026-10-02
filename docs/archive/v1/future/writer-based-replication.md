@@ -170,13 +170,13 @@ the operator itself.
 
 ### Architecture Overview
 
-This is a **new, parallel system** — not a modification of the
-existing `kuberic-operator`. The two systems share some low-level
-components (proto definitions, `QuorumTracker` logic) but are
-independently deployable.
+The proposal described a **new, parallel system** rather than a modification
+of the then-existing classic operator. It assumed the two systems could share
+low-level concepts while being deployed independently; that coexistence
+baseline was later removed.
 
 ```
-Existing system (unchanged)          New system (this design)
+Historical classic baseline          Proposed writer system
 ─────────────────────────────        ────────────────────────────
 kuberic-operator                     kuberic-writer-op
   ├─ Primary election                  ├─ Replica set management
@@ -207,9 +207,9 @@ Pod roles: Primary / Secondary       Pod roles: None (all equal)
 
 ### What the New System Does NOT Need
 
-The following machinery from `kuberic-operator` / `kuberic-core` is
-**not present** in the new system (the existing system keeps all of
-it):
+The following machinery from `kuberic-operator` / `kuberic-core` was
+**not present** in the proposed system (the historical baseline contained all
+of it):
 
 | Not needed in new system | Exists in `kuberic-core` | Why it existed |
 |---|---|---|
@@ -934,7 +934,7 @@ self-ACK).
 #### 6. Crash Recovery: The In-Doubt Writer Contract
 
 Crash recovery is the central design challenge of separating the
-Writer from the replicas. With the existing leader-based design,
+Writer from the replicas. With the former leader-based design,
 the primary IS a replica — its local state is authoritative on
 failover, and no external tracking is needed. With a separated
 Writer, the question becomes: when the Writer crashes or is fenced
@@ -1319,7 +1319,7 @@ and classic implementation are now historical.
 | `AccessStatus` gating | All replicas accept writes |
 | Primary election | No primary to elect |
 
-### Reused from Existing System
+### Proposed Reuse from the Historical Baseline
 
 | Component | How reused |
 |---|---|
@@ -1370,15 +1370,15 @@ The "1 RTT" claim only holds for **in-cluster Writer + in-cluster
 replicas** topology, which is the only supported scope (see Scope
 at the top of this document).
 
-| Topology | Existing leader-based | Writer-based (in-doubt) | Win? |
+| Topology | Historical leader-based baseline | Writer-based (in-doubt) | Win? |
 |---|---|---|---|
 | In-cluster Writer + in-cluster replicas | 2 RTT (intra-cluster, ~3R) | 1 RTT (intra-cluster, ~R) | ✅ ~50-67% reduction |
 | In-cluster Writer + cross-AZ replicas | 2 RTT (1 intra, 1 cross-AZ) | 1 RTT (slowest of W cross-AZ) | ✅ ~30-50% reduction (depends on AZ count and replica placement) |
 | ~~Out-of-cluster Writer (cross-region, laptop, CI)~~ | — | — | **Out of scope** — see Scope. The latency benefit does not hold across WAN; failure-domain coupling becomes problematic. |
 
-**Out-of-cluster Writer is out of scope.** Use the existing
-leader-based system or deploy the
-Writer in-cluster.
+**Out-of-cluster Writer was out of scope.** The original proposal referred
+those workloads to the then-existing leader-based system or required an
+in-cluster Writer. That leader-based implementation has since been removed.
 
 Note: The coordinator stream is long-lived and carries only
 infrequent config events — it adds no latency to the write path.
@@ -1432,20 +1432,20 @@ Writer — the payload is complete and self-describing.
 | **Any page/WAL-level replication** | Replication payload (pages, WAL frames) is produced as a side effect of local storage engine operations. Cannot be separated from the data. |
 | **Workloads requiring local reads** | If the Writer must serve reads from the data it writes, it needs local state — defeating the "Writer has no data" principle. |
 
-### SQLite → Use Leader-Based System
+### Historical SQLite Recommendation
 
-The existing `kuberic-operator` (leader-based, SF-style) is the
-correct choice for replicated SQLite and similar workloads where the
-write path is coupled to local storage. The primary hosts the SQLite
-DB, executes SQL, captures WAL frames, and replicates them. This
-coupling is inherent to SQLite's architecture, not a design limitation.
+The original proposal recommended the then-existing leader-based operator for
+replicated SQLite and similar workloads where the write path was coupled to
+local storage. The primary hosted the SQLite DB, executed SQL, captured WAL
+frames and replicated them. The classic implementation used for that
+recommendation has since been removed.
 
-### Decision Rule
+### Historical Decision Rule
 
 ```
 Can the app produce the replication payload WITHOUT local state?
   YES → Writer-based system (this design)
-  NO  → Leader-based system (kuberic-operator)
+  NO  → Then-existing leader-based system
 ```
 
 ---
@@ -1766,7 +1766,7 @@ is not sent. This is essential for correctness:
   (fence-first-then-query), then a new Writer starts at
   `authority_lsn + 1` with a clean slate.
 
-This matches the existing leader-based system's pattern: when a
+This matched the former leader-based system's pattern: when a
 primary cannot reach quorum, it gets demoted; the new primary's
 `max(received_lsn)` defines truth.
 
@@ -2097,7 +2097,7 @@ event).
 | Coordinator crashes mid-recovery | Next coordinator resumes from CRD `recovery_phase` | Recovery completes idempotently | ✓ No partial-fence state |
 | Caller invokes after poison | Return `WriterPoisoned` | No state change | ✓ Clean signal — app should be restarting |
 | Pre-send validation fails | Return `PreSendFailure` | No replica saw the op | ✓ User told clean failure |
-| All replicas dead | Return `InDoubt`, poison; quorum loss | Data loss recovery (existing protocol) | ✓ Same as existing system |
+| All replicas dead | Return `InDoubt`, poison; quorum loss | Data loss recovery (historical protocol) | ✓ Same as the historical baseline |
 | Old Writer reconnects with retired writer_id | Coordinator returns `WriterRetired` error | Old Writer must clear ID and restart | ✓ No cascading takeover |
 
 ### Caller Contract
@@ -2128,7 +2128,7 @@ match writer.replicate(data).await {
         // - Avoids the trap of trying to "retry InDoubt with idempotency
         //   tokens" — application logic for that is subtle and mistakes
         //   silently double-write.
-        // - Aligns with the existing leader-based system's failover
+        // - Aligns with the former leader-based system's failover
         //   semantics: a primary crash also forces transport-error
         //   in-doubt at the client; clients must handle this anyway.
         // - The Writer is poisoned after this; no further ops will
@@ -2220,7 +2220,7 @@ restarting.
 The in-doubt contract trades **Writer availability and throughput**
 for **latency + correctness**:
 
-| Aspect | Existing leader-based | With in-doubt contract |
+| Aspect | Historical leader-based baseline | With in-doubt contract |
 |---|---|---|
 | Write latency (steady state) | 2 RTT (client→primary→secondary) | 1 RTT (Writer→replicas, in-cluster only) |
 | Throughput per partition | High (pipelined) | ~1/RTT (~1000 ops/sec at 1ms RTT) |
@@ -2247,7 +2247,7 @@ and a new Writer takes over.
   ops; the in-flight op completes before the pause takes effect.
   After replacement, `ResumeWrites` lets writes flow again. This
   prevents InDoubt storms during routine pod replacement, mirroring
-  the existing leader-based system's behavior during reconfiguration.
+  the former leader-based system's behavior during reconfiguration.
 - **Pre-flight checks**: refuse to start a new op (return
   `PreSendFailure`) when the coordinator reports < W replicas
   reachable. Avoids sending ops predestined to be in-doubt.
@@ -2360,15 +2360,18 @@ The contract shifts the design space from
 tolerate occasional Writer takeovers (with appropriate idempotency
 in client code) get the latency benefit at full correctness.
 
-### When to Choose Each Design
+### Historical Design Comparison
 
-| Workload | Recommendation |
+| Workload | Original proposal recommendation |
 |---|---|
 | Lowest write latency required, app handles InDoubt by restart | Writer-based with in-doubt contract |
-| Writer must stay logically up across transient failures (no app-restart cost acceptable) | Existing leader-based (`kuberic-operator`) |
+| Writer must stay logically up across transient failures (no app-restart cost acceptable) | Then-existing leader-based system |
 | App lifecycle includes graceful crash/restart already | Writer-based with in-doubt contract |
-| Throughput-critical (>1000 ops/sec per partition) | Existing leader-based (writer-based caps at ~1/RTT due to single-op-in-flight) |
-| Cross-region or out-of-cluster Writer deployment | Existing leader-based (writer-based is in-cluster only) |
+| Throughput-critical (>1000 ops/sec per partition) | Then-existing leader-based system (writer-based caps at ~1/RTT due to single-op-in-flight) |
+| Cross-region or out-of-cluster Writer deployment | Then-existing leader-based system (writer-based is in-cluster only) |
+
+This table records the proposal's original comparison; it is not a current
+workload-selection guide.
 
 ---
 
@@ -2482,9 +2485,9 @@ load testing. As a rough guide:
 - Sidecar topology: ≈ pod-replacement rate (1-5 / day for typical
   rolling deployments)
 
-If observed takeover rate is unacceptable, consider escalating to
-the sidecar topology or switching back to the existing leader-based
-system.
+The original proposal suggested escalating to the sidecar topology or returning
+to the then-existing leader-based system if takeover rate was unacceptable.
+That fallback implementation has since been removed.
 
 ---
 
@@ -2552,7 +2555,7 @@ Replica behavior:
    - `applied_lsn` advancing but slowly = replica is behind but
      progressing → retry with larger timeout, or wait.
 
-This pattern is **NOT** equivalent to the existing leader-based
+This pattern is **NOT** equivalent to the former leader-based
 "primary is always up-to-date" semantic; the application must thread
 the LSN through. The trade-off is that reads can be load-balanced
 across all N replicas instead of single-pointing through the primary.
@@ -2963,16 +2966,17 @@ If multiple coordinator pods are deployed (HA via replication):
    is no longer needed for replication-side correctness, but
    application-side LSN tracking remains required for read-after-write.
 6. **Single writer only** — this system is designed for exactly one
-   Writer. For multi-writer workloads, use the existing
-   `kuberic-operator` (leader-based) system.
+   Writer. The original proposal referred multi-writer workloads to the
+   then-existing leader-based system, which has since been removed.
 
 ---
 
 ## Implementation Plan
 
-All work is in **new crates and a new operator**. The existing
-`kuberic-operator` and `kuberic-core` are not modified (except for
-extracting `QuorumTracker` to a shared crate).
+The proposal placed all work in **new crates and a new operator**. It assumed
+the classic operator/runtime would remain unchanged except for extracting
+`QuorumTracker` to a shared crate. Those implementation-plan assumptions are
+historical.
 
 ### Phase 1: Shared Components
 
@@ -3090,12 +3094,13 @@ where epoch propagation to replicas is not atomic. A partitioned-
 but-alive "zombie" Writer could still send items to replicas that
 haven't yet received the epoch bump.
 
-**This is not a new problem.** The existing leader-based system also needs
+**This was not a new problem relative to the historical baseline.** The former
+leader-based system also needed
 old-primary isolation while durable failover applies a new epoch, commits the
 new authority, and converges retained secondaries. Unverifiable convergence
 fails closed rather than becoming a successful stable snapshot.
 
-The existing system accepts this because:
+The historical baseline accepted this because:
 - Epoch propagation is **in-cluster** (operator → replicas), so it's
   fast (milliseconds)
 - Once a replica receives the epoch bump, it truncates uncommitted
@@ -3114,14 +3119,14 @@ epoch arrives at affected replicas.
 **Mitigated by the Writer Lifecycle Protocol** (see section 2,
 Coordinator): graceful shutdown sends `WriterShutdown` before
 disconnect, so the coordinator skips fencing on clean restarts.
-Crash restarts trigger immediate `writer_epoch` bump, same as the
-existing system's failover.
+Crash restarts were designed to trigger an immediate `writer_epoch` bump,
+matching the former system's failover.
 
 **Lease considered and not adopted.** A lease would add crash
 recovery latency (must wait for expiry) without meaningful safety
 improvement — epoch fencing already truncates uncommitted ops.
 
-**Severity: consider** (inherited from existing system, not a new
+**Severity: consider** (inherited from the historical baseline, not a new
 risk). Improvements (lease, synchronous fence token) would benefit
 both systems equally and can be designed as a shared enhancement.
 
@@ -3131,10 +3136,10 @@ The Writer's `ReplicationQueue` is in-memory. If the Writer crashes
 during a replica build, the queue is lost and the zero-gap invariant
 is broken for the in-progress build.
 
-**This is the same as the existing system.** Today's primary also has
-an in-memory `ReplicationQueue` (`queue.rs`). If the primary crashes
-during a build, the queue is lost. The existing system handles this
-by aborting the in-progress build: the operator detects primary
+**This matched the historical baseline.** The former primary also had
+an in-memory `ReplicationQueue` (`queue.rs`). If the primary crashed
+during a build, the queue was lost. The former system handled this
+by aborting the in-progress build: the operator detected primary
 failure, triggers durable failover, and the new primary restarts the build
 from scratch through durable add/rebuild. The partially-built secondary is
 closed and rebuilt.
@@ -3153,10 +3158,9 @@ closed and rebuilt.
 - The alternative (Writer-side WAL or replica-side query) adds
   significant complexity for a rare edge case
 
-**Severity downgraded to consider.** The existing system has lived
-with this behavior. The "abort builds on Writer crash" solution is
-the recommended approach — simple, matches existing behavior, no new
-infrastructure needed.
+**Severity downgraded to consider.** The proposal treated the former system's
+behavior as precedent. Its recommended approach was to abort builds on Writer
+crash because that matched the historical baseline without new infrastructure.
 
 The more complex solutions (Writer-side WAL, replica-side ops query)
 remain available as future optimizations if build frequency or build
@@ -3177,8 +3181,8 @@ the coordinator is unreachable (no `BuildComplete` to resume GC), the
 Writer's in-memory queue grows without bound. Since the Writer is
 embedded in the user app, this can cause OOM in the user process.
 
-**The existing system has this too** — the primary's in-memory
-`ReplicationQueue` grows during builds. But the primary runs in a
+**The historical baseline had this too** — the primary's in-memory
+`ReplicationQueue` grew during builds. But the primary ran in a
 dedicated pod with Kubernetes resource limits, so OOM only kills the
 pod (which triggers failover). The Writer runs in the user's
 process, where OOM is more damaging.
