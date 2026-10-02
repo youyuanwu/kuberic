@@ -7033,7 +7033,7 @@ async fn cancelling_an_exact_outbound_build_terminates_only_its_pending_wait() {
 }
 
 #[tokio::test]
-async fn default_build_effect_dispatches_before_waiting_for_copy_completion() {
+async fn default_build_effect_dispatches_without_waiting_for_copy_completion() {
     let runtime = open_primary(
         Arc::new(TestApplication::default()),
         vec![identity(1, "primary")],
@@ -7041,35 +7041,26 @@ async fn default_build_effect_dispatches_before_waiting_for_copy_completion() {
     .await;
     let build_id = OperationId::new("async-default-build");
     let target = identity(2, "target");
-    let pending = {
-        let runtime = runtime.clone();
-        let build_id = build_id.clone();
-        let target = target.clone();
-        tokio::spawn(async move {
-            runtime
-                .apply_effect(effect(
-                    5,
-                    RuntimeEffectAction::BuildReplica {
-                        build_id,
-                        target,
-                        replication_address: "http://target".into(),
-                    },
-                ))
-                .await
-        })
-    };
+    timeout(
+        Duration::from_secs(1),
+        runtime.apply_effect(effect(
+            5,
+            RuntimeEffectAction::BuildReplica {
+                build_id: build_id.clone(),
+                target: target.clone(),
+                replication_address: "http://target".into(),
+            },
+        )),
+    )
+    .await
+    .expect("build effect dispatch must be non-blocking")
+    .unwrap();
     assert!(matches!(
         timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
             .await
             .unwrap(),
         Some(OutboundReplication::Build(endpoint))
             if endpoint.build_id == build_id && endpoint.identity == target
-    ));
-    assert!(!pending.is_finished());
-    runtime.cancel_outbound_build(&build_id).await.unwrap();
-    assert!(matches!(
-        pending.await.unwrap(),
-        Err(RuntimeError::OperationCancelled)
     ));
 }
 

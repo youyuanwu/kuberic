@@ -30,6 +30,15 @@ pub trait RuntimeEffectExecutor: Send + Sync {
     async fn cancel_build(&self, _build_id: &OperationId) -> Result<()> {
         Ok(())
     }
+
+    async fn reissue_build(
+        &self,
+        _build_id: OperationId,
+        _target: kuberic_protocol::types::ReplicaIdentity,
+        _replication_address: String,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -51,6 +60,15 @@ impl RuntimeEffectExecutor for PodRuntime {
 
     async fn cancel_build(&self, build_id: &OperationId) -> Result<()> {
         Ok(PodRuntime::cancel_outbound_build(self, build_id).await?)
+    }
+
+    async fn reissue_build(
+        &self,
+        build_id: OperationId,
+        target: kuberic_protocol::types::ReplicaIdentity,
+        replication_address: String,
+    ) -> Result<()> {
+        Ok(PodRuntime::reissue_outbound_build(self, build_id, target, replication_address).await?)
     }
 }
 
@@ -74,7 +92,19 @@ where
 
     pub async fn execute(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         match self.store.begin_effect(&effect).await? {
-            BeginEffect::Completed(result) => Ok(*result),
+            BeginEffect::Completed(result) => {
+                if let kuberic_runtime_internal::effects::RuntimeEffectAction::BuildReplica {
+                    build_id,
+                    target,
+                    replication_address,
+                } = effect.action
+                {
+                    self.executor
+                        .reissue_build(build_id, target, replication_address)
+                        .await?;
+                }
+                Ok(*result)
+            }
             BeginEffect::Execute(effect) | BeginEffect::Pending(effect) => {
                 let result = match self.executor.apply_runtime_effect(effect.clone()).await {
                     Ok(result) => result,

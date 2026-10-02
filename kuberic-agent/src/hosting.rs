@@ -607,6 +607,32 @@ impl PodRuntime {
         self.host.lifecycle()?.cancel_outbound_build(build_id).await
     }
 
+    pub async fn reissue_outbound_build(
+        &self,
+        build_id: OperationId,
+        target: ReplicaIdentity,
+        replication_address: String,
+    ) -> Result<()> {
+        let lifecycle = self.host.lifecycle()?;
+        let snapshot = lifecycle.snapshot().await;
+        if snapshot.builds.iter().any(|build| {
+            build.authority.build_id == build_id
+                && build.authority.target == target
+                && build.completed
+                && build.durable_lsn >= snapshot.current_progress
+        }) {
+            return Ok(());
+        }
+        lifecycle
+            .enqueue_custom_build(ReplicaEndpoint {
+                build_id,
+                identity: target,
+                replication_address,
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn repair_peer(&self, identity: ReplicaIdentity, progress: i64) -> Result<()> {
         self.host
             .managed_data_plane()?
@@ -1282,11 +1308,7 @@ impl RuntimeHost {
                     Err(RuntimeError::Application(_)) => false,
                     Err(error) => return Err(error),
                 };
-                if dispatched {
-                    self.lifecycle()?
-                        .wait_for_build_completion(&endpoint.build_id, &endpoint.identity)
-                        .await?;
-                } else {
+                if !dispatched {
                     self.registered
                         .get()
                         .and_then(|registered| registered.primary())

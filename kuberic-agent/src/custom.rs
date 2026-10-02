@@ -13,7 +13,7 @@ use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{BuildAuthority, BuildSelection, DurableBuildProgress};
 use kuberic_runtime_internal::effects::{BuildPostcondition, RuntimeEffectAction, RuntimeSnapshot};
 use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
-use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use super::{RuntimeHost, empty_snapshot};
 #[path = "custom_removal.rs"]
@@ -43,11 +43,6 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()>;
     async fn next_outbound(&self) -> Option<OutboundOperation>;
-    async fn wait_for_build_completion(
-        &self,
-        build_id: &OperationId,
-        target: &ReplicaIdentity,
-    ) -> Result<()>;
 
     async fn select_build(&self, _authority: &BuildAuthority) -> Result<()> {
         Ok(())
@@ -179,33 +174,6 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         }
     }
 
-    async fn wait_for_build_completion(
-        &self,
-        build_id: &OperationId,
-        target: &ReplicaIdentity,
-    ) -> Result<()> {
-        let generation = self.common.build_generation(build_id).await;
-        loop {
-            let changed = self.common.changed.notified();
-            let snapshot = self.legacy.snapshot().await;
-            if snapshot.builds.iter().any(|build| {
-                &build.authority.build_id == build_id
-                    && &build.authority.target == target
-                    && build.completed
-                    && build.durable_lsn >= snapshot.current_progress
-            }) {
-                return Ok(());
-            }
-            self.common
-                .ensure_build_generation(build_id, generation)
-                .await?;
-            tokio::select! {
-                _ = changed => {}
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-            }
-        }
-    }
-
     async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
         let _gate = self.common.gate.lock().await;
         self.common.select_build_inner(authority).await
@@ -313,16 +281,6 @@ impl ReplicatorLifecycleHost {
         self.backend.next_outbound().await
     }
 
-    pub(super) async fn wait_for_build_completion(
-        &self,
-        build_id: &OperationId,
-        target: &ReplicaIdentity,
-    ) -> Result<()> {
-        self.backend
-            .wait_for_build_completion(build_id, target)
-            .await
-    }
-
     pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
         self.backend.select_build(authority).await
     }
@@ -373,7 +331,6 @@ pub(super) struct CustomReplicatorHost {
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
     outbound: mpsc::Sender<OutboundOperation>,
     receiver: Mutex<mpsc::Receiver<OutboundOperation>>,
-    changed: Notify,
 }
 
 impl CustomReplicatorHost {
@@ -409,7 +366,6 @@ impl CustomReplicatorHost {
             removal_witnesses: RwLock::default(),
             outbound,
             receiver: Mutex::new(receiver),
-            changed: Notify::new(),
         }
     }
 
@@ -813,7 +769,6 @@ impl CustomReplicatorHost {
             completed: true,
             catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
         });
-        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -966,26 +921,6 @@ impl CustomReplicatorHost {
                 .checked_add(1)
                 .ok_or(RuntimeError::OperationCancelled)?;
         }
-        self.changed.notify_waiters();
-        Ok(())
-    }
-
-    async fn build_generation(&self, id: &OperationId) -> u64 {
-        self.build_generations
-            .read()
-            .await
-            .get(id)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    async fn ensure_build_generation(&self, id: &OperationId, generation: u64) -> Result<()> {
-        self.host()?;
-        if self.build_generation(id).await != generation
-            || self.retired_builds.read().await.contains(id)
-        {
-            return Err(RuntimeError::OperationCancelled);
-        }
         Ok(())
     }
 
@@ -1058,7 +993,6 @@ impl CustomReplicatorHost {
                     .await
                     .builds
                     .retain(|b| b.authority.build_id != id);
-                self.changed.notify_waiters();
                 Ok(())
             }
             _ => Err(RuntimeError::Application(
@@ -1079,7 +1013,6 @@ impl CustomReplicatorHost {
             .await
             .builds
             .retain(|b| &b.authority.build_id != id);
-        self.changed.notify_waiters();
         Ok(())
     }
 }
@@ -1472,27 +1405,6 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
 
     async fn next_outbound(&self) -> Option<OutboundOperation> {
         CustomReplicatorHost::next_outbound(self).await
-    }
-
-    async fn wait_for_build_completion(
-        &self,
-        build_id: &OperationId,
-        target: &ReplicaIdentity,
-    ) -> Result<()> {
-        let generation = CustomReplicatorHost::build_generation(self, build_id).await;
-        loop {
-            let changed = self.changed.notified();
-            let snapshot = CustomReplicatorHost::snapshot(self).await;
-            if snapshot.builds.iter().any(|build| {
-                &build.authority.build_id == build_id
-                    && &build.authority.target == target
-                    && build.completed
-            }) {
-                return Ok(());
-            }
-            self.ensure_build_generation(build_id, generation).await?;
-            changed.await;
-        }
     }
 
     async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
