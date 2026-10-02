@@ -23,9 +23,9 @@ The leader-based operator used as the comparison baseline was later removed.
 > Related: [Leaderless Quorum Research](../../../background/leaderless-quorum-replication.md),
 > [WAL Persistence](wal-persistence.md)
 >
-> **This is a new, separate system.** The existing `kuberic-operator`
-> (leader-based, SF-style) is not modified. Users choose one or the
-> other per workload.
+> **Historical assumption:** This proposal originally envisioned a new system
+> built alongside the leader-based classic operator. That baseline has since
+> been removed; there is no current workload choice between the two.
 
 > **Key design properties:**
 > - **In-Doubt Writer Contract** (see [section](#in-doubt-writer-contract)):
@@ -1289,10 +1289,11 @@ ops works identically — replicas receive ops and acknowledge them.
 
 ---
 
-## New System vs. Existing System
+## Proposed System vs. Historical Baseline
 
-The existing `kuberic-operator` + `kuberic-core` system is **not
-modified**. The new system is built alongside it.
+The proposal assumed the classic operator/runtime would remain unchanged while
+the writer system was developed alongside it. Both the coexistence assumption
+and classic implementation are now historical.
 
 ### New Components (to build)
 

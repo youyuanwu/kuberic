@@ -91,18 +91,32 @@ versioned installation assets and compatibility guidance remains deferred.
 
 ## Deferred Scale-Down Follow-Ups
 
-The following remain outside v1 removal:
+These remain v2 roadmap work, not prerequisites for the completed classic
+source deletion. P1 identifies availability/status boundaries, P2 is
+maintainability or policy expansion, and P3 requires a new recovery protocol.
 
-- automatic or atomic direct-primary removal;
-- independent target/minimum replica policy;
+| Priority | Follow-up | Deferred change class |
+|---|---|---|
+| P1 | Durable per-member Kubernetes resource provenance | Persist exact original Pod/PVC/endpoint identity before disappearance so pre-admission loss can converge. This requires a durable lifecycle/status contract rather than inferring absence from lists. |
+| P1 | CRD/status compaction and boundary redesign | Reference context-bound preparation/retirement records from their frozen intent; separate replication proof, Kubernetes cleanup obligation and request metadata. Coordinate status, wire/store, recovery and serialized-size validation. |
+| P2 | Shared candidate-selection, exact-cleanup and command-binding helpers | Mechanical refactoring may reduce duplicate policy/identity checks while retaining layer-specific installed-authority and live-session validation. |
+| P2 | Independent target/minimum and placement-aware policy | New API, placement input and availability policy are required; current highest-ID selection and target=min remain deliberately narrow. |
+| P2 design / P3 implementation | Automatic direct-primary removal composition | The supported composition is planned switchover followed by secondary scale-down. A single movement/removal/recovery request requires a new orchestration protocol. |
+| P1 design / P3 implementation | Frozen-primary recovery during removal/cleanup | Safe continuation or overlap with failover requires a cross-epoch recovery and cleanup-ownership protocol; frozen evidence must not be weakened. |
+| P3 | Multi-member removal in one reconfiguration | Batch removal changes quorum, identity, evidence and cleanup semantics; current reductions remain sequential. |
+| P3 | Durable primary-agent phase coordinator | Per-member ordering, witness freezing, PC/CC progression and restart replay require a durable cross-replica coordination protocol. Desired policy remains controller-owned and Kubernetes cleanup authority stays outside the replicator. |
+| P2 | Scale-up operational budget and performance characterization | Existing bounded tests do not define maximum replica count, completion SLO, throughput target or outage bound. |
+
+Compaction must preserve typed structural schemas, exact contextual evidence and
+late-member recovery. Opaque schemas, hash-only receipts and TTL evidence
+deletion are not substitutes for a coordinated redesign.
+
+Other deferred v2 work includes:
+
 - configurable PVC retention and storage size;
-- validated maximum replica-count guidance;
 - automatic rolling image/protocol upgrades;
 - node-maintenance orchestration for v2;
 - application data import or resource conversion.
-
-These items are v2 roadmap work, not prerequisites for the completed classic
-source deletion.
 
 ## Preserved Independent Components
 

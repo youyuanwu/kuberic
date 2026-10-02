@@ -14,7 +14,7 @@ This is a separate system from both the former leader-based
 operator and the Writer-based design
 (`writer-based-replication.md`).
 
-> **Status:** Active design alternative. Shares the **API contract**
+> **Status:** Archived design alternative. Shares the **API contract**
 > of the [In-Doubt Writer Contract](writer-based-replication.md#in-doubt-writer-contract):
 > - `Ok(lsn)` / `PreSendFailure` / `InDoubt` / `WriterPoisoned`
 > - Single-op-in-flight serialization (Writer caps throughput at
