@@ -4,9 +4,51 @@ cluster_context := "kind-" + cluster_name
 kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-config.yaml")
 ownership_receipt := kubeconfig + ".kuberic-owner"
 level_token := env_var_or_default("KUBERIC_AGENT_BEARER_TOKEN", "")
+nextest_archive := env_var_or_default("NEXTEST_ARCHIVE", "target/nextest/kuberic-tests.tar.zst")
+ordinary_filter := "not package(=postgres-replicated) and not binary(=kubernetes_checkpoint_real)"
+postgres_filter := "package(=postgres-replicated)"
 
 # Build the retained level-triggered binaries.
 default: level-triggered-build
+
+# Install the repository-pinned cargo-nextest binary.
+install-nextest:
+    scripts/install_nextest.sh
+
+# Build one reusable all-features test archive.
+nextest-archive: install-nextest
+    mkdir -p "$(dirname "{{ nextest_archive }}")"
+    cargo nextest archive --workspace --all-features --profile ci \
+        --archive-file "{{ nextest_archive }}"
+
+# Validate exact-once repository tiers and all configured partitions.
+nextest-validate: install-nextest
+    python3 scripts/validate_nextest_partitions.py
+
+# Validate exact-once tiers and partitions from the reusable archive.
+nextest-validate-archive: install-nextest
+    python3 scripts/validate_nextest_partitions.py \
+        --archive-file "{{ nextest_archive }}"
+
+# Run the cluster-free repository tier, optionally as slice N/M.
+nextest-test partition="": install-nextest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    partition_args=()
+    if [[ -n "{{ partition }}" ]]; then
+      partition_args=(--partition "slice:{{ partition }}")
+    fi
+    cargo nextest run --profile ci -E '{{ ordinary_filter }}' "${partition_args[@]}"
+
+# Run the PostgreSQL tier serially, optionally as hash shard N/M.
+nextest-postgres partition="": install-nextest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    partition_args=()
+    if [[ -n "{{ partition }}" ]]; then
+      partition_args=(--partition "hash:{{ partition }}")
+    fi
+    cargo nextest run --profile postgres -E '{{ postgres_filter }}' "${partition_args[@]}"
 
 # Create the local Kind cluster and write its kubeconfig.
 create-kind-cluster:
@@ -116,7 +158,8 @@ level-triggered-kind-test *scenarios: verify-kind-context
       esac
       started=$SECONDS
       echo "=== level-triggered scenario: $scenario ==="
-      cargo test -p kuberic-level-tests "$test_name" -- --ignored --exact --nocapture
+      cargo nextest run --profile kind --run-ignored only \
+        -E "group(=kind-live) and test(=${test_name})" --no-capture
       echo "=== $scenario passed in $((SECONDS - started))s ==="
     done
 
