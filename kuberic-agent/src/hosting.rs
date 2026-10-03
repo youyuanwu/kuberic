@@ -2058,7 +2058,13 @@ impl RuntimeHost {
             state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
         }
         if let Ok(managed) = self.lifecycle() {
-            managed.fence_writes().await?;
+            managed.cancel_configuration_work().await?;
+            managed
+                .set_access(
+                    AccessStatus::ReconfigurationPending,
+                    AccessStatus::ReconfigurationPending,
+                )
+                .await?;
         }
         if let Err(error) = registered.close().await {
             if let Ok(managed) = self.lifecycle() {

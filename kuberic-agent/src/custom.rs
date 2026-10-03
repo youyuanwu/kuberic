@@ -32,6 +32,17 @@ struct BuildReceipt {
     attempt_generation: u64,
 }
 
+struct AccessProjection {
+    read: AccessStatus,
+    write: AccessStatus,
+    authority: Option<AdmittedAuthority>,
+    configuration: Option<ReplicaSetConfiguration>,
+    sessions: BTreeMap<ReplicaIdentity, ProcessSessionId>,
+    role: kuberic_protocol::types::ReplicaRole,
+    configuration_generation: u64,
+    faulted_grant: bool,
+}
+
 type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -178,9 +189,21 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 
     async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         let generation = self.legacy.prepare_access(read, write).await?;
-        self.common.restore_access(read, write).await?;
+        let projection = match self.common.prepare_access_projection(read, write).await {
+            Err(RuntimeError::ReconfigurationPending) => {
+                *self.common.restored_access.write().await = Some((read, write));
+                return Err(RuntimeError::ReconfigurationPending);
+            }
+            result => result?,
+        };
         if let Err(error) = self.legacy.publish_access(read, write, generation).await {
             self.common.fence_managed_access().await?;
+            return Err(error);
+        }
+        if let Err(error) = self.common.publish_access_projection(projection).await {
+            self.legacy.fence_writes().await?;
+            self.common.fence_managed_access().await?;
+            self.sync_engine_proof().await?;
             return Err(error);
         }
         self.sync_engine_proof().await
@@ -405,6 +428,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         target: &ReplicaIdentity,
     ) -> Result<()> {
         let generation = self.common.build_generation(build_id).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(75);
         loop {
             let changed = self.common.changed.notified();
             let snapshot = self.snapshot().await;
@@ -419,6 +443,9 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             self.common
                 .ensure_build_generation(build_id, generation)
                 .await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RuntimeError::OperationCancelled);
+            }
             tokio::select! {
                 _ = changed => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
@@ -444,10 +471,13 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
         let authority_before = self.common.state.read().await.authority.clone();
         let sessions_before = self.common.sessions.read().await.clone();
+        let configuration_generation = self.common.configuration_generation.load(Ordering::Acquire);
         self.legacy.remove_replica_proof(replica_id).await?;
         self.common.active_host()?;
         if authority_before != self.common.state.read().await.authority
             || sessions_before != *self.common.sessions.read().await
+            || configuration_generation
+                != self.common.configuration_generation.load(Ordering::Acquire)
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -535,11 +565,15 @@ impl ManagedLifecycleBackend {
 
     async fn execute_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         let generation = self.legacy.prepare_access(read, write).await?;
-        self.common
-            .apply_common_action(RuntimeEffectAction::SetAccessStatus { read, write })
-            .await?;
+        let projection = self.common.prepare_access_projection(read, write).await?;
         if let Err(error) = self.legacy.publish_access(read, write, generation).await {
             self.common.fence_managed_access().await?;
+            return Err(error);
+        }
+        if let Err(error) = self.common.publish_access_projection(projection).await {
+            self.legacy.fence_writes().await?;
+            self.common.fence_managed_access().await?;
+            self.sync_engine_proof().await?;
             return Err(error);
         }
         self.sync_engine_proof().await
@@ -811,11 +845,11 @@ pub(super) struct CustomReplicatorHost {
     retired_builds: RwLock<BTreeSet<OperationId>>,
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
-    configuration: RwLock<Option<ReplicaSetConfiguration>>,
+    configuration: Arc<RwLock<Option<ReplicaSetConfiguration>>>,
     deferred_configuration: Mutex<Option<DeferredConfiguration>>,
     deferred_configuration_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     configuration_generation: Arc<AtomicU64>,
-    configuration_commit: Mutex<()>,
+    configuration_commit: Arc<Mutex<()>>,
     restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
@@ -853,11 +887,11 @@ impl CustomReplicatorHost {
             retired_builds: RwLock::default(),
             build_generations: RwLock::default(),
             receipts: RwLock::default(),
-            configuration: RwLock::default(),
+            configuration: Arc::new(RwLock::default()),
             deferred_configuration: Mutex::new(None),
             deferred_configuration_abort: StdMutex::new(None),
             configuration_generation: Arc::new(AtomicU64::new(0)),
-            configuration_commit: Mutex::new(()),
+            configuration_commit: Arc::new(Mutex::new(())),
             restored_access: RwLock::default(),
             removal_witnesses: RwLock::default(),
             outbound,
@@ -1171,8 +1205,7 @@ impl CustomReplicatorHost {
         let Some(mut handle) = self.deferred_configuration.lock().await.take() else {
             return Ok(());
         };
-        self.deferred_configuration_abort.lock().unwrap().take();
-        let (generation, current) =
+        let (generation, _) =
             match tokio::time::timeout(std::time::Duration::from_secs(75), &mut handle).await {
                 Ok(result) => result.map_err(|error| {
                     if error.is_cancelled() {
@@ -1186,13 +1219,8 @@ impl CustomReplicatorHost {
                     return Err(RuntimeError::OperationCancelled);
                 }
             };
-        let _commit = self.configuration_commit.lock().await;
+        self.deferred_configuration_abort.lock().unwrap().take();
         self.ensure_configuration_generation(generation)?;
-        *self.configuration.write().await = Some(current);
-        if let Err(error) = self.ensure_configuration_generation(generation) {
-            *self.configuration.write().await = None;
-            return Err(error);
-        }
         Ok(())
     }
 
@@ -1219,6 +1247,9 @@ impl CustomReplicatorHost {
         }
         let generation = self.advance_configuration_generation()?;
         let configuration_generation = self.configuration_generation.clone();
+        let configuration = self.configuration.clone();
+        let configuration_commit = self.configuration_commit.clone();
+        let host = self.host.clone();
         let primary = self.primary.clone();
         let handle = tokio::spawn(async move {
             let current = tokio::time::timeout(
@@ -1228,6 +1259,23 @@ impl CustomReplicatorHost {
             .await
             .map_err(|_| RuntimeError::OperationCancelled)??;
             if configuration_generation.load(Ordering::Acquire) != generation {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            let _commit = configuration_commit.lock().await;
+            let active = host.upgrade().is_some_and(|host| {
+                !host.aborted.load(std::sync::atomic::Ordering::Acquire)
+                    && !host.closed.load(std::sync::atomic::Ordering::Acquire)
+            });
+            if !active || configuration_generation.load(Ordering::Acquire) != generation {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            *configuration.write().await = Some(current.clone());
+            let still_active = host.upgrade().is_some_and(|host| {
+                !host.aborted.load(std::sync::atomic::Ordering::Acquire)
+                    && !host.closed.load(std::sync::atomic::Ordering::Acquire)
+            });
+            if !still_active || configuration_generation.load(Ordering::Acquire) != generation {
+                *configuration.write().await = None;
                 return Err(RuntimeError::OperationCancelled);
             }
             Ok((generation, current))
@@ -1244,7 +1292,11 @@ impl CustomReplicatorHost {
         };
         let generation = {
             let _commit = self.configuration_commit.lock().await;
-            self.advance_configuration_generation()?
+            if self.configuration.read().await.as_ref() == Some(&current) {
+                self.configuration_generation.load(Ordering::Acquire)
+            } else {
+                self.advance_configuration_generation()?
+            }
         };
         let current =
             Self::apply_configuration_update(self.primary.clone(), current, previous).await?;
@@ -1258,7 +1310,11 @@ impl CustomReplicatorHost {
         Ok(())
     }
 
-    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+    async fn prepare_access_projection(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<AccessProjection> {
         *self.restored_access.write().await = None;
         let host = self.host()?;
         let faulted_grant = (read == AccessStatus::Granted || write == AccessStatus::Granted)
@@ -1275,6 +1331,7 @@ impl CustomReplicatorHost {
         let configuration_before = self.published_configuration().await;
         let sessions_before = self.sessions.read().await.clone();
         let role_before = host.state.read().await.fallback_snapshot.role;
+        let configuration_generation = self.configuration_generation.load(Ordering::Acquire);
         if write == AccessStatus::Granted {
             if role_before != kuberic_protocol::types::ReplicaRole::Primary {
                 return Err(RuntimeError::NotPrimary);
@@ -1320,28 +1377,57 @@ impl CustomReplicatorHost {
             return Err(error);
         }
         self.active_host()?;
-        if authority_before != self.state.read().await.authority
-            || configuration_before != self.published_configuration().await
-            || sessions_before != *self.sessions.read().await
-            || role_before != host.state.read().await.fallback_snapshot.role
+        let projection = AccessProjection {
+            read,
+            write,
+            authority: authority_before,
+            configuration: configuration_before,
+            sessions: sessions_before,
+            role: role_before,
+            configuration_generation,
+            faulted_grant,
+        };
+        self.validate_access_projection(&projection).await?;
+        Ok(projection)
+    }
+
+    async fn validate_access_projection(&self, projection: &AccessProjection) -> Result<()> {
+        let host = self.active_host()?;
+        if projection.authority != self.state.read().await.authority
+            || projection.configuration != self.published_configuration().await
+            || projection.sessions != *self.sessions.read().await
+            || projection.role != host.state.read().await.fallback_snapshot.role
+            || projection.configuration_generation
+                != self.configuration_generation.load(Ordering::Acquire)
         {
             return Err(RuntimeError::OperationCancelled);
         }
+        Ok(())
+    }
+
+    async fn publish_access_projection(&self, projection: AccessProjection) -> Result<()> {
+        self.validate_access_projection(&projection).await?;
         {
             let mut state = self.state.write().await;
-            state.read_status = read;
-            state.write_status = write;
+            state.read_status = projection.read;
+            state.write_status = projection.write;
         }
         {
+            let host = self.active_host()?;
             let mut state = host.state.write().await;
-            state.fallback_snapshot.read_status = read;
-            state.fallback_snapshot.write_status = write;
+            state.fallback_snapshot.read_status = projection.read;
+            state.fallback_snapshot.write_status = projection.write;
         }
-        if faulted_grant {
+        if projection.faulted_grant {
             Err(RuntimeError::ReconfigurationPending)
         } else {
             Ok(())
         }
+    }
+
+    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        let projection = self.prepare_access_projection(read, write).await?;
+        self.publish_access_projection(projection).await
     }
 
     async fn record_completion(&self, receipt: BuildReceipt) -> Result<()> {
@@ -1491,6 +1577,7 @@ impl CustomReplicatorHost {
         };
         let authority_before = self.state.read().await.authority.clone();
         let sessions_before = self.sessions.read().await.clone();
+        let configuration_generation = self.configuration_generation.load(Ordering::Acquire);
         let progress = match self.control.current_progress().await {
             Ok(progress) => progress,
             Err(RuntimeError::ReconfigurationPending) => {
@@ -1508,6 +1595,7 @@ impl CustomReplicatorHost {
         self.active_host()?;
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
+            || configuration_generation != self.configuration_generation.load(Ordering::Acquire)
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -1568,6 +1656,7 @@ impl CustomReplicatorHost {
             .ok_or(RuntimeError::OperationCancelled)?;
         drop(generations);
         let mut operation = OutboundOperation::Build(endpoint);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(75);
         loop {
             match self.outbound.try_send(operation) {
                 Ok(()) => return Ok(()),
@@ -1579,6 +1668,9 @@ impl CustomReplicatorHost {
                 }
             }
             self.host()?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RuntimeError::QueueFull);
+            }
             let changed = self.changed.notified();
             tokio::select! {
                 _ = changed => {}
@@ -1980,6 +2072,7 @@ impl CustomReplicatorHost {
     ) -> Result<()> {
         let host = self.host()?;
         retired.validate(&host.identity)?;
+        self.invalidate_configuration_attempts().await?;
         *self.restored_access.write().await = None;
         self.removal_witnesses.write().await.clear();
         {
@@ -2198,11 +2291,12 @@ impl CustomReplicatorHost {
     }
 
     async fn wait_for_common_catchup(&self) -> Result<()> {
-        let (authority_before, sessions_before) = {
+        let (authority_before, sessions_before, configuration_generation) = {
             let _gate = self.gate.lock().await;
             (
                 self.state.read().await.authority.clone(),
                 self.sessions.read().await.clone(),
+                self.configuration_generation.load(Ordering::Acquire),
             )
         };
         self.primary
@@ -2213,6 +2307,7 @@ impl CustomReplicatorHost {
         self.active_host()?;
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
+            || configuration_generation != self.configuration_generation.load(Ordering::Acquire)
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -2223,11 +2318,12 @@ impl CustomReplicatorHost {
     }
 
     async fn authorize_common_failover_prefix(&self, boundary: i64) -> Result<()> {
-        let (authority_before, sessions_before) = {
+        let (authority_before, sessions_before, configuration_generation) = {
             let _gate = self.gate.lock().await;
             (
                 self.state.read().await.authority.clone(),
                 self.sessions.read().await.clone(),
+                self.configuration_generation.load(Ordering::Acquire),
             )
         };
         let progress = self.control.current_progress().await?;
@@ -2235,6 +2331,7 @@ impl CustomReplicatorHost {
         self.active_host()?;
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
+            || configuration_generation != self.configuration_generation.load(Ordering::Acquire)
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -2280,6 +2377,7 @@ impl CustomReplicatorHost {
             }
         };
         if replaced {
+            self.invalidate_build_attempts().await?;
             self.fence_writes().await?;
         }
         self.configure().await
@@ -2454,6 +2552,7 @@ impl CustomReplicatorHost {
             }
             RuntimeEffectAction::FenceRetirement(retired) => {
                 retired.validate(&host.identity)?;
+                self.invalidate_configuration_attempts().await?;
                 host.default_dependencies
                     .replica_authority_store
                     .record_retirement_started(&retired)
@@ -2818,6 +2917,7 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         target: &ReplicaIdentity,
     ) -> Result<()> {
         let generation = self.build_generation(build_id).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(75);
         loop {
             let changed = self.changed.notified();
             let snapshot = CustomReplicatorHost::snapshot(self).await;
@@ -2830,6 +2930,9 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
             }
 
             self.ensure_build_generation(build_id, generation).await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RuntimeError::OperationCancelled);
+            }
             tokio::select! {
                 _ = changed => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
@@ -2844,14 +2947,16 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
         let authority_before = self.state.read().await.authority.clone();
         let sessions_before = self.sessions.read().await.clone();
+        let configuration_generation = self.configuration_generation.load(Ordering::Acquire);
         self.primary.remove_replica(replica_id).await?;
         self.active_host()?;
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
+            || configuration_generation != self.configuration_generation.load(Ordering::Acquire)
         {
             return Err(RuntimeError::OperationCancelled);
         }
-        Ok(())
+        self.remove_managed_replica(replica_id).await
     }
 
     async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {

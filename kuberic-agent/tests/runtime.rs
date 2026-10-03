@@ -6219,48 +6219,188 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
     );
 }
 
-#[test]
-fn synthetic_custom_guarantee_matrix_covers_all_categories() {
-    let source = include_str!("runtime.rs");
-    for (category, test) in [
-        (
-            "build",
-            "independent_custom_primary_with_state_capability_keeps_sf_effect_hosting",
+#[tokio::test]
+async fn synthetic_custom_build_requires_exact_receipt() {
+    let (runtime, _, _, peer) = blocked_lifecycle_fixture("synthetic-build").await;
+    let authority = runtime
+        .authorize_build(
+            OperationId::new("synthetic-build"),
+            peer.clone(),
+            BuildConfiguration::Current,
+        )
+        .await
+        .unwrap();
+    let wrong = identity(3, "synthetic-build-wrong");
+    assert!(
+        kuberic_agent::testing::execute_build(
+            &runtime,
+            ReplicaInformation::new(
+                authority.build_id.clone(),
+                wrong,
+                "in-process://wrong".into(),
+            ),
+        )
+        .await
+        .is_err()
+    );
+    kuberic_agent::testing::execute_build(
+        &runtime,
+        ReplicaInformation::new(
+            authority.build_id,
+            peer,
+            "in-process://synthetic-build".into(),
         ),
-        (
-            "progress",
-            "custom_restored_access_defers_only_pending_and_new_intent_supersedes_it",
-        ),
-        (
-            "reconfiguration",
-            "independent_custom_primary_with_state_capability_keeps_sf_effect_hosting",
-        ),
-        (
-            "failover",
-            "custom_primary_role_completion_gates_writes_and_replays_only_its_durable_effect",
-        ),
-        (
-            "switchover",
-            "custom_removal_uses_sf_catchup_and_never_projects_raw_witness_progress",
-        ),
-        (
-            "replacement",
-            "newer_epoch_supersedes_failed_custom_primary_role_without_reusing_its_receipt",
-        ),
-        (
-            "access",
-            "blocked_progress_never_publishes_access_before_proof",
-        ),
-        (
-            "restart",
-            "custom_restored_access_defers_only_pending_and_new_intent_supersedes_it",
-        ),
-    ] {
-        assert!(
-            source.contains(&format!("fn {test}")),
-            "synthetic custom {category} coverage is missing {test}"
-        );
+    )
+    .await
+    .unwrap();
+    assert!(
+        runtime
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .any(|build| build.completed)
+    );
+}
+
+#[tokio::test]
+async fn synthetic_custom_progress_requires_exact_authority() {
+    exercise_blocked_lifecycle_invalidation(
+        BlockedLifecycleCallback::Progress,
+        LifecycleInvalidation::Authority,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn synthetic_custom_reconfiguration_uses_exact_sessions() {
+    exercise_blocked_lifecycle_invalidation(
+        BlockedLifecycleCallback::Configuration,
+        LifecycleInvalidation::Session,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn synthetic_custom_failover_fences_stale_completion() {
+    exercise_blocked_lifecycle_invalidation(
+        BlockedLifecycleCallback::Catchup,
+        LifecycleInvalidation::Authority,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn synthetic_custom_switchover_requires_all_catchup() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("synthetic-switchover").await;
+    runtime
+        .primary_replicator()
+        .await
+        .unwrap()
+        .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+        .await
+        .unwrap();
+    assert_eq!(
+        control.catchups.lock().unwrap().as_slice(),
+        [ReplicaSetQuorumMode::All]
+    );
+}
+
+#[tokio::test]
+async fn synthetic_custom_replacement_rejects_retired_session() {
+    exercise_blocked_lifecycle_invalidation(
+        BlockedLifecycleCallback::Build,
+        LifecycleInvalidation::Session,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn synthetic_custom_access_is_proof_before_publish() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("synthetic-access").await;
+    control.block_progress.store(true, Ordering::SeqCst);
+    let grant = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::set_lifecycle_access(
+                &runtime,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .unwrap();
+    assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    control.progress_released.notify_one();
+    grant.await.unwrap().unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn synthetic_custom_restart_restores_only_durable_intent() {
+    let local = identity(1, "synthetic-restart");
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let authority = authority(local.clone(), vec![local.clone()]);
+    let first_control = Arc::new(CustomRoleGate::default());
+    let first = PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(first_control)),
+        store.clone(),
+    );
+    first
+        .bind_replica_session(
+            ResourceUid::new("synthetic-restart"),
+            ProcessSessionId::new("first-session"),
+        )
+        .unwrap();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::New),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        first
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
     }
+    first.abort();
+    drop(first);
+    let reopened = PodRuntime::new(
+        local,
+        Arc::new(CustomRoleService(Arc::new(CustomRoleGate::default()))),
+        store,
+    );
+    reopened
+        .bind_replica_session(
+            ResourceUid::new("synthetic-restart"),
+            ProcessSessionId::new("second-session"),
+        )
+        .unwrap();
+    reopened
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            AccessStatus::ReconfigurationPending,
+            AccessStatus::ReconfigurationPending,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.snapshot().await.authority, Some(authority));
+    assert_ne!(
+        reopened.snapshot().await.write_status,
+        AccessStatus::Granted
+    );
 }
 
 #[tokio::test]

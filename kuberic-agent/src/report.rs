@@ -29,10 +29,15 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub async fn report(&self, runtime: &PodRuntime) -> Result<proto::AgentStatusReport> {
-        if let Err(error) = runtime.observe_progress().await
-            && !matches!(error, kuberic_runtime::RuntimeError::ReconfigurationPending)
-        {
-            return Err(error.into());
+        for attempt in 0..100 {
+            match runtime.observe_progress().await {
+                Ok(()) | Err(kuberic_runtime::RuntimeError::ReconfigurationPending) => break,
+                Err(kuberic_runtime::RuntimeError::OperationCancelled) if attempt < 99 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         let durable = self.store.load_state().await?;
         let snapshot = runtime.snapshot().await;
@@ -41,16 +46,23 @@ impl<S: AgentStore> AgentReporter<S> {
             && (snapshot.read_status != durable.read_status
                 || snapshot.write_status != durable.write_status)
         {
-            match runtime
-                .reconcile_durable_access(durable.read_status, durable.write_status)
-                .await
-            {
-                Err(
-                    kuberic_runtime::RuntimeError::ReconfigurationPending
-                    | kuberic_runtime::RuntimeError::NotOpen
-                    | kuberic_runtime::RuntimeError::Closed,
-                ) => {}
-                result => result?,
+            for attempt in 0..100 {
+                match runtime
+                    .reconcile_durable_access(durable.read_status, durable.write_status)
+                    .await
+                {
+                    Ok(())
+                    | Err(
+                        kuberic_runtime::RuntimeError::ReconfigurationPending
+                        | kuberic_runtime::RuntimeError::NotOpen
+                        | kuberic_runtime::RuntimeError::Closed,
+                    ) => break,
+                    Err(kuberic_runtime::RuntimeError::OperationCancelled) if attempt < 99 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         let partition = runtime.partition_report().await;
