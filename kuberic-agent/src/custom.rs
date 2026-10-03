@@ -1447,8 +1447,16 @@ impl CustomReplicatorHost {
             state.read_status = projection.read;
             state.write_status = projection.write;
         }
+        let host = match self.active_host() {
+            Ok(host) => host,
+            Err(error) => {
+                let mut state = self.state.write().await;
+                state.read_status = AccessStatus::ReconfigurationPending;
+                state.write_status = AccessStatus::ReconfigurationPending;
+                return Err(error);
+            }
+        };
         {
-            let host = self.active_host()?;
             let mut state = host.state.write().await;
             state.fallback_snapshot.read_status = projection.read;
             state.fallback_snapshot.write_status = projection.write;
@@ -1458,11 +1466,9 @@ impl CustomReplicatorHost {
             state.read_status = AccessStatus::ReconfigurationPending;
             state.write_status = AccessStatus::ReconfigurationPending;
             drop(state);
-            if let Some(host) = self.host.upgrade() {
-                let mut state = host.state.write().await;
-                state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
-                state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
-            }
+            let mut state = host.state.write().await;
+            state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
+            state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
             return Err(error);
         }
         if projection.faulted_grant {
