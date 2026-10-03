@@ -34,6 +34,25 @@ impl<S: AgentStore> AgentReporter<S> {
         {
             return Err(error.into());
         }
+        let durable = self.store.load_state().await?;
+        let snapshot = runtime.snapshot().await;
+        if durable.pending_effect.is_none()
+            && durable.reconfiguration.is_none()
+            && (snapshot.read_status != durable.read_status
+                || snapshot.write_status != durable.write_status)
+        {
+            match runtime
+                .reconcile_durable_access(durable.read_status, durable.write_status)
+                .await
+            {
+                Err(
+                    kuberic_runtime::RuntimeError::ReconfigurationPending
+                    | kuberic_runtime::RuntimeError::NotOpen
+                    | kuberic_runtime::RuntimeError::Closed,
+                ) => {}
+                result => result?,
+            }
+        }
         let partition = runtime.partition_report().await;
         self.store
             .record_partition_reports(partition.load_metrics.clone(), partition.reported_fault)
@@ -81,10 +100,15 @@ fn build_report(
         .map(|build| (build.authority.build_id.clone(), build))
         .collect::<BTreeMap<_, _>>();
     for (build_id, command) in &state.build_commands {
+        let retained_scale_up_completion = state
+            .scale_up_evidence
+            .as_ref()
+            .is_some_and(|evidence| &evidence.intent().build_id == build_id);
         if !snapshot.live_builds_only
-            && command.authority.is_none()
-            && !state.retired_builds.contains(build_id)
-            && !state.abandoned_builds.contains(build_id)
+            && ((command.authority.is_none()
+                && !state.retired_builds.contains(build_id)
+                && !state.abandoned_builds.contains(build_id))
+                || retained_scale_up_completion)
             && let Some(progress) = state.build_progress.get(build_id)
         {
             builds.entry(build_id.clone()).or_insert_with(|| {

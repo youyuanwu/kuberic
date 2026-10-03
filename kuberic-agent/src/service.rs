@@ -587,6 +587,10 @@ where
                 r.command.transition_kind
                     == kuberic_protocol::types::TransitionKind::SecondaryScaleDown
             });
+        let planned_switchover_pending = state.reconfiguration.as_ref().is_some_and(|record| {
+            record.command.transition_kind
+                == kuberic_protocol::types::TransitionKind::PlannedSwitchover
+        });
         self.runtime
             .reconstruct(
                 if state
@@ -610,6 +614,7 @@ where
                         .pending_effect
                         .as_ref()
                         .map(|pending| &pending.effect.action),
+                    removal_pending || planned_switchover_pending,
                 ),
                 transition,
             )
@@ -890,15 +895,18 @@ where
 fn startup_write_status(
     persisted: kuberic_protocol::types::AccessStatus,
     pending: Option<&kuberic_runtime_internal::effects::RuntimeEffectAction>,
+    lifecycle_pending: bool,
 ) -> kuberic_protocol::types::AccessStatus {
-    if pending.is_some_and(|action| {
-        matches!(
-            action,
-            kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover { .. }
-                | kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_)
-        )
-    }) {
+    if lifecycle_pending
+        || pending.is_some_and(|action| {
+            matches!(
+                action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover { .. }
+                    | kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                    | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_)
+            )
+        })
+    {
         kuberic_protocol::types::AccessStatus::ReconfigurationPending
     } else {
         persisted
@@ -1239,7 +1247,8 @@ mod tests {
         assert_eq!(
             startup_write_status(
                 kuberic_protocol::types::AccessStatus::Granted,
-                Some(&action)
+                Some(&action),
+                false,
             ),
             kuberic_protocol::types::AccessStatus::ReconfigurationPending
         );
@@ -1311,7 +1320,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            startup_write_status(AccessStatus::Granted, Some(&pending)),
+            startup_write_status(AccessStatus::Granted, Some(&pending), false),
             AccessStatus::Granted
         );
     }

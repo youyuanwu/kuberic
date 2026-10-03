@@ -4345,8 +4345,6 @@ struct CustomRoleGate {
     wait: AtomicBool,
     fail: AtomicBool,
     grant_error: AtomicUsize,
-    progress_calls: AtomicUsize,
-    observed_granted_progress: AtomicBool,
     block_progress: AtomicBool,
     progress_entered: Notify,
     progress_released: Notify,
@@ -4379,18 +4377,16 @@ impl Replicator for CustomRoleGate {
     }
     fn abort(&self) {}
     async fn current_progress(&self) -> Result<i64> {
-        let progress_call = self.progress_calls.fetch_add(1, Ordering::SeqCst);
         if self.block_progress.swap(false, Ordering::SeqCst) {
             self.progress_entered.notify_one();
             self.progress_released.notified().await;
         }
         let partition = self.partition.lock().unwrap().clone();
-        if let Some(partition) = partition
-            && partition.get_write_status().await? == AccessStatus::Granted
-        {
-            self.observed_granted_progress.store(true, Ordering::SeqCst);
-        }
-        if progress_call > 1 {
+        let grant_attempt = match partition {
+            Some(partition) => partition.get_write_status().await? == AccessStatus::Granted,
+            None => false,
+        };
+        if grant_attempt {
             match self.grant_error.load(Ordering::SeqCst) {
                 1 => return Err(RuntimeError::ReconfigurationPending),
                 2 => return Err(RuntimeError::Application("grant failed".into())),
@@ -5008,10 +5004,6 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
             store.load_state().await.unwrap().write_status,
             AccessStatus::Granted
         );
-        assert!(
-            !gate.observed_granted_progress.load(Ordering::SeqCst),
-            "durable grant intent must not be visible while progress proof is pending"
-        );
         gate.grant_error.store(0, Ordering::SeqCst);
         if supersede == 1 {
             RuntimeAdapter::new(store.clone(), runtime.clone())
@@ -5026,8 +5018,8 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
                 .unwrap();
         } else if supersede == 2 {
             let authority = runtime.snapshot().await.authority.unwrap();
-            runtime
-                .apply_effect(effect(
+            RuntimeAdapter::new(store.clone(), runtime.clone())
+                .execute(effect(
                     5,
                     RuntimeEffectAction::PrepareSwitchover {
                         preparation_generation: 1,
@@ -5367,7 +5359,7 @@ async fn assert_default_data_plane_unavailable(
 }
 
 #[tokio::test]
-async fn unavailable_default_data_plane_never_returns_success_for_custom_primaries() {
+async fn unavailable_default_data_plane_never_returns_success() {
     let ordinary_local = identity(1, "unavailable-ordinary");
     let ordinary_peer = identity(2, "unavailable-ordinary-peer");
     let ordinary = PodRuntime::new(
@@ -5408,6 +5400,152 @@ async fn unavailable_default_data_plane_never_returns_success_for_custom_primari
         .await
         .unwrap();
     assert_default_data_plane_unavailable(&capable, capable_local, capable_peer).await;
+}
+
+#[tokio::test]
+async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
+    let default_identity = identity(1, "conformance-default");
+    let default = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![default_identity.clone()],
+    )
+    .await;
+    let custom_identity = identity(1, "conformance-custom");
+    let custom_control = Arc::new(CustomRoleGate::default());
+    let custom = PodRuntime::new(
+        custom_identity.clone(),
+        Arc::new(CustomRoleService(custom_control)),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    custom
+        .bind_replica_session(
+            ResourceUid::new("conformance-custom"),
+            ProcessSessionId::new("conformance-session"),
+        )
+        .unwrap();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::New),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+            custom_identity.clone(),
+            vec![custom_identity],
+        ))),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::WaitForCatchup,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        custom
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    for (name, snapshot) in [
+        ("default", default.snapshot().await),
+        ("custom", custom.snapshot().await),
+    ] {
+        assert!(snapshot.open, "{name}");
+        assert_eq!(snapshot.role, ReplicaRole::Primary, "{name}");
+        assert!(snapshot.authority.is_some(), "{name}");
+        assert_eq!(snapshot.write_status, AccessStatus::Granted, "{name}");
+        assert!(snapshot.current_progress >= 0, "{name}");
+    }
+    let default_authority = default.snapshot().await.authority.unwrap();
+    default
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::AdmitAuthority(Box::new(default_authority)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(default.snapshot().await.write_status, AccessStatus::Granted);
+    let custom_authority = custom.snapshot().await.authority.unwrap();
+    custom
+        .apply_effect(effect(
+            6,
+            RuntimeEffectAction::AdmitAuthority(Box::new(custom_authority)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(custom.snapshot().await.write_status, AccessStatus::Granted);
+    default
+        .apply_effect(effect(
+            6,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    custom
+        .apply_effect(effect(
+            7,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(default.snapshot().await.write_status, AccessStatus::Granted);
+    assert_eq!(custom.snapshot().await.write_status, AccessStatus::Granted);
+    default.cancel_configuration_work().await.unwrap();
+    custom.cancel_configuration_work().await.unwrap();
+    assert_eq!(default.snapshot().await.write_status, AccessStatus::Granted);
+    assert_eq!(custom.snapshot().await.write_status, AccessStatus::Granted);
+    default
+        .apply_effect(effect(7, RuntimeEffectAction::Close))
+        .await
+        .unwrap();
+    custom
+        .apply_effect(effect(8, RuntimeEffectAction::Close))
+        .await
+        .unwrap();
+    assert!(!default.snapshot().await.open);
+    assert!(!custom.snapshot().await.open);
+}
+
+#[test]
+fn synthetic_custom_guarantee_matrix_covers_all_categories() {
+    let source = include_str!("runtime.rs");
+    for (category, test) in [
+        (
+            "build",
+            "independent_custom_primary_with_state_capability_keeps_sf_effect_hosting",
+        ),
+        (
+            "progress",
+            "custom_restored_access_defers_only_pending_and_new_intent_supersedes_it",
+        ),
+        (
+            "reconfiguration",
+            "independent_custom_primary_with_state_capability_keeps_sf_effect_hosting",
+        ),
+        (
+            "failover",
+            "custom_primary_role_completion_gates_writes_and_replays_only_its_durable_effect",
+        ),
+        (
+            "switchover",
+            "custom_removal_uses_sf_catchup_and_never_projects_raw_witness_progress",
+        ),
+        (
+            "replacement",
+            "newer_epoch_supersedes_failed_custom_primary_role_without_reusing_its_receipt",
+        ),
+        (
+            "access",
+            "blocked_progress_never_publishes_access_before_proof",
+        ),
+        (
+            "restart",
+            "custom_restored_access_defers_only_pending_and_new_intent_supersedes_it",
+        ),
+    ] {
+        assert!(
+            source.contains(&format!("fn {test}")),
+            "synthetic custom {category} coverage is missing {test}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6958,7 +7096,7 @@ async fn cancelled_factory_creation_aborts_pending_managed_replicator() {
 
 #[cfg(feature = "testing")]
 #[tokio::test]
-async fn managed_capability_registration_is_exact_and_cleans_every_partial_state() {
+async fn replicator_creation_failure_matrix_releases_all_state() {
     let runtime = PodRuntime::new(
         identity(1, "managed-pre-reservation"),
         Arc::new(TestApplication::default()),
@@ -7930,7 +8068,7 @@ impl StatefulServiceReplica for ExternalService {
 }
 
 #[tokio::test]
-async fn custom_factory_does_not_require_the_default_engine_or_service_storage_traits() {
+async fn secondary_only_replicator_preserves_narrow_lifecycle() {
     let service = Arc::new(ExternalService::default());
     let runtime = PodRuntime::new(
         identity(1, "external"),

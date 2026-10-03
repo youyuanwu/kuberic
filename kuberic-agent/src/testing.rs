@@ -578,3 +578,17 @@ pub async fn describe_peer(
 ) -> kuberic_runtime::Result<()> {
     runtime.describe_peer(replica).await
 }
+
+pub async fn execute_build(
+    runtime: &crate::hosting::PodRuntime,
+    replica: kuberic_runtime::replicator::ReplicaInformation,
+) -> kuberic_runtime::Result<()> {
+    match runtime.execute_build(replica).await? {
+        crate::hosting::BuildExecution::ApplicationCompleted => Ok(()),
+        crate::hosting::BuildExecution::BuiltInCopyRequired => {
+            Err(kuberic_runtime::RuntimeError::Application(
+                "testing custom build requested the built-in copy route".into(),
+            ))
+        }
+    }
+}

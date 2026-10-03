@@ -1497,7 +1497,11 @@ async fn scale_up_source_service_startup_restores_completed_evidence_without_rep
         .observation
         .unwrap();
     assert_eq!(response.write_status, proto::AccessStatus::Granted as i32);
-    assert!(response.builds.is_empty());
+    assert!(response.builds.iter().any(|build| {
+        build.build_id == fixture.build_id.as_str()
+            && build.completed
+            && build.catch_up_boundary_lsn == Some(0)
+    }));
     assert!(
         fixture
             .store

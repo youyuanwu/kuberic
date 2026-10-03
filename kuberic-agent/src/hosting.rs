@@ -29,8 +29,8 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::RuntimeHostToken;
 use kuberic_runtime_internal::authority::{
-    AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
-    LocalWriteJournal, ReplicaAuthorityStore, ReplicationProgressStore,
+    AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
+    BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{
     RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
@@ -39,6 +39,21 @@ use kuberic_runtime_internal::effects::{
 use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
 use kuberic_wire::proto;
 use tokio::sync::{Mutex, RwLock};
+
+tokio::task_local! {
+    static ACCESS_PROOF_VIEW: (AccessStatus, AccessStatus);
+}
+
+pub(super) async fn with_access_proof_view<F>(
+    read: AccessStatus,
+    write: AccessStatus,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    ACCESS_PROOF_VIEW.scope((read, write), future).await
+}
 
 use crate::transport::{
     copy_ack_from_proto, copy_ack_to_proto, copy_from_proto, copy_to_proto,
@@ -114,6 +129,7 @@ struct HostState {
     load_metrics: BTreeMap<String, i64>,
     reported_fault: Option<FaultType>,
     role_transition_epoch: Option<Epoch>,
+    role_transition_authority: Option<AdmittedAuthority>,
 }
 
 struct RegisteredReplicator {
@@ -364,6 +380,7 @@ impl PodRuntime {
                     load_metrics: BTreeMap::new(),
                     reported_fault: None,
                     role_transition_epoch: None,
+                    role_transition_authority: None,
                 }),
                 effect_lock: Mutex::new(()),
                 registered: OnceLock::new(),
@@ -679,6 +696,24 @@ impl PodRuntime {
         self.host.snapshot().await
     }
 
+    pub(crate) async fn reconcile_durable_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
+            lifecycle.restore_access(read, write).await?;
+            self.host
+                .sync_access_projection(lifecycle.snapshot().await)
+                .await;
+        } else {
+            let mut state = self.host.state.write().await;
+            state.fallback_snapshot.read_status = read;
+            state.fallback_snapshot.write_status = write;
+        }
+        Ok(())
+    }
+
     pub async fn primary_replicator(&self) -> Result<Arc<dyn PrimaryReplicator>> {
         let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
         let primary = registered.primary().ok_or(RuntimeError::NotPrimary)?;
@@ -988,11 +1023,17 @@ impl PartitionAccessView for HostAccessView {
     }
 
     async fn read_status(&self) -> Result<AccessStatus> {
+        if let Ok(status) = ACCESS_PROOF_VIEW.try_with(|status| status.0) {
+            return Ok(status);
+        }
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
         Ok(host.state.read().await.fallback_snapshot.read_status)
     }
 
     async fn write_status(&self) -> Result<AccessStatus> {
+        if let Ok(status) = ACCESS_PROOF_VIEW.try_with(|status| status.1) {
+            return Ok(status);
+        }
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
         Ok(host.state.read().await.fallback_snapshot.write_status)
     }
@@ -1495,6 +1536,7 @@ impl RuntimeHost {
                 self.lifecycle()?
                     .authorize_failover_prefix(boundary)
                     .await?;
+                self.require_primary_application_refresh().await;
             }
             RuntimeEffectAction::PrepareSwitchover {
                 preparation_generation,
@@ -1805,6 +1847,35 @@ impl RuntimeHost {
         self.change_application_role(role).await
     }
 
+    async fn require_primary_application_refresh(&self) {
+        let snapshot = self.snapshot().await;
+        if snapshot.role != ReplicaRole::Primary
+            || snapshot
+                .authority
+                .as_ref()
+                .is_none_or(|authority| authority.local_role() != ReplicaRole::Primary)
+        {
+            return;
+        }
+        let epoch = snapshot
+            .authority
+            .as_ref()
+            .map_or_else(Epoch::default, |authority| {
+                authority.current_configuration.epoch
+            });
+        let authority = snapshot.authority.clone();
+        let mut state = self.state.write().await;
+        state.fallback_snapshot.role_transition = Some(RoleTransition {
+            completed_role: ReplicaRole::Primary,
+            target_role: ReplicaRole::Primary,
+            replicator_completed: true,
+            epoch_completed: true,
+            application_completed: false,
+        });
+        state.role_transition_epoch = Some(epoch);
+        state.role_transition_authority = authority;
+    }
+
     async fn change_replicator_role(&self, role: ReplicaRole) -> Result<()> {
         self.change_replicator_role_at_epoch(role, None).await
     }
@@ -1830,10 +1901,15 @@ impl RuntimeHost {
                     authority.current_configuration.epoch
                 })
         });
+        let authority = snapshot.authority.clone();
         let transition = {
             let mut state = self.state.write().await;
-            state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
-            if state.role_transition_epoch.is_some_and(|old| epoch > old) {
+            if snapshot.role != role {
+                state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+            }
+            if state.role_transition_epoch.is_some_and(|old| epoch > old)
+                || state.role_transition_authority != authority
+            {
                 state.fallback_snapshot.role_transition = None;
             }
             if let Some(transition) = state.fallback_snapshot.role_transition.clone() {
@@ -1842,24 +1918,32 @@ impl RuntimeHost {
                 }
                 transition
             } else {
+                let same_role = snapshot.role == role;
+                let role_stage_completed = same_role
+                    && state
+                        .role_transition_epoch
+                        .is_some_and(|completed| completed >= epoch)
+                    && state.role_transition_authority == authority;
+                let epoch_completed = role != ReplicaRole::Primary || role_stage_completed;
                 let transition = RoleTransition {
                     completed_role: snapshot.role,
                     target_role: role,
-                    replicator_completed: false,
-                    epoch_completed: role != ReplicaRole::Primary,
-                    application_completed: false,
+                    replicator_completed: same_role,
+                    epoch_completed,
+                    application_completed: role_stage_completed,
                 };
                 state.fallback_snapshot.role_transition = Some(transition.clone());
                 state.role_transition_epoch = Some(epoch);
+                state.role_transition_authority = authority;
                 transition
             }
         };
-        if let Ok(managed) = self.lifecycle() {
-            managed.fence_writes().await?;
-        }
-        self.state.write().await.fallback_snapshot.read_status =
-            AccessStatus::ReconfigurationPending;
         if !transition.replicator_completed {
+            if let Ok(managed) = self.lifecycle() {
+                managed.fence_writes().await?;
+            }
+            self.state.write().await.fallback_snapshot.read_status =
+                AccessStatus::ReconfigurationPending;
             registered.change_role(epoch, role).await?;
             let mut state = self.state.write().await;
             state

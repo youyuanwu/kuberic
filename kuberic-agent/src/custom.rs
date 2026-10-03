@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use kuberic_protocol::types::{AccessStatus, OperationId, ProcessSessionId, ReplicaIdentity};
+use kuberic_protocol::types::{
+    AccessStatus, ConfigurationDescriptor, OperationId, ProcessSessionId, ReplicaIdentity,
+};
 use kuberic_runtime::replicator::{
     ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
     ReplicaSetQuorumMode, Replicator,
@@ -160,7 +162,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn cancel_configuration_work(&self) -> Result<()> {
-        self.common.fence_managed_access().await?;
+        self.common.cancel_configuration_work().await?;
         self.legacy.cancel_configuration_work().await?;
         self.sync_engine_proof().await
     }
@@ -292,29 +294,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn observe_progress(&self) -> Result<()> {
-        let snapshot = self.common.snapshot().await;
-        let terminal_transition = snapshot.role_transition.as_ref().is_some_and(|transition| {
-            transition.target_role == kuberic_protocol::types::ReplicaRole::None
-        });
-        if !snapshot.open
-            || snapshot.role == kuberic_protocol::types::ReplicaRole::None
-            || terminal_transition
-            || self.common.host_is_terminal()
-        {
-            return Ok(());
-        }
-        self.legacy.refresh_progress_proof().await?;
-        let result = self
-            .common
-            .apply_common_action(RuntimeEffectAction::RefreshApplicationProgress)
-            .await;
-        if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
-            self.common.fence_managed_access().await?;
-            self.common.mark_not_open().await;
-            return Ok(());
-        }
-        result?;
-        self.sync_engine_proof().await
+        self.common.retry_restored_access().await
     }
 
     async fn prepare_secondary_removal(
@@ -821,6 +801,7 @@ pub(super) struct CustomReplicatorHost {
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
+    deferred_configuration: Mutex<Option<tokio::task::JoinHandle<Result<ReplicaSetConfiguration>>>>,
     restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
@@ -859,6 +840,7 @@ impl CustomReplicatorHost {
             build_generations: RwLock::default(),
             receipts: RwLock::default(),
             configuration: RwLock::default(),
+            deferred_configuration: Mutex::new(None),
             restored_access: RwLock::default(),
             removal_witnesses: RwLock::default(),
             outbound,
@@ -877,13 +859,6 @@ impl CustomReplicatorHost {
             return Err(RuntimeError::Closed);
         }
         Ok(host)
-    }
-
-    fn host_is_terminal(&self) -> bool {
-        self.host.upgrade().is_none_or(|host| {
-            host.aborted.load(std::sync::atomic::Ordering::Acquire)
-                || host.closed.load(std::sync::atomic::Ordering::Acquire)
-        })
     }
 
     pub(super) async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
@@ -910,8 +885,10 @@ impl CustomReplicatorHost {
     }
 
     pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
-        let _gate = self.gate.lock().await;
-        self.select_build_inner(authority).await?;
+        {
+            let _gate = self.gate.lock().await;
+            self.select_build_inner(authority).await?;
+        }
         self.configure().await
     }
 
@@ -1089,19 +1066,29 @@ impl CustomReplicatorHost {
         }))
     }
 
-    async fn configure(&self) -> Result<()> {
+    async fn configuration_update(
+        &self,
+    ) -> Result<Option<(ReplicaSetConfiguration, Option<ConfigurationDescriptor>)>> {
         let Some(current) = self.descriptions().await? else {
-            return Ok(());
+            return Ok(None);
         };
-        let result = if let Some(previous) = self
+        let previous = self
             .state
             .read()
             .await
             .authority
             .as_ref()
-            .and_then(|a| a.previous_configuration.clone())
-        {
-            self.primary
+            .and_then(|a| a.previous_configuration.clone());
+        Ok(Some((current, previous)))
+    }
+
+    async fn apply_configuration_update(
+        primary: Arc<dyn PrimaryReplicator>,
+        current: ReplicaSetConfiguration,
+        previous: Option<ConfigurationDescriptor>,
+    ) -> Result<ReplicaSetConfiguration> {
+        if let Some(previous) = previous {
+            primary
                 .update_catch_up_replica_set_configuration(
                     current.clone(),
                     ReplicaSetConfiguration {
@@ -1121,13 +1108,48 @@ impl CustomReplicatorHost {
                         configuration: previous,
                     },
                 )
-                .await
+                .await?;
         } else {
-            self.primary
+            primary
                 .update_current_replica_set_configuration(current.clone())
-                .await
+                .await?;
+        }
+        Ok(current)
+    }
+
+    async fn finish_deferred_configuration(&self) -> Result<()> {
+        let Some(handle) = self.deferred_configuration.lock().await.take() else {
+            return Ok(());
         };
-        result?;
+        let current = handle
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))??;
+        *self.configuration.write().await = Some(current);
+        Ok(())
+    }
+
+    async fn defer_configuration(&self) -> Result<()> {
+        if let Some(handle) = self.deferred_configuration.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        let Some((current, previous)) = self.configuration_update().await? else {
+            return Ok(());
+        };
+        let primary = self.primary.clone();
+        *self.deferred_configuration.lock().await = Some(tokio::spawn(async move {
+            Self::apply_configuration_update(primary, current, previous).await
+        }));
+        Ok(())
+    }
+
+    async fn configure(&self) -> Result<()> {
+        self.finish_deferred_configuration().await?;
+        let Some((current, previous)) = self.configuration_update().await? else {
+            return Ok(());
+        };
+        let current =
+            Self::apply_configuration_update(self.primary.clone(), current, previous).await?;
         *self.configuration.write().await = Some(current);
         Ok(())
     }
@@ -1174,9 +1196,9 @@ impl CustomReplicatorHost {
                 return Err(RuntimeError::ReconfigurationPending);
             }
         }
-        if (read == AccessStatus::Granted || write == AccessStatus::Granted)
-            && let Err(error) = self.control.current_progress().await
-        {
+        let progress =
+            super::with_access_proof_view(read, write, self.control.current_progress()).await;
+        if let Err(error) = progress {
             let mut state = self.state.write().await;
             state.read_status = AccessStatus::ReconfigurationPending;
             state.write_status = AccessStatus::ReconfigurationPending;
@@ -1288,8 +1310,67 @@ impl CustomReplicatorHost {
         Ok(())
     }
 
+    async fn record_build_start(&self, receipt: &BuildReceipt) -> Result<()> {
+        let authority = receipt.selection.authority.clone();
+        let host = self.host()?;
+        if self.receipt(&authority).await? != *receipt {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let existing = host
+            .default_dependencies
+            .build_progress_store
+            .load_build_progress(&authority.build_id)
+            .await?;
+        let progress = match existing {
+            Some(progress) if progress.authority == authority => progress,
+            Some(_) => {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "build progress belongs to different authority".into(),
+                ));
+            }
+            None => {
+                let progress = DurableBuildProgress {
+                    authority,
+                    last_sequence: 0,
+                    durable_lsn: receipt.selection.authority.replication_boundary_lsn,
+                    completed: false,
+                    catch_up_boundary_lsn: None,
+                };
+                host.default_dependencies
+                    .build_progress_store
+                    .record_selected_build_progress(&receipt.selection, &progress)
+                    .await?;
+                progress
+            }
+        };
+        let mut state = self.state.write().await;
+        state
+            .builds
+            .retain(|build| build.authority.build_id != progress.authority.build_id);
+        state.builds.push(BuildPostcondition {
+            authority: progress.authority,
+            last_sequence: progress.last_sequence,
+            durable_lsn: progress.durable_lsn,
+            completed: progress.completed,
+            catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+        });
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
     async fn refresh(&self) -> Result<()> {
         let host = self.host()?;
+        if self.native_receipts
+            && host
+                .default_dependencies
+                .build_authority_store
+                .load_build_selection(&host.identity)
+                .await?
+                .is_some()
+        {
+            self.configure().await?;
+        }
         let restored = *self.restored_access.read().await;
         if let Some((read, write)) = restored {
             self.try_restore_access(read, write).await?;
@@ -1450,6 +1531,7 @@ impl CustomReplicatorHost {
 
     pub(super) async fn execute_build(&self, mut replica: ReplicaInformation) -> Result<()> {
         let receipt = self.prepare_build(&mut replica).await?;
+        self.record_build_start(&receipt).await?;
         self.primary.build_replica(replica).await?;
         let _gate = self.gate.lock().await;
         self.record_completion(receipt).await?;
@@ -1466,6 +1548,10 @@ impl CustomReplicatorHost {
         *self.restored_access.write().await = None;
         self.removal_witnesses.write().await.clear();
         self.invalidate_build_attempts().await?;
+        if let Some(handle) = self.deferred_configuration.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
         self.receiver.lock().await.close();
         let mut state = self.state.write().await;
         state.open = false;
@@ -1503,7 +1589,9 @@ impl CustomReplicatorHost {
             .await
             .authority
             .as_ref()
-            .is_some_and(|existing| preserves_same_primary_scale_up_access(existing, authority));
+            .is_some_and(|existing| {
+                existing == authority || preserves_same_primary_scale_up_access(existing, authority)
+            });
         if preserve_access {
             return Ok(());
         }
@@ -1677,12 +1765,75 @@ impl CustomReplicatorHost {
         }
         self.select_build_inner(authority).await?;
         self.restore_builds().await?;
-        if authority.target == host.identity {
+        let completed = self.state.read().await.builds.iter().any(|build| {
+            build.authority == *authority
+                && build.completed
+                && build.durable_lsn >= authority.replication_boundary_lsn
+        });
+        if authority.target == host.identity && !completed {
             let read = self.state.read().await.read_status;
             self.set_access(read, AccessStatus::ReconfigurationPending)
                 .await?;
         }
         if self.state.read().await.authority.is_some() {
+            self.configure().await?;
+        }
+        Ok(())
+    }
+
+    async fn admit_common_build(&self, authority: BuildAuthority) -> Result<()> {
+        let (configure, defer) = {
+            let _gate = self.gate.lock().await;
+            authority.validate()?;
+            let host = self.host()?;
+            if self
+                .retired_builds
+                .read()
+                .await
+                .contains(&authority.build_id)
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let superseding = host
+                .default_dependencies
+                .build_authority_store
+                .load_build_selection(&authority.target)
+                .await?
+                .is_some_and(|selection| selection.authority != authority);
+            host.default_dependencies
+                .build_authority_store
+                .admit_build(&authority)
+                .await?;
+            self.select_build_inner(&authority).await?;
+            let completed = self.state.read().await.builds.iter().any(|build| {
+                build.authority == authority
+                    && build.completed
+                    && build.durable_lsn >= authority.replication_boundary_lsn
+            });
+            if authority.target == host.identity && !completed {
+                let read = self.state.read().await.read_status;
+                if self.native_receipts && superseding {
+                    let mut state = self.state.write().await;
+                    state.read_status = read;
+                    state.write_status = AccessStatus::ReconfigurationPending;
+                    drop(state);
+                    let mut state = host.state.write().await;
+                    state.fallback_snapshot.read_status = read;
+                    state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+                } else {
+                    self.set_access(read, AccessStatus::ReconfigurationPending)
+                        .await?;
+                }
+            }
+            let configure = self.native_receipts || self.state.read().await.authority.is_some();
+            (
+                configure && !(self.native_receipts && superseding),
+                configure && self.native_receipts && superseding,
+            )
+        };
+        if defer {
+            self.defer_configuration().await?;
+        } else if configure {
             self.configure().await?;
         }
         Ok(())
@@ -1868,6 +2019,14 @@ impl CustomReplicatorHost {
         result
     }
 
+    async fn retry_restored_access(&self) -> Result<()> {
+        let restored = *self.restored_access.read().await;
+        if let Some((read, write)) = restored {
+            self.try_restore_access(read, write).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn complete_open(&self, address: String) -> Result<()> {
         self.complete_open_common(address).await;
         Ok(())
@@ -1893,7 +2052,9 @@ impl CustomReplicatorHost {
     }
     pub(super) async fn cancel_configuration_work(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
-        self.fence_writes().await
+        *self.restored_access.write().await = None;
+        self.removal_witnesses.write().await.clear();
+        self.invalidate_build_attempts().await
     }
     pub(super) async fn restore_authority(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
@@ -1916,6 +2077,12 @@ impl CustomReplicatorHost {
         self.refresh().await
     }
     async fn apply_common_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        let action = match action {
+            RuntimeEffectAction::AdmitBuildAuthority(authority) => {
+                return self.admit_common_build(*authority).await;
+            }
+            action => action,
+        };
         let _gate = self.gate.lock().await;
         let host = self.host()?;
         match action {
@@ -1968,30 +2135,7 @@ impl CustomReplicatorHost {
                 self.state.write().await.authority = Some(*authority);
                 self.configure().await?;
             }
-            RuntimeEffectAction::AdmitBuildAuthority(authority) => {
-                authority.validate()?;
-                if self
-                    .retired_builds
-                    .read()
-                    .await
-                    .contains(&authority.build_id)
-                {
-                    return Err(RuntimeError::AuthorityNotAdmitted);
-                }
-                host.default_dependencies
-                    .build_authority_store
-                    .admit_build(&authority)
-                    .await?;
-                self.select_build_inner(&authority).await?;
-                if authority.target == host.identity {
-                    let read = self.state.read().await.read_status;
-                    self.set_access(read, AccessStatus::ReconfigurationPending)
-                        .await?;
-                }
-                if self.native_receipts || self.state.read().await.authority.is_some() {
-                    self.configure().await?;
-                }
-            }
+            RuntimeEffectAction::AdmitBuildAuthority(_) => unreachable!(),
             RuntimeEffectAction::RegisterPeerSession { identity, session } => {
                 if session.is_empty()
                     || self
