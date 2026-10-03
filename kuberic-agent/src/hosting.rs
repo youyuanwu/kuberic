@@ -646,6 +646,30 @@ impl PodRuntime {
         self.host.lifecycle()?.cancel_configuration_work().await
     }
 
+    #[cfg(feature = "testing")]
+    pub(crate) async fn testing_set_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        self.host.lifecycle()?.set_access(read, write).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn testing_wait_for_catch_up(&self) -> Result<()> {
+        self.host.lifecycle()?.wait_for_catch_up().await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn testing_admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
+        self.host.lifecycle()?.admit_authority(authority).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn testing_close(&self) -> Result<()> {
+        self.host.close().await
+    }
+
     pub fn data_plane(&self) -> RuntimeDataPlane {
         RuntimeDataPlane {
             host: self.host.clone(),

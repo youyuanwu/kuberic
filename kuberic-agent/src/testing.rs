@@ -592,3 +592,28 @@ pub async fn execute_build(
         }
     }
 }
+
+pub async fn set_lifecycle_access(
+    runtime: &crate::hosting::PodRuntime,
+    read: kuberic_protocol::types::AccessStatus,
+    write: kuberic_protocol::types::AccessStatus,
+) -> kuberic_runtime::Result<()> {
+    runtime.testing_set_access(read, write).await
+}
+
+pub async fn wait_for_lifecycle_catch_up(
+    runtime: &crate::hosting::PodRuntime,
+) -> kuberic_runtime::Result<()> {
+    runtime.testing_wait_for_catch_up().await
+}
+
+pub async fn admit_lifecycle_authority(
+    runtime: &crate::hosting::PodRuntime,
+    authority: kuberic_runtime_internal::authority::AdmittedAuthority,
+) -> kuberic_runtime::Result<()> {
+    runtime.testing_admit_authority(authority).await
+}
+
+pub async fn close_lifecycle(runtime: &crate::hosting::PodRuntime) -> kuberic_runtime::Result<()> {
+    runtime.testing_close().await
+}

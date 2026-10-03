@@ -32,6 +32,8 @@ struct BuildReceipt {
     attempt_generation: u64,
 }
 
+type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuildExecution {
     ApplicationCompleted,
@@ -440,7 +442,15 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
+        let authority_before = self.common.state.read().await.authority.clone();
+        let sessions_before = self.common.sessions.read().await.clone();
         self.legacy.remove_replica_proof(replica_id).await?;
+        self.common.active_host()?;
+        if authority_before != self.common.state.read().await.authority
+            || sessions_before != *self.common.sessions.read().await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         self.common.remove_managed_replica(replica_id).await
     }
 
@@ -802,8 +812,9 @@ pub(super) struct CustomReplicatorHost {
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
-    deferred_configuration: Mutex<Option<tokio::task::JoinHandle<Result<ReplicaSetConfiguration>>>>,
+    deferred_configuration: Mutex<Option<DeferredConfiguration>>,
     configuration_generation: Arc<AtomicU64>,
+    configuration_commit: Mutex<()>,
     restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
@@ -844,6 +855,7 @@ impl CustomReplicatorHost {
             configuration: RwLock::default(),
             deferred_configuration: Mutex::new(None),
             configuration_generation: Arc::new(AtomicU64::new(0)),
+            configuration_commit: Mutex::new(()),
             restored_access: RwLock::default(),
             removal_witnesses: RwLock::default(),
             outbound,
@@ -864,26 +876,38 @@ impl CustomReplicatorHost {
         Ok(host)
     }
 
+    fn active_host(&self) -> Result<Arc<RuntimeHost>> {
+        let host = self.host()?;
+        if host.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        Ok(host)
+    }
+
     pub(super) async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
         self.apply_common_action(RuntimeEffectAction::RegisterPeerSession {
             identity: replica.identity.clone(),
             session: replica.process_session_id.clone(),
         })
         .await?;
-        let _gate = self.gate.lock().await;
-        if self.sessions.read().await.get(&replica.identity) != Some(&replica.process_session_id) {
-            return Err(RuntimeError::AuthorityNotAdmitted);
+        {
+            let _gate = self.gate.lock().await;
+            if self.sessions.read().await.get(&replica.identity)
+                != Some(&replica.process_session_id)
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            if replica.replication_address.is_empty() || replica.replication_address.len() > 512 {
+                return Err(RuntimeError::InvalidReplication(
+                    "invalid replica address".into(),
+                ));
+            }
+            let value = (replica.process_session_id, replica.replication_address);
+            if self.addresses.read().await.get(&replica.identity) == Some(&value) {
+                return Ok(());
+            }
+            self.addresses.write().await.insert(replica.identity, value);
         }
-        if replica.replication_address.is_empty() || replica.replication_address.len() > 512 {
-            return Err(RuntimeError::InvalidReplication(
-                "invalid replica address".into(),
-            ));
-        }
-        let value = (replica.process_session_id, replica.replication_address);
-        if self.addresses.read().await.get(&replica.identity) == Some(&value) {
-            return Ok(());
-        }
-        self.addresses.write().await.insert(replica.identity, value);
         self.configure().await
     }
 
@@ -1130,7 +1154,7 @@ impl CustomReplicatorHost {
     }
 
     fn ensure_configuration_generation(&self, generation: u64) -> Result<()> {
-        self.host()?;
+        self.active_host()?;
         if self.configuration_generation.load(Ordering::Acquire) != generation {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -1141,7 +1165,7 @@ impl CustomReplicatorHost {
         let Some(mut handle) = self.deferred_configuration.lock().await.take() else {
             return Ok(());
         };
-        let current =
+        let (generation, current) =
             match tokio::time::timeout(std::time::Duration::from_secs(75), &mut handle).await {
                 Ok(result) => {
                     result.map_err(|error| RuntimeError::Application(error.to_string()))??
@@ -1151,12 +1175,18 @@ impl CustomReplicatorHost {
                     return Err(RuntimeError::OperationCancelled);
                 }
             };
-        self.host()?;
+        let _commit = self.configuration_commit.lock().await;
+        self.ensure_configuration_generation(generation)?;
         *self.configuration.write().await = Some(current);
+        if let Err(error) = self.ensure_configuration_generation(generation) {
+            *self.configuration.write().await = None;
+            return Err(error);
+        }
         Ok(())
     }
 
     async fn defer_configuration(&self) -> Result<()> {
+        let _commit = self.configuration_commit.lock().await;
         if let Some(handle) = self.deferred_configuration.lock().await.take() {
             handle.abort();
             let _ = handle.await;
@@ -1172,7 +1202,7 @@ impl CustomReplicatorHost {
             if configuration_generation.load(Ordering::Acquire) != generation {
                 return Err(RuntimeError::OperationCancelled);
             }
-            Ok(current)
+            Ok((generation, current))
         }));
         Ok(())
     }
@@ -1182,11 +1212,19 @@ impl CustomReplicatorHost {
         let Some((current, previous)) = self.configuration_update().await? else {
             return Ok(());
         };
-        let generation = self.advance_configuration_generation()?;
+        let generation = {
+            let _commit = self.configuration_commit.lock().await;
+            self.advance_configuration_generation()?
+        };
         let current =
             Self::apply_configuration_update(self.primary.clone(), current, previous).await?;
+        let _commit = self.configuration_commit.lock().await;
         self.ensure_configuration_generation(generation)?;
         *self.configuration.write().await = Some(current);
+        if let Err(error) = self.ensure_configuration_generation(generation) {
+            *self.configuration.write().await = None;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1251,7 +1289,7 @@ impl CustomReplicatorHost {
             self.control.abort();
             return Err(error);
         }
-        self.host()?;
+        self.active_host()?;
         if authority_before != self.state.read().await.authority
             || configuration_before != *self.configuration.read().await
             || sessions_before != *self.sessions.read().await
@@ -1437,7 +1475,7 @@ impl CustomReplicatorHost {
             }
             Err(error) => return Err(error),
         };
-        self.host()?;
+        self.active_host()?;
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
         {
@@ -1578,6 +1616,7 @@ impl CustomReplicatorHost {
         let receipt = self.prepare_build(&mut replica).await?;
         self.record_build_start(&receipt).await?;
         self.primary.build_replica(replica).await?;
+        self.active_host()?;
         let _gate = self.gate.lock().await;
         self.record_completion(receipt).await?;
         self.refresh().await
@@ -1614,6 +1653,7 @@ impl CustomReplicatorHost {
     }
 
     async fn invalidate_configuration_attempts(&self) -> Result<()> {
+        let _commit = self.configuration_commit.lock().await;
         self.advance_configuration_generation()?;
         if let Some(handle) = self.deferred_configuration.lock().await.take() {
             handle.abort();
@@ -2038,7 +2078,7 @@ impl CustomReplicatorHost {
     }
 
     async fn ensure_build_generation(&self, id: &OperationId, generation: u64) -> Result<()> {
-        self.host()?;
+        self.active_host()?;
         if self.build_generation(id).await != generation
             || self.retired_builds.read().await.contains(id)
         {
@@ -2139,7 +2179,7 @@ impl CustomReplicatorHost {
             .await?;
         let boundary = self.control.current_progress().await?;
         let _gate = self.gate.lock().await;
-        self.host()?;
+        self.active_host()?;
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
         {
@@ -2161,7 +2201,7 @@ impl CustomReplicatorHost {
         };
         let progress = self.control.current_progress().await?;
         let _gate = self.gate.lock().await;
-        self.host()?;
+        self.active_host()?;
         if authority_before != self.state.read().await.authority
             || sessions_before != *self.sessions.read().await
         {
@@ -2172,6 +2212,46 @@ impl CustomReplicatorHost {
         }
         self.state.write().await.verified_replication_lsn = Some(boundary);
         Ok(())
+    }
+
+    async fn register_common_peer(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        let replaced = {
+            let _gate = self.gate.lock().await;
+            if session.is_empty()
+                || self
+                    .retired_sessions
+                    .read()
+                    .await
+                    .contains(&(identity.clone(), session.clone()))
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let old = self
+                .sessions
+                .write()
+                .await
+                .insert(identity.clone(), session.clone());
+            if let Some(old) = old.filter(|old| old != &session) {
+                self.retired_sessions
+                    .write()
+                    .await
+                    .insert((identity.clone(), old));
+                self.state.write().await.builds.retain(|build| {
+                    build.authority.source != identity && build.authority.target != identity
+                });
+                true
+            } else {
+                false
+            }
+        };
+        if replaced {
+            self.fence_writes().await?;
+        }
+        self.configure().await
     }
 
     async fn apply_common_action(&self, action: RuntimeEffectAction) -> Result<()> {
@@ -2195,6 +2275,9 @@ impl CustomReplicatorHost {
             }
             RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
                 return self.authorize_common_failover_prefix(boundary).await;
+            }
+            RuntimeEffectAction::RegisterPeerSession { identity, session } => {
+                return self.register_common_peer(identity, session).await;
             }
             action => action,
         };
@@ -2251,33 +2334,7 @@ impl CustomReplicatorHost {
                 self.configure().await?;
             }
             RuntimeEffectAction::AdmitBuildAuthority(_) => unreachable!(),
-            RuntimeEffectAction::RegisterPeerSession { identity, session } => {
-                if session.is_empty()
-                    || self
-                        .retired_sessions
-                        .read()
-                        .await
-                        .contains(&(identity.clone(), session.clone()))
-                {
-                    return Err(RuntimeError::AuthorityNotAdmitted);
-                }
-                let old = self
-                    .sessions
-                    .write()
-                    .await
-                    .insert(identity.clone(), session.clone());
-                if let Some(old) = old.filter(|old| old != &session) {
-                    self.retired_sessions
-                        .write()
-                        .await
-                        .insert((identity.clone(), old));
-                    self.state.write().await.builds.retain(|b| {
-                        b.authority.source != identity && b.authority.target != identity
-                    });
-                    self.fence_writes().await?;
-                }
-                self.configure().await?;
-            }
+            RuntimeEffectAction::RegisterPeerSession { .. } => unreachable!(),
             RuntimeEffectAction::RetireBuild(id) => {
                 self.retired_builds.write().await.insert(id.clone());
                 if let Some(build) = host
@@ -2746,8 +2803,15 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     }
 
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
+        let authority_before = self.state.read().await.authority.clone();
+        let sessions_before = self.sessions.read().await.clone();
         self.primary.remove_replica(replica_id).await?;
-        self.host()?;
+        self.active_host()?;
+        if authority_before != self.state.read().await.authority
+            || sessions_before != *self.sessions.read().await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         Ok(())
     }
 
