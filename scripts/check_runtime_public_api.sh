@@ -29,11 +29,11 @@ if cargo check --manifest-path "$fixture/Cargo.toml" --quiet >"$fixture_output" 
     exit 1
 fi
 
-if ! grep -q 'managed_replicator' "$fixture_output" ||
-    ! grep -q 'no associated function or constant named `new`' "$fixture_output" ||
+if ! grep -q 'method `prepare_attachment` is private' "$fixture_output" ||
+    ! grep -q 'cannot construct `ReplicatorInterfaces` with struct literal syntax due to private fields' "$fixture_output" ||
+    ! grep -q 'cannot construct `kuberic_runtime::replicator::ReplicatorAttachment` with struct literal syntax due to private fields' "$fixture_output" ||
     ! grep -q 'RuntimeHostToken: Default' "$fixture_output" ||
-    ! grep -q 'no method named `register_managed`' "$fixture_output" ||
-    ! grep -q 'no method named `disarm_creation`' "$fixture_output" ||
+    ! grep -q 'method `disarm` is private' "$fixture_output" ||
     ! grep -q 'field `default_dependencies` of struct `ReplicatorFactoryContext` is private' "$fixture_output" ||
     ! grep -q 'module `authority` is private' "$fixture_output"; then
     cat "$fixture_output" >&2

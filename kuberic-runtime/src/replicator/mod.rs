@@ -310,6 +310,8 @@ impl Drop for ReplicatorCreation {
 #[doc(hidden)]
 pub struct ReplicatorAttachment {
     creation: Arc<ReplicatorCreation>,
+    replicator: Arc<dyn Replicator>,
+    primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
 }
 
 #[doc(hidden)]
@@ -342,8 +344,24 @@ impl ReplicatorAttachment {
             .map(|managed| managed.data_plane.clone())
     }
 
-    pub fn disarm(&self, _token: RuntimeHostToken) {
+    pub fn replicator(&self, _token: RuntimeHostToken) -> Arc<dyn Replicator> {
+        self.replicator.clone()
+    }
+
+    pub fn primary_replicator(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<Arc<dyn PrimaryReplicator>> {
+        self.primary_replicator.clone()
+    }
+
+    fn disarm(&self) {
         self.creation.armed.store(false, Ordering::Release);
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_disarm(&self, _token: RuntimeHostToken) {
+        self.disarm();
     }
 }
 
@@ -466,6 +484,8 @@ impl ReplicatorInterfaces {
             .bind_identity(reservation.identity(RuntimeHostToken::new()))?;
         Ok(ReplicatorAttachment {
             creation: self.creation.clone(),
+            replicator: self.replicator(),
+            primary_replicator: self.primary_replicator(),
         })
     }
 
@@ -588,8 +608,7 @@ pub trait ReplicatorRegistration: Send + Sync {
 
     async fn register_interfaces(
         &self,
-        interfaces: &ReplicatorInterfaces,
-        attachment: ReplicatorAttachment,
+        attachment: &ReplicatorAttachment,
         provider: Option<Arc<dyn StateProvider>>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()>;
@@ -688,12 +707,13 @@ impl StatefulServicePartition {
         };
         if let Err(error) = self
             .registration
-            .register_interfaces(&interfaces, attachment, state_provider, reservation)
+            .register_interfaces(&attachment, state_provider, reservation)
             .await
         {
             self.registration.cancel_replicator_creation(reservation);
             return Err(error);
         }
+        attachment.disarm();
         Ok(interfaces)
     }
 }

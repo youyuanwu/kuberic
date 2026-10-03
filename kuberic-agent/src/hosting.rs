@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use async_trait::async_trait;
@@ -23,8 +23,7 @@ use kuberic_runtime::replicator::copy::{
 use kuberic_runtime::replicator::{
     DefaultReplicatorDependencies, ManagedReplicatorDataPlane, PartitionAccessView,
     PrimaryReplicator, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
-    ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
-    StatefulServicePartition,
+    ReplicatorFactoryContext, ReplicatorRegistration, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{
@@ -60,10 +59,6 @@ use crate::transport::{
     replication_ack_from_proto, replication_ack_to_proto, replication_from_proto,
     replication_to_proto,
 };
-
-const REPLICATOR_CREATION_AVAILABLE: u8 = 0;
-const REPLICATOR_CREATION_RESERVED: u8 = 1;
-const REPLICATOR_CREATION_REGISTERED: u8 = 2;
 
 #[path = "custom.rs"]
 mod custom;
@@ -137,6 +132,12 @@ struct RegisteredReplicator {
     provider: Option<Arc<dyn StateProvider>>,
     lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
+}
+
+enum ReplicatorCreationState {
+    Available,
+    Reserved(ReplicatorCreationIdentity),
+    Registered,
 }
 
 struct HostedPrimaryReplicator {
@@ -340,11 +341,10 @@ impl PodRuntime {
                 }),
                 effect_lock: Mutex::new(()),
                 registered: OnceLock::new(),
-                replicator_creation_identity: StdMutex::new(None),
+                replicator_creation: StdMutex::new(ReplicatorCreationState::Available),
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
-                replicator_creation: AtomicU8::new(REPLICATOR_CREATION_AVAILABLE),
                 replica_session: OnceLock::new(),
             }),
         }
@@ -984,11 +984,10 @@ struct RuntimeHost {
     state: RwLock<HostState>,
     effect_lock: Mutex<()>,
     registered: OnceLock<RegisteredReplicator>,
-    replicator_creation_identity: StdMutex<Option<ReplicatorCreationIdentity>>,
+    replicator_creation: StdMutex<ReplicatorCreationState>,
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
-    replicator_creation: AtomicU8,
 }
 
 struct HostAccessView {
@@ -1058,86 +1057,73 @@ impl PartitionAccessView for HostAccessView {
 #[async_trait]
 impl ReplicatorRegistration for RuntimeHost {
     fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
-        self.replicator_creation
-            .compare_exchange(
-                REPLICATOR_CREATION_AVAILABLE,
-                REPLICATOR_CREATION_RESERVED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| {
-                RuntimeError::Application(
-                    "CreateReplicator may be called only once per Open".into(),
-                )
-            })?;
         let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
-        let mut identity = match self.replicator_creation_identity.lock() {
-            Ok(identity) => identity,
-            Err(_) => {
-                let _ = self.replicator_creation.compare_exchange(
-                    REPLICATOR_CREATION_RESERVED,
-                    REPLICATOR_CREATION_AVAILABLE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+        let mut creation = self.replicator_creation.lock().map_err(|_| {
+            RuntimeError::Application("replicator creation state was poisoned".into())
+        })?;
+        match &*creation {
+            ReplicatorCreationState::Available => {
+                *creation = ReplicatorCreationState::Reserved(
+                    reservation.identity(RuntimeHostToken::new()),
                 );
-                return Err(RuntimeError::Application(
-                    "replicator creation identity was poisoned".into(),
-                ));
+                Ok(reservation)
             }
-        };
-        *identity = Some(reservation.identity(RuntimeHostToken::new()));
-        Ok(reservation)
+            ReplicatorCreationState::Reserved(_) | ReplicatorCreationState::Registered => {
+                Err(RuntimeError::Application(
+                    "CreateReplicator may be called only once per Open".into(),
+                ))
+            }
+        }
     }
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation) {
-        if let Ok(mut active_identity) = self.replicator_creation_identity.lock()
-            && active_identity.as_ref() == Some(&reservation.identity(RuntimeHostToken::new()))
+        if let Ok(mut creation) = self.replicator_creation.lock()
+            && matches!(
+                &*creation,
+                ReplicatorCreationState::Reserved(identity)
+                    if *identity == reservation.identity(RuntimeHostToken::new())
+            )
         {
-            *active_identity = None;
-            let _ = self.replicator_creation.compare_exchange(
-                REPLICATOR_CREATION_RESERVED,
-                REPLICATOR_CREATION_AVAILABLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            *creation = ReplicatorCreationState::Available;
         }
     }
 
     async fn register_interfaces(
         &self,
-        interfaces: &ReplicatorInterfaces,
-        attachment: ReplicatorAttachment,
+        attachment: &ReplicatorAttachment,
         provider: Option<Arc<dyn StateProvider>>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()> {
         let reservation_identity = reservation.identity(RuntimeHostToken::new());
-        if self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
-            || self
-                .replicator_creation_identity
-                .lock()
-                .map_err(|_| {
-                    RuntimeError::Application("replicator creation identity was poisoned".into())
-                })?
-                .as_ref()
-                != Some(&reservation_identity)
-            || attachment.identity(RuntimeHostToken::new()) != reservation_identity
         {
-            return Err(RuntimeError::Application(
-                "CreateReplicator reservation is not active".into(),
-            ));
+            let creation = self.replicator_creation.lock().map_err(|_| {
+                RuntimeError::Application("replicator creation state was poisoned".into())
+            })?;
+            if !matches!(
+                &*creation,
+                ReplicatorCreationState::Reserved(identity)
+                    if *identity == reservation_identity
+                        && attachment.identity(RuntimeHostToken::new()) == *identity
+            ) {
+                return Err(RuntimeError::Application(
+                    "CreateReplicator reservation is not active".into(),
+                ));
+            }
         }
         let managed_lifecycle = attachment.managed_lifecycle(RuntimeHostToken::new());
         let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
+        let control = attachment.replicator(RuntimeHostToken::new());
+        let primary = attachment.primary_replicator(RuntimeHostToken::new());
         if let Some(lifecycle) = managed_lifecycle.as_ref() {
             lifecycle
-                .attach_interfaces(interfaces.replicator(), interfaces.primary_replicator())
+                .attach_interfaces(control.clone(), primary.clone())
                 .await?;
         }
-        let lifecycle = match (managed_lifecycle.as_ref(), interfaces.primary_replicator()) {
+        let lifecycle = match (managed_lifecycle.as_ref(), primary.clone()) {
             (Some(lifecycle), Some(primary)) => {
                 Some(Arc::new(custom::ReplicatorLifecycleHost::managed(
                     self.weak_self.clone(),
-                    interfaces.replicator(),
+                    control.clone(),
                     primary,
                     lifecycle.clone(),
                 )))
@@ -1149,42 +1135,38 @@ impl ReplicatorRegistration for RuntimeHost {
             }
             (None, Some(primary)) => Some(Arc::new(custom::ReplicatorLifecycleHost::service(
                 self.weak_self.clone(),
-                interfaces.replicator(),
+                control.clone(),
                 primary,
             ))),
             (None, None) => None,
         };
-        if self
-            .registered
+        let mut creation = self.replicator_creation.lock().map_err(|_| {
+            RuntimeError::Application("replicator creation state was poisoned".into())
+        })?;
+        if !matches!(
+            &*creation,
+            ReplicatorCreationState::Reserved(identity)
+                if *identity == reservation_identity
+                    && attachment.identity(RuntimeHostToken::new()) == *identity
+        ) {
+            return Err(RuntimeError::Application(
+                "CreateReplicator reservation was lost before registration".into(),
+            ));
+        }
+        self.registered
             .set(RegisteredReplicator {
-                control: interfaces.replicator(),
-                primary: interfaces.primary_replicator(),
+                control,
+                primary,
                 provider,
                 lifecycle,
                 managed_data_plane,
             })
-            .is_err()
-        {
-            return Err(RuntimeError::Application(
-                "CreateReplicator may be called only once per Open".into(),
-            ));
-        }
-        self.replicator_creation
-            .compare_exchange(
-                REPLICATOR_CREATION_RESERVED,
-                REPLICATOR_CREATION_REGISTERED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
             .map_err(|_| {
                 RuntimeError::Application(
-                    "CreateReplicator reservation was lost before registration".into(),
+                    "CreateReplicator may be called only once per Open".into(),
                 )
             })?;
-        *self.replicator_creation_identity.lock().map_err(|_| {
-            RuntimeError::Application("replicator creation identity was poisoned".into())
-        })? = None;
-        attachment.disarm(RuntimeHostToken::new());
+        *creation = ReplicatorCreationState::Registered;
         Ok(())
     }
 }

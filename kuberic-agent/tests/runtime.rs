@@ -7971,9 +7971,10 @@ async fn replicator_creation_failure_matrix_releases_all_state() {
         .testing_prepare_attachment(RuntimeHostToken::new(), reservation)
         .unwrap();
     registration
-        .register_interfaces(&interfaces, attachment, None, reservation)
+        .register_interfaces(&attachment, None, reservation)
         .await
         .unwrap();
+    attachment.testing_disarm(RuntimeHostToken::new());
     assert_eq!(runtime.testing_lifecycle_registration(), (Some(true), true));
     assert_eq!(capability.aborts.load(Ordering::SeqCst), 0);
 
@@ -8060,9 +8061,11 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
     let registering = {
         let registration = registration.clone();
         tokio::spawn(async move {
-            registration
-                .register_interfaces(&interfaces, attachment, None, reservation)
-                .await
+            let result = registration
+                .register_interfaces(&attachment, None, reservation)
+                .await;
+            drop(interfaces);
+            result
         })
     };
     attach_entered.notified().await;
@@ -8072,9 +8075,78 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
         Err(error) if error.is_cancelled()
     ));
     assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
+    assert_eq!(runtime.testing_lifecycle_registration(), (None, false));
     registration.cancel_replicator_creation(reservation);
     let retry = registration.reserve_replicator_creation().unwrap();
     registration.cancel_replicator_creation(retry);
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn stale_attachment_cannot_consume_a_retry_reservation() {
+    let runtime = PodRuntime::new(
+        identity(1, "stale-interface-attachment"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let registration = runtime.testing_replicator_registration();
+    let reservation = registration.reserve_replicator_creation().unwrap();
+    let attach_entered = Arc::new(Notify::new());
+    let attach_resume = Arc::new(Notify::new());
+    let capability = Arc::new(TrackingManagedCapability {
+        aborts: AtomicUsize::new(0),
+        attach_entered: Some(attach_entered.clone()),
+        attach_resume: Some(attach_resume.clone()),
+    });
+    let interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
+    );
+    let attachment = interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), reservation)
+        .unwrap();
+    let stale_registration = {
+        let registration = registration.clone();
+        tokio::spawn(async move {
+            let result = registration
+                .register_interfaces(&attachment, None, reservation)
+                .await;
+            drop(interfaces);
+            result
+        })
+    };
+    attach_entered.notified().await;
+
+    registration.cancel_replicator_creation(reservation);
+    let retry = registration.reserve_replicator_creation().unwrap();
+    attach_resume.notify_one();
+    assert!(matches!(
+        stale_registration.await.unwrap(),
+        Err(RuntimeError::Application(_))
+    ));
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
+    assert_eq!(runtime.testing_lifecycle_registration(), (None, false));
+
+    let replacement = Arc::new(TrackingManagedCapability::default());
+    let replacement_interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        retry.identity(RuntimeHostToken::new()),
+        replacement.clone(),
+        None,
+        replacement,
+    );
+    let replacement_attachment = replacement_interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), retry)
+        .unwrap();
+    registration
+        .register_interfaces(&replacement_attachment, None, retry)
+        .await
+        .unwrap();
+    replacement_attachment.testing_disarm(RuntimeHostToken::new());
+    assert_eq!(runtime.testing_lifecycle_registration(), (Some(true), true));
 }
 
 #[cfg(feature = "testing")]
