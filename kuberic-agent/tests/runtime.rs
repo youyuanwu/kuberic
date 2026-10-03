@@ -5993,6 +5993,26 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
         ))
         .await
         .unwrap();
+    for (runtime, peer, session, address) in [
+        (
+            &*default,
+            default_peer.clone(),
+            ProcessSessionId::new("default-peer-session"),
+            "in-process://conformance-default-peer",
+        ),
+        (
+            &custom,
+            custom_peer.clone(),
+            ProcessSessionId::new("custom-peer-session"),
+            "in-process://conformance-custom-peer",
+        ),
+    ] {
+        let mut description = ReplicaInformation::new(OperationId::default(), peer, address.into());
+        description.process_session_id = session;
+        kuberic_agent::testing::describe_peer(runtime, description)
+            .await
+            .unwrap();
+    }
     let default_snapshot = default.snapshot().await;
     let custom_snapshot = custom.snapshot().await;
     let default_build = BuildAuthority {
@@ -6025,6 +6045,38 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
         ))
         .await
         .unwrap();
+    let default_build_route = kuberic_agent::testing::execute_build(
+        &default,
+        ReplicaInformation::new(
+            default_build.build_id.clone(),
+            default_peer.clone(),
+            "in-process://conformance-default-build".into(),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        default_build_route,
+        Err(RuntimeError::Application(message))
+            if message.contains("built-in copy route")
+    ));
+    kuberic_agent::testing::execute_build(
+        &custom,
+        ReplicaInformation::new(
+            custom_build.build_id.clone(),
+            custom_peer.clone(),
+            "in-process://conformance-custom-build".into(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        custom
+            .snapshot()
+            .await
+            .builds
+            .iter()
+            .any(|build| build.authority == custom_build && build.completed)
+    );
     default
         .primary_replicator()
         .await
@@ -6094,6 +6146,77 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
     custom_abort.abort();
     assert!(!default_abort.snapshot().await.open);
     assert!(!custom_abort.snapshot().await.open);
+    let retirement_intent = removal_fixture::intent(&[1, 2], 1);
+    let retired = kuberic_runtime_internal::authority::RetiredAuthority {
+        committed: removal_fixture::cleanup(&retirement_intent),
+        report: removal_fixture::retirement(&retirement_intent),
+    };
+    let default_retirement = open_removal_member(
+        &retirement_intent,
+        retirement_intent.target.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    )
+    .await;
+    let custom_retirement_control = Arc::new(CustomRoleGate::default());
+    let custom_retirement = PodRuntime::new(
+        retirement_intent.target.clone(),
+        Arc::new(CustomRoleService(custom_retirement_control)),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    custom_retirement
+        .bind_replica_session(
+            ResourceUid::new("conformance-custom-retirement"),
+            ProcessSessionId::new("conformance-custom-retirement-session"),
+        )
+        .unwrap();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+            local_identity: retirement_intent.target.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: retirement_intent.previous_configuration.clone(),
+            switchover_handoff: None,
+            secondary_removal: None,
+            scale_up: None,
+        })),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::NotPrimary,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        custom_retirement
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    default_retirement
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::RetireReplica(Box::new(retired.clone())),
+        ))
+        .await
+        .unwrap();
+    custom_retirement
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::RetireReplica(Box::new(retired.clone())),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        default_retirement.snapshot().await.retired_authority,
+        Some(retired.clone())
+    );
+    assert_eq!(
+        custom_retirement.snapshot().await.retired_authority,
+        Some(retired)
+    );
 }
 
 #[test]

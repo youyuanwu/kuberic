@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use async_trait::async_trait;
 use kuberic_protocol::types::{
@@ -813,6 +813,7 @@ pub(super) struct CustomReplicatorHost {
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
     deferred_configuration: Mutex<Option<DeferredConfiguration>>,
+    deferred_configuration_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     configuration_generation: Arc<AtomicU64>,
     configuration_commit: Mutex<()>,
     restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
@@ -854,6 +855,7 @@ impl CustomReplicatorHost {
             receipts: RwLock::default(),
             configuration: RwLock::default(),
             deferred_configuration: Mutex::new(None),
+            deferred_configuration_abort: StdMutex::new(None),
             configuration_generation: Arc::new(AtomicU64::new(0)),
             configuration_commit: Mutex::new(()),
             restored_access: RwLock::default(),
@@ -997,8 +999,7 @@ impl CustomReplicatorHost {
             (None, incoming) => incoming,
         };
         let previous_configuration = self
-            .configuration
-            .read()
+            .published_configuration()
             .await
             .as_ref()
             .map(|c| c.configuration.clone());
@@ -1093,6 +1094,11 @@ impl CustomReplicatorHost {
         }))
     }
 
+    async fn published_configuration(&self) -> Option<ReplicaSetConfiguration> {
+        let _commit = self.configuration_commit.lock().await;
+        self.configuration.read().await.clone()
+    }
+
     async fn configuration_update(
         &self,
     ) -> Result<Option<(ReplicaSetConfiguration, Option<ConfigurationDescriptor>)>> {
@@ -1165,11 +1171,16 @@ impl CustomReplicatorHost {
         let Some(mut handle) = self.deferred_configuration.lock().await.take() else {
             return Ok(());
         };
+        self.deferred_configuration_abort.lock().unwrap().take();
         let (generation, current) =
             match tokio::time::timeout(std::time::Duration::from_secs(75), &mut handle).await {
-                Ok(result) => {
-                    result.map_err(|error| RuntimeError::Application(error.to_string()))??
-                }
+                Ok(result) => result.map_err(|error| {
+                    if error.is_cancelled() {
+                        RuntimeError::OperationCancelled
+                    } else {
+                        RuntimeError::Application(error.to_string())
+                    }
+                })??,
                 Err(_) => {
                     handle.abort();
                     return Err(RuntimeError::OperationCancelled);
@@ -1186,24 +1197,43 @@ impl CustomReplicatorHost {
     }
 
     async fn defer_configuration(&self) -> Result<()> {
-        let _commit = self.configuration_commit.lock().await;
-        if let Some(handle) = self.deferred_configuration.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
+        {
+            let _commit = self.configuration_commit.lock().await;
+            self.deferred_configuration_abort.lock().unwrap().take();
+            if let Some(handle) = self.deferred_configuration.lock().await.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
+        let authority_before = self.state.read().await.authority.clone();
+        let sessions_before = self.sessions.read().await.clone();
         let Some((current, previous)) = self.configuration_update().await? else {
             return Ok(());
         };
+        let _commit = self.configuration_commit.lock().await;
+        self.active_host()?;
+        if authority_before != self.state.read().await.authority
+            || sessions_before != *self.sessions.read().await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         let generation = self.advance_configuration_generation()?;
         let configuration_generation = self.configuration_generation.clone();
         let primary = self.primary.clone();
-        *self.deferred_configuration.lock().await = Some(tokio::spawn(async move {
-            let current = Self::apply_configuration_update(primary, current, previous).await?;
+        let handle = tokio::spawn(async move {
+            let current = tokio::time::timeout(
+                std::time::Duration::from_secs(75),
+                Self::apply_configuration_update(primary, current, previous),
+            )
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)??;
             if configuration_generation.load(Ordering::Acquire) != generation {
                 return Err(RuntimeError::OperationCancelled);
             }
             Ok((generation, current))
-        }));
+        });
+        *self.deferred_configuration_abort.lock().unwrap() = Some(handle.abort_handle());
+        *self.deferred_configuration.lock().await = Some(handle);
         Ok(())
     }
 
@@ -1242,7 +1272,7 @@ impl CustomReplicatorHost {
             (read, write)
         };
         let authority_before = self.state.read().await.authority.clone();
-        let configuration_before = self.configuration.read().await.clone();
+        let configuration_before = self.published_configuration().await;
         let sessions_before = self.sessions.read().await.clone();
         let role_before = host.state.read().await.fallback_snapshot.role;
         if write == AccessStatus::Granted {
@@ -1291,7 +1321,7 @@ impl CustomReplicatorHost {
         }
         self.active_host()?;
         if authority_before != self.state.read().await.authority
-            || configuration_before != *self.configuration.read().await
+            || configuration_before != self.published_configuration().await
             || sessions_before != *self.sessions.read().await
             || role_before != host.state.read().await.fallback_snapshot.role
         {
@@ -1486,7 +1516,7 @@ impl CustomReplicatorHost {
                 "negative custom replicator progress".into(),
             ));
         }
-        let described = self.configuration.read().await.clone();
+        let described = self.published_configuration().await;
         if let Some(receipt) = incoming {
             let build = &receipt.selection.authority;
             let exact_description = described.as_ref().is_some_and(|c| {
@@ -1655,6 +1685,7 @@ impl CustomReplicatorHost {
     async fn invalidate_configuration_attempts(&self) -> Result<()> {
         let _commit = self.configuration_commit.lock().await;
         self.advance_configuration_generation()?;
+        self.deferred_configuration_abort.lock().unwrap().take();
         if let Some(handle) = self.deferred_configuration.lock().await.take() {
             handle.abort();
             let _ = handle.await;
@@ -2123,7 +2154,7 @@ impl CustomReplicatorHost {
     pub(super) async fn fence_writes(&self) -> Result<()> {
         *self.restored_access.write().await = None;
         self.removal_witnesses.write().await.clear();
-        let configuration = self.configuration.read().await.clone();
+        let configuration = self.published_configuration().await;
         if let Some(configuration) = configuration {
             self.invalidate_build_attempts().await?;
             self.control
@@ -2526,6 +2557,14 @@ impl CustomReplicatorHost {
     fn notify_abort(&self) {
         self.abort_notified
             .store(true, std::sync::atomic::Ordering::Release);
+        let _ = self.configuration_generation.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |generation| generation.checked_add(1),
+        );
+        if let Some(handle) = self.deferred_configuration_abort.lock().unwrap().take() {
+            handle.abort();
+        }
         self.changed.notify_waiters();
     }
 }
