@@ -30,6 +30,16 @@ struct BuildReceipt {
     source_session: ProcessSessionId,
     target_session: ProcessSessionId,
     attempt_generation: u64,
+    configuration_generation: u64,
+}
+
+impl BuildReceipt {
+    fn matches_durable_selection(&self, other: &Self) -> bool {
+        self.selection == other.selection
+            && self.source_session == other.source_session
+            && self.target_session == other.target_session
+            && self.attempt_generation == other.attempt_generation
+    }
 }
 
 struct AccessProjection {
@@ -40,6 +50,7 @@ struct AccessProjection {
     sessions: BTreeMap<ReplicaIdentity, ProcessSessionId>,
     role: kuberic_protocol::types::ReplicaRole,
     configuration_generation: u64,
+    access_generation: u64,
     faulted_grant: bool,
 }
 
@@ -850,6 +861,8 @@ pub(super) struct CustomReplicatorHost {
     deferred_configuration_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     configuration_generation: Arc<AtomicU64>,
     configuration_commit: Arc<Mutex<()>>,
+    access_generation: Arc<AtomicU64>,
+    access_commit: Mutex<()>,
     restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
@@ -892,6 +905,8 @@ impl CustomReplicatorHost {
             deferred_configuration_abort: StdMutex::new(None),
             configuration_generation: Arc::new(AtomicU64::new(0)),
             configuration_commit: Arc::new(Mutex::new(())),
+            access_generation: Arc::new(AtomicU64::new(0)),
+            access_commit: Mutex::new(()),
             restored_access: RwLock::default(),
             removal_witnesses: RwLock::default(),
             outbound,
@@ -1007,6 +1022,7 @@ impl CustomReplicatorHost {
                 .get(&authority.build_id)
                 .copied()
                 .unwrap_or_default(),
+            configuration_generation: self.configuration_generation.load(Ordering::Acquire),
         })
     }
 
@@ -1193,6 +1209,21 @@ impl CustomReplicatorHost {
             .map_err(|_| RuntimeError::OperationCancelled)
     }
 
+    fn advance_access_generation(&self) -> Result<u64> {
+        self.access_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|generation| generation + 1)
+            .map_err(|_| RuntimeError::OperationCancelled)
+    }
+
+    async fn invalidate_access_projections(&self) -> Result<()> {
+        let _commit = self.access_commit.lock().await;
+        self.advance_access_generation()?;
+        Ok(())
+    }
+
     fn ensure_configuration_generation(&self, generation: u64) -> Result<()> {
         self.active_host()?;
         if self.configuration_generation.load(Ordering::Acquire) != generation {
@@ -1332,6 +1363,7 @@ impl CustomReplicatorHost {
         let sessions_before = self.sessions.read().await.clone();
         let role_before = host.state.read().await.fallback_snapshot.role;
         let configuration_generation = self.configuration_generation.load(Ordering::Acquire);
+        let access_generation = self.access_generation.load(Ordering::Acquire);
         if write == AccessStatus::Granted {
             if role_before != kuberic_protocol::types::ReplicaRole::Primary {
                 return Err(RuntimeError::NotPrimary);
@@ -1385,6 +1417,7 @@ impl CustomReplicatorHost {
             sessions: sessions_before,
             role: role_before,
             configuration_generation,
+            access_generation,
             faulted_grant,
         };
         self.validate_access_projection(&projection).await?;
@@ -1399,6 +1432,7 @@ impl CustomReplicatorHost {
             || projection.role != host.state.read().await.fallback_snapshot.role
             || projection.configuration_generation
                 != self.configuration_generation.load(Ordering::Acquire)
+            || projection.access_generation != self.access_generation.load(Ordering::Acquire)
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -1406,6 +1440,7 @@ impl CustomReplicatorHost {
     }
 
     async fn publish_access_projection(&self, projection: AccessProjection) -> Result<()> {
+        let _commit = self.access_commit.lock().await;
         self.validate_access_projection(&projection).await?;
         {
             let mut state = self.state.write().await;
@@ -1417,6 +1452,18 @@ impl CustomReplicatorHost {
             let mut state = host.state.write().await;
             state.fallback_snapshot.read_status = projection.read;
             state.fallback_snapshot.write_status = projection.write;
+        }
+        if let Err(error) = self.validate_access_projection(&projection).await {
+            let mut state = self.state.write().await;
+            state.read_status = AccessStatus::ReconfigurationPending;
+            state.write_status = AccessStatus::ReconfigurationPending;
+            drop(state);
+            if let Some(host) = self.host.upgrade() {
+                let mut state = host.state.write().await;
+                state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
+                state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+            }
+            return Err(error);
         }
         if projection.faulted_grant {
             Err(RuntimeError::ReconfigurationPending)
@@ -1625,7 +1672,12 @@ impl CustomReplicatorHost {
                 && !self.retired_builds.read().await.contains(&build.build_id)
                 && progress > 0
                 && progress >= build.replication_boundary_lsn
-                && self.receipts.read().await.get(&build.build_id) != Some(&receipt)
+                && self
+                    .receipts
+                    .read()
+                    .await
+                    .get(&build.build_id)
+                    .is_none_or(|stored| !stored.matches_durable_selection(&receipt))
             {
                 self.record_completion(receipt).await?;
             }
@@ -1775,6 +1827,7 @@ impl CustomReplicatorHost {
     }
 
     async fn invalidate_configuration_attempts(&self) -> Result<()> {
+        self.invalidate_access_projections().await?;
         let _commit = self.configuration_commit.lock().await;
         self.advance_configuration_generation()?;
         self.deferred_configuration_abort.lock().unwrap().take();
@@ -2436,12 +2489,16 @@ impl CustomReplicatorHost {
                             .load_build(&intent.build_id)
                             .await?
                             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                        let current_receipt = self.receipt(&build).await?;
+                        let retained_receipt =
+                            self.receipts.read().await.get(&intent.build_id).cloned();
                         if build.source != intent.primary
                             || build.target != intent.target
                             || build.current_configuration != intent.previous_configuration
                             || build.replication_boundary_lsn != intent.snapshot_boundary_lsn
-                            || self.receipts.read().await.get(&intent.build_id)
-                                != Some(&self.receipt(&build).await?)
+                            || retained_receipt.as_ref().is_none_or(|retained| {
+                                !retained.matches_durable_selection(&current_receipt)
+                            })
                             || !self.state.read().await.builds.iter().any(|progress| {
                                 progress.authority == build
                                     && progress.completed
@@ -2593,7 +2650,8 @@ impl CustomReplicatorHost {
         let mut current = Vec::new();
         for build in snapshot.builds {
             if let Some(receipt) = receipts.get(&build.authority.build_id)
-                && self.receipt(&build.authority).await.as_ref().ok() == Some(receipt)
+                && let Ok(current_receipt) = self.receipt(&build.authority).await
+                && receipt.matches_durable_selection(&current_receipt)
                 && !self
                     .retired_builds
                     .read()
@@ -2657,6 +2715,11 @@ impl CustomReplicatorHost {
         self.abort_notified
             .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.configuration_generation.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |generation| generation.checked_add(1),
+        );
+        let _ = self.access_generation.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |generation| generation.checked_add(1),
