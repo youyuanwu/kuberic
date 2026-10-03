@@ -10,6 +10,41 @@ use kuberic_runtime::replicator::sender::SenderOutbound;
 use kuberic_runtime_internal::transport::OutboundOperation;
 use kuberic_runtime_internal::transport::ReplicationItem;
 
+#[test]
+fn hosted_build_dispatch_uses_one_shared_public_execution_coordinator() {
+    let transport = include_str!("../src/transport.rs");
+    assert_eq!(
+        transport.matches(".execute_admitted_build(").count(),
+        1,
+        "production transport must have one admitted-build coordinator call"
+    );
+    assert!(
+        !transport.contains(".build_replica("),
+        "transport must not invoke the public primary through a parallel path"
+    );
+    assert!(
+        transport.contains("self.build_id.as_ref()")
+            && transport.contains("self.build_id = None;\n            self.guard.take();"),
+        "drop-safe dispatch cleanup must retain its token and lock until cancellation completes"
+    );
+    assert_eq!(
+        transport
+            .matches("QueuedOutbound::Build(endpoint) => self.dispatch_build(endpoint).await")
+            .count(),
+        1,
+        "one common Build control branch must own hosted dispatch"
+    );
+    assert_eq!(
+        transport
+            .matches(
+                "QueuedOutbound::Remove(replica_id) => {\n                let receiver = self.transport",
+            )
+            .count(),
+        1,
+        "one common Remove control branch must own hosted dispatch"
+    );
+}
+
 fn identity(id: i64, instance: &str) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(id),

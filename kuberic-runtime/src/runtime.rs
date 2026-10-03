@@ -16,7 +16,7 @@ use kuberic_protocol::validation::{
 };
 use kuberic_runtime_internal::authority::RetiredAuthority;
 use kuberic_runtime_internal::transport::{
-    CopyAck, CopyItem, OutboundOperation, ReplicaEndpoint, ReplicationAck, ReplicationItem,
+    CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
 };
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch};
 
@@ -78,7 +78,7 @@ struct OutboundBuild {
     emitted: BTreeMap<u64, EmittedBuildItem>,
     pending_operations: BTreeMap<i64, Operation>,
     catching_up: bool,
-    stream_tx: mpsc::Sender<Result<CopyItem>>,
+    stream_tx: Option<mpsc::Sender<Result<CopyItem>>>,
     generation: u64,
 }
 
@@ -728,11 +728,7 @@ impl DefaultReplicatorInner {
         }
     }
 
-    pub(crate) async fn wait_for_build(
-        &self,
-        replica: ReplicaInformation,
-        dispatch: bool,
-    ) -> Result<()> {
+    pub(crate) async fn wait_for_build(&self, replica: ReplicaInformation) -> Result<()> {
         self.require_primary().await?;
         let build_generation = self.fence_generation.load(Ordering::Acquire);
         if replica.identity == self.identity {
@@ -752,14 +748,6 @@ impl DefaultReplicatorInner {
             let mut state = self.state.write().await;
             state.removed_replicas.remove(&replica.identity.replica_id);
             state.cancelled_outbound_builds.remove(&build_id);
-        }
-        if dispatch {
-            self.send_outbound(OutboundOperation::Build(ReplicaEndpoint {
-                build_id: replica.build_id.clone(),
-                identity: replica.identity.clone(),
-                replication_address: replica.replication_address.clone(),
-            }))
-            .await?;
         }
         loop {
             let changed = self.changed.notified();
@@ -787,7 +775,8 @@ impl DefaultReplicatorInner {
                 ));
             }
             if state.outbound_builds.values().any(|build| {
-                build.progress.authority.target == replica.identity
+                build.progress.authority.build_id == build_id
+                    && build.progress.authority.target == replica.identity
                     && build.generation == build_generation
                     && build.progress.completed
                     && build.progress.durable_lsn >= state.current_progress
@@ -803,7 +792,7 @@ impl DefaultReplicatorInner {
         }
     }
 
-    pub(crate) async fn remove_replica(&self, replica_id: ReplicaId, dispatch: bool) -> Result<()> {
+    pub(crate) async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
         self.require_primary().await?;
         let mut state = self.state.write().await;
@@ -823,10 +812,6 @@ impl DefaultReplicatorInner {
             .retain(|_, build| build.progress.authority.target.replica_id != replica_id);
         state.removed_replicas.insert(replica_id);
         drop(state);
-        if dispatch {
-            self.send_outbound(OutboundOperation::Remove(replica_id))
-                .await?;
-        }
         self.changed.notify_waiters();
         Ok(())
     }
@@ -1194,7 +1179,9 @@ impl DefaultReplicatorInner {
                     snapshot_chunk: false,
                 },
             );
-            live_items.push((build.stream_tx.clone(), item));
+            if let Some(sender) = build.stream_tx.clone() {
+                live_items.push((sender, item));
+            }
         }
         drop(state);
         for (sender, item) in live_items {
@@ -1340,7 +1327,7 @@ impl DefaultReplicatorInner {
                 emitted: BTreeMap::new(),
                 pending_operations: BTreeMap::new(),
                 catching_up: true,
-                stream_tx: stream_tx.clone(),
+                stream_tx: Some(stream_tx.clone()),
                 generation: prepare_generation,
             },
         );
@@ -3814,11 +3801,6 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             .await
     }
 
-    async fn wait_for_catch_up_proof(&self) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::WaitForCatchup)
-            .await
-    }
-
     async fn prepare_switchover_proof(
         &self,
         preparation_generation: u64,
@@ -3935,14 +3917,6 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             .await
     }
 
-    async fn build_replica_proof(&self, replica: ReplicaInformation) -> Result<()> {
-        self.wait_for_build(replica, false).await
-    }
-
-    async fn remove_replica_proof(&self, replica_id: ReplicaId) -> Result<()> {
-        self.remove_replica(replica_id, false).await
-    }
-
     async fn refresh_progress_proof(&self) -> Result<()> {
         self.execute_managed_proof_action(RuntimeEffectAction::RefreshApplicationProgress)
             .await
@@ -3964,6 +3938,20 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         state.cancelled_outbound_builds.insert(build_id.clone());
         drop(state);
         self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn detach_outbound_build_stream(&self, build_id: &OperationId) -> Result<()> {
+        let _effect = self.effect_lock.lock().await;
+        let mut state = self.state.write().await;
+        let build = state
+            .outbound_builds
+            .get_mut(build_id)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        if !build.progress.completed {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        build.stream_tx = None;
         Ok(())
     }
 

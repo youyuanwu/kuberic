@@ -91,7 +91,6 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     ) -> Result<()>;
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
     async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()>;
-    async fn wait_for_catch_up_proof(&self) -> Result<()>;
     async fn prepare_switchover_proof(
         &self,
         preparation_generation: u64,
@@ -131,12 +130,11 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     ) -> Result<()>;
     async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()>;
     async fn retire_build_proof(&self, build_id: OperationId) -> Result<()>;
-    async fn build_replica_proof(&self, replica: ReplicaInformation) -> Result<()>;
-    async fn remove_replica_proof(&self, replica_id: ReplicaId) -> Result<()>;
     async fn refresh_progress_proof(&self) -> Result<()>;
     async fn restore_engine_proof(&self) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
+    async fn detach_outbound_build_stream(&self, build_id: &OperationId) -> Result<()>;
     async fn complete_open(&self, replication_address: String) -> Result<()>;
     async fn attach_interfaces(
         &self,
@@ -869,11 +867,11 @@ impl PrimaryReplicator for DefaultReplicator {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.engine.wait_for_build(replica, true).await
+        self.engine.wait_for_build(replica).await
     }
 
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
-        self.engine.remove_replica(replica_id, true).await
+        self.engine.remove_replica(replica_id).await
     }
 }
 

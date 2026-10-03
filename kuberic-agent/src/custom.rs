@@ -25,7 +25,7 @@ use super::{RuntimeHost, empty_snapshot};
 mod removal;
 
 #[derive(Clone, PartialEq, Eq)]
-struct BuildReceipt {
+pub(super) struct BuildReceipt {
     selection: BuildSelection,
     source_session: ProcessSessionId,
     target_session: ProcessSessionId,
@@ -55,12 +55,6 @@ struct AccessProjection {
 }
 
 type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuildExecution {
-    ApplicationCompleted,
-    BuiltInCopyRequired,
-}
 
 #[async_trait]
 trait ReplicatorLifecycleBackend: Send + Sync {
@@ -130,6 +124,8 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     ) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()>;
+    async fn cancel_outbound_build_attempt(&self, id: &OperationId, generation: u64) -> Result<()>;
+    async fn build_generation(&self, id: &OperationId) -> u64;
     async fn next_outbound(&self) -> Option<OutboundOperation>;
     async fn wait_for_build_completion(
         &self,
@@ -140,13 +136,15 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()>;
     async fn select_build(&self, authority: &BuildAuthority) -> Result<()>;
     async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()>;
-    async fn execute_build(&self, replica: ReplicaInformation) -> Result<BuildExecution>;
+    async fn execute_build(&self, replica: ReplicaInformation) -> Result<Option<BuildReceipt>>;
+    async fn accept_build(&self, receipt: Option<BuildReceipt>) -> Result<()>;
     async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()>;
 }
 
 struct ManagedLifecycleBackend {
     legacy: Arc<dyn ManagedReplicatorLifecycle>,
     common: CustomReplicatorHost,
+    accepted_builds: RwLock<BTreeMap<OperationId, BuildReceipt>>,
 }
 
 #[async_trait]
@@ -276,6 +274,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn retire_build(&self, build_id: OperationId) -> Result<()> {
+        self.accepted_builds.write().await.remove(&build_id);
         self.legacy.retire_build_proof(build_id.clone()).await?;
         self.common.retire_managed_build(build_id).await?;
         self.sync_engine_proof().await
@@ -286,7 +285,28 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn wait_for_catch_up(&self) -> Result<()> {
-        let result = self.legacy.wait_for_catch_up_proof().await;
+        let (authority_before, sessions_before, configuration_generation) = {
+            let _gate = self.common.gate.lock().await;
+            (
+                self.common.state.read().await.authority.clone(),
+                self.common.sessions.read().await.clone(),
+                self.common.configuration_generation.load(Ordering::Acquire),
+            )
+        };
+        let result = self
+            .common
+            .primary
+            .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
+            .await;
+        self.common.active_host()?;
+        let _gate = self.common.gate.lock().await;
+        if authority_before != self.common.state.read().await.authority
+            || sessions_before != *self.common.sessions.read().await
+            || configuration_generation
+                != self.common.configuration_generation.load(Ordering::Acquire)
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         self.sync_engine_proof().await?;
         result
     }
@@ -408,7 +428,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 
     async fn snapshot(&self) -> RuntimeSnapshot {
         let mut snapshot = self.common.snapshot().await;
-        let engine = self.legacy.snapshot().await;
+        let engine = self.engine_snapshot_for_host().await;
         snapshot.current_progress = engine.current_progress;
         snapshot.committed_lsn = engine.committed_lsn;
         snapshot.verified_replication_lsn = engine.verified_replication_lsn;
@@ -425,8 +445,29 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
+        self.accepted_builds.write().await.remove(id);
         self.common.cancel_common_build(id).await?;
         self.legacy.cancel_outbound_build(id).await
+    }
+
+    async fn cancel_outbound_build_attempt(&self, id: &OperationId, generation: u64) -> Result<()> {
+        if !self
+            .common
+            .cancel_common_build_attempt(id, generation)
+            .await?
+        {
+            return Ok(());
+        }
+        self.accepted_builds.write().await.remove(id);
+        self.legacy.cancel_outbound_build(id).await?;
+        self.common
+            .complete_common_build_cancellation(id, generation)
+            .await;
+        Ok(())
+    }
+
+    async fn build_generation(&self, id: &OperationId) -> u64 {
+        self.common.build_generation(id).await
     }
 
     async fn next_outbound(&self) -> Option<OutboundOperation> {
@@ -466,24 +507,28 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
         let build_id = replica.build_id.clone();
+        let target = replica.identity.clone();
+        if self.snapshot().await.builds.iter().any(|build| {
+            build.authority.build_id == build_id
+                && build.authority.target == target
+                && build.completed
+        }) {
+            return Ok(());
+        }
         let endpoint = ReplicaEndpoint {
             build_id: build_id.clone(),
             identity: replica.identity.clone(),
             replication_address: replica.replication_address.clone(),
         };
         self.common.enqueue_build_wait(endpoint).await?;
-        if let Err(error) = self.legacy.build_replica_proof(replica).await {
-            self.common.cancel_common_build(&build_id).await?;
-            return Err(error);
-        }
-        self.sync_engine_proof().await
+        self.wait_for_build_completion(&build_id, &target).await
     }
 
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
         let authority_before = self.common.state.read().await.authority.clone();
         let sessions_before = self.common.sessions.read().await.clone();
         let configuration_generation = self.common.configuration_generation.load(Ordering::Acquire);
-        self.legacy.remove_replica_proof(replica_id).await?;
+        self.common.primary.remove_replica(replica_id).await?;
         self.common.active_host()?;
         if authority_before != self.common.state.read().await.authority
             || sessions_before != *self.common.sessions.read().await
@@ -492,6 +537,10 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         {
             return Err(RuntimeError::OperationCancelled);
         }
+        self.accepted_builds
+            .write()
+            .await
+            .retain(|_, receipt| receipt.selection.authority.target.replica_id != replica_id);
         self.common.remove_managed_replica(replica_id).await
     }
 
@@ -504,10 +553,37 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.common.describe_peer(replica).await
     }
 
-    async fn execute_build(&self, replica: ReplicaInformation) -> Result<BuildExecution> {
+    async fn execute_build(&self, replica: ReplicaInformation) -> Result<Option<BuildReceipt>> {
         let mut replica = replica;
-        self.common.prepare_build_description(&mut replica).await?;
-        Ok(BuildExecution::BuiltInCopyRequired)
+        let receipt = self.common.prepare_build(&mut replica).await?;
+        self.common.primary.build_replica(replica).await?;
+        Ok(Some(receipt))
+    }
+
+    async fn accept_build(&self, receipt: Option<BuildReceipt>) -> Result<()> {
+        let receipt = receipt.ok_or_else(|| {
+            RuntimeError::Application("managed build acceptance omitted its receipt".into())
+        })?;
+        self.common.active_host()?;
+        let _gate = self.common.gate.lock().await;
+        if self.common.receipt(&receipt.selection.authority).await? != receipt {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.legacy
+            .detach_outbound_build_stream(&receipt.selection.authority.build_id)
+            .await?;
+        self.accepted_builds.write().await.insert(
+            receipt.selection.authority.build_id.clone(),
+            receipt.clone(),
+        );
+        self.common
+            .pending_builds
+            .write()
+            .await
+            .remove(&receipt.selection.authority.build_id);
+        self.sync_engine_proof().await?;
+        self.common.changed.notify_waiters();
+        Ok(())
     }
 
     async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
@@ -516,6 +592,31 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 }
 
 impl ManagedLifecycleBackend {
+    async fn engine_snapshot_for_host(&self) -> RuntimeSnapshot {
+        let mut snapshot = self.legacy.snapshot().await;
+        let accepted = self.accepted_builds.read().await.clone();
+        for build in &mut snapshot.builds {
+            if !build.completed
+                || self
+                    .common
+                    .build_generation(&build.authority.build_id)
+                    .await
+                    == 0
+            {
+                continue;
+            }
+            build.completed = match accepted.get(&build.authority.build_id) {
+                Some(receipt) if receipt.selection.authority == build.authority => self
+                    .common
+                    .receipt(&build.authority)
+                    .await
+                    .is_ok_and(|current| current == *receipt),
+                _ => false,
+            };
+        }
+        snapshot
+    }
+
     async fn execute_removal_action(&self, action: RuntimeEffectAction) -> Result<()> {
         let result = match action {
             RuntimeEffectAction::PrepareSecondaryRemoval {
@@ -592,7 +693,7 @@ impl ManagedLifecycleBackend {
 
     async fn sync_engine_proof(&self) -> Result<()> {
         self.common
-            .restore_engine_proof(self.legacy.snapshot().await)
+            .restore_engine_proof(self.engine_snapshot_for_host().await)
             .await
     }
 }
@@ -612,6 +713,7 @@ impl ReplicatorLifecycleHost {
             backend: Arc::new(ManagedLifecycleBackend {
                 legacy: lifecycle,
                 common: CustomReplicatorHost::new(host, control, primary, false),
+                accepted_builds: RwLock::default(),
             }),
         }
     }
@@ -797,6 +899,20 @@ impl ReplicatorLifecycleHost {
         self.backend.cancel_outbound_build(id).await
     }
 
+    pub(super) async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+    ) -> Result<()> {
+        self.backend
+            .cancel_outbound_build_attempt(id, generation)
+            .await
+    }
+
+    pub(super) async fn build_generation(&self, id: &OperationId) -> u64 {
+        self.backend.build_generation(id).await
+    }
+
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
         self.backend.next_outbound().await
     }
@@ -833,8 +949,12 @@ impl ReplicatorLifecycleHost {
     pub(super) async fn execute_build(
         &self,
         replica: ReplicaInformation,
-    ) -> Result<BuildExecution> {
+    ) -> Result<Option<BuildReceipt>> {
         self.backend.execute_build(replica).await
+    }
+
+    pub(super) async fn accept_build(&self, receipt: Option<BuildReceipt>) -> Result<()> {
+        self.backend.accept_build(receipt).await
     }
 
     pub(super) async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
@@ -855,6 +975,8 @@ pub(super) struct CustomReplicatorHost {
     retired_sessions: RwLock<BTreeSet<(ReplicaIdentity, ProcessSessionId)>>,
     retired_builds: RwLock<BTreeSet<OperationId>>,
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
+    cancelling_builds: RwLock<BTreeMap<OperationId, u64>>,
+    pending_builds: RwLock<BTreeMap<OperationId, ReplicaEndpoint>>,
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: Arc<RwLock<Option<ReplicaSetConfiguration>>>,
     deferred_configuration: Mutex<Option<DeferredConfiguration>>,
@@ -899,6 +1021,8 @@ impl CustomReplicatorHost {
             retired_sessions: RwLock::default(),
             retired_builds: RwLock::default(),
             build_generations: RwLock::default(),
+            cancelling_builds: RwLock::default(),
+            pending_builds: RwLock::default(),
             receipts: RwLock::default(),
             configuration: Arc::new(RwLock::default()),
             deferred_configuration: Mutex::new(None),
@@ -1697,22 +1821,52 @@ impl CustomReplicatorHost {
     }
 
     pub(super) async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
-        let mut generations = self.build_generations.write().await;
-        let generation = generations.entry(endpoint.build_id.clone()).or_default();
-        *generation = generation
-            .checked_add(1)
-            .ok_or(RuntimeError::OperationCancelled)?;
-        drop(generations);
-        self.enqueue_outbound(OutboundOperation::Build(endpoint))
+        if !self.begin_build_attempt(&endpoint).await? {
+            return Ok(());
+        }
+        let build_id = endpoint.build_id.clone();
+        if let Err(error) = self.enqueue_outbound(OutboundOperation::Build(endpoint)) {
+            self.pending_builds.write().await.remove(&build_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn enqueue_build_wait(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        if !self.begin_build_attempt(&endpoint).await? {
+            return Ok(());
+        }
+        let build_id = endpoint.build_id.clone();
+        let endpoint_for_cleanup = endpoint.clone();
+        let result = self.enqueue_build_wait_inner(endpoint).await;
+        if result.is_err()
+            && self.pending_builds.read().await.get(&build_id) == Some(&endpoint_for_cleanup)
+        {
+            self.pending_builds.write().await.remove(&build_id);
+        }
+        result
+    }
+
+    async fn begin_build_attempt(&self, endpoint: &ReplicaEndpoint) -> Result<bool> {
+        let mut pending = self.pending_builds.write().await;
+        if let Some(existing) = pending.get(&endpoint.build_id) {
+            if existing == endpoint {
+                return Ok(false);
+            }
+            return Err(RuntimeError::AuthorityMismatch(
+                "build ID is already queued for another exact target".into(),
+            ));
+        }
         let mut generations = self.build_generations.write().await;
         let generation = generations.entry(endpoint.build_id.clone()).or_default();
         *generation = generation
             .checked_add(1)
             .ok_or(RuntimeError::OperationCancelled)?;
-        drop(generations);
+        pending.insert(endpoint.build_id.clone(), endpoint.clone());
+        Ok(true)
+    }
+
+    async fn enqueue_build_wait_inner(&self, endpoint: ReplicaEndpoint) -> Result<()> {
         let mut operation = OutboundOperation::Build(endpoint);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(75);
         loop {
@@ -1798,7 +1952,11 @@ impl CustomReplicatorHost {
         self.primary.build_replica(replica).await?;
         self.active_host()?;
         let _gate = self.gate.lock().await;
-        self.record_completion(receipt).await?;
+        self.record_completion(receipt.clone()).await?;
+        self.pending_builds
+            .write()
+            .await
+            .remove(&receipt.selection.authority.build_id);
         self.refresh().await
     }
 
@@ -1851,6 +2009,7 @@ impl CustomReplicatorHost {
                 .checked_add(1)
                 .ok_or(RuntimeError::OperationCancelled)?;
         }
+        self.pending_builds.write().await.clear();
         self.changed.notify_waiters();
         Ok(())
     }
@@ -2008,6 +2167,15 @@ impl CustomReplicatorHost {
             .filter(|build| build.authority.target.replica_id == replica_id)
             .map(|build| build.authority.build_id.clone())
             .collect::<Vec<_>>();
+        {
+            let mut generations = self.build_generations.write().await;
+            for build_id in &retired {
+                let generation = generations.entry(build_id.clone()).or_default();
+                *generation = generation
+                    .checked_add(1)
+                    .ok_or(RuntimeError::OperationCancelled)?;
+            }
+        }
         self.state
             .write()
             .await
@@ -2017,6 +2185,10 @@ impl CustomReplicatorHost {
             .write()
             .await
             .retain(|_, receipt| receipt.selection.authority.target.replica_id != replica_id);
+        self.pending_builds
+            .write()
+            .await
+            .retain(|_, endpoint| endpoint.identity.replica_id != replica_id);
         self.retired_builds.write().await.extend(retired);
         self.changed.notify_waiters();
         self.enqueue_outbound(OutboundOperation::Remove(replica_id))
@@ -2221,6 +2393,7 @@ impl CustomReplicatorHost {
             }
             RuntimeEffectAction::RetireBuild(id) => {
                 self.retired_builds.write().await.insert(id.clone());
+                self.pending_builds.write().await.remove(&id);
                 self.state
                     .write()
                     .await
@@ -2242,13 +2415,53 @@ impl CustomReplicatorHost {
             .checked_add(1)
             .ok_or(RuntimeError::OperationCancelled)?;
         drop(generations);
+        self.pending_builds.write().await.remove(id);
         self.state
             .write()
             .await
             .builds
             .retain(|b| &b.authority.build_id != id);
         self.changed.notify_waiters();
+        self.cancelling_builds.write().await.remove(id);
         Ok(())
+    }
+
+    async fn cancel_common_build_attempt(
+        &self,
+        id: &OperationId,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        if self.cancelling_builds.read().await.get(id) == Some(&expected_generation) {
+            return Ok(true);
+        }
+        let mut generations = self.build_generations.write().await;
+        let generation = generations.entry(id.clone()).or_default();
+        if *generation != expected_generation {
+            return Ok(false);
+        }
+        *generation = generation
+            .checked_add(1)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        self.cancelling_builds
+            .write()
+            .await
+            .insert(id.clone(), expected_generation);
+        drop(generations);
+        self.pending_builds.write().await.remove(id);
+        self.state
+            .write()
+            .await
+            .builds
+            .retain(|build| &build.authority.build_id != id);
+        self.changed.notify_waiters();
+        Ok(true)
+    }
+
+    async fn complete_common_build_cancellation(&self, id: &OperationId, expected_generation: u64) {
+        let mut cancelling = self.cancelling_builds.write().await;
+        if cancelling.get(id) == Some(&expected_generation) {
+            cancelling.remove(id);
+        }
     }
 
     async fn build_generation(&self, id: &OperationId) -> u64 {
@@ -2529,6 +2742,7 @@ impl CustomReplicatorHost {
             RuntimeEffectAction::RegisterPeerSession { .. } => unreachable!(),
             RuntimeEffectAction::RetireBuild(id) => {
                 self.retired_builds.write().await.insert(id.clone());
+                self.pending_builds.write().await.remove(&id);
                 if let Some(build) = host
                     .default_dependencies
                     .build_authority_store
@@ -2693,7 +2907,9 @@ impl CustomReplicatorHost {
         {
             self.primary.remove_replica(build.target.replica_id).await?;
         }
-        self.configure().await
+        self.configure().await?;
+        self.cancelling_builds.write().await.remove(id);
+        Ok(())
     }
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
         loop {
@@ -2976,6 +3192,30 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::cancel_outbound_build(self, id).await
     }
 
+    async fn cancel_outbound_build_attempt(&self, id: &OperationId, generation: u64) -> Result<()> {
+        if !self.cancel_common_build_attempt(id, generation).await? {
+            return Ok(());
+        }
+        let _gate = self.gate.lock().await;
+        if let Some(build) = self
+            .host()?
+            .default_dependencies
+            .build_authority_store
+            .load_build(id)
+            .await?
+        {
+            self.primary.remove_replica(build.target.replica_id).await?;
+        }
+        self.configure().await?;
+        self.complete_common_build_cancellation(id, generation)
+            .await;
+        Ok(())
+    }
+
+    async fn build_generation(&self, id: &OperationId) -> u64 {
+        CustomReplicatorHost::build_generation(self, id).await
+    }
+
     async fn next_outbound(&self) -> Option<OutboundOperation> {
         CustomReplicatorHost::next_outbound(self).await
     }
@@ -3010,7 +3250,22 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        CustomReplicatorHost::execute_build(self, replica).await
+        let build_id = replica.build_id.clone();
+        let target = replica.identity.clone();
+        if self.snapshot().await.builds.iter().any(|build| {
+            build.authority.build_id == build_id
+                && build.authority.target == target
+                && build.completed
+        }) {
+            return Ok(());
+        }
+        self.enqueue_build_wait(ReplicaEndpoint {
+            build_id: build_id.clone(),
+            identity: target.clone(),
+            replication_address: replica.replication_address,
+        })
+        .await?;
+        self.wait_for_build_completion(&build_id, &target).await
     }
 
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
@@ -3036,9 +3291,18 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::describe_peer(self, replica).await
     }
 
-    async fn execute_build(&self, replica: ReplicaInformation) -> Result<BuildExecution> {
+    async fn execute_build(&self, replica: ReplicaInformation) -> Result<Option<BuildReceipt>> {
         CustomReplicatorHost::execute_build(self, replica).await?;
-        Ok(BuildExecution::ApplicationCompleted)
+        Ok(None)
+    }
+
+    async fn accept_build(&self, receipt: Option<BuildReceipt>) -> Result<()> {
+        if receipt.is_some() {
+            return Err(RuntimeError::Application(
+                "independent build returned a managed acceptance receipt".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {

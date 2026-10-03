@@ -1,6 +1,7 @@
 //! Service Fabric-aligned process hosting boundary.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
@@ -62,7 +63,6 @@ use crate::transport::{
 
 #[path = "custom.rs"]
 mod custom;
-pub(crate) use custom::BuildExecution;
 
 #[async_trait]
 pub trait RuntimeControlPlane: Send {
@@ -260,6 +260,60 @@ impl RegisteredReplicator {
 
 pub struct PodRuntime {
     host: Arc<RuntimeHost>,
+}
+
+struct ExactBuildCancellation {
+    host: Weak<RuntimeHost>,
+    build_id: Option<OperationId>,
+    generation: u64,
+}
+
+impl ExactBuildCancellation {
+    fn new(host: &Arc<RuntimeHost>, build_id: OperationId, generation: u64) -> Self {
+        Self {
+            host: Arc::downgrade(host),
+            build_id: Some(build_id),
+            generation,
+        }
+    }
+
+    async fn cancel(&mut self) -> Result<()> {
+        let Some(build_id) = self.build_id.as_ref() else {
+            return Ok(());
+        };
+        let Some(host) = self.host.upgrade() else {
+            self.build_id = None;
+            return Ok(());
+        };
+        host.lifecycle()?
+            .cancel_outbound_build_attempt(build_id, self.generation)
+            .await?;
+        self.build_id = None;
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.build_id = None;
+    }
+}
+
+impl Drop for ExactBuildCancellation {
+    fn drop(&mut self) {
+        let Some(build_id) = self.build_id.take() else {
+            return;
+        };
+        let host = self.host.clone();
+        let generation = self.generation;
+        tokio::spawn(async move {
+            if let Some(host) = host.upgrade()
+                && let Ok(lifecycle) = host.lifecycle()
+            {
+                let _ = lifecycle
+                    .cancel_outbound_build_attempt(&build_id, generation)
+                    .await;
+            }
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -719,6 +773,21 @@ impl PodRuntime {
         self.host.lifecycle()?.cancel_outbound_build(build_id).await
     }
 
+    pub(crate) async fn cancel_outbound_build_attempt(
+        &self,
+        build_id: &OperationId,
+        generation: u64,
+    ) -> Result<()> {
+        self.host
+            .lifecycle()?
+            .cancel_outbound_build_attempt(build_id, generation)
+            .await
+    }
+
+    pub(crate) async fn build_generation(&self, build_id: &OperationId) -> Result<u64> {
+        Ok(self.host.lifecycle()?.build_generation(build_id).await)
+    }
+
     pub async fn wait_for_build_completion(
         &self,
         build_id: &OperationId,
@@ -809,11 +878,54 @@ impl PodRuntime {
         Ok(())
     }
 
-    pub(crate) async fn execute_build(
+    pub(crate) async fn execute_admitted_build<F, Fut, E>(
         &self,
         replica: kuberic_runtime::replicator::ReplicaInformation,
-    ) -> Result<custom::BuildExecution> {
-        self.host.lifecycle()?.execute_build(replica).await
+        managed_copy: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<(), E>>,
+        E: From<RuntimeError>,
+    {
+        let lifecycle = self.host.lifecycle().map_err(E::from)?;
+        let managed = lifecycle.is_managed();
+        let generation = lifecycle.build_generation(&replica.build_id).await;
+        let mut cancellation =
+            ExactBuildCancellation::new(&self.host, replica.build_id.clone(), generation);
+        let result = if managed {
+            async {
+                let execution = lifecycle.execute_build(replica);
+                let copy = managed_copy();
+                tokio::pin!(execution);
+                tokio::pin!(copy);
+                let receipt = tokio::select! {
+                    result = &mut execution => result.map_err(E::from)?,
+                    result = &mut copy => {
+                        result?;
+                        execution.await.map_err(E::from)?
+                    }
+                };
+                lifecycle.accept_build(receipt).await.map_err(E::from)
+            }
+            .await
+        } else {
+            async {
+                let receipt = lifecycle.execute_build(replica).await.map_err(E::from)?;
+                lifecycle.accept_build(receipt).await.map_err(E::from)
+            }
+            .await
+        };
+        match result {
+            Ok(()) => {
+                cancellation.disarm();
+                Ok(())
+            }
+            Err(error) => {
+                cancellation.cancel().await.map_err(E::from)?;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
