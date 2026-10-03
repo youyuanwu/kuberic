@@ -59,7 +59,7 @@ use kuberic_runtime_internal::transport::{
     CopyAck as RuntimeCopyAck, CopyItem as RuntimeCopyItem, OutboundOperation,
     ReplicationAck as RuntimeReplicationAck, ReplicationItem as RuntimeReplicationItem,
 };
-use kuberic_runtime_internal::{ContractError, Result as ContractResult};
+use kuberic_runtime_internal::{ContractError, Result as ContractResult, RuntimeHostToken};
 use kuberic_wire::proto;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
@@ -3723,7 +3723,7 @@ impl ReplicatorFactory for CountingFactory {
                 .ok_or(RuntimeError::NotPrimary)?,
             counts: self.clone(),
         });
-        Ok(ReplicatorInterfaces::primary(replicator, state_replicator))
+        Ok(interfaces.wrap_primary(replicator, state_replicator))
     }
 }
 
@@ -7953,136 +7953,82 @@ async fn cancelled_factory_creation_aborts_pending_managed_replicator() {
 #[tokio::test]
 async fn replicator_creation_failure_matrix_releases_all_state() {
     let runtime = PodRuntime::new(
-        identity(1, "managed-pre-reservation"),
-        Arc::new(TestApplication::default()),
-        Arc::new(MemoryAuthorityStore::default()),
-    );
-    let registration = runtime.testing_replicator_registration();
-    let capability = Arc::new(TrackingManagedCapability::default());
-    let reservation = ReplicatorCreationReservation(1);
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    assert!(
-        registration
-            .register_managed_data_plane(capability, reservation)
-            .await
-            .is_err()
-    );
-
-    let runtime = PodRuntime::new(
-        identity(1, "managed-duplicates"),
+        identity(1, "managed-coherent-attachment"),
         Arc::new(TestApplication::default()),
         Arc::new(MemoryAuthorityStore::default()),
     );
     let registration = runtime.testing_replicator_registration();
     let reservation = registration.reserve_replicator_creation().unwrap();
     let capability = Arc::new(TrackingManagedCapability::default());
+    let interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
+    );
+    let attachment = interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), reservation)
+        .unwrap();
     registration
-        .register_managed_lifecycle(capability.clone(), reservation)
+        .register_interfaces(&interfaces, attachment, None, reservation)
         .await
         .unwrap();
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    registration
-        .register_managed_data_plane(capability.clone(), reservation)
-        .await
-        .unwrap();
-    assert!(
-        registration
-            .register_managed_data_plane(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    registration.cancel_replicator_creation(reservation);
-    assert_eq!(capability.aborts.load(Ordering::SeqCst), 2);
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
-    );
-    let retry = registration.reserve_replicator_creation().unwrap();
-    registration.cancel_replicator_creation(retry);
+    assert_eq!(runtime.testing_lifecycle_registration(), (Some(true), true));
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 0);
 
-    for lifecycle_only in [true, false] {
-        let runtime = PodRuntime::new(
-            identity(
-                1,
-                if lifecycle_only {
-                    "managed-lifecycle-only"
-                } else {
-                    "managed-data-plane-only"
-                },
-            ),
-            Arc::new(TestApplication::default()),
-            Arc::new(MemoryAuthorityStore::default()),
-        );
-        let registration = runtime.testing_replicator_registration();
-        let reservation = registration.reserve_replicator_creation().unwrap();
-        let capability = Arc::new(TrackingManagedCapability::default());
-        if lifecycle_only {
-            registration
-                .register_managed_lifecycle(capability.clone(), reservation)
-                .await
-                .unwrap();
-        } else {
-            registration
-                .register_managed_data_plane(capability.clone(), reservation)
-                .await
-                .unwrap();
-        }
-        let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
-        assert!(
-            registration
-                .register_interfaces(&interfaces, None, reservation)
-                .await
-                .is_err()
-        );
-        registration.cancel_replicator_creation(reservation);
-        assert_eq!(capability.aborts.load(Ordering::SeqCst), 1);
-    }
-
-    let runtime = PodRuntime::new(
-        identity(1, "managed-late-registration"),
+    let source_runtime = PodRuntime::new(
+        identity(1, "managed-source-identity"),
         Arc::new(TestApplication::default()),
         Arc::new(MemoryAuthorityStore::default()),
     );
-    let registration = runtime.testing_replicator_registration();
-    let reservation = registration.reserve_replicator_creation().unwrap();
+    let source_registration = source_runtime.testing_replicator_registration();
+    let source_reservation = source_registration.reserve_replicator_creation().unwrap();
+    let target_runtime = PodRuntime::new(
+        identity(1, "managed-target-identity"),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    let target_registration = target_runtime.testing_replicator_registration();
+    let target_reservation = target_registration.reserve_replicator_creation().unwrap();
+    let mismatched = Arc::new(TrackingManagedCapability::default());
+    let mismatched_interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        source_reservation.identity(RuntimeHostToken::new()),
+        mismatched.clone(),
+        None,
+        mismatched.clone(),
+    );
+    assert!(
+        mismatched_interfaces
+            .testing_prepare_attachment(RuntimeHostToken::new(), target_reservation)
+            .is_err()
+    );
+    drop(mismatched_interfaces);
+    assert_eq!(mismatched.aborts.load(Ordering::SeqCst), 3);
+    source_registration.cancel_replicator_creation(source_reservation);
+    target_registration.cancel_replicator_creation(target_reservation);
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn reconstructing_a_managed_bundle_abandons_its_original_creation() {
+    let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
     let capability = Arc::new(TrackingManagedCapability::default());
-    registration
-        .register_managed_lifecycle(capability.clone(), reservation)
-        .await
-        .unwrap();
-    registration
-        .register_managed_data_plane(capability.clone(), reservation)
-        .await
-        .unwrap();
-    let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
-    registration
-        .register_interfaces(&interfaces, None, reservation)
-        .await
-        .unwrap();
-    assert!(
-        registration
-            .register_managed_lifecycle(capability.clone(), reservation)
-            .await
-            .is_err()
+    let original = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
     );
-    assert!(
-        registration
-            .register_managed_data_plane(capability, reservation)
-            .await
-            .is_err()
-    );
+    let replacement = ReplicatorInterfaces::primary(capability.clone(), None);
+
+    drop(original);
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
+
+    drop(replacement);
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 4);
 }
 
 #[cfg(feature = "testing")]
@@ -8101,20 +8047,21 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
         attach_entered: Some(attach_entered.clone()),
         attach_resume: Some(Arc::new(Notify::new())),
     });
-    registration
-        .register_managed_lifecycle(capability.clone(), reservation)
-        .await
+    let interfaces = ReplicatorInterfaces::testing_managed_primary(
+        RuntimeHostToken::new(),
+        reservation.identity(RuntimeHostToken::new()),
+        capability.clone(),
+        None,
+        capability.clone(),
+    );
+    let attachment = interfaces
+        .testing_prepare_attachment(RuntimeHostToken::new(), reservation)
         .unwrap();
-    registration
-        .register_managed_data_plane(capability.clone(), reservation)
-        .await
-        .unwrap();
-    let interfaces = ReplicatorInterfaces::primary(capability.clone(), None);
     let registering = {
         let registration = registration.clone();
         tokio::spawn(async move {
             registration
-                .register_interfaces(&interfaces, None, reservation)
+                .register_interfaces(&interfaces, attachment, None, reservation)
                 .await
         })
     };
@@ -8124,7 +8071,7 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
         registering.await,
         Err(error) if error.is_cancelled()
     ));
-    assert_eq!(capability.aborts.load(Ordering::SeqCst), 2);
+    assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
     registration.cancel_replicator_creation(reservation);
     let retry = registration.reserve_replicator_creation().unwrap();
     registration.cancel_replicator_creation(retry);

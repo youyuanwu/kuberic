@@ -32,7 +32,8 @@ fi
 if ! grep -q 'managed_replicator' "$fixture_output" ||
     ! grep -q 'no associated function or constant named `new`' "$fixture_output" ||
     ! grep -q 'RuntimeHostToken: Default' "$fixture_output" ||
-    ! grep -q 'method `register_managed` is private' "$fixture_output" ||
+    ! grep -q 'no method named `register_managed`' "$fixture_output" ||
+    ! grep -q 'no method named `disarm_creation`' "$fixture_output" ||
     ! grep -q 'field `default_dependencies` of struct `ReplicatorFactoryContext` is private' "$fixture_output" ||
     ! grep -q 'module `authority` is private' "$fixture_output"; then
     cat "$fixture_output" >&2
@@ -42,4 +43,4 @@ fi
 
 cargo test -p kuberic-runtime --test public_api_inventory --quiet
 
-echo "kuberic-runtime documented and source-public APIs match their allowlists; tested managed, authority, and host-construction paths are unreachable from safe application code."
+echo "kuberic-runtime documented and source-public APIs match their allowlists; tested private-capability extraction, forging, attachment, guard, authority, and host-construction paths are unreachable from safe application code."

@@ -31,6 +31,10 @@ pub async fn register_managed_directly(context: ReplicatorFactoryContext) {
     context.register_managed(panic!("no managed capability")).await;
 }
 
+pub fn disarm_bundle_guard(interfaces: &ReplicatorInterfaces) {
+    interfaces.disarm_creation();
+}
+
 pub fn inspect_host_dependencies(context: &ReplicatorFactoryContext) {
     let _ = &context.default_dependencies;
 }

@@ -27,3 +27,14 @@ impl RuntimeHostToken {
         Self { _private: () }
     }
 }
+
+/// Opaque identity for one reserved replicator creation and its coherent
+/// public/private capability bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReplicatorCreationIdentity(uuid::Uuid);
+
+impl ReplicatorCreationIdentity {
+    pub fn new(_token: RuntimeHostToken) -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}

@@ -21,13 +21,12 @@ use kuberic_runtime::replicator::copy::{
     BuildConfiguration, PrepareCopyRequest, PreparedCopy as RuntimePreparedCopy,
 };
 use kuberic_runtime::replicator::{
-    DefaultReplicatorDependencies, ManagedReplicatorDataPlane, ManagedReplicatorLifecycle,
-    PartitionAccessView, PrimaryReplicator, Replicator, ReplicatorCreationReservation,
+    DefaultReplicatorDependencies, ManagedReplicatorDataPlane, PartitionAccessView,
+    PrimaryReplicator, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
     ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
     StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
-use kuberic_runtime_internal::RuntimeHostToken;
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
     BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore, ReplicationProgressStore,
@@ -37,6 +36,7 @@ use kuberic_runtime_internal::effects::{
     RuntimeSnapshot,
 };
 use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
+use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
 use kuberic_wire::proto;
 use tokio::sync::{Mutex, RwLock};
 
@@ -64,7 +64,6 @@ use crate::transport::{
 const REPLICATOR_CREATION_AVAILABLE: u8 = 0;
 const REPLICATOR_CREATION_RESERVED: u8 = 1;
 const REPLICATOR_CREATION_REGISTERED: u8 = 2;
-const REPLICATOR_RESERVATION_ID: u64 = 1;
 
 #[path = "custom.rs"]
 mod custom;
@@ -221,49 +220,6 @@ impl PrimaryReplicator for HostedPrimaryReplicator {
     }
 }
 
-struct PendingManagedCapabilities {
-    reservation: u64,
-    lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
-    data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
-}
-
-struct ManagedCapabilityRegistrationGuard {
-    lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
-    data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
-    armed: bool,
-}
-
-impl ManagedCapabilityRegistrationGuard {
-    fn new(
-        lifecycle: Option<Arc<dyn ManagedReplicatorLifecycle>>,
-        data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
-    ) -> Self {
-        Self {
-            lifecycle,
-            data_plane,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ManagedCapabilityRegistrationGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(lifecycle) = self.lifecycle.as_ref() {
-            lifecycle.abort();
-        }
-        if let Some(data_plane) = self.data_plane.as_ref() {
-            data_plane.abort();
-        }
-    }
-}
-
 impl RegisteredReplicator {
     fn managed_data_plane(&self) -> Option<Arc<dyn ManagedReplicatorDataPlane>> {
         self.managed_data_plane.clone()
@@ -384,7 +340,7 @@ impl PodRuntime {
                 }),
                 effect_lock: Mutex::new(()),
                 registered: OnceLock::new(),
-                pending_managed_capabilities: StdMutex::new(None),
+                replicator_creation_identity: StdMutex::new(None),
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
@@ -1028,7 +984,7 @@ struct RuntimeHost {
     state: RwLock<HostState>,
     effect_lock: Mutex<()>,
     registered: OnceLock<RegisteredReplicator>,
-    pending_managed_capabilities: StdMutex<Option<PendingManagedCapabilities>>,
+    replicator_creation_identity: StdMutex<Option<ReplicatorCreationIdentity>>,
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
@@ -1114,24 +1070,30 @@ impl ReplicatorRegistration for RuntimeHost {
                     "CreateReplicator may be called only once per Open".into(),
                 )
             })?;
-        Ok(ReplicatorCreationReservation(REPLICATOR_RESERVATION_ID))
+        let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+        let mut identity = match self.replicator_creation_identity.lock() {
+            Ok(identity) => identity,
+            Err(_) => {
+                let _ = self.replicator_creation.compare_exchange(
+                    REPLICATOR_CREATION_RESERVED,
+                    REPLICATOR_CREATION_AVAILABLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return Err(RuntimeError::Application(
+                    "replicator creation identity was poisoned".into(),
+                ));
+            }
+        };
+        *identity = Some(reservation.identity(RuntimeHostToken::new()));
+        Ok(reservation)
     }
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation) {
-        if reservation.0 == REPLICATOR_RESERVATION_ID {
-            if let Ok(mut pending) = self.pending_managed_capabilities.lock()
-                && pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.reservation == reservation.0)
-                && let Some(pending) = pending.take()
-            {
-                if let Some(lifecycle) = pending.lifecycle {
-                    lifecycle.abort();
-                }
-                if let Some(data_plane) = pending.data_plane {
-                    data_plane.abort();
-                }
-            }
+        if let Ok(mut active_identity) = self.replicator_creation_identity.lock()
+            && active_identity.as_ref() == Some(&reservation.identity(RuntimeHostToken::new()))
+        {
+            *active_identity = None;
             let _ = self.replicator_creation.compare_exchange(
                 REPLICATOR_CREATION_RESERVED,
                 REPLICATOR_CREATION_AVAILABLE,
@@ -1141,125 +1103,37 @@ impl ReplicatorRegistration for RuntimeHost {
         }
     }
 
-    async fn register_managed_lifecycle(
-        &self,
-        lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
-        reservation: ReplicatorCreationReservation,
-    ) -> Result<()> {
-        if reservation.0 != REPLICATOR_RESERVATION_ID
-            || self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
-        {
-            return Err(RuntimeError::Application(
-                "CreateReplicator reservation is not active".into(),
-            ));
-        }
-        let mut pending = self.pending_managed_capabilities.lock().map_err(|_| {
-            RuntimeError::Application("managed capability registration was poisoned".into())
-        })?;
-        match pending.as_mut() {
-            Some(pending) if pending.reservation != reservation.0 => {
-                return Err(RuntimeError::Application(
-                    "managed capability reservation does not match".into(),
-                ));
-            }
-            Some(pending) if pending.lifecycle.is_some() => {
-                return Err(RuntimeError::Application(
-                    "managed lifecycle may be registered only once".into(),
-                ));
-            }
-            Some(pending) => pending.lifecycle = Some(lifecycle),
-            None => {
-                *pending = Some(PendingManagedCapabilities {
-                    reservation: reservation.0,
-                    lifecycle: Some(lifecycle),
-                    data_plane: None,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn register_managed_data_plane(
-        &self,
-        data_plane: Arc<dyn ManagedReplicatorDataPlane>,
-        reservation: ReplicatorCreationReservation,
-    ) -> Result<()> {
-        if reservation.0 != REPLICATOR_RESERVATION_ID
-            || self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
-        {
-            return Err(RuntimeError::Application(
-                "CreateReplicator reservation is not active".into(),
-            ));
-        }
-        let mut pending = self.pending_managed_capabilities.lock().map_err(|_| {
-            RuntimeError::Application("managed capability registration was poisoned".into())
-        })?;
-        match pending.as_mut() {
-            Some(pending) if pending.reservation != reservation.0 => {
-                return Err(RuntimeError::Application(
-                    "managed capability reservation does not match".into(),
-                ));
-            }
-            Some(pending) if pending.data_plane.is_some() => {
-                return Err(RuntimeError::Application(
-                    "managed data plane may be registered only once".into(),
-                ));
-            }
-            Some(pending) => pending.data_plane = Some(data_plane),
-            None => {
-                *pending = Some(PendingManagedCapabilities {
-                    reservation: reservation.0,
-                    lifecycle: None,
-                    data_plane: Some(data_plane),
-                });
-            }
-        }
-        Ok(())
-    }
-
     async fn register_interfaces(
         &self,
         interfaces: &ReplicatorInterfaces,
+        attachment: ReplicatorAttachment,
         provider: Option<Arc<dyn StateProvider>>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()> {
-        if reservation.0 != REPLICATOR_RESERVATION_ID
-            || self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
+        let reservation_identity = reservation.identity(RuntimeHostToken::new());
+        if self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
+            || self
+                .replicator_creation_identity
+                .lock()
+                .map_err(|_| {
+                    RuntimeError::Application("replicator creation identity was poisoned".into())
+                })?
+                .as_ref()
+                != Some(&reservation_identity)
+            || attachment.identity(RuntimeHostToken::new()) != reservation_identity
         {
             return Err(RuntimeError::Application(
                 "CreateReplicator reservation is not active".into(),
             ));
         }
-        let (managed_lifecycle, managed_data_plane) = {
-            let mut pending = self.pending_managed_capabilities.lock().map_err(|_| {
-                RuntimeError::Application("managed capability registration was poisoned".into())
-            })?;
-            match pending.as_ref() {
-                None => (None, None),
-                Some(pending) if pending.reservation != reservation.0 => {
-                    return Err(RuntimeError::Application(
-                        "managed capability reservation does not match".into(),
-                    ));
-                }
-                Some(pending) if pending.lifecycle.is_none() || pending.data_plane.is_none() => {
-                    return Err(RuntimeError::Application(
-                        "managed lifecycle and data plane must be registered together".into(),
-                    ));
-                }
-                Some(_) => {
-                    let pending = pending.take().expect("pending capabilities");
-                    (pending.lifecycle, pending.data_plane)
-                }
-            }
-        };
-        let mut managed =
-            ManagedCapabilityRegistrationGuard::new(managed_lifecycle, managed_data_plane);
-        if let Some(lifecycle) = managed.lifecycle.as_ref() {
+        let managed_lifecycle = attachment.managed_lifecycle(RuntimeHostToken::new());
+        let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
+        if let Some(lifecycle) = managed_lifecycle.as_ref() {
             lifecycle
                 .attach_interfaces(interfaces.replicator(), interfaces.primary_replicator())
                 .await?;
         }
-        let lifecycle = match (managed.lifecycle.as_ref(), interfaces.primary_replicator()) {
+        let lifecycle = match (managed_lifecycle.as_ref(), interfaces.primary_replicator()) {
             (Some(lifecycle), Some(primary)) => {
                 Some(Arc::new(custom::ReplicatorLifecycleHost::managed(
                     self.weak_self.clone(),
@@ -1287,7 +1161,7 @@ impl ReplicatorRegistration for RuntimeHost {
                 primary: interfaces.primary_replicator(),
                 provider,
                 lifecycle,
-                managed_data_plane: managed.data_plane.clone(),
+                managed_data_plane,
             })
             .is_err()
         {
@@ -1295,7 +1169,6 @@ impl ReplicatorRegistration for RuntimeHost {
                 "CreateReplicator may be called only once per Open".into(),
             ));
         }
-        managed.disarm();
         self.replicator_creation
             .compare_exchange(
                 REPLICATOR_CREATION_RESERVED,
@@ -1308,6 +1181,10 @@ impl ReplicatorRegistration for RuntimeHost {
                     "CreateReplicator reservation was lost before registration".into(),
                 )
             })?;
+        *self.replicator_creation_identity.lock().map_err(|_| {
+            RuntimeError::Application("replicator creation identity was poisoned".into())
+        })? = None;
+        attachment.disarm(RuntimeHostToken::new());
         Ok(())
     }
 }
@@ -1359,15 +1236,6 @@ impl RuntimeHost {
                 lifecycle.notify_abort();
             }
             registered.abort();
-        } else if let Ok(mut pending) = self.pending_managed_capabilities.lock()
-            && let Some(pending) = pending.take()
-        {
-            if let Some(lifecycle) = pending.lifecycle {
-                lifecycle.abort();
-            }
-            if let Some(data_plane) = pending.data_plane {
-                data_plane.abort();
-            }
         }
         self.application.abort();
     }
@@ -1818,7 +1686,6 @@ impl RuntimeHost {
                 host: self.weak_self.clone(),
                 partition_information: self.state.read().await.partition_information.clone(),
             }),
-            registration.clone(),
             self.default_dependencies.clone(),
         );
         let registration = self
