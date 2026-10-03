@@ -4348,6 +4348,18 @@ struct CustomRoleGate {
     block_progress: AtomicBool,
     progress_entered: Notify,
     progress_released: Notify,
+    block_configuration: AtomicBool,
+    configuration_entered: Notify,
+    configuration_released: Notify,
+    block_catchup: AtomicBool,
+    catchup_entered: Notify,
+    catchup_released: Notify,
+    block_build: AtomicBool,
+    build_entered: Notify,
+    build_released: Notify,
+    block_remove: AtomicBool,
+    remove_entered: Notify,
+    remove_released: Notify,
     partition: Mutex<Option<StatefulServicePartition>>,
     configurations: Mutex<Vec<kuberic_runtime::replicator::ReplicaSetConfiguration>>,
     operations: Mutex<Vec<Bytes>>,
@@ -4417,17 +4429,33 @@ impl PrimaryReplicator for CustomRoleGate {
         &self,
         configuration: kuberic_runtime::replicator::ReplicaSetConfiguration,
     ) -> Result<()> {
+        if self.block_configuration.swap(false, Ordering::SeqCst) {
+            self.configuration_entered.notify_one();
+            self.configuration_released.notified().await;
+        }
         self.configurations.lock().unwrap().push(configuration);
         Ok(())
     }
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+        if self.block_catchup.swap(false, Ordering::SeqCst) {
+            self.catchup_entered.notify_one();
+            self.catchup_released.notified().await;
+        }
         self.catchups.lock().unwrap().push(mode);
         Ok(())
     }
     async fn build_replica(&self, _: ReplicaInformation) -> Result<()> {
+        if self.block_build.swap(false, Ordering::SeqCst) {
+            self.build_entered.notify_one();
+            self.build_released.notified().await;
+        }
         Ok(())
     }
     async fn remove_replica(&self, _: ReplicaId) -> Result<()> {
+        if self.block_remove.swap(false, Ordering::SeqCst) {
+            self.remove_entered.notify_one();
+            self.remove_released.notified().await;
+        }
         Ok(())
     }
 }
@@ -4732,6 +4760,206 @@ async fn blocked_progress_never_publishes_access_before_proof() {
         partition.get_write_status().await.unwrap(),
         AccessStatus::Granted
     );
+}
+
+async fn blocked_lifecycle_fixture(
+    suffix: &str,
+) -> (
+    Arc<PodRuntime>,
+    Arc<CustomRoleGate>,
+    ReplicaIdentity,
+    ReplicaIdentity,
+) {
+    let local = identity(1, &format!("blocked-lifecycle-{suffix}"));
+    let peer = identity(2, &format!("blocked-lifecycle-peer-{suffix}"));
+    let control = Arc::new(CustomRoleGate::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new(format!("blocked-lifecycle-{suffix}")),
+            ProcessSessionId::new("local-session"),
+        )
+        .unwrap();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::New),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+            local.clone(),
+            vec![local.clone(), peer.clone()],
+        ))),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::RegisterPeerSession {
+            identity: peer.clone(),
+            session: ProcessSessionId::new("peer-session"),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let mut description = ReplicaInformation::new(
+        OperationId::default(),
+        peer.clone(),
+        format!("in-process://{suffix}"),
+    );
+    description.process_session_id = ProcessSessionId::new("peer-session");
+    kuberic_agent::testing::describe_peer(&runtime, description)
+        .await
+        .unwrap();
+    (runtime, control, local, peer)
+}
+
+fn assert_stale_lifecycle_result<T>(result: Result<T>) {
+    assert!(matches!(
+        result,
+        Err(RuntimeError::Closed | RuntimeError::OperationCancelled)
+    ));
+}
+
+#[tokio::test]
+async fn blocked_lifecycle_callbacks_reject_fencing_session_replacement_close_and_abort() {
+    {
+        let (runtime, control, _, peer) = blocked_lifecycle_fixture("progress").await;
+        control.block_progress.store(true, Ordering::SeqCst);
+        let grant = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .apply_effect(effect(
+                        5,
+                        RuntimeEffectAction::SetAccessStatus {
+                            read: AccessStatus::Granted,
+                            write: AccessStatus::Granted,
+                        },
+                    ))
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(1), control.progress_entered.notified())
+            .await
+            .unwrap();
+        let mut replacement = ReplicaInformation::new(
+            OperationId::default(),
+            peer,
+            "in-process://replacement".into(),
+        );
+        replacement.process_session_id = ProcessSessionId::new("replacement-session");
+        kuberic_agent::testing::describe_peer(&runtime, replacement)
+            .await
+            .unwrap();
+        control.progress_released.notify_one();
+        assert_stale_lifecycle_result(grant.await.unwrap());
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    }
+    {
+        let (runtime, control, _, peer) = blocked_lifecycle_fixture("configuration").await;
+        control.block_configuration.store(true, Ordering::SeqCst);
+        let configuration = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                let mut replacement = ReplicaInformation::new(
+                    OperationId::default(),
+                    peer,
+                    "in-process://configuration".into(),
+                );
+                replacement.process_session_id = ProcessSessionId::new("configuration-session");
+                kuberic_agent::testing::describe_peer(&runtime, replacement).await
+            })
+        };
+        timeout(
+            Duration::from_secs(1),
+            control.configuration_entered.notified(),
+        )
+        .await
+        .unwrap();
+        runtime
+            .apply_effect(effect(5, RuntimeEffectAction::Close))
+            .await
+            .unwrap();
+        control.configuration_released.notify_one();
+        assert_stale_lifecycle_result(configuration.await.unwrap());
+        assert!(!runtime.snapshot().await.open);
+    }
+    {
+        let (runtime, control, _, _) = blocked_lifecycle_fixture("catchup").await;
+        control.block_catchup.store(true, Ordering::SeqCst);
+        let catchup = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(1), control.catchup_entered.notified())
+            .await
+            .unwrap();
+        runtime.abort();
+        control.catchup_released.notify_one();
+        assert_stale_lifecycle_result(catchup.await.unwrap());
+        assert!(!runtime.snapshot().await.catch_up_complete);
+    }
+    {
+        let (runtime, control, _, peer) = blocked_lifecycle_fixture("build").await;
+        let authority = runtime
+            .authorize_build(
+                OperationId::new("blocked-build"),
+                peer.clone(),
+                BuildConfiguration::Current,
+            )
+            .await
+            .unwrap();
+        control.block_build.store(true, Ordering::SeqCst);
+        let build = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                kuberic_agent::testing::execute_build(
+                    &runtime,
+                    ReplicaInformation::new(
+                        authority.build_id,
+                        peer,
+                        "in-process://blocked-build".into(),
+                    ),
+                )
+                .await
+            })
+        };
+        timeout(Duration::from_secs(1), control.build_entered.notified())
+            .await
+            .unwrap();
+        runtime.abort();
+        control.build_released.notify_one();
+        assert_stale_lifecycle_result(build.await.unwrap());
+        assert!(
+            runtime
+                .snapshot()
+                .await
+                .builds
+                .iter()
+                .all(|build| !build.completed)
+        );
+    }
+    {
+        let (runtime, control, _, peer) = blocked_lifecycle_fixture("removal").await;
+        control.block_remove.store(true, Ordering::SeqCst);
+        let removal = {
+            let primary = runtime.primary_replicator().await.unwrap();
+            tokio::spawn(async move { primary.remove_replica(peer.replica_id).await })
+        };
+        timeout(Duration::from_secs(1), control.remove_entered.notified())
+            .await
+            .unwrap();
+        runtime.abort();
+        control.remove_released.notify_one();
+        assert_stale_lifecycle_result(removal.await.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -5404,6 +5632,19 @@ async fn unavailable_default_data_plane_never_returns_success() {
 
 #[tokio::test]
 async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
+    let operation_classes = [
+        "open",
+        "authority",
+        "role",
+        "catch-up",
+        "access",
+        "configuration-session",
+        "build",
+        "removal",
+        "retirement",
+        "close-abort",
+    ];
+    assert_eq!(operation_classes.len() * 2, 20);
     let default_identity = identity(1, "conformance-default");
     let default = open_primary(
         Arc::new(TestApplication::default()),
@@ -5427,7 +5668,7 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
         RuntimeEffectAction::Open(OpenMode::New),
         RuntimeEffectAction::AdmitAuthority(Box::new(authority(
             custom_identity.clone(),
-            vec![custom_identity],
+            vec![custom_identity.clone()],
         ))),
         RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
         RuntimeEffectAction::WaitForCatchup,
@@ -5492,14 +5733,100 @@ async fn default_and_custom_primaries_share_lifecycle_conformance_matrix() {
     custom.cancel_configuration_work().await.unwrap();
     assert_eq!(default.snapshot().await.write_status, AccessStatus::Granted);
     assert_eq!(custom.snapshot().await.write_status, AccessStatus::Granted);
+    let default_peer = identity(2, "conformance-default-peer");
+    let custom_peer = identity(2, "conformance-custom-peer");
     default
-        .apply_effect(effect(7, RuntimeEffectAction::Close))
+        .apply_effect(effect(
+            7,
+            RuntimeEffectAction::RegisterPeerSession {
+                identity: default_peer.clone(),
+                session: ProcessSessionId::new("default-peer-session"),
+            },
+        ))
         .await
         .unwrap();
     custom
-        .apply_effect(effect(8, RuntimeEffectAction::Close))
+        .apply_effect(effect(
+            8,
+            RuntimeEffectAction::RegisterPeerSession {
+                identity: custom_peer.clone(),
+                session: ProcessSessionId::new("custom-peer-session"),
+            },
+        ))
         .await
         .unwrap();
+    let default_snapshot = default.snapshot().await;
+    let custom_snapshot = custom.snapshot().await;
+    let default_build = BuildAuthority {
+        build_id: OperationId::new("conformance-default-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: default_identity,
+        target: default_peer.clone(),
+        current_configuration: default_snapshot.authority.unwrap().current_configuration,
+        replication_boundary_lsn: default_snapshot.committed_lsn,
+    };
+    let custom_build = BuildAuthority {
+        build_id: OperationId::new("conformance-custom-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: custom_identity,
+        target: custom_peer.clone(),
+        current_configuration: custom_snapshot.authority.unwrap().current_configuration,
+        replication_boundary_lsn: custom_snapshot.committed_lsn,
+    };
+    default
+        .apply_effect(effect(
+            8,
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(default_build.clone())),
+        ))
+        .await
+        .unwrap();
+    custom
+        .apply_effect(effect(
+            9,
+            RuntimeEffectAction::AdmitBuildAuthority(Box::new(custom_build.clone())),
+        ))
+        .await
+        .unwrap();
+    default
+        .primary_replicator()
+        .await
+        .unwrap()
+        .remove_replica(default_peer.replica_id)
+        .await
+        .unwrap();
+    custom
+        .primary_replicator()
+        .await
+        .unwrap()
+        .remove_replica(custom_peer.replica_id)
+        .await
+        .unwrap();
+    default
+        .apply_effect(effect(
+            9,
+            RuntimeEffectAction::RetireBuild(default_build.build_id),
+        ))
+        .await
+        .unwrap();
+    custom
+        .apply_effect(effect(
+            10,
+            RuntimeEffectAction::RetireBuild(custom_build.build_id),
+        ))
+        .await
+        .unwrap();
+    assert!(default.snapshot().await.builds.is_empty());
+    assert!(custom.snapshot().await.builds.is_empty());
+    default
+        .apply_effect(effect(10, RuntimeEffectAction::Close))
+        .await
+        .unwrap();
+    custom
+        .apply_effect(effect(11, RuntimeEffectAction::Close))
+        .await
+        .unwrap();
+    default.abort();
+    custom.abort();
     assert!(!default.snapshot().await.open);
     assert!(!custom.snapshot().await.open);
 }

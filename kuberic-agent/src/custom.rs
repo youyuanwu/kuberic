@@ -1,6 +1,7 @@
 //! Private SF lifecycle/effect hosting, independent of operation/copy capability.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -802,6 +803,7 @@ pub(super) struct CustomReplicatorHost {
     receipts: RwLock<BTreeMap<OperationId, BuildReceipt>>,
     configuration: RwLock<Option<ReplicaSetConfiguration>>,
     deferred_configuration: Mutex<Option<tokio::task::JoinHandle<Result<ReplicaSetConfiguration>>>>,
+    configuration_generation: Arc<AtomicU64>,
     restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
@@ -841,6 +843,7 @@ impl CustomReplicatorHost {
             receipts: RwLock::default(),
             configuration: RwLock::default(),
             deferred_configuration: Mutex::new(None),
+            configuration_generation: Arc::new(AtomicU64::new(0)),
             restored_access: RwLock::default(),
             removal_witnesses: RwLock::default(),
             outbound,
@@ -1117,13 +1120,38 @@ impl CustomReplicatorHost {
         Ok(current)
     }
 
+    fn advance_configuration_generation(&self) -> Result<u64> {
+        self.configuration_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|generation| generation + 1)
+            .map_err(|_| RuntimeError::OperationCancelled)
+    }
+
+    fn ensure_configuration_generation(&self, generation: u64) -> Result<()> {
+        self.host()?;
+        if self.configuration_generation.load(Ordering::Acquire) != generation {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        Ok(())
+    }
+
     async fn finish_deferred_configuration(&self) -> Result<()> {
-        let Some(handle) = self.deferred_configuration.lock().await.take() else {
+        let Some(mut handle) = self.deferred_configuration.lock().await.take() else {
             return Ok(());
         };
-        let current = handle
-            .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))??;
+        let current =
+            match tokio::time::timeout(std::time::Duration::from_secs(75), &mut handle).await {
+                Ok(result) => {
+                    result.map_err(|error| RuntimeError::Application(error.to_string()))??
+                }
+                Err(_) => {
+                    handle.abort();
+                    return Err(RuntimeError::OperationCancelled);
+                }
+            };
+        self.host()?;
         *self.configuration.write().await = Some(current);
         Ok(())
     }
@@ -1136,9 +1164,15 @@ impl CustomReplicatorHost {
         let Some((current, previous)) = self.configuration_update().await? else {
             return Ok(());
         };
+        let generation = self.advance_configuration_generation()?;
+        let configuration_generation = self.configuration_generation.clone();
         let primary = self.primary.clone();
         *self.deferred_configuration.lock().await = Some(tokio::spawn(async move {
-            Self::apply_configuration_update(primary, current, previous).await
+            let current = Self::apply_configuration_update(primary, current, previous).await?;
+            if configuration_generation.load(Ordering::Acquire) != generation {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            Ok(current)
         }));
         Ok(())
     }
@@ -1148,8 +1182,10 @@ impl CustomReplicatorHost {
         let Some((current, previous)) = self.configuration_update().await? else {
             return Ok(());
         };
+        let generation = self.advance_configuration_generation()?;
         let current =
             Self::apply_configuration_update(self.primary.clone(), current, previous).await?;
+        self.ensure_configuration_generation(generation)?;
         *self.configuration.write().await = Some(current);
         Ok(())
     }
@@ -1215,6 +1251,7 @@ impl CustomReplicatorHost {
             self.control.abort();
             return Err(error);
         }
+        self.host()?;
         if authority_before != self.state.read().await.authority
             || configuration_before != *self.configuration.read().await
             || sessions_before != *self.sessions.read().await
@@ -1384,6 +1421,8 @@ impl CustomReplicatorHost {
             Some(selection) => self.receipt(&selection.authority).await.ok(),
             None => None,
         };
+        let authority_before = self.state.read().await.authority.clone();
+        let sessions_before = self.sessions.read().await.clone();
         let progress = match self.control.current_progress().await {
             Ok(progress) => progress,
             Err(RuntimeError::ReconfigurationPending) => {
@@ -1398,6 +1437,12 @@ impl CustomReplicatorHost {
             }
             Err(error) => return Err(error),
         };
+        self.host()?;
+        if authority_before != self.state.read().await.authority
+            || sessions_before != *self.sessions.read().await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         if progress < 0 {
             return Err(RuntimeError::InvalidReplication(
                 "negative custom replicator progress".into(),
@@ -1548,10 +1593,6 @@ impl CustomReplicatorHost {
         *self.restored_access.write().await = None;
         self.removal_witnesses.write().await.clear();
         self.invalidate_build_attempts().await?;
-        if let Some(handle) = self.deferred_configuration.lock().await.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
         self.receiver.lock().await.close();
         let mut state = self.state.write().await;
         state.open = false;
@@ -1572,7 +1613,17 @@ impl CustomReplicatorHost {
         }
     }
 
+    async fn invalidate_configuration_attempts(&self) -> Result<()> {
+        self.advance_configuration_generation()?;
+        if let Some(handle) = self.deferred_configuration.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        Ok(())
+    }
+
     async fn invalidate_build_attempts(&self) -> Result<()> {
+        self.invalidate_configuration_attempts().await?;
         for generation in self.build_generations.write().await.values_mut() {
             *generation = generation
                 .checked_add(1)
@@ -1583,15 +1634,13 @@ impl CustomReplicatorHost {
     }
 
     async fn prepare_authority_admission(&self, authority: &AdmittedAuthority) -> Result<()> {
-        let preserve_access = self
-            .state
-            .read()
-            .await
-            .authority
-            .as_ref()
-            .is_some_and(|existing| {
-                existing == authority || preserves_same_primary_scale_up_access(existing, authority)
-            });
+        let previous = self.state.read().await.authority.clone();
+        if previous.as_ref() != Some(authority) {
+            self.invalidate_configuration_attempts().await?;
+        }
+        let preserve_access = previous.as_ref().is_some_and(|existing| {
+            existing == authority || preserves_same_primary_scale_up_access(existing, authority)
+        });
         if preserve_access {
             return Ok(());
         }
@@ -2076,10 +2125,76 @@ impl CustomReplicatorHost {
         }
         self.refresh().await
     }
+
+    async fn wait_for_common_catchup(&self) -> Result<()> {
+        let (authority_before, sessions_before) = {
+            let _gate = self.gate.lock().await;
+            (
+                self.state.read().await.authority.clone(),
+                self.sessions.read().await.clone(),
+            )
+        };
+        self.primary
+            .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
+            .await?;
+        let boundary = self.control.current_progress().await?;
+        let _gate = self.gate.lock().await;
+        self.host()?;
+        if authority_before != self.state.read().await.authority
+            || sessions_before != *self.sessions.read().await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        let mut state = self.state.write().await;
+        state.catch_up_boundary = Some(boundary);
+        state.catch_up_complete = true;
+        Ok(())
+    }
+
+    async fn authorize_common_failover_prefix(&self, boundary: i64) -> Result<()> {
+        let (authority_before, sessions_before) = {
+            let _gate = self.gate.lock().await;
+            (
+                self.state.read().await.authority.clone(),
+                self.sessions.read().await.clone(),
+            )
+        };
+        let progress = self.control.current_progress().await?;
+        let _gate = self.gate.lock().await;
+        self.host()?;
+        if authority_before != self.state.read().await.authority
+            || sessions_before != *self.sessions.read().await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        if progress < boundary {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        self.state.write().await.verified_replication_lsn = Some(boundary);
+        Ok(())
+    }
+
     async fn apply_common_action(&self, action: RuntimeEffectAction) -> Result<()> {
         let action = match action {
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
                 return self.admit_common_build(*authority).await;
+            }
+            RuntimeEffectAction::SetAccessStatus { read, write } => {
+                return self.set_access(read, write).await;
+            }
+            RuntimeEffectAction::SetReadStatus(read) => {
+                let write = self.state.read().await.write_status;
+                return self.set_access(read, write).await;
+            }
+            RuntimeEffectAction::SetWriteStatus(write) => {
+                let read = self.state.read().await.read_status;
+                return self.set_access(read, write).await;
+            }
+            RuntimeEffectAction::WaitForCatchup => {
+                return self.wait_for_common_catchup().await;
+            }
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
+                return self.authorize_common_failover_prefix(boundary).await;
             }
             action => action,
         };
@@ -2181,33 +2296,11 @@ impl CustomReplicatorHost {
                 self.configure().await?;
                 self.refresh().await?;
             }
-            RuntimeEffectAction::SetAccessStatus { read, write } => {
-                self.set_access(read, write).await?
-            }
-            RuntimeEffectAction::SetReadStatus(read) => {
-                let write = self.state.read().await.write_status;
-                self.set_access(read, write).await?;
-            }
-            RuntimeEffectAction::SetWriteStatus(write) => {
-                let read = self.state.read().await.read_status;
-                self.set_access(read, write).await?;
-            }
-            RuntimeEffectAction::WaitForCatchup => {
-                self.primary
-                    .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
-                    .await?;
-                let boundary = self.control.current_progress().await?;
-                let mut state = self.state.write().await;
-                state.catch_up_boundary = Some(boundary);
-                state.catch_up_complete = true;
-            }
-            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
-                let progress = self.control.current_progress().await?;
-                if progress < boundary {
-                    return Err(RuntimeError::ReconfigurationPending);
-                }
-                self.state.write().await.verified_replication_lsn = Some(boundary);
-            }
+            RuntimeEffectAction::SetAccessStatus { .. }
+            | RuntimeEffectAction::SetReadStatus(_)
+            | RuntimeEffectAction::SetWriteStatus(_)
+            | RuntimeEffectAction::WaitForCatchup
+            | RuntimeEffectAction::AuthorizeFailoverPrefix(_) => unreachable!(),
             RuntimeEffectAction::PrepareSwitchover {
                 source,
                 target,
@@ -2653,7 +2746,9 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     }
 
     async fn remove_replica(&self, replica_id: kuberic_protocol::types::ReplicaId) -> Result<()> {
-        self.primary.remove_replica(replica_id).await
+        self.primary.remove_replica(replica_id).await?;
+        self.host()?;
+        Ok(())
     }
 
     async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
