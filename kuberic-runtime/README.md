@@ -175,7 +175,8 @@ and publishes access only after implementation-specific proof.
 An unmanaged custom factory without that hosting support remains rejected for
 managed admission.
 
-Private custom hosting durably selects one build per logical target slot.
+The common agent lifecycle host durably selects one build per logical target
+slot for custom implementations.
 Descriptions for superseded builds are withdrawn, and callback receipts bind
 the full authority/generation to both process sessions and the local attempt.
 An idle custom replicator must withhold build-ready progress until its durable
