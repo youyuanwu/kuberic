@@ -8802,6 +8802,62 @@ async fn stale_build_cleanup_does_not_cancel_same_id_retry_attempt() {
 }
 
 #[tokio::test]
+async fn hosted_custom_build_cancellation_clears_pending_retry_admission() {
+    let (runtime, _, _, peer) = blocked_lifecycle_fixture("custom-build-retry").await;
+    let build_id = OperationId::new("custom-hosted-retry");
+    runtime
+        .authorize_build(build_id.clone(), peer.clone(), BuildConfiguration::Current)
+        .await
+        .unwrap();
+    let primary = runtime.primary_replicator().await.unwrap();
+    let first = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-hosted-retry".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(first.await.unwrap().is_err());
+
+    let retry = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-hosted-retry".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
 async fn aborted_post_claim_cleanup_keeps_the_explicit_cancellation_owner() {
     let (runtime, control, _, peer) = blocked_lifecycle_fixture("cancel-claim-retry").await;
     let authority = runtime
@@ -9830,6 +9886,93 @@ async fn bounded_outbound_build_queue_is_cancelled_by_abort() {
             Err(RuntimeError::Closed)
         ));
     }
+}
+
+#[tokio::test]
+async fn cancelled_queue_blocked_build_can_retry_after_capacity_returns() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "queue-retry-primary")],
+    )
+    .await;
+    let control = runtime.primary_replicator().await.unwrap();
+    let mut queued = Vec::new();
+    for id in 2..=17 {
+        let control = control.clone();
+        queued.push(tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    OperationId::new(format!("queue-fill-{id}")),
+                    identity(id, &format!("queue-fill-target-{id}")),
+                    format!("queue-fill-target-{id}"),
+                ))
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let retry_id = OperationId::new("queue-blocked-retry");
+    let retry_target = identity(99, "queue-blocked-target");
+    let blocked = {
+        let control = control.clone();
+        let retry_id = retry_id.clone();
+        let retry_target = retry_target.clone();
+        tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    retry_id,
+                    retry_target,
+                    "queue-blocked-target".into(),
+                ))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!blocked.is_finished());
+    blocked.abort();
+    assert!(blocked.await.unwrap_err().is_cancelled());
+
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(_))
+    ));
+    let retry = {
+        let control = control.clone();
+        let retry_id = retry_id.clone();
+        let retry_target = retry_target.clone();
+        tokio::spawn(async move {
+            control
+                .build_replica(ReplicaInformation::new(
+                    retry_id,
+                    retry_target,
+                    "queue-blocked-target".into(),
+                ))
+                .await
+        })
+    };
+    let mut observed_retry = false;
+    for _ in 0..16 {
+        if matches!(
+            timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+                .await
+                .unwrap(),
+            Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == retry_id
+        ) {
+            observed_retry = true;
+        }
+    }
+    assert!(
+        observed_retry,
+        "the cancelled queue reservation must be retryable"
+    );
+
+    control.abort();
+    for task in queued {
+        assert!(task.await.unwrap().is_err());
+    }
+    assert!(retry.await.unwrap().is_err());
 }
 
 #[tokio::test]

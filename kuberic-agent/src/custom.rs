@@ -66,9 +66,41 @@ pub(super) struct AccessEffectTransaction {
     completion: tokio::task::JoinHandle<Result<()>>,
 }
 
+struct BuildQueueAdmission {
+    decision: Option<oneshot::Sender<bool>>,
+    completion: tokio::task::JoinHandle<()>,
+}
+
 pub(super) struct BuildCompletionConfirmation {
     pub(super) postcondition: RuntimePostcondition,
     _native: Option<ManagedFenceGuard>,
+}
+
+impl BuildQueueAdmission {
+    fn new(host: Weak<RuntimeHost>, build_id: OperationId, generation: u64) -> Self {
+        let (decision, completion) = oneshot::channel();
+        let completion = tokio::spawn(async move {
+            if completion.await != Ok(true)
+                && let Some(host) = host.upgrade()
+                && let Ok(lifecycle) = host.lifecycle()
+            {
+                let _ = lifecycle
+                    .cancel_outbound_build_attempt(&build_id, generation, false)
+                    .await;
+            }
+        });
+        Self {
+            decision: Some(decision),
+            completion,
+        }
+    }
+
+    async fn finish(mut self, admitted: bool) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(admitted);
+        }
+        let _ = self.completion.await;
+    }
 }
 
 impl AccessEffectTransaction {
@@ -631,8 +663,8 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        self.accepted_builds.write().await.remove(id);
         self.common.cancel_common_build(id).await?;
+        self.accepted_builds.write().await.remove(id);
         self.legacy.cancel_outbound_build(id).await
     }
 
@@ -674,18 +706,21 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(75);
         loop {
             let changed = self.common.changed.notified();
+            self.common
+                .ensure_build_generation(build_id, generation)
+                .await?;
             let snapshot = self.snapshot().await;
             if snapshot.builds.iter().any(|build| {
                 &build.authority.build_id == build_id
                     && &build.authority.target == target
                     && build.completed
             }) {
+                self.common
+                    .ensure_build_generation(build_id, generation)
+                    .await?;
                 return Ok(());
             }
 
-            self.common
-                .ensure_build_generation(build_id, generation)
-                .await?;
             if tokio::time::Instant::now() >= deadline {
                 return Err(RuntimeError::OperationCancelled);
             }
@@ -2565,37 +2600,31 @@ impl CustomReplicatorHost {
     }
 
     pub(super) async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
-        if !self.begin_build_attempt(&endpoint).await? {
+        let Some(admission) = self.begin_build_attempt(&endpoint).await? else {
             return Ok(());
-        }
-        let build_id = endpoint.build_id.clone();
-        if let Err(error) = self.enqueue_outbound(OutboundOperation::Build(endpoint)) {
-            self.pending_builds.write().await.remove(&build_id);
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    async fn enqueue_build_wait(&self, endpoint: ReplicaEndpoint) -> Result<()> {
-        if !self.begin_build_attempt(&endpoint).await? {
-            return Ok(());
-        }
-        let build_id = endpoint.build_id.clone();
-        let endpoint_for_cleanup = endpoint.clone();
-        let result = self.enqueue_build_wait_inner(endpoint).await;
-        if result.is_err()
-            && self.pending_builds.read().await.get(&build_id) == Some(&endpoint_for_cleanup)
-        {
-            self.pending_builds.write().await.remove(&build_id);
-        }
+        };
+        let result = self.enqueue_outbound(OutboundOperation::Build(endpoint));
+        admission.finish(result.is_ok()).await;
         result
     }
 
-    async fn begin_build_attempt(&self, endpoint: &ReplicaEndpoint) -> Result<bool> {
+    async fn enqueue_build_wait(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        let Some(admission) = self.begin_build_attempt(&endpoint).await? else {
+            return Ok(());
+        };
+        let result = self.enqueue_build_wait_inner(endpoint).await;
+        admission.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn begin_build_attempt(
+        &self,
+        endpoint: &ReplicaEndpoint,
+    ) -> Result<Option<BuildQueueAdmission>> {
         let mut pending = self.pending_builds.write().await;
         if let Some(existing) = pending.get(&endpoint.build_id) {
             if existing == endpoint {
-                return Ok(false);
+                return Ok(None);
             }
             return Err(RuntimeError::AuthorityMismatch(
                 "build ID is already queued for another exact target".into(),
@@ -2606,8 +2635,13 @@ impl CustomReplicatorHost {
         *generation = generation
             .checked_add(1)
             .ok_or(RuntimeError::OperationCancelled)?;
+        let attempt_generation = *generation;
         pending.insert(endpoint.build_id.clone(), endpoint.clone());
-        Ok(true)
+        Ok(Some(BuildQueueAdmission::new(
+            self.host.clone(),
+            endpoint.build_id.clone(),
+            attempt_generation,
+        )))
     }
 
     async fn enqueue_build_wait_inner(&self, endpoint: ReplicaEndpoint) -> Result<()> {
@@ -3122,6 +3156,11 @@ impl CustomReplicatorHost {
     }
 
     async fn cancel_common_build(&self, id: &OperationId) -> Result<()> {
+        let _gate = self.gate.lock().await;
+        self.cancel_common_build_locked(id).await
+    }
+
+    async fn cancel_common_build_locked(&self, id: &OperationId) -> Result<()> {
         let mut generations = self.build_generations.write().await;
         let generation = generations.entry(id.clone()).or_default();
         *generation = generation
@@ -3140,6 +3179,16 @@ impl CustomReplicatorHost {
     }
 
     async fn cancel_common_build_attempt(
+        &self,
+        id: &OperationId,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        let _gate = self.gate.lock().await;
+        self.cancel_common_build_attempt_locked(id, expected_generation)
+            .await
+    }
+
+    async fn cancel_common_build_attempt_locked(
         &self,
         id: &OperationId,
         expected_generation: u64,
@@ -3583,19 +3632,7 @@ impl CustomReplicatorHost {
     }
 
     pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        let _gate = self.gate.lock().await;
-        let mut generations = self.build_generations.write().await;
-        let generation = generations.entry(id.clone()).or_default();
-        *generation = generation
-            .checked_add(1)
-            .ok_or(RuntimeError::OperationCancelled)?;
-        drop(generations);
-        self.state
-            .write()
-            .await
-            .builds
-            .retain(|b| &b.authority.build_id != id);
-        self.changed.notify_waiters();
+        self.cancel_common_build(id).await?;
         if let Some(build) = self
             .host()?
             .default_dependencies
@@ -3606,7 +3643,6 @@ impl CustomReplicatorHost {
             self.primary.remove_replica(build.target.replica_id).await?;
         }
         self.configure().await?;
-        self.cancelling_builds.write().await.remove(id);
         Ok(())
     }
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
@@ -3947,16 +3983,17 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(75);
         loop {
             let changed = self.changed.notified();
+            self.ensure_build_generation(build_id, generation).await?;
             let snapshot = CustomReplicatorHost::snapshot(self).await;
             if snapshot.builds.iter().any(|build| {
                 &build.authority.build_id == build_id
                     && &build.authority.target == target
                     && build.completed
             }) {
+                self.ensure_build_generation(build_id, generation).await?;
                 return Ok(());
             }
 
-            self.ensure_build_generation(build_id, generation).await?;
             if tokio::time::Instant::now() >= deadline {
                 return Err(RuntimeError::OperationCancelled);
             }

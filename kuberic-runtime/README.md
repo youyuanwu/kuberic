@@ -186,10 +186,12 @@ capabilities, fences delayed callback completion by exact authority and session,
 and publishes access only after implementation-specific proof. Standard
 catch-up, build, and remove requests cross the returned public
 `PrimaryReplicator`; the private capability exposes only native proof,
-recovery, reconciliation, topology receipts, and narrow observation. Typed
-receipts bind engine identity/generation, authority, exact build/target,
-configuration, durable boundary, and retirement/removal evidence. Independent
-custom replicators are not required to construct these receipts.
+recovery, reconciliation, canonical topology receipts, and narrow observation.
+Topology receipts bind engine identity/generation, authority, durable boundary,
+and switchover/removal/retirement evidence. Public build completion is fenced by
+the host's exact target, process sessions, configuration, and attempt admission
+rather than a second native receipt. Independent custom replicators are not
+required to construct topology receipts.
 An unmanaged custom factory without that hosting support remains rejected for
 managed admission.
 
@@ -206,7 +208,7 @@ continues to use its own per-build copy acknowledgements.
 Custom services retain the partition handle and reconcile direct-client access
 against its read/write statuses, never role notifications alone. Progress
 observation must finish that reconciliation before returning; hosting awaits it
-before publishing an access-effect receipt. Application-specific lineage and
+before accepting the access transaction's effect result. Application-specific lineage and
 recovery evidence stay in the application. See the repository's
 [SF interface mapping](../docs/background/service-fabric/references.md) and
 [service-created replicator design](../docs/archive/v1/implemented/runtime-replicator-separation.md).
