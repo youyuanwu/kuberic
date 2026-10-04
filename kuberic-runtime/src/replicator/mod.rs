@@ -19,6 +19,9 @@ use kuberic_protocol::types::{
     SecondaryRemovalPreparation, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
     SecondaryScaleDownIntent,
 };
+use kuberic_runtime_internal::receipts::{
+    AccessReceipt, BuildReceipt, CatchUpReceipt, NativeOperationToken, RemovalReceipt,
+};
 use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
 use tokio::sync::{Mutex, RwLock};
 
@@ -82,13 +85,20 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
-    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64>;
-    async fn publish_access(
+    async fn prepare_access(
         &self,
         read: AccessStatus,
         write: AccessStatus,
-        generation: u64,
-    ) -> Result<()>;
+    ) -> Result<AccessReceipt>;
+    async fn publish_access(&self, preparation: AccessReceipt) -> Result<AccessReceipt>;
+    async fn operation_token(&self) -> Result<NativeOperationToken>;
+    async fn catch_up_receipt(&self) -> Result<CatchUpReceipt>;
+    async fn build_receipt(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<BuildReceipt>;
+    async fn removal_receipt(&self, replica_id: ReplicaId) -> Result<RemovalReceipt>;
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
     async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()>;
     async fn prepare_switchover_proof(

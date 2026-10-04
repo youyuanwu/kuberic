@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority::RetiredAuthority;
 use crate::authority::{AdmittedAuthority, BuildAuthority};
+use crate::receipts::{AccessReceipt, BuildReceipt, CatchUpReceipt, RemovalReceipt};
 use kuberic_protocol::types::{
     ProcessSessionId, SecondaryRemovalPreparation, SecondaryRemovalWitness,
     SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
@@ -152,9 +153,19 @@ pub struct RuntimePostcondition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeOperationEvidence {
+    CatchUp(CatchUpReceipt),
+    Build(BuildReceipt),
+    Removal(RemovalReceipt),
+    Access(AccessReceipt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEffectResult {
     pub operation_id: OperationId,
     pub sequence: u64,
+    #[serde(default)]
+    pub evidence: Option<Box<RuntimeOperationEvidence>>,
     pub postcondition: RuntimePostcondition,
 }
 

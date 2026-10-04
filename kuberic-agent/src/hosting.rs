@@ -330,6 +330,13 @@ pub struct PartitionReportSnapshot {
     pub reported_fault: Option<FaultType>,
 }
 
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+pub struct AccessEffectAcceptanceGate {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
 impl Drop for PodRuntime {
     fn drop(&mut self) {
         self.host.abort();
@@ -400,8 +407,43 @@ impl PodRuntime {
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 replica_session: OnceLock::new(),
+                #[cfg(feature = "testing")]
+                access_effect_acceptance_gate: StdMutex::new(None),
             }),
         }
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_pause_access_effect_acceptance(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.access_effect_acceptance_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn testing_resume_access_effect_acceptance(&self) {
+        if let Some(gate) = self
+            .host
+            .access_effect_acceptance_gate
+            .lock()
+            .unwrap()
+            .take()
+        {
+            gate.release.notify_waiters();
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn testing_has_applied_effect(&self, sequence: u64) -> bool {
+        self.host.state.read().await.effects.contains_key(&sequence)
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn testing_cancel_configuration_work(&self) -> Result<()> {
+        self.host.lifecycle()?.cancel_configuration_work().await
     }
 
     pub async fn serve<C: RuntimeControlPlane>(&self, control_plane: &mut C) -> Result<()> {
@@ -737,9 +779,6 @@ impl PodRuntime {
     ) -> Result<()> {
         if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
             lifecycle.restore_access(read, write).await?;
-            self.host
-                .sync_access_projection(lifecycle.snapshot().await)
-                .await;
         } else {
             let mut state = self.host.state.write().await;
             state.fallback_snapshot.read_status = read;
@@ -1100,6 +1139,8 @@ struct RuntimeHost {
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
+    #[cfg(feature = "testing")]
+    access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
 }
 
 struct HostAccessView {
@@ -1404,6 +1445,7 @@ impl RuntimeHost {
         {
             return Err(RuntimeError::Closed);
         }
+        let mut access_commit = None;
         match effect.action.clone() {
             RuntimeEffectAction::RetireReplica(retired) => {
                 retired.validate(&self.identity)?;
@@ -1482,9 +1524,7 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::SetAccessStatus { read, write } => {
                 if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    lifecycle.set_access(read, write).await?;
-                    self.sync_access_projection(lifecycle.snapshot().await)
-                        .await;
+                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetAccessStatus {
                         read,
@@ -1495,10 +1535,8 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::SetReadStatus(read) => {
                 if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    let write = lifecycle.snapshot().await.write_status;
-                    lifecycle.set_access(read, write).await?;
-                    self.sync_access_projection(lifecycle.snapshot().await)
-                        .await;
+                    let write = self.state.read().await.fallback_snapshot.write_status;
+                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetReadStatus(read))
                         .await?;
@@ -1506,10 +1544,8 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::SetWriteStatus(write) => {
                 if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    let read = lifecycle.snapshot().await.read_status;
-                    lifecycle.set_access(read, write).await?;
-                    self.sync_access_projection(lifecycle.snapshot().await)
-                        .await;
+                    let read = self.state.read().await.fallback_snapshot.read_status;
+                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetWriteStatus(write))
                         .await?;
@@ -1597,9 +1633,29 @@ impl RuntimeHost {
             RuntimeEffectAction::Close => self.close().await?,
             RuntimeEffectAction::Abort => self.abort_action().await,
         }
+        #[cfg(feature = "testing")]
+        if access_commit.is_some() {
+            let gate = self.access_effect_acceptance_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_waiters();
+                gate.release.notified().await;
+            }
+        }
+        let access_acceptance_guard = match access_commit.as_ref() {
+            Some(commit) => commit.lock_acceptance().await?,
+            None => None,
+        };
+        let evidence = match self.lifecycle() {
+            Ok(lifecycle) => lifecycle
+                .effect_evidence(&effect.action)
+                .await
+                .map(Box::new),
+            Err(_) => None,
+        };
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
+            evidence,
             postcondition: snapshot_postcondition(self.snapshot().await),
         };
         self.state.write().await.effects.insert(
@@ -1609,6 +1665,10 @@ impl RuntimeHost {
                 result: result.clone(),
             },
         );
+        if let Some(commit) = access_commit {
+            commit.commit();
+        }
+        drop(access_acceptance_guard);
         Ok(result)
     }
 
@@ -1665,6 +1725,7 @@ impl RuntimeHost {
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
+            evidence: None,
             postcondition: snapshot_postcondition(snapshot),
         };
         self.state.write().await.effects.insert(
@@ -1736,6 +1797,11 @@ impl RuntimeHost {
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
+            evidence: self
+                .lifecycle()?
+                .effect_evidence(&effect.action)
+                .await
+                .map(Box::new),
             postcondition: snapshot_postcondition(snapshot),
         };
         self.state.write().await.effects.insert(

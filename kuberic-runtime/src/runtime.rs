@@ -15,6 +15,9 @@ use kuberic_protocol::validation::{
     validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
 };
 use kuberic_runtime_internal::authority::RetiredAuthority;
+use kuberic_runtime_internal::receipts::{
+    AccessReceipt, BuildReceipt, CatchUpReceipt, NativeOperationToken, RemovalReceipt,
+};
 use kuberic_runtime_internal::transport::{
     CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
 };
@@ -3718,7 +3721,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn prepare_access(&self, read: AccessStatus, write: AccessStatus) -> Result<u64> {
+    async fn prepare_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<AccessReceipt> {
         self.check_aborted()?;
         let generation = self.fence_generation.load(Ordering::Acquire);
         if write == AccessStatus::Granted {
@@ -3766,29 +3773,164 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         if generation != self.fence_generation.load(Ordering::Acquire) {
             return Err(RuntimeError::OperationCancelled);
         }
-        Ok(generation)
+        let state = self.state.read().await;
+        Ok(AccessReceipt {
+            authority: state.authority.clone(),
+            engine_session_id: self.session_id.clone(),
+            engine_generation: generation,
+            read,
+            write,
+            current_progress: state.current_progress,
+            committed_lsn: state.committed_lsn,
+            published: false,
+        })
     }
 
-    async fn publish_access(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-        generation: u64,
-    ) -> Result<()> {
+    async fn publish_access(&self, preparation: AccessReceipt) -> Result<AccessReceipt> {
         let _effect = self.effect_lock.lock().await;
         self.check_aborted()?;
-        if generation != self.fence_generation.load(Ordering::Acquire) {
+        if preparation.published
+            || preparation.engine_session_id != self.session_id
+            || preparation.engine_generation != self.fence_generation.load(Ordering::Acquire)
+        {
             return Err(RuntimeError::OperationCancelled);
         }
-        if write != AccessStatus::Granted {
+        let mut state = self.state.write().await;
+        if preparation.authority != state.authority
+            || preparation.current_progress != state.current_progress
+            || preparation.committed_lsn != state.committed_lsn
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        if preparation.write != AccessStatus::Granted {
             self.replicator.lock().await.fence_client_writes();
         }
-        let mut state = self.state.write().await;
-        state.read_status = read;
-        state.write_status = write;
+        state.read_status = preparation.read;
+        state.write_status = preparation.write;
         drop(state);
         self.changed.notify_waiters();
-        Ok(())
+        Ok(AccessReceipt {
+            published: true,
+            ..preparation
+        })
+    }
+
+    async fn operation_token(&self) -> Result<NativeOperationToken> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        Ok(NativeOperationToken {
+            authority: self.state.read().await.authority.clone(),
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+        })
+    }
+
+    async fn catch_up_receipt(&self) -> Result<CatchUpReceipt> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let state = self.state.read().await;
+        let authority = state
+            .authority
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let current_progress = state.current_progress;
+        let committed_lsn = state.committed_lsn;
+        drop(state);
+        let log = self.replicator.lock().await;
+        if !log.catch_up_complete() || log.epoch() != authority.current_configuration.epoch {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        Ok(CatchUpReceipt {
+            authority,
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+            boundary_lsn: log.catch_up_boundary().unwrap_or(current_progress),
+            current_progress,
+            committed_lsn: committed_lsn.max(log.committed_lsn()),
+            current_configuration_quorum_progress: log.current_configuration_quorum_progress(),
+        })
+    }
+
+    async fn build_receipt(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<BuildReceipt> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let selection = self
+            .build_authority_store
+            .load_build_selection(target)
+            .await?
+            .filter(|selection| {
+                &selection.authority.build_id == build_id && &selection.authority.target == target
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let progress = self
+            .build_progress_store
+            .load_build_progress(build_id)
+            .await?
+            .filter(|progress| {
+                progress.authority == selection.authority
+                    && progress.completed
+                    && progress.durable_lsn >= progress.authority.replication_boundary_lsn
+            })
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        Ok(BuildReceipt {
+            selection,
+            progress,
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+        })
+    }
+
+    async fn removal_receipt(&self, replica_id: ReplicaId) -> Result<RemovalReceipt> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let state = self.state.read().await;
+        if !state.removed_replicas.contains(&replica_id) {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        let authority = state
+            .authority
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if authority
+            .current_configuration
+            .members
+            .iter()
+            .chain(
+                authority
+                    .previous_configuration
+                    .iter()
+                    .flat_map(|configuration| &configuration.members),
+            )
+            .any(|member| member.identity.replica_id == replica_id)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "removed replica remains configured".into(),
+            ));
+        }
+        drop(state);
+        let retired_build_ids = self
+            .build_authority_store
+            .load_builds()
+            .await?
+            .into_iter()
+            .filter(|build| build.target.replica_id == replica_id)
+            .map(|build| build.build_id)
+            .collect();
+        Ok(RemovalReceipt {
+            authority,
+            replica_id,
+            retired_build_ids,
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+        })
     }
 
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()> {

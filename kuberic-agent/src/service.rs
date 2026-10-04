@@ -665,6 +665,7 @@ where
                 .complete_effect(&kuberic_runtime_internal::effects::RuntimeEffectResult {
                     operation_id: pending.effect.operation_id.clone(),
                     sequence: pending.effect.sequence,
+                    evidence: None,
                     postcondition: self.runtime.snapshot().await.into(),
                 })
                 .await?;

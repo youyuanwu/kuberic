@@ -3517,17 +3517,44 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn prepare_access(&self, _read: AccessStatus, _write: AccessStatus) -> Result<u64> {
-        Ok(0)
+    async fn prepare_access(
+        &self,
+        _read: AccessStatus,
+        _write: AccessStatus,
+    ) -> Result<kuberic_runtime_internal::receipts::AccessReceipt> {
+        panic!("registration tests do not request access receipts")
     }
 
     async fn publish_access(
         &self,
-        _read: AccessStatus,
-        _write: AccessStatus,
-        _generation: u64,
-    ) -> Result<()> {
-        Ok(())
+        _preparation: kuberic_runtime_internal::receipts::AccessReceipt,
+    ) -> Result<kuberic_runtime_internal::receipts::AccessReceipt> {
+        panic!("registration tests do not publish access receipts")
+    }
+
+    async fn operation_token(
+        &self,
+    ) -> Result<kuberic_runtime_internal::receipts::NativeOperationToken> {
+        panic!("registration tests do not request native operation tokens")
+    }
+
+    async fn catch_up_receipt(&self) -> Result<kuberic_runtime_internal::receipts::CatchUpReceipt> {
+        panic!("registration tests do not request catch-up receipts")
+    }
+
+    async fn build_receipt(
+        &self,
+        _build_id: &OperationId,
+        _target: &ReplicaIdentity,
+    ) -> Result<kuberic_runtime_internal::receipts::BuildReceipt> {
+        panic!("registration tests do not request build receipts")
+    }
+
+    async fn removal_receipt(
+        &self,
+        _replica_id: ReplicaId,
+    ) -> Result<kuberic_runtime_internal::receipts::RemovalReceipt> {
+        panic!("registration tests do not request removal receipts")
     }
 
     async fn admit_authority_proof(&self, _authority: AdmittedAuthority) -> Result<()> {
@@ -7968,6 +7995,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
             .await
             .unwrap();
     }
+
     let mut copy = target_app.held_streams.lock().unwrap().remove(1);
     let mut coordinator = {
         let source = source.clone();
@@ -8105,6 +8133,137 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
             "{operation} must cross the returned public primary exactly once"
         );
     }
+}
+
+#[tokio::test]
+async fn cancelled_access_effect_rolls_back_projection_before_effect_acceptance() {
+    let primary = identity(1, "access-cancel-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application, vec![primary], "access-cancel-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let task_effect = access.clone();
+    let task = tokio::spawn(async move { task_runtime.apply_effect(task_effect).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert!(matches!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("cancelled-access-write"),
+                data: Bytes::from_static(b"must-remain-fenced"),
+            })
+            .await,
+        Err(RuntimeError::WriteClosed(
+            AccessStatus::ReconfigurationPending
+        ))
+    ));
+
+    runtime.testing_resume_access_effect_acceptance();
+    let accepted = runtime.apply_effect(access).await.unwrap();
+    assert!(matches!(
+        accepted.evidence.as_deref(),
+        Some(kuberic_runtime_internal::effects::RuntimeOperationEvidence::Access(_))
+    ));
+    assert_eq!(accepted.postcondition.write_status, AccessStatus::Granted);
+    assert!(runtime.testing_has_applied_effect(6).await);
+    runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("accepted-access-write"),
+            data: Bytes::from_static(b"live-after-retry"),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn configuration_invalidation_rejects_gated_access_effect() {
+    let primary = identity(1, "access-invalidation-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application, vec![primary], "access-invalidation-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let task = tokio::spawn(async move { task_runtime.apply_effect(access).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+
+    runtime.testing_cancel_configuration_work().await.unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    runtime.testing_resume_access_effect_acceptance();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("invalidated-access-write"),
+                data: Bytes::from_static(b"must-remain-fenced"),
+            })
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

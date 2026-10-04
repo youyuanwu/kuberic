@@ -276,8 +276,10 @@ public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn admit_build_authority_proof (& self , authority : BuildAuthority) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn attach_interfaces (& self , control : Arc < dyn Replicator > , primary : Option < Arc < dyn PrimaryReplicator > > ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn authorize_failover_prefix_proof (& self , boundary : Lsn) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn build_receipt (& self , build_id : & OperationId , target : & ReplicaIdentity ,) -> Result < BuildReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_configuration_work (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn cancel_outbound_build (& self , build_id : & OperationId) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn catch_up_receipt (& self) -> Result < CatchUpReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_open (& self , replication_address : String) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn complete_retirement_proof (& self , retired : RetiredAuthority) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn detach_outbound_build_stream (& self , build_id : & OperationId) -> Result < () >
@@ -285,12 +287,14 @@ public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn fence_writes (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_progress_proof (& self , witness : SecondaryRemovalWitness , committed : SecondaryScaleDownCleanup ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn observe_secondary_removal_proof (& self , witness : SecondaryRemovalWitness) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_access (& self , read : AccessStatus , write : AccessStatus) -> Result < u64 >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn operation_token (& self) -> Result < NativeOperationToken >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_access (& self , read : AccessStatus , write : AccessStatus ,) -> Result < AccessReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_secondary_removal_proof (& self , intent : SecondaryScaleDownIntent , process_session_id : ProcessSessionId , report_sequence : u64 ,) -> Result < SecondaryRemovalPreparation >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn prepare_switchover_proof (& self , preparation_generation : u64 , request_id : kuberic_protocol :: types :: SwitchoverRequestId , source : ReplicaIdentity , target : ReplicaIdentity , starting_configuration_id : kuberic_protocol :: types :: ConfigurationId , starting_epoch : Epoch ,) -> Result < () >
-public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn publish_access (& self , read : AccessStatus , write : AccessStatus , generation : u64 ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn publish_access (& self , preparation : AccessReceipt) -> Result < AccessReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn refresh_progress_proof (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn register_peer_session_proof (& self , identity : ReplicaIdentity , session : ProcessSessionId ,) -> Result < () >
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn removal_receipt (& self , replica_id : ReplicaId) -> Result < RemovalReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn restore_engine_proof (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn retire_build_proof (& self , build_id : OperationId) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn settle_primary_prefix (& self) -> Result < () >
