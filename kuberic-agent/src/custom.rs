@@ -27,9 +27,16 @@ use kuberic_runtime_internal::receipts::{
 use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 
-use super::{RuntimeHost, empty_snapshot};
+use crate::runtime_adapter::RuntimeEffectCommit;
+
+use super::{AppliedEffect, RuntimeHost, empty_snapshot};
 #[path = "custom_removal.rs"]
 mod removal;
+
+#[cfg(feature = "testing")]
+const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(not(feature = "testing"))]
+const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct BuildAdmission {
@@ -128,6 +135,42 @@ impl AccessEffectTransaction {
         self.completion
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?
+    }
+
+    pub(super) fn into_runtime_commit(
+        mut self,
+        host: Weak<RuntimeHost>,
+        applied: AppliedEffect,
+    ) -> RuntimeEffectCommit {
+        let (decision, durable_decision) = oneshot::channel();
+        let completion = tokio::spawn(async move {
+            let committed = durable_decision.await.unwrap_or(false);
+            if let Some(inner) = self.decision.take() {
+                let _ = inner.send(committed);
+            }
+            let result = self
+                .completion
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            if committed {
+                result?;
+                if let Some(host) = host.upgrade() {
+                    host.state
+                        .write()
+                        .await
+                        .effects
+                        .insert(applied.result.sequence, applied);
+                }
+                Ok(())
+            } else {
+                match result {
+                    Ok(()) | Err(RuntimeError::OperationCancelled) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            .map_err(crate::AgentError::from)
+        });
+        RuntimeEffectCommit::new(decision, completion)
     }
 }
 
@@ -423,37 +466,47 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
-        let registered_engine_peer = self
-            .common
-            .state
-            .read()
-            .await
-            .authority
-            .as_ref()
-            .is_some_and(|authority| {
-                authority
-                    .current_configuration
-                    .members
-                    .iter()
-                    .chain(
+        {
+            let _registration = self.common.session_registration.lock().await;
+            let registered_engine_peer = {
+                let _gate = self.common.gate.lock().await;
+                self.common
+                    .validate_peer_session_replacement(&identity, &session)
+                    .await?;
+                self.common
+                    .state
+                    .read()
+                    .await
+                    .authority
+                    .as_ref()
+                    .is_some_and(|authority| {
                         authority
-                            .previous_configuration
+                            .current_configuration
+                            .members
                             .iter()
-                            .flat_map(|configuration| &configuration.members),
-                    )
-                    .any(|member| member.identity == identity)
-            });
-        if registered_engine_peer {
-            self.legacy
-                .register_peer_session_proof(identity.clone(), session.clone())
+                            .chain(
+                                authority
+                                    .previous_configuration
+                                    .iter()
+                                    .flat_map(|configuration| &configuration.members),
+                            )
+                            .any(|member| member.identity == identity)
+                    })
+            };
+            if registered_engine_peer {
+                self.legacy
+                    .register_peer_session_proof(identity.clone(), session.clone())
+                    .await?;
+            }
+            let _access = self.common.access_commit.lock().await;
+            self.common
+                .validate_peer_session_replacement(&identity, &session)
+                .await?;
+            self.common
+                .register_common_peer_locked(identity, session)
                 .await?;
         }
-        self.common
-            .execute_common_build_action(RuntimeEffectAction::RegisterPeerSession {
-                identity,
-                session,
-            })
-            .await
+        Ok(())
     }
 
     async fn retire_build(&self, build_id: OperationId) -> Result<()> {
@@ -1136,11 +1189,19 @@ impl ManagedLifecycleBackend {
 
     async fn publish_managed_access(
         &self,
-        read: AccessStatus,
-        write: AccessStatus,
+        projection: AccessProjection,
     ) -> Result<(AccessProjection, NativeOperationToken)> {
-        let preparation = self.legacy.prepare_access(read, write).await?;
-        let projection = self.common.reserve_access_projection(read, write).await?;
+        let preparation = match self
+            .legacy
+            .prepare_access(projection.read, projection.write)
+            .await
+        {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                self.common.release_access_reservation(&projection).await;
+                return Err(error);
+            }
+        };
         if let Err(error) = self.common.complete_access_projection(&projection).await {
             self.common
                 .rollback_common_access_projection(&projection)
@@ -1203,16 +1264,46 @@ impl ManagedLifecycleBackend {
             .await;
     }
 
+    async fn rollback_cancelled_managed_access(&self, projection: &AccessProjection) {
+        let _commit = self.common.access_commit.lock().await;
+        if self.common.access_generation.load(Ordering::Acquire) != projection.access_generation
+            || self
+                .common
+                .published_access_generation
+                .load(Ordering::Acquire)
+                > projection.access_generation
+        {
+            return;
+        }
+        let _ = self.legacy.fence_writes().await;
+        self.common
+            .rollback_common_access_projection_locked(projection)
+            .await;
+    }
+
     async fn execute_access_transaction(
         &self,
         read: AccessStatus,
         write: AccessStatus,
-        ready: oneshot::Sender<()>,
+        mut ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<bool>,
     ) -> Result<()> {
-        let (projection, native_token) = self.publish_managed_access(read, write).await?;
+        let projection = self.common.reserve_access_projection(read, write).await?;
+        let publication = {
+            let publication = self.publish_managed_access(projection.clone());
+            tokio::pin!(publication);
+            tokio::select! {
+                result = &mut publication => Some(result),
+                _ = ready.closed() => None,
+            }
+        };
+        let Some(publication) = publication else {
+            self.rollback_cancelled_managed_access(&projection).await;
+            return Err(RuntimeError::OperationCancelled);
+        };
+        let (projection, native_token) = publication?;
         if ready.send(()).is_err() || accept.await.is_err() {
             self.rollback_managed_access(&projection).await;
             return Err(RuntimeError::OperationCancelled);
@@ -1240,17 +1331,30 @@ impl ManagedLifecycleBackend {
         let progress = native_guard.progress().clone();
         if accepted.send(Some(progress)).is_err() {
             drop(native_guard);
+            let _ = self.legacy.fence_writes().await;
+            self.common
+                .rollback_common_access_projection_locked(&projection)
+                .await;
             drop(common_guard);
-            self.rollback_managed_access(&projection).await;
             return Err(RuntimeError::OperationCancelled);
         }
         let committed = decision.await.unwrap_or(false);
         drop(native_guard);
-        drop(common_guard);
-        if committed {
+        if committed
+            && self
+                .common
+                .validate_access_projection(&projection)
+                .await
+                .is_ok()
+        {
+            drop(common_guard);
             Ok(())
         } else {
-            self.rollback_managed_access(&projection).await;
+            let _ = self.legacy.fence_writes().await;
+            self.common
+                .rollback_common_access_projection_locked(&projection)
+                .await;
+            drop(common_guard);
             Err(RuntimeError::OperationCancelled)
         }
     }
@@ -1629,6 +1733,7 @@ pub(super) struct CustomReplicatorHost {
     access_generation: Arc<AtomicU64>,
     published_access_generation: Arc<AtomicU64>,
     access_commit: Arc<Mutex<()>>,
+    session_registration: Mutex<()>,
     restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, kuberic_protocol::types::SecondaryRemovalWitness>>,
@@ -1677,6 +1782,7 @@ impl CustomReplicatorHost {
             access_generation: Arc::new(AtomicU64::new(0)),
             published_access_generation: Arc::new(AtomicU64::new(0)),
             access_commit: Arc::new(Mutex::new(())),
+            session_registration: Mutex::new(()),
             restored_access: RwLock::default(),
             removal_witnesses: RwLock::default(),
             outbound,
@@ -1989,12 +2095,6 @@ impl CustomReplicatorHost {
             .map_err(|_| RuntimeError::OperationCancelled)
     }
 
-    async fn invalidate_access_projections(&self) -> Result<()> {
-        let _commit = self.access_commit.lock().await;
-        self.advance_access_generation()?;
-        Ok(())
-    }
-
     fn ensure_configuration_generation(&self, generation: u64) -> Result<()> {
         self.active_host()?;
         if self.configuration_generation.load(Ordering::Acquire) != generation {
@@ -2282,12 +2382,19 @@ impl CustomReplicatorHost {
         write: AccessStatus,
     ) -> Result<AccessProjection> {
         let projection = self.reserve_access_projection(read, write).await?;
+        self.publish_common_access_projection(projection).await
+    }
+
+    async fn publish_common_access_projection(
+        &self,
+        projection: AccessProjection,
+    ) -> Result<AccessProjection> {
         if let Err(error) = self.complete_access_projection(&projection).await {
-            self.rollback_common_access_projection(&projection).await;
+            self.cleanup_failed_access_projection(&projection).await;
             return Err(error);
         }
         if let Err(error) = self.publish_access_projection(projection.clone()).await {
-            self.rollback_common_access_projection(&projection).await;
+            self.cleanup_failed_access_projection(&projection).await;
             return Err(error);
         }
         Ok(projection)
@@ -2297,14 +2404,27 @@ impl CustomReplicatorHost {
         &self,
         read: AccessStatus,
         write: AccessStatus,
-        ready: oneshot::Sender<()>,
+        mut ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<bool>,
     ) -> Result<()> {
-        let projection = self.publish_common_access(read, write).await?;
+        let projection = self.reserve_access_projection(read, write).await?;
+        let publication = {
+            let publication = self.publish_common_access_projection(projection.clone());
+            tokio::pin!(publication);
+            tokio::select! {
+                result = &mut publication => Some(result),
+                _ = ready.closed() => None,
+            }
+        };
+        let Some(publication) = publication else {
+            self.rollback_cancelled_common_access(&projection).await;
+            return Err(RuntimeError::OperationCancelled);
+        };
+        let projection = publication?;
         if ready.send(()).is_err() || accept.await.is_err() {
-            self.rollback_common_access_projection(&projection).await;
+            self.rollback_published_common_access(&projection).await;
             return Err(RuntimeError::OperationCancelled);
         }
         let guard = self.access_commit.clone().lock_owned().await;
@@ -2317,16 +2437,19 @@ impl CustomReplicatorHost {
             return Err(RuntimeError::OperationCancelled);
         }
         if accepted.send(None).is_err() {
+            self.rollback_published_common_access_locked(&projection)
+                .await;
             drop(guard);
-            self.rollback_common_access_projection(&projection).await;
             return Err(RuntimeError::OperationCancelled);
         }
         let committed = decision.await.unwrap_or(false);
-        drop(guard);
-        if committed {
+        if committed && self.validate_access_projection(&projection).await.is_ok() {
+            drop(guard);
             Ok(())
         } else {
-            self.rollback_common_access_projection(&projection).await;
+            self.rollback_published_common_access_locked(&projection)
+                .await;
+            drop(guard);
             Err(RuntimeError::OperationCancelled)
         }
     }
@@ -2335,6 +2458,92 @@ impl CustomReplicatorHost {
         let _commit = self.access_commit.lock().await;
         self.rollback_common_access_projection_locked(projection)
             .await;
+    }
+
+    async fn release_access_reservation(&self, projection: &AccessProjection) {
+        let _commit = self.access_commit.lock().await;
+        if self.access_generation.load(Ordering::Acquire) == projection.access_generation
+            && self.published_access_generation.load(Ordering::Acquire)
+                < projection.access_generation
+        {
+            self.access_generation.store(
+                projection.access_generation.saturating_add(1),
+                Ordering::Release,
+            );
+        }
+    }
+
+    async fn rollback_cancelled_common_access(&self, projection: &AccessProjection) {
+        let _commit = self.access_commit.lock().await;
+        if self.access_generation.load(Ordering::Acquire) != projection.access_generation {
+            return;
+        }
+        self.rollback_published_common_access_locked(projection)
+            .await;
+    }
+
+    async fn rollback_published_common_access(&self, projection: &AccessProjection) {
+        let _commit = self.access_commit.lock().await;
+        self.rollback_published_common_access_locked(projection)
+            .await;
+    }
+
+    async fn cleanup_failed_access_projection(&self, projection: &AccessProjection) {
+        let _commit = self.access_commit.lock().await;
+        let access_generation = self.access_generation.load(Ordering::Acquire);
+        let published_generation = self.published_access_generation.load(Ordering::Acquire);
+        if access_generation > projection.access_generation
+            && published_generation <= projection.access_generation
+        {
+            return;
+        }
+        if published_generation > projection.access_generation {
+            let state = self.state.read().await;
+            if state.read_status == AccessStatus::Granted
+                || state.write_status == AccessStatus::Granted
+            {
+                return;
+            }
+            drop(state);
+            let _ = self.close_custom_native_access().await;
+            return;
+        }
+        self.rollback_published_common_access_locked(projection)
+            .await;
+    }
+
+    async fn rollback_published_common_access_locked(&self, projection: &AccessProjection) {
+        if self.published_access_generation.load(Ordering::Acquire) > projection.access_generation {
+            return;
+        }
+        self.rollback_common_access_projection_locked(projection)
+            .await;
+        let _ = self.close_custom_native_access().await;
+    }
+
+    async fn close_custom_native_access(&self) -> Result<()> {
+        let result = tokio::time::timeout(
+            ACCESS_CLOSE_TIMEOUT,
+            super::with_access_proof_view(
+                AccessStatus::ReconfigurationPending,
+                AccessStatus::ReconfigurationPending,
+                self.control.current_progress(),
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => {
+                self.notify_abort();
+                self.control.abort();
+                Err(error)
+            }
+            Err(_) => {
+                self.notify_abort();
+                self.control.abort();
+                Err(RuntimeError::OperationCancelled)
+            }
+        }
     }
 
     async fn rollback_common_access_projection_locked(&self, projection: &AccessProjection) {
@@ -2856,7 +3065,17 @@ impl CustomReplicatorHost {
     }
 
     async fn invalidate_configuration_attempts(&self) -> Result<()> {
-        self.invalidate_access_projections().await?;
+        let _access = self.access_commit.lock().await;
+        self.invalidate_configuration_attempts_locked().await
+    }
+
+    async fn invalidate_configuration_attempts_locked(&self) -> Result<()> {
+        self.advance_access_generation()?;
+        self.invalidate_configuration_attempts_without_access_locked()
+            .await
+    }
+
+    async fn invalidate_configuration_attempts_without_access_locked(&self) -> Result<()> {
         let _commit = self.configuration_commit.lock().await;
         self.advance_configuration_generation()?;
         self.deferred_configuration_abort.lock().unwrap().take();
@@ -2868,7 +3087,16 @@ impl CustomReplicatorHost {
     }
 
     async fn invalidate_build_attempts(&self) -> Result<()> {
-        self.invalidate_configuration_attempts().await?;
+        let _access = self.access_commit.lock().await;
+        self.invalidate_build_attempts_locked().await
+    }
+
+    async fn invalidate_build_attempts_locked(&self) -> Result<()> {
+        self.invalidate_configuration_attempts_locked().await?;
+        self.invalidate_build_attempts_without_access_locked().await
+    }
+
+    async fn invalidate_build_attempts_without_access_locked(&self) -> Result<()> {
         for generation in self.build_generations.write().await.values_mut() {
             *generation = generation
                 .checked_add(1)
@@ -3195,36 +3423,6 @@ impl CustomReplicatorHost {
                 self.select_build_inner(&authority).await?;
                 Ok(())
             }
-            RuntimeEffectAction::RegisterPeerSession { identity, session } => {
-                if session.is_empty()
-                    || self
-                        .retired_sessions
-                        .read()
-                        .await
-                        .contains(&(identity.clone(), session.clone()))
-                {
-                    return Err(RuntimeError::AuthorityNotAdmitted);
-                }
-                let old = self
-                    .sessions
-                    .write()
-                    .await
-                    .insert(identity.clone(), session.clone());
-                if let Some(old) = old.filter(|old| old != &session) {
-                    self.retired_sessions
-                        .write()
-                        .await
-                        .insert((identity.clone(), old));
-                    self.state.write().await.builds.retain(|b| {
-                        b.authority.source != identity && b.authority.target != identity
-                    });
-                    self.invalidate_build_attempts().await?;
-                }
-                if self.native_receipts {
-                    self.configure().await?;
-                }
-                Ok(())
-            }
             RuntimeEffectAction::RetireBuild(id) => {
                 self.retired_builds.write().await.insert(id.clone());
                 self.pending_builds.write().await.remove(&id);
@@ -3346,10 +3544,18 @@ impl CustomReplicatorHost {
         self.refresh().await
     }
     pub(super) async fn cancel_configuration_work(&self) -> Result<()> {
-        let _gate = self.gate.lock().await;
-        *self.restored_access.write().await = None;
-        self.removal_witnesses.write().await.clear();
-        self.invalidate_build_attempts().await
+        {
+            let _gate = self.gate.lock().await;
+            *self.restored_access.write().await = None;
+            self.removal_witnesses.write().await.clear();
+            self.invalidate_configuration_attempts_without_access_locked()
+                .await?;
+            self.invalidate_build_attempts_without_access_locked()
+                .await?;
+        }
+        let _access = self.access_commit.lock().await;
+        self.advance_access_generation()?;
+        Ok(())
     }
     pub(super) async fn restore_authority(&self) -> Result<()> {
         let _gate = self.gate.lock().await;
@@ -3429,40 +3635,69 @@ impl CustomReplicatorHost {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
-        let replaced = {
-            let _gate = self.gate.lock().await;
-            if session.is_empty()
-                || self
-                    .retired_sessions
-                    .read()
-                    .await
-                    .contains(&(identity.clone(), session.clone()))
-            {
-                return Err(RuntimeError::AuthorityNotAdmitted);
+        {
+            let _registration = self.session_registration.lock().await;
+            let replaced = {
+                let _access = self.access_commit.lock().await;
+                self.validate_peer_session_replacement(&identity, &session)
+                    .await?;
+                self.register_common_peer_locked(identity, session).await?
+            };
+            if replaced {
+                self.fence_writes().await?;
             }
-            let old = self
-                .sessions
-                .write()
-                .await
-                .insert(identity.clone(), session.clone());
-            if let Some(old) = old.filter(|old| old != &session) {
-                self.retired_sessions
-                    .write()
-                    .await
-                    .insert((identity.clone(), old));
-                self.state.write().await.builds.retain(|build| {
-                    build.authority.source != identity && build.authority.target != identity
-                });
-                true
-            } else {
-                false
-            }
-        };
-        if replaced {
-            self.invalidate_build_attempts().await?;
-            self.fence_writes().await?;
         }
         self.configure().await
+    }
+
+    async fn validate_peer_session_replacement(
+        &self,
+        identity: &ReplicaIdentity,
+        session: &ProcessSessionId,
+    ) -> Result<bool> {
+        if session.is_empty()
+            || self
+                .retired_sessions
+                .read()
+                .await
+                .contains(&(identity.clone(), session.clone()))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(self
+            .sessions
+            .read()
+            .await
+            .get(identity)
+            .is_some_and(|old| old != session))
+    }
+
+    async fn register_common_peer_locked(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<bool> {
+        let old = self
+            .sessions
+            .write()
+            .await
+            .insert(identity.clone(), session.clone());
+        let replaced = if let Some(old) = old.filter(|old| old != &session) {
+            self.retired_sessions
+                .write()
+                .await
+                .insert((identity.clone(), old));
+            self.state.write().await.builds.retain(|build| {
+                build.authority.source != identity && build.authority.target != identity
+            });
+            true
+        } else {
+            false
+        };
+        if replaced {
+            self.invalidate_build_attempts_locked().await?;
+        }
+        Ok(replaced)
     }
 
     async fn apply_common_action(&self, action: RuntimeEffectAction) -> Result<()> {
@@ -3491,6 +3726,11 @@ impl CustomReplicatorHost {
                 return self.register_common_peer(identity, session).await;
             }
             action => action,
+        };
+        let _session_registration = if matches!(&action, RuntimeEffectAction::AdmitAuthority(_)) {
+            Some(self.session_registration.lock().await)
+        } else {
+            None
         };
         let _gate = self.gate.lock().await;
         let host = self.host()?;

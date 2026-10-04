@@ -55,6 +55,7 @@ where
     ACCESS_PROOF_VIEW.scope((read, write), future).await
 }
 
+use crate::runtime_adapter::RuntimeEffectExecution;
 use crate::transport::{
     copy_ack_from_proto, copy_ack_to_proto, copy_from_proto, copy_to_proto,
     replication_ack_from_proto, replication_ack_to_proto, replication_from_proto,
@@ -676,7 +677,21 @@ impl PodRuntime {
     }
 
     pub async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
-        Box::pin(self.host.apply_effect(effect)).await
+        Box::pin(self.host.prepare_effect(effect))
+            .await?
+            .accept()
+            .await
+            .map_err(|error| match error {
+                crate::AgentError::Runtime(error) => error,
+                error => RuntimeError::Application(error.to_string()),
+            })
+    }
+
+    pub(crate) async fn prepare_effect(
+        &self,
+        effect: RuntimeEffect,
+    ) -> Result<RuntimeEffectExecution> {
+        Box::pin(self.host.prepare_effect(effect)).await
     }
 
     pub(crate) async fn consume_cancelled_build_effect(
@@ -1368,7 +1383,7 @@ impl RuntimeHost {
         self.application.abort();
     }
 
-    async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+    async fn prepare_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectExecution> {
         let _guard = self.effect_lock.lock().await;
         if !matches!(
             effect.action,
@@ -1392,7 +1407,7 @@ impl RuntimeHost {
             let state = self.state.read().await;
             if let Some(previous) = state.effects.get(&effect.sequence) {
                 if effect == previous.effect {
-                    return Ok(previous.result.clone());
+                    return Ok(RuntimeEffectExecution::completed(previous.result.clone()));
                 }
                 return Err(RuntimeError::EffectConflict {
                     sequence: effect.sequence,
@@ -1656,20 +1671,20 @@ impl RuntimeHost {
             topology_receipt,
             postcondition,
         };
-        self.state.write().await.effects.insert(
-            result.sequence,
-            AppliedEffect {
-                effect,
-                result: result.clone(),
-            },
-        );
+        let applied = AppliedEffect {
+            effect,
+            result: result.clone(),
+        };
         if let Some(commit) = access_commit {
-            if let Err(error) = commit.commit().await {
-                self.state.write().await.effects.remove(&result.sequence);
-                return Err(error);
-            }
+            let commit = commit.into_runtime_commit(self.weak_self.clone(), applied);
+            return Ok(RuntimeEffectExecution::prepared(result, commit));
         }
-        Ok(result)
+        self.state
+            .write()
+            .await
+            .effects
+            .insert(result.sequence, applied);
+        Ok(RuntimeEffectExecution::completed(result))
     }
 
     async fn consume_cancelled_build_effect(

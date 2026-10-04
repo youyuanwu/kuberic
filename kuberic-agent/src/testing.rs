@@ -629,6 +629,14 @@ pub async fn set_lifecycle_access(
     runtime.testing_set_access(read, write).await
 }
 
+pub async fn register_lifecycle_peer_session(
+    runtime: &crate::hosting::PodRuntime,
+    identity: kuberic_protocol::types::ReplicaIdentity,
+    session: kuberic_protocol::types::ProcessSessionId,
+) -> kuberic_runtime::Result<()> {
+    runtime.register_peer_session(identity, session).await
+}
+
 pub async fn wait_for_lifecycle_catch_up(
     runtime: &crate::hosting::PodRuntime,
 ) -> kuberic_runtime::Result<()> {

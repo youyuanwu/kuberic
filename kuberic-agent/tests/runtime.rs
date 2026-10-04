@@ -13,9 +13,12 @@ use kuberic_agent::hosting::{OutboundReplication, PodRuntime, PreparedCopy, Runt
 use kuberic_agent::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use kuberic_agent::service::AgentService;
 use kuberic_agent::sqlite_store::SqliteStore;
-use kuberic_agent::state::{AgentState, CoordinatorStage, SCHEMA_VERSION, StorageIdentity};
-use kuberic_agent::store::AgentStore;
-use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_agent::state::{
+    AgentState, CoordinatorStage, ReconfigurationRecord, RetainedCommandResult, RetainedResult,
+    SCHEMA_VERSION, StorageIdentity,
+};
+use kuberic_agent::store::{AgentStore, BeginConfiguration, BeginEffect};
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation,
@@ -4379,6 +4382,11 @@ struct CustomRoleGate {
     block_progress: AtomicBool,
     progress_entered: Notify,
     progress_released: Notify,
+    native_access_granted: AtomicBool,
+    block_revocation: AtomicBool,
+    revocation_entered: Notify,
+    revocation_released: Notify,
+    revoke_error: AtomicBool,
     abort_count: AtomicUsize,
     block_configuration: AtomicBool,
     configuration_entered: Notify,
@@ -4421,6 +4429,7 @@ impl Replicator for CustomRoleGate {
         Ok(())
     }
     fn abort(&self) {
+        self.native_access_granted.store(false, Ordering::SeqCst);
         self.abort_count.fetch_add(1, Ordering::SeqCst);
     }
     async fn current_progress(&self) -> Result<i64> {
@@ -4440,7 +4449,17 @@ impl Replicator for CustomRoleGate {
                 3 => return Err(RuntimeError::OperationCancelled),
                 _ => {}
             }
+        } else {
+            if self.block_revocation.swap(false, Ordering::SeqCst) {
+                self.revocation_entered.notify_one();
+                self.revocation_released.notified().await;
+            }
+            if self.revoke_error.swap(false, Ordering::SeqCst) {
+                return Err(RuntimeError::Application("revocation failed".into()));
+            }
         }
+        self.native_access_granted
+            .store(grant_attempt, Ordering::SeqCst);
         Ok(10)
     }
     async fn catch_up_capability(&self) -> Result<i64> {
@@ -4893,6 +4912,7 @@ async fn blocked_lifecycle_callbacks_reject_fencing_session_replacement_close_an
         control.progress_released.notify_one();
         assert_stale_lifecycle_result(grant.await.unwrap());
         assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        assert!(!control.native_access_granted.load(Ordering::SeqCst));
     }
     {
         let (runtime, control, _, peer) = blocked_lifecycle_fixture("configuration").await;
@@ -6339,6 +6359,59 @@ async fn synthetic_custom_switchover_requires_all_catchup() {
 }
 
 #[tokio::test]
+async fn configuration_cancellation_does_not_deadlock_blocked_switchover_fencing() {
+    let (runtime, control, local, peer) =
+        blocked_lifecycle_fixture("switchover-cancellation-lock-order").await;
+    let configuration = runtime
+        .snapshot()
+        .await
+        .authority
+        .unwrap()
+        .current_configuration;
+    control.block_catchup.store(true, Ordering::SeqCst);
+    let switchover = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::PrepareSwitchover {
+                        preparation_generation: 1,
+                        request_id: SwitchoverRequestId::new("lock-order"),
+                        source: local,
+                        target: peer,
+                        starting_configuration_id: configuration.configuration_id,
+                        starting_epoch: configuration.epoch,
+                    },
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.catchup_entered.notified())
+        .await
+        .unwrap();
+    let cancellation = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.testing_cancel_configuration_work().await })
+    };
+    control.catchup_released.notify_one();
+    timeout(Duration::from_secs(1), switchover)
+        .await
+        .expect("switchover remained deadlocked")
+        .unwrap()
+        .ok();
+    timeout(Duration::from_secs(1), cancellation)
+        .await
+        .expect("configuration cancellation remained deadlocked")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+}
+
+#[tokio::test]
 async fn synthetic_custom_replacement_rejects_retired_session() {
     exercise_blocked_lifecycle_invalidation(
         BlockedLifecycleCallback::Build,
@@ -6369,6 +6442,82 @@ async fn synthetic_custom_access_is_proof_before_publish() {
     control.progress_released.notify_one();
     grant.await.unwrap().unwrap();
     assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn cancelled_custom_access_preparation_stops_publication_and_closes_access() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("cancelled-access-preparation").await;
+    control.block_progress.store(true, Ordering::SeqCst);
+    let grant = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::set_lifecycle_access(
+                &runtime,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .unwrap();
+    grant.abort();
+    assert!(grant.await.unwrap_err().is_cancelled());
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    control.progress_released.notify_one();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn cancelled_custom_access_preparation_cannot_fence_a_newer_grant() {
+    let (runtime, control, _, _) =
+        blocked_lifecycle_fixture("cancelled-preparation-newer-grant").await;
+    control.block_progress.store(true, Ordering::SeqCst);
+    let old = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::set_lifecycle_access(
+                &runtime,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .unwrap();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    control.progress_released.notify_one();
 }
 
 #[tokio::test]
@@ -8097,6 +8246,160 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
     }
 }
 
+#[derive(Clone, Copy)]
+enum EffectPersistenceFailure {
+    MarkApplied = 1,
+    Complete = 2,
+    BlockComplete = 3,
+}
+
+struct FailingEffectStore {
+    inner: Arc<SqliteStore>,
+    failure: AtomicUsize,
+    complete_entered: Notify,
+    complete_release: Notify,
+}
+
+impl FailingEffectStore {
+    fn new(inner: Arc<SqliteStore>, failure: EffectPersistenceFailure) -> Self {
+        Self {
+            inner,
+            failure: AtomicUsize::new(failure as usize),
+            complete_entered: Notify::new(),
+            complete_release: Notify::new(),
+        }
+    }
+
+    fn fail(&self, stage: EffectPersistenceFailure) -> kuberic_agent::Result<()> {
+        if self
+            .failure
+            .compare_exchange(stage as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Err(kuberic_agent::AgentError::EffectConflict(
+                "injected effect persistence failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl AgentStore for FailingEffectStore {
+    async fn identity(&self) -> kuberic_agent::Result<StorageIdentity> {
+        self.inner.identity().await
+    }
+
+    async fn load_state(&self) -> kuberic_agent::Result<AgentState> {
+        self.inner.load_state().await
+    }
+
+    async fn complete_application_initialization(&self) -> kuberic_agent::Result<()> {
+        self.inner.complete_application_initialization().await
+    }
+
+    async fn begin_effect(&self, effect: &RuntimeEffect) -> kuberic_agent::Result<BeginEffect> {
+        self.inner.begin_effect(effect).await
+    }
+
+    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> kuberic_agent::Result<()> {
+        self.fail(EffectPersistenceFailure::MarkApplied)?;
+        self.inner.mark_effect_applied(effect).await
+    }
+
+    async fn complete_effect(&self, result: &RuntimeEffectResult) -> kuberic_agent::Result<()> {
+        if self
+            .failure
+            .compare_exchange(
+                EffectPersistenceFailure::BlockComplete as usize,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.complete_entered.notify_one();
+            self.complete_release.notified().await;
+        }
+        self.fail(EffectPersistenceFailure::Complete)?;
+        self.inner.complete_effect(result).await
+    }
+
+    async fn cancel_effect(&self, effect: &RuntimeEffect) -> kuberic_agent::Result<()> {
+        self.inner.cancel_effect(effect).await
+    }
+
+    async fn begin_configuration(
+        &self,
+        command: &EnsureConfiguration,
+    ) -> kuberic_agent::Result<BeginConfiguration> {
+        self.inner.begin_configuration(command).await
+    }
+
+    async fn journal_build(
+        &self,
+        command: &EnsureReplicaBuild,
+    ) -> kuberic_agent::Result<EnsureReplicaBuild> {
+        self.inner.journal_build(command).await
+    }
+
+    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> kuberic_agent::Result<()> {
+        self.inner.abandon_build(command).await
+    }
+
+    async fn advance_configuration(
+        &self,
+        operation_id: &OperationId,
+        expected: CoordinatorStage,
+        next: CoordinatorStage,
+        observed_lsn: Option<i64>,
+    ) -> kuberic_agent::Result<ReconfigurationRecord> {
+        self.inner
+            .advance_configuration(operation_id, expected, next, observed_lsn)
+            .await
+    }
+
+    async fn complete_configuration(
+        &self,
+        operation_id: &OperationId,
+    ) -> kuberic_agent::Result<RetainedCommandResult> {
+        self.inner.complete_configuration(operation_id).await
+    }
+
+    async fn retained_result(&self) -> kuberic_agent::Result<Option<RetainedResult>> {
+        self.inner.retained_result().await
+    }
+
+    async fn set_reconfiguration(&self, data: Option<String>) -> kuberic_agent::Result<()> {
+        self.inner.set_reconfiguration(data).await
+    }
+
+    async fn clear_reconfiguration(&self) -> kuberic_agent::Result<()> {
+        self.inner.clear_reconfiguration().await
+    }
+
+    async fn migrate_schema(
+        &self,
+        expected_version: u32,
+        target_version: u32,
+    ) -> kuberic_agent::Result<()> {
+        self.inner
+            .migrate_schema(expected_version, target_version)
+            .await
+    }
+
+    async fn record_partition_reports(
+        &self,
+        load_metrics: Vec<LoadMetric>,
+        reported_fault: Option<FaultType>,
+    ) -> kuberic_agent::Result<()> {
+        self.inner
+            .record_partition_reports(load_metrics, reported_fault)
+            .await
+    }
+}
+
 #[tokio::test]
 async fn cancelled_access_effect_rolls_back_projection_before_effect_acceptance() {
     let primary = identity(1, "access-cancel-primary");
@@ -8165,6 +8468,428 @@ async fn cancelled_access_effect_rolls_back_projection_before_effect_acceptance(
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn prepared_access_effect_holds_native_fence_until_durable_decision() {
+    let primary = identity(1, "access-durable-boundary-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = open_primary_with_session(
+        application,
+        vec![primary],
+        "access-durable-boundary-session",
+    )
+    .await;
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        runtime.as_ref(),
+        effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    assert!(!runtime.testing_has_applied_effect(6).await);
+
+    let invalidation = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.testing_cancel_configuration_work().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !invalidation.is_finished(),
+        "native generation mutation crossed the uncommitted effect boundary"
+    );
+
+    execution.reject().await.unwrap();
+    invalidation.await.unwrap().unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+}
+
+#[tokio::test]
+async fn peer_session_replacement_waits_for_the_durable_access_decision() {
+    let (runtime, control, _, peer) = blocked_lifecycle_fixture("session-durable-boundary").await;
+    let execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        runtime.as_ref(),
+        effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+
+    let replacement = {
+        let runtime = runtime.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::register_lifecycle_peer_session(
+                &runtime,
+                peer,
+                ProcessSessionId::new("replacement-peer-session"),
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !replacement.is_finished(),
+        "peer-session mutation crossed the durable access decision"
+    );
+
+    execution.reject().await.unwrap();
+    replacement.await.unwrap().unwrap();
+    assert!(!control.native_access_granted.load(Ordering::SeqCst));
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+}
+
+#[tokio::test]
+async fn abort_rejects_prepared_managed_and_custom_access() {
+    let primary = identity(1, "managed-access-abort");
+    let managed = open_primary_with_session(
+        Arc::new(TestApplication::default()),
+        vec![primary],
+        "managed-access-abort-session",
+    )
+    .await;
+    managed
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+    let managed_execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        managed.as_ref(),
+        effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    managed.abort();
+    assert!(managed_execution.accept().await.is_err());
+    assert!(!managed.testing_has_applied_effect(6).await);
+
+    let (custom, control, _, _) = blocked_lifecycle_fixture("custom-access-abort").await;
+    let custom_execution = <PodRuntime as RuntimeEffectExecutor>::prepare_runtime_effect(
+        custom.as_ref(),
+        effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+    custom.abort();
+    assert!(custom_execution.accept().await.is_err());
+    assert!(!control.native_access_granted.load(Ordering::SeqCst));
+    assert!(!custom.testing_has_applied_effect(5).await);
+}
+
+#[tokio::test]
+async fn access_effect_persistence_failures_reject_then_retry_the_exact_pending_generation() {
+    for (suffix, failure) in [
+        ("mark-applied", EffectPersistenceFailure::MarkApplied),
+        ("complete", EffectPersistenceFailure::Complete),
+    ] {
+        let primary = identity(1, &format!("access-persistence-{suffix}"));
+        let application = Arc::new(TestApplication::default());
+        let runtime = open_primary_with_session(
+            application,
+            vec![primary.clone()],
+            &format!("access-persistence-{suffix}-session"),
+        )
+        .await;
+        runtime
+            .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+            .await
+            .unwrap();
+
+        let resource_uid = ResourceUid::new(format!("access-persistence-{suffix}"));
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid,
+            pod_uid: PodUid::new(primary.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("access-persistence-{suffix}-pvc")),
+            initialization_id: InitializationId::new(format!(
+                "access-persistence-{suffix}-initialization"
+            )),
+            local_identity: primary,
+            effective_policy: EffectivePolicy::fixed(1, 10).unwrap(),
+        });
+        state.next_effect_sequence = 6;
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(FailingEffectStore::new(inner.clone(), failure));
+        let adapter = RuntimeAdapter::new(store, runtime.clone());
+        let access = effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+
+        assert!(adapter.execute(access.clone()).await.is_err(), "{suffix}");
+        assert!(!runtime.testing_has_applied_effect(6).await, "{suffix}");
+        assert_eq!(
+            runtime.snapshot().await.write_status,
+            AccessStatus::ReconfigurationPending,
+            "{suffix}"
+        );
+        assert!(inner.load_state().await.unwrap().pending_effect.is_some());
+
+        adapter.execute(access).await.unwrap();
+        assert!(runtime.testing_has_applied_effect(6).await, "{suffix}");
+        assert_eq!(
+            runtime.snapshot().await.write_status,
+            AccessStatus::Granted,
+            "{suffix}"
+        );
+        assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancelling_durable_access_completion_rolls_back_and_preserves_pending_retry() {
+    let primary = identity(1, "access-persistence-cancel");
+    let application = Arc::new(TestApplication::default());
+    let runtime = open_primary_with_session(
+        application,
+        vec![primary.clone()],
+        "access-persistence-cancel-session",
+    )
+    .await;
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("access-persistence-cancel"),
+        pod_uid: PodUid::new(primary.instance_id.as_str()),
+        pvc_uid: PvcUid::new("access-persistence-cancel-pvc"),
+        initialization_id: InitializationId::new("access-persistence-cancel-initialization"),
+        local_identity: primary,
+        effective_policy: EffectivePolicy::fixed(1, 10).unwrap(),
+    });
+    state.next_effect_sequence = 6;
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let store = Arc::new(FailingEffectStore::new(
+        inner.clone(),
+        EffectPersistenceFailure::BlockComplete,
+    ));
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let execution = {
+        let store = store.clone();
+        let runtime = runtime.clone();
+        let access = access.clone();
+        tokio::spawn(async move { RuntimeAdapter::new(store, runtime).execute(access).await })
+    };
+    timeout(Duration::from_secs(1), store.complete_entered.notified())
+        .await
+        .unwrap();
+    execution.abort();
+    assert!(execution.await.unwrap_err().is_cancelled());
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert!(inner.load_state().await.unwrap().pending_effect.is_some());
+
+    RuntimeAdapter::new(store, runtime.clone())
+        .execute(access)
+        .await
+        .unwrap();
+    assert!(runtime.testing_has_applied_effect(6).await);
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+}
+
+#[tokio::test]
+async fn custom_access_durable_rejection_closes_native_access_and_retries_exactly() {
+    for (suffix, failure) in [
+        ("complete", EffectPersistenceFailure::Complete),
+        ("cancel", EffectPersistenceFailure::BlockComplete),
+    ] {
+        let (runtime, control, local, _) =
+            blocked_lifecycle_fixture(&format!("custom-persistence-{suffix}")).await;
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new(format!("custom-persistence-{suffix}")),
+            pod_uid: PodUid::new(local.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("custom-persistence-{suffix}-pvc")),
+            initialization_id: InitializationId::new(format!(
+                "custom-persistence-{suffix}-initialization"
+            )),
+            local_identity: local,
+            effective_policy: EffectivePolicy::fixed(2, 10).unwrap(),
+        });
+        state.next_effect_sequence = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(FailingEffectStore::new(inner.clone(), failure));
+        let access = effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+
+        if matches!(failure, EffectPersistenceFailure::BlockComplete) {
+            let execution = {
+                let store = store.clone();
+                let runtime = runtime.clone();
+                let access = access.clone();
+                tokio::spawn(
+                    async move { RuntimeAdapter::new(store, runtime).execute(access).await },
+                )
+            };
+            timeout(Duration::from_secs(1), store.complete_entered.notified())
+                .await
+                .unwrap();
+            assert!(control.native_access_granted.load(Ordering::SeqCst));
+            execution.abort();
+            assert!(execution.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(
+                RuntimeAdapter::new(store.clone(), runtime.clone())
+                    .execute(access.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !control.native_access_granted.load(Ordering::SeqCst)
+                    && runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!runtime.testing_has_applied_effect(5).await);
+        assert!(inner.load_state().await.unwrap().pending_effect.is_some());
+
+        RuntimeAdapter::new(store, runtime.clone())
+            .execute(access)
+            .await
+            .unwrap();
+        assert!(control.native_access_granted.load(Ordering::SeqCst));
+        assert!(runtime.testing_has_applied_effect(5).await);
+        assert!(inner.load_state().await.unwrap().pending_effect.is_none());
+    }
+}
+
+#[tokio::test]
+async fn failed_or_stalled_custom_revocation_aborts_after_closing_projection() {
+    for (suffix, blocked) in [("error", false), ("blocked", true)] {
+        let (runtime, control, local, _) =
+            blocked_lifecycle_fixture(&format!("custom-revocation-{suffix}")).await;
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new(format!("custom-revocation-{suffix}")),
+            pod_uid: PodUid::new(local.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("custom-revocation-{suffix}-pvc")),
+            initialization_id: InitializationId::new(format!(
+                "custom-revocation-{suffix}-initialization"
+            )),
+            local_identity: local,
+            effective_policy: EffectivePolicy::fixed(2, 10).unwrap(),
+        });
+        state.next_effect_sequence = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let inner = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(FailingEffectStore::new(
+            inner,
+            EffectPersistenceFailure::Complete,
+        ));
+        if blocked {
+            control.block_revocation.store(true, Ordering::SeqCst);
+        } else {
+            control.revoke_error.store(true, Ordering::SeqCst);
+        }
+        let access = effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        );
+        let execution = {
+            let store = store.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move { RuntimeAdapter::new(store, runtime).execute(access).await })
+        };
+        if blocked {
+            timeout(
+                Duration::from_secs(1),
+                control.revocation_entered.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                runtime.snapshot().await.write_status,
+                AccessStatus::ReconfigurationPending
+            );
+        }
+        assert!(execution.await.unwrap().is_err());
+        assert!(control.abort_count.load(Ordering::SeqCst) > 0);
+        assert!(!control.native_access_granted.load(Ordering::SeqCst));
+        assert_eq!(
+            runtime.snapshot().await.write_status,
+            AccessStatus::ReconfigurationPending
+        );
+    }
 }
 
 #[tokio::test]
