@@ -2478,8 +2478,12 @@ impl CustomReplicatorHost {
         if self.access_generation.load(Ordering::Acquire) != projection.access_generation {
             return;
         }
-        self.rollback_published_common_access_locked(projection)
+        if self.published_access_generation.load(Ordering::Acquire) > projection.access_generation {
+            return;
+        }
+        self.rollback_common_access_projection_locked(projection)
             .await;
+        let _ = self.close_custom_native_access(false).await;
     }
 
     async fn rollback_published_common_access(&self, projection: &AccessProjection) {
@@ -2505,11 +2509,12 @@ impl CustomReplicatorHost {
                 return;
             }
             drop(state);
-            let _ = self.close_custom_native_access().await;
+            let _ = self.close_custom_native_access(false).await;
             return;
         }
-        self.rollback_published_common_access_locked(projection)
+        self.rollback_common_access_projection_locked(projection)
             .await;
+        let _ = self.close_custom_native_access(false).await;
     }
 
     async fn rollback_published_common_access_locked(&self, projection: &AccessProjection) {
@@ -2518,10 +2523,10 @@ impl CustomReplicatorHost {
         }
         self.rollback_common_access_projection_locked(projection)
             .await;
-        let _ = self.close_custom_native_access().await;
+        let _ = self.close_custom_native_access(true).await;
     }
 
-    async fn close_custom_native_access(&self) -> Result<()> {
+    async fn close_custom_native_access(&self, abort_on_failure: bool) -> Result<()> {
         let result = tokio::time::timeout(
             ACCESS_CLOSE_TIMEOUT,
             super::with_access_proof_view(
@@ -2534,13 +2539,17 @@ impl CustomReplicatorHost {
         match result {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(error)) => {
-                self.notify_abort();
-                self.control.abort();
+                if abort_on_failure {
+                    self.notify_abort();
+                    self.control.abort();
+                }
                 Err(error)
             }
             Err(_) => {
-                self.notify_abort();
-                self.control.abort();
+                if abort_on_failure {
+                    self.notify_abort();
+                    self.control.abort();
+                }
                 Err(RuntimeError::OperationCancelled)
             }
         }
