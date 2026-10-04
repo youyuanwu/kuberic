@@ -47,6 +47,22 @@ implementations. Only the registered default engine supplies the separate
 managed replication/copy data plane and write journal; custom replicators do
 not implement or impersonate that capability.
 
+Standard catch-up, build, and remove operations are invoked through the
+returned public primary. The built-in engine's unpublished capability returns
+typed native receipts for catch-up/build/access, certified-prefix settlement,
+switchover, secondary removal, and retirement. The host validates those
+receipts against current authority, process sessions, attempt/configuration
+generations, and exact targets before accepting an effect. Independent custom
+primaries retain exact common build receipts and never need default-engine
+proof types.
+
+Access publication has one generation-scoped commit owner. Native admission,
+common projection, external projection, and durable effect acceptance must
+complete coherently; cancellation or invalidation fences native writes and
+rolls back an unaccepted projection without revoking a newer grant. Receipt-
+backed effect completion persists compact evidence and a narrow lifecycle
+postcondition rather than restoring an unrelated full native snapshot.
+
 Lifecycle callbacks publish completion only after exact authority, process
 sessions, and callback generation are revalidated. Close, Abort, authority
 replacement, and session replacement cancel or stale delayed progress,

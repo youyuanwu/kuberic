@@ -48,9 +48,14 @@ separate object. Custom factories use the same partition boundary and need not
 use the default engine or implement `DurableState` on the service.
 `CreateReplicator` is the construction boundary: the default factory creates
 one shared `DefaultReplicatorInner`, and the control, primary, state, and
-agent-managed capabilities all reference that inner. Private registration
-transfers a lifecycle proof capability and a separate optional replication/copy
-data plane; neither is returned in the application-visible interface bundle.
+agent-managed capabilities all reference that inner. `ReplicatorInterfaces`
+owns one identity-bound creation containing the public handles, an armed
+abandonment guard, and optional host-only lifecycle/data-plane capabilities.
+Attachment consumes that coherent creation; cancellation, attachment failure,
+or an Open identity mismatch aborts all of its capabilities together. A wrapper
+that retains the built-in creation consumes the original bundle through
+`wrap_primary`; reconstructing with `primary` intentionally creates an
+independent public bundle without the original native provenance.
 `PodRuntime` owns the
 hosting registrar, application lifetime, Open registration, effect ordering,
 and exact returned-interface identity; it does not preconstruct unused default
@@ -152,8 +157,8 @@ and custom-factory code constructs only the SF-shaped interface bundle through
 `ReplicatorInterfaces::secondary` or `ReplicatorInterfaces::primary`. The
 primary constructor derives the control and primary views from the same
 allocation, matching SF's coherent interface-query invariant. The default implementation's lifecycle proof capability and managed data-plane
-bridge are transferred through an unforgeable unpublished agent/runtime
-registration boundary. Every primary implementation uses the common agent
+bridge travel with that coherent bundle and are consumed through an
+unforgeable unpublished agent/runtime attachment boundary. Every primary implementation uses the common agent
 lifecycle owner; only the default engine supplies replication/copy operations.
 Custom replicators own their transport independently.
 
@@ -171,7 +176,13 @@ dispatching `build_replica`. Configuration/epoch/session changes revoke old work
 `remove_replica` retires idle build work without removing an admitted secondary.
 The private agent lifecycle host retains all durable authority/effect/store
 capabilities, fences delayed callback completion by exact authority and session,
-and publishes access only after implementation-specific proof.
+and publishes access only after implementation-specific proof. Standard
+catch-up, build, and remove requests cross the returned public
+`PrimaryReplicator`; the private capability exposes only native proof,
+recovery, reconciliation, topology receipts, and narrow observation. Typed
+receipts bind engine identity/generation, authority, exact build/target,
+configuration, durable boundary, and retirement/removal evidence. Independent
+custom replicators are not required to construct these receipts.
 An unmanaged custom factory without that hosting support remains rejected for
 managed admission.
 

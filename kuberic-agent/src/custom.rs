@@ -210,6 +210,7 @@ impl Drop for AccessPublicationRollback {
     }
 }
 
+#[derive(Clone)]
 struct AccessProjection {
     read: AccessStatus,
     write: AccessStatus,
@@ -256,7 +257,6 @@ fn validate_catch_up_receipt(
         || receipt.boundary_lsn > receipt.current_progress
         || receipt.current_progress < observed_progress
         || receipt.committed_lsn > receipt.current_progress
-        || receipt.current_configuration_quorum_progress < receipt.boundary_lsn
     {
         return Err(RuntimeError::OperationCancelled);
     }
@@ -2319,10 +2319,38 @@ impl CustomReplicatorHost {
         write: AccessStatus,
     ) -> Result<AccessEffectCommit> {
         let projection = self.reserve_access_projection(read, write).await?;
-        let rollback = AccessPublicationRollback::common(self, &projection);
-        self.complete_access_projection(&projection).await?;
-        self.publish_access_projection(projection).await?;
+        let mut rollback = AccessPublicationRollback::common(self, &projection);
+        if let Err(error) = self.complete_access_projection(&projection).await {
+            self.rollback_common_access_projection(&projection).await;
+            rollback.disarm();
+            return Err(error);
+        }
+        if let Err(error) = self.publish_access_projection(projection.clone()).await {
+            self.rollback_common_access_projection(&projection).await;
+            rollback.disarm();
+            return Err(error);
+        }
         Ok(AccessEffectCommit::managed(rollback))
+    }
+
+    async fn rollback_common_access_projection(&self, projection: &AccessProjection) {
+        let _commit = self.access_commit.lock().await;
+        if self.access_generation.load(Ordering::Acquire) != projection.access_generation {
+            return;
+        }
+        self.access_generation.store(
+            projection.access_generation.saturating_add(1),
+            Ordering::Release,
+        );
+        let mut state = self.state.write().await;
+        state.read_status = AccessStatus::ReconfigurationPending;
+        state.write_status = AccessStatus::ReconfigurationPending;
+        drop(state);
+        if let Some(host) = self.host.upgrade() {
+            let mut state = host.state.write().await;
+            state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
+            state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+        }
     }
 
     async fn accept_catch_up_receipt(&self, receipt: &CatchUpReceipt) -> Result<()> {
@@ -4010,16 +4038,6 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     async fn cancel_outbound_build_attempt(&self, id: &OperationId, generation: u64) -> Result<()> {
         if !self.cancel_common_build_attempt(id, generation).await? {
             return Ok(());
-        }
-        let _gate = self.gate.lock().await;
-        if let Some(build) = self
-            .host()?
-            .default_dependencies
-            .build_authority_store
-            .load_build(id)
-            .await?
-        {
-            self.primary.remove_replica(build.target.replica_id).await?;
         }
         self.configure().await?;
         self.complete_common_build_cancellation(id, generation)

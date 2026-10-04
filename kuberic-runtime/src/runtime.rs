@@ -3875,8 +3875,10 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         }
         let mut state = self.state.write().await;
         if preparation.authority != state.authority
-            || preparation.current_progress != state.current_progress
-            || preparation.committed_lsn != state.committed_lsn
+            || ((preparation.read == AccessStatus::Granted
+                || preparation.write == AccessStatus::Granted)
+                && (preparation.current_progress != state.current_progress
+                    || preparation.committed_lsn != state.committed_lsn))
         {
             return Err(RuntimeError::OperationCancelled);
         }
