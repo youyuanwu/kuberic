@@ -707,7 +707,7 @@ impl RuntimeEffectExecutor for SwitchoverRecoveryRuntime {
         Ok(RuntimeEffectResult {
             operation_id: effect.operation_id,
             sequence: effect.sequence,
-            evidence: None,
+            topology_receipt: None,
             postcondition: state.clone(),
         })
     }
@@ -5091,7 +5091,7 @@ fn result() -> RuntimeEffectResult {
     RuntimeEffectResult {
         operation_id: OperationId::new("effect-1"),
         sequence: 1,
-        evidence: None,
+        topology_receipt: None,
         postcondition: RuntimePostcondition {
             prepared_secondary_removal: None,
             retired_authority: None,
@@ -5138,7 +5138,7 @@ fn switchover_result() -> RuntimeEffectResult {
     RuntimeEffectResult {
         operation_id: OperationId::new("prepare-switchover-1"),
         sequence: 1,
-        evidence: None,
+        topology_receipt: None,
         postcondition: RuntimePostcondition {
             prepared_secondary_removal: None,
             retired_authority: None,

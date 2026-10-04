@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority::RetiredAuthority;
 use crate::authority::{AdmittedAuthority, BuildAuthority};
-use crate::receipts::{AccessReceipt, BuildReceipt, CatchUpReceipt};
+use crate::receipts::TopologyReceipt;
 use kuberic_protocol::types::{
     ProcessSessionId, SecondaryRemovalPreparation, SecondaryRemovalWitness,
     SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
@@ -153,52 +153,11 @@ pub struct RuntimePostcondition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TopologyEvidenceKind {
-    CertifiedPrefix,
-    Switchover,
-    SecondaryRemoval,
-    Retirement,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TopologyOperationEvidence {
-    pub kind: TopologyEvidenceKind,
-    pub engine_session_id: String,
-    pub engine_generation: u64,
-    #[serde(default)]
-    pub operation_id: Option<OperationId>,
-    #[serde(default)]
-    pub request_id: Option<SwitchoverRequestId>,
-    #[serde(default)]
-    pub preparation_generation: Option<u64>,
-    #[serde(default)]
-    pub source: Option<ReplicaIdentity>,
-    #[serde(default)]
-    pub target: Option<ReplicaIdentity>,
-    #[serde(default)]
-    pub configuration_id: Option<ConfigurationId>,
-    #[serde(default)]
-    pub epoch: Option<kuberic_protocol::types::Epoch>,
-    #[serde(default)]
-    pub boundary_lsn: Option<i64>,
-    #[serde(default)]
-    pub completed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RuntimeOperationEvidence {
-    CatchUp(Box<CatchUpReceipt>),
-    Build(Box<BuildReceipt>),
-    Access(Box<AccessReceipt>),
-    Topology(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEffectResult {
     pub operation_id: OperationId,
     pub sequence: u64,
     #[serde(default)]
-    pub evidence: Option<Box<RuntimeOperationEvidence>>,
+    pub topology_receipt: Option<Box<TopologyReceipt>>,
     pub postcondition: RuntimePostcondition,
 }
 

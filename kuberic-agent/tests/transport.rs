@@ -23,9 +23,10 @@ fn hosted_build_dispatch_uses_one_shared_public_execution_coordinator() {
         "transport must not invoke the public primary through a parallel path"
     );
     assert!(
-        transport.contains("self.build_id.as_ref()")
-            && transport.contains("self.build_id = None;\n            self.guard.take();"),
-        "drop-safe dispatch cleanup must retain its token and lock until cancellation completes"
+        transport.contains("let (decision, completion) = tokio::sync::oneshot::channel()")
+            && transport.contains("if completion.await != Ok(true)")
+            && !transport.contains("impl Drop for BuildDispatchCancellation"),
+        "dispatch cleanup must be an explicit transaction, not asynchronous Drop work"
     );
     assert_eq!(
         transport

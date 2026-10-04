@@ -16,11 +16,10 @@ use async_trait::async_trait;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
     PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
-    SecondaryRemovalWitness, SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
 };
 use kuberic_runtime_internal::receipts::{
-    AccessReceipt, BuildReceipt, CatchUpReceipt, CertifiedPrefixReceipt, NativeOperationToken,
-    RemovalReceipt, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
+    AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
+    TopologyReceipt,
 };
 use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -28,9 +27,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
     AdmittedAuthority, BuildAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
-    ReplicaAuthorityStore, ReplicationProgressStore, RetiredAuthority,
+    ReplicaAuthorityStore, ReplicationProgressStore,
 };
-use crate::effects::RuntimeSnapshot;
+use crate::effects::{RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
 use crate::internal::{DefaultReplicatorInner, PendingReplication, PendingWrite};
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -89,62 +88,14 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
         &self,
         read: AccessStatus,
         write: AccessStatus,
-    ) -> Result<AccessReceipt>;
-    async fn publish_access(&self, preparation: AccessReceipt) -> Result<AccessReceipt>;
-    async fn lock_access_acceptance(
-        &self,
-        expected: &NativeOperationToken,
-    ) -> Result<ManagedAccessAcceptance>;
-    async fn operation_token(&self) -> Result<NativeOperationToken>;
-    async fn catch_up_receipt(&self) -> Result<CatchUpReceipt>;
-    async fn build_receipt(
-        &self,
-        build_id: &OperationId,
-        target: &ReplicaIdentity,
-    ) -> Result<BuildReceipt>;
-    async fn removal_receipt(&self, replica_id: ReplicaId) -> Result<RemovalReceipt>;
+    ) -> Result<AccessPreparation>;
+    async fn publish_access(&self, preparation: AccessPreparation) -> Result<()>;
+    async fn lock_native_fence(&self, expected: &NativeOperationToken)
+    -> Result<ManagedFenceGuard>;
+    async fn native_fence(&self) -> Result<NativeOperationToken>;
+    async fn progress_status(&self) -> NativeProgressStatus;
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
-    async fn authorize_failover_prefix_proof(
-        &self,
-        boundary: Lsn,
-    ) -> Result<CertifiedPrefixReceipt>;
-    async fn prepare_switchover_proof(
-        &self,
-        preparation_generation: u64,
-        request_id: kuberic_protocol::types::SwitchoverRequestId,
-        source: ReplicaIdentity,
-        target: ReplicaIdentity,
-        starting_configuration_id: kuberic_protocol::types::ConfigurationId,
-        starting_epoch: Epoch,
-    ) -> Result<SwitchoverReceipt>;
-    async fn prepare_secondary_removal_proof(
-        &self,
-        intent: SecondaryScaleDownIntent,
-        process_session_id: ProcessSessionId,
-        report_sequence: u64,
-    ) -> Result<SecondaryRemovalReceipt>;
-    async fn observe_secondary_removal_proof(
-        &self,
-        witness: SecondaryRemovalWitness,
-    ) -> Result<SecondaryRemovalReceipt>;
-    async fn observe_secondary_removal_progress_proof(
-        &self,
-        witness: SecondaryRemovalWitness,
-        committed: SecondaryScaleDownCleanup,
-    ) -> Result<SecondaryRemovalReceipt>;
-    async fn accept_secondary_removal_proof(
-        &self,
-        committed: SecondaryScaleDownCleanup,
-    ) -> Result<SecondaryRemovalReceipt>;
-    async fn accept_historical_secondary_removal_proof(
-        &self,
-        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<SecondaryRemovalReceipt>;
-    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<RetirementReceipt>;
-    async fn complete_retirement_proof(
-        &self,
-        retired: RetiredAuthority,
-    ) -> Result<RetirementReceipt>;
+    async fn apply_topology(&self, action: RuntimeEffectAction) -> Result<TopologyReceipt>;
     async fn register_peer_session_proof(
         &self,
         identity: ReplicaIdentity,
@@ -167,11 +118,11 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
 }
 
 #[doc(hidden)]
-pub struct ManagedAccessAcceptance {
+pub struct ManagedFenceGuard {
     _delivery: OwnedMutexGuard<()>,
 }
 
-impl ManagedAccessAcceptance {
+impl ManagedFenceGuard {
     pub(crate) fn new(delivery: OwnedMutexGuard<()>) -> Self {
         Self {
             _delivery: delivery,

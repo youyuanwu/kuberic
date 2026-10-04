@@ -108,10 +108,8 @@ pub struct GrpcOutboundDispatcher<R> {
 }
 
 struct BuildDispatchCancellation {
-    runtime: Arc<PodRuntime>,
-    build_id: Option<kuberic_protocol::types::OperationId>,
-    generation: u64,
-    guard: Option<OwnedMutexGuard<()>>,
+    decision: Option<tokio::sync::oneshot::Sender<bool>>,
+    completion: tokio::task::JoinHandle<()>,
 }
 
 impl BuildDispatchCancellation {
@@ -121,51 +119,26 @@ impl BuildDispatchCancellation {
         generation: u64,
         guard: OwnedMutexGuard<()>,
     ) -> Self {
-        Self {
-            runtime,
-            build_id: Some(build_id),
-            generation,
-            guard: Some(guard),
-        }
-    }
-
-    async fn cancel(&mut self) {
-        if let Some(build_id) = self.build_id.as_ref()
-            && self
-                .runtime
-                .cancel_outbound_build_attempt(build_id, self.generation, true)
-                .await
-                .is_ok()
-        {
-            self.build_id = None;
-            self.guard.take();
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.build_id = None;
-        self.guard.take();
-    }
-}
-
-impl Drop for BuildDispatchCancellation {
-    fn drop(&mut self) {
-        let Some(build_id) = self.build_id.take() else {
-            return;
-        };
-        let runtime = self.runtime.clone();
-        let generation = self.generation;
-        let guard = self.guard.take();
-        let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
-            drop(guard);
-            return;
-        };
-        runtime_handle.spawn(async move {
-            let _ = runtime
-                .cancel_outbound_build_attempt(&build_id, generation, true)
-                .await;
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let completion = tokio::spawn(async move {
+            if completion.await != Ok(true) {
+                let _ = runtime
+                    .cancel_outbound_build_attempt(&build_id, generation, true)
+                    .await;
+            }
             drop(guard);
         });
+        Self {
+            decision: Some(decision),
+            completion,
+        }
+    }
+
+    async fn finish(mut self, success: bool) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(success);
+        }
+        let _ = self.completion.await;
     }
 }
 
@@ -178,8 +151,9 @@ pub async fn testing_cancel_build_dispatch(
     lock: Arc<Mutex<()>>,
 ) {
     let guard = lock.lock_owned().await;
-    let mut cancellation = BuildDispatchCancellation::new(runtime, build_id, generation, guard);
-    cancellation.cancel().await;
+    BuildDispatchCancellation::new(runtime, build_id, generation, guard)
+        .finish(false)
+        .await;
 }
 
 impl<R> GrpcOutboundDispatcher<R>
@@ -273,14 +247,10 @@ where
         let build_id = endpoint.build_id.clone();
         let guard = build_lock.lock_owned().await;
         let generation = self.runtime.build_generation(&build_id).await?;
-        let mut cancellation =
+        let cancellation =
             BuildDispatchCancellation::new(self.runtime.clone(), build_id, generation, guard);
         let result = self.dispatch_build_locked(endpoint).await;
-        if result.is_ok() {
-            cancellation.disarm();
-        } else {
-            cancellation.cancel().await;
-        }
+        cancellation.finish(result.is_ok()).await;
         result
     }
 

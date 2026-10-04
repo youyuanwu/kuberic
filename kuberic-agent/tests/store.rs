@@ -86,7 +86,7 @@ fn pending_acceptance_fixture() -> (
     let result = RuntimeEffectResult {
         operation_id: ordinary.operation_id.clone(),
         sequence: ordinary.sequence,
-        evidence: None,
+        topology_receipt: None,
         postcondition: RuntimePostcondition {
             open: true,
             role: state.role,

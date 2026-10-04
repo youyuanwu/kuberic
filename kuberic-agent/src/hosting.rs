@@ -266,66 +266,45 @@ pub struct PodRuntime {
 }
 
 struct ExactBuildCancellation {
-    host: Weak<RuntimeHost>,
-    build_id: Option<OperationId>,
-    generation: u64,
-    public_cleanup: bool,
+    decision: Option<tokio::sync::oneshot::Sender<BuildCancellationDecision>>,
+    completion: tokio::task::JoinHandle<Result<()>>,
+}
+
+enum BuildCancellationDecision {
+    Commit,
+    Cancel { public_cleanup: bool },
 }
 
 impl ExactBuildCancellation {
     fn new(host: &Arc<RuntimeHost>, build_id: OperationId, generation: u64) -> Self {
+        let host = Arc::downgrade(host);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let completion = tokio::spawn(async move {
+            let public_cleanup = match completion.await {
+                Ok(BuildCancellationDecision::Commit) => return Ok(()),
+                Ok(BuildCancellationDecision::Cancel { public_cleanup }) => public_cleanup,
+                Err(_) => true,
+            };
+            let Some(host) = host.upgrade() else {
+                return Ok(());
+            };
+            host.lifecycle()?
+                .cancel_outbound_build_attempt(&build_id, generation, public_cleanup)
+                .await
+        });
         Self {
-            host: Arc::downgrade(host),
-            build_id: Some(build_id),
-            generation,
-            public_cleanup: true,
+            decision: Some(decision),
+            completion,
         }
     }
 
-    async fn cancel(&mut self) -> Result<()> {
-        let Some(build_id) = self.build_id.as_ref() else {
-            return Ok(());
-        };
-        let Some(host) = self.host.upgrade() else {
-            self.build_id = None;
-            return Ok(());
-        };
-        host.lifecycle()?
-            .cancel_outbound_build_attempt(build_id, self.generation, self.public_cleanup)
-            .await?;
-        self.build_id = None;
-        Ok(())
-    }
-
-    fn disarm(&mut self) {
-        self.build_id = None;
-    }
-
-    fn public_completed(&mut self) {
-        self.public_cleanup = false;
-    }
-}
-
-impl Drop for ExactBuildCancellation {
-    fn drop(&mut self) {
-        let Some(build_id) = self.build_id.take() else {
-            return;
-        };
-        let host = self.host.clone();
-        let generation = self.generation;
-        let public_cleanup = self.public_cleanup;
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        runtime.spawn(async move {
-            if let Some(host) = host.upgrade()
-                && let Ok(lifecycle) = host.lifecycle()
-            {
-                let _ = lifecycle
-                    .cancel_outbound_build_attempt(&build_id, generation, public_cleanup)
-                    .await;
-            }
-        });
+    async fn finish(mut self, decision: BuildCancellationDecision) -> Result<()> {
+        if let Some(sender) = self.decision.take() {
+            let _ = sender.send(decision);
+        }
+        self.completion
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
     }
 }
 
@@ -944,35 +923,38 @@ impl PodRuntime {
         let lifecycle = self.host.lifecycle().map_err(E::from)?;
         let managed = lifecycle.is_managed();
         let generation = lifecycle.build_generation(&replica.build_id).await;
-        let mut cancellation =
+        let cancellation =
             ExactBuildCancellation::new(&self.host, replica.build_id.clone(), generation);
-        let result = if managed {
-            async {
-                let execution = async { lifecycle.execute_build(replica).await.map_err(E::from) };
-                let (receipt, ()) = tokio::try_join!(execution, managed_copy())?;
-                lifecycle.accept_build(receipt).await.map_err(E::from)
-            }
-            .await
+        let (result, public_cleanup) = if managed {
+            (
+                async {
+                    let execution =
+                        async { lifecycle.execute_build(replica).await.map_err(E::from) };
+                    let (receipt, ()) = tokio::try_join!(execution, managed_copy())?;
+                    lifecycle.accept_build(receipt).await.map_err(E::from)
+                }
+                .await,
+                true,
+            )
         } else {
-            async {
-                let receipt = match lifecycle.execute_build(replica).await {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        cancellation.public_completed();
-                        return Err(E::from(error));
-                    }
-                };
-                lifecycle.accept_build(receipt).await.map_err(E::from)
+            match lifecycle.execute_build(replica).await {
+                Ok(receipt) => (lifecycle.accept_build(receipt).await.map_err(E::from), true),
+                Err(error) => (Err(E::from(error)), false),
             }
-            .await
         };
         match result {
             Ok(()) => {
-                cancellation.disarm();
+                cancellation
+                    .finish(BuildCancellationDecision::Commit)
+                    .await
+                    .map_err(E::from)?;
                 Ok(())
             }
             Err(error) => {
-                cancellation.cancel().await.map_err(E::from)?;
+                cancellation
+                    .finish(BuildCancellationDecision::Cancel { public_cleanup })
+                    .await
+                    .map_err(E::from)?;
                 Err(error)
             }
         }
@@ -1652,26 +1634,25 @@ impl RuntimeHost {
                 gate.release.notified().await;
             }
         }
-        let access_acceptance_guard = match access_commit.as_ref() {
-            Some(commit) => commit.lock_acceptance().await?,
-            None => None,
-        };
+        if let Some(transaction) = access_commit.as_mut() {
+            transaction.accept().await?;
+        }
         let lifecycle = self.lifecycle().ok();
-        let evidence = match lifecycle.as_ref() {
+        let topology_receipt = match lifecycle.as_ref() {
             Some(lifecycle) => lifecycle
-                .effect_evidence(&effect.action)
+                .topology_receipt(&effect.action)
                 .await
                 .map(Box::new),
             None => None,
         };
-        let postcondition = match (evidence.as_ref(), lifecycle.as_ref()) {
-            (Some(_), Some(lifecycle)) => lifecycle.postcondition().await,
-            _ => snapshot_postcondition(self.snapshot().await),
+        let postcondition = match lifecycle.as_ref() {
+            Some(lifecycle) => lifecycle.postcondition().await,
+            None => snapshot_postcondition(self.snapshot().await),
         };
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            evidence,
+            topology_receipt,
             postcondition,
         };
         self.state.write().await.effects.insert(
@@ -1682,9 +1663,11 @@ impl RuntimeHost {
             },
         );
         if let Some(commit) = access_commit {
-            commit.commit();
+            if let Err(error) = commit.commit().await {
+                self.state.write().await.effects.remove(&result.sequence);
+                return Err(error);
+            }
         }
-        drop(access_acceptance_guard);
         Ok(result)
     }
 
@@ -1741,7 +1724,7 @@ impl RuntimeHost {
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            evidence: None,
+            topology_receipt: None,
             postcondition: snapshot_postcondition(snapshot),
         };
         self.state.write().await.effects.insert(
@@ -1804,11 +1787,10 @@ impl RuntimeHost {
         }
         let lifecycle = self.lifecycle()?;
         let confirmation = lifecycle.confirm_build_completion(build_id, target).await?;
-        let evidence = confirmation.evidence.clone();
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            evidence: evidence.map(Box::new),
+            topology_receipt: None,
             postcondition: lifecycle.postcondition().await,
         };
         self.state.write().await.effects.insert(

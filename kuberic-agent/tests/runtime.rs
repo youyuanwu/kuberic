@@ -3523,123 +3523,43 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         &self,
         _read: AccessStatus,
         _write: AccessStatus,
-    ) -> Result<kuberic_runtime_internal::receipts::AccessReceipt> {
-        panic!("registration tests do not request access receipts")
+    ) -> Result<kuberic_runtime_internal::receipts::AccessPreparation> {
+        panic!("registration tests do not prepare access")
     }
 
     async fn publish_access(
         &self,
-        _preparation: kuberic_runtime_internal::receipts::AccessReceipt,
-    ) -> Result<kuberic_runtime_internal::receipts::AccessReceipt> {
-        panic!("registration tests do not publish access receipts")
+        _preparation: kuberic_runtime_internal::receipts::AccessPreparation,
+    ) -> Result<()> {
+        panic!("registration tests do not publish access")
     }
 
-    async fn lock_access_acceptance(
+    async fn lock_native_fence(
         &self,
         _expected: &kuberic_runtime_internal::receipts::NativeOperationToken,
-    ) -> Result<kuberic_runtime::replicator::ManagedAccessAcceptance> {
-        panic!("registration tests do not accept native access receipts")
+    ) -> Result<kuberic_runtime::replicator::ManagedFenceGuard> {
+        panic!("registration tests do not lock native fencing")
     }
 
-    async fn operation_token(
+    async fn native_fence(
         &self,
     ) -> Result<kuberic_runtime_internal::receipts::NativeOperationToken> {
-        panic!("registration tests do not request native operation tokens")
+        panic!("registration tests do not request native fencing")
     }
 
-    async fn catch_up_receipt(&self) -> Result<kuberic_runtime_internal::receipts::CatchUpReceipt> {
-        panic!("registration tests do not request catch-up receipts")
-    }
-
-    async fn build_receipt(
-        &self,
-        _build_id: &OperationId,
-        _target: &ReplicaIdentity,
-    ) -> Result<kuberic_runtime_internal::receipts::BuildReceipt> {
-        panic!("registration tests do not request build receipts")
-    }
-
-    async fn removal_receipt(
-        &self,
-        _replica_id: ReplicaId,
-    ) -> Result<kuberic_runtime_internal::receipts::RemovalReceipt> {
-        panic!("registration tests do not request removal receipts")
+    async fn progress_status(&self) -> kuberic_runtime_internal::receipts::NativeProgressStatus {
+        panic!("registration tests do not request native progress")
     }
 
     async fn admit_authority_proof(&self, _authority: AdmittedAuthority) -> Result<()> {
         Ok(())
     }
 
-    async fn authorize_failover_prefix_proof(
+    async fn apply_topology(
         &self,
-        _boundary: i64,
-    ) -> Result<kuberic_runtime_internal::receipts::CertifiedPrefixReceipt> {
-        panic!("registration tests do not authorize failover prefixes")
-    }
-
-    async fn prepare_switchover_proof(
-        &self,
-        _preparation_generation: u64,
-        _request_id: SwitchoverRequestId,
-        _source: ReplicaIdentity,
-        _target: ReplicaIdentity,
-        _starting_configuration_id: kuberic_protocol::types::ConfigurationId,
-        _starting_epoch: Epoch,
-    ) -> Result<kuberic_runtime_internal::receipts::SwitchoverReceipt> {
-        panic!("registration tests do not prepare switchover")
-    }
-
-    async fn prepare_secondary_removal_proof(
-        &self,
-        intent: kuberic_protocol::types::SecondaryScaleDownIntent,
-        process_session_id: ProcessSessionId,
-        report_sequence: u64,
-    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
-        let _ = (intent, process_session_id, report_sequence);
-        panic!("registration tests do not prepare secondary removal")
-    }
-
-    async fn observe_secondary_removal_proof(
-        &self,
-        _witness: kuberic_protocol::types::SecondaryRemovalWitness,
-    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
-        panic!("registration tests do not observe secondary removal")
-    }
-
-    async fn observe_secondary_removal_progress_proof(
-        &self,
-        _witness: kuberic_protocol::types::SecondaryRemovalWitness,
-        _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
-        panic!("registration tests do not observe secondary-removal progress")
-    }
-
-    async fn accept_secondary_removal_proof(
-        &self,
-        _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
-        panic!("registration tests do not accept secondary removal")
-    }
-
-    async fn accept_historical_secondary_removal_proof(
-        &self,
-        _command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
-        panic!("registration tests do not accept historical secondary removal")
-    }
-
-    async fn fence_retirement_proof(
-        &self,
-        _retired: kuberic_runtime_internal::authority::RetiredAuthority,
-    ) -> Result<kuberic_runtime_internal::receipts::RetirementReceipt> {
-        panic!("registration tests do not fence retirement")
-    }
-
-    async fn complete_retirement_proof(
-        &self,
-        _retired: kuberic_runtime_internal::authority::RetiredAuthority,
-    ) -> Result<kuberic_runtime_internal::receipts::RetirementReceipt> {
-        panic!("registration tests do not complete retirement")
+        _action: RuntimeEffectAction,
+    ) -> Result<kuberic_runtime_internal::receipts::TopologyReceipt> {
+        panic!("registration tests do not apply native topology")
     }
 
     async fn register_peer_session_proof(
@@ -8225,10 +8145,7 @@ async fn cancelled_access_effect_rolls_back_projection_before_effect_acceptance(
 
     runtime.testing_resume_access_effect_acceptance();
     let accepted = runtime.apply_effect(access).await.unwrap();
-    assert!(matches!(
-        accepted.evidence.as_deref(),
-        Some(kuberic_runtime_internal::effects::RuntimeOperationEvidence::Access(_))
-    ));
+    assert!(accepted.topology_receipt.is_none());
     assert_eq!(accepted.postcondition.write_status, AccessStatus::Granted);
     assert!(runtime.testing_has_applied_effect(6).await);
     runtime
@@ -8794,7 +8711,7 @@ async fn stale_build_cleanup_does_not_cancel_same_id_retry_attempt() {
 }
 
 #[tokio::test]
-async fn aborted_post_claim_cleanup_retries_the_same_cancellation_owner() {
+async fn aborted_post_claim_cleanup_keeps_the_explicit_cancellation_owner() {
     let (runtime, control, _, peer) = blocked_lifecycle_fixture("cancel-claim-retry").await;
     let authority = runtime
         .authorize_build(
@@ -8846,14 +8763,10 @@ async fn aborted_post_claim_cleanup_retries_the_same_cancellation_owner() {
         .await
         .expect("cancellation must claim the attempt before native cleanup");
     first_cleanup.abort();
-    control.block_remove.store(true, Ordering::SeqCst);
     assert!(first_cleanup.await.unwrap_err().is_cancelled());
-    timeout(Duration::from_secs(1), control.remove_entered.notified())
-        .await
-        .expect("the dispatch guard must resume its claimed native cleanup");
     assert!(
         dispatch_lock.try_lock().is_err(),
-        "the production per-build lock must remain owned during Drop cleanup"
+        "the explicit cleanup transaction must retain the production per-build lock"
     );
     control.remove_released.notify_one();
     let _released = timeout(Duration::from_secs(1), dispatch_lock.lock())

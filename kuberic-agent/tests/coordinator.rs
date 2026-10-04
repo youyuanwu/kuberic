@@ -704,7 +704,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
         Ok(RuntimeEffectResult {
             operation_id: effect.operation_id,
             sequence: effect.sequence,
-            evidence: None,
+            topology_receipt: None,
             postcondition: state.clone(),
         })
     }
