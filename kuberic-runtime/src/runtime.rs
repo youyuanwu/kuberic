@@ -9,14 +9,15 @@ use futures::StreamExt;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaId,
     ReplicaIdentity, ReplicaRole, SecondaryRemovalPreparation, SecondaryRemovalStage,
-    SecondaryScaleDownCleanup,
+    SecondaryRemovalWitness, SecondaryScaleDownCleanup,
 };
 use kuberic_protocol::validation::{
     validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
 };
 use kuberic_runtime_internal::authority::RetiredAuthority;
 use kuberic_runtime_internal::receipts::{
-    AccessReceipt, BuildReceipt, CatchUpReceipt, NativeOperationToken, RemovalReceipt,
+    AccessReceipt, BuildReceipt, CatchUpReceipt, CertifiedPrefixReceipt, NativeOperationToken,
+    RemovalReceipt, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
 };
 use kuberic_runtime_internal::transport::{
     CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
@@ -3617,6 +3618,69 @@ impl DefaultReplicatorInner {
         self.changed.notify_waiters();
         Ok(())
     }
+
+    async fn certified_prefix_receipt(&self, settled_lsn: i64) -> Result<CertifiedPrefixReceipt> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let state = self.state.read().await;
+        let verified_lsn = state
+            .replication_progress
+            .as_ref()
+            .map_or(state.current_progress, |progress| progress.verified_lsn);
+        let committed_lsn = state.committed_lsn;
+        let authority = state.authority.clone();
+        drop(state);
+        Ok(CertifiedPrefixReceipt {
+            token: NativeOperationToken {
+                authority,
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
+            verified_lsn,
+            settled_lsn,
+            committed_lsn,
+        })
+    }
+
+    async fn secondary_removal_receipt(
+        &self,
+        witness: Option<SecondaryRemovalWitness>,
+    ) -> Result<SecondaryRemovalReceipt> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let state = self.state.read().await;
+        Ok(SecondaryRemovalReceipt {
+            token: NativeOperationToken {
+                authority: state.authority.clone(),
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
+            preparation: state.prepared_secondary_removal.clone(),
+            witness,
+            accepted: state.accepted_secondary_removal.clone(),
+        })
+    }
+
+    async fn prepare_switchover_with_token(
+        &self,
+        action: RuntimeEffectAction,
+    ) -> Result<NativeOperationToken> {
+        let _effect = self.effect_lock.lock().await;
+        self.check_aborted()?;
+        if self.state.read().await.retiring_authority.is_some() {
+            return Err(RuntimeError::Closed);
+        }
+        let token = NativeOperationToken {
+            authority: self.state.read().await.authority.clone(),
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+        };
+        self.execute_action(action).await?;
+        self.changed.notify_waiters();
+        Ok(token)
+    }
 }
 
 #[async_trait::async_trait]
@@ -3641,7 +3705,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn settle_primary_prefix(&self) -> Result<()> {
+    async fn settle_primary_prefix(&self) -> Result<CertifiedPrefixReceipt> {
         let _effect = self.effect_lock.lock().await;
         let _delivery = self.delivery_lock.lock().await;
         self.check_aborted()?;
@@ -3665,17 +3729,17 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         drop(state);
         let storage = self.storage().await?;
         let durable = storage.durable_progress().await?;
-        let verified_lsn = match (authority, progress) {
+        let verified_lsn = match (authority.as_ref(), progress.as_ref()) {
             (Some(authority), Some(progress)) => {
                 if authority.primary_identity() != &self.identity
                     || progress.fence != authority.fence()
-                    || self.replica_authority_store.load().await?.as_ref() != Some(&authority)
+                    || self.replica_authority_store.load().await?.as_ref() != Some(authority)
                     || self
                         .replication_progress_store
                         .load_replication_progress(&authority.fence())
                         .await?
                         .as_ref()
-                        != Some(&progress)
+                        != Some(progress)
                 {
                     return Err(RuntimeError::AuthorityMismatch(
                         "primary activation lacks durable authority-fenced progress".into(),
@@ -3708,7 +3772,16 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             .await
             .restore_committed_prefix(settled_lsn);
         self.state.write().await.committed_lsn = committed.committed_lsn;
-        Ok(())
+        Ok(CertifiedPrefixReceipt {
+            token: NativeOperationToken {
+                authority,
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
+            verified_lsn: verified_lsn.max(settled_lsn),
+            settled_lsn,
+            committed_lsn: committed.committed_lsn,
+        })
     }
 
     async fn cancel_configuration_work(&self) -> Result<()> {
@@ -3938,9 +4011,13 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             .await
     }
 
-    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()> {
+    async fn authorize_failover_prefix_proof(
+        &self,
+        boundary: Lsn,
+    ) -> Result<CertifiedPrefixReceipt> {
         self.execute_managed_proof_action(RuntimeEffectAction::AuthorizeFailoverPrefix(boundary))
-            .await
+            .await?;
+        self.certified_prefix_receipt(boundary).await
     }
 
     async fn prepare_switchover_proof(
@@ -3951,16 +4028,39 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         target: ReplicaIdentity,
         starting_configuration_id: kuberic_protocol::types::ConfigurationId,
         starting_epoch: Epoch,
-    ) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::PrepareSwitchover {
+    ) -> Result<SwitchoverReceipt> {
+        let receipt_request_id = request_id.clone();
+        let receipt_source = source.clone();
+        let receipt_target = target.clone();
+        let receipt_configuration_id = starting_configuration_id.clone();
+        let token = self
+            .prepare_switchover_with_token(RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            })
+            .await?;
+        let state = self.state.read().await;
+        let handoff_lsn = state
+            .replication_progress
+            .as_ref()
+            .map_or(state.current_progress, |progress| progress.verified_lsn)
+            .min(state.current_progress)
+            .max(state.committed_lsn);
+        Ok(SwitchoverReceipt {
+            token,
             preparation_generation,
-            request_id,
-            source,
-            target,
-            starting_configuration_id,
+            request_id: receipt_request_id,
+            source: receipt_source,
+            target: receipt_target,
+            starting_configuration_id: receipt_configuration_id,
             starting_epoch,
+            handoff_lsn,
+            committed_lsn: state.committed_lsn,
         })
-        .await
     }
 
     async fn prepare_secondary_removal_proof(
@@ -3968,71 +4068,91 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         intent: kuberic_protocol::types::SecondaryScaleDownIntent,
         process_session_id: ProcessSessionId,
         report_sequence: u64,
-    ) -> Result<kuberic_protocol::types::SecondaryRemovalPreparation> {
+    ) -> Result<SecondaryRemovalReceipt> {
         self.execute_managed_proof_action(RuntimeEffectAction::PrepareSecondaryRemoval {
             intent: Box::new(intent),
             process_session_id,
             report_sequence,
         })
         .await?;
-        self.snapshot()
-            .await
-            .prepared_secondary_removal
-            .ok_or(RuntimeError::AuthorityNotAdmitted)
+        self.secondary_removal_receipt(None).await
     }
 
     async fn observe_secondary_removal_proof(
         &self,
         witness: kuberic_protocol::types::SecondaryRemovalWitness,
-    ) -> Result<()> {
+    ) -> Result<SecondaryRemovalReceipt> {
+        let receipt_witness = witness.clone();
         self.execute_managed_proof_action(RuntimeEffectAction::ObserveSecondaryRemovalWitness(
             Box::new(witness),
         ))
-        .await
+        .await?;
+        self.secondary_removal_receipt(Some(receipt_witness)).await
     }
 
     async fn observe_secondary_removal_progress_proof(
         &self,
         witness: kuberic_protocol::types::SecondaryRemovalWitness,
         committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
+    ) -> Result<SecondaryRemovalReceipt> {
+        let receipt_witness = witness.clone();
         self.execute_managed_proof_action(RuntimeEffectAction::ObserveSecondaryRemovalProgress {
             witness: Box::new(witness),
             committed: Box::new(committed),
         })
-        .await
+        .await?;
+        self.secondary_removal_receipt(Some(receipt_witness)).await
     }
 
     async fn accept_secondary_removal_proof(
         &self,
         committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
+    ) -> Result<SecondaryRemovalReceipt> {
         self.execute_managed_proof_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(
             Box::new(committed),
         ))
-        .await
+        .await?;
+        self.secondary_removal_receipt(None).await
     }
 
     async fn accept_historical_secondary_removal_proof(
         &self,
         command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<()> {
+    ) -> Result<SecondaryRemovalReceipt> {
         self.execute_managed_proof_action(
             RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command)),
         )
-        .await
+        .await?;
+        self.secondary_removal_receipt(None).await
     }
 
-    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::FenceRetirement(Box::new(retired)))
-            .await
-    }
-
-    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()> {
-        self.execute_managed_proof_action(RuntimeEffectAction::CompleteRetirement(Box::new(
-            retired,
+    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<RetirementReceipt> {
+        self.execute_managed_proof_action(RuntimeEffectAction::FenceRetirement(Box::new(
+            retired.clone(),
         )))
-        .await
+        .await?;
+        Ok(RetirementReceipt {
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+            retired,
+            completed: false,
+        })
+    }
+
+    async fn complete_retirement_proof(
+        &self,
+        retired: RetiredAuthority,
+    ) -> Result<RetirementReceipt> {
+        self.execute_managed_proof_action(RuntimeEffectAction::CompleteRetirement(Box::new(
+            retired.clone(),
+        )))
+        .await?;
+        Ok(RetirementReceipt {
+            engine_session_id: self.session_id.clone(),
+            engine_generation: self.fence_generation.load(Ordering::Acquire),
+            retired,
+            completed: true,
+        })
     }
 
     async fn register_peer_session_proof(

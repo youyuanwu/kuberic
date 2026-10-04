@@ -16,11 +16,11 @@ use async_trait::async_trait;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
     PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
-    SecondaryRemovalPreparation, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
-    SecondaryScaleDownIntent,
+    SecondaryRemovalWitness, SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
 };
 use kuberic_runtime_internal::receipts::{
-    AccessReceipt, BuildReceipt, CatchUpReceipt, NativeOperationToken, RemovalReceipt,
+    AccessReceipt, BuildReceipt, CatchUpReceipt, CertifiedPrefixReceipt, NativeOperationToken,
+    RemovalReceipt, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
 };
 use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
 use tokio::sync::{Mutex, RwLock};
@@ -83,7 +83,7 @@ pub trait StateReplicator: Send + Sync {
 #[doc(hidden)]
 pub trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
-    async fn settle_primary_prefix(&self) -> Result<()>;
+    async fn settle_primary_prefix(&self) -> Result<CertifiedPrefixReceipt>;
     async fn cancel_configuration_work(&self) -> Result<()>;
     async fn prepare_access(
         &self,
@@ -100,7 +100,10 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     ) -> Result<BuildReceipt>;
     async fn removal_receipt(&self, replica_id: ReplicaId) -> Result<RemovalReceipt>;
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
-    async fn authorize_failover_prefix_proof(&self, boundary: Lsn) -> Result<()>;
+    async fn authorize_failover_prefix_proof(
+        &self,
+        boundary: Lsn,
+    ) -> Result<CertifiedPrefixReceipt>;
     async fn prepare_switchover_proof(
         &self,
         preparation_generation: u64,
@@ -109,30 +112,35 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
         target: ReplicaIdentity,
         starting_configuration_id: kuberic_protocol::types::ConfigurationId,
         starting_epoch: Epoch,
-    ) -> Result<()>;
+    ) -> Result<SwitchoverReceipt>;
     async fn prepare_secondary_removal_proof(
         &self,
         intent: SecondaryScaleDownIntent,
         process_session_id: ProcessSessionId,
         report_sequence: u64,
-    ) -> Result<SecondaryRemovalPreparation>;
-    async fn observe_secondary_removal_proof(&self, witness: SecondaryRemovalWitness)
-    -> Result<()>;
+    ) -> Result<SecondaryRemovalReceipt>;
+    async fn observe_secondary_removal_proof(
+        &self,
+        witness: SecondaryRemovalWitness,
+    ) -> Result<SecondaryRemovalReceipt>;
     async fn observe_secondary_removal_progress_proof(
         &self,
         witness: SecondaryRemovalWitness,
         committed: SecondaryScaleDownCleanup,
-    ) -> Result<()>;
+    ) -> Result<SecondaryRemovalReceipt>;
     async fn accept_secondary_removal_proof(
         &self,
         committed: SecondaryScaleDownCleanup,
-    ) -> Result<()>;
+    ) -> Result<SecondaryRemovalReceipt>;
     async fn accept_historical_secondary_removal_proof(
         &self,
         command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<()>;
-    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
-    async fn complete_retirement_proof(&self, retired: RetiredAuthority) -> Result<()>;
+    ) -> Result<SecondaryRemovalReceipt>;
+    async fn fence_retirement_proof(&self, retired: RetiredAuthority) -> Result<RetirementReceipt>;
+    async fn complete_retirement_proof(
+        &self,
+        retired: RetiredAuthority,
+    ) -> Result<RetirementReceipt>;
     async fn register_peer_session_proof(
         &self,
         identity: ReplicaIdentity,

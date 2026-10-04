@@ -3509,8 +3509,10 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn settle_primary_prefix(&self) -> Result<()> {
-        Ok(())
+    async fn settle_primary_prefix(
+        &self,
+    ) -> Result<kuberic_runtime_internal::receipts::CertifiedPrefixReceipt> {
+        panic!("registration tests do not settle certified prefixes")
     }
 
     async fn cancel_configuration_work(&self) -> Result<()> {
@@ -3561,8 +3563,11 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn authorize_failover_prefix_proof(&self, _boundary: i64) -> Result<()> {
-        Ok(())
+    async fn authorize_failover_prefix_proof(
+        &self,
+        _boundary: i64,
+    ) -> Result<kuberic_runtime_internal::receipts::CertifiedPrefixReceipt> {
+        panic!("registration tests do not authorize failover prefixes")
     }
 
     async fn prepare_switchover_proof(
@@ -3573,8 +3578,8 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         _target: ReplicaIdentity,
         _starting_configuration_id: kuberic_protocol::types::ConfigurationId,
         _starting_epoch: Epoch,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<kuberic_runtime_internal::receipts::SwitchoverReceipt> {
+        panic!("registration tests do not prepare switchover")
     }
 
     async fn prepare_secondary_removal_proof(
@@ -3582,60 +3587,52 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         intent: kuberic_protocol::types::SecondaryScaleDownIntent,
         process_session_id: ProcessSessionId,
         report_sequence: u64,
-    ) -> Result<kuberic_protocol::types::SecondaryRemovalPreparation> {
-        Ok(kuberic_protocol::types::SecondaryRemovalPreparation {
-            operation_id: intent.command_operation_id(
-                kuberic_protocol::types::SecondaryRemovalStage::Prepare,
-                &intent.primary,
-            ),
-            intent,
-            process_session_id,
-            report_sequence,
-            boundary_lsn: 0,
-        })
+    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
+        let _ = (intent, process_session_id, report_sequence);
+        panic!("registration tests do not prepare secondary removal")
     }
 
     async fn observe_secondary_removal_proof(
         &self,
         _witness: kuberic_protocol::types::SecondaryRemovalWitness,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
+        panic!("registration tests do not observe secondary removal")
     }
 
     async fn observe_secondary_removal_progress_proof(
         &self,
         _witness: kuberic_protocol::types::SecondaryRemovalWitness,
         _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
+        panic!("registration tests do not observe secondary-removal progress")
     }
 
     async fn accept_secondary_removal_proof(
         &self,
         _committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
+        panic!("registration tests do not accept secondary removal")
     }
 
     async fn accept_historical_secondary_removal_proof(
         &self,
         _command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<kuberic_runtime_internal::receipts::SecondaryRemovalReceipt> {
+        panic!("registration tests do not accept historical secondary removal")
     }
 
     async fn fence_retirement_proof(
         &self,
         _retired: kuberic_runtime_internal::authority::RetiredAuthority,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<kuberic_runtime_internal::receipts::RetirementReceipt> {
+        panic!("registration tests do not fence retirement")
     }
 
     async fn complete_retirement_proof(
         &self,
         _retired: kuberic_runtime_internal::authority::RetiredAuthority,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<kuberic_runtime_internal::receipts::RetirementReceipt> {
+        panic!("registration tests do not complete retirement")
     }
 
     async fn register_peer_session_proof(
@@ -7403,6 +7400,21 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         replication.contains("async fn next_outbound_item(&self) -> Option<OutboundOperation>")
             && !managed_lifecycle.contains("next_outbound"),
         "only the optional built-in data plane may expose replication/copy outbound polling"
+    );
+    assert!(
+        !lifecycle.contains("install_engine_removal_proof"),
+        "migrated topology completion must not restore a broad runtime snapshot"
+    );
+    let removal_completion = lifecycle
+        .split_once("async fn execute_removal_action")
+        .unwrap()
+        .1
+        .split_once("async fn execute_access")
+        .unwrap()
+        .0;
+    assert!(
+        !removal_completion.contains(".snapshot()"),
+        "secondary-removal and retirement completion must consume typed receipts"
     );
     assert!(
         hosting.contains("async fn execute_admitted_build")
