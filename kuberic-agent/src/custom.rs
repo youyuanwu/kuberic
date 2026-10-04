@@ -67,6 +67,7 @@ pub(super) struct AccessEffectTransaction {
 }
 
 struct BuildQueueAdmission {
+    generation: u64,
     decision: Option<oneshot::Sender<bool>>,
     completion: tokio::task::JoinHandle<()>,
 }
@@ -90,9 +91,14 @@ impl BuildQueueAdmission {
             }
         });
         Self {
+            generation,
             decision: Some(decision),
             completion,
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
     async fn finish(mut self, admitted: bool) {
@@ -663,9 +669,13 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        self.common.cancel_common_build(id).await?;
+        let generation = self.common.cancel_common_build(id).await?;
         self.accepted_builds.write().await.remove(id);
-        self.legacy.cancel_outbound_build(id).await
+        self.legacy.cancel_outbound_build(id).await?;
+        self.common
+            .complete_common_build_cancellation(id, generation)
+            .await;
+        Ok(())
     }
 
     async fn cancel_outbound_build_attempt(
@@ -2603,7 +2613,12 @@ impl CustomReplicatorHost {
         let Some(admission) = self.begin_build_attempt(&endpoint).await? else {
             return Ok(());
         };
-        let result = self.enqueue_outbound(OutboundOperation::Build(endpoint));
+        let result = {
+            let _gate = self.gate.lock().await;
+            self.ensure_build_generation(&endpoint.build_id, admission.generation())
+                .await?;
+            self.enqueue_outbound(OutboundOperation::Build(endpoint))
+        };
         admission.finish(result.is_ok()).await;
         result
     }
@@ -2612,8 +2627,15 @@ impl CustomReplicatorHost {
         let Some(admission) = self.begin_build_attempt(&endpoint).await? else {
             return Ok(());
         };
-        let result = self.enqueue_build_wait_inner(endpoint).await;
-        admission.finish(result.is_ok()).await;
+        let build_id = endpoint.build_id.clone();
+        let result = self
+            .enqueue_build_wait_inner(endpoint, admission.generation())
+            .await;
+        let current_generation = self.build_generation(&build_id).await;
+        let admission_generation = admission.generation();
+        admission
+            .finish(result.is_ok() || current_generation != admission_generation)
+            .await;
         result
     }
 
@@ -2621,6 +2643,15 @@ impl CustomReplicatorHost {
         &self,
         endpoint: &ReplicaEndpoint,
     ) -> Result<Option<BuildQueueAdmission>> {
+        let _gate = self.gate.lock().await;
+        if self
+            .cancelling_builds
+            .read()
+            .await
+            .contains_key(&endpoint.build_id)
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
         let mut pending = self.pending_builds.write().await;
         if let Some(existing) = pending.get(&endpoint.build_id) {
             if existing == endpoint {
@@ -2644,11 +2675,21 @@ impl CustomReplicatorHost {
         )))
     }
 
-    async fn enqueue_build_wait_inner(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+    async fn enqueue_build_wait_inner(
+        &self,
+        endpoint: ReplicaEndpoint,
+        generation: u64,
+    ) -> Result<()> {
+        let build_id = endpoint.build_id.clone();
         let mut operation = OutboundOperation::Build(endpoint);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(75);
         loop {
-            match self.outbound.try_send(operation) {
+            let send = {
+                let _gate = self.gate.lock().await;
+                self.ensure_build_generation(&build_id, generation).await?;
+                self.outbound.try_send(operation)
+            };
+            match send {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Full(returned)) => {
                     operation = returned;
@@ -3155,17 +3196,25 @@ impl CustomReplicatorHost {
         }
     }
 
-    async fn cancel_common_build(&self, id: &OperationId) -> Result<()> {
+    async fn cancel_common_build(&self, id: &OperationId) -> Result<u64> {
         let _gate = self.gate.lock().await;
         self.cancel_common_build_locked(id).await
     }
 
-    async fn cancel_common_build_locked(&self, id: &OperationId) -> Result<()> {
+    async fn cancel_common_build_locked(&self, id: &OperationId) -> Result<u64> {
+        if let Some(generation) = self.cancelling_builds.read().await.get(id).copied() {
+            return Ok(generation);
+        }
         let mut generations = self.build_generations.write().await;
         let generation = generations.entry(id.clone()).or_default();
+        let cancelled_generation = *generation;
         *generation = generation
             .checked_add(1)
             .ok_or(RuntimeError::OperationCancelled)?;
+        self.cancelling_builds
+            .write()
+            .await
+            .insert(id.clone(), cancelled_generation);
         drop(generations);
         self.pending_builds.write().await.remove(id);
         self.state
@@ -3174,8 +3223,7 @@ impl CustomReplicatorHost {
             .builds
             .retain(|b| &b.authority.build_id != id);
         self.changed.notify_waiters();
-        self.cancelling_builds.write().await.remove(id);
-        Ok(())
+        Ok(cancelled_generation)
     }
 
     async fn cancel_common_build_attempt(
@@ -3193,11 +3241,11 @@ impl CustomReplicatorHost {
         id: &OperationId,
         expected_generation: u64,
     ) -> Result<bool> {
-        if self.cancelling_builds.read().await.get(id) == Some(&expected_generation) {
-            return Ok(true);
-        }
         let mut generations = self.build_generations.write().await;
         let generation = generations.entry(id.clone()).or_default();
+        if self.cancelling_builds.read().await.get(id) == Some(&expected_generation) {
+            return Ok(*generation == expected_generation.saturating_add(1));
+        }
         if *generation != expected_generation {
             return Ok(false);
         }
@@ -3632,7 +3680,7 @@ impl CustomReplicatorHost {
     }
 
     pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        self.cancel_common_build(id).await?;
+        let generation = self.cancel_common_build(id).await?;
         if let Some(build) = self
             .host()?
             .default_dependencies
@@ -3643,6 +3691,8 @@ impl CustomReplicatorHost {
             self.primary.remove_replica(build.target.replica_id).await?;
         }
         self.configure().await?;
+        self.complete_common_build_cancellation(id, generation)
+            .await;
         Ok(())
     }
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
