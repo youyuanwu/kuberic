@@ -212,6 +212,17 @@ fn apply_progress_status(
     postcondition.catch_up_complete = progress.catch_up_complete;
 }
 
+fn cleanup_releases_claim(result: &Result<()>) -> bool {
+    result.is_ok()
+        || matches!(
+            result,
+            Err(RuntimeError::OperationCancelled
+                | RuntimeError::ReconfigurationPending
+                | RuntimeError::Closed
+                | RuntimeError::ReplicaRemoved(_))
+        )
+}
+
 type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>;
 
 #[async_trait]
@@ -291,7 +302,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         retired: kuberic_runtime_internal::authority::RetiredAuthority,
     ) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
-    async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()>;
+    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()>;
     async fn cancel_outbound_build_attempt(
         &self,
         id: &OperationId,
@@ -668,22 +679,8 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         snapshot
     }
 
-    async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        let generation = self.common.cancel_common_build(id).await?;
-        self.accepted_builds.write().await.remove(id);
-        self.legacy.cancel_outbound_build(id).await?;
-        self.common
-            .complete_common_build_cancellation(id, generation)
-            .await;
-        Ok(())
-    }
-
-    async fn cancel_outbound_build_attempt(
-        &self,
-        id: &OperationId,
-        generation: u64,
-        _public_cleanup: bool,
-    ) -> Result<()> {
+    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()> {
+        let _cleanup = self.common.build_cleanup_lock(id).await;
         if !self
             .common
             .cancel_common_build_attempt(id, generation)
@@ -692,11 +689,37 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             return Ok(());
         }
         self.accepted_builds.write().await.remove(id);
-        self.legacy.cancel_outbound_build(id).await?;
-        self.common
-            .complete_common_build_cancellation(id, generation)
-            .await;
-        Ok(())
+        let result = self.legacy.cancel_outbound_build(id).await;
+        if cleanup_releases_claim(&result) {
+            self.common
+                .complete_common_build_cancellation(id, generation)
+                .await;
+        }
+        result
+    }
+
+    async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        _public_cleanup: bool,
+    ) -> Result<()> {
+        let _cleanup = self.common.build_cleanup_lock(id).await;
+        if !self
+            .common
+            .cancel_common_build_attempt(id, generation)
+            .await?
+        {
+            return Ok(());
+        }
+        self.accepted_builds.write().await.remove(id);
+        let result = self.legacy.cancel_outbound_build(id).await;
+        if cleanup_releases_claim(&result) {
+            self.common
+                .complete_common_build_cancellation(id, generation)
+                .await;
+        }
+        result
     }
 
     async fn build_generation(&self, id: &OperationId) -> u64 {
@@ -1477,7 +1500,12 @@ impl ReplicatorLifecycleHost {
     }
 
     pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        self.backend.cancel_outbound_build(id).await
+        let generation = self.backend.build_generation(id).await;
+        let backend = self.backend.clone();
+        let id = id.clone();
+        tokio::spawn(async move { backend.cancel_outbound_build(&id, generation).await })
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
     }
 
     pub(super) async fn cancel_outbound_build_attempt(
@@ -1582,6 +1610,7 @@ pub(super) struct CustomReplicatorHost {
     retired_builds: RwLock<BTreeSet<OperationId>>,
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     cancelling_builds: RwLock<BTreeMap<OperationId, u64>>,
+    build_cleanup_locks: Mutex<BTreeMap<OperationId, Arc<Mutex<()>>>>,
     pending_builds: RwLock<BTreeMap<OperationId, ReplicaEndpoint>>,
     receipts: RwLock<BTreeMap<OperationId, BuildAdmission>>,
     configuration: Arc<RwLock<Option<ReplicaSetConfiguration>>>,
@@ -1629,6 +1658,7 @@ impl CustomReplicatorHost {
             retired_builds: RwLock::default(),
             build_generations: RwLock::default(),
             cancelling_builds: RwLock::default(),
+            build_cleanup_locks: Mutex::default(),
             pending_builds: RwLock::default(),
             receipts: RwLock::default(),
             configuration: Arc::new(RwLock::default()),
@@ -3196,36 +3226,6 @@ impl CustomReplicatorHost {
         }
     }
 
-    async fn cancel_common_build(&self, id: &OperationId) -> Result<u64> {
-        let _gate = self.gate.lock().await;
-        self.cancel_common_build_locked(id).await
-    }
-
-    async fn cancel_common_build_locked(&self, id: &OperationId) -> Result<u64> {
-        if let Some(generation) = self.cancelling_builds.read().await.get(id).copied() {
-            return Ok(generation);
-        }
-        let mut generations = self.build_generations.write().await;
-        let generation = generations.entry(id.clone()).or_default();
-        let cancelled_generation = *generation;
-        *generation = generation
-            .checked_add(1)
-            .ok_or(RuntimeError::OperationCancelled)?;
-        self.cancelling_builds
-            .write()
-            .await
-            .insert(id.clone(), cancelled_generation);
-        drop(generations);
-        self.pending_builds.write().await.remove(id);
-        self.state
-            .write()
-            .await
-            .builds
-            .retain(|b| &b.authority.build_id != id);
-        self.changed.notify_waiters();
-        Ok(cancelled_generation)
-    }
-
     async fn cancel_common_build_attempt(
         &self,
         id: &OperationId,
@@ -3281,6 +3281,17 @@ impl CustomReplicatorHost {
             .get(id)
             .copied()
             .unwrap_or_default()
+    }
+
+    async fn build_cleanup_lock(&self, id: &OperationId) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.build_cleanup_locks.lock().await;
+            locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 
     async fn ensure_build_generation(&self, id: &OperationId, generation: u64) -> Result<()> {
@@ -3679,21 +3690,33 @@ impl CustomReplicatorHost {
         snapshot.into()
     }
 
-    pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        let generation = self.cancel_common_build(id).await?;
-        if let Some(build) = self
-            .host()?
-            .default_dependencies
-            .build_authority_store
-            .load_build(id)
-            .await?
-        {
-            self.primary.remove_replica(build.target.replica_id).await?;
+    pub(super) async fn cancel_outbound_build(
+        &self,
+        id: &OperationId,
+        generation: u64,
+    ) -> Result<()> {
+        let _cleanup = self.build_cleanup_lock(id).await;
+        if !self.cancel_common_build_attempt(id, generation).await? {
+            return Ok(());
         }
-        self.configure().await?;
-        self.complete_common_build_cancellation(id, generation)
-            .await;
-        Ok(())
+        let result = async {
+            if let Some(build) = self
+                .host()?
+                .default_dependencies
+                .build_authority_store
+                .load_build(id)
+                .await?
+            {
+                self.primary.remove_replica(build.target.replica_id).await?;
+            }
+            self.configure().await
+        }
+        .await;
+        if cleanup_releases_claim(&result) {
+            self.complete_common_build_cancellation(id, generation)
+                .await;
+        }
+        result
     }
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
         loop {
@@ -3985,8 +4008,8 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::snapshot(self).await
     }
 
-    async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        CustomReplicatorHost::cancel_outbound_build(self, id).await
+    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()> {
+        CustomReplicatorHost::cancel_outbound_build(self, id, generation).await
     }
 
     async fn cancel_outbound_build_attempt(
@@ -3995,25 +4018,31 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         generation: u64,
         public_cleanup: bool,
     ) -> Result<()> {
+        let _cleanup = self.build_cleanup_lock(id).await;
         if !self.cancel_common_build_attempt(id, generation).await? {
             return Ok(());
         }
-        if public_cleanup {
-            let _gate = self.gate.lock().await;
-            if let Some(build) = self
-                .host()?
-                .default_dependencies
-                .build_authority_store
-                .load_build(id)
-                .await?
-            {
-                self.primary.remove_replica(build.target.replica_id).await?;
+        let result = async {
+            if public_cleanup {
+                let _gate = self.gate.lock().await;
+                if let Some(build) = self
+                    .host()?
+                    .default_dependencies
+                    .build_authority_store
+                    .load_build(id)
+                    .await?
+                {
+                    self.primary.remove_replica(build.target.replica_id).await?;
+                }
             }
+            self.configure().await
         }
-        self.configure().await?;
-        self.complete_common_build_cancellation(id, generation)
-            .await;
-        Ok(())
+        .await;
+        if cleanup_releases_claim(&result) {
+            self.complete_common_build_cancellation(id, generation)
+                .await;
+        }
+        result
     }
 
     async fn build_generation(&self, id: &OperationId) -> u64 {

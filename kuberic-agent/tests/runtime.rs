@@ -8953,6 +8953,85 @@ async fn claimed_custom_cleanup_blocks_retry_and_cannot_remove_its_successor() {
 }
 
 #[tokio::test]
+async fn session_fenced_custom_cleanup_releases_same_id_retry_admission() {
+    let (runtime, control, _, peer) = blocked_lifecycle_fixture("custom-cleanup-session").await;
+    let build_id = OperationId::new("custom-cleanup-session");
+    runtime
+        .authorize_build(build_id.clone(), peer.clone(), BuildConfiguration::Current)
+        .await
+        .unwrap();
+    let primary = runtime.primary_replicator().await.unwrap();
+    let first = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-cleanup-session".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+
+    control.block_configuration.store(true, Ordering::SeqCst);
+    let cancellation = {
+        let runtime = runtime.clone();
+        let build_id = build_id.clone();
+        tokio::spawn(async move { runtime.cancel_outbound_build(&build_id).await })
+    };
+    timeout(
+        Duration::from_secs(1),
+        control.configuration_entered.notified(),
+    )
+    .await
+    .unwrap();
+    let mut replacement = ReplicaInformation::new(
+        OperationId::default(),
+        peer.clone(),
+        "custom-cleanup-session-replacement".into(),
+    );
+    replacement.process_session_id = ProcessSessionId::new("custom-cleanup-session-replacement");
+    kuberic_agent::testing::describe_peer(&runtime, replacement)
+        .await
+        .unwrap();
+    control.configuration_released.notify_one();
+    assert!(cancellation.await.unwrap().is_err());
+    assert!(first.await.unwrap().is_err());
+
+    let retry = {
+        let primary = primary.clone();
+        let build_id = build_id.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            primary
+                .build_replica(ReplicaInformation::new(
+                    build_id,
+                    peer,
+                    "custom-cleanup-session-replacement".into(),
+                ))
+                .await
+        })
+    };
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound())
+            .await
+            .unwrap(),
+        Some(OutboundReplication::Build(endpoint)) if endpoint.build_id == build_id
+    ));
+    runtime.cancel_outbound_build(&build_id).await.unwrap();
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
 async fn aborted_post_claim_cleanup_keeps_the_explicit_cancellation_owner() {
     let (runtime, control, _, peer) = blocked_lifecycle_fixture("cancel-claim-retry").await;
     let authority = runtime
