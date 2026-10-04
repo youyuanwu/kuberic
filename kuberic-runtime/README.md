@@ -24,6 +24,13 @@ and write status, `CreateReplicator`, load reporting, and fault reporting.
 The agent owns the access and report source of truth rather than inferring it
 from the replica role.
 
+Successful public `PrimaryReplicator` catch-up, build, and ordinary removal
+completion is also the built-in engine's durable completion contract. The
+host-private capability does not expose duplicate receipts for those
+operations; it is limited to local write fencing/access preparation,
+pending-write recovery, committed-prefix reconciliation, exact topology
+durability, and narrow reporting/recovery observation.
+
 Service Open receives a `StatefulServicePartition` in its `OpenContext`.
 The service selects a `ReplicatorFactory` with `partition.with_factory(...)`,
 then calls `create_replicator(state_provider, settings)`. The result contains

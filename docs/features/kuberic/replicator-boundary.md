@@ -15,10 +15,11 @@ write journals, quorum commitment, copy progress, pending-write recovery,
 committed-prefix reconciliation, native topology evidence, and local write
 fencing.
 
-These responsibilities do not move when a standard operation needs native
-proof. The agent invokes the public operation first (or coordinates its one
-accepted build dispatch), validates the returned native receipt, then commits
-the common effect or access projection.
+These responsibilities do not move at a standard-operation boundary.
+Successful public catch-up, build, and ordinary removal completion is the
+built-in engine's durable completion contract. The agent validates that its
+authority, sessions, target, and attempt are still current, then commits the
+common effect; it does not fetch a second native receipt.
 
 ## Coherent interface bundle
 
@@ -45,32 +46,34 @@ agent-owned:
 - native copy progress alone is not host-accepted completion;
 - remove invokes the public primary before the common Remove dispatch.
 
-The private lifecycle contract contains proof, recovery, reconciliation,
-topology, and observation methods rather than duplicate standard commands.
+The private lifecycle contract contains local write fencing/access preparation,
+pending-write recovery, committed-prefix reconciliation, exact topology proof,
+and reporting/recovery observation rather than duplicate standard commands.
 
-## Typed receipts
+## Native topology receipts
 
-The internal receipt contracts cover catch-up, exact build completion, ordinary
-removal, access preparation/publication, certified-prefix settlement,
-switchover preparation, secondary removal, and retirement. Receipts bind the
-relevant authority, engine session/generation, operation/target, configuration,
-durable boundary, and completion state.
+Only Kuberic-specific topology operations retain private durable receipts:
+certified-prefix settlement, switchover preparation, secondary removal, and
+retirement. `TopologyReceipt` stores those canonical payloads directly in an
+effect result. There is no catch-up/build/removal receipt layer and no generic
+operation-evidence wrapper duplicating the same payload.
 
-The host revalidates receipts against current authority, process sessions,
-build attempt/configuration generations, and public operation inputs. Effect
-results retain compact operation evidence; topology evidence is serialized as
-narrow metadata so durable agent-state replay does not duplicate the complete
-native authority graph.
+The host revalidates topology receipts against the durable intent and current
+authority. Standard-operation staleness is validated from host admission plus
+the native topology fence captured around the public call.
 
 ## Access publication
 
 Native access admission does not itself grant application access. The host
 reserves one common projection generation, validates public progress, publishes
-native access, and atomically updates the common and external projection. A
-drop-safe rollback owner remains armed until the host accepts the result into
-its in-memory effect sequence. The adapter then persists applied/completed
-stages through the existing intent-first protocol; startup remains write-closed
-and reissues or reobserves an interrupted persistence boundary.
+native access, and atomically updates the common and external projection. An
+explicit access transaction owns native fencing and projection cleanup while it
+waits for host-memory effect acceptance. If the caller is cancelled, the
+already-running transaction observes the closed decision channel and performs
+rollback; no `Drop` implementation starts asynchronous correctness work. The
+adapter then persists applied/completed stages through the existing intent-
+first protocol; startup remains write-closed and reissues or reobserves an
+interrupted persistence boundary.
 
 Cancellation, publication failure, or configuration invalidation fences native
 writes and clears an unaccepted projection. Rollback is generation-scoped, so
@@ -79,8 +82,9 @@ with projection invalidation.
 
 ## Persistence, reporting, and recovery
 
-SQLite persists effect intent before execution and completion only after
-receipt metadata and the minimum lifecycle postcondition validate. Existing
+SQLite persists effect intent before execution and completion only after the
+canonical topology receipt, when present, and the lifecycle postcondition
+validate. Existing
 JSON fields remain backward-readable through serde defaults; this refactor does
 not introduce a database schema migration.
 
