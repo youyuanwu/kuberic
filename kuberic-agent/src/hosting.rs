@@ -1634,9 +1634,10 @@ impl RuntimeHost {
                 gate.release.notified().await;
             }
         }
-        if let Some(transaction) = access_commit.as_mut() {
-            transaction.accept().await?;
-        }
+        let access_progress = match access_commit.as_mut() {
+            Some(transaction) => transaction.accept().await?,
+            None => None,
+        };
         let lifecycle = self.lifecycle().ok();
         let topology_receipt = match lifecycle.as_ref() {
             Some(lifecycle) => lifecycle
@@ -1646,7 +1647,7 @@ impl RuntimeHost {
             None => None,
         };
         let postcondition = match lifecycle.as_ref() {
-            Some(lifecycle) => lifecycle.postcondition().await,
+            Some(lifecycle) => lifecycle.postcondition(access_progress.as_ref()).await,
             None => snapshot_postcondition(self.snapshot().await),
         };
         let result = RuntimeEffectResult {

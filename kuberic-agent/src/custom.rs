@@ -61,7 +61,7 @@ struct AcceptedBuild {
 
 pub(super) struct AccessEffectTransaction {
     accept: Option<oneshot::Sender<()>>,
-    accepted: Option<oneshot::Receiver<()>>,
+    accepted: Option<oneshot::Receiver<Option<NativeProgressStatus>>>,
     decision: Option<oneshot::Sender<bool>>,
     completion: tokio::task::JoinHandle<Result<()>>,
 }
@@ -72,17 +72,14 @@ pub(super) struct BuildCompletionConfirmation {
 }
 
 impl AccessEffectTransaction {
-    pub(super) async fn accept(&mut self) -> Result<()> {
+    pub(super) async fn accept(&mut self) -> Result<Option<NativeProgressStatus>> {
         if let Some(accept) = self.accept.take() {
             let _ = accept.send(());
         }
         let Some(accepted) = self.accepted.take() else {
             return Err(RuntimeError::OperationCancelled);
         };
-        if accepted.await.is_err() {
-            return Err(RuntimeError::OperationCancelled);
-        }
-        Ok(())
+        accepted.await.map_err(|_| RuntimeError::OperationCancelled)
     }
 
     pub(super) async fn commit(mut self) -> Result<()> {
@@ -207,7 +204,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         write: AccessStatus,
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
-        accepted: oneshot::Sender<()>,
+        accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<bool>,
     ) -> Result<()>;
     async fn wait_for_catch_up(&self) -> Result<()>;
@@ -283,7 +280,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         build_id: &OperationId,
         target: &ReplicaIdentity,
     ) -> Result<BuildCompletionConfirmation>;
-    async fn postcondition(&self) -> RuntimePostcondition;
+    async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition;
 }
 
 struct ManagedLifecycleBackend {
@@ -421,7 +418,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         write: AccessStatus,
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
-        accepted: oneshot::Sender<()>,
+        accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<bool>,
     ) -> Result<()> {
         self.execute_access_transaction(read, write, ready, accept, accepted, decision)
@@ -865,10 +862,15 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         })
     }
 
-    async fn postcondition(&self) -> RuntimePostcondition {
+    async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition {
         let mut postcondition = self.common.narrow_postcondition().await;
-        let progress = self.legacy.progress_status().await;
-        apply_progress_status(&mut postcondition, &progress);
+        match progress {
+            Some(progress) => apply_progress_status(&mut postcondition, progress),
+            None => {
+                let progress = self.legacy.progress_status().await;
+                apply_progress_status(&mut postcondition, &progress);
+            }
+        }
         postcondition
     }
 }
@@ -1069,21 +1071,33 @@ impl ManagedLifecycleBackend {
                 .await;
             return Err(error);
         }
-        validate_access_preparation(&preparation, &projection)?;
-        if let Err(error) = self.legacy.publish_access(preparation.clone()).await {
+        if let Err(error) = validate_access_preparation(&preparation, &projection) {
             self.common
                 .rollback_common_access_projection(&projection)
                 .await;
             return Err(error);
         }
+        let _commit = self.common.access_commit.lock().await;
+        if let Err(error) = self.common.validate_access_projection(&projection).await {
+            self.common
+                .rollback_common_access_projection_locked(&projection)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = self.legacy.publish_access(preparation.clone()).await {
+            self.common
+                .rollback_common_access_projection_locked(&projection)
+                .await;
+            return Err(error);
+        }
         if let Err(error) = self
             .common
-            .publish_access_projection(projection.clone())
+            .publish_access_projection_locked(projection.clone())
             .await
         {
             let _ = self.legacy.fence_writes().await;
             self.common
-                .rollback_common_access_projection(&projection)
+                .rollback_common_access_projection_locked(&projection)
                 .await;
             return Err(error);
         }
@@ -1119,7 +1133,7 @@ impl ManagedLifecycleBackend {
         write: AccessStatus,
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
-        accepted: oneshot::Sender<()>,
+        accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<bool>,
     ) -> Result<()> {
         let (projection, native_token) = self.publish_managed_access(read, write).await?;
@@ -1147,7 +1161,8 @@ impl ManagedLifecycleBackend {
                 return Err(error);
             }
         };
-        if accepted.send(()).is_err() {
+        let progress = native_guard.progress().clone();
+        if accepted.send(Some(progress)).is_err() {
             drop(native_guard);
             drop(common_guard);
             self.rollback_managed_access(&projection).await;
@@ -1500,8 +1515,11 @@ impl ReplicatorLifecycleHost {
             .await
     }
 
-    pub(super) async fn postcondition(&self) -> RuntimePostcondition {
-        self.backend.postcondition().await
+    pub(super) async fn postcondition(
+        &self,
+        progress: Option<&NativeProgressStatus>,
+    ) -> RuntimePostcondition {
+        self.backend.postcondition(progress).await
     }
 }
 
@@ -2123,6 +2141,10 @@ impl CustomReplicatorHost {
 
     async fn publish_access_projection(&self, projection: AccessProjection) -> Result<()> {
         let _commit = self.access_commit.lock().await;
+        self.publish_access_projection_locked(projection).await
+    }
+
+    async fn publish_access_projection_locked(&self, projection: AccessProjection) -> Result<()> {
         self.validate_access_projection(&projection).await?;
         let host = self.active_host()?;
         let configuration = self.published_configuration().await;
@@ -2187,7 +2209,7 @@ impl CustomReplicatorHost {
         write: AccessStatus,
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
-        accepted: oneshot::Sender<()>,
+        accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<bool>,
     ) -> Result<()> {
         let projection = self.publish_common_access(read, write).await?;
@@ -2204,7 +2226,7 @@ impl CustomReplicatorHost {
             self.rollback_common_access_projection(&projection).await;
             return Err(RuntimeError::OperationCancelled);
         }
-        if accepted.send(()).is_err() {
+        if accepted.send(None).is_err() {
             drop(guard);
             self.rollback_common_access_projection(&projection).await;
             return Err(RuntimeError::OperationCancelled);
@@ -3708,7 +3730,7 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         write: AccessStatus,
         ready: oneshot::Sender<()>,
         accept: oneshot::Receiver<()>,
-        accepted: oneshot::Sender<()>,
+        accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<bool>,
     ) -> Result<()> {
         self.execute_common_access_transaction(read, write, ready, accept, accepted, decision)
@@ -4033,7 +4055,10 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         })
     }
 
-    async fn postcondition(&self) -> RuntimePostcondition {
+    async fn postcondition(
+        &self,
+        _progress: Option<&NativeProgressStatus>,
+    ) -> RuntimePostcondition {
         self.narrow_postcondition().await
     }
 }
