@@ -19,7 +19,7 @@ use kuberic_protocol::types::{
 };
 use kuberic_runtime_internal::receipts::{
     AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
-    TopologyReceipt,
+    NativeTopologyStatus, TopologyReceipt,
 };
 use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -94,6 +94,7 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
     -> Result<ManagedFenceGuard>;
     async fn native_fence(&self) -> Result<NativeOperationToken>;
     async fn progress_status(&self) -> NativeProgressStatus;
+    async fn topology_status(&self) -> NativeTopologyStatus;
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()>;
     async fn apply_topology(&self, action: RuntimeEffectAction) -> Result<TopologyReceipt>;
     async fn register_peer_session_proof(

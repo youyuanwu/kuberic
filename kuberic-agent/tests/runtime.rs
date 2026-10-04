@@ -3551,6 +3551,10 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         panic!("registration tests do not request native progress")
     }
 
+    async fn topology_status(&self) -> kuberic_runtime_internal::receipts::NativeTopologyStatus {
+        panic!("registration tests do not request native topology status")
+    }
+
     async fn admit_authority_proof(&self, _authority: AdmittedAuthority) -> Result<()> {
         Ok(())
     }

@@ -21,7 +21,8 @@ use kuberic_runtime_internal::effects::{
 };
 use kuberic_runtime_internal::receipts::{
     AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
-    RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt, TopologyReceipt,
+    NativeTopologyStatus, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
+    TopologyReceipt,
 };
 use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
@@ -394,7 +395,8 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 
     async fn restore_authority(&self) -> Result<()> {
         self.legacy.restore_engine_proof().await?;
-        self.common.restore_authority().await
+        self.common.restore_authority().await?;
+        self.sync_topology_status().await
     }
 
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
@@ -405,7 +407,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.common.prepare_authority_admission(&authority).await?;
         self.legacy.admit_authority_proof(authority.clone()).await?;
         self.common.install_managed_authority(&authority).await?;
-        Ok(())
+        self.sync_topology_status().await
     }
 
     async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()> {
@@ -944,6 +946,12 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
 }
 
 impl ManagedLifecycleBackend {
+    async fn sync_topology_status(&self) -> Result<()> {
+        self.common
+            .install_topology_status(self.legacy.topology_status().await)
+            .await
+    }
+
     async fn engine_snapshot_for_host(&self) -> RuntimeSnapshot {
         let mut snapshot = self.legacy.snapshot().await;
         let accepted = self.accepted_builds.read().await.clone();
@@ -2355,6 +2363,14 @@ impl CustomReplicatorHost {
         state.current_progress = state.current_progress.max(progress);
         state.catch_up_boundary = Some(progress);
         state.catch_up_complete = true;
+        Ok(())
+    }
+
+    async fn install_topology_status(&self, status: NativeTopologyStatus) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.prepared_secondary_removal = status.prepared_secondary_removal;
+        state.accepted_secondary_removal = status.accepted_secondary_removal;
+        state.retired_authority = status.retired_authority;
         Ok(())
     }
 

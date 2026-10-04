@@ -27,6 +27,15 @@ pub struct NativeProgressStatus {
     pub catch_up_complete: bool,
 }
 
+/// Narrow native topology observation used to restore host reporting and
+/// access gating without mirroring a full runtime snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTopologyStatus {
+    pub prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
+    pub accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
+    pub retired_authority: Option<RetiredAuthority>,
+}
+
 /// Native access preparation. The exact value must be supplied back to the
 /// engine for publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

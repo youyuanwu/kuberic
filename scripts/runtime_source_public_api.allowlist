@@ -292,6 +292,7 @@ public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn retire_build_proof (& self , build_id : OperationId) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn settle_primary_prefix (& self) -> Result < CertifiedPrefixReceipt >
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn snapshot (& self) -> RuntimeSnapshot
+public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::async fn topology_status (& self) -> NativeTopologyStatus
 public-path hidden trait crate::replicator::ManagedReplicatorLifecycle::fn abort (& self)
 public-path hidden trait crate::replicator::PartitionAccessView: Send + Sync
 public-path hidden trait crate::replicator::PartitionAccessView::async fn read_status (& self) -> Result < AccessStatus >

@@ -17,7 +17,8 @@ use kuberic_protocol::validation::{
 use kuberic_runtime_internal::authority::RetiredAuthority;
 use kuberic_runtime_internal::receipts::{
     AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
-    RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt, TopologyReceipt,
+    NativeTopologyStatus, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
+    TopologyReceipt,
 };
 use kuberic_runtime_internal::transport::{
     CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
@@ -3910,6 +3911,15 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
     async fn progress_status(&self) -> NativeProgressStatus {
         let _effect = self.effect_lock.lock().await;
         self.progress_status_unlocked().await
+    }
+
+    async fn topology_status(&self) -> NativeTopologyStatus {
+        let state = self.state.read().await;
+        NativeTopologyStatus {
+            prepared_secondary_removal: state.prepared_secondary_removal.clone(),
+            accepted_secondary_removal: state.accepted_secondary_removal.clone(),
+            retired_authority: state.retired_authority.clone(),
+        }
     }
 
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()> {
