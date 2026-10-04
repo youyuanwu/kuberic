@@ -4065,13 +4065,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
-        let _effect = self.effect_lock.lock().await;
-        let _delivery = self.delivery_lock.lock().await;
-        self.check_aborted()?;
-        self.execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
-            .await?;
-        self.changed.notify_waiters();
-        Ok(())
+        self.execute_managed_proof_action(RuntimeEffectAction::RegisterPeerSession {
+            identity,
+            session,
+        })
+        .await
     }
 
     async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()> {

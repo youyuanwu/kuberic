@@ -8945,6 +8945,43 @@ async fn cancelled_old_access_transaction_cannot_fence_a_newer_grant() {
 }
 
 #[tokio::test]
+async fn cancelled_published_custom_grant_cannot_fence_a_newer_grant() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("published-custom-newer-grant").await;
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let old = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::SetAccessStatus {
+                        read: AccessStatus::Granted,
+                        write: AccessStatus::Granted,
+                    },
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), entered).await.unwrap();
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(control.native_access_granted.load(Ordering::SeqCst));
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    runtime.testing_resume_access_effect_acceptance();
+}
+
+#[tokio::test]
 async fn stale_fatal_progress_callback_cannot_abort_a_newer_access_grant() {
     let (runtime, control, _, _) = blocked_lifecycle_fixture("stale-fatal-access").await;
     control.block_progress.store(true, Ordering::SeqCst);

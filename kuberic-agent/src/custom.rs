@@ -176,6 +176,8 @@ impl AccessEffectTransaction {
 
 #[derive(Clone)]
 struct AccessProjection {
+    previous_read: AccessStatus,
+    previous_write: AccessStatus,
     read: AccessStatus,
     write: AccessStatus,
     authority: Option<AdmittedAuthority>,
@@ -493,12 +495,12 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                             .any(|member| member.identity == identity)
                     })
             };
+            let _access = self.common.access_commit.lock().await;
             if registered_engine_peer {
                 self.legacy
                     .register_peer_session_proof(identity.clone(), session.clone())
                     .await?;
             }
-            let _access = self.common.access_commit.lock().await;
             self.common
                 .validate_peer_session_replacement(&identity, &session)
                 .await?;
@@ -2230,6 +2232,10 @@ impl CustomReplicatorHost {
             (read, write)
         };
         let authority_before = self.state.read().await.authority.clone();
+        let (previous_read, previous_write) = {
+            let state = self.state.read().await;
+            (state.read_status, state.write_status)
+        };
         let configuration_before = self.published_configuration().await;
         let sessions_before = self.sessions.read().await.clone();
         let role_before = host.state.read().await.fallback_snapshot.role;
@@ -2274,6 +2280,8 @@ impl CustomReplicatorHost {
         // without an intervening await.
         let access_generation = self.advance_access_generation()?;
         Ok(AccessProjection {
+            previous_read,
+            previous_write,
             read,
             write,
             authority: authority_before,
@@ -2390,11 +2398,19 @@ impl CustomReplicatorHost {
         projection: AccessProjection,
     ) -> Result<AccessProjection> {
         if let Err(error) = self.complete_access_projection(&projection).await {
-            self.cleanup_failed_access_projection(&projection).await;
+            self.cleanup_failed_access_projection(
+                &projection,
+                matches!(error, RuntimeError::OperationCancelled),
+            )
+            .await;
             return Err(error);
         }
         if let Err(error) = self.publish_access_projection(projection.clone()).await {
-            self.cleanup_failed_access_projection(&projection).await;
+            self.cleanup_failed_access_projection(
+                &projection,
+                matches!(error, RuntimeError::OperationCancelled),
+            )
+            .await;
             return Err(error);
         }
         Ok(projection)
@@ -2456,8 +2472,16 @@ impl CustomReplicatorHost {
 
     async fn rollback_common_access_projection(&self, projection: &AccessProjection) {
         let _commit = self.access_commit.lock().await;
+        let owns_publication = self.published_access_generation.load(Ordering::Acquire)
+            <= projection.access_generation;
         self.rollback_common_access_projection_locked(projection)
             .await;
+        if owns_publication
+            && projection.previous_read != AccessStatus::Granted
+            && projection.previous_write != AccessStatus::Granted
+        {
+            let _ = self.close_custom_native_access(true).await;
+        }
     }
 
     async fn release_access_reservation(&self, projection: &AccessProjection) {
@@ -2483,7 +2507,11 @@ impl CustomReplicatorHost {
         }
         self.rollback_common_access_projection_locked(projection)
             .await;
-        let _ = self.close_custom_native_access(false).await;
+        if projection.previous_read != AccessStatus::Granted
+            && projection.previous_write != AccessStatus::Granted
+        {
+            let _ = self.close_custom_native_access(true).await;
+        }
     }
 
     async fn rollback_published_common_access(&self, projection: &AccessProjection) {
@@ -2492,7 +2520,11 @@ impl CustomReplicatorHost {
             .await;
     }
 
-    async fn cleanup_failed_access_projection(&self, projection: &AccessProjection) {
+    async fn cleanup_failed_access_projection(
+        &self,
+        projection: &AccessProjection,
+        preserve_existing: bool,
+    ) {
         let _commit = self.access_commit.lock().await;
         let access_generation = self.access_generation.load(Ordering::Acquire);
         let published_generation = self.published_access_generation.load(Ordering::Acquire);
@@ -2512,9 +2544,19 @@ impl CustomReplicatorHost {
             let _ = self.close_custom_native_access(false).await;
             return;
         }
-        self.rollback_common_access_projection_locked(projection)
-            .await;
-        let _ = self.close_custom_native_access(false).await;
+        if access_generation == projection.access_generation
+            && published_generation < projection.access_generation
+        {
+            if preserve_existing {
+                self.access_generation.store(
+                    projection.access_generation.saturating_add(1),
+                    Ordering::Release,
+                );
+            } else {
+                self.rollback_common_access_projection_locked(projection)
+                    .await;
+            }
+        }
     }
 
     async fn rollback_published_common_access_locked(&self, projection: &AccessProjection) {
