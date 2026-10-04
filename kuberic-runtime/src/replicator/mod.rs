@@ -120,13 +120,19 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
 #[doc(hidden)]
 pub struct ManagedFenceGuard {
     _delivery: OwnedMutexGuard<()>,
+    progress: NativeProgressStatus,
 }
 
 impl ManagedFenceGuard {
-    pub(crate) fn new(delivery: OwnedMutexGuard<()>) -> Self {
+    pub(crate) fn new(delivery: OwnedMutexGuard<()>, progress: NativeProgressStatus) -> Self {
         Self {
             _delivery: delivery,
+            progress,
         }
+    }
+
+    pub fn progress(&self) -> &NativeProgressStatus {
+        &self.progress
     }
 }
 

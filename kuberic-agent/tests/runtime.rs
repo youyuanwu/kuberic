@@ -8159,6 +8159,58 @@ async fn cancelled_access_effect_rolls_back_projection_before_effect_acceptance(
 }
 
 #[tokio::test]
+async fn cancelled_old_access_transaction_cannot_fence_a_newer_grant() {
+    let primary = identity(1, "access-newer-grant-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application, vec![primary], "access-newer-grant-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let old = tokio::spawn(async move {
+        task_runtime
+            .apply_effect(effect(
+                6,
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::Granted,
+                },
+            ))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("newer-access-write"),
+            data: Bytes::from_static(b"newer-grant-remains-live"),
+        })
+        .await
+        .unwrap();
+    runtime.testing_resume_access_effect_acceptance();
+}
+
+#[tokio::test]
 async fn configuration_invalidation_rejects_gated_access_effect() {
     let primary = identity(1, "access-invalidation-primary");
     let application = Arc::new(TestApplication::default());

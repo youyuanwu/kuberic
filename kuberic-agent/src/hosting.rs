@@ -1791,7 +1791,7 @@ impl RuntimeHost {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
             topology_receipt: None,
-            postcondition: lifecycle.postcondition().await,
+            postcondition: confirmation.postcondition.clone(),
         };
         self.state.write().await.effects.insert(
             result.sequence,

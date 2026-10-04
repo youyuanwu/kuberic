@@ -57,6 +57,7 @@ public-path documented field crate::replicator::ReplicatorSettings::replication_
 public-path documented field crate::replicator::stream::StreamOperation::data: Bytes
 public-path documented field crate::replicator::stream::StreamOperation::metadata: OperationMetadata
 public-path documented impl crate::replicator::DefaultReplicatorFactory::fn new (storage : Arc < dyn DurableState >) -> Self
+public-path documented impl crate::replicator::ManagedFenceGuard::fn progress (& self) -> & NativeProgressStatus
 public-path documented impl crate::replicator::ReplicaInformation::fn new (build_id : OperationId , identity : ReplicaIdentity , replication_address : String ,) -> Self
 public-path documented impl crate::replicator::ReplicatorAttachment::fn identity (& self , _token : RuntimeHostToken) -> ReplicatorCreationIdentity
 public-path documented impl crate::replicator::ReplicatorAttachment::fn managed_data_plane (& self , _token : RuntimeHostToken ,) -> Option < Arc < dyn ManagedReplicatorDataPlane > >

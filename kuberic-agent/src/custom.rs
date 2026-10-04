@@ -20,8 +20,8 @@ use kuberic_runtime_internal::effects::{
     BuildPostcondition, RuntimeEffectAction, RuntimePostcondition, RuntimeSnapshot,
 };
 use kuberic_runtime_internal::receipts::{
-    AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, RetirementReceipt,
-    SecondaryRemovalReceipt, SwitchoverReceipt, TopologyReceipt,
+    AccessPreparation, CertifiedPrefixReceipt, NativeOperationToken, NativeProgressStatus,
+    RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt, TopologyReceipt,
 };
 use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
@@ -67,6 +67,7 @@ pub(super) struct AccessEffectTransaction {
 }
 
 pub(super) struct BuildCompletionConfirmation {
+    pub(super) postcondition: RuntimePostcondition,
     _native: Option<ManagedFenceGuard>,
 }
 
@@ -163,6 +164,19 @@ fn validate_retirement_receipt(
     Ok(())
 }
 
+fn apply_progress_status(
+    postcondition: &mut RuntimePostcondition,
+    progress: &NativeProgressStatus,
+) {
+    postcondition.current_progress = progress.current_progress;
+    postcondition.verified_replication_lsn = progress.verified_replication_lsn;
+    postcondition.committed_lsn = progress.committed_lsn;
+    postcondition.current_configuration_quorum_progress =
+        progress.current_configuration_quorum_progress;
+    postcondition.catch_up_boundary = progress.catch_up_boundary;
+    postcondition.catch_up_complete = progress.catch_up_complete;
+}
+
 type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>;
 
 #[async_trait]
@@ -178,7 +192,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
-    async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
+    async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus);
     async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()>;
     async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()>;
     async fn register_peer_session(
@@ -187,7 +201,6 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         session: ProcessSessionId,
     ) -> Result<()>;
     async fn retire_build(&self, build_id: OperationId) -> Result<()>;
-    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
     async fn run_access_transaction(
         &self,
         read: AccessStatus,
@@ -210,6 +223,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     ) -> Result<()>;
     async fn refresh_progress(&self) -> Result<()>;
     async fn observe_progress(&self) -> Result<()>;
+    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)>;
     async fn prepare_secondary_removal(
         &self,
         intent: kuberic_protocol::types::SecondaryScaleDownIntent,
@@ -337,14 +351,8 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.common.restore_authority().await
     }
 
-    async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        match self.execute_access_once(read, write).await {
-            Err(RuntimeError::ReconfigurationPending) => {
-                *self.common.restored_access.write().await = Some((read, write));
-                Err(RuntimeError::ReconfigurationPending)
-            }
-            result => result,
-        }
+    async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+        *self.common.restored_access.write().await = Some((read, write));
     }
 
     async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
@@ -405,10 +413,6 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.legacy.retire_build_proof(build_id.clone()).await?;
         self.common.retire_managed_build(build_id).await?;
         Ok(())
-    }
-
-    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        self.execute_access_once(read, write).await
     }
 
     async fn run_access_transaction(
@@ -528,7 +532,11 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     }
 
     async fn observe_progress(&self) -> Result<()> {
-        self.common.retry_restored_access().await
+        Ok(())
+    }
+
+    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
+        *self.common.restored_access.read().await
     }
 
     async fn prepare_secondary_removal(
@@ -758,6 +766,9 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             .native_token
             .as_ref()
             .ok_or(RuntimeError::OperationCancelled)?;
+        self.legacy
+            .detach_outbound_build_stream(&receipt.selection.authority.build_id)
+            .await?;
         let _native = self.legacy.lock_native_fence(expected_native).await?;
         self.common.active_host()?;
         let _gate = self.common.gate.lock().await;
@@ -769,9 +780,6 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         {
             return Err(RuntimeError::OperationCancelled);
         }
-        self.legacy
-            .detach_outbound_build_stream(&receipt.selection.authority.build_id)
-            .await?;
         self.common.accept_managed_build(&receipt).await?;
         self.accepted_builds.write().await.insert(
             receipt.selection.authority.build_id.clone(),
@@ -849,7 +857,10 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
+        let mut postcondition = self.common.narrow_postcondition().await;
+        apply_progress_status(&mut postcondition, native_guard.progress());
         Ok(BuildCompletionConfirmation {
+            postcondition,
             _native: Some(native_guard),
         })
     }
@@ -857,13 +868,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
     async fn postcondition(&self) -> RuntimePostcondition {
         let mut postcondition = self.common.narrow_postcondition().await;
         let progress = self.legacy.progress_status().await;
-        postcondition.current_progress = progress.current_progress;
-        postcondition.verified_replication_lsn = progress.verified_replication_lsn;
-        postcondition.committed_lsn = progress.committed_lsn;
-        postcondition.current_configuration_quorum_progress =
-            progress.current_configuration_quorum_progress;
-        postcondition.catch_up_boundary = progress.catch_up_boundary;
-        postcondition.catch_up_complete = progress.catch_up_complete;
+        apply_progress_status(&mut postcondition, &progress);
         postcondition
     }
 }
@@ -1093,14 +1098,19 @@ impl ManagedLifecycleBackend {
     }
 
     async fn rollback_managed_access(&self, projection: &AccessProjection) {
+        let _commit = self.common.access_commit.lock().await;
+        if self
+            .common
+            .published_access_generation
+            .load(Ordering::Acquire)
+            > projection.access_generation
+        {
+            return;
+        }
         let _ = self.legacy.fence_writes().await;
         self.common
-            .rollback_common_access_projection(projection)
+            .rollback_common_access_projection_locked(projection)
             .await;
-    }
-
-    async fn execute_access_once(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        self.publish_managed_access(read, write).await.map(|_| ())
     }
 
     async fn execute_access_transaction(
@@ -1231,7 +1241,13 @@ impl ReplicatorLifecycleHost {
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<()> {
-        self.backend.restore_access(read, write).await
+        match self.commit_access_transaction(read, write).await {
+            Err(RuntimeError::ReconfigurationPending) => {
+                self.backend.defer_restored_access(read, write).await;
+                Err(RuntimeError::ReconfigurationPending)
+            }
+            result => result,
+        }
     }
 
     pub(super) async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
@@ -1255,7 +1271,17 @@ impl ReplicatorLifecycleHost {
     }
 
     pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        self.backend.set_access(read, write).await
+        self.commit_access_transaction(read, write).await
+    }
+
+    async fn commit_access_transaction(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        let mut transaction = self.begin_access_effect(read, write).await?;
+        transaction.accept().await?;
+        transaction.commit().await
     }
 
     pub(super) async fn begin_access_effect(
@@ -1321,7 +1347,11 @@ impl ReplicatorLifecycleHost {
     }
 
     pub(super) async fn observe_progress(&self) -> Result<()> {
-        self.backend.observe_progress().await
+        self.backend.observe_progress().await?;
+        if let Some((read, write)) = self.backend.restored_access().await {
+            self.commit_access_transaction(read, write).await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn prepare_secondary_removal(
@@ -2191,6 +2221,11 @@ impl CustomReplicatorHost {
 
     async fn rollback_common_access_projection(&self, projection: &AccessProjection) {
         let _commit = self.access_commit.lock().await;
+        self.rollback_common_access_projection_locked(projection)
+            .await;
+    }
+
+    async fn rollback_common_access_projection_locked(&self, projection: &AccessProjection) {
         if self.published_access_generation.load(Ordering::Acquire) > projection.access_generation {
             return;
         }
@@ -2422,10 +2457,6 @@ impl CustomReplicatorHost {
                 .is_some()
         {
             self.configure().await?;
-        }
-        let restored = *self.restored_access.read().await;
-        if let Some((read, write)) = restored {
-            self.try_restore_access(read, write).await?;
         }
         let incoming = match host
             .default_dependencies
@@ -3138,33 +3169,6 @@ impl CustomReplicatorHost {
 }
 
 impl CustomReplicatorHost {
-    pub(super) async fn restore_access(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-    ) -> Result<()> {
-        let _gate = self.gate.lock().await;
-        self.try_restore_access(read, write).await
-    }
-
-    async fn try_restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        let result = self.set_access(read, write).await;
-        if matches!(result, Err(RuntimeError::ReconfigurationPending)) {
-            // Retain the durable intent, not a successful effect receipt. Progress
-            // reconciliation retries it until discovery/application readiness converge.
-            *self.restored_access.write().await = Some((read, write));
-        }
-        result
-    }
-
-    async fn retry_restored_access(&self) -> Result<()> {
-        let restored = *self.restored_access.read().await;
-        if let Some((read, write)) = restored {
-            self.try_restore_access(read, write).await?;
-        }
-        Ok(())
-    }
-
     pub(super) async fn complete_open(&self, address: String) -> Result<()> {
         self.complete_open_common(address).await;
         Ok(())
@@ -3661,8 +3665,8 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::restore_authority(self).await
     }
 
-    async fn restore_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        CustomReplicatorHost::restore_access(self, read, write).await
+    async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+        *self.restored_access.write().await = Some((read, write));
     }
 
     async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
@@ -3696,10 +3700,6 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     async fn retire_build(&self, build_id: OperationId) -> Result<()> {
         CustomReplicatorHost::apply_common_action(self, RuntimeEffectAction::RetireBuild(build_id))
             .await
-    }
-
-    async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        CustomReplicatorHost::set_access(self, read, write).await
     }
 
     async fn run_access_transaction(
@@ -3773,6 +3773,10 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
             return Ok(());
         }
         result
+    }
+
+    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
+        *self.restored_access.read().await
     }
 
     async fn prepare_secondary_removal(
@@ -4023,7 +4027,10 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        Ok(BuildCompletionConfirmation { _native: None })
+        Ok(BuildCompletionConfirmation {
+            postcondition: self.narrow_postcondition().await,
+            _native: None,
+        })
     }
 
     async fn postcondition(&self) -> RuntimePostcondition {
@@ -4041,330 +4048,6 @@ fn preserves_same_primary_scale_up_access(
     ) && existing.primary_identity() == next.primary_identity()
         && next.local_identity == *next.primary_identity()
         && existing.local_identity == next.local_identity
-}
-
-#[cfg(any())]
-#[allow(clippy::items_after_test_module)]
-mod receipt_validation_tests {
-    use super::*;
-    use kuberic_protocol::types::{
-        AgentGeneration, BuildAuthorityKind, ConfigurationMember, Epoch, ReplicaId,
-        ReplicaInstanceId, ReplicaRole,
-    };
-    use kuberic_runtime_internal::authority::{BuildSelection, DurableBuildProgress};
-    use std::sync::atomic::AtomicUsize;
-
-    fn identity(id: i64, instance: &str) -> ReplicaIdentity {
-        ReplicaIdentity {
-            replica_id: ReplicaId::new(id),
-            instance_id: ReplicaInstanceId::new(instance),
-            agent_generation: AgentGeneration::new(format!("generation-{instance}")),
-        }
-    }
-
-    fn authority() -> AdmittedAuthority {
-        let primary = identity(1, "primary");
-        let secondary = identity(2, "secondary");
-        AdmittedAuthority {
-            local_identity: primary.clone(),
-            transition_kind: None,
-            previous_configuration: None,
-            current_configuration: ConfigurationDescriptor::new(
-                Epoch::new(0, 1),
-                primary.replica_id,
-                vec![
-                    ConfigurationMember {
-                        identity: primary,
-                        role: ReplicaRole::Primary,
-                    },
-                    ConfigurationMember {
-                        identity: secondary,
-                        role: ReplicaRole::ActiveSecondary,
-                    },
-                ],
-                2,
-            ),
-            switchover_handoff: None,
-            secondary_removal: None,
-            scale_up: None,
-        }
-    }
-
-    fn token(authority: &AdmittedAuthority) -> NativeOperationToken {
-        NativeOperationToken {
-            authority: Some(authority.clone()),
-            engine_session_id: "engine-session".into(),
-            engine_generation: 7,
-        }
-    }
-
-    struct TestFence {
-        calls: AtomicUsize,
-        notified: Notify,
-    }
-
-    #[async_trait]
-    impl AccessRollbackFence for TestFence {
-        async fn fence_writes(&self) {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            self.notified.notify_waiters();
-        }
-
-        async fn lock_acceptance(
-            &self,
-            _expected: &NativeOperationToken,
-        ) -> Result<Option<ManagedAccessAcceptance>> {
-            Ok(None)
-        }
-
-        fn abort(&self) {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            self.notified.notify_waiters();
-        }
-    }
-
-    type RollbackFixture = (
-        AccessPublicationRollback,
-        Arc<TestFence>,
-        Arc<RwLock<RuntimeSnapshot>>,
-        Arc<AtomicU64>,
-        Arc<Mutex<()>>,
-    );
-
-    fn rollback_fixture(generation: u64) -> RollbackFixture {
-        let fence = Arc::new(TestFence {
-            calls: AtomicUsize::new(0),
-            notified: Notify::new(),
-        });
-        let mut snapshot = empty_snapshot(identity(1, "primary"));
-        snapshot.read_status = AccessStatus::Granted;
-        snapshot.write_status = AccessStatus::Granted;
-        let state = Arc::new(RwLock::new(snapshot));
-        let access_generation = Arc::new(AtomicU64::new(generation));
-        let published_access_generation = Arc::new(AtomicU64::new(generation));
-        let access_commit = Arc::new(Mutex::new(()));
-        (
-            AccessPublicationRollback {
-                fence: fence.clone(),
-                host: Weak::new(),
-                common_state: state.clone(),
-                access_generation: access_generation.clone(),
-                published_access_generation,
-                access_commit: access_commit.clone(),
-                generation,
-                native_token: None,
-                armed: true,
-            },
-            fence,
-            state,
-            access_generation,
-            access_commit,
-        )
-    }
-
-    #[test]
-    fn access_publication_requires_the_exact_preparation_receipt() {
-        let authority = authority();
-        let projection = AccessProjection {
-            read: AccessStatus::Granted,
-            write: AccessStatus::Granted,
-            authority: Some(authority.clone()),
-            configuration: None,
-            sessions: BTreeMap::new(),
-            role: ReplicaRole::Primary,
-            configuration_generation: 11,
-            access_generation: 13,
-            faulted_grant: false,
-        };
-        let preparation = AccessReceipt {
-            authority: Some(authority),
-            engine_session_id: "engine-session".into(),
-            engine_generation: 7,
-            read: AccessStatus::Granted,
-            write: AccessStatus::Granted,
-            current_progress: 19,
-            committed_lsn: 17,
-            published: false,
-        };
-        let publication = AccessReceipt {
-            published: true,
-            ..preparation.clone()
-        };
-        validate_access_receipt(&preparation, &publication, &projection, true).unwrap();
-
-        let mut stale = publication.clone();
-        stale.engine_session_id = "other-session".into();
-        assert!(validate_access_receipt(&preparation, &stale, &projection, true).is_err());
-        let mut stale = publication.clone();
-        stale.engine_generation += 1;
-        assert!(validate_access_receipt(&preparation, &stale, &projection, true).is_err());
-        let mut stale = publication;
-        stale.committed_lsn -= 1;
-        assert!(validate_access_receipt(&preparation, &stale, &projection, true).is_err());
-    }
-
-    #[test]
-    fn standard_receipts_reject_stale_native_tokens_and_targets() {
-        let authority = authority();
-        let token = token(&authority);
-        let catch_up = CatchUpReceipt {
-            authority: authority.clone(),
-            engine_session_id: token.engine_session_id.clone(),
-            engine_generation: token.engine_generation,
-            boundary_lsn: 8,
-            current_progress: 8,
-            committed_lsn: 8,
-            current_configuration_quorum_progress: 8,
-        };
-        validate_catch_up_receipt(&catch_up, &token, Some(&authority), 8).unwrap();
-        let mut stale_token = token.clone();
-        stale_token.engine_generation += 1;
-        assert!(validate_catch_up_receipt(&catch_up, &stale_token, Some(&authority), 8).is_err());
-        let mut stale_catch_up = catch_up.clone();
-        stale_catch_up.authority.current_configuration.epoch = Epoch::new(0, 2);
-        assert!(validate_catch_up_receipt(&stale_catch_up, &token, Some(&authority), 8).is_err());
-
-        let target = identity(3, "idle");
-        let build_authority = BuildAuthority {
-            build_id: OperationId::new("build"),
-            kind: BuildAuthorityKind::Provisioning,
-            source: authority.local_identity.clone(),
-            target: target.clone(),
-            current_configuration: authority.current_configuration.clone(),
-            replication_boundary_lsn: 8,
-        };
-        let selection = BuildSelection {
-            authority: build_authority.clone(),
-            generation: 3,
-        };
-        let admission = BuildAdmission {
-            selection: selection.clone(),
-            source_session: ProcessSessionId::default(),
-            target_session: ProcessSessionId::default(),
-            attempt_generation: 5,
-            configuration_generation: 11,
-            native_token: Some(token.clone()),
-        };
-        let native = NativeBuildReceipt {
-            selection,
-            progress: DurableBuildProgress {
-                authority: build_authority,
-                last_sequence: 1,
-                durable_lsn: 8,
-                completed: true,
-                catch_up_boundary_lsn: Some(8),
-            },
-            engine_session_id: token.engine_session_id.clone(),
-            engine_generation: token.engine_generation,
-        };
-        validate_build_receipt(&native, &admission).unwrap();
-        let mut current_admission = admission.clone();
-        current_admission.native_token = None;
-        assert!(current_admission.matches_host_admission(&admission));
-        let mut stale_admission = current_admission.clone();
-        stale_admission.source_session = ProcessSessionId::new("stale-source");
-        assert!(!stale_admission.matches_host_admission(&admission));
-        let mut stale_admission = current_admission.clone();
-        stale_admission.target_session = ProcessSessionId::new("stale-target");
-        assert!(!stale_admission.matches_host_admission(&admission));
-        let mut stale_admission = current_admission.clone();
-        stale_admission.attempt_generation += 1;
-        assert!(!stale_admission.matches_host_admission(&admission));
-        let mut stale_admission = current_admission.clone();
-        stale_admission.configuration_generation += 1;
-        assert!(!stale_admission.matches_host_admission(&admission));
-        let mut stale_admission = current_admission;
-        stale_admission.selection.generation += 1;
-        assert!(!stale_admission.matches_host_admission(&admission));
-        let mut stale_native = native;
-        stale_native.engine_generation += 1;
-        assert!(validate_build_receipt(&stale_native, &admission).is_err());
-
-        let removal = RemovalReceipt {
-            authority: authority.clone(),
-            replica_id: target.replica_id,
-            retired_build_ids: vec![OperationId::new("build")],
-            engine_session_id: token.engine_session_id.clone(),
-            engine_generation: token.engine_generation,
-        };
-        validate_removal_receipt(&removal, &token, Some(&authority), target.replica_id).unwrap();
-        assert!(
-            validate_removal_receipt(&removal, &token, Some(&authority), ReplicaId::new(99),)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn topology_receipts_reject_stale_engine_identity_and_generation() {
-        let authority = authority();
-        let token = token(&authority);
-        let prefix = CertifiedPrefixReceipt {
-            token: token.clone(),
-            verified_lsn: 9,
-            settled_lsn: 8,
-            committed_lsn: 8,
-        };
-        validate_certified_prefix_receipt(&prefix, &token).unwrap();
-        let mut stale = token.clone();
-        stale.engine_session_id = "restarted-engine".into();
-        assert!(validate_certified_prefix_receipt(&prefix, &stale).is_err());
-        let mut stale = token.clone();
-        stale.engine_generation += 1;
-        assert!(validate_certified_prefix_receipt(&prefix, &stale).is_err());
-
-        let removal = SecondaryRemovalReceipt {
-            token: token.clone(),
-            preparation: None,
-            witness: None,
-            accepted: None,
-            verified_lsn: Some(9),
-            committed_lsn: 8,
-        };
-        validate_secondary_removal_receipt(&removal, &token).unwrap();
-        let mut stale_removal = removal;
-        stale_removal.token.engine_generation += 1;
-        assert!(validate_secondary_removal_receipt(&stale_removal, &token).is_err());
-    }
-
-    #[tokio::test]
-    async fn dropped_access_effect_rolls_back_the_exact_publication() {
-        let (rollback, fence, state, generation, _) = rollback_fixture(5);
-        let notified = fence.notified.notified();
-        drop(AccessEffectCommit::managed(rollback));
-        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
-            .await
-            .unwrap();
-        assert_eq!(fence.calls.load(Ordering::Acquire), 1);
-        assert_eq!(generation.load(Ordering::Acquire), 6);
-        let state = state.read().await;
-        assert_eq!(state.read_status, AccessStatus::ReconfigurationPending);
-        assert_eq!(state.write_status, AccessStatus::ReconfigurationPending);
-    }
-
-    #[tokio::test]
-    async fn committed_access_effect_disarms_rollback() {
-        let (rollback, fence, state, generation, _) = rollback_fixture(7);
-        AccessEffectCommit::managed(rollback).commit();
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        assert_eq!(fence.calls.load(Ordering::Acquire), 0);
-        assert_eq!(generation.load(Ordering::Acquire), 7);
-        assert_eq!(state.read().await.write_status, AccessStatus::Granted);
-    }
-
-    #[tokio::test]
-    async fn stale_rollback_cannot_fence_a_newer_access_publication() {
-        let (rollback, fence, state, generation, commit) = rollback_fixture(9);
-        let commit_guard = commit.lock().await;
-        rollback
-            .published_access_generation
-            .store(11, Ordering::Release);
-        drop(AccessEffectCommit::managed(rollback));
-        generation.store(11, Ordering::Release);
-        drop(commit_guard);
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        assert_eq!(fence.calls.load(Ordering::Acquire), 0);
-        assert_eq!(state.read().await.write_status, AccessStatus::Granted);
-    }
 }
 
 fn merge_builds(current: &mut Vec<BuildPostcondition>, incoming: Vec<BuildPostcondition>) {

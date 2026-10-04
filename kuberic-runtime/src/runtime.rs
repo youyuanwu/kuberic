@@ -87,40 +87,17 @@ struct OutboundBuild {
 }
 
 struct BuildPreparationGuard {
-    engine: Weak<DefaultReplicatorInner>,
-    build_id: OperationId,
-    generation: u64,
-    armed: bool,
+    decision: Option<tokio::sync::oneshot::Sender<bool>>,
+    completion: tokio::task::JoinHandle<()>,
 }
 
 impl BuildPreparationGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for BuildPreparationGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let Some(engine) = self.engine.upgrade() else {
-            return;
-        };
-        let build_id = self.build_id.clone();
-        let generation = self.generation;
-        if let Ok(mut state) = engine.state.try_write() {
-            if state
-                .outbound_builds
-                .get(&build_id)
-                .is_some_and(|build| build.generation == generation)
+    fn new(engine: Weak<DefaultReplicatorInner>, build_id: OperationId, generation: u64) -> Self {
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let completion = tokio::spawn(async move {
+            if completion.await != Ok(true)
+                && let Some(engine) = engine.upgrade()
             {
-                state.outbound_builds.remove(&build_id);
-            }
-            return;
-        }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
                 let mut state = engine.state.write().await;
                 if state
                     .outbound_builds
@@ -129,8 +106,19 @@ impl Drop for BuildPreparationGuard {
                 {
                     state.outbound_builds.remove(&build_id);
                 }
-            });
+            }
+        });
+        Self {
+            decision: Some(decision),
+            completion,
         }
+    }
+
+    async fn finish(mut self, success: bool) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(success);
+        }
+        let _ = self.completion.await;
     }
 }
 
@@ -1338,12 +1326,11 @@ impl DefaultReplicatorInner {
                 generation: prepare_generation,
             },
         );
-        let mut preparation = BuildPreparationGuard {
-            engine: self.weak_self.clone(),
-            build_id: build_authority.build_id.clone(),
-            generation: prepare_generation,
-            armed: true,
-        };
+        let preparation = BuildPreparationGuard::new(
+            self.weak_self.clone(),
+            build_authority.build_id.clone(),
+            prepare_generation,
+        );
         drop(guard);
         let operations_result = async {
             let mut operations = BTreeMap::new();
@@ -1372,23 +1359,13 @@ impl DefaultReplicatorInner {
         let operations = match operations_result {
             Ok(operations) => operations,
             Err(error) => {
-                self.state
-                    .write()
-                    .await
-                    .outbound_builds
-                    .remove(&build_authority.build_id);
-                preparation.disarm();
+                preparation.finish(false).await;
                 return Err(error);
             }
         };
         let guard = self.effect_lock.lock().await;
         if let Err(error) = self.check_delivery_generation(prepare_generation) {
-            self.state
-                .write()
-                .await
-                .outbound_builds
-                .remove(&build_authority.build_id);
-            preparation.disarm();
+            preparation.finish(false).await;
             return Err(error);
         }
         let replicator = self.replicator.lock().await;
@@ -1397,12 +1374,7 @@ impl DefaultReplicatorInner {
         if replicator_epoch != Epoch::default()
             && replicator_epoch != build_authority.current_configuration.epoch
         {
-            self.state
-                .write()
-                .await
-                .outbound_builds
-                .remove(&build_authority.build_id);
-            preparation.disarm();
+            preparation.finish(false).await;
             return Err(RuntimeError::AuthorityMismatch(
                 "build authority was fenced during preparation".into(),
             ));
@@ -1410,12 +1382,7 @@ impl DefaultReplicatorInner {
         if current_highest > boundary
             && ((boundary + 1)..=current_highest).any(|lsn| !operations.contains_key(&lsn))
         {
-            self.state
-                .write()
-                .await
-                .outbound_builds
-                .remove(&build_authority.build_id);
-            preparation.disarm();
+            preparation.finish(false).await;
             return Err(RuntimeError::InvalidReplication(
                 "retained operations do not close the post-snapshot gap".to_string(),
             ));
@@ -1429,16 +1396,11 @@ impl DefaultReplicatorInner {
         {
             Ok(stream) => stream,
             Err(error) => {
-                self.state
-                    .write()
-                    .await
-                    .outbound_builds
-                    .remove(&build_authority.build_id);
-                preparation.disarm();
+                preparation.finish(false).await;
                 return Err(error);
             }
         };
-        preparation.disarm();
+        preparation.finish(true).await;
         let engine = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
         let producer_authority = build_authority.clone();
         tokio::spawn(async move {
@@ -3691,6 +3653,29 @@ impl DefaultReplicatorInner {
     }
 }
 
+impl DefaultReplicatorInner {
+    async fn progress_status_unlocked(&self) -> NativeProgressStatus {
+        let state = self.state.read().await;
+        let current_progress = state.current_progress;
+        let verified_replication_lsn = state
+            .replication_progress
+            .as_ref()
+            .map(|progress| progress.verified_lsn);
+        let committed_lsn = state.committed_lsn;
+        drop(state);
+        let replicator = self.replicator.lock().await;
+        NativeProgressStatus {
+            current_progress,
+            verified_replication_lsn,
+            committed_lsn: committed_lsn.max(replicator.committed_lsn()),
+            current_configuration_quorum_progress: replicator
+                .current_configuration_quorum_progress(),
+            catch_up_boundary: replicator.catch_up_boundary(),
+            catch_up_complete: replicator.catch_up_complete(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
     async fn complete_open(&self, replication_address: String) -> Result<()> {
@@ -3898,6 +3883,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         &self,
         expected: &NativeOperationToken,
     ) -> Result<ManagedFenceGuard> {
+        let _effect = self.effect_lock.lock().await;
         let delivery = self.delivery_lock.clone().lock_owned().await;
         self.check_aborted()?;
         if expected.engine_session_id != self.session_id
@@ -3906,7 +3892,8 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         {
             return Err(RuntimeError::OperationCancelled);
         }
-        Ok(ManagedFenceGuard::new(delivery))
+        let progress = self.progress_status_unlocked().await;
+        Ok(ManagedFenceGuard::new(delivery, progress))
     }
 
     async fn native_fence(&self) -> Result<NativeOperationToken> {
@@ -3921,15 +3908,8 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
     }
 
     async fn progress_status(&self) -> NativeProgressStatus {
-        let snapshot = self.snapshot().await;
-        NativeProgressStatus {
-            current_progress: snapshot.current_progress,
-            verified_replication_lsn: snapshot.verified_replication_lsn,
-            committed_lsn: snapshot.committed_lsn,
-            current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
-            catch_up_boundary: snapshot.catch_up_boundary,
-            catch_up_complete: snapshot.catch_up_complete,
-        }
+        let _effect = self.effect_lock.lock().await;
+        self.progress_status_unlocked().await
     }
 
     async fn admit_authority_proof(&self, authority: AdmittedAuthority) -> Result<()> {
