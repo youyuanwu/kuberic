@@ -1645,18 +1645,23 @@ impl RuntimeHost {
             Some(commit) => commit.lock_acceptance().await?,
             None => None,
         };
-        let evidence = match self.lifecycle() {
-            Ok(lifecycle) => lifecycle
+        let lifecycle = self.lifecycle().ok();
+        let evidence = match lifecycle.as_ref() {
+            Some(lifecycle) => lifecycle
                 .effect_evidence(&effect.action)
                 .await
                 .map(Box::new),
-            Err(_) => None,
+            None => None,
+        };
+        let postcondition = match (evidence.as_ref(), lifecycle.as_ref()) {
+            (Some(_), Some(lifecycle)) => lifecycle.postcondition().await,
+            _ => snapshot_postcondition(self.snapshot().await),
         };
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
             evidence,
-            postcondition: snapshot_postcondition(self.snapshot().await),
+            postcondition,
         };
         self.state.write().await.effects.insert(
             result.sequence,
@@ -1786,23 +1791,13 @@ impl RuntimeHost {
                 sequence: effect.sequence,
             });
         }
-        let snapshot = self.snapshot().await;
-        if !snapshot.builds.iter().any(|build| {
-            &build.authority.build_id == build_id
-                && &build.authority.target == target
-                && build.completed
-        }) {
-            return Err(RuntimeError::ReconfigurationPending);
-        }
+        let lifecycle = self.lifecycle()?;
+        let evidence = lifecycle.confirm_build_completion(build_id, target).await?;
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
-            evidence: self
-                .lifecycle()?
-                .effect_evidence(&effect.action)
-                .await
-                .map(Box::new),
-            postcondition: snapshot_postcondition(snapshot),
+            evidence: evidence.map(Box::new),
+            postcondition: lifecycle.postcondition().await,
         };
         self.state.write().await.effects.insert(
             result.sequence,

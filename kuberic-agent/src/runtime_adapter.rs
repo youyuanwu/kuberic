@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kuberic_protocol::types::OperationId;
-use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
+use kuberic_runtime_internal::effects::{
+    RuntimeEffect, RuntimeEffectResult, RuntimeOperationEvidence,
+};
 
 use crate::hosting::PodRuntime;
 use crate::store::{AgentStore, BeginEffect};
@@ -179,11 +181,21 @@ where
                         build_id,
                         target,
                         ..
-                    } => !result.postcondition.builds.iter().any(|build| {
-                        &build.authority.build_id == build_id
-                            && &build.authority.target == target
-                            && build.completed
-                    }),
+                    } => {
+                        let receipt_complete = matches!(
+                            result.evidence.as_deref(),
+                            Some(RuntimeOperationEvidence::Build(receipt))
+                                if &receipt.progress.authority.build_id == build_id
+                                    && &receipt.progress.authority.target == target
+                                    && receipt.progress.completed
+                        );
+                        !receipt_complete
+                            && !result.postcondition.builds.iter().any(|build| {
+                                &build.authority.build_id == build_id
+                                    && &build.authority.target == target
+                                    && build.completed
+                            })
+                    }
                     _ => false,
                 };
                 if pending_build_completion {

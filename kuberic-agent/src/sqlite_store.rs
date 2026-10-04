@@ -15,7 +15,10 @@ use kuberic_runtime_internal::authority::{
     DurableBuildProgress, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore, RetiredAuthority,
 };
-use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
+use kuberic_runtime_internal::effects::{
+    RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimeOperationEvidence,
+    TopologyEvidenceKind, TopologyOperationEvidence,
+};
 use kuberic_runtime_internal::{ContractError, Result as ContractResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
@@ -26,6 +29,157 @@ use crate::state::{
 };
 use crate::store::{AgentStore, BeginConfiguration, BeginEffect};
 use crate::{AgentError, Result};
+
+fn topology_metadata(evidence: &RuntimeOperationEvidence) -> Option<TopologyOperationEvidence> {
+    match evidence {
+        RuntimeOperationEvidence::Topology(encoded) => serde_json::from_str(encoded).ok(),
+        _ => None,
+    }
+}
+
+fn switchover_metadata_matches(
+    receipt: &TopologyOperationEvidence,
+    preparation_generation: u64,
+    request_id: &kuberic_protocol::types::SwitchoverRequestId,
+    source: &ReplicaIdentity,
+    target: &ReplicaIdentity,
+    starting_configuration_id: &ConfigurationId,
+    starting_epoch: Epoch,
+) -> bool {
+    receipt.kind == TopologyEvidenceKind::Switchover
+        && receipt.preparation_generation == Some(preparation_generation)
+        && receipt.request_id.as_ref() == Some(request_id)
+        && receipt.source.as_ref() == Some(source)
+        && receipt.target.as_ref() == Some(target)
+        && receipt.configuration_id.as_ref() == Some(starting_configuration_id)
+        && receipt.epoch == Some(starting_epoch)
+        && receipt.completed
+        && receipt.boundary_lsn.is_some_and(|boundary| boundary >= 0)
+}
+
+fn validate_operation_evidence(effect: &RuntimeEffect, result: &RuntimeEffectResult) -> Result<()> {
+    let Some(evidence) = result.evidence.as_deref() else {
+        return Ok(());
+    };
+    let topology = topology_metadata(evidence);
+    let matches_action = match (&effect.action, evidence) {
+        (RuntimeEffectAction::WaitForCatchup, RuntimeOperationEvidence::CatchUp(_))
+        | (RuntimeEffectAction::BuildReplica { .. }, RuntimeOperationEvidence::Build(_))
+        | (
+            RuntimeEffectAction::SetAccessStatus { .. }
+            | RuntimeEffectAction::SetReadStatus(_)
+            | RuntimeEffectAction::SetWriteStatus(_),
+            RuntimeOperationEvidence::Access(_),
+        ) => true,
+        (
+            RuntimeEffectAction::AuthorizeFailoverPrefix(_)
+            | RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::Primary),
+            RuntimeOperationEvidence::Topology(_),
+        ) => topology
+            .as_ref()
+            .is_some_and(|value| value.kind == TopologyEvidenceKind::CertifiedPrefix),
+        (RuntimeEffectAction::PrepareSwitchover { .. }, RuntimeOperationEvidence::Topology(_)) => {
+            topology
+                .as_ref()
+                .is_some_and(|value| value.kind == TopologyEvidenceKind::Switchover)
+        }
+        (
+            RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+            | RuntimeEffectAction::ObserveSecondaryRemovalWitness(_)
+            | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
+            | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
+            | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_),
+            RuntimeOperationEvidence::Topology(_),
+        ) => topology
+            .as_ref()
+            .is_some_and(|value| value.kind == TopologyEvidenceKind::SecondaryRemoval),
+        (
+            RuntimeEffectAction::RetireReplica(_)
+            | RuntimeEffectAction::FenceRetirement(_)
+            | RuntimeEffectAction::CompleteRetirement(_),
+            RuntimeOperationEvidence::Topology(_),
+        ) => topology
+            .as_ref()
+            .is_some_and(|value| value.kind == TopologyEvidenceKind::Retirement),
+        _ => false,
+    };
+    if !matches_action {
+        return Err(AgentError::EffectConflict(
+            "operation receipt does not match durable intent".into(),
+        ));
+    }
+    match (&effect.action, evidence) {
+        (RuntimeEffectAction::WaitForCatchup, RuntimeOperationEvidence::CatchUp(receipt))
+            if receipt.authority
+                != result.postcondition.authority.clone().ok_or_else(|| {
+                    AgentError::EffectConflict("catch-up receipt omitted admitted authority".into())
+                })?
+                || result.postcondition.catch_up_boundary != Some(receipt.boundary_lsn)
+                || !result.postcondition.catch_up_complete =>
+        {
+            Err(AgentError::EffectConflict(
+                "catch-up receipt differs from accepted postcondition".into(),
+            ))
+        }
+        (
+            RuntimeEffectAction::BuildReplica {
+                build_id, target, ..
+            },
+            RuntimeOperationEvidence::Build(receipt),
+        ) if &receipt.progress.authority.build_id != build_id
+            || &receipt.progress.authority.target != target
+            || !receipt.progress.completed =>
+        {
+            Err(AgentError::EffectConflict(
+                "build receipt differs from durable intent".into(),
+            ))
+        }
+        (
+            RuntimeEffectAction::SetAccessStatus { read, write },
+            RuntimeOperationEvidence::Access(receipt),
+        ) if !receipt.published
+            || &receipt.read != read
+            || &receipt.write != write
+            || result.postcondition.read_status != receipt.read
+            || result.postcondition.write_status != receipt.write =>
+        {
+            Err(AgentError::EffectConflict(
+                "access receipt differs from durable intent".into(),
+            ))
+        }
+        (RuntimeEffectAction::SetReadStatus(read), RuntimeOperationEvidence::Access(receipt))
+            if !receipt.published
+                || &receipt.read != read
+                || result.postcondition.read_status != receipt.read =>
+        {
+            Err(AgentError::EffectConflict(
+                "read-access receipt differs from durable intent".into(),
+            ))
+        }
+        (RuntimeEffectAction::SetWriteStatus(write), RuntimeOperationEvidence::Access(receipt))
+            if !receipt.published
+                || &receipt.write != write
+                || result.postcondition.write_status != receipt.write =>
+        {
+            Err(AgentError::EffectConflict(
+                "write-access receipt differs from durable intent".into(),
+            ))
+        }
+        (
+            RuntimeEffectAction::AuthorizeFailoverPrefix(boundary),
+            RuntimeOperationEvidence::Topology(_),
+        ) if topology.as_ref().is_none_or(|topology| {
+            topology.kind != TopologyEvidenceKind::CertifiedPrefix
+                || topology.boundary_lsn != Some(*boundary)
+        }) =>
+        {
+            Err(AgentError::EffectConflict(
+                "certified-prefix receipt differs from durable intent".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
 
 const DATABASE_FILE: &str = "agent.sqlite3";
 
@@ -273,6 +427,7 @@ impl AgentStore for SqliteStore {
                     "effect completion does not match durable intent".into(),
                 ));
             }
+            validate_operation_evidence(&pending.effect, result)?;
             if let RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) =
                 &pending.effect.action
             {
@@ -345,12 +500,26 @@ impl AgentStore for SqliteStore {
                     kuberic_protocol::validation::validate_accept_secondary_removal_commit(command)
                         .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
                     let intent = &command.committed.evidence.preparation.intent;
+                    let receipt_metadata = result
+                        .evidence
+                        .as_deref()
+                        .and_then(topology_metadata)
+                        .filter(|topology| topology.kind == TopologyEvidenceKind::SecondaryRemoval);
                     if !command.local_recovery
                         || command.operation_id != pending.effect.operation_id
                         || command.target != state.identity.local_identity
                         || intent.resource_uid != state.identity.resource_uid
                         || result.postcondition.accepted_secondary_removal.as_ref()
                             != Some(&command.committed)
+                        || receipt_metadata.as_ref().is_some_and(|metadata| {
+                            !metadata.completed
+                                || metadata.operation_id
+                                    != Some(
+                                        command.committed.evidence.preparation.operation_id.clone(),
+                                    )
+                                || metadata.boundary_lsn
+                                    != Some(command.committed.evidence.preparation.boundary_lsn)
+                        })
                         || result.postcondition.role != ReplicaRole::ActiveSecondary
                         || result.postcondition.write_status == AccessStatus::Granted
                         || result.postcondition.role_transition.is_some()
@@ -377,6 +546,11 @@ impl AgentStore for SqliteStore {
                     process_session_id,
                     report_sequence,
                 } => {
+                    let receipt_metadata = result
+                        .evidence
+                        .as_deref()
+                        .and_then(topology_metadata)
+                        .filter(|topology| topology.kind == TopologyEvidenceKind::SecondaryRemoval);
                     let prepared = result
                         .postcondition
                         .prepared_secondary_removal
@@ -392,6 +566,13 @@ impl AgentStore for SqliteStore {
                         || &prepared.process_session_id != process_session_id
                         || prepared.report_sequence != *report_sequence
                         || prepared.operation_id != pending.effect.operation_id
+                        || receipt_metadata.as_ref().is_some_and(|metadata| {
+                            metadata.completed
+                                || metadata.operation_id != Some(prepared.operation_id.clone())
+                                || metadata.source != Some(prepared.intent.primary.clone())
+                                || metadata.target != Some(prepared.intent.target.clone())
+                                || metadata.boundary_lsn != Some(prepared.boundary_lsn)
+                        })
                         || result.postcondition.role != ReplicaRole::Primary
                         || result.postcondition.read_status == AccessStatus::Granted
                         || result.postcondition.write_status == AccessStatus::Granted
@@ -417,7 +598,16 @@ impl AgentStore for SqliteStore {
                     retired
                         .validate(&state.identity.local_identity)
                         .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
-                    if result.postcondition.retired_authority.as_ref() != Some(retired)
+                    let retirement_receipt = result
+                        .evidence
+                        .as_deref()
+                        .and_then(topology_metadata)
+                        .filter(|topology| topology.kind == TopologyEvidenceKind::Retirement);
+                    if retirement_receipt.as_ref().is_some_and(|receipt| {
+                        !receipt.completed
+                            || receipt.operation_id != Some(retired.report.operation_id.clone())
+                            || receipt.target != Some(retired.report.intent.target.clone())
+                    }) || result.postcondition.retired_authority.as_ref() != Some(retired)
                         || result.postcondition.open
                         || result.postcondition.role != ReplicaRole::None
                         || result.postcondition.read_status != AccessStatus::NotPrimary
@@ -462,6 +652,11 @@ impl AgentStore for SqliteStore {
                 starting_epoch,
             } = &pending.effect.action
             {
+                let switchover_receipt = result
+                    .evidence
+                    .as_deref()
+                    .and_then(topology_metadata)
+                    .filter(|topology| topology.kind == TopologyEvidenceKind::Switchover);
                 let authority = result.postcondition.authority.as_ref().ok_or_else(|| {
                     AgentError::EffectConflict(
                         "planned switchover preparation omitted admitted authority".into(),
@@ -477,6 +672,17 @@ impl AgentStore for SqliteStore {
                         != *starting_configuration_id
                     || authority.current_configuration.epoch != *starting_epoch
                     || authority.primary_identity() != source
+                    || switchover_receipt.as_ref().is_some_and(|receipt| {
+                        !switchover_metadata_matches(
+                            receipt,
+                            *preparation_generation,
+                            request_id,
+                            source,
+                            target,
+                            starting_configuration_id,
+                            *starting_epoch,
+                        )
+                    })
                     || !authority
                         .current_configuration
                         .members
@@ -497,7 +703,14 @@ impl AgentStore for SqliteStore {
                     target: target.clone(),
                     starting_configuration_id: starting_configuration_id.clone(),
                     starting_epoch: *starting_epoch,
-                    handoff_lsn: result.postcondition.current_progress,
+                    handoff_lsn: switchover_receipt.as_ref().map_or(
+                        result.postcondition.current_progress,
+                        |receipt| {
+                            receipt
+                                .boundary_lsn
+                                .unwrap_or(result.postcondition.current_progress)
+                        },
+                    ),
                 };
                 if state
                     .prepared_switchover
@@ -1912,6 +2125,63 @@ mod tests {
                 expected: 5,
                 observed: 4
             })
+        ));
+    }
+
+    #[test]
+    fn switchover_metadata_rejects_negative_or_incomplete_handoff() {
+        let source = identity().local_identity;
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(3),
+            instance_id: ReplicaInstanceId::new("target"),
+            agent_generation: AgentGeneration::new("target-generation"),
+        };
+        let request_id = kuberic_protocol::types::SwitchoverRequestId::new("metadata-validation");
+        let configuration_id = ConfigurationId::new("starting");
+        let epoch = Epoch::new(0, 1);
+        let mut metadata = TopologyOperationEvidence {
+            kind: TopologyEvidenceKind::Switchover,
+            engine_session_id: "engine".into(),
+            engine_generation: 3,
+            operation_id: None,
+            request_id: Some(request_id.clone()),
+            preparation_generation: Some(1),
+            source: Some(source.clone()),
+            target: Some(target.clone()),
+            configuration_id: Some(configuration_id.clone()),
+            epoch: Some(epoch),
+            boundary_lsn: Some(7),
+            completed: true,
+        };
+        assert!(switchover_metadata_matches(
+            &metadata,
+            1,
+            &request_id,
+            &source,
+            &target,
+            &configuration_id,
+            epoch,
+        ));
+        metadata.boundary_lsn = Some(-1);
+        assert!(!switchover_metadata_matches(
+            &metadata,
+            1,
+            &request_id,
+            &source,
+            &target,
+            &configuration_id,
+            epoch,
+        ));
+        metadata.boundary_lsn = Some(7);
+        metadata.completed = false;
+        assert!(!switchover_metadata_matches(
+            &metadata,
+            1,
+            &request_id,
+            &source,
+            &target,
+            &configuration_id,
+            epoch,
         ));
     }
 }

@@ -3660,6 +3660,11 @@ impl DefaultReplicatorInner {
             preparation: state.prepared_secondary_removal.clone(),
             witness,
             accepted: state.accepted_secondary_removal.clone(),
+            verified_lsn: state
+                .replication_progress
+                .as_ref()
+                .map(|progress| progress.verified_lsn),
+            committed_lsn: state.committed_lsn,
         })
     }
 

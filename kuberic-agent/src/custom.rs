@@ -17,7 +17,8 @@ use kuberic_runtime_internal::authority::{
     AdmittedAuthority, BuildAuthority, BuildSelection, DurableBuildProgress,
 };
 use kuberic_runtime_internal::effects::{
-    BuildPostcondition, RuntimeEffectAction, RuntimeOperationEvidence, RuntimeSnapshot,
+    BuildPostcondition, RuntimeEffectAction, RuntimeOperationEvidence, RuntimePostcondition,
+    RuntimeSnapshot, TopologyEvidenceKind, TopologyOperationEvidence,
 };
 use kuberic_runtime_internal::receipts::{
     AccessReceipt, BuildReceipt as NativeBuildReceipt, CatchUpReceipt, CertifiedPrefixReceipt,
@@ -351,6 +352,12 @@ fn validate_retirement_receipt(
     Ok(())
 }
 
+fn topology_evidence(metadata: TopologyOperationEvidence) -> RuntimeOperationEvidence {
+    RuntimeOperationEvidence::Topology(
+        serde_json::to_string(&metadata).expect("topology receipt metadata is serializable"),
+    )
+}
+
 type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConfiguration)>>;
 
 #[async_trait]
@@ -445,6 +452,12 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         &self,
         action: &RuntimeEffectAction,
     ) -> Option<RuntimeOperationEvidence>;
+    async fn confirm_build_completion(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<Option<RuntimeOperationEvidence>>;
+    async fn postcondition(&self) -> RuntimePostcondition;
 }
 
 struct ManagedLifecycleBackend {
@@ -453,6 +466,10 @@ struct ManagedLifecycleBackend {
     accepted_builds: RwLock<BTreeMap<OperationId, AcceptedBuildReceipt>>,
     catch_up_receipt: RwLock<Option<CatchUpReceipt>>,
     access_receipt: RwLock<Option<AccessReceipt>>,
+    certified_prefix_receipt: RwLock<Option<CertifiedPrefixReceipt>>,
+    switchover_receipt: RwLock<Option<SwitchoverReceipt>>,
+    secondary_removal_receipt: RwLock<Option<SecondaryRemovalReceipt>>,
+    retirement_receipt: RwLock<Option<RetirementReceipt>>,
 }
 
 #[async_trait]
@@ -494,7 +511,9 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             return Err(RuntimeError::OperationCancelled);
         }
         self.common.settle_primary_prefix().await?;
-        self.common.accept_certified_prefix(&receipt).await
+        self.common.accept_certified_prefix(&receipt).await?;
+        *self.certified_prefix_receipt.write().await = Some(receipt);
+        Ok(())
     }
 
     async fn cancel_configuration_work(&self) -> Result<()> {
@@ -653,7 +672,9 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         if receipt.settled_lsn != boundary {
             return Err(RuntimeError::OperationCancelled);
         }
-        self.common.accept_certified_prefix(&receipt).await
+        self.common.accept_certified_prefix(&receipt).await?;
+        *self.certified_prefix_receipt.write().await = Some(receipt);
+        Ok(())
     }
 
     async fn prepare_switchover(
@@ -696,7 +717,9 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         {
             return Err(RuntimeError::OperationCancelled);
         }
-        self.common.accept_switchover_receipt(&receipt).await
+        self.common.accept_switchover_receipt(&receipt).await?;
+        *self.switchover_receipt.write().await = Some(receipt);
+        Ok(())
     }
 
     async fn refresh_progress(&self) -> Result<()> {
@@ -791,7 +814,11 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         snapshot.verified_replication_lsn = engine.verified_replication_lsn;
         snapshot.current_configuration_quorum_progress =
             engine.current_configuration_quorum_progress;
-        snapshot.catch_up_boundary = engine.catch_up_boundary;
+        snapshot.catch_up_boundary = if engine.catch_up_complete {
+            snapshot.catch_up_boundary.or(engine.catch_up_boundary)
+        } else {
+            engine.catch_up_boundary
+        };
         snapshot.catch_up_complete = engine.catch_up_complete;
         merge_builds(&mut snapshot.builds, engine.builds);
         snapshot.live_builds_only = false;
@@ -982,13 +1009,14 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 .read()
                 .await
                 .clone()
-                .map(RuntimeOperationEvidence::CatchUp),
-            RuntimeEffectAction::BuildReplica { build_id, .. } => self
-                .accepted_builds
-                .read()
+                .map(|receipt| RuntimeOperationEvidence::CatchUp(Box::new(receipt))),
+            RuntimeEffectAction::BuildReplica {
+                build_id, target, ..
+            } => self
+                .confirm_build_completion(build_id, target)
                 .await
-                .get(build_id)
-                .map(|receipt| RuntimeOperationEvidence::Build(receipt.native.clone())),
+                .ok()
+                .flatten(),
             RuntimeEffectAction::SetAccessStatus { .. }
             | RuntimeEffectAction::SetReadStatus(_)
             | RuntimeEffectAction::SetWriteStatus(_) => self
@@ -996,9 +1024,153 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 .read()
                 .await
                 .clone()
-                .map(RuntimeOperationEvidence::Access),
+                .map(|receipt| RuntimeOperationEvidence::Access(Box::new(receipt))),
+            RuntimeEffectAction::AuthorizeFailoverPrefix(_)
+            | RuntimeEffectAction::ChangeApplicationRole(
+                kuberic_protocol::types::ReplicaRole::Primary,
+            ) => self
+                .certified_prefix_receipt
+                .read()
+                .await
+                .clone()
+                .map(|receipt| {
+                    topology_evidence(TopologyOperationEvidence {
+                        kind: TopologyEvidenceKind::CertifiedPrefix,
+                        engine_session_id: receipt.token.engine_session_id,
+                        engine_generation: receipt.token.engine_generation,
+                        operation_id: None,
+                        request_id: None,
+                        preparation_generation: None,
+                        source: None,
+                        target: None,
+                        configuration_id: receipt.token.authority.as_ref().map(|authority| {
+                            authority.current_configuration.configuration_id.clone()
+                        }),
+                        epoch: receipt
+                            .token
+                            .authority
+                            .as_ref()
+                            .map(|authority| authority.current_configuration.epoch),
+                        boundary_lsn: Some(receipt.settled_lsn),
+                        completed: true,
+                    })
+                }),
+            RuntimeEffectAction::PrepareSwitchover { .. } => {
+                self.switchover_receipt.read().await.clone().map(|receipt| {
+                    topology_evidence(TopologyOperationEvidence {
+                        kind: TopologyEvidenceKind::Switchover,
+                        engine_session_id: receipt.token.engine_session_id,
+                        engine_generation: receipt.token.engine_generation,
+                        operation_id: None,
+                        request_id: Some(receipt.request_id),
+                        preparation_generation: Some(receipt.preparation_generation),
+                        source: Some(receipt.source),
+                        target: Some(receipt.target),
+                        configuration_id: Some(receipt.starting_configuration_id),
+                        epoch: Some(receipt.starting_epoch),
+                        boundary_lsn: Some(receipt.handoff_lsn),
+                        completed: true,
+                    })
+                })
+            }
+            RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+            | RuntimeEffectAction::ObserveSecondaryRemovalWitness(_)
+            | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
+            | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
+            | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_) => self
+                .secondary_removal_receipt
+                .read()
+                .await
+                .clone()
+                .map(|receipt| {
+                    let completed = matches!(
+                        action,
+                        RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
+                            | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
+                            | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
+                    );
+                    let preparation = receipt.preparation.as_ref().or_else(|| {
+                        receipt
+                            .accepted
+                            .as_ref()
+                            .map(|accepted| &accepted.evidence.preparation)
+                    });
+                    topology_evidence(TopologyOperationEvidence {
+                        kind: TopologyEvidenceKind::SecondaryRemoval,
+                        engine_session_id: receipt.token.engine_session_id,
+                        engine_generation: receipt.token.engine_generation,
+                        operation_id: preparation.map(|value| value.operation_id.clone()),
+                        request_id: None,
+                        preparation_generation: None,
+                        source: preparation.map(|value| value.intent.primary.clone()),
+                        target: preparation.map(|value| value.intent.target.clone()),
+                        configuration_id: preparation.map(|value| {
+                            value.intent.current_configuration.configuration_id.clone()
+                        }),
+                        epoch: preparation.map(|value| value.intent.current_configuration.epoch),
+                        boundary_lsn: preparation.map(|value| value.boundary_lsn),
+                        completed,
+                    })
+                }),
+            RuntimeEffectAction::RetireReplica(_)
+            | RuntimeEffectAction::FenceRetirement(_)
+            | RuntimeEffectAction::CompleteRetirement(_) => {
+                self.retirement_receipt.read().await.clone().map(|receipt| {
+                    let intent = &receipt.retired.report.intent;
+                    topology_evidence(TopologyOperationEvidence {
+                        kind: TopologyEvidenceKind::Retirement,
+                        engine_session_id: receipt.engine_session_id,
+                        engine_generation: receipt.engine_generation,
+                        operation_id: Some(receipt.retired.report.operation_id.clone()),
+                        request_id: None,
+                        preparation_generation: None,
+                        source: Some(intent.primary.clone()),
+                        target: Some(intent.target.clone()),
+                        configuration_id: Some(
+                            intent.current_configuration.configuration_id.clone(),
+                        ),
+                        epoch: Some(intent.current_configuration.epoch),
+                        boundary_lsn: Some(
+                            receipt.retired.committed.evidence.preparation.boundary_lsn,
+                        ),
+                        completed: receipt.completed,
+                    })
+                })
+            }
             _ => None,
         }
+    }
+
+    async fn confirm_build_completion(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<Option<RuntimeOperationEvidence>> {
+        let accepted = self
+            .accepted_builds
+            .read()
+            .await
+            .get(build_id)
+            .cloned()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        if &accepted.admission.selection.authority.target != target
+            || !self
+                .common
+                .receipt(&accepted.admission.selection.authority)
+                .await?
+                .matches_host_admission(&accepted.admission)
+            || accepted.native.selection != accepted.admission.selection
+            || !accepted.native.progress.completed
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        Ok(Some(RuntimeOperationEvidence::Build(Box::new(
+            accepted.native,
+        ))))
+    }
+
+    async fn postcondition(&self) -> RuntimePostcondition {
+        self.common.narrow_postcondition().await
     }
 }
 
@@ -1055,7 +1227,11 @@ impl ManagedLifecycleBackend {
                 }) {
                     return Err(RuntimeError::OperationCancelled);
                 }
-                self.common.accept_secondary_removal_receipt(&receipt).await
+                self.common
+                    .accept_secondary_removal_receipt(&receipt)
+                    .await?;
+                *self.secondary_removal_receipt.write().await = Some(receipt);
+                Ok(())
             }
             RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness) => {
                 let token = self.legacy.operation_token().await?;
@@ -1068,7 +1244,11 @@ impl ManagedLifecycleBackend {
                 if receipt.witness.as_ref() != Some(&expected) {
                     return Err(RuntimeError::OperationCancelled);
                 }
-                self.common.accept_secondary_removal_receipt(&receipt).await
+                self.common
+                    .accept_secondary_removal_receipt(&receipt)
+                    .await?;
+                *self.secondary_removal_receipt.write().await = Some(receipt);
+                Ok(())
             }
             RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
                 let token = self.legacy.operation_token().await?;
@@ -1084,7 +1264,11 @@ impl ManagedLifecycleBackend {
                 {
                     return Err(RuntimeError::OperationCancelled);
                 }
-                self.common.accept_secondary_removal_receipt(&receipt).await
+                self.common
+                    .accept_secondary_removal_receipt(&receipt)
+                    .await?;
+                *self.secondary_removal_receipt.write().await = Some(receipt);
+                Ok(())
             }
             RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
                 let token = self.legacy.operation_token().await?;
@@ -1097,7 +1281,11 @@ impl ManagedLifecycleBackend {
                 if receipt.accepted.as_ref() != Some(&expected) {
                     return Err(RuntimeError::OperationCancelled);
                 }
-                self.common.accept_secondary_removal_receipt(&receipt).await
+                self.common
+                    .accept_secondary_removal_receipt(&receipt)
+                    .await?;
+                *self.secondary_removal_receipt.write().await = Some(receipt);
+                Ok(())
             }
             RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
                 let token = self.legacy.operation_token().await?;
@@ -1106,7 +1294,11 @@ impl ManagedLifecycleBackend {
                     .accept_historical_secondary_removal_proof(*command)
                     .await?;
                 validate_secondary_removal_receipt(&receipt, &token)?;
-                self.common.accept_secondary_removal_receipt(&receipt).await
+                self.common
+                    .accept_secondary_removal_receipt(&receipt)
+                    .await?;
+                *self.secondary_removal_receipt.write().await = Some(receipt);
+                Ok(())
             }
             RuntimeEffectAction::FenceRetirement(retired) => {
                 let receipt = self
@@ -1114,7 +1306,9 @@ impl ManagedLifecycleBackend {
                     .fence_retirement_proof((*retired).clone())
                     .await?;
                 validate_retirement_receipt(&receipt, &retired, false)?;
-                self.common.fence_retirement_state(&retired).await
+                self.common.fence_retirement_state(&retired).await?;
+                *self.retirement_receipt.write().await = Some(receipt);
+                Ok(())
             }
             RuntimeEffectAction::CompleteRetirement(retired) => {
                 let receipt = self
@@ -1122,7 +1316,9 @@ impl ManagedLifecycleBackend {
                     .complete_retirement_proof((*retired).clone())
                     .await?;
                 validate_retirement_receipt(&receipt, &retired, true)?;
-                self.common.complete_retirement_state(&retired).await
+                self.common.complete_retirement_state(&retired).await?;
+                *self.retirement_receipt.write().await = Some(receipt);
+                Ok(())
             }
             _ => Err(RuntimeError::Application(
                 "managed removal proof requires a removal action".into(),
@@ -1176,6 +1372,10 @@ impl ReplicatorLifecycleHost {
                 accepted_builds: RwLock::default(),
                 catch_up_receipt: RwLock::default(),
                 access_receipt: RwLock::default(),
+                certified_prefix_receipt: RwLock::default(),
+                switchover_receipt: RwLock::default(),
+                secondary_removal_receipt: RwLock::default(),
+                retirement_receipt: RwLock::default(),
             }),
         }
     }
@@ -1436,6 +1636,20 @@ impl ReplicatorLifecycleHost {
         action: &RuntimeEffectAction,
     ) -> Option<RuntimeOperationEvidence> {
         self.backend.effect_evidence(action).await
+    }
+
+    pub(super) async fn confirm_build_completion(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<Option<RuntimeOperationEvidence>> {
+        self.backend
+            .confirm_build_completion(build_id, target)
+            .await
+    }
+
+    pub(super) async fn postcondition(&self) -> RuntimePostcondition {
+        self.backend.postcondition().await
     }
 }
 
@@ -2169,6 +2383,15 @@ impl CustomReplicatorHost {
                 .current_progress
                 .max(accepted.evidence.preparation.boundary_lsn);
         }
+        if let Some(verified_lsn) = receipt.verified_lsn {
+            state.verified_replication_lsn = Some(
+                state
+                    .verified_replication_lsn
+                    .map_or(verified_lsn, |verified| verified.max(verified_lsn)),
+            );
+            state.current_progress = state.current_progress.max(verified_lsn);
+        }
+        state.committed_lsn = state.committed_lsn.max(receipt.committed_lsn);
         Ok(())
     }
 
@@ -3460,6 +3683,18 @@ impl CustomReplicatorHost {
         snapshot.builds = current;
         snapshot
     }
+
+    async fn narrow_postcondition(&self) -> RuntimePostcondition {
+        let mut snapshot = self.snapshot().await;
+        if let Some(host) = self.host.upgrade() {
+            let fallback = host.state.read().await.fallback_snapshot.clone();
+            snapshot.open = fallback.open;
+            snapshot.role = fallback.role;
+            snapshot.role_transition = fallback.role_transition;
+        }
+        snapshot.into()
+    }
+
     pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
         let _gate = self.gate.lock().await;
         let mut generations = self.build_generations.write().await;
@@ -3895,6 +4130,38 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
     ) -> Option<RuntimeOperationEvidence> {
         None
     }
+
+    async fn confirm_build_completion(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<Option<RuntimeOperationEvidence>> {
+        let receipt = self
+            .receipts
+            .read()
+            .await
+            .get(build_id)
+            .cloned()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        if &receipt.selection.authority.target != target
+            || !self
+                .receipt(&receipt.selection.authority)
+                .await?
+                .matches_host_admission(&receipt)
+            || !self.state.read().await.builds.iter().any(|build| {
+                &build.authority.build_id == build_id
+                    && &build.authority.target == target
+                    && build.completed
+            })
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        Ok(None)
+    }
+
+    async fn postcondition(&self) -> RuntimePostcondition {
+        self.narrow_postcondition().await
+    }
 }
 
 fn preserves_same_primary_scale_up_access(
@@ -4175,6 +4442,8 @@ mod receipt_validation_tests {
             preparation: None,
             witness: None,
             accepted: None,
+            verified_lsn: Some(9),
+            committed_lsn: 8,
         };
         validate_secondary_removal_receipt(&removal, &token).unwrap();
         let mut stale_removal = removal;

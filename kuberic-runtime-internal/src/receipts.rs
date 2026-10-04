@@ -91,6 +91,8 @@ pub struct SecondaryRemovalReceipt {
     pub preparation: Option<SecondaryRemovalPreparation>,
     pub witness: Option<SecondaryRemovalWitness>,
     pub accepted: Option<SecondaryScaleDownCleanup>,
+    pub verified_lsn: Option<i64>,
+    pub committed_lsn: i64,
 }
 
 /// Native retirement start/completion evidence.
