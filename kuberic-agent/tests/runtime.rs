@@ -4375,6 +4375,7 @@ struct CustomRoleGate {
     block_progress: AtomicBool,
     progress_entered: Notify,
     progress_released: Notify,
+    abort_count: AtomicUsize,
     block_configuration: AtomicBool,
     configuration_entered: Notify,
     configuration_released: Notify,
@@ -4414,7 +4415,9 @@ impl Replicator for CustomRoleGate {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
-    fn abort(&self) {}
+    fn abort(&self) {
+        self.abort_count.fetch_add(1, Ordering::SeqCst);
+    }
     async fn current_progress(&self) -> Result<i64> {
         if self.block_progress.swap(false, Ordering::SeqCst) {
             self.progress_entered.notify_one();
@@ -8208,6 +8211,42 @@ async fn cancelled_old_access_transaction_cannot_fence_a_newer_grant() {
         .await
         .unwrap();
     runtime.testing_resume_access_effect_acceptance();
+}
+
+#[tokio::test]
+async fn stale_fatal_progress_callback_cannot_abort_a_newer_access_grant() {
+    let (runtime, control, _, _) = blocked_lifecycle_fixture("stale-fatal-access").await;
+    control.block_progress.store(true, Ordering::SeqCst);
+    let old = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            kuberic_agent::testing::set_lifecycle_access(
+                &runtime,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+            )
+            .await
+        })
+    };
+    timeout(Duration::from_secs(1), control.progress_entered.notified())
+        .await
+        .unwrap();
+
+    kuberic_agent::testing::set_lifecycle_access(
+        &runtime,
+        AccessStatus::Granted,
+        AccessStatus::Granted,
+    )
+    .await
+    .unwrap();
+    control.grant_error.store(2, Ordering::SeqCst);
+    control.progress_released.notify_one();
+    assert!(matches!(
+        old.await.unwrap(),
+        Err(RuntimeError::Application(message)) if message == "grant failed"
+    ));
+    assert_eq!(control.abort_count.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
 }
 
 #[tokio::test]

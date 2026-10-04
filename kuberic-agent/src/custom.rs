@@ -2115,7 +2115,14 @@ impl CustomReplicatorHost {
                 error,
                 RuntimeError::ReconfigurationPending | RuntimeError::OperationCancelled
             ) {
-                self.control.abort();
+                let _commit = self.access_commit.lock().await;
+                if self.published_access_generation.load(Ordering::Acquire)
+                    <= projection.access_generation
+                    && self.access_generation.load(Ordering::Acquire)
+                        == projection.access_generation
+                {
+                    self.control.abort();
+                }
             }
             return Err(error);
         }
