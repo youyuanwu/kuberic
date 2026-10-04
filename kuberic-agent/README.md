@@ -57,9 +57,11 @@ primaries retain exact common build receipts and never need default-engine
 proof types.
 
 Access publication has one generation-scoped commit owner. Native admission,
-common projection, external projection, and durable effect acceptance must
+common projection, external projection, and host-memory effect acceptance must
 complete coherently; cancellation or invalidation fences native writes and
-rolls back an unaccepted projection without revoking a newer grant. Receipt-
+rolls back an unaccepted projection without revoking a newer grant. Durable
+applied/completed recording follows through the intent-first adapter; recovery
+stays write-closed while interrupted work is reissued or reobserved. Receipt-
 backed effect completion persists compact evidence and a narrow lifecycle
 postcondition rather than restoring an unrelated full native snapshot.
 

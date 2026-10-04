@@ -3534,6 +3534,13 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         panic!("registration tests do not publish access receipts")
     }
 
+    async fn lock_access_acceptance(
+        &self,
+        _expected: &kuberic_runtime_internal::receipts::NativeOperationToken,
+    ) -> Result<kuberic_runtime::replicator::ManagedAccessAcceptance> {
+        panic!("registration tests do not accept native access receipts")
+    }
+
     async fn operation_token(
         &self,
     ) -> Result<kuberic_runtime_internal::receipts::NativeOperationToken> {
@@ -8009,11 +8016,13 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
     }
 
     let mut copy = target_app.held_streams.lock().unwrap().remove(1);
+    let copy_release = Arc::new(Notify::new());
     let mut coordinator = {
         let source = source.clone();
         let copy_source = source.clone();
         let target = target.clone();
         let replacement = replacement.clone();
+        let copy_release = copy_release.clone();
         tokio::spawn(async move {
             kuberic_agent::testing::execute_build_with_copy(
                 &source,
@@ -8025,7 +8034,8 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
                         .data_plane()
                         .accept_copy_acknowledgement(acknowledgement)
                         .await?;
-                    std::future::pending().await
+                    copy_release.notified().await;
+                    Ok(())
                 },
             )
             .await
@@ -8071,6 +8081,12 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         Err(RuntimeError::ReconfigurationPending)
     ));
     build_gate.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !coordinator.is_finished(),
+        "public completion must not discard a still-pending copy branch"
+    );
+    copy_release.notify_one();
     timeout(Duration::from_secs(1), coordinator)
         .await
         .expect("shared build coordinator must finish after the native copy ACK")
@@ -8083,7 +8099,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         .unwrap();
     assert!(
         source
-            .observe_build_completion(build_effect)
+            .observe_build_completion(build_effect.clone())
             .await
             .unwrap()
             .postcondition
@@ -8117,6 +8133,11 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         .committed()
         .await
         .expect("post-build primary write must retain native durability semantics");
+    control.update_epoch(Epoch::new(0, 2)).await.unwrap();
+    assert!(matches!(
+        source.observe_build_completion(build_effect).await,
+        Err(RuntimeError::ReconfigurationPending | RuntimeError::OperationCancelled)
+    ));
     assert!(matches!(
         control.remove_replica(primary.replica_id).await,
         Err(RuntimeError::AuthorityMismatch(_))
@@ -8275,6 +8296,54 @@ async fn configuration_invalidation_rejects_gated_access_effect() {
             })
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn direct_epoch_fence_rejects_gated_access_effect() {
+    let primary = identity(1, "access-epoch-primary");
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(
+        open_primary_with_session(application.clone(), vec![primary], "access-epoch-session").await,
+    );
+    runtime
+        .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+        .await
+        .unwrap();
+
+    let access = effect(
+        6,
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    );
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let entered = gate.entered.notified();
+    let task_runtime = runtime.clone();
+    let task = tokio::spawn(async move { task_runtime.apply_effect(access).await });
+    tokio::time::timeout(Duration::from_secs(1), entered)
+        .await
+        .unwrap();
+    let retained_control = application
+        .returned_control
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    retained_control
+        .update_epoch(Epoch::new(0, 2))
+        .await
+        .unwrap();
+    runtime.testing_resume_access_effect_acceptance();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(RuntimeError::OperationCancelled)
+    ));
+    assert!(!runtime.testing_has_applied_effect(6).await);
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
     );
 }
 

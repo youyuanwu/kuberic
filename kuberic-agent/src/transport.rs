@@ -133,7 +133,7 @@ impl BuildDispatchCancellation {
         if let Some(build_id) = self.build_id.as_ref()
             && self
                 .runtime
-                .cancel_outbound_build_attempt(build_id, self.generation)
+                .cancel_outbound_build_attempt(build_id, self.generation, true)
                 .await
                 .is_ok()
         {
@@ -156,9 +156,13 @@ impl Drop for BuildDispatchCancellation {
         let runtime = self.runtime.clone();
         let generation = self.generation;
         let guard = self.guard.take();
-        tokio::spawn(async move {
+        let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
+            drop(guard);
+            return;
+        };
+        runtime_handle.spawn(async move {
             let _ = runtime
-                .cancel_outbound_build_attempt(&build_id, generation)
+                .cancel_outbound_build_attempt(&build_id, generation, true)
                 .await;
             drop(guard);
         });
@@ -370,11 +374,22 @@ where
                             copy_context: Box::pin(stream::empty()),
                         })
                         .await?;
+                    let mut catch_up_boundary = None;
                     while let Some(item) = prepared.items.next().await {
-                        self.dispatch_copy(endpoint.identity.clone(), item?, false)
+                        let item = item?;
+                        if item.final_item {
+                            catch_up_boundary = item.catch_up_boundary_lsn;
+                        }
+                        let delivered_lsn = item.lsn;
+                        self.dispatch_copy(endpoint.identity.clone(), item, false)
                             .await?;
+                        if catch_up_boundary.is_some_and(|boundary| delivered_lsn >= boundary) {
+                            return Ok::<(), AgentError>(());
+                        }
                     }
-                    Ok::<(), AgentError>(())
+                    Err(AgentError::SessionRejected(
+                        "copy stream ended before its final durable boundary".into(),
+                    ))
                 },
             )
             .await?;

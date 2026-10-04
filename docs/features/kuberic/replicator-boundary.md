@@ -67,8 +67,10 @@ native authority graph.
 Native access admission does not itself grant application access. The host
 reserves one common projection generation, validates public progress, publishes
 native access, and atomically updates the common and external projection. A
-drop-safe rollback owner remains armed until the durable effect result is
-accepted.
+drop-safe rollback owner remains armed until the host accepts the result into
+its in-memory effect sequence. The adapter then persists applied/completed
+stages through the existing intent-first protocol; startup remains write-closed
+and reissues or reobserves an interrupted persistence boundary.
 
 Cancellation, publication failure, or configuration invalidation fences native
 writes and clears an unaccepted projection. Rollback is generation-scoped, so

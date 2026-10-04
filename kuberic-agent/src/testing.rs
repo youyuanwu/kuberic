@@ -617,7 +617,7 @@ pub async fn cancel_build_attempt(
     generation: u64,
 ) -> kuberic_runtime::Result<()> {
     runtime
-        .cancel_outbound_build_attempt(build_id, generation)
+        .cancel_outbound_build_attempt(build_id, generation, true)
         .await
 }
 

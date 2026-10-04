@@ -9,8 +9,8 @@ use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, OperationId, ProcessSessionId, ReplicaIdentity,
 };
 use kuberic_runtime::replicator::{
-    ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
-    ReplicaSetQuorumMode, Replicator,
+    ManagedAccessAcceptance, ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation,
+    ReplicaSetConfiguration, ReplicaSetQuorumMode, Replicator,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{
@@ -65,6 +65,10 @@ struct AcceptedBuildReceipt {
 #[async_trait]
 trait AccessRollbackFence: Send + Sync {
     async fn fence_writes(&self);
+    async fn lock_acceptance(
+        &self,
+        expected: &NativeOperationToken,
+    ) -> Result<Option<ManagedAccessAcceptance>>;
     fn abort(&self);
 }
 
@@ -77,6 +81,13 @@ impl AccessRollbackFence for ManagedAccessRollbackFence {
         let _ = self.0.fence_writes().await;
     }
 
+    async fn lock_acceptance(
+        &self,
+        expected: &NativeOperationToken,
+    ) -> Result<Option<ManagedAccessAcceptance>> {
+        self.0.lock_access_acceptance(expected).await.map(Some)
+    }
+
     fn abort(&self) {
         self.0.abort();
     }
@@ -85,6 +96,13 @@ impl AccessRollbackFence for ManagedAccessRollbackFence {
 #[async_trait]
 impl AccessRollbackFence for CommonAccessRollbackFence {
     async fn fence_writes(&self) {}
+
+    async fn lock_acceptance(
+        &self,
+        _expected: &NativeOperationToken,
+    ) -> Result<Option<ManagedAccessAcceptance>> {
+        Ok(None)
+    }
 
     fn abort(&self) {}
 }
@@ -97,11 +115,22 @@ struct AccessPublicationRollback {
     published_access_generation: Arc<AtomicU64>,
     access_commit: Arc<Mutex<()>>,
     generation: u64,
+    native_token: Option<NativeOperationToken>,
     armed: bool,
 }
 
 pub(super) struct AccessEffectCommit {
     rollback: Option<AccessPublicationRollback>,
+}
+
+pub(super) struct AccessAcceptanceGuards {
+    _common: tokio::sync::OwnedMutexGuard<()>,
+    _native: Option<ManagedAccessAcceptance>,
+}
+
+pub(super) struct BuildCompletionConfirmation {
+    pub(super) evidence: Option<RuntimeOperationEvidence>,
+    _native: Option<ManagedAccessAcceptance>,
 }
 
 impl AccessEffectCommit {
@@ -118,7 +147,7 @@ impl AccessEffectCommit {
         self.rollback = None;
     }
 
-    pub(super) async fn lock_acceptance(&self) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    pub(super) async fn lock_acceptance(&self) -> Result<Option<AccessAcceptanceGuards>> {
         let Some(rollback) = self.rollback.as_ref() else {
             return Ok(None);
         };
@@ -128,7 +157,14 @@ impl AccessEffectCommit {
         {
             return Err(RuntimeError::OperationCancelled);
         }
-        Ok(Some(guard))
+        let native = match rollback.native_token.as_ref() {
+            Some(expected) => rollback.fence.lock_acceptance(expected).await?,
+            None => None,
+        };
+        Ok(Some(AccessAcceptanceGuards {
+            _common: guard,
+            _native: native,
+        }))
     }
 }
 
@@ -137,6 +173,7 @@ impl AccessPublicationRollback {
         fence: Arc<dyn AccessRollbackFence>,
         common: &CustomReplicatorHost,
         projection: &AccessProjection,
+        native_token: Option<NativeOperationToken>,
     ) -> Self {
         Self {
             fence,
@@ -146,6 +183,7 @@ impl AccessPublicationRollback {
             published_access_generation: common.published_access_generation.clone(),
             access_commit: common.access_commit.clone(),
             generation: projection.access_generation,
+            native_token,
             armed: true,
         }
     }
@@ -154,16 +192,27 @@ impl AccessPublicationRollback {
         lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
         common: &CustomReplicatorHost,
         projection: &AccessProjection,
+        preparation: &AccessReceipt,
     ) -> Self {
         Self::with_fence(
             Arc::new(ManagedAccessRollbackFence(lifecycle)),
             common,
             projection,
+            Some(NativeOperationToken {
+                authority: preparation.authority.clone(),
+                engine_session_id: preparation.engine_session_id.clone(),
+                engine_generation: preparation.engine_generation,
+            }),
         )
     }
 
     fn common(common: &CustomReplicatorHost, projection: &AccessProjection) -> Self {
-        Self::with_fence(Arc::new(CommonAccessRollbackFence), common, projection)
+        Self::with_fence(
+            Arc::new(CommonAccessRollbackFence),
+            common,
+            projection,
+            None,
+        )
     }
 
     fn disarm(&mut self) {
@@ -369,6 +418,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     async fn complete_abort(&self);
     fn notify_abort(&self);
     async fn fence_writes(&self) -> Result<()>;
+    async fn invalidate_public_access(&self) -> Result<()>;
     async fn settle_primary_prefix(&self) -> Result<()>;
     async fn cancel_configuration_work(&self) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
@@ -433,7 +483,12 @@ trait ReplicatorLifecycleBackend: Send + Sync {
     ) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()>;
-    async fn cancel_outbound_build_attempt(&self, id: &OperationId, generation: u64) -> Result<()>;
+    async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()>;
     async fn build_generation(&self, id: &OperationId) -> u64;
     async fn next_outbound(&self) -> Option<OutboundOperation>;
     async fn wait_for_build_completion(
@@ -456,7 +511,7 @@ trait ReplicatorLifecycleBackend: Send + Sync {
         &self,
         build_id: &OperationId,
         target: &ReplicaIdentity,
-    ) -> Result<Option<RuntimeOperationEvidence>>;
+    ) -> Result<BuildCompletionConfirmation>;
     async fn postcondition(&self) -> RuntimePostcondition;
 }
 
@@ -503,6 +558,10 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.sync_engine_proof().await
     }
 
+    async fn invalidate_public_access(&self) -> Result<()> {
+        self.common.fence_managed_access().await
+    }
+
     async fn settle_primary_prefix(&self) -> Result<()> {
         let token = self.legacy.operation_token().await?;
         let receipt = self.legacy.settle_primary_prefix().await?;
@@ -538,8 +597,12 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             }
             result => result?,
         };
-        let mut rollback =
-            AccessPublicationRollback::managed(self.legacy.clone(), &self.common, &projection);
+        let mut rollback = AccessPublicationRollback::managed(
+            self.legacy.clone(),
+            &self.common,
+            &projection,
+            &preparation,
+        );
         self.common.complete_access_projection(&projection).await?;
         validate_access_receipt(&preparation, &preparation, &projection, false)?;
         let publication = match self.legacy.publish_access(preparation.clone()).await {
@@ -834,7 +897,12 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         self.legacy.cancel_outbound_build(id).await
     }
 
-    async fn cancel_outbound_build_attempt(&self, id: &OperationId, generation: u64) -> Result<()> {
+    async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        _public_cleanup: bool,
+    ) -> Result<()> {
         if !self
             .common
             .cancel_common_build_attempt(id, generation)
@@ -1010,13 +1078,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 .await
                 .clone()
                 .map(|receipt| RuntimeOperationEvidence::CatchUp(Box::new(receipt))),
-            RuntimeEffectAction::BuildReplica {
-                build_id, target, ..
-            } => self
-                .confirm_build_completion(build_id, target)
-                .await
-                .ok()
-                .flatten(),
+            RuntimeEffectAction::BuildReplica { .. } => None,
             RuntimeEffectAction::SetAccessStatus { .. }
             | RuntimeEffectAction::SetReadStatus(_)
             | RuntimeEffectAction::SetWriteStatus(_) => self
@@ -1145,7 +1207,7 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
         &self,
         build_id: &OperationId,
         target: &ReplicaIdentity,
-    ) -> Result<Option<RuntimeOperationEvidence>> {
+    ) -> Result<BuildCompletionConfirmation> {
         let accepted = self
             .accepted_builds
             .read()
@@ -1153,6 +1215,12 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
             .get(build_id)
             .cloned()
             .ok_or(RuntimeError::ReconfigurationPending)?;
+        let expected_native = accepted
+            .admission
+            .native_token
+            .as_ref()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        let native_guard = self.legacy.lock_access_acceptance(expected_native).await?;
         if &accepted.admission.selection.authority.target != target
             || !self
                 .common
@@ -1161,12 +1229,19 @@ impl ReplicatorLifecycleBackend for ManagedLifecycleBackend {
                 .matches_host_admission(&accepted.admission)
             || accepted.native.selection != accepted.admission.selection
             || !accepted.native.progress.completed
+            || accepted.native.engine_session_id != expected_native.engine_session_id
+            || accepted.native.engine_generation != expected_native.engine_generation
+            || expected_native.authority.as_ref().is_none_or(|authority| {
+                authority.current_configuration
+                    != accepted.native.progress.authority.current_configuration
+            })
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        Ok(Some(RuntimeOperationEvidence::Build(Box::new(
-            accepted.native,
-        ))))
+        Ok(BuildCompletionConfirmation {
+            evidence: Some(RuntimeOperationEvidence::Build(Box::new(accepted.native))),
+            _native: Some(native_guard),
+        })
     }
 
     async fn postcondition(&self) -> RuntimePostcondition {
@@ -1196,7 +1271,7 @@ impl ManagedLifecycleBackend {
                     self.common
                         .receipt(&build.authority)
                         .await
-                        .is_ok_and(|current| current.matches_host_admission(&receipt.admission))
+                        .is_ok_and(|current| current.matches_durable_selection(&receipt.admission))
                 }
                 _ => false,
             };
@@ -1333,8 +1408,12 @@ impl ManagedLifecycleBackend {
     ) -> Result<AccessEffectCommit> {
         let preparation = self.legacy.prepare_access(read, write).await?;
         let projection = self.common.reserve_access_projection(read, write).await?;
-        let rollback =
-            AccessPublicationRollback::managed(self.legacy.clone(), &self.common, &projection);
+        let rollback = AccessPublicationRollback::managed(
+            self.legacy.clone(),
+            &self.common,
+            &projection,
+            &preparation,
+        );
         self.common.complete_access_projection(&projection).await?;
         validate_access_receipt(&preparation, &preparation, &projection, false)?;
         let publication = match self.legacy.publish_access(preparation.clone()).await {
@@ -1412,6 +1491,10 @@ impl ReplicatorLifecycleHost {
 
     pub(super) async fn fence_writes(&self) -> Result<()> {
         self.backend.fence_writes().await
+    }
+
+    pub(super) async fn invalidate_public_access(&self) -> Result<()> {
+        self.backend.invalidate_public_access().await
     }
 
     pub(super) async fn settle_primary_prefix(&self) -> Result<()> {
@@ -1573,9 +1656,10 @@ impl ReplicatorLifecycleHost {
         &self,
         id: &OperationId,
         generation: u64,
+        public_cleanup: bool,
     ) -> Result<()> {
         self.backend
-            .cancel_outbound_build_attempt(id, generation)
+            .cancel_outbound_build_attempt(id, generation, public_cleanup)
             .await
     }
 
@@ -1642,7 +1726,7 @@ impl ReplicatorLifecycleHost {
         &self,
         build_id: &OperationId,
         target: &ReplicaIdentity,
-    ) -> Result<Option<RuntimeOperationEvidence>> {
+    ) -> Result<BuildCompletionConfirmation> {
         self.backend
             .confirm_build_completion(build_id, target)
             .await
@@ -3819,6 +3903,10 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::fence_writes(self).await
     }
 
+    async fn invalidate_public_access(&self) -> Result<()> {
+        self.fence_managed_access().await
+    }
+
     async fn settle_primary_prefix(&self) -> Result<()> {
         CustomReplicatorHost::settle_primary_prefix(self).await
     }
@@ -4035,9 +4123,26 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         CustomReplicatorHost::cancel_outbound_build(self, id).await
     }
 
-    async fn cancel_outbound_build_attempt(&self, id: &OperationId, generation: u64) -> Result<()> {
+    async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()> {
         if !self.cancel_common_build_attempt(id, generation).await? {
             return Ok(());
+        }
+        if public_cleanup {
+            let _gate = self.gate.lock().await;
+            if let Some(build) = self
+                .host()?
+                .default_dependencies
+                .build_authority_store
+                .load_build(id)
+                .await?
+            {
+                self.primary.remove_replica(build.target.replica_id).await?;
+            }
         }
         self.configure().await?;
         self.complete_common_build_cancellation(id, generation)
@@ -4153,7 +4258,7 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         &self,
         build_id: &OperationId,
         target: &ReplicaIdentity,
-    ) -> Result<Option<RuntimeOperationEvidence>> {
+    ) -> Result<BuildCompletionConfirmation> {
         let receipt = self
             .receipts
             .read()
@@ -4174,7 +4279,10 @@ impl ReplicatorLifecycleBackend for CustomReplicatorHost {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        Ok(None)
+        Ok(BuildCompletionConfirmation {
+            evidence: None,
+            _native: None,
+        })
     }
 
     async fn postcondition(&self) -> RuntimePostcondition {
@@ -4261,6 +4369,13 @@ mod receipt_validation_tests {
             self.notified.notify_waiters();
         }
 
+        async fn lock_acceptance(
+            &self,
+            _expected: &NativeOperationToken,
+        ) -> Result<Option<ManagedAccessAcceptance>> {
+            Ok(None)
+        }
+
         fn abort(&self) {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.notified.notify_waiters();
@@ -4296,6 +4411,7 @@ mod receipt_validation_tests {
                 published_access_generation,
                 access_commit: access_commit.clone(),
                 generation,
+                native_token: None,
                 armed: true,
             },
             fence,

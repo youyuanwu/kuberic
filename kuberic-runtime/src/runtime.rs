@@ -41,8 +41,8 @@ use crate::replicator::copy::{
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
 use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
 use crate::replicator::{
-    ManagedReplicatorDataPlane, ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation,
-    ReplicaSetQuorumMode, Replicator,
+    ManagedAccessAcceptance, ManagedReplicatorDataPlane, ManagedReplicatorLifecycle,
+    PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator,
 };
 use crate::{Result, RuntimeError};
 
@@ -783,7 +783,10 @@ impl DefaultReplicatorInner {
                     && build.progress.authority.target == replica.identity
                     && build.generation == build_generation
                     && build.progress.completed
-                    && build.progress.durable_lsn >= state.current_progress
+                    && build
+                        .progress
+                        .catch_up_boundary_lsn
+                        .is_some_and(|boundary| build.progress.durable_lsn >= boundary)
                     && state.authority.as_ref().is_none_or(|authority| {
                         build.progress.authority.current_configuration
                             == authority.current_configuration
@@ -3866,6 +3869,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
 
     async fn publish_access(&self, preparation: AccessReceipt) -> Result<AccessReceipt> {
         let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
         self.check_aborted()?;
         if preparation.published
             || preparation.engine_session_id != self.session_id
@@ -3893,6 +3897,21 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             published: true,
             ..preparation
         })
+    }
+
+    async fn lock_access_acceptance(
+        &self,
+        expected: &NativeOperationToken,
+    ) -> Result<ManagedAccessAcceptance> {
+        let delivery = self.delivery_lock.clone().lock_owned().await;
+        self.check_aborted()?;
+        if expected.engine_session_id != self.session_id
+            || expected.engine_generation != self.fence_generation.load(Ordering::Acquire)
+            || expected.authority != self.state.read().await.authority
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        Ok(ManagedAccessAcceptance::new(delivery))
     }
 
     async fn operation_token(&self) -> Result<NativeOperationToken> {

@@ -23,7 +23,7 @@ use kuberic_runtime_internal::receipts::{
     RemovalReceipt, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
 };
 use kuberic_runtime_internal::{ReplicatorCreationIdentity, RuntimeHostToken};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
 use crate::authority::{
@@ -91,6 +91,10 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
         write: AccessStatus,
     ) -> Result<AccessReceipt>;
     async fn publish_access(&self, preparation: AccessReceipt) -> Result<AccessReceipt>;
+    async fn lock_access_acceptance(
+        &self,
+        expected: &NativeOperationToken,
+    ) -> Result<ManagedAccessAcceptance>;
     async fn operation_token(&self) -> Result<NativeOperationToken>;
     async fn catch_up_receipt(&self) -> Result<CatchUpReceipt>;
     async fn build_receipt(
@@ -160,6 +164,19 @@ pub trait ManagedReplicatorLifecycle: Send + Sync {
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()>;
     fn abort(&self);
+}
+
+#[doc(hidden)]
+pub struct ManagedAccessAcceptance {
+    _delivery: OwnedMutexGuard<()>,
+}
+
+impl ManagedAccessAcceptance {
+    pub(crate) fn new(delivery: OwnedMutexGuard<()>) -> Self {
+        Self {
+            _delivery: delivery,
+        }
+    }
 }
 
 #[async_trait]

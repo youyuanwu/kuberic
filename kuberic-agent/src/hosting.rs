@@ -152,14 +152,17 @@ impl Replicator for HostedPrimaryReplicator {
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        self.lifecycle.invalidate_public_access().await?;
         self.inner.change_role(epoch, role).await
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        self.lifecycle.invalidate_public_access().await?;
         self.inner.update_epoch(epoch).await
     }
 
     async fn close(&self) -> Result<()> {
+        self.lifecycle.invalidate_public_access().await?;
         self.inner.close().await
     }
 
@@ -266,6 +269,7 @@ struct ExactBuildCancellation {
     host: Weak<RuntimeHost>,
     build_id: Option<OperationId>,
     generation: u64,
+    public_cleanup: bool,
 }
 
 impl ExactBuildCancellation {
@@ -274,6 +278,7 @@ impl ExactBuildCancellation {
             host: Arc::downgrade(host),
             build_id: Some(build_id),
             generation,
+            public_cleanup: true,
         }
     }
 
@@ -286,7 +291,7 @@ impl ExactBuildCancellation {
             return Ok(());
         };
         host.lifecycle()?
-            .cancel_outbound_build_attempt(build_id, self.generation)
+            .cancel_outbound_build_attempt(build_id, self.generation, self.public_cleanup)
             .await?;
         self.build_id = None;
         Ok(())
@@ -294,6 +299,10 @@ impl ExactBuildCancellation {
 
     fn disarm(&mut self) {
         self.build_id = None;
+    }
+
+    fn public_completed(&mut self) {
+        self.public_cleanup = false;
     }
 }
 
@@ -304,12 +313,16 @@ impl Drop for ExactBuildCancellation {
         };
         let host = self.host.clone();
         let generation = self.generation;
-        tokio::spawn(async move {
+        let public_cleanup = self.public_cleanup;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
             if let Some(host) = host.upgrade()
                 && let Ok(lifecycle) = host.lifecycle()
             {
                 let _ = lifecycle
-                    .cancel_outbound_build_attempt(&build_id, generation)
+                    .cancel_outbound_build_attempt(&build_id, generation, public_cleanup)
                     .await;
             }
         });
@@ -816,10 +829,11 @@ impl PodRuntime {
         &self,
         build_id: &OperationId,
         generation: u64,
+        public_cleanup: bool,
     ) -> Result<()> {
         self.host
             .lifecycle()?
-            .cancel_outbound_build_attempt(build_id, generation)
+            .cancel_outbound_build_attempt(build_id, generation, public_cleanup)
             .await
     }
 
@@ -934,23 +948,20 @@ impl PodRuntime {
             ExactBuildCancellation::new(&self.host, replica.build_id.clone(), generation);
         let result = if managed {
             async {
-                let execution = lifecycle.execute_build(replica);
-                let copy = managed_copy();
-                tokio::pin!(execution);
-                tokio::pin!(copy);
-                let receipt = tokio::select! {
-                    result = &mut execution => result.map_err(E::from)?,
-                    result = &mut copy => {
-                        result?;
-                        execution.await.map_err(E::from)?
-                    }
-                };
+                let execution = async { lifecycle.execute_build(replica).await.map_err(E::from) };
+                let (receipt, ()) = tokio::try_join!(execution, managed_copy())?;
                 lifecycle.accept_build(receipt).await.map_err(E::from)
             }
             .await
         } else {
             async {
-                let receipt = lifecycle.execute_build(replica).await.map_err(E::from)?;
+                let receipt = match lifecycle.execute_build(replica).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        cancellation.public_completed();
+                        return Err(E::from(error));
+                    }
+                };
                 lifecycle.accept_build(receipt).await.map_err(E::from)
             }
             .await
@@ -1792,7 +1803,8 @@ impl RuntimeHost {
             });
         }
         let lifecycle = self.lifecycle()?;
-        let evidence = lifecycle.confirm_build_completion(build_id, target).await?;
+        let confirmation = lifecycle.confirm_build_completion(build_id, target).await?;
+        let evidence = confirmation.evidence.clone();
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,
@@ -1806,6 +1818,7 @@ impl RuntimeHost {
                 result: result.clone(),
             },
         );
+        drop(confirmation);
         Ok(result)
     }
 
