@@ -9,8 +9,7 @@ use crate::protocol::types::{
     TransitionIntent, TransitionKind, derive_agent_generation, derive_initialization_id,
 };
 
-use crate::Result;
-use crate::RuntimeError;
+use crate::host::Result;
 use crate::host::state::{SCHEMA_VERSION, StorageIdentity};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +55,7 @@ pub(crate) fn authorize_initialization(
         || command.expected_pvc_uid != observed.pvc_uid
         || command.expected_instance_id != observed.instance_id
     {
-        return Err(RuntimeError::InitializationNotAuthorized(
+        return Err(crate::host::HostError::InitializationNotAuthorized(
             "resource, Pod, PVC, or replica incarnation does not match observation".into(),
         ));
     }
@@ -75,7 +74,7 @@ pub(crate) fn authorize_initialization(
     if command.initialization_id != derived_initialization
         || command.assigned_agent_generation != derive_agent_generation(&command.initialization_id)
     {
-        return Err(RuntimeError::InitializationNotAuthorized(
+        return Err(crate::host::HostError::InitializationNotAuthorized(
             "initialization ID or durable generation is not derived from exact storage identity"
                 .into(),
         ));
@@ -93,7 +92,7 @@ pub(crate) fn authorize_initialization(
                     .iter()
                     .any(|member| member.identity == local_identity)
             {
-                return Err(RuntimeError::InitializationNotAuthorized(
+                return Err(crate::host::HostError::InitializationNotAuthorized(
                     "command does not match the persisted Bootstrap transition".into(),
                 ));
             }
@@ -109,16 +108,17 @@ pub(crate) fn authorize_initialization(
                 || provisioning.assigned_agent_generation(&command.resource_uid)
                     != command.assigned_agent_generation
             {
-                return Err(RuntimeError::InitializationNotAuthorized(
+                return Err(crate::host::HostError::InitializationNotAuthorized(
                     "command does not match persisted replacement provisioning".into(),
                 ));
             }
         }
         InitializationAuthority::ScaleUp(provisioning) => {
-            crate::protocol::validation::validate_scale_up_provisioning(provisioning)
-                .map_err(|error| RuntimeError::InitializationNotAuthorized(error.to_string()))?;
+            crate::protocol::validation::validate_scale_up_provisioning(provisioning).map_err(
+                |error| crate::host::HostError::InitializationNotAuthorized(error.to_string()),
+            )?;
             let scale_up = provisioning.scale_up().ok_or_else(|| {
-                RuntimeError::InitializationNotAuthorized(
+                crate::host::HostError::InitializationNotAuthorized(
                     "missing persisted scale-up provisioning authority".into(),
                 )
             })?;
@@ -144,7 +144,7 @@ pub(crate) fn authorize_initialization(
                 || command.effective_policy != scale_up.current_policy
                 || primary.role != crate::protocol::types::ReplicaRole::Primary
             {
-                return Err(RuntimeError::InitializationNotAuthorized(
+                return Err(crate::host::HostError::InitializationNotAuthorized(
                     "command does not match exact persisted scale-up provisioning authority".into(),
                 ));
             }
@@ -173,7 +173,7 @@ pub(crate) fn validate_established_identity(
         || identity.local_identity.replica_id != replica_id
         || identity.local_identity.instance_id != observed.instance_id
     {
-        return Err(RuntimeError::IdentityMismatch(
+        return Err(crate::host::HostError::IdentityMismatch(
             "established resource, Pod, PVC, or replica incarnation differs from this process"
                 .into(),
         ));

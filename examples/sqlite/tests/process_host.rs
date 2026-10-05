@@ -63,7 +63,7 @@ fn start_host(
 ) -> (
     SocketAddr,
     Arc<SqliteService>,
-    tokio::task::JoinHandle<kuberic_runtime::Result<RunningReplica>>,
+    tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>,
 ) {
     let address = TcpListener::bind("127.0.0.1:0")
         .unwrap()

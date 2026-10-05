@@ -1,7 +1,6 @@
 use std::fs;
 
 use super::tempdir;
-use crate::RuntimeError;
 use crate::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
     BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
@@ -150,7 +149,7 @@ async fn exhausted_effect_sequence_persists_and_rejects_new_intents_after_reopen
             action: RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
         };
         assert!(matches!(store.begin_effect(&next).await,
-            Err(RuntimeError::DurableEffectConflict(message)) if message.contains("exhausted")));
+            Err(crate::host::HostError::DurableEffectConflict(message)) if message.contains("exhausted")));
     }
     let state = store.load_state().await.unwrap();
     assert_eq!(state.next_effect_sequence, u64::MAX);
@@ -191,7 +190,7 @@ async fn pending_acceptance_conversion_is_atomic_one_way_and_preserves_stage_and
             .unwrap();
         assert!(matches!(
             store.begin_effect(&historical).await,
-            Err(RuntimeError::Sqlite(_))
+            Err(crate::host::HostError::Sqlite(_))
         ));
         drop(store);
         let store = SqliteStore::open_existing(&path, Some(&state.identity)).unwrap();
@@ -388,7 +387,7 @@ async fn schema_two_is_rejected_without_migration_or_provenance_changes() {
         .unwrap();
     assert!(matches!(
         SqliteStore::open_existing(&path, None),
-        Err(RuntimeError::SchemaMismatch {
+        Err(crate::host::HostError::SchemaMismatch {
             expected: 5,
             observed: 2
         })
@@ -611,7 +610,7 @@ fn fresh_bootstrap_store_requires_exact_persisted_authority() {
             &observed,
             InitializationAuthority::Bootstrap(&transition)
         ),
-        Err(RuntimeError::InitializationNotAuthorized(_))
+        Err(crate::host::HostError::InitializationNotAuthorized(_))
     ));
 }
 
@@ -718,7 +717,7 @@ fn fresh_scale_up_store_requires_exact_frozen_authority() {
                 &observed,
                 InitializationAuthority::ScaleUp(&provisioning)
             ),
-            Err(RuntimeError::InitializationNotAuthorized(_))
+            Err(crate::host::HostError::InitializationNotAuthorized(_))
         ));
     }
 }
@@ -866,7 +865,7 @@ async fn source_build_abandonment_resolves_only_the_exact_pending_copy_effect() 
     unrelated.begin_effect(&other).await.unwrap();
     assert!(matches!(
         unrelated.abandon_build(&retirement).await,
-        Err(RuntimeError::DurableEffectConflict(_))
+        Err(crate::host::HostError::DurableEffectConflict(_))
     ));
     let fenced = unrelated.load_state().await.unwrap();
     assert_eq!(
@@ -1181,7 +1180,7 @@ fn established_store_rejects_identity_schema_and_corruption_mismatches() {
     other_identity.pod_uid = PodUid::new("different-pod");
     assert!(matches!(
         SqliteStore::open_existing(&path, Some(&other_identity)),
-        Err(RuntimeError::IdentityMismatch(_))
+        Err(crate::host::HostError::IdentityMismatch(_))
     ));
 
     {
@@ -1191,7 +1190,7 @@ fn established_store_rejects_identity_schema_and_corruption_mismatches() {
 
     assert!(matches!(
         SqliteStore::open_existing(&path, Some(&storage_identity)),
-        Err(RuntimeError::SchemaMismatch {
+        Err(crate::host::HostError::SchemaMismatch {
             expected: SCHEMA_VERSION,
             observed: 99
         })
@@ -1200,7 +1199,7 @@ fn established_store_rejects_identity_schema_and_corruption_mismatches() {
     fs::write(&path, b"not a sqlite database").unwrap();
     assert!(matches!(
         SqliteStore::open_existing(&path, Some(&storage_identity)),
-        Err(RuntimeError::Corrupt(_))
+        Err(crate::host::HostError::Corrupt(_))
     ));
 }
 
@@ -1222,7 +1221,7 @@ fn established_identity_requires_the_same_observed_pod_and_pvc() {
     };
     assert!(matches!(
         validate_established_identity(&storage_identity, &mismatched, ReplicaId::new(1)),
-        Err(RuntimeError::IdentityMismatch(_))
+        Err(crate::host::HostError::IdentityMismatch(_))
     ));
 }
 
@@ -1366,7 +1365,7 @@ async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejec
     mutated.failover_safe_lsn = Some(13);
     assert!(matches!(
         store.begin_configuration(&mutated).await,
-        Err(RuntimeError::DurableEffectConflict(_))
+        Err(crate::host::HostError::DurableEffectConflict(_))
     ));
 
     let current_only = EnsureConfiguration {
@@ -1402,7 +1401,7 @@ async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejec
     mutated.failover_safe_lsn = Some(13);
     assert!(matches!(
         current_only_store.begin_configuration(&mutated).await,
-        Err(RuntimeError::DurableEffectConflict(_))
+        Err(crate::host::HostError::DurableEffectConflict(_))
     ));
 }
 

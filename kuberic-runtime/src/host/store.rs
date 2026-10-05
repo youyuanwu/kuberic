@@ -5,7 +5,7 @@ use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use crate::protocol::types::{FaultType, LoadMetric, OperationId};
 use async_trait::async_trait;
 
-use crate::Result;
+use crate::host::Result;
 #[cfg(test)]
 use crate::host::state::RetainedResult;
 use crate::host::state::{

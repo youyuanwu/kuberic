@@ -10,12 +10,12 @@ use crate::protocol::validation::{
     validate_secondary_scale_down_cleanup,
 };
 
-use crate::Result;
-use crate::RuntimeError;
+use crate::host::HostError;
+use crate::host::Result;
 use crate::host::state::AgentState;
 
-fn reject(message: &str) -> RuntimeError {
-    RuntimeError::CommandRejected(message.into())
+fn reject(message: &str) -> HostError {
+    HostError::CommandRejected(message.into())
 }
 
 pub(crate) fn admit_commit(

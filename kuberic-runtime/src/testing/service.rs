@@ -39,7 +39,7 @@ impl AgentService {
         runtime: Arc<PodRuntime>,
         reporter: Arc<PodRuntime>,
         bearer_token: impl Into<Arc<str>>,
-    ) -> crate::Result<Self> {
+    ) -> crate::host::Result<Self> {
         Ok(Self {
             inner: crate::host::service::AgentService::new(
                 store.inner.clone(),
@@ -57,7 +57,7 @@ impl AgentService {
         }
     }
 
-    pub async fn reconstruct_runtime(&self) -> crate::Result<()> {
+    pub async fn reconstruct_runtime(&self) -> crate::host::Result<()> {
         self.inner.reconstruct_runtime().await
     }
 
@@ -67,7 +67,7 @@ impl AgentService {
         replication: SocketAddr,
         ready: tokio::sync::watch::Sender<bool>,
         shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> crate::Result<()> {
+    ) -> crate::host::Result<()> {
         self.inner
             .serve(control, replication, ready, shutdown)
             .await

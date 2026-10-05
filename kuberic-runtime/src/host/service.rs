@@ -20,8 +20,8 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock, watch};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
-use crate::Result;
 use crate::RuntimeError;
+use crate::host::Result;
 use crate::host::coordinator::Coordinator;
 use crate::host::hosting::{PodRuntime, RuntimeDataPlane};
 use crate::host::provisioning::{InitializationAuthority, ObservedStorageIdentity};
@@ -57,7 +57,7 @@ impl InitializationService {
     ) -> Result<Self> {
         let bearer_token = bearer_token.into();
         if bearer_token.is_empty() {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "agent bearer token must not be empty".into(),
             ));
         }
@@ -100,7 +100,7 @@ impl InitializationService {
                 wait_for_shutdown(&mut shutdown).await;
             })
             .await
-            .map_err(|error| RuntimeError::CommandRejected(error.to_string()));
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()));
         ready.send_replace(false);
         result
     }
@@ -235,7 +235,9 @@ impl InitializationService {
             .filter(|provisioning| provisioning.scale_up().is_some());
         match SqliteStore::create_authorized(&self.database_path, state) {
             Ok(store) => drop(store),
-            Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(crate::host::HostError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
                 SqliteStore::open_existing(&self.database_path, Some(&identity))
                     .map_err(status_from_agent)?;
             }
@@ -429,7 +431,7 @@ where
     ) -> Result<Self> {
         let bearer_token = bearer_token.into();
         if bearer_token.is_empty() {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "agent bearer token must not be empty".into(),
             ));
         }
@@ -502,7 +504,9 @@ where
             biased;
             result = &mut startup => result,
             _ = wait_for_shutdown(&mut shutdown) => {
-                Err(crate::RuntimeError::OperationCancelled)
+                Err(crate::host::HostError::Runtime(
+                    crate::RuntimeError::OperationCancelled,
+                ))
             }
         };
         if let Err(error) = startup_result {
@@ -512,7 +516,7 @@ where
             let persisted = self.persist_partition_fault().await;
             self.runtime.abort();
             if let Err(persisted) = persisted {
-                return Err(RuntimeError::CommandRejected(format!(
+                return Err(crate::host::HostError::CommandRejected(format!(
                     "{persisted}; startup: {error}"
                 )));
             }
@@ -571,7 +575,7 @@ where
         })
         .await
         .map_err(|_| {
-            RuntimeError::CommandRejected("partition fault persistence timed out".into())
+            crate::host::HostError::CommandRejected("partition fault persistence timed out".into())
         })?
     }
 
@@ -699,7 +703,11 @@ where
         if !pending_catchup
             && !pending_abandoned_build
             && let Err(error) = self.coordinator.resume_pending().await
-            && !(pending_acceptance && matches!(error, crate::RuntimeError::ReconfigurationPending))
+            && !(pending_acceptance
+                && matches!(
+                    error,
+                    crate::host::HostError::Runtime(crate::RuntimeError::ReconfigurationPending)
+                ))
         {
             return Err(error);
         }
@@ -777,7 +785,9 @@ where
             .report(&self.runtime)
             .await
             .map_err(|error| match error {
-                RuntimeError::DurableEffectConflict(message) => Status::unavailable(message),
+                crate::host::HostError::DurableEffectConflict(message) => {
+                    Status::unavailable(message)
+                }
                 other => status_from_agent(other),
             })
     }
@@ -977,8 +987,8 @@ fn flatten_server_result(
     >,
 ) -> Result<()> {
     result
-        .map_err(|error| RuntimeError::CommandRejected(error.to_string()))?
-        .map_err(|error| RuntimeError::CommandRejected(error.to_string()))
+        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
+        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
 }
 
 async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
@@ -1162,14 +1172,18 @@ where
     }
 }
 
-fn status_from_agent(error: RuntimeError) -> Status {
+fn status_from_agent(error: crate::host::HostError) -> Status {
     match error {
-        RuntimeError::DurableEffectConflict(_) | RuntimeError::CommandRejected(_) => {
+        crate::host::HostError::DurableEffectConflict(_)
+        | crate::host::HostError::CommandRejected(_) => {
             Status::failed_precondition(error.to_string())
         }
-        RuntimeError::SessionRejected(_) => Status::failed_precondition(error.to_string()),
-        RuntimeError::Backpressure(_) => Status::resource_exhausted(error.to_string()),
-        error => status_from_runtime(error),
+        crate::host::HostError::SessionRejected(_) => {
+            Status::failed_precondition(error.to_string())
+        }
+        crate::host::HostError::Backpressure(_) => Status::resource_exhausted(error.to_string()),
+        crate::host::HostError::Runtime(error) => status_from_runtime(error),
+        _ => Status::internal(error.to_string()),
     }
 }
 

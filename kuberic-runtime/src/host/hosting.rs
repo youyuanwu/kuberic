@@ -690,6 +690,10 @@ impl PodRuntime {
             .await?
             .accept()
             .await
+            .map_err(|error| match error {
+                crate::host::HostError::Runtime(error) => error,
+                error => RuntimeError::Application(error.to_string()),
+            })
     }
 
     pub(crate) async fn prepare_effect(

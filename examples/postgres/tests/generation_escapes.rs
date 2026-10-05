@@ -58,7 +58,12 @@ async fn retired_error_inside_sf_effect_cannot_abort_replacement_or_publish_succ
         gate.release.notify_one();
         let old = old.await.unwrap();
         assert!(
-            matches!(old, Err(kuberic_runtime::RuntimeError::OperationCancelled)),
+            matches!(
+                old,
+                Err(kuberic_runtime::host::HostError::Runtime(
+                    kuberic_runtime::RuntimeError::OperationCancelled
+                ))
+            ),
             "{old:?}"
         );
         sql.simple_query("SELECT 1").await.unwrap();
@@ -105,7 +110,9 @@ async fn timed_out_sf_effect_does_not_abort_its_retryable_successor() {
     .unwrap_err();
     assert!(matches!(
         error,
-        kuberic_runtime::RuntimeError::OperationCancelled
+        kuberic_runtime::host::HostError::Runtime(
+            kuberic_runtime::RuntimeError::OperationCancelled
+        )
     ));
     owned.assert_reaped();
     assert_eq!(

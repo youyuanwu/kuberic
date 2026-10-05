@@ -166,6 +166,7 @@ impl AccessEffectTransaction {
                     Err(error) => Err(error),
                 }
             }
+            .map_err(crate::host::HostError::from)
         });
         RuntimeEffectCommit::new(decision, completion)
     }

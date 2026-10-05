@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::tempdir;
 use crate::Result as RuntimeResult;
+use crate::RuntimeError;
 use crate::application::{
     CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext, Operation,
     OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
@@ -25,6 +26,7 @@ use crate::authority::{
 use crate::control::proto;
 use crate::effects::{RuntimeEffect, RuntimeEffectAction};
 use crate::engine::{DurableState, RetainedOperationStream};
+use crate::host::Result as AgentResult;
 use crate::host::hosting::PodRuntime;
 use crate::host::process::{ApplicationStorageState, ReplicaHost, ReplicaProcessConfig};
 use crate::host::provisioning::ObservedStorageIdentity;
@@ -52,7 +54,6 @@ use crate::replicator::{
     Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
     ReplicatorSettings, StateReplicator,
 };
-use crate::{Result as AgentResult, RuntimeError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
@@ -555,7 +556,7 @@ impl crate::host::runtime_adapter::RuntimeEffectExecutor for CutRetirementReply 
             )
             .await?;
         if lose {
-            return Err(RuntimeError::SessionRejected(
+            return Err(crate::host::HostError::SessionRejected(
                 "injected lost build-retirement reply".into(),
             ));
         }
@@ -569,7 +570,7 @@ impl crate::host::runtime_adapter::RuntimeEffectExecutor for CutRetirementReply 
         if matches!(self.cut, RetirementCut::BeforeConsume)
             && self.lose_once.swap(false, Ordering::SeqCst)
         {
-            return Err(RuntimeError::SessionRejected(
+            return Err(crate::host::HostError::SessionRejected(
                 "injected pre-consume build-cancellation interruption".into(),
             ));
         }
@@ -581,7 +582,7 @@ impl crate::host::runtime_adapter::RuntimeEffectExecutor for CutRetirementReply 
         if matches!(self.cut, RetirementCut::AfterConsume)
             && self.lose_once.swap(false, Ordering::SeqCst)
         {
-            return Err(RuntimeError::SessionRejected(
+            return Err(crate::host::HostError::SessionRejected(
                 "injected lost cancelled-build consumption reply".into(),
             ));
         }
@@ -620,7 +621,7 @@ impl crate::host::runtime_adapter::RuntimeEffectExecutor for LoseCancelledBuildR
         )
         .await?;
         if self.lose_once.swap(false, Ordering::SeqCst) {
-            return Err(RuntimeError::SessionRejected(
+            return Err(crate::host::HostError::SessionRejected(
                 "injected lost cancelled-build consumption reply".into(),
             ));
         }
@@ -2596,7 +2597,12 @@ async fn startup_and_shutdown_acknowledge_durable_partition_faults() {
                     .to_string()
                     .contains("injected startup rejection")
             ),
-            "cancel" => assert!(matches!(result, Err(RuntimeError::OperationCancelled))),
+            "cancel" => assert!(matches!(
+                result,
+                Err(crate::host::HostError::Runtime(
+                    RuntimeError::OperationCancelled
+                ))
+            )),
             _ => result.unwrap(),
         }
         assert!(!*ready_rx.borrow());

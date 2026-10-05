@@ -291,7 +291,7 @@ async fn run() -> ProcessResult {
 async fn finish_shutdown(
     mut replica: RunningReplica,
     application: &PgService,
-    completion: Option<kuberic_runtime::Result<()>>,
+    completion: Option<kuberic_runtime::host::Result<()>>,
     coordination: Option<CoordinationTask>,
     trigger: ProcessResult,
 ) -> ProcessResult {

@@ -20,8 +20,7 @@ use crate::receipts::TopologyReceipt;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
-use crate::Result;
-use crate::RuntimeError;
+use crate::host::Result;
 use crate::host::command::is_access_only_configuration;
 use crate::host::state::{
     AgentState, CoordinatorStage, DeactivationState, EffectStage, PendingEffect,
@@ -118,7 +117,7 @@ fn validate_topology_receipt(effect: &RuntimeEffect, result: &RuntimeEffectResul
     if valid {
         Ok(())
     } else {
-        Err(RuntimeError::DurableEffectConflict(
+        Err(crate::host::HostError::DurableEffectConflict(
             "topology receipt does not match durable intent".into(),
         ))
     }
@@ -140,13 +139,13 @@ impl SqliteStore {
     pub(crate) fn create_authorized(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if state.identity.schema_version != SCHEMA_VERSION {
-            return Err(RuntimeError::SchemaMismatch {
+            return Err(crate::host::HostError::SchemaMismatch {
                 expected: SCHEMA_VERSION,
                 observed: state.identity.schema_version,
             });
         }
         let parent = path.parent().ok_or_else(|| {
-            RuntimeError::Corrupt("agent database path has no metadata directory".into())
+            crate::host::HostError::Corrupt("agent database path has no metadata directory".into())
         })?;
         std::fs::create_dir_all(parent)?;
         OpenOptions::new()
@@ -175,25 +174,25 @@ impl SqliteStore {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if !path.is_file() {
-            return Err(RuntimeError::MissingEstablishedStore);
+            return Err(crate::host::HostError::MissingEstablishedStore);
         }
         let connection = open_connection(&path).map_err(|error| {
-            RuntimeError::Corrupt(format!("cannot open SQLite metadata: {error}"))
+            crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
         })?;
         configure_durability(&connection)
-            .map_err(|error| RuntimeError::Corrupt(error.to_string()))?;
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
         validate_integrity(&connection)
-            .map_err(|error| RuntimeError::Corrupt(error.to_string()))?;
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA_VERSION {
-            return Err(RuntimeError::SchemaMismatch {
+            return Err(crate::host::HostError::SchemaMismatch {
                 expected: SCHEMA_VERSION,
                 observed: version,
             });
         }
         let state = load_state_from_connection(&connection)?;
         if state.identity.schema_version != version {
-            return Err(RuntimeError::SchemaMismatch {
+            return Err(crate::host::HostError::SchemaMismatch {
                 expected: version,
                 observed: state.identity.schema_version,
             });
@@ -201,7 +200,7 @@ impl SqliteStore {
         if let Some(expected) = expected_identity
             && &state.identity != expected
         {
-            return Err(RuntimeError::IdentityMismatch(
+            return Err(crate::host::HostError::IdentityMismatch(
                 "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
                     .into(),
             ));
@@ -220,7 +219,7 @@ impl SqliteStore {
 
     fn with_transaction<T>(&self, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut connection = self.connection.lock().map_err(|_| {
-            RuntimeError::Corrupt("agent database connection mutex was poisoned".into())
+            crate::host::HostError::Corrupt("agent database connection mutex was poisoned".into())
         })?;
         let transaction = connection.transaction()?;
         let result = action(&transaction)?;
@@ -250,7 +249,7 @@ impl AgentStore for SqliteStore {
 
     async fn load_state(&self) -> Result<AgentState> {
         let connection = self.connection.lock().map_err(|_| {
-            RuntimeError::Corrupt("agent database connection mutex was poisoned".into())
+            crate::host::HostError::Corrupt("agent database connection mutex was poisoned".into())
         })?;
         load_state_from_connection(&connection)
     }
@@ -276,7 +275,7 @@ impl AgentStore for SqliteStore {
             {
                 crate::host::removal::admit_commit(command, &state)?;
                 if !command.local_recovery || effect.operation_id != command.operation_id {
-                    return Err(RuntimeError::CommandRejected(
+                    return Err(crate::host::HostError::CommandRejected(
                         "historical acceptance effect identity differs".into(),
                     ));
                 }
@@ -284,13 +283,13 @@ impl AgentStore for SqliteStore {
             if state.retired_authority.is_some()
                 && !matches!(effect.action, RuntimeEffectAction::RetireReplica(_))
             {
-                return Err(RuntimeError::CommandRejected(
+                return Err(crate::host::HostError::CommandRejected(
                     "retired incarnation is permanently fenced".into(),
                 ));
             }
             if let Some(retained) = state.removal_effects.get(&effect.operation_id) {
                 if retained.effect != *effect {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "removal effect operation was mutated".into(),
                     ));
                 }
@@ -300,14 +299,14 @@ impl AgentStore for SqliteStore {
                 && retained.operation_id == effect.operation_id
             {
                 if retained.effect != *effect {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "operation ID was reused with a different effect".into(),
                     ));
                 }
                 return Ok(BeginEffect::Completed(Box::new(retained.result.clone())));
             }
             if state.next_effect_sequence == u64::MAX || effect.sequence == u64::MAX {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "effect sequence exhausted".into(),
                 ));
             }
@@ -329,7 +328,7 @@ impl AgentStore for SqliteStore {
                             return Ok(BeginEffect::Pending(effect.clone()));
                         }
                         _ => {
-                            return Err(RuntimeError::DurableEffectConflict(
+                            return Err(crate::host::HostError::DurableEffectConflict(
                                 "another durable effect is pending".into(),
                             ));
                         }
@@ -350,10 +349,12 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let pending = state.pending_effect.as_mut().ok_or_else(|| {
-                RuntimeError::DurableEffectConflict("runtime effect has no durable intent".into())
+                crate::host::HostError::DurableEffectConflict(
+                    "runtime effect has no durable intent".into(),
+                )
             })?;
             if pending.effect != *effect {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "runtime effect does not match durable intent".into(),
                 ));
             }
@@ -366,14 +367,14 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let pending = state.pending_effect.take().ok_or_else(|| {
-                RuntimeError::DurableEffectConflict(
+                crate::host::HostError::DurableEffectConflict(
                     "effect completion has no durable intent".into(),
                 )
             })?;
             if pending.effect.operation_id != result.operation_id
                 || pending.effect.sequence != result.sequence
             {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "effect completion does not match durable intent".into(),
                 ));
             }
@@ -448,7 +449,9 @@ impl AgentStore for SqliteStore {
             match &pending.effect.action {
                 RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
                     crate::protocol::validation::validate_accept_secondary_removal_commit(command)
-                        .map_err(|e| RuntimeError::DurableEffectConflict(e.to_string()))?;
+                        .map_err(|e| {
+                            crate::host::HostError::DurableEffectConflict(e.to_string())
+                        })?;
                     let intent = &command.committed.evidence.preparation.intent;
                     let receipt = match result.topology_receipt.as_deref() {
                         Some(TopologyReceipt::SecondaryRemoval(receipt)) => Some(receipt),
@@ -479,7 +482,7 @@ impl AgentStore for SqliteStore {
                                 lsn < command.committed.evidence.preparation.boundary_lsn
                             })
                     {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "historical acceptance omitted exact local postcondition".into(),
                         ));
                     }
@@ -498,12 +501,12 @@ impl AgentStore for SqliteStore {
                         .prepared_secondary_removal
                         .as_ref()
                         .ok_or_else(|| {
-                            RuntimeError::DurableEffectConflict(
+                            crate::host::HostError::DurableEffectConflict(
                                 "preparation omitted durable boundary".into(),
                             )
                         })?;
                     crate::protocol::validation::validate_secondary_removal_preparation(prepared)
-                        .map_err(|e| RuntimeError::DurableEffectConflict(e.to_string()))?;
+                        .map_err(|e| crate::host::HostError::DurableEffectConflict(e.to_string()))?;
                     if &prepared.intent != intent.as_ref()
                         || &prepared.process_session_id != process_session_id
                         || prepared.report_sequence != *report_sequence
@@ -525,7 +528,7 @@ impl AgentStore for SqliteStore {
                             .is_none_or(|lsn| lsn < prepared.boundary_lsn)
                         || result.postcondition.committed_lsn > prepared.boundary_lsn
                     {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "preparation returned conflicting authority or progress".into(),
                         ));
                     }
@@ -534,7 +537,9 @@ impl AgentStore for SqliteStore {
                 RuntimeEffectAction::RetireReplica(retired) => {
                     retired
                         .validate(&state.identity.local_identity)
-                        .map_err(|e| RuntimeError::DurableEffectConflict(e.to_string()))?;
+                        .map_err(|e| {
+                            crate::host::HostError::DurableEffectConflict(e.to_string())
+                        })?;
                     let retirement_receipt = match result.topology_receipt.as_deref() {
                         Some(TopologyReceipt::Retirement(receipt)) => Some(receipt),
                         _ => None,
@@ -550,7 +555,7 @@ impl AgentStore for SqliteStore {
                         || result.postcondition.role_transition.is_some()
                         || !result.postcondition.builds.is_empty()
                     {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "retirement omitted terminal closure".into(),
                         ));
                     }
@@ -569,7 +574,7 @@ impl AgentStore for SqliteStore {
                         .iter()
                         .any(|build| &build.authority.build_id == build_id)
                     {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "build retirement left the build active".into(),
                         ));
                     }
@@ -591,7 +596,7 @@ impl AgentStore for SqliteStore {
                     _ => None,
                 };
                 let authority = result.postcondition.authority.as_ref().ok_or_else(|| {
-                    RuntimeError::DurableEffectConflict(
+                    crate::host::HostError::DurableEffectConflict(
                         "planned switchover preparation omitted admitted authority".into(),
                     )
                 })?;
@@ -624,7 +629,7 @@ impl AgentStore for SqliteStore {
                             member.identity == *target && member.role != ReplicaRole::Primary
                         })
                 {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "planned switchover preparation returned an invalid postcondition".into(),
                     ));
                 }
@@ -647,7 +652,7 @@ impl AgentStore for SqliteStore {
                     .as_ref()
                     .is_some_and(|existing| existing != &handoff)
                 {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "another planned switchover preparation is retained".into(),
                     ));
                 }
@@ -670,7 +675,7 @@ impl AgentStore for SqliteStore {
             }
             state.retained_result = Some(retained);
             let next = result.sequence.checked_add(1).ok_or_else(|| {
-                RuntimeError::DurableEffectConflict("effect sequence exhausted".into())
+                crate::host::HostError::DurableEffectConflict("effect sequence exhausted".into())
             })?;
             state.next_effect_sequence = state.next_effect_sequence.max(next);
             write_agent_state(transaction, &state)
@@ -681,10 +686,12 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let pending = state.pending_effect.take().ok_or_else(|| {
-                RuntimeError::DurableEffectConflict("runtime effect has no durable intent".into())
+                crate::host::HostError::DurableEffectConflict(
+                    "runtime effect has no durable intent".into(),
+                )
             })?;
             if pending.effect != *effect {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "cancelled runtime effect does not match durable intent".into(),
                 ));
             }
@@ -700,7 +707,7 @@ impl AgentStore for SqliteStore {
             let mut state = load_state_from_connection(transaction)?;
             if let Some(retained) = state.removal_commands.get(&command.operation_id) {
                 if retained.command != *command {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "removal command operation was mutated".into(),
                     ));
                 }
@@ -710,7 +717,7 @@ impl AgentStore for SqliteStore {
                 && retained.command.operation_id == command.operation_id
             {
                 if retained.command != *command {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "operation ID was reused with different configuration authority".into(),
                     ));
                 }
@@ -719,7 +726,7 @@ impl AgentStore for SqliteStore {
             if let Some(pending) = state.reconfiguration.as_ref() {
                 if pending.command != *command {
                     if command.current_epoch <= pending.command.current_epoch {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "another configuration command is pending".into(),
                         ));
                     }
@@ -730,7 +737,7 @@ impl AgentStore for SqliteStore {
                             .as_str()
                             .starts_with(&format!("{}:", pending.command.operation_id.as_str()))
                     {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "pending runtime effect is not owned by the superseded command".into(),
                         ));
                     }
@@ -767,7 +774,7 @@ impl AgentStore for SqliteStore {
             if state.retired_builds.contains(&command.operation_id)
                 || state.abandoned_builds.contains(&command.operation_id)
             {
-                return Err(RuntimeError::CommandRejected(
+                return Err(crate::host::HostError::CommandRejected(
                     "abandoned or retired build authority cannot be reopened".into(),
                 ));
             }
@@ -783,7 +790,7 @@ impl AgentStore for SqliteStore {
                     || (existing.authority.is_none()
                         && existing.source_session_id != command.source_session_id)
                 {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "build operation was reused with different immutable authority".into(),
                     ));
                 }
@@ -836,7 +843,7 @@ impl AgentStore for SqliteStore {
                                 ))
                 );
                 if !matching_build && !matching_retirement {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "build abandonment conflicts with unrelated pending work".into(),
                     ));
                 }
@@ -856,10 +863,12 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let record = state.reconfiguration.as_mut().ok_or_else(|| {
-                RuntimeError::DurableEffectConflict("configuration command is not pending".into())
+                crate::host::HostError::DurableEffectConflict(
+                    "configuration command is not pending".into(),
+                )
             })?;
             if &record.command.operation_id != operation_id || record.stage != expected {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "configuration stage does not match durable command".into(),
                 ));
             }
@@ -886,12 +895,14 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let record = state.reconfiguration.take().ok_or_else(|| {
-                RuntimeError::DurableEffectConflict("configuration command is not pending".into())
+                crate::host::HostError::DurableEffectConflict(
+                    "configuration command is not pending".into(),
+                )
             })?;
             if &record.command.operation_id != operation_id
                 || record.stage != CoordinatorStage::Complete
             {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "configuration command has not reached its terminal stage".into(),
                 ));
             }
@@ -905,7 +916,7 @@ impl AgentStore for SqliteStore {
                         .as_ref()
                         .is_some_and(|prepared| &prepared.preparation() != retirement_id)
                     {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "restoration retires another preparation".into(),
                         ));
                     }
@@ -918,12 +929,12 @@ impl AgentStore for SqliteStore {
                         .as_ref()
                         .or(state.retired_switchover.as_ref())
                         .ok_or_else(|| {
-                            RuntimeError::DurableEffectConflict(
+                            crate::host::HostError::DurableEffectConflict(
                                 "configuration retires missing switchover preparation".into(),
                             )
                         })?;
                     if record.command.switchover_handoff.as_ref() != Some(prepared) {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "configuration retires a changed switchover certificate".into(),
                         ));
                     }
@@ -931,7 +942,7 @@ impl AgentStore for SqliteStore {
                         || record.command.retire_switchover_preparation_ids[0]
                             != prepared.preparation()
                     {
-                        return Err(RuntimeError::DurableEffectConflict(
+                        return Err(crate::host::HostError::DurableEffectConflict(
                             "configuration retires another switchover preparation".into(),
                         ));
                     }
@@ -965,7 +976,7 @@ impl AgentStore for SqliteStore {
                                     || retired.generation > retirement_id.generation))
                     })
                 {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "preparation retirement regresses durable fencing".into(),
                     ));
                 }
@@ -1026,7 +1037,7 @@ impl AgentStore for SqliteStore {
                 || expected_version != SCHEMA_VERSION
                 || target_version != SCHEMA_VERSION
             {
-                return Err(RuntimeError::SchemaMismatch {
+                return Err(crate::host::HostError::SchemaMismatch {
                     expected: target_version,
                     observed,
                 });
@@ -1050,7 +1061,7 @@ impl AgentStore for SqliteStore {
             if load_metrics.iter().any(|metric| {
                 metric.name.is_empty() || metric.value < 0 || !names.insert(metric.name.clone())
             }) {
-                return Err(RuntimeError::CommandRejected(
+                return Err(crate::host::HostError::CommandRejected(
                     "load metrics require unique nonempty names and nonnegative values".into(),
                 ));
             }
@@ -1097,7 +1108,7 @@ fn validate_acceptance_conversion(
                 || p.verified_lsn < command.committed.evidence.preparation.boundary_lsn
         })
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "acceptance conversion requires exact durable authority and verified boundary".into(),
         ));
     }
@@ -1866,7 +1877,7 @@ fn configure_durability(connection: &Connection) -> Result<()> {
     let journal_mode: String =
         connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(RuntimeError::Corrupt(format!(
+        return Err(crate::host::HostError::Corrupt(format!(
             "SQLite refused WAL journaling and selected {journal_mode}"
         )));
     }
@@ -1878,7 +1889,7 @@ fn configure_durability(connection: &Connection) -> Result<()> {
     )?;
     let synchronous: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
     if synchronous != 2 {
-        return Err(RuntimeError::Corrupt(
+        return Err(crate::host::HostError::Corrupt(
             "SQLite synchronous mode is not FULL".into(),
         ));
     }
@@ -1943,7 +1954,7 @@ fn create_schema(connection: &mut Connection, state: &AgentState) -> Result<()> 
 fn validate_integrity(connection: &Connection) -> Result<()> {
     let result: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
     if result != "ok" {
-        return Err(RuntimeError::Corrupt(result));
+        return Err(crate::host::HostError::Corrupt(result));
     }
     Ok(())
 }
@@ -2053,7 +2064,7 @@ mod tests {
         drop(connection);
         assert!(matches!(
             SqliteStore::open_existing(&path, Some(&expected)),
-            Err(RuntimeError::SchemaMismatch {
+            Err(crate::host::HostError::SchemaMismatch {
                 expected: 5,
                 observed: 4
             })

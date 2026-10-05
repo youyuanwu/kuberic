@@ -7,6 +7,7 @@ use crate::application::OpenMode;
 use crate::effects::{
     RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition, RuntimeSnapshot,
 };
+use crate::host::Result;
 use crate::host::hosting::empty_snapshot;
 use crate::host::recovery::{RecoveryDecision, inspect_recovery, recover_pending};
 use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
@@ -18,7 +19,6 @@ use crate::protocol::types::{
     AccessStatus, AgentGeneration, EffectivePolicy, InitializationId, OperationId, PodUid, PvcUid,
     ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
 };
-use crate::{Result, RuntimeError};
 
 use super::tempdir;
 
@@ -161,7 +161,7 @@ async fn recovery_starts_idle_and_requires_closed_writes() {
     writable.write_status = AccessStatus::Granted;
     assert!(matches!(
         inspect_recovery(store.as_ref(), &writable).await,
-        Err(RuntimeError::DurableEffectConflict(_))
+        Err(crate::host::HostError::DurableEffectConflict(_))
     ));
     assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
     adapter.execute(effect()).await.unwrap();

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::control::proto;
 use crate::protocol::types::{AccessStatus, FaultType, ReplicaRole};
 
-use crate::Result;
+use crate::host::Result;
 use crate::host::hosting::PodRuntime;
 use crate::host::session::ProcessSession;
 use crate::host::store::AgentStore;
@@ -36,7 +36,7 @@ impl<S: AgentStore> AgentReporter<S> {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         let durable = self.store.load_state().await?;
@@ -61,7 +61,7 @@ impl<S: AgentStore> AgentReporter<S> {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.into()),
                 }
             }
         }
@@ -93,7 +93,7 @@ impl<S: AgentStore> AgentReporter<S> {
                 partition.reported_fault,
             ));
         }
-        Err(crate::RuntimeError::DurableEffectConflict(
+        Err(crate::host::HostError::DurableEffectConflict(
             "agent authority changed while constructing a status report".into(),
         ))
     }

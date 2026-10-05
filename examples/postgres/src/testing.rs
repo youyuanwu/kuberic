@@ -72,7 +72,7 @@ pub struct PgPod {
     pub identity: ReplicaIdentity,
     pub session: ProcessSessionId,
     agent: AgentService<SqliteStore, PodRuntime>,
-    control_server: Option<tokio::task::JoinHandle<kuberic_runtime::Result<()>>>,
+    control_server: Option<tokio::task::JoinHandle<kuberic_runtime::host::Result<()>>>,
     pub root: PathBuf,
     pub endpoint: String,
     server: tokio::task::JoinHandle<()>,
@@ -261,7 +261,7 @@ impl PgPod {
         build.await.unwrap();
     }
 
-    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_runtime::Result<()> {
+    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         self.effect_as(
             OperationId::new(format!("native-effect-{sequence}")),
@@ -274,7 +274,7 @@ impl PgPod {
         &self,
         operation_id: OperationId,
         action: RuntimeEffectAction,
-    ) -> kuberic_runtime::Result<()> {
+    ) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
             .execute(RuntimeEffect {
@@ -474,7 +474,7 @@ impl PgPod {
 
     pub async fn status(
         &self,
-    ) -> kuberic_runtime::Result<kuberic_runtime::control::proto::AgentStatusReport> {
+    ) -> kuberic_runtime::host::Result<kuberic_runtime::control::proto::AgentStatusReport> {
         kuberic_runtime::testing::report::AgentReporter::new(self.store.clone())
             .report(&self.runtime)
             .await

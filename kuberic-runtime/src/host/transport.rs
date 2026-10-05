@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::Result;
+use crate::host::Result;
 use crate::host::hosting::PodRuntime;
 use crate::host::service::SessionRegistry;
 use crate::host::store::AgentStore;
@@ -169,7 +169,7 @@ where
     ) -> Result<Self> {
         let bearer_token = bearer_token.into();
         if bearer_token.is_empty() {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "agent bearer token must not be empty".into(),
             ));
         }
@@ -199,8 +199,10 @@ where
             proto::agent_control_client::AgentControlClient::connect(endpoint),
         )
         .await
-        .map_err(|_| RuntimeError::SessionRejected("peer status connection timed out".into()))?
-        .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?;
+        .map_err(|_| {
+            crate::host::HostError::SessionRejected("peer status connection timed out".into())
+        })?
+        .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?;
         let mut request = Request::new(proto::GetAgentStatusRequest {
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             resource_uid: self.resource_uid.to_string(),
@@ -210,20 +212,22 @@ where
         add_bearer_token(&mut request, &self.bearer_token)?;
         let report = tokio::time::timeout(self.deadline, client.get_status(request))
             .await
-            .map_err(|_| RuntimeError::SessionRejected("peer status request timed out".into()))?
-            .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?
+            .map_err(|_| {
+                crate::host::HostError::SessionRejected("peer status request timed out".into())
+            })?
+            .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?
             .into_inner();
         let address = report.replication_address.clone();
         let AgentObservation::Report(report) =
             crate::control::normalize_agent_status_report(report)
-                .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?
+                .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?
         else {
-            return Err(RuntimeError::SessionRejected(
+            return Err(crate::host::HostError::SessionRejected(
                 "peer is not initialized".into(),
             ));
         };
         if report.identity != *receiver {
-            return Err(RuntimeError::SessionRejected(
+            return Err(crate::host::HostError::SessionRejected(
                 "peer status returned another exact identity".into(),
             ));
         }
@@ -308,8 +312,10 @@ where
             proto::agent_control_client::AgentControlClient::connect(control_endpoint),
         )
         .await
-        .map_err(|_| RuntimeError::SessionRejected("build target connection timed out".into()))?
-        .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?;
+        .map_err(|_| {
+            crate::host::HostError::SessionRejected("build target connection timed out".into())
+        })?
+        .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?;
         let mut request = Request::new(build_target_admission_request(
             self.resource_uid.as_ref(),
             &endpoint.identity,
@@ -319,14 +325,18 @@ where
         add_bearer_token(&mut request, &self.bearer_token)?;
         let response = tokio::time::timeout(self.deadline, control.execute(request))
             .await
-            .map_err(|_| RuntimeError::SessionRejected("build target admission timed out".into()))?
-            .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?
+            .map_err(|_| {
+                crate::host::HostError::SessionRejected("build target admission timed out".into())
+            })?
+            .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?
             .into_inner();
         let report = response.observation.ok_or_else(|| {
-            RuntimeError::SessionRejected("build target admission omitted its report".into())
+            crate::host::HostError::SessionRejected(
+                "build target admission omitted its report".into(),
+            )
         })?;
         crate::control::validate_agent_status_report(&report)
-            .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?;
+            .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?;
 
         let build_id = endpoint.build_id.clone();
         self.runtime
@@ -357,10 +367,10 @@ where
                         self.dispatch_copy(endpoint.identity.clone(), item, false)
                             .await?;
                         if catch_up_boundary.is_some_and(|boundary| delivered_lsn >= boundary) {
-                            return Ok::<(), RuntimeError>(());
+                            return Ok::<(), crate::host::HostError>(());
                         }
                     }
-                    Err(RuntimeError::SessionRejected(
+                    Err(crate::host::HostError::SessionRejected(
                         "copy stream ended before its final durable boundary".into(),
                     ))
                 },
@@ -389,21 +399,25 @@ where
             proto::replication_data_client::ReplicationDataClient::connect(endpoint),
         )
         .await
-        .map_err(|_| RuntimeError::SessionRejected("copy connection timed out".into()))?
-        .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?;
+        .map_err(|_| crate::host::HostError::SessionRejected("copy connection timed out".into()))?
+        .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?;
         let mut request = Request::new(iter([item]));
         add_bearer_token(&mut request, &self.bearer_token)?;
         let mut acknowledgements = tokio::time::timeout(self.deadline, client.build(request))
             .await
-            .map_err(|_| RuntimeError::SessionRejected("copy request timed out".into()))?
-            .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?
+            .map_err(|_| crate::host::HostError::SessionRejected("copy request timed out".into()))?
+            .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?
             .into_inner();
         let acknowledgement = tokio::time::timeout(self.deadline, acknowledgements.message())
             .await
-            .map_err(|_| RuntimeError::SessionRejected("copy acknowledgement timed out".into()))?
-            .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?
+            .map_err(|_| {
+                crate::host::HostError::SessionRejected("copy acknowledgement timed out".into())
+            })?
+            .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?
             .ok_or_else(|| {
-                RuntimeError::SessionRejected("copy peer returned no acknowledgement".into())
+                crate::host::HostError::SessionRejected(
+                    "copy peer returned no acknowledgement".into(),
+                )
             })?;
         let current_sender_session = self.transport.lock().await.local_session().to_string();
         let current_receiver_session = self.peer_session(&receiver).await?.to_string();
@@ -442,7 +456,7 @@ fn validate_copy_ack_sessions(
         || current_sender_session != expected_sender_session
         || current_receiver_session != expected_receiver_session
     {
-        return Err(RuntimeError::SessionRejected(
+        return Err(crate::host::HostError::SessionRejected(
             "copy acknowledgement belongs to an obsolete process session".into(),
         ));
     }
@@ -494,30 +508,38 @@ where
                 )
                 .await
                 .map_err(|_| {
-                    RuntimeError::SessionRejected("replication connection timed out".into())
+                    crate::host::HostError::SessionRejected(
+                        "replication connection timed out".into(),
+                    )
                 })?
-                .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?;
+                .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?;
                 let mut request = Request::new(iter([item]));
                 add_bearer_token(&mut request, &self.bearer_token)?;
                 let mut acknowledgements =
                     tokio::time::timeout(self.deadline, client.replicate(request))
                         .await
                         .map_err(|_| {
-                            RuntimeError::SessionRejected("replication request timed out".into())
+                            crate::host::HostError::SessionRejected(
+                                "replication request timed out".into(),
+                            )
                         })?
-                        .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?
+                        .map_err(|error| {
+                            crate::host::HostError::SessionRejected(error.to_string())
+                        })?
                         .into_inner();
                 let acknowledgement =
                     tokio::time::timeout(self.deadline, acknowledgements.message())
                         .await
                         .map_err(|_| {
-                            RuntimeError::SessionRejected(
+                            crate::host::HostError::SessionRejected(
                                 "replication acknowledgement timed out".into(),
                             )
                         })?
-                        .map_err(|error| RuntimeError::SessionRejected(error.to_string()))?
+                        .map_err(|error| {
+                            crate::host::HostError::SessionRejected(error.to_string())
+                        })?
                         .ok_or_else(|| {
-                            RuntimeError::SessionRejected(
+                            crate::host::HostError::SessionRejected(
                                 "replication peer returned no acknowledgement".into(),
                             )
                         })?;
@@ -526,7 +548,7 @@ where
                     || acknowledgement.sender_session_id
                         != self.transport.lock().await.local_session().as_str()
                 {
-                    return Err(RuntimeError::SessionRejected(
+                    return Err(crate::host::HostError::SessionRejected(
                         "replication ACK does not match the dispatched sessions".into(),
                     ));
                 }
@@ -538,6 +560,7 @@ where
                     .lock()
                     .await
                     .acknowledge_replication(&receiver, applied_lsn)
+                    .map_err(crate::host::HostError::from)
             }
             QueuedOutbound::Copy {
                 receiver,
@@ -561,9 +584,9 @@ where
 }
 
 fn add_bearer_token<T>(request: &mut Request<T>, token: &str) -> Result<()> {
-    let value = format!("Bearer {token}")
-        .parse()
-        .map_err(|error| RuntimeError::CommandRejected(format!("invalid bearer token: {error}")))?;
+    let value = format!("Bearer {token}").parse().map_err(|error| {
+        crate::host::HostError::CommandRejected(format!("invalid bearer token: {error}"))
+    })?;
     request.metadata_mut().insert("authorization", value);
     Ok(())
 }
@@ -688,7 +711,7 @@ pub(crate) async fn run_outbound<D: OutboundDispatcher + 'static>(
                         shutdown.clone(),
                     );
                     replacement.send(outbound).map_err(|_| {
-                        RuntimeError::Backpressure("outbound peer worker stopped".into())
+                        crate::host::HostError::Backpressure("outbound peer worker stopped".into())
                     })?;
                     *sender = replacement;
                 }
@@ -717,7 +740,10 @@ fn spawn_outbound_worker<D: OutboundDispatcher + 'static>(
             .await
             {
                 tracing::warn!(%error, "outbound delivery failed");
-                if matches!(error, RuntimeError::OperationCancelled) {
+                if matches!(
+                    error,
+                    crate::host::HostError::Runtime(RuntimeError::OperationCancelled)
+                ) {
                     break;
                 }
             }
@@ -747,7 +773,10 @@ fn spawn_delivery_worker<D: OutboundDispatcher + 'static>(
             .await
             {
                 tracing::warn!(%error, "outbound delivery failed");
-                if matches!(error, RuntimeError::OperationCancelled) {
+                if matches!(
+                    error,
+                    crate::host::HostError::Runtime(RuntimeError::OperationCancelled)
+                ) {
                     break;
                 }
             }
@@ -770,7 +799,9 @@ async fn dispatch_queued_with_retry<D: OutboundDispatcher>(
             if let Some(receiver) = queued_outbound_receiver(&queued) {
                 transport.lock().await.retire_peer(receiver);
             }
-            return Err(RuntimeError::OperationCancelled);
+            return Err(crate::host::HostError::Runtime(
+                RuntimeError::OperationCancelled,
+            ));
         }
         let mut dispatch_shutdown = shutdown.clone();
         let result = tokio::select! {
@@ -780,7 +811,10 @@ async fn dispatch_queued_with_retry<D: OutboundDispatcher>(
         };
         match result {
             Ok(()) => return Ok(()),
-            Err(error @ (RuntimeError::SessionRejected(_) | RuntimeError::Backpressure(_))) => {
+            Err(
+                error @ (crate::host::HostError::SessionRejected(_)
+                | crate::host::HostError::Backpressure(_)),
+            ) => {
                 if matches!(queued, QueuedOutbound::Build(_)) {
                     return Err(error);
                 }
@@ -841,7 +875,7 @@ async fn deliver_outbound_with_runtime<D: OutboundDispatcher>(
                     _ = tokio::time::sleep(retry_delay) => {}
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     };
     dispatch_queued_with_retry(runtime, transport, dispatcher, queued, shutdown).await
@@ -1350,7 +1384,7 @@ mod tests {
                 && self.failed_peer_attempts.fetch_add(1, Ordering::SeqCst)
                     < self.failures_before_success
             {
-                return Err(RuntimeError::SessionRejected(
+                return Err(crate::host::HostError::SessionRejected(
                     "injected unavailable peer".into(),
                 ));
             }

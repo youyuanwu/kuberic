@@ -8,7 +8,7 @@ use crate::protocol::types::OperationId;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 
-use crate::Result;
+use crate::host::Result;
 use crate::host::hosting::PodRuntime;
 use crate::host::store::{AgentStore, BeginEffect};
 
@@ -100,7 +100,7 @@ pub(crate) trait RuntimeEffectExecutor: Send + Sync {
         &self,
         _effect: RuntimeEffect,
     ) -> Result<RuntimeEffectResult> {
-        Err(RuntimeError::DurableEffectConflict(
+        Err(crate::host::HostError::DurableEffectConflict(
             "runtime cannot consume a cancelled build effect".into(),
         ))
     }
@@ -127,7 +127,7 @@ pub(crate) trait RuntimeEffectExecutor: Send + Sync {
         _build_id: &OperationId,
         _target: &crate::protocol::types::ReplicaIdentity,
     ) -> Result<()> {
-        Err(RuntimeError::DurableEffectConflict(
+        Err(crate::host::HostError::DurableEffectConflict(
             "runtime cannot observe build completion".into(),
         ))
     }
@@ -136,7 +136,7 @@ pub(crate) trait RuntimeEffectExecutor: Send + Sync {
         &self,
         _effect: RuntimeEffect,
     ) -> Result<RuntimeEffectResult> {
-        Err(RuntimeError::DurableEffectConflict(
+        Err(crate::host::HostError::DurableEffectConflict(
             "runtime cannot publish build completion".into(),
         ))
     }
@@ -238,8 +238,10 @@ where
                 let execution = match self.executor.prepare_runtime_effect(effect.clone()).await {
                     Ok(execution) => execution,
                     Err(
-                        error @ (crate::RuntimeError::OperationCancelled
-                        | crate::RuntimeError::ReplicaRemoved(_)),
+                        error @ crate::host::HostError::Runtime(
+                            crate::RuntimeError::OperationCancelled
+                            | crate::RuntimeError::ReplicaRemoved(_),
+                        ),
                     ) => {
                         let state = self.store.load_state().await?;
                         let removal = matches!(
@@ -305,7 +307,7 @@ where
                 build_id, target, ..
             } => (build_id, target),
             _ => {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "build completion wait requires a build effect".into(),
                 ));
             }
@@ -326,8 +328,10 @@ where
                 Ok(completed)
             }
             Err(
-                error @ (crate::RuntimeError::OperationCancelled
-                | crate::RuntimeError::ReplicaRemoved(_)),
+                error @ crate::host::HostError::Runtime(
+                    crate::RuntimeError::OperationCancelled
+                    | crate::RuntimeError::ReplicaRemoved(_),
+                ),
             ) => {
                 let state = self.store.load_state().await?;
                 if state.abandoned_builds.contains(build_id) {
@@ -357,7 +361,7 @@ where
     ) -> Result<Option<RuntimeEffectResult>> {
         let state = self.store.load_state().await?;
         if !state.abandoned_builds.contains(build_id) {
-            return Err(RuntimeError::DurableEffectConflict(
+            return Err(crate::host::HostError::DurableEffectConflict(
                 "build cancellation lacks durable abandonment".into(),
             ));
         }
@@ -385,7 +389,7 @@ where
             return Ok(None);
         }
         if !matching_build {
-            return Err(RuntimeError::DurableEffectConflict(
+            return Err(crate::host::HostError::DurableEffectConflict(
                 "build cancellation would consume unrelated pending work".into(),
             ));
         }
@@ -414,7 +418,7 @@ pub(crate) fn require_matching_result(
     result: &RuntimeEffectResult,
 ) -> Result<()> {
     if effect.operation_id != result.operation_id || effect.sequence != result.sequence {
-        return Err(RuntimeError::DurableEffectConflict(
+        return Err(crate::host::HostError::DurableEffectConflict(
             "runtime returned a result for a different durable effect".into(),
         ));
     }

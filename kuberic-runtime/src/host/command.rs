@@ -9,8 +9,7 @@ use crate::protocol::validation::{
     validate_scale_up_configuration, validate_transition_relationship,
 };
 
-use crate::Result;
-use crate::RuntimeError;
+use crate::host::Result;
 use crate::host::provisioning::{
     InitializationAuthority, ObservedStorageIdentity, authorize_initialization,
 };
@@ -44,7 +43,7 @@ pub(crate) fn admit_switchover_preparation(
     state: &AgentState,
 ) -> Result<()> {
     if state.retired_authority.is_some() || state.removal_pending() {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "secondary removal fences switchover preparation".into(),
         ));
     }
@@ -66,7 +65,7 @@ pub(crate) fn admit_switchover_preparation(
         || command.expected_agent_generation != identity.agent_generation
         || command.source != *identity
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "planned switchover preparation target does not match durable identity".into(),
         ));
     }
@@ -80,7 +79,7 @@ pub(crate) fn admit_switchover_preparation(
                 && command.preparation_generation <= retired.generation
         })
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "planned switchover preparation has already been retired".into(),
         ));
     }
@@ -95,27 +94,27 @@ pub(crate) fn admit_switchover_preparation(
         {
             return Ok(());
         }
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "another planned switchover preparation is retained".into(),
         ));
     }
     if state.reconfiguration.is_some() {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "configuration work is already pending".into(),
         ));
     }
     if state.role != ReplicaRole::Primary || state.write_status != AccessStatus::Granted {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "planned switchover preparation requires the writable primary".into(),
         ));
     }
     let current = state.current_configuration.as_ref().ok_or_else(|| {
-        RuntimeError::CommandRejected(
+        crate::host::HostError::CommandRejected(
             "planned switchover preparation requires installed authority".into(),
         )
     })?;
     if current != &command.current_configuration {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "planned switchover preparation differs from installed authority".into(),
         ));
     }
@@ -131,7 +130,7 @@ pub(crate) fn admit_switchover_preparation(
             .iter()
             .any(|member| member.identity == command.target && member.role != ReplicaRole::Primary)
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "planned switchover preparation source or target differs from authority".into(),
         ));
     }
@@ -166,7 +165,7 @@ fn admit_configuration_with_replay(
     persisted_exact_replay: bool,
 ) -> Result<AdmittedAuthority> {
     if state.retired_authority.is_some() {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "retired incarnation cannot admit authority".into(),
         ));
     }
@@ -174,7 +173,7 @@ fn admit_configuration_with_replay(
         return crate::host::removal::admit_configuration(command, state, persisted_exact_replay);
     }
     if state.removal_pending() {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "prepared removal may only roll forward".into(),
         ));
     }
@@ -187,12 +186,12 @@ fn admit_configuration_with_replay(
             .as_ref()
             .is_some_and(|policy| policy != &command.effective_policy)
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "secondary scale-down execution is not enabled".into(),
         ));
     }
     if command.operation_id.is_empty() {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "operation ID must not be empty".into(),
         ));
     }
@@ -201,12 +200,12 @@ fn admit_configuration_with_replay(
         || command.expected_instance_id != identity.instance_id
         || command.expected_agent_generation != identity.agent_generation
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "command target does not match durable replica identity".into(),
         ));
     }
     if command.current_epoch != command.current_configuration.epoch {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "current epoch differs from Current Configuration".into(),
         ));
     }
@@ -216,12 +215,12 @@ fn admit_configuration_with_replay(
         .map(|configuration| configuration.epoch)
         != command.previous_epoch
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "previous epoch differs from Previous Configuration".into(),
         ));
     }
     if command.current_epoch < state.highest_epoch {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "command epoch regresses durable authority".into(),
         ));
     }
@@ -243,7 +242,7 @@ fn admit_configuration_with_replay(
             .as_ref()
             .is_some_and(|current| current != &command.current_configuration)
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "same-epoch command conflicts with durable Current Configuration".into(),
         ));
     }
@@ -252,7 +251,7 @@ fn admit_configuration_with_replay(
         && !completed_current_only_replay
         && state.previous_configuration != command.previous_configuration
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "same-epoch command conflicts with durable Previous Configuration".into(),
         ));
     }
@@ -262,7 +261,7 @@ fn admit_configuration_with_replay(
             .as_ref()
             .unwrap_or(&state.identity.effective_policy)
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "command policy differs from admitted policy".into(),
         ));
     }
@@ -292,7 +291,7 @@ fn admit_configuration_with_replay(
                 command.retire_switchover_preparation_ids[0] != prepared.preparation()
             })
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "restoration requires exact starting authority and the whole retained certificate"
                     .into(),
             ));
@@ -309,7 +308,7 @@ fn admit_configuration_with_replay(
     }
     match command.transition_kind {
         TransitionKind::Failover if command.failover_safe_lsn.is_none_or(|lsn| lsn < 0) => {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "failover command requires a non-negative election-safe LSN".into(),
             ));
         }
@@ -318,7 +317,7 @@ fn admit_configuration_with_replay(
         | TransitionKind::PlannedSwitchover
             if command.failover_safe_lsn.is_some() =>
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "only failover authority can carry an election-safe LSN".into(),
             ));
         }
@@ -340,7 +339,7 @@ fn admit_configuration_with_replay(
         && state.role == ReplicaRole::Primary;
     if command.primary_write_status == AccessStatus::Granted && state.prepared_switchover.is_some()
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "retained switchover preparation forbids write grants".into(),
         ));
     }
@@ -348,7 +347,7 @@ fn admit_configuration_with_replay(
         && !transition_primary_grant
         && !installed_primary_grant
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "write grant requires the exact installed primary authority".into(),
         ));
     }
@@ -357,25 +356,25 @@ fn admit_configuration_with_replay(
             || (!current_only_completion && !completed_current_only_replay)
             || command.transition_kind == TransitionKind::Bootstrap
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "current-only completion does not match durable PC/CC authority".into(),
             ));
         }
         if command.transition_kind == TransitionKind::Replacement
             && command.retire_build_ids.is_empty()
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "replacement current-only completion must retire its build".into(),
             ));
         }
     } else {
         if !command.retire_build_ids.is_empty() {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "build retirement is valid only for current-only completion".into(),
             ));
         }
         if !command.retire_switchover_preparation_ids.is_empty() {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "switchover preparation retirement is valid only for current-only completion"
                     .into(),
             ));
@@ -386,17 +385,17 @@ fn admit_configuration_with_replay(
             &command.current_configuration,
             &command.effective_policy,
         )
-        .map_err(|error| RuntimeError::CommandRejected(error.to_string()))?;
+        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?;
     }
     if command.transition_kind == TransitionKind::PlannedSwitchover {
         if command.primary_write_status == AccessStatus::Granted {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "planned switchover must remain write-closed until stable access convergence"
                     .into(),
             ));
         }
         let handoff = command.switchover_handoff.as_ref().ok_or_else(|| {
-            RuntimeError::CommandRejected(
+            crate::host::HostError::CommandRejected(
                 "planned switchover authority requires a handoff certificate".into(),
             )
         })?;
@@ -481,14 +480,14 @@ fn admit_configuration_with_replay(
                 && *identity != handoff.source
                 && !command.retire_switchover_preparation_ids.is_empty())
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "planned switchover handoff differs from configuration authority".into(),
             ));
         }
     } else if command.switchover_handoff.is_some()
         || !command.retire_switchover_preparation_ids.is_empty()
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "non-switchover command contains switchover evidence".into(),
         ));
     }
@@ -508,11 +507,11 @@ fn admit_configuration_with_replay(
     };
     admitted
         .validate()
-        .map_err(|error| RuntimeError::CommandRejected(error.to_string()))?;
+        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?;
     if command.transition_kind == TransitionKind::Bootstrap
         && admitted.local_role() == ReplicaRole::None
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "bootstrap authority must assign a runtime role".into(),
         ));
     }
@@ -525,7 +524,7 @@ fn admit_scale_up_configuration(
     persisted_exact_replay: bool,
 ) -> Result<AdmittedAuthority> {
     validate_scale_up_configuration(command)
-        .map_err(|error| RuntimeError::CommandRejected(error.to_string()))?;
+        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?;
     let evidence = command
         .scale_up_evidence
         .as_ref()
@@ -538,7 +537,7 @@ fn admit_scale_up_configuration(
         || command.expected_agent_generation != identity.agent_generation
         || command.current_epoch < state.highest_epoch
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "scale-up command target or epoch differs from durable identity".into(),
         ));
     }
@@ -558,7 +557,7 @@ fn admit_scale_up_configuration(
         && existing.intent() != intent
         && !sequential_supersession
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "scale-up command conflicts with incomplete durable attempt authority".into(),
         ));
     }
@@ -681,7 +680,7 @@ fn admit_scale_up_configuration(
                 && !exact_provisional_return
                 && !(exact_installed_failover && (command.current_only || persisted_exact_replay)))
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "carried scale-up failover lacks durable PC/CC authority or a new-primary witness"
                     .into(),
             ));
@@ -689,12 +688,12 @@ fn admit_scale_up_configuration(
     }
     if *identity == intent.target {
         let provisioning = state.scale_up_initialization.as_ref().ok_or_else(|| {
-            RuntimeError::CommandRejected(
+            crate::host::HostError::CommandRejected(
                 "candidate lacks durable scale-up initialization authority".into(),
             )
         })?;
         let initialized = provisioning.scale_up().ok_or_else(|| {
-            RuntimeError::CommandRejected(
+            crate::host::HostError::CommandRejected(
                 "candidate initialization is not tagged for scale-up".into(),
             )
         })?;
@@ -710,22 +709,22 @@ fn admit_scale_up_configuration(
                 .as_ref()
                 != Some(&intent.build_id)
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "candidate authority differs from durable scale-up initialization".into(),
             ));
         }
         let build = state.build_commands.get(&intent.build_id).ok_or_else(|| {
-            RuntimeError::CommandRejected(
+            crate::host::HostError::CommandRejected(
                 "candidate has not durably admitted the exact scale-up build".into(),
             )
         })?;
         let authority = build.authority.as_ref().ok_or_else(|| {
-            RuntimeError::CommandRejected(
+            crate::host::HostError::CommandRejected(
                 "candidate build command lacks immutable receiver authority".into(),
             )
         })?;
         let progress = state.build_progress.get(&intent.build_id).ok_or_else(|| {
-            RuntimeError::CommandRejected(
+            crate::host::HostError::CommandRejected(
                 "candidate lacks durable exact scale-up build progress".into(),
             )
         })?;
@@ -745,7 +744,7 @@ fn admit_scale_up_configuration(
             || progress.catch_up_boundary_lsn != Some(intent.catch_up_boundary_lsn)
             || progress.durable_lsn < intent.catch_up_boundary_lsn
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "candidate requires exact completed build progress through the frozen boundary"
                     .into(),
             ));
@@ -762,7 +761,7 @@ fn admit_scale_up_configuration(
             && (state.current_configuration.as_ref() != Some(&command.current_configuration)
                 || state.previous_configuration.as_ref() != Some(&intent.previous_configuration))
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "scale-up current-only completion lacks durable PC/CC authority".into(),
             ));
         }
@@ -822,7 +821,7 @@ fn admit_scale_up_configuration(
             },
         );
         if !same_attempt_replay && !admission_start && !candidate_start && !carried_failover {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "scale-up PC/CC command does not extend durable accepted authority".into(),
             ));
         }
@@ -839,9 +838,9 @@ fn admit_scale_up_configuration(
     };
     admitted
         .validate()
-        .map_err(|error| RuntimeError::CommandRejected(error.to_string()))?;
+        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?;
     if admitted.local_role() == ReplicaRole::None {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "scale-up authority does not assign the local replica".into(),
         ));
     }
@@ -850,14 +849,14 @@ fn admit_scale_up_configuration(
 
 pub(crate) fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<()> {
     if state.retired_authority.is_some() || state.removal_pending() {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "secondary removal fences replica builds".into(),
         ));
     }
     let identity = &state.identity.local_identity;
     if command.retire {
         if command.authority.is_some() || command.source_session_id.is_some() {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "build retirement cannot carry delivery authority".into(),
             ));
         }
@@ -865,7 +864,7 @@ pub(crate) fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> R
             .build_commands
             .get(&command.operation_id)
             .ok_or_else(|| {
-                RuntimeError::CommandRejected(
+                crate::host::HostError::CommandRejected(
                     "build retirement requires exact durable build authority".into(),
                 )
             })?;
@@ -876,7 +875,7 @@ pub(crate) fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> R
             || existing.target != command.target
             || existing.authority.is_some()
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "build retirement differs from exact durable source authority".into(),
             ));
         }
@@ -885,7 +884,7 @@ pub(crate) fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> R
     if state.retired_builds.contains(&command.operation_id)
         || state.abandoned_builds.contains(&command.operation_id)
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "abandoned or retired build authority cannot be reopened".into(),
         ));
     }
@@ -894,14 +893,14 @@ pub(crate) fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> R
         || command.expected_instance_id != identity.instance_id
         || command.expected_agent_generation != identity.agent_generation
     {
-        return Err(RuntimeError::CommandRejected(
+        return Err(crate::host::HostError::CommandRejected(
             "build command target does not match durable replica identity".into(),
         ));
     }
     if let Some(authority) = &command.authority {
         authority
             .validate()
-            .map_err(|error| RuntimeError::CommandRejected(error.to_string()))?;
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?;
         if authority.build_id != command.operation_id
             || authority.target != command.target
             || authority.target != *identity
@@ -910,18 +909,20 @@ pub(crate) fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> R
                 .as_ref()
                 .is_none_or(|session| session.is_empty())
         {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "target build command differs from admitted build authority".into(),
             ));
         }
     } else {
         if command.source_session_id.is_some() {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "source build command cannot carry a peer session".into(),
             ));
         }
         let current = state.current_configuration.as_ref().ok_or_else(|| {
-            RuntimeError::CommandRejected("build source has no Current Configuration".into())
+            crate::host::HostError::CommandRejected(
+                "build source has no Current Configuration".into(),
+            )
         })?;
         let primary = current
             .members
@@ -929,7 +930,7 @@ pub(crate) fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> R
             .find(|member| member.identity.replica_id == current.primary_id)
             .expect("validated configuration has primary");
         if primary.identity != *identity || command.target.replica_id == identity.replica_id {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "source build command must target another logical replica from the primary".into(),
             ));
         }

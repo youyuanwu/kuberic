@@ -9,12 +9,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::tempdir;
-use crate::Result;
 use crate::RuntimeError;
 use crate::authority::{AdmittedAuthority, BuildAuthorityStore, BuildProgressStore};
 use crate::effects::{
     RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
 };
+use crate::host::Result;
 use crate::host::command::{admit_configuration, admit_persisted_configuration};
 use crate::host::coordinator::Coordinator;
 use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
@@ -578,7 +578,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
         let mut fail_once = self.fail_once.lock().unwrap();
         if *fail_once == Some(stage) {
             *fail_once = None;
-            return Err(RuntimeError::Application("injected failure".into()));
+            return Err(RuntimeError::Application("injected failure".into()).into());
         }
         drop(fail_once);
         let mut state = self.state.lock().unwrap();
@@ -2857,7 +2857,7 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
     mutated.failover_safe_lsn = Some(13);
     assert!(matches!(
         coordinator.ensure_configuration(mutated).await,
-        Err(RuntimeError::DurableEffectConflict(_))
+        Err(crate::host::HostError::DurableEffectConflict(_))
     ));
 
     let calls = runtime.calls.lock().unwrap().clone();
@@ -2894,13 +2894,13 @@ async fn coordinator_rejects_operation_reuse_and_stale_authority() {
         coordinator
             .ensure_configuration(command("same-operation", Epoch::new(0, 3)))
             .await,
-        Err(RuntimeError::DurableEffectConflict(_))
+        Err(crate::host::HostError::DurableEffectConflict(_))
     ));
     assert!(matches!(
         coordinator
             .ensure_configuration(command("stale-operation", Epoch::new(0, 1)))
             .await,
-        Err(RuntimeError::CommandRejected(_))
+        Err(crate::host::HostError::CommandRejected(_))
     ));
 }
 
@@ -3183,7 +3183,7 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
     mutated.retire_build_ids = vec![OperationId::new("different-build")];
     assert!(matches!(
         coordinator.ensure_configuration(mutated).await,
-        Err(RuntimeError::DurableEffectConflict(_))
+        Err(crate::host::HostError::DurableEffectConflict(_))
     ));
 }
 
@@ -3254,7 +3254,7 @@ fn same_epoch_new_operation_cannot_replace_durable_membership() {
     };
     assert!(matches!(
         admit_configuration(&command, &state),
-        Err(RuntimeError::CommandRejected(_))
+        Err(crate::host::HostError::CommandRejected(_))
     ));
 }
 

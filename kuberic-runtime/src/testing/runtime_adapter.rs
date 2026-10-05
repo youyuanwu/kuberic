@@ -21,14 +21,14 @@ impl RuntimeAdapter {
         }
     }
 
-    pub async fn execute(&self, effect: RuntimeEffect) -> crate::Result<RuntimeEffectResult> {
+    pub async fn execute(&self, effect: RuntimeEffect) -> crate::host::Result<RuntimeEffectResult> {
         self.inner
             .execute(super::convert(effect))
             .await
             .map(super::convert)
     }
 
-    pub async fn resume_pending(&self) -> crate::Result<Option<RuntimeEffectResult>> {
+    pub async fn resume_pending(&self) -> crate::host::Result<Option<RuntimeEffectResult>> {
         self.inner.resume_pending().await.map(super::convert)
     }
 }

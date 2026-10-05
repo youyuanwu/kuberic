@@ -32,6 +32,7 @@ use crate::host::state::{
     AgentState, CoordinatorStage, EffectStage, SCHEMA_VERSION, StorageIdentity,
 };
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
+use crate::host::{HostError as AgentError, Result};
 use crate::protocol::command::{EnsureConfiguration, PrepareSwitchover};
 use crate::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -44,7 +45,6 @@ use crate::protocol::types::{
 use crate::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
 use crate::replicator::stream::{OperationMetadata, OperationStream};
 use crate::replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings};
-use crate::{Result, RuntimeError as AgentError};
 use crate::{Result as RuntimeResult, RuntimeError};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -823,7 +823,7 @@ fn switchover_recovery_fixture(boundary: &str) -> (AgentState, EnsureConfigurati
 #[async_trait]
 impl RuntimeEffectExecutor for CancelledRuntime {
     async fn apply_runtime_effect(&self, _effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
-        Err(RuntimeError::ReplicaRemoved(2))
+        Err(AgentError::Runtime(RuntimeError::ReplicaRemoved(2)))
     }
 }
 
@@ -5346,7 +5346,7 @@ async fn definitively_cancelled_build_effect_releases_durable_intent() {
         RuntimeAdapter::new(store.clone(), Arc::new(CancelledRuntime))
             .execute(effect)
             .await,
-        Err(RuntimeError::ReplicaRemoved(2))
+        Err(AgentError::Runtime(RuntimeError::ReplicaRemoved(2)))
     ));
     assert!(store.load_state().await.unwrap().pending_effect.is_none());
 }
@@ -6586,7 +6586,10 @@ fn scale_up_failover_replays_after_authority_and_completion_process_boundaries()
                 .await
                 .expect_err("failover was admitted without durable runtime authority");
             assert!(
-                matches!(error, RuntimeError::AuthorityNotAdmitted),
+                matches!(
+                    error,
+                    AgentError::Runtime(RuntimeError::AuthorityNotAdmitted)
+                ),
                 "empty-authority negative control failed for the wrong reason: {error:?}"
             );
         });

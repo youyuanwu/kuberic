@@ -16,8 +16,7 @@ use crate::protocol::types::{
     SecondaryRemovalPreparation, SwitchoverHandoff,
 };
 
-use crate::Result;
-use crate::RuntimeError;
+use crate::host::Result;
 use crate::host::command::{
     admit_build, admit_configuration, admit_persisted_configuration, admit_switchover_preparation,
 };
@@ -92,7 +91,7 @@ where
     ) -> Result<SecondaryRemovalPreparation> {
         let _command = self.command_lock.lock().await;
         if process_session_id.is_empty() || report_sequence == 0 {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "preparation requires exact session and sequence".into(),
             ));
         }
@@ -117,7 +116,7 @@ where
             if existing.operation_id != command.operation_id
                 || !matches!(&existing.action, RuntimeEffectAction::PrepareSecondaryRemoval { intent, .. } if intent.as_ref() == &command.intent)
             {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "preparation differs from persisted intent".into(),
                 ));
             }
@@ -134,7 +133,9 @@ where
             .postcondition
             .prepared_secondary_removal
             .ok_or_else(|| {
-                RuntimeError::DurableEffectConflict("preparation omitted terminal evidence".into())
+                crate::host::HostError::DurableEffectConflict(
+                    "preparation omitted terminal evidence".into(),
+                )
             })
     }
 
@@ -152,7 +153,7 @@ where
         };
         let effect = if let Some(pending) = &state.pending_effect {
             if pending.effect.operation_id != command.operation_id {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "commit conflicts with pending work".into(),
                 ));
             }
@@ -183,7 +184,7 @@ where
     ) -> Result<ReplicaRetirementReport> {
         let _command = self.command_lock.lock().await;
         if process_session_id.is_empty() || report_sequence == 0 {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "retirement requires exact session and sequence".into(),
             ));
         }
@@ -219,7 +220,7 @@ where
             if existing.operation_id != command.operation_id
                 || !matches!(&existing.action, RuntimeEffectAction::RetireReplica(r) if r.committed == command.committed)
             {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "retirement differs from persisted intent".into(),
                 ));
             }
@@ -227,7 +228,7 @@ where
         } else {
             retired
                 .validate(&state.identity.local_identity)
-                .map_err(|e| RuntimeError::CommandRejected(e.to_string()))?;
+                .map_err(|e| crate::host::HostError::CommandRejected(e.to_string()))?;
             RuntimeEffect {
                 operation_id: command.operation_id,
                 sequence: state.next_effect_sequence,
@@ -240,7 +241,9 @@ where
             .retired_authority
             .map(|r| r.report)
             .ok_or_else(|| {
-                RuntimeError::DurableEffectConflict("retirement omitted terminal evidence".into())
+                crate::host::HostError::DurableEffectConflict(
+                    "retirement omitted terminal evidence".into(),
+                )
             })
     }
     pub(crate) async fn ensure_switchover_prepared(
@@ -265,7 +268,7 @@ where
             if pending.effect.operation_id != command.operation_id
                 || pending.effect.action != action
             {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "another durable effect is pending".into(),
                 ));
             }
@@ -273,7 +276,7 @@ where
         } else if let Some(retained) = state.retained_result {
             if retained.operation_id == command.operation_id {
                 if retained.effect.action != action {
-                    return Err(RuntimeError::DurableEffectConflict(
+                    return Err(crate::host::HostError::DurableEffectConflict(
                         "operation ID was reused with another switchover preparation".into(),
                     ));
                 }
@@ -298,7 +301,7 @@ where
             .await?
             .prepared_switchover
             .ok_or_else(|| {
-                RuntimeError::DurableEffectConflict(
+                crate::host::HostError::DurableEffectConflict(
                     "switchover preparation completed without durable handoff evidence".into(),
                 )
             })
@@ -322,7 +325,7 @@ where
                 || command.current_epoch < observed.highest_epoch
                 || observed.retired_authority.is_some()
             {
-                return Err(RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "stale or mutated removal command replay".into(),
                 ));
             }
@@ -333,7 +336,7 @@ where
         {
             admit_configuration(&command, &observed)?;
             if command.current_epoch <= pending.command.current_epoch {
-                return Err(crate::RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "a same-or-newer configuration command is pending".into(),
                 ));
             }
@@ -349,7 +352,9 @@ where
         }
         let _command = self.command_lock.lock().await;
         if self.is_superseded(&command) {
-            return Err(crate::RuntimeError::OperationCancelled);
+            return Err(crate::host::HostError::Runtime(
+                crate::RuntimeError::OperationCancelled,
+            ));
         }
         let durable = self.store.load_state().await?;
         let persisted_exact = durable
@@ -383,12 +388,14 @@ where
             {
                 return Ok(retained);
             } else {
-                return Err(crate::RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "configuration ownership changed while the command was executing".into(),
                 ));
             };
             if self.is_superseded(&record.command) {
-                return Err(crate::RuntimeError::OperationCancelled);
+                return Err(crate::host::HostError::Runtime(
+                    crate::RuntimeError::OperationCancelled,
+                ));
             }
             match record.stage {
                 CoordinatorStage::AdmitAuthority => {
@@ -706,7 +713,7 @@ where
             && retained.operation_id == operation_id
         {
             if retained.effect.action != action {
-                return Err(crate::RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "retained coordinator effect has different stage authority".into(),
                 ));
             }
@@ -749,7 +756,7 @@ where
             && retained.operation_id == operation_id
         {
             if retained.effect.action != action {
-                return Err(crate::RuntimeError::DurableEffectConflict(
+                return Err(crate::host::HostError::DurableEffectConflict(
                     "retained build effect has different stage authority".into(),
                 ));
             }

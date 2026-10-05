@@ -198,7 +198,7 @@ async fn status(address: SocketAddr) -> (AgentControlClient<Channel>, wire::Agen
 struct HostAttempt {
     address: SocketAddr,
     application: Arc<PgService>,
-    task: tokio::task::JoinHandle<kuberic_runtime::Result<RunningReplica>>,
+    task: tokio::task::JoinHandle<kuberic_runtime::host::Result<RunningReplica>>,
 }
 
 struct OpenGate {

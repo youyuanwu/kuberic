@@ -13,8 +13,7 @@ use crate::protocol::types::{
 use serde::Serialize;
 use tokio::sync::{Mutex, watch};
 
-use crate::Result;
-use crate::RuntimeError;
+use crate::host::Result;
 use crate::host::hosting::PodRuntime;
 use crate::host::provisioning::{ObservedStorageIdentity, validate_established_identity};
 use crate::host::service::{AgentService, InitializationService, SHUTDOWN_TIMEOUT};
@@ -182,7 +181,7 @@ impl RunningReplica {
     pub async fn wait(&mut self) -> Result<()> {
         (&mut self.completion)
             .await
-            .map_err(|error| RuntimeError::CommandRejected(error.to_string()))?
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
     }
 }
 
@@ -231,7 +230,9 @@ where
         let (_shutdown, receiver) = watch::channel(false);
         self.start_with_shutdown(receiver)
             .await?
-            .ok_or(crate::RuntimeError::OperationCancelled)
+            .ok_or(crate::host::HostError::Runtime(
+                crate::RuntimeError::OperationCancelled,
+            ))
     }
 
     /// Cooperatively cancel startup and await its acknowledgement and task cleanup.
@@ -246,12 +247,12 @@ where
             return Ok(None);
         }
         if self.config.replica_id.value() <= 0 {
-            return Err(RuntimeError::CommandRejected(
+            return Err(crate::host::HostError::CommandRejected(
                 "replica ID must be positive".into(),
             ));
         }
         if self.config.transport_window_capacity == 0 {
-            return Err(RuntimeError::Backpressure(
+            return Err(crate::host::HostError::Backpressure(
                 "transport window capacity must be positive".into(),
             ));
         }
@@ -299,7 +300,7 @@ where
             store
                 .record_partition_reports(state.load_metrics, Some(FaultType::Permanent))
                 .await?;
-            return Err(RuntimeError::InitializationNotAuthorized(
+            return Err(crate::host::HostError::InitializationNotAuthorized(
                 "application storage paths differ from the authorized agent binding".into(),
             ));
         }
@@ -360,8 +361,8 @@ where
                 agent_finished = true;
                 match result {
                     Ok(Err(error)) => Err(error),
-                    Err(error) => Err(RuntimeError::CommandRejected(error.to_string())),
-                    Ok(Ok(())) => Err(RuntimeError::CommandRejected(
+                    Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
+                    Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
                         "agent service stopped before becoming ready".into(),
                     )),
                 }
@@ -370,8 +371,8 @@ where
                 outbound_finished = true;
                 match result {
                     Ok(Err(error)) => Err(error),
-                    Err(error) => Err(RuntimeError::CommandRejected(error.to_string())),
-                    Ok(Ok(())) => Err(RuntimeError::CommandRejected(
+                    Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
+                    Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
                         "outbound progress stopped before agent readiness".into(),
                     )),
                 }
@@ -380,8 +381,8 @@ where
                 peer_finished = true;
                 match result {
                     Ok(Err(error)) => Err(error),
-                    Err(error) => Err(RuntimeError::CommandRejected(error.to_string())),
-                    Ok(Ok(())) => Err(RuntimeError::CommandRejected(
+                    Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
+                    Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
                         "peer discovery stopped before agent readiness".into(),
                     )),
                 }
@@ -393,8 +394,8 @@ where
                         agent_finished = true;
                         match (&mut agent_task).await {
                             Ok(Err(error)) => Err(error),
-                            Err(error) => Err(RuntimeError::CommandRejected(error.to_string())),
-                            Ok(Ok(())) => Err(RuntimeError::CommandRejected(
+                            Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
+                            Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
                                 "agent readiness channel closed".into(),
                             )),
                         }
@@ -413,14 +414,13 @@ where
                 finish_agent(&mut agent_task).await
             };
             runtime.abort();
-            let cleanup = match cleanup {
-                Err(crate::RuntimeError::OperationCancelled)
-                    if matches!(startup_result, Ok(false)) =>
-                {
-                    Ok(())
-                }
-                result => result,
-            };
+            let cleanup =
+                match cleanup {
+                    Err(crate::host::HostError::Runtime(
+                        crate::RuntimeError::OperationCancelled,
+                    )) if matches!(startup_result, Ok(false)) => Ok(()),
+                    result => result,
+                };
             let result = with_shutdown_error(startup_result.map(|_| ()), cleanup, "agent shutdown");
             let result = with_shutdown_error(result, outbound, "outbound shutdown");
             with_shutdown_error(result, peer, "peer discovery shutdown")?;
@@ -446,7 +446,7 @@ where
             };
             supervisor_runtime.abort();
             let first = first
-                .map_err(|error| RuntimeError::CommandRejected(error.to_string()))
+                .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
                 .and_then(|result| result);
             let result = with_shutdown_error(cleanup, first, "replica task");
             let result = with_shutdown_error(result, outbound, "outbound shutdown");
@@ -476,13 +476,13 @@ async fn abort_progress(
     match task.await {
         Ok(result) => result,
         Err(error) if error.is_cancelled() => Ok(()),
-        Err(error) => Err(RuntimeError::CommandRejected(error.to_string())),
+        Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
     }
 }
 
 fn with_shutdown_error(primary: Result<()>, cleanup: Result<()>, context: &str) -> Result<()> {
     match (primary, cleanup) {
-        (Err(primary), Err(cleanup)) => Err(RuntimeError::CommandRejected(format!(
+        (Err(primary), Err(cleanup)) => Err(crate::host::HostError::CommandRejected(format!(
             "{primary}; {context}: {cleanup}"
         ))),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -492,11 +492,13 @@ fn with_shutdown_error(primary: Result<()>, cleanup: Result<()>, context: &str) 
 
 async fn finish_agent(task: &mut tokio::task::JoinHandle<Result<()>>) -> Result<()> {
     match tokio::time::timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(1), &mut *task).await {
-        Ok(result) => result.map_err(|error| RuntimeError::CommandRejected(error.to_string()))?,
+        Ok(result) => {
+            result.map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
+        }
         Err(_) => {
             task.abort();
             let _ = task.await;
-            Err(RuntimeError::CommandRejected(
+            Err(crate::host::HostError::CommandRejected(
                 "agent shutdown acknowledgement timed out".into(),
             ))
         }
@@ -563,14 +565,19 @@ mod shutdown_tests {
         let mut pending = tokio::spawn(std::future::pending::<Result<()>>());
         abort_progress(&mut pending, false).await.unwrap();
         assert!(pending.is_finished());
-        let mut failed =
-            tokio::spawn(async { Err(RuntimeError::CommandRejected("outbound failed".into())) });
+        let mut failed = tokio::spawn(async {
+            Err(crate::host::HostError::CommandRejected(
+                "outbound failed".into(),
+            ))
+        });
         while !failed.is_finished() {
             tokio::task::yield_now().await;
         }
         let cleanup = abort_progress(&mut failed, false).await;
         let result = with_shutdown_error(
-            Err(RuntimeError::CommandRejected("startup failed".into())),
+            Err(crate::host::HostError::CommandRejected(
+                "startup failed".into(),
+            )),
             cleanup,
             "outbound shutdown",
         );
@@ -583,7 +590,7 @@ mod shutdown_tests {
         let (release, wait) = tokio::sync::oneshot::channel();
         let mut agent = tokio::spawn(async move {
             wait.await.unwrap();
-            Err(RuntimeError::CommandRejected(
+            Err(crate::host::HostError::CommandRejected(
                 "injected persistence failure".into(),
             ))
         });

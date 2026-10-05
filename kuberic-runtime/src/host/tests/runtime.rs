@@ -5479,7 +5479,9 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
         if error != 1 {
             assert!(matches!(
                 startup,
-                Err(RuntimeError::Application(_)) | Err(RuntimeError::OperationCancelled)
+                Err(crate::host::HostError::Runtime(
+                    RuntimeError::Application(_) | RuntimeError::OperationCancelled
+                ))
             ));
             continue;
         }
@@ -8243,13 +8245,13 @@ impl FailingEffectStore {
         }
     }
 
-    fn fail(&self, stage: EffectPersistenceFailure) -> crate::Result<()> {
+    fn fail(&self, stage: EffectPersistenceFailure) -> crate::host::Result<()> {
         if self
             .failure
             .compare_exchange(stage as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            Err(RuntimeError::DurableEffectConflict(
+            Err(crate::host::HostError::DurableEffectConflict(
                 "injected effect persistence failure".into(),
             ))
         } else {
@@ -8260,28 +8262,28 @@ impl FailingEffectStore {
 
 #[async_trait]
 impl AgentStore for FailingEffectStore {
-    async fn identity(&self) -> crate::Result<StorageIdentity> {
+    async fn identity(&self) -> crate::host::Result<StorageIdentity> {
         self.inner.identity().await
     }
 
-    async fn load_state(&self) -> crate::Result<AgentState> {
+    async fn load_state(&self) -> crate::host::Result<AgentState> {
         self.inner.load_state().await
     }
 
-    async fn complete_application_initialization(&self) -> crate::Result<()> {
+    async fn complete_application_initialization(&self) -> crate::host::Result<()> {
         self.inner.complete_application_initialization().await
     }
 
-    async fn begin_effect(&self, effect: &RuntimeEffect) -> crate::Result<BeginEffect> {
+    async fn begin_effect(&self, effect: &RuntimeEffect) -> crate::host::Result<BeginEffect> {
         self.inner.begin_effect(effect).await
     }
 
-    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> crate::Result<()> {
+    async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
         self.fail(EffectPersistenceFailure::MarkApplied)?;
         self.inner.mark_effect_applied(effect).await
     }
 
-    async fn complete_effect(&self, result: &RuntimeEffectResult) -> crate::Result<()> {
+    async fn complete_effect(&self, result: &RuntimeEffectResult) -> crate::host::Result<()> {
         if self
             .failure
             .compare_exchange(
@@ -8299,25 +8301,25 @@ impl AgentStore for FailingEffectStore {
         self.inner.complete_effect(result).await
     }
 
-    async fn cancel_effect(&self, effect: &RuntimeEffect) -> crate::Result<()> {
+    async fn cancel_effect(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
         self.inner.cancel_effect(effect).await
     }
 
     async fn begin_configuration(
         &self,
         command: &EnsureConfiguration,
-    ) -> crate::Result<BeginConfiguration> {
+    ) -> crate::host::Result<BeginConfiguration> {
         self.inner.begin_configuration(command).await
     }
 
     async fn journal_build(
         &self,
         command: &EnsureReplicaBuild,
-    ) -> crate::Result<EnsureReplicaBuild> {
+    ) -> crate::host::Result<EnsureReplicaBuild> {
         self.inner.journal_build(command).await
     }
 
-    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> crate::Result<()> {
+    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> crate::host::Result<()> {
         self.inner.abandon_build(command).await
     }
 
@@ -8327,7 +8329,7 @@ impl AgentStore for FailingEffectStore {
         expected: CoordinatorStage,
         next: CoordinatorStage,
         observed_lsn: Option<i64>,
-    ) -> crate::Result<ReconfigurationRecord> {
+    ) -> crate::host::Result<ReconfigurationRecord> {
         self.inner
             .advance_configuration(operation_id, expected, next, observed_lsn)
             .await
@@ -8336,19 +8338,19 @@ impl AgentStore for FailingEffectStore {
     async fn complete_configuration(
         &self,
         operation_id: &OperationId,
-    ) -> crate::Result<RetainedCommandResult> {
+    ) -> crate::host::Result<RetainedCommandResult> {
         self.inner.complete_configuration(operation_id).await
     }
 
-    async fn retained_result(&self) -> crate::Result<Option<RetainedResult>> {
+    async fn retained_result(&self) -> crate::host::Result<Option<RetainedResult>> {
         self.inner.retained_result().await
     }
 
-    async fn set_reconfiguration(&self, data: Option<String>) -> crate::Result<()> {
+    async fn set_reconfiguration(&self, data: Option<String>) -> crate::host::Result<()> {
         self.inner.set_reconfiguration(data).await
     }
 
-    async fn clear_reconfiguration(&self) -> crate::Result<()> {
+    async fn clear_reconfiguration(&self) -> crate::host::Result<()> {
         self.inner.clear_reconfiguration().await
     }
 
@@ -8356,7 +8358,7 @@ impl AgentStore for FailingEffectStore {
         &self,
         expected_version: u32,
         target_version: u32,
-    ) -> crate::Result<()> {
+    ) -> crate::host::Result<()> {
         self.inner
             .migrate_schema(expected_version, target_version)
             .await
@@ -8366,7 +8368,7 @@ impl AgentStore for FailingEffectStore {
         &self,
         load_metrics: Vec<LoadMetric>,
         reported_fault: Option<FaultType>,
-    ) -> crate::Result<()> {
+    ) -> crate::host::Result<()> {
         self.inner
             .record_partition_reports(load_metrics, reported_fault)
             .await

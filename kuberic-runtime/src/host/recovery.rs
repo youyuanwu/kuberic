@@ -3,8 +3,7 @@
 use crate::effects::{RuntimeEffect, RuntimeEffectResult, RuntimeSnapshot};
 use crate::protocol::types::AccessStatus;
 
-use crate::Result;
-use crate::RuntimeError;
+use crate::host::Result;
 use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use crate::host::state::RetainedResult;
 use crate::host::store::AgentStore;
@@ -21,7 +20,7 @@ pub(crate) async fn inspect_recovery<S: AgentStore>(
     runtime: &RuntimeSnapshot,
 ) -> Result<RecoveryDecision> {
     if runtime.write_status == AccessStatus::Granted {
-        return Err(RuntimeError::DurableEffectConflict(
+        return Err(crate::host::HostError::DurableEffectConflict(
             "runtime must start write-closed before recovery".into(),
         ));
     }

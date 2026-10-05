@@ -59,9 +59,9 @@ fn isolated_fixture<A>(
 async fn observe_host(replica: &mut RunningReplica, handle: ReplicaHandle) {
     let _: ReplicaHandle = replica.handle();
     let _ = replica.shutdown_signal();
-    let _: kuberic_runtime::Result<ReplicaDiagnostics> = handle.diagnostics().await;
+    let _: kuberic_runtime::host::Result<ReplicaDiagnostics> = handle.diagnostics().await;
     replica.shutdown();
-    let _: kuberic_runtime::Result<()> = replica.wait().await;
+    let _: kuberic_runtime::host::Result<()> = replica.wait().await;
 }
 
 fn main() {}

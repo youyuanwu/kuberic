@@ -15,7 +15,10 @@ impl AgentReporter {
         }
     }
 
-    pub async fn report(&self, runtime: &PodRuntime) -> crate::Result<proto::AgentStatusReport> {
+    pub async fn report(
+        &self,
+        runtime: &PodRuntime,
+    ) -> crate::host::Result<proto::AgentStatusReport> {
         self.inner.report(&runtime.inner).await
     }
 }

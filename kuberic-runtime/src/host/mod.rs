@@ -2,6 +2,7 @@
 
 mod command;
 mod coordinator;
+mod error;
 pub(crate) mod hosting;
 mod process;
 mod provisioning;
@@ -22,6 +23,7 @@ pub(crate) mod transport;
 #[cfg(test)]
 mod tests;
 
+pub use error::{HostError, Result};
 pub use process::{
     ApplicationStorageState, ReplicaBuildDiagnostics, ReplicaDiagnostics, ReplicaHandle,
     ReplicaHost, ReplicaProcessConfig, RunningReplica,

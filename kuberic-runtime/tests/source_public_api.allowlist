@@ -1,4 +1,5 @@
 private-path documented enum crate::error::RuntimeError
+private-path documented enum crate::host::error::HostError
 private-path documented enum crate::host::process::ApplicationStorageState
 private-path documented field crate::host::process::ReplicaBuildDiagnostics::build_id: String
 private-path documented field crate::host::process::ReplicaBuildDiagnostics::catch_up_boundary_lsn: Option < i64 >
@@ -63,24 +64,17 @@ private-path documented trait crate::host::transport::ReplicaEndpointResolver: S
 private-path documented trait crate::host::transport::ReplicaEndpointResolver::fn control_endpoint (& self , identity : & ReplicaIdentity) -> String
 private-path documented trait crate::host::transport::ReplicaEndpointResolver::fn replication_endpoint (& self , identity : & ReplicaIdentity) -> String
 private-path documented type crate::error::Result< T > = std :: result :: Result < T , RuntimeError >
+private-path documented type crate::host::error::Result< T > = std :: result :: Result < T , HostError >
 private-path documented variant crate::error::RuntimeError::Application((String))
 private-path documented variant crate::error::RuntimeError::AuthorityMismatch((String))
 private-path documented variant crate::error::RuntimeError::AuthorityNotAdmitted
-private-path documented variant crate::error::RuntimeError::Backpressure((String))
 private-path documented variant crate::error::RuntimeError::Closed
-private-path documented variant crate::error::RuntimeError::CommandRejected((String))
 private-path documented variant crate::error::RuntimeError::ControlPlane((String))
-private-path documented variant crate::error::RuntimeError::Corrupt((String))
 private-path documented variant crate::error::RuntimeError::DataLossFenced
-private-path documented variant crate::error::RuntimeError::DurableEffectConflict((String))
 private-path documented variant crate::error::RuntimeError::EffectConflict { { sequence : u64 } }
 private-path documented variant crate::error::RuntimeError::EffectOutOfOrder { { expected : u64 , observed : u64 } }
-private-path documented variant crate::error::RuntimeError::IdentityMismatch((String))
-private-path documented variant crate::error::RuntimeError::InitializationNotAuthorized((String))
 private-path documented variant crate::error::RuntimeError::InvalidReplication((String))
-private-path documented variant crate::error::RuntimeError::Io((# [from] std :: io :: Error))
 private-path documented variant crate::error::RuntimeError::LocalWritePending((String))
-private-path documented variant crate::error::RuntimeError::MissingEstablishedStore
 private-path documented variant crate::error::RuntimeError::NotOpen
 private-path documented variant crate::error::RuntimeError::NotPrimary
 private-path documented variant crate::error::RuntimeError::OperationCancelled
@@ -88,13 +82,23 @@ private-path documented variant crate::error::RuntimeError::QueueFull
 private-path documented variant crate::error::RuntimeError::ReadClosed((AccessStatus))
 private-path documented variant crate::error::RuntimeError::ReconfigurationPending
 private-path documented variant crate::error::RuntimeError::ReplicaRemoved((i64))
-private-path documented variant crate::error::RuntimeError::SchemaMismatch { { expected : u32 , observed : u32 } }
-private-path documented variant crate::error::RuntimeError::Serialization((# [from] serde_json :: Error))
-private-path documented variant crate::error::RuntimeError::SessionRejected((String))
-private-path documented variant crate::error::RuntimeError::Sqlite((# [from] rusqlite :: Error))
-private-path documented variant crate::error::RuntimeError::Uninitialized
 private-path documented variant crate::error::RuntimeError::WriteClosed((AccessStatus))
 private-path documented variant crate::error::RuntimeError::WriteCompletionClosed
+private-path documented variant crate::host::error::HostError::Backpressure((String))
+private-path documented variant crate::host::error::HostError::CommandRejected((String))
+private-path documented variant crate::host::error::HostError::Contract((String))
+private-path documented variant crate::host::error::HostError::Corrupt((String))
+private-path documented variant crate::host::error::HostError::DurableEffectConflict((String))
+private-path documented variant crate::host::error::HostError::IdentityMismatch((String))
+private-path documented variant crate::host::error::HostError::InitializationNotAuthorized((String))
+private-path documented variant crate::host::error::HostError::Io((# [from] std :: io :: Error))
+private-path documented variant crate::host::error::HostError::MissingEstablishedStore
+private-path documented variant crate::host::error::HostError::Runtime((# [from] RuntimeError))
+private-path documented variant crate::host::error::HostError::SchemaMismatch { { expected : u32 , observed : u32 } }
+private-path documented variant crate::host::error::HostError::Serialization((# [from] serde_json :: Error))
+private-path documented variant crate::host::error::HostError::SessionRejected((String))
+private-path documented variant crate::host::error::HostError::Sqlite((# [from] rusqlite :: Error))
+private-path documented variant crate::host::error::HostError::Uninitialized
 private-path documented variant crate::host::process::ApplicationStorageState::Established
 private-path documented variant crate::host::process::ApplicationStorageState::FreshEmpty
 public-path documented enum crate::application::OpenMode
@@ -214,6 +218,7 @@ public-path documented type crate::application::OperationData = Bytes
 public-path documented type crate::application::OperationDataStream = Pin < Box < dyn Stream < Item = Result < OperationData > > + Send > >
 public-path documented use crate::application :: { StateProvider , StatefulServiceReplica }
 public-path documented use crate::error :: { Result , RuntimeError }
+public-path documented use crate::host::error :: { HostError , Result }
 public-path documented use crate::host::process :: { ApplicationStorageState , ReplicaBuildDiagnostics , ReplicaDiagnostics , ReplicaHandle , ReplicaHost , ReplicaProcessConfig , RunningReplica , }
 public-path documented use crate::host::transport :: { KubernetesDnsResolver , ReplicaEndpointResolver }
 public-path documented use crate::replicator :: { DefaultReplicator , DefaultReplicatorFactory , PrimaryReplicator , Replicator , ReplicatorFactory , ReplicatorInterfaces , StateReplicator , StatefulServicePartition , }

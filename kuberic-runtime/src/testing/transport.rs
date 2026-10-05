@@ -21,7 +21,7 @@ pub async fn dispatch_build<R: crate::host::ReplicaEndpointResolver + 'static>(
     token: &str,
     deadline: Duration,
     endpoint: ReplicaEndpoint,
-) -> crate::Result<()> {
+) -> crate::host::Result<()> {
     let transport = Arc::new(tokio::sync::Mutex::new(
         crate::host::transport::ReliableTransport::new(session, 16)?,
     ));

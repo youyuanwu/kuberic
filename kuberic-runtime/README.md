@@ -16,6 +16,8 @@ observations live in `protocol`; protobuf contracts and conversion live in
 `control`. Enable `testing` for isolated fixture hosts/stores and deterministic
 transport. Application-specific SQLite WAL commit barriers live privately in
 the unpublished SQLite example, not in runtime.
+Application and replication callbacks return `RuntimeError`; process hosting,
+durable metadata, RPC and transport orchestration return `host::HostError`.
 Controller-only consumers use `default-features = false` for the contracts-only
 `protocol` and `control` modules; application and runtime implementation APIs
 require `host`. Pure evaluation and plans belong to `kuberic-controller`.

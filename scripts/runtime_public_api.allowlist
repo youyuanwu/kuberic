@@ -117,6 +117,9 @@ page:enum.RuntimeError.html
 page:error/enum.RuntimeError.html
 page:error/type.Result.html
 page:host/enum.ApplicationStorageState.html
+page:host/enum.HostError.html
+page:host/error/enum.HostError.html
+page:host/error/type.Result.html
 page:host/index.html
 page:host/process/enum.ApplicationStorageState.html
 page:host/process/struct.ReplicaBuildDiagnostics.html
@@ -135,6 +138,7 @@ page:host/struct.RunningReplica.html
 page:host/trait.ReplicaEndpointResolver.html
 page:host/transport/struct.KubernetesDnsResolver.html
 page:host/transport/trait.ReplicaEndpointResolver.html
+page:host/type.Result.html
 page:index.html
 page:protocol/command/enum.EffectClass.html
 page:protocol/command/enum.KubernetesChange.html

@@ -174,7 +174,7 @@ impl SqlitePod {
         }
     }
 
-    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_runtime::Result<()> {
+    pub async fn effect(&self, action: RuntimeEffectAction) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         self.effect_as(
             OperationId::new(format!("sqlite-effect-{sequence}")),
@@ -187,7 +187,7 @@ impl SqlitePod {
         &self,
         operation_id: OperationId,
         action: RuntimeEffectAction,
-    ) -> kuberic_runtime::Result<()> {
+    ) -> kuberic_runtime::host::Result<()> {
         let sequence = self.store.load_state().await?.next_effect_sequence;
         RuntimeAdapter::new(self.store.clone(), self.runtime.clone())
             .execute(RuntimeEffect {
