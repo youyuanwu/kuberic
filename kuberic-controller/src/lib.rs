@@ -6,6 +6,7 @@
 
 pub mod cluster_api;
 pub mod crd;
+mod error;
 pub mod evaluator;
 mod exact_resources;
 pub mod executor;
@@ -14,11 +15,10 @@ pub mod observation;
 pub mod plan;
 pub mod reconciler;
 
+pub use error::{ControllerError, Result};
 pub use evaluator::{EvaluationConfig, evaluate};
 pub use kuberic_runtime::{control, protocol};
 pub use plan::{Plan, UnsafeReason, WaitReason};
-
-use thiserror::Error;
 
 pub fn production_evaluation_config(
     stable_resync_seconds: u64,
@@ -34,24 +34,6 @@ pub fn production_evaluation_config(
         unsafe_requeue_seconds,
     }
 }
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ControllerError {
-    #[error("observation failed: {0}")]
-    Observation(String),
-    #[error("transient observation failed: {0}")]
-    TransientObservation(String),
-    #[error("observed Kubernetes object changed; a fresh observation is required")]
-    ObservationStale,
-    #[error("agent is unavailable: {0}")]
-    AgentUnavailable(String),
-    #[error("agent returned invalid evidence: {0}")]
-    InvalidAgentEvidence(String),
-    #[error("effect failed: {0}")]
-    Effect(String),
-}
-
-pub type Result<T> = std::result::Result<T, ControllerError>;
 
 #[cfg(test)]
 mod tests {

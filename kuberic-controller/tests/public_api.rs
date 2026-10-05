@@ -79,7 +79,9 @@ fn controller_control_exports_preserve_protocol_fencing() {
 
 #[test]
 fn crdgen_preserves_schema_and_flattened_status() {
-    let output = Command::new(env!("CARGO_BIN_EXE_crdgen")).output().unwrap();
+    let crdgen = std::env::var_os("CARGO_BIN_EXE_crdgen")
+        .expect("test runner did not provide the crdgen binary");
+    let output = Command::new(crdgen).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
