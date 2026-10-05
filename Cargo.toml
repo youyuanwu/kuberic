@@ -49,7 +49,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 crc32fast = "1"
 serial_test = "4.0.1"
 tokio-postgres = "0.7"
-tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls"] }
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "rustls"] }
 zeroize = "1"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 whoami = "2"
