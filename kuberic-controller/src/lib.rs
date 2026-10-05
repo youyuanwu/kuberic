@@ -1,12 +1,23 @@
+//! Kubernetes control plane and pure level-triggered reconciliation policy.
+//!
+//! Canonical command, observation, validation, and transport contracts are
+//! owned by `kuberic_runtime::protocol` and `kuberic_runtime::control`.
+//! They are re-exported here so controller integrations need only this crate.
+
 pub mod cluster_api;
 pub mod crd;
+pub mod evaluator;
 mod exact_resources;
 pub mod executor;
 pub mod normalize;
 pub mod observation;
+pub mod plan;
 pub mod reconciler;
 
-use kuberic_protocol::evaluator::EvaluationConfig;
+pub use evaluator::{EvaluationConfig, evaluate};
+pub use kuberic_runtime::{control, protocol};
+pub use plan::{Plan, UnsafeReason, WaitReason};
+
 use thiserror::Error;
 
 pub fn production_evaluation_config(
@@ -17,7 +28,7 @@ pub fn production_evaluation_config(
     EvaluationConfig {
         enable_secondary_scale_down: true,
         allow_scale_up: true,
-        supported_protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        supported_protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         stable_resync_seconds,
         wait_requeue_seconds,
         unsafe_requeue_seconds,
@@ -51,7 +62,7 @@ mod tests {
         assert!(config.allow_scale_up);
         assert_eq!(
             config.supported_protocol_version,
-            kuberic_protocol::PROTOCOL_VERSION
+            kuberic_runtime::protocol::PROTOCOL_VERSION
         );
         assert_eq!(config.stable_resync_seconds, 31);
         assert_eq!(config.wait_requeue_seconds, 7);

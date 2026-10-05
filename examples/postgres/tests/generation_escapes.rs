@@ -2,9 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kuberic_agent::store::AgentStore;
-use kuberic_protocol::types::{AccessStatus, FaultType, ProcessSessionId, ResourceUid};
-use kuberic_runtime_internal::effects::RuntimeEffectAction;
+use kuberic_runtime::protocol::types::{AccessStatus, FaultType, ProcessSessionId, ResourceUid};
+use kuberic_runtime::testing::effects::RuntimeEffectAction;
 use postgres_replicated::access::{PgAccessController, initialize_application_role};
 use postgres_replicated::durable::{PgDurableIdentity, PgDurableStore, StorageMode};
 use postgres_replicated::instance::PgInstanceManager;
@@ -59,12 +58,7 @@ async fn retired_error_inside_sf_effect_cannot_abort_replacement_or_publish_succ
         gate.release.notify_one();
         let old = old.await.unwrap();
         assert!(
-            matches!(
-                old,
-                Err(kuberic_agent::AgentError::Runtime(
-                    kuberic_runtime::RuntimeError::OperationCancelled
-                ))
-            ),
+            matches!(old, Err(kuberic_runtime::RuntimeError::OperationCancelled)),
             "{old:?}"
         );
         sql.simple_query("SELECT 1").await.unwrap();
@@ -111,7 +105,7 @@ async fn timed_out_sf_effect_does_not_abort_its_retryable_successor() {
     .unwrap_err();
     assert!(matches!(
         error,
-        kuberic_agent::AgentError::Runtime(kuberic_runtime::RuntimeError::OperationCancelled)
+        kuberic_runtime::RuntimeError::OperationCancelled
     ));
     owned.assert_reaped();
     assert_eq!(
