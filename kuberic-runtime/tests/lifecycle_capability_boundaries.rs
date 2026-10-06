@@ -314,38 +314,53 @@ fn reject_unclassified_capability_aggregates(
     file: &syn::File,
     allowed: &[&str],
 ) -> Result<(), String> {
-    fn inspect(items: &[Item], allowed: &[&str], nested: bool) -> Result<(), String> {
-        for item in items {
-            match item {
-                Item::Struct(item) => {
-                    let capability_fields = item
-                        .fields
-                        .iter()
-                        .filter(|field| {
-                            let ty = compact(&field.ty);
-                            capability_marker_count(&ty) > 0
-                        })
-                        .count();
-                    if capability_fields >= 2
-                        && (nested || !allowed.contains(&item.ident.to_string().as_str()))
-                    {
-                        return Err(format!(
-                            "{} is an unclassified capability aggregate",
-                            item.ident
-                        ));
-                    }
-                }
-                Item::Mod(item) => {
-                    if let Some((_, items)) = &item.content {
-                        inspect(items, allowed, true)?;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+    struct AggregateVisitor<'a> {
+        allowed: &'a [&'a str],
+        depth: usize,
+        issue: Option<String>,
     }
-    inspect(&file.items, allowed, false)
+
+    impl<'ast> Visit<'ast> for AggregateVisitor<'_> {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            let capabilities = item
+                .fields
+                .iter()
+                .map(|field| capability_marker_count(&compact(&field.ty)))
+                .sum::<usize>();
+            if capabilities >= 2
+                && (self.depth > 0 || !self.allowed.contains(&item.ident.to_string().as_str()))
+            {
+                self.issue = Some(format!(
+                    "{} is an unclassified capability aggregate",
+                    item.ident
+                ));
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            self.depth += 1;
+            syn::visit::visit_block(self, block);
+            self.depth -= 1;
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            self.depth += 1;
+            syn::visit::visit_item_mod(self, item);
+            self.depth -= 1;
+        }
+    }
+
+    let mut visitor = AggregateVisitor {
+        allowed,
+        depth: 0,
+        issue: None,
+    };
+    visitor.visit_file(file);
+    match visitor.issue {
+        Some(issue) => Err(issue),
+        None => Ok(()),
+    }
 }
 
 fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
@@ -1397,4 +1412,16 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "{hosting}\nfn all_views() -> (BuildRuntime, ReportRuntime) {{ unreachable!() }}\n"
     );
     assert!(validate(&lifecycle, &custom, &tuple_getter).is_err());
+
+    let tuple_struct = format!("{hosting}\nstruct TupleBroker((BuildRuntime, ReportRuntime));\n");
+    assert!(validate(&lifecycle, &custom, &tuple_struct).is_err());
+
+    let tuple_field =
+        format!("{hosting}\nstruct TupleFieldBroker {{ views: (BuildRuntime, ReportRuntime) }}\n");
+    assert!(validate(&lifecycle, &custom, &tuple_field).is_err());
+
+    let local_broker = format!(
+        "{hosting}\nfn leaked_local() {{ struct LocalBroker {{ build: BuildRuntime, report: ReportRuntime }} }}\n"
+    );
+    assert!(validate(&lifecycle, &custom, &local_broker).is_err());
 }
