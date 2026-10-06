@@ -1223,8 +1223,8 @@ impl ReportHost for RuntimeHost {
         {
             lifecycle.observe_progress().await?;
         } else {
-            let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
             let result = async {
+                let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
                 let current = registered.current_progress().await?;
                 let committed = match registered.provider.as_ref() {
                     Some(provider) => Some(provider.last_committed_lsn().await?),
