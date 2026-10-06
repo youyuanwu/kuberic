@@ -258,6 +258,13 @@ fn allowed_aggregates(relative: &Path) -> &'static [&'static str] {
     }
 }
 
+fn view_rule(name: &str) -> Option<&'static [&'static str]> {
+    LIFECYCLE_VIEW_RULES
+        .iter()
+        .chain(HOSTING_VIEW_RULES)
+        .find_map(|(view, allowed)| (*view == name).then_some(*allowed))
+}
+
 fn reject_transitive_capability_inheritance(file: &syn::File) -> Result<(), String> {
     let graph = file
         .items
@@ -407,9 +414,10 @@ fn validate_module_policy(
                 .collect::<BTreeSet<_>>();
             let approved =
                 self.depth == 0 && self.allowed.contains(&item.ident.to_string().as_str());
+            let reject_broad = disallowed_type_lint_exempt(&item.attrs, self.reject_broad);
             if capabilities.len() >= 2 && !approved {
                 self.record(|| format!("{} is an unapproved capability aggregate", item.ident));
-            } else if self.reject_broad && !broad.is_empty() && !approved {
+            } else if reject_broad && !broad.is_empty() && !approved {
                 self.record(|| format!("{} retains an unapproved broad owner", item.ident));
             }
             syn::visit::visit_item_struct(self, item);
@@ -454,6 +462,7 @@ fn validate_module_policy(
         }
 
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let owner = impl_name(item);
             if let Some((path, _)) = &item.trait_ {
                 let mut markers = type_markers(&item.self_ty);
                 markers.visit_path(path);
@@ -470,12 +479,46 @@ fn validate_module_policy(
                     self.record(|| "conversion exposes complete lifecycle wiring".into());
                 }
             }
+            let registration = matches!(
+                owner.as_str(),
+                "RegisteredReplicator" | "ReplicatorLifecycleRegistration"
+            );
+            if registration && item.trait_.is_some() {
+                self.record(|| format!("{owner} implements an unapproved wiring conversion"));
+            }
+            if view_rule(&owner).is_some() && item.trait_.is_some() {
+                self.record(|| format!("{owner} implements an unapproved conversion trait"));
+            }
             for member in &item.items {
                 if let ImplItem::Fn(method) = member {
-                    self.signature(
-                        &format!("{}::{}", impl_name(item), method.sig.ident),
-                        &method.sig,
-                    );
+                    let method_owner = format!("{owner}::{}", method.sig.ident);
+                    let markers = signature_markers(&method.sig);
+                    if registration {
+                        let output = return_markers(&method.sig.output);
+                        if output.broad.iter().any(|name| {
+                            [
+                                "LifecycleWiring",
+                                "ManagedLifecycleBackend",
+                                "CustomReplicatorHost",
+                            ]
+                            .contains(&name.as_str())
+                        }) {
+                            self.record(|| {
+                                format!("{method_owner} exposes complete lifecycle wiring")
+                            });
+                        }
+                    }
+                    if let Some(allowed) = view_rule(&owner)
+                        && (markers.direct_primary
+                            || !markers.broad.is_empty()
+                            || markers
+                                .capabilities
+                                .iter()
+                                .any(|value| !allowed.contains(&value.as_str())))
+                    {
+                        self.record(|| format!("{method_owner} exposes an unrelated capability"));
+                    }
+                    self.signature(&method_owner, &method.sig);
                 }
             }
             syn::visit::visit_item_impl(self, item);
@@ -507,46 +550,6 @@ fn validate_module_policy(
     visitor.issue.map_or(Ok(()), Err)
 }
 
-struct ViewImplValidator<'a> {
-    view: &'a str,
-    allowed: &'a [&'a str],
-    issue: Option<String>,
-}
-
-impl<'ast> Visit<'ast> for ViewImplValidator<'_> {
-    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        if type_name(&item.self_ty).as_deref() == Some(self.view) {
-            if item.trait_.is_some() {
-                self.issue = Some(format!(
-                    "{} implements an unapproved conversion trait",
-                    self.view
-                ));
-            }
-            for member in &item.items {
-                if let ImplItem::Fn(method) = member {
-                    let markers = signature_markers(&method.sig);
-                    if !markers.broad.is_empty() || markers.direct_primary {
-                        self.issue = Some(format!(
-                            "{}::{} exposes a broad owner",
-                            self.view, method.sig.ident
-                        ));
-                    } else if markers
-                        .capabilities
-                        .iter()
-                        .any(|capability| !self.allowed.contains(&capability.as_str()))
-                    {
-                        self.issue = Some(format!(
-                            "{}::{} exposes an unrelated capability",
-                            self.view, method.sig.ident
-                        ));
-                    }
-                }
-            }
-        }
-        syn::visit::visit_item_impl(self, item);
-    }
-}
-
 fn validate_view_boundaries(file: &syn::File, rules: &[(&str, &[&str])]) -> Result<(), String> {
     for (view, allowed) in rules {
         let item = file
@@ -569,15 +572,6 @@ fn validate_view_boundaries(file: &syn::File, rules: &[(&str, &[&str])]) -> Resu
             {
                 return Err(format!("{view} retains an unrelated capability"));
             }
-        }
-        let mut validator = ViewImplValidator {
-            view,
-            allowed,
-            issue: None,
-        };
-        validator.visit_file(file);
-        if let Some(issue) = validator.issue {
-            return Err(issue);
         }
     }
     Ok(())
@@ -763,35 +757,6 @@ fn reject_wiring_escape(file: &syn::File, owner: &str, forbidden: &[&str]) -> Re
             .any(|marker| forbidden.contains(&marker.as_str()))
         {
             return Err(format!("{owner} retains complete lifecycle wiring"));
-        }
-    }
-    for item in &file.items {
-        let Item::Impl(item) = item else {
-            continue;
-        };
-        if type_name(&item.self_ty).as_deref() != Some(owner) {
-            continue;
-        }
-        if item.trait_.is_some() {
-            return Err(format!(
-                "{owner} implements an unapproved wiring conversion"
-            ));
-        }
-        for member in &item.items {
-            let ImplItem::Fn(method) = member else {
-                continue;
-            };
-            let markers = return_markers(&method.sig.output);
-            if markers
-                .broad
-                .iter()
-                .any(|marker| forbidden.contains(&marker.as_str()))
-            {
-                return Err(format!(
-                    "{owner}::{} exposes complete lifecycle wiring",
-                    method.sig.ident
-                ));
-            }
         }
     }
     Ok(())
@@ -1061,7 +1026,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     let harmless_method = format!(
         "{lifecycle}\nimpl ProcessRuntime {{ fn harmless_narrow_helper(&self) -> bool {{ true }} }}\n"
     );
-    validate_view_boundaries(&parsed(&harmless_method), LIFECYCLE_VIEW_RULES).unwrap();
+    validate_module_policy(&parsed(&harmless_method), allowed_aggregates(Path::new("lifecycle.rs")), true).unwrap();
 
     reject_policy("use self::BuildRuntime as B;\ntype R = ReportRuntime;\nstruct Broker { build: B, report: R }", false, "guarded");
     reject_policy("use self::BuildLifecycle as Other;", false, "guarded import alias");
@@ -1072,12 +1037,12 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     let view_escape = format!(
         "{lifecycle}\nimpl ProcessRuntime {{ fn build_capability(&self) -> Arc<dyn self::BuildLifecycle> {{ unreachable!() }} }}\n"
     );
-    assert_rejected(validate_view_boundaries(&parsed(&view_escape), LIFECYCLE_VIEW_RULES), "build_capability");
+    assert_rejected(validate_module_policy(&parsed(&view_escape), allowed_aggregates(Path::new("lifecycle.rs")), true), "build_capability");
 
     let conversion = format!(
         "{lifecycle}\nimpl std::ops::Deref for ProcessRuntime {{ type Target = RuntimeHost; fn deref(&self) -> &Self::Target {{ unreachable!() }} }}\n"
     );
-    assert_rejected(validate_view_boundaries(&parsed(&conversion), LIFECYCLE_VIEW_RULES), "conversion");
+    assert_rejected(validate_module_policy(&parsed(&conversion), allowed_aggregates(Path::new("lifecycle.rs")), true), "conversion");
 
     reject_policy("trait ReportHost { fn broad(&self) -> &PodRuntime; }", true, "ReportHost::broad");
     let host_view_escape = syn::parse_file(
@@ -1095,6 +1060,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     reject_policy("type DirectPrimary = dyn PrimaryReplicator;", true, "DirectPrimary");
     reject_policy("#[allow(clippy::disallowed_types)] mod worker { struct Facade { runtime: Arc<PodRuntime> } }", false, "Facade");
     reject_policy("#[deny(clippy::disallowed_types)] mod worker { #![allow(clippy::disallowed_types)] struct Facade { runtime: Arc<PodRuntime> } }", false, "Facade");
+    reject_policy("#[allow(clippy::disallowed_types)] struct UnauthorizedFacade { runtime: Arc<PodRuntime> }", false, "UnauthorizedFacade");
 
     for gate in [
         "#[cfg(all())]",
@@ -1125,21 +1091,13 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         "impl ReplicatorLifecycleRegistration {\n",
         "impl ReplicatorLifecycleRegistration {\n    fn all_capabilities(&self) -> &super::lifecycle::LifecycleWiring { unreachable!() }\n",
     );
-    assert_rejected(
-        reject_wiring_escape(
-            &syn::parse_file(&wiring_getter).unwrap(),
-            "ReplicatorLifecycleRegistration",
-            &[
-                "LifecycleWiring",
-                "ManagedLifecycleBackend",
-                "CustomReplicatorHost",
-            ],
-        ),
-        "all_capabilities",
-    );
+    assert_rejected(validate_module_policy(&parsed(&wiring_getter), allowed_aggregates(Path::new("custom.rs")), true), "all_capabilities");
     reject_policy("impl From<ReplicatorLifecycleRegistration> for LifecycleWiring { fn from(value: ReplicatorLifecycleRegistration) -> Self { unreachable!() } }", true, "conversion");
     reject_policy("impl From<RegisteredReplicator> for LifecycleWiring { fn from(value: RegisteredReplicator) -> Self { unreachable!() } }", true, "conversion");
     reject_policy("impl From<ReplicatorLifecycleRegistration> for ManagedLifecycleBackend { fn from(value: ReplicatorLifecycleRegistration) -> Self { unreachable!() } }", true, "conversion");
+    reject_policy("mod nested { impl RegisteredReplicator { fn leak(&self) -> LifecycleWiring { unreachable!() } } }", true, "leak");
+    reject_policy("mod nested { impl ReplicatorLifecycleRegistration { fn leak(&self) -> LifecycleWiring { unreachable!() } } }", true, "leak");
+    assert_rejected(validate_production_module(Path::new("hosting/worker.rs"), "impl ReportRuntime { fn leak(&self) -> BuildRuntime { unreachable!() } }", true), "leak");
 
     reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildRuntime) -> Self { unreachable!() } }", "cancellation-only");
     reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime) -> Self { let host: Option<Arc<PodRuntime>> = None; unreachable!() } }", "broader runtime");
@@ -1179,5 +1137,5 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     assert!(modules.contains(&(PathBuf::from("root_worker.rs"), true)));
 
     let nested_view = format!("{lifecycle}\nmod nested {{ impl super::ProcessRuntime {{ fn leak(&self) -> super::BuildLifecycleRuntime {{ unreachable!() }} }} }}");
-    assert_rejected(validate_view_boundaries(&parsed(&nested_view), LIFECYCLE_VIEW_RULES), "leak");
+    assert_rejected(validate_module_policy(&parsed(&nested_view), allowed_aggregates(Path::new("lifecycle.rs")), true), "leak");
 }
