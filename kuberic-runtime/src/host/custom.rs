@@ -68,10 +68,10 @@ struct AcceptedBuild {
 }
 
 pub(super) struct ReadyAccessTransaction {
-    accept: oneshot::Sender<()>,
-    accepted: oneshot::Receiver<Option<NativeProgressStatus>>,
-    decision: oneshot::Sender<AccessDecision>,
-    completion: tokio::task::JoinHandle<Result<()>>,
+    pub(super) accept: oneshot::Sender<()>,
+    pub(super) accepted: oneshot::Receiver<Option<NativeProgressStatus>>,
+    pub(super) decision: oneshot::Sender<AccessDecision>,
+    pub(super) completion: tokio::task::JoinHandle<Result<()>>,
 }
 
 pub(crate) struct AcceptedAccessTransaction {
@@ -1356,7 +1356,6 @@ impl ManagedLifecycleBackend {
 
 pub(super) struct ReplicatorLifecycleHost {
     managed: bool,
-    access: Arc<dyn AccessLifecycle>,
     build: Arc<dyn BuildLifecycle>,
     topology: Arc<dyn TopologyLifecycle>,
     observation: Arc<dyn LifecycleObservation>,
@@ -1369,7 +1368,10 @@ pub(super) struct ReplicatorLifecycleRegistration {
     pub(super) authority: super::lifecycle::AuthorityRuntime,
     pub(super) peer: super::lifecycle::PeerRuntime,
     pub(super) access_closure: super::lifecycle::AccessClosure,
+    pub(super) access: super::lifecycle::AccessRuntime,
+    pub(super) report: super::lifecycle::ReportLifecycle,
     pub(super) evidence: super::lifecycle::EvidenceRuntime,
+    pub(super) effect_evidence: super::lifecycle::EffectEvidenceRuntime,
 }
 
 impl ReplicatorLifecycleHost {
@@ -1402,10 +1404,12 @@ impl ReplicatorLifecycleHost {
         let authority = wiring.authority_runtime();
         let peer = wiring.peer_runtime();
         let access_closure = wiring.access_closure();
+        let access = wiring.access_runtime();
+        let report = wiring.report_lifecycle();
         let evidence = wiring.evidence_runtime();
+        let effect_evidence = wiring.effect_evidence_runtime();
         let lifecycle = Arc::new(Self {
             managed,
-            access: wiring.access,
             build: wiring.build,
             topology: wiring.topology,
             observation: wiring.observation,
@@ -1417,26 +1421,15 @@ impl ReplicatorLifecycleHost {
             authority,
             peer,
             access_closure,
+            access,
+            report,
             evidence,
+            effect_evidence,
         }
     }
 
     pub(super) fn is_managed(&self) -> bool {
         self.managed
-    }
-
-    pub(super) async fn restore_access(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-    ) -> Result<()> {
-        match self.commit_access_transaction(read, write).await {
-            Err(RuntimeError::ReconfigurationPending) => {
-                self.access.defer_restored_access(read, write).await;
-                Err(RuntimeError::ReconfigurationPending)
-            }
-            result => result,
-        }
     }
 
     pub(super) async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()> {
@@ -1445,45 +1438,6 @@ impl ReplicatorLifecycleHost {
 
     pub(super) async fn retire_build(&self, build_id: OperationId) -> Result<()> {
         self.build.retire_build(build_id).await
-    }
-
-    async fn commit_access_transaction(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-    ) -> Result<()> {
-        let transaction = self.begin_access_effect(read, write).await?;
-        let (_, transaction) = transaction.accept().await?;
-        transaction.commit().await
-    }
-
-    pub(super) async fn begin_access_effect(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-    ) -> Result<ReadyAccessTransaction> {
-        let access = self.access.clone();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (accept_tx, accept_rx) = oneshot::channel();
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        let (decision_tx, decision_rx) = oneshot::channel();
-        let completion = tokio::spawn(async move {
-            access
-                .run_access_transaction(read, write, ready_tx, accept_rx, accepted_tx, decision_rx)
-                .await
-        });
-        match ready_rx.await {
-            Ok(()) => Ok(ReadyAccessTransaction {
-                accept: accept_tx,
-                accepted: accepted_rx,
-                decision: decision_tx,
-                completion,
-            }),
-            Err(_) => completion
-                .await
-                .map_err(|error| RuntimeError::Application(error.to_string()))?
-                .and(Err(RuntimeError::OperationCancelled)),
-        }
     }
 
     pub(super) async fn wait_for_catch_up(&self) -> Result<()> {
@@ -1513,18 +1467,6 @@ impl ReplicatorLifecycleHost {
                 starting_epoch,
             )
             .await
-    }
-
-    pub(super) async fn refresh_progress(&self) -> Result<()> {
-        self.observation.refresh_progress().await
-    }
-
-    pub(super) async fn observe_progress(&self) -> Result<()> {
-        self.observation.observe_progress().await?;
-        if let Some((read, write)) = self.access.restored_access().await {
-            self.commit_access_transaction(read, write).await?;
-        }
-        Ok(())
     }
 
     pub(super) async fn prepare_secondary_removal(
@@ -1670,13 +1612,6 @@ impl ReplicatorLifecycleHost {
         target: &ReplicaIdentity,
     ) -> Result<BuildCompletionConfirmation> {
         self.build.confirm_build_completion(build_id, target).await
-    }
-
-    pub(super) async fn postcondition(
-        &self,
-        progress: Option<&NativeProgressStatus>,
-    ) -> RuntimePostcondition {
-        self.observation.postcondition(progress).await
     }
 }
 

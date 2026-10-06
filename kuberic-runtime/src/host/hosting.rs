@@ -146,7 +146,10 @@ struct RegisteredReplicator {
     authority_lifecycle: Option<lifecycle::AuthorityRuntime>,
     peer_lifecycle: Option<lifecycle::PeerRuntime>,
     access_closure: Option<lifecycle::AccessClosure>,
+    access_lifecycle: Option<lifecycle::AccessRuntime>,
+    report_lifecycle: Option<lifecycle::ReportLifecycle>,
     lifecycle_evidence: Option<lifecycle::EvidenceRuntime>,
+    effect_evidence: Option<lifecycle::EffectEvidenceRuntime>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
@@ -260,8 +263,17 @@ impl RegisteredReplicator {
     fn access_closure(&self) -> Option<lifecycle::AccessClosure> {
         self.access_closure.clone()
     }
+    fn access_lifecycle(&self) -> Option<lifecycle::AccessRuntime> {
+        self.access_lifecycle.clone()
+    }
+    fn report_lifecycle(&self) -> Option<lifecycle::ReportLifecycle> {
+        self.report_lifecycle.clone()
+    }
     fn lifecycle_evidence(&self) -> Option<lifecycle::EvidenceRuntime> {
         self.lifecycle_evidence.clone()
+    }
+    fn effect_evidence(&self) -> Option<lifecycle::EffectEvidenceRuntime> {
+        self.effect_evidence.clone()
     }
     fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary.clone()
@@ -352,6 +364,46 @@ pub(crate) struct PartitionReportSnapshot {
     pub(crate) write_status: AccessStatus,
     pub(crate) load_metrics: Vec<LoadMetric>,
     pub(crate) reported_fault: Option<FaultType>,
+}
+
+#[async_trait]
+trait ReportHost: Send + Sync {
+    async fn observe_progress(&self) -> Result<()>;
+    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
+    async fn partition_report(&self) -> PartitionReportSnapshot;
+    async fn catch_up_capability(&self) -> Result<i64>;
+}
+
+#[derive(Clone)]
+pub(crate) struct ReportRuntime {
+    inner: Arc<dyn ReportHost>,
+}
+
+impl ReportRuntime {
+    pub(crate) async fn observe_progress(&self) -> Result<()> {
+        self.inner.observe_progress().await
+    }
+
+    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
+        self.inner.snapshot().await
+    }
+
+    pub(crate) async fn reconcile_durable_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        self.inner.reconcile_access(read, write).await
+    }
+
+    pub(crate) async fn partition_report(&self) -> PartitionReportSnapshot {
+        self.inner.partition_report().await
+    }
+
+    pub(crate) async fn catch_up_capability(&self) -> Result<i64> {
+        self.inner.catch_up_capability().await
+    }
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -630,10 +682,10 @@ impl PodRuntime {
         if !self.host.snapshot().await.open {
             self.host.open(mode).await?;
         }
-        if let Ok(managed) = self.host.lifecycle() {
+        if let Ok(evidence) = self.host.lifecycle_evidence() {
             self.restore_authority().await?;
             self.host
-                .sync_access_projection(managed.snapshot().await)
+                .sync_access_projection(evidence.snapshot().await)
                 .await;
         }
         if let Some((target_role, epoch_completed, application_completed)) = transition {
@@ -659,7 +711,8 @@ impl PodRuntime {
         } else {
             (read_status, write_status)
         };
-        if let Ok(managed) = self.host.lifecycle() {
+        if let Ok(access) = self.host.access_lifecycle() {
+            let evidence = self.host.lifecycle_evidence()?;
             if write_status == AccessStatus::Granted
                 && let Some(committed) = self
                     .host
@@ -667,7 +720,7 @@ impl PodRuntime {
                     .replica_authority_store
                     .load_secondary_removal_commit()
                     .await?
-                && managed
+                && evidence
                     .snapshot()
                     .await
                     .authority
@@ -677,16 +730,19 @@ impl PodRuntime {
                             && a.secondary_removal.as_ref() == Some(&committed.evidence)
                     })
             {
-                managed.accept_secondary_removal(committed).await?;
+                self.host
+                    .lifecycle()?
+                    .accept_secondary_removal(committed)
+                    .await?;
             }
-            match managed.restore_access(read_status, write_status).await {
+            match access.restore(read_status, write_status).await {
                 Err(RuntimeError::ReconfigurationPending) => {
                     tracing::info!("replica access restoration deferred");
                 }
                 result => result?,
             }
             self.host
-                .sync_access_projection(managed.snapshot().await)
+                .sync_access_projection(evidence.snapshot().await)
                 .await;
         } else {
             let mut state = self.host.state.write().await;
@@ -820,19 +876,10 @@ impl PodRuntime {
         self.host.snapshot().await
     }
 
-    pub(crate) async fn reconcile_durable_access(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-    ) -> Result<()> {
-        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-            lifecycle.restore_access(read, write).await?;
-        } else {
-            let mut state = self.host.state.write().await;
-            state.fallback_snapshot.read_status = read;
-            state.fallback_snapshot.write_status = write;
+    pub(crate) fn report_runtime(&self) -> ReportRuntime {
+        ReportRuntime {
+            inner: self.host.clone(),
         }
-        Ok(())
     }
 
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -849,15 +896,6 @@ impl PodRuntime {
             })),
             None => Ok(primary),
         }
-    }
-
-    pub(crate) async fn catch_up_capability(&self) -> Result<i64> {
-        self.host
-            .registered
-            .get()
-            .ok_or(RuntimeError::NotOpen)?
-            .catch_up_capability()
-            .await
     }
 
     pub(crate) async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
@@ -956,23 +994,6 @@ impl PodRuntime {
         self.host.peer_lifecycle()?.describe_peer(replica).await
     }
 
-    pub(crate) async fn observe_progress(&self) -> Result<()> {
-        if let Some(lifecycle) = self.host.registered.get().and_then(|r| r.lifecycle()) {
-            lifecycle.observe_progress().await?;
-        } else {
-            let result = self
-                .host
-                .execute_secondary_action(RuntimeEffectAction::RefreshApplicationProgress)
-                .await;
-            if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
-                self.host.state.write().await.fallback_snapshot.open = false;
-                return Ok(());
-            }
-            result?;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn execute_admitted_build<F, Fut, E>(
         &self,
         replica: crate::replicator::ReplicaInformation,
@@ -1055,21 +1076,7 @@ impl PodRuntime {
     }
 
     pub(crate) async fn partition_report(&self) -> PartitionReportSnapshot {
-        let state = self.host.state.read().await;
-        PartitionReportSnapshot {
-            information: state.partition_information.clone(),
-            read_status: state.fallback_snapshot.read_status,
-            write_status: state.fallback_snapshot.write_status,
-            load_metrics: state
-                .load_metrics
-                .iter()
-                .map(|(name, value)| LoadMetric {
-                    name: name.clone(),
-                    value: *value,
-                })
-                .collect(),
-            reported_fault: state.reported_fault,
-        }
+        self.host.partition_report_snapshot().await
     }
 }
 
@@ -1204,6 +1211,80 @@ struct RuntimeHost {
     closed: AtomicBool,
     #[cfg(all(test, feature = "testing"))]
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+}
+
+#[async_trait]
+impl ReportHost for RuntimeHost {
+    async fn observe_progress(&self) -> Result<()> {
+        if let Some(lifecycle) = self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle)
+        {
+            lifecycle.observe_progress().await?;
+        } else {
+            let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+            let result = async {
+                let current = registered.current_progress().await?;
+                let committed = match registered.provider.as_ref() {
+                    Some(provider) => Some(provider.last_committed_lsn().await?),
+                    None => None,
+                };
+                let mut state = self.state.write().await;
+                state.fallback_snapshot.current_progress = current;
+                if let Some(committed) = committed {
+                    state.fallback_snapshot.committed_lsn = committed;
+                }
+                Ok(())
+            }
+            .await;
+            if matches!(result, Err(RuntimeError::NotOpen | RuntimeError::Closed)) {
+                self.state.write().await.fallback_snapshot.open = false;
+                return Ok(());
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        let lifecycle = self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle);
+        let snapshot = match lifecycle {
+            Some(lifecycle) => Some(lifecycle.snapshot().await),
+            None => None,
+        };
+        self.compose_snapshot(snapshot).await
+    }
+
+    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        if let Some(lifecycle) = self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle)
+        {
+            lifecycle.reconcile_access(read, write).await?;
+        } else {
+            let mut state = self.state.write().await;
+            state.fallback_snapshot.read_status = read;
+            state.fallback_snapshot.write_status = write;
+        }
+        Ok(())
+    }
+
+    async fn partition_report(&self) -> PartitionReportSnapshot {
+        self.partition_report_snapshot().await
+    }
+
+    async fn catch_up_capability(&self) -> Result<i64> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .catch_up_capability()
+            .await
+    }
 }
 
 struct HostAccessView {
@@ -1360,7 +1441,10 @@ impl ReplicatorRegistration for RuntimeHost {
             authority_lifecycle,
             peer_lifecycle,
             access_closure,
+            access_lifecycle,
+            report_lifecycle,
             lifecycle_evidence,
+            effect_evidence,
         ) = match lifecycle_registration {
             Some(registration) => (
                 Some(registration.lifecycle),
@@ -1368,9 +1452,12 @@ impl ReplicatorRegistration for RuntimeHost {
                 Some(registration.authority),
                 Some(registration.peer),
                 Some(registration.access_closure),
+                Some(registration.access),
+                Some(registration.report),
                 Some(registration.evidence),
+                Some(registration.effect_evidence),
             ),
-            None => (None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None, None, None),
         };
         let mut creation = self.replicator_creation.lock().map_err(|_| {
             RuntimeError::Application("replicator creation state was poisoned".into())
@@ -1395,7 +1482,10 @@ impl ReplicatorRegistration for RuntimeHost {
                 authority_lifecycle,
                 peer_lifecycle,
                 access_closure,
+                access_lifecycle,
+                report_lifecycle,
                 lifecycle_evidence,
+                effect_evidence,
                 managed_data_plane,
             })
             .map_err(|_| {
@@ -1463,6 +1553,17 @@ impl RuntimeHost {
             .get()
             .ok_or(RuntimeError::NotOpen)?
             .access_closure()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose access lifecycle capabilities".into(),
+                )
+            })
+    }
+    fn access_lifecycle(&self) -> Result<lifecycle::AccessRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .access_lifecycle()
             .ok_or_else(|| {
                 RuntimeError::Application(
                     "replicator does not expose access lifecycle capabilities".into(),
@@ -1663,8 +1764,12 @@ impl RuntimeHost {
                 self.lifecycle()?.retire_build(build_id).await?;
             }
             RuntimeEffectAction::SetAccessStatus { read, write } => {
-                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
+                if let Some(access) = self
+                    .registered
+                    .get()
+                    .and_then(RegisteredReplicator::access_lifecycle)
+                {
+                    access_commit = Some(access.begin_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetAccessStatus {
                         read,
@@ -1674,18 +1779,26 @@ impl RuntimeHost {
                 }
             }
             RuntimeEffectAction::SetReadStatus(read) => {
-                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
+                if let Some(access) = self
+                    .registered
+                    .get()
+                    .and_then(RegisteredReplicator::access_lifecycle)
+                {
                     let write = self.state.read().await.fallback_snapshot.write_status;
-                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
+                    access_commit = Some(access.begin_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetReadStatus(read))
                         .await?;
                 }
             }
             RuntimeEffectAction::SetWriteStatus(write) => {
-                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
+                if let Some(access) = self
+                    .registered
+                    .get()
+                    .and_then(RegisteredReplicator::access_lifecycle)
+                {
                     let read = self.state.read().await.fallback_snapshot.read_status;
-                    access_commit = Some(lifecycle.begin_access_effect(read, write).await?);
+                    access_commit = Some(access.begin_effect(read, write).await?);
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::SetWriteStatus(write))
                         .await?;
@@ -1720,8 +1833,12 @@ impl RuntimeHost {
                     .await?;
             }
             RuntimeEffectAction::RefreshApplicationProgress => {
-                if let Some(lifecycle) = self.registered.get().and_then(|r| r.lifecycle()) {
-                    lifecycle.refresh_progress().await?;
+                if let Some(evidence) = self
+                    .registered
+                    .get()
+                    .and_then(RegisteredReplicator::effect_evidence)
+                {
+                    evidence.refresh_progress().await?;
                 } else {
                     self.execute_secondary_action(RuntimeEffectAction::RefreshApplicationProgress)
                         .await?;
@@ -1796,8 +1913,12 @@ impl RuntimeHost {
                 .map(Box::new),
             None => None,
         };
-        let postcondition = match lifecycle.as_ref() {
-            Some(lifecycle) => lifecycle.postcondition(access_progress.as_ref()).await,
+        let postcondition = match self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::effect_evidence)
+        {
+            Some(evidence) => evidence.postcondition(access_progress.as_ref()).await,
             None => snapshot_postcondition(self.snapshot().await),
         };
         let result = RuntimeEffectResult {
@@ -2361,9 +2482,8 @@ impl RuntimeHost {
         Ok(())
     }
 
-    async fn snapshot(&self) -> RuntimeSnapshot {
-        if let Ok(managed) = self.lifecycle() {
-            let mut snapshot = managed.snapshot().await;
+    async fn compose_snapshot(&self, managed: Option<RuntimeSnapshot>) -> RuntimeSnapshot {
+        if let Some(mut snapshot) = managed {
             let host = self.state.read().await.fallback_snapshot.clone();
             snapshot.open = host.open;
             snapshot.replication_address = host.replication_address;
@@ -2383,6 +2503,32 @@ impl RuntimeHost {
             }
             snapshot
         }
+    }
+
+    async fn partition_report_snapshot(&self) -> PartitionReportSnapshot {
+        let state = self.state.read().await;
+        PartitionReportSnapshot {
+            information: state.partition_information.clone(),
+            read_status: state.fallback_snapshot.read_status,
+            write_status: state.fallback_snapshot.write_status,
+            load_metrics: state
+                .load_metrics
+                .iter()
+                .map(|(name, value)| LoadMetric {
+                    name: name.clone(),
+                    value: *value,
+                })
+                .collect(),
+            reported_fault: state.reported_fault,
+        }
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        let managed = match self.lifecycle() {
+            Ok(managed) => Some(managed.snapshot().await),
+            Err(_) => None,
+        };
+        self.compose_snapshot(managed).await
     }
 }
 

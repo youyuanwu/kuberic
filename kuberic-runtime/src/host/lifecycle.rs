@@ -16,7 +16,9 @@ use crate::replicator::ReplicaInformation;
 use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
 
-use super::custom::{AccessCommit, AccessDecision, BuildAdmission, BuildCompletionConfirmation};
+use super::custom::{
+    AccessDecision, BuildAdmission, BuildCompletionConfirmation, ReadyAccessTransaction,
+};
 
 #[async_trait]
 pub(super) trait ProcessLifecycle: Send + Sync {
@@ -198,8 +200,27 @@ impl LifecycleWiring {
         }
     }
 
+    pub(super) fn access_runtime(&self) -> AccessRuntime {
+        AccessRuntime {
+            inner: self.access.clone(),
+        }
+    }
+
+    pub(super) fn report_lifecycle(&self) -> ReportLifecycle {
+        ReportLifecycle {
+            access: self.access.clone(),
+            observation: self.observation.clone(),
+        }
+    }
+
     pub(super) fn evidence_runtime(&self) -> EvidenceRuntime {
         EvidenceRuntime {
+            inner: self.observation.clone(),
+        }
+    }
+
+    pub(super) fn effect_evidence_runtime(&self) -> EffectEvidenceRuntime {
+        EffectEvidenceRuntime {
             inner: self.observation.clone(),
         }
     }
@@ -288,34 +309,108 @@ pub(super) struct AccessClosure {
     inner: Arc<dyn AccessLifecycle>,
 }
 
+async fn begin_access_effect(
+    access: Arc<dyn AccessLifecycle>,
+    read: AccessStatus,
+    write: AccessStatus,
+) -> Result<ReadyAccessTransaction> {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (accept_tx, accept_rx) = oneshot::channel();
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (decision_tx, decision_rx) = oneshot::channel();
+    let completion = tokio::spawn(async move {
+        access
+            .run_access_transaction(read, write, ready_tx, accept_rx, accepted_tx, decision_rx)
+            .await
+    });
+    match ready_rx.await {
+        Ok(()) => Ok(ReadyAccessTransaction {
+            accept: accept_tx,
+            accepted: accepted_rx,
+            decision: decision_tx,
+            completion,
+        }),
+        Err(_) => completion
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .and(Err(RuntimeError::OperationCancelled)),
+    }
+}
+
+async fn commit_access(
+    access: Arc<dyn AccessLifecycle>,
+    read: AccessStatus,
+    write: AccessStatus,
+) -> Result<()> {
+    let transaction = begin_access_effect(access, read, write).await?;
+    let (_, transaction) = transaction.accept().await?;
+    transaction.commit().await
+}
+
+async fn restore_access(
+    access: Arc<dyn AccessLifecycle>,
+    read: AccessStatus,
+    write: AccessStatus,
+) -> Result<()> {
+    match commit_access(access.clone(), read, write).await {
+        Err(RuntimeError::ReconfigurationPending) => {
+            access.defer_restored_access(read, write).await;
+            Err(RuntimeError::ReconfigurationPending)
+        }
+        result => result,
+    }
+}
+
 impl AccessClosure {
     pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (accept_tx, accept_rx) = oneshot::channel();
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        let (decision_tx, decision_rx) = oneshot::channel();
-        let access = self.inner.clone();
-        let completion = tokio::spawn(async move {
-            access
-                .run_access_transaction(read, write, ready_tx, accept_rx, accepted_tx, decision_rx)
-                .await
-        });
-        match ready_rx.await {
-            Ok(()) => {
-                let _ = accept_tx.send(());
-                accepted_rx
-                    .await
-                    .map_err(|_| RuntimeError::OperationCancelled)?;
-                let _ = decision_tx.send(AccessDecision::Commit(AccessCommit::Direct));
-                completion
-                    .await
-                    .map_err(|error| RuntimeError::Application(error.to_string()))?
-            }
-            Err(_) => completion
-                .await
-                .map_err(|error| RuntimeError::Application(error.to_string()))?
-                .and(Err(RuntimeError::OperationCancelled)),
+        commit_access(self.inner.clone(), read, write).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct AccessRuntime {
+    inner: Arc<dyn AccessLifecycle>,
+}
+
+impl AccessRuntime {
+    pub(super) async fn begin_effect(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<ReadyAccessTransaction> {
+        begin_access_effect(self.inner.clone(), read, write).await
+    }
+
+    pub(super) async fn restore(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        restore_access(self.inner.clone(), read, write).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ReportLifecycle {
+    access: Arc<dyn AccessLifecycle>,
+    observation: Arc<dyn LifecycleObservation>,
+}
+
+impl ReportLifecycle {
+    pub(super) async fn observe_progress(&self) -> Result<()> {
+        self.observation.observe_progress().await?;
+        if let Some((read, write)) = self.access.restored_access().await {
+            commit_access(self.access.clone(), read, write).await?;
         }
+        Ok(())
+    }
+
+    pub(super) async fn reconcile_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        restore_access(self.access.clone(), read, write).await
+    }
+
+    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
+        self.observation.snapshot().await
     }
 }
 
@@ -327,6 +422,24 @@ pub(super) struct EvidenceRuntime {
 impl EvidenceRuntime {
     pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
         self.inner.snapshot().await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct EffectEvidenceRuntime {
+    inner: Arc<dyn LifecycleObservation>,
+}
+
+impl EffectEvidenceRuntime {
+    pub(super) async fn refresh_progress(&self) -> Result<()> {
+        self.inner.refresh_progress().await
+    }
+
+    pub(super) async fn postcondition(
+        &self,
+        progress: Option<&NativeProgressStatus>,
+    ) -> RuntimePostcondition {
+        self.inner.postcondition(progress).await
     }
 }
 

@@ -366,7 +366,10 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "authority_runtime",
             "peer_runtime",
             "access_closure",
+            "access_runtime",
+            "report_lifecycle",
             "evidence_runtime",
+            "effect_evidence_runtime",
         ],
     )?;
     assert_shape(
@@ -412,6 +415,27 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         &[("inner", "Arc<dynLifecycleObservation>")],
         &["snapshot"],
     )?;
+    assert_shape(
+        &lifecycle_file,
+        "AccessRuntime",
+        &[("inner", "Arc<dynAccessLifecycle>")],
+        &["begin_effect", "restore"],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "ReportLifecycle",
+        &[
+            ("access", "Arc<dynAccessLifecycle>"),
+            ("observation", "Arc<dynLifecycleObservation>"),
+        ],
+        &["observe_progress", "reconcile_access", "snapshot"],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "EffectEvidenceRuntime",
+        &[("inner", "Arc<dynLifecycleObservation>")],
+        &["refresh_progress", "postcondition"],
+    )?;
 
     let custom_file =
         syn::parse_file(custom).map_err(|error| format!("parse custom host: {error}"))?;
@@ -421,16 +445,11 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "service",
         "registration",
         "is_managed",
-        "restore_access",
         "admit_build_authority",
         "retire_build",
-        "commit_access_transaction",
-        "begin_access_effect",
         "wait_for_catch_up",
         "authorize_failover_prefix",
         "prepare_switchover",
-        "refresh_progress",
-        "observe_progress",
         "prepare_secondary_removal",
         "observe_secondary_removal",
         "observe_secondary_removal_progress",
@@ -452,7 +471,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "enqueue_build",
         "topology_receipt",
         "confirm_build_completion",
-        "postcondition",
     ]);
     let facade_methods = impl_methods(&custom_file, "ReplicatorLifecycleHost");
     if facade_methods.as_ref() != Some(&expected_facade) {
@@ -462,7 +480,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     }
     let expected_facade_fields = BTreeMap::from([
         ("managed".to_owned(), "bool".to_owned()),
-        ("access".to_owned(), "Arc<dynAccessLifecycle>".to_owned()),
         ("build".to_owned(), "Arc<dynBuildLifecycle>".to_owned()),
         (
             "topology".to_owned(),
@@ -504,8 +521,20 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "super::lifecycle::AccessClosure".to_owned(),
         ),
         (
+            "access".to_owned(),
+            "super::lifecycle::AccessRuntime".to_owned(),
+        ),
+        (
+            "report".to_owned(),
+            "super::lifecycle::ReportLifecycle".to_owned(),
+        ),
+        (
             "evidence".to_owned(),
             "super::lifecycle::EvidenceRuntime".to_owned(),
+        ),
+        (
+            "effect_evidence".to_owned(),
+            "super::lifecycle::EffectEvidenceRuntime".to_owned(),
         ),
     ]);
     if struct_fields(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
@@ -536,6 +565,45 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     let hosting_file =
         syn::parse_file(hosting).map_err(|error| format!("parse hosting: {error}"))?;
     reject_broad_aliases(&hosting_file)?;
+    let report_host = hosting_file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Trait(item) if item.ident == "ReportHost" => Some(item),
+            _ => None,
+        })
+        .ok_or_else(|| "ReportHost missing".to_owned())?;
+    if compact(&report_host.supertraits) != "Send+Sync"
+        || report_host
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TraitItem::Fn(method) => Some(method.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            != names(&[
+                "observe_progress",
+                "snapshot",
+                "reconcile_access",
+                "partition_report",
+                "catch_up_capability",
+            ])
+    {
+        return Err("report host capability budget changed".into());
+    }
+    assert_shape(
+        &hosting_file,
+        "ReportRuntime",
+        &[("inner", "Arc<dynReportHost>")],
+        &[
+            "observe_progress",
+            "snapshot",
+            "reconcile_durable_access",
+            "partition_report",
+            "catch_up_capability",
+        ],
+    )?;
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
     let expected_registered_fields = BTreeMap::from([
@@ -569,8 +637,20 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "Option<lifecycle::AccessClosure>".to_owned(),
         ),
         (
+            "access_lifecycle".to_owned(),
+            "Option<lifecycle::AccessRuntime>".to_owned(),
+        ),
+        (
+            "report_lifecycle".to_owned(),
+            "Option<lifecycle::ReportLifecycle>".to_owned(),
+        ),
+        (
             "lifecycle_evidence".to_owned(),
             "Option<lifecycle::EvidenceRuntime>".to_owned(),
+        ),
+        (
+            "effect_evidence".to_owned(),
+            "Option<lifecycle::EffectEvidenceRuntime>".to_owned(),
         ),
         (
             "managed_data_plane".to_owned(),
@@ -622,10 +702,8 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "PodRuntime::cancel_outbound_build_attempt",
         "PodRuntime::execute_admitted_build",
         "PodRuntime::next_outbound",
-        "PodRuntime::observe_progress",
         "PodRuntime::observe_secondary_removal_witness",
         "PodRuntime::primary_replicator",
-        "PodRuntime::reconcile_durable_access",
         "PodRuntime::reconstruct",
         "PodRuntime::reissue_outbound_build",
         "PodRuntime::restore_accepted_removal",
@@ -654,9 +732,15 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
     let lifecycle = source("src/host/lifecycle.rs");
     let custom = source("src/host/custom.rs");
     let hosting = source("src/host/hosting.rs");
+    let report = source("src/host/report.rs");
     validate(&lifecycle, &custom, &hosting).unwrap();
 
     assert!(hosting.contains("#[path = \"lifecycle.rs\"]\nmod lifecycle;"));
+    assert!(
+        report.contains("use crate::host::hosting::ReportRuntime;")
+            && !report.contains("use crate::host::hosting::PodRuntime;")
+            && report.contains("report(&self, runtime: &ReportRuntime)")
+    );
     let host_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/host");
     for entry in fs::read_dir(&host_root).unwrap() {
         let path = entry.unwrap().path();

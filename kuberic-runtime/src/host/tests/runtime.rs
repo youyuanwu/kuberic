@@ -5494,7 +5494,7 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
         }
         startup.unwrap();
         let reporter = crate::host::report::AgentReporter::new(store.clone());
-        let report = reporter.report(&runtime).await.unwrap();
+        let report = reporter.report(&runtime.report_runtime()).await.unwrap();
         assert_eq!(
             report.write_status,
             proto::AccessStatus::ReconfigurationPending as i32
@@ -5532,7 +5532,7 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
                 .await
                 .unwrap();
         }
-        let report = reporter.report(&runtime).await.unwrap();
+        let report = reporter.report(&runtime.report_runtime()).await.unwrap();
         assert_eq!(
             report.write_status,
             if supersede != 0 {
