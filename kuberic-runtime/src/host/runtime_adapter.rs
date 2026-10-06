@@ -12,10 +12,19 @@ use crate::host::Result;
 use crate::host::hosting::PodRuntime;
 use crate::host::store::{AgentStore, BeginEffect};
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RuntimeEffectObserverGate {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
+}
+
 #[doc(hidden)]
 pub(crate) struct RuntimeEffectCommit {
     decision: Option<oneshot::Sender<bool>>,
     completion: tokio::task::JoinHandle<Result<()>>,
+    #[cfg(test)]
+    observer_gate: Option<RuntimeEffectObserverGate>,
 }
 
 impl RuntimeEffectCommit {
@@ -26,12 +35,19 @@ impl RuntimeEffectCommit {
         Self {
             decision: Some(decision),
             completion,
+            #[cfg(test)]
+            observer_gate: None,
         }
     }
 
     async fn finish(mut self, committed: bool) -> Result<()> {
         if let Some(decision) = self.decision.take() {
             let _ = decision.send(committed);
+        }
+        #[cfg(test)]
+        if let Some(gate) = self.observer_gate.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
         }
         self.completion
             .await
@@ -62,6 +78,17 @@ impl RuntimeEffectExecution {
 
     pub(crate) fn result(&self) -> &RuntimeEffectResult {
         &self.result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_pause_after_decision(&mut self) -> Option<RuntimeEffectObserverGate> {
+        let commit = self.commit.as_mut()?;
+        let gate = RuntimeEffectObserverGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        commit.observer_gate = Some(gate.clone());
+        Some(gate)
     }
 
     pub(crate) async fn accept(mut self) -> Result<RuntimeEffectResult> {
