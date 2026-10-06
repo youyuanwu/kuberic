@@ -75,8 +75,33 @@ fn raw(replicas: u32) -> RawObservation {
         cluster_pods: Vec::new(),
         agents: BTreeMap::new(),
         failures: Vec::new(),
+        placement_inventory_failures: Vec::new(),
         now_unix_seconds: 100,
     }
+}
+
+#[test]
+fn auxiliary_inventory_failure_does_not_block_authority_evaluation() {
+    let mut observation = raw(1);
+    observation
+        .placement_inventory_failures
+        .push(RawObservationFailure {
+            source: "nodes".to_string(),
+            message: "forbidden".to_string(),
+        });
+
+    let snapshot = normalize(observation, BTreeMap::new()).unwrap();
+    assert!(snapshot.observation_failures.is_empty());
+    let plan = evaluate(&snapshot, &config());
+    assert!(!matches!(
+        &plan,
+        Plan::Wait { status, .. }
+            if status
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ObservationFailed")
+    ));
+    assert!(matches!(plan, Plan::Apply { .. }));
 }
 
 #[test]

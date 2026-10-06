@@ -46,6 +46,14 @@ The CRD intentionally exposes only compact placement fields. Native Kubernetes
 `Affinity`, `Toleration`, and `TopologySpreadConstraint` schemas are not embedded
 because the controller CRD has a strict size guard.
 
+Node inventory is fetched lazily. Sets that omit Required placement and primary
+balancing do not trigger Node, cluster-wide `KubericSet`, or cluster-wide Pod
+lists during reconcile. Required placement lists Nodes so diagnostics can verify
+current bound domains. Automatic primary balancing additionally lists all
+`KubericSet`s and Kuberic-owned Pods to compute cross-set primary density.
+The controller ClusterRole therefore needs `nodes: get,list,watch` for Required
+placement diagnostics and primary balancing.
+
 ## Placement diagnostics
 
 The controller projects placement diagnostics into status conditions without
@@ -60,7 +68,12 @@ using evaluator-owned condition types:
   the observed Node inventory, or Node inventory itself was unavailable.
 
 These conditions report the current observation only. They do not relax Required
-placement, promote Pending replicas, or authorize eviction.
+placement, promote Pending replicas, or authorize eviction. Optional placement
+inventory failures are deliberately not forwarded into authority evaluation:
+failover, replacement, scale-up, scale-down, and user switchovers continue to be
+evaluated from the required per-set observations. When optional inventory is
+unavailable, diagnostics degrade to `RequiredTopologyUnverified` and automatic
+balancing is skipped for that reconcile.
 
 ## Automatic primary balancing
 
@@ -104,11 +117,13 @@ or compensates that request with the same safety gates as a user request.
 Primary counts are computed across all observed `KubericSet` statuses using the
 accepted primary's Pod `nodeName` and the selected Node topology label. Unknown
 primary placement evidence suppresses automatic balancing rather than treating
-unknown load as zero. Candidate secondaries must already be committed members in
-a different, less-loaded domain. For source count `s` and target-domain count
-`t`, a move is useful only when `s - t - 1 >= minimumImprovement`; with the
-default threshold, `2 -> 0` moves and `1 -> 0` does not. Ties are deterministic:
-target domain count, target node count, then replica ID.
+unknown load as zero. Optional inventory list failures also suppress balancing
+without blocking authority evaluation. Candidate secondaries must already be
+committed members in a different, less-loaded domain. For source count `s` and
+target-domain count `t`, a move is useful only when
+`s - t - 1 >= minimumImprovement`; with the default threshold, `2 -> 0` moves
+and `1 -> 0` does not. Ties are deterministic: target domain count, target node
+count, then replica ID.
 
 ## Deferred from the V1 PR
 

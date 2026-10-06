@@ -30,7 +30,8 @@ use tonic::Code;
 
 use crate::crd::{
     CONTROL_ADDRESS_ANNOTATION, CONTROLLER_NAME, INSTANCE_LABEL, KubericSet, KubericSetStatus,
-    PlannedSwitchoverRequestSpec, REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL,
+    PlacementMode, PlannedSwitchoverRequestSpec, REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION,
+    SET_UID_LABEL,
 };
 use crate::observation::{
     ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
@@ -348,36 +349,53 @@ where
         let services_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let secrets_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let params = ListParams::default().labels(&selector);
-        let all_sets_api: Api<KubericSet> = Api::all(self.client.clone());
-        let all_pods_api: Api<Pod> = Api::all(self.client.clone());
-        let nodes_api: Api<Node> = Api::all(self.client.clone());
-        let all_pods_params = ListParams::default().labels(SET_UID_LABEL);
-        let cluster_params = ListParams::default();
-        let (
-            pods_result,
-            pvcs_result,
-            services_result,
-            secrets_result,
-            nodes_result,
-            cluster_sets_result,
-            cluster_pods_result,
-        ) = tokio::join!(
+        let (pods_result, pvcs_result, services_result, secrets_result) = tokio::join!(
             pods_api.list(&params),
             pvcs_api.list(&params),
             services_api.list(&params),
-            secrets_api.list(&params),
-            nodes_api.list(&cluster_params),
-            all_sets_api.list(&cluster_params),
-            all_pods_api.list(&all_pods_params)
+            secrets_api.list(&params)
         );
         let mut failures = Vec::new();
         let pods = list_or_failure(pods_result, "pods", &mut failures);
         let pvcs = list_or_failure(pvcs_result, "pvcs", &mut failures);
         let services = list_or_failure(services_result, "services", &mut failures);
         let secrets = list_or_failure(secrets_result, "secrets", &mut failures);
-        let nodes = list_or_failure(nodes_result, "nodes", &mut failures);
-        let cluster_sets = list_or_failure(cluster_sets_result, "cluster-sets", &mut failures);
-        let cluster_pods = list_or_failure(cluster_pods_result, "cluster-pods", &mut failures);
+        let mut placement_inventory_failures = Vec::new();
+        let inventory = placement_inventory_scope(&set);
+        let nodes = if inventory.nodes {
+            let nodes_api: Api<Node> = Api::all(self.client.clone());
+            list_or_failure(
+                nodes_api.list(&ListParams::default()).await,
+                "nodes",
+                &mut placement_inventory_failures,
+            )
+        } else {
+            Vec::new()
+        };
+        let (cluster_sets, cluster_pods) = if inventory.cluster_sets_and_pods {
+            let all_sets_api: Api<KubericSet> = Api::all(self.client.clone());
+            let all_pods_api: Api<Pod> = Api::all(self.client.clone());
+            let all_pods_params = ListParams::default().labels(SET_UID_LABEL);
+            let cluster_params = ListParams::default();
+            let (cluster_sets_result, cluster_pods_result) = tokio::join!(
+                all_sets_api.list(&cluster_params),
+                all_pods_api.list(&all_pods_params)
+            );
+            (
+                list_or_failure(
+                    cluster_sets_result,
+                    "cluster-sets",
+                    &mut placement_inventory_failures,
+                ),
+                list_or_failure(
+                    cluster_pods_result,
+                    "cluster-pods",
+                    &mut placement_inventory_failures,
+                ),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let resource_uid = ResourceUid::new(uid);
         let mut raw = RawObservation {
             set,
@@ -389,6 +407,7 @@ where
             cluster_sets,
             cluster_pods,
             failures,
+            placement_inventory_failures,
             agents: BTreeMap::new(),
             exact_resources: Vec::new(),
             now_unix_seconds: SystemTime::now()
@@ -1098,6 +1117,25 @@ where
             });
             Vec::new()
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlacementInventoryScope {
+    nodes: bool,
+    cluster_sets_and_pods: bool,
+}
+
+fn placement_inventory_scope(set: &KubericSet) -> PlacementInventoryScope {
+    let primary_balancing = set.spec.primary_balancing.is_some();
+    let required_placement = set
+        .spec
+        .placement
+        .as_ref()
+        .is_some_and(|placement| placement.mode == PlacementMode::Required);
+    PlacementInventoryScope {
+        nodes: required_placement || primary_balancing,
+        cluster_sets_and_pods: primary_balancing,
     }
 }
 
@@ -2354,10 +2392,10 @@ impl ClusterApi for InMemoryClusterApi {
             .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
         raw.services
             .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
-        if raw.cluster_sets.is_empty() {
+        if raw.set.spec.primary_balancing.is_some() && raw.cluster_sets.is_empty() {
             raw.cluster_sets = vec![raw.set.clone()];
         }
-        if raw.cluster_pods.is_empty() {
+        if raw.set.spec.primary_balancing.is_some() && raw.cluster_pods.is_empty() {
             raw.cluster_pods = physical.pods.clone();
         }
         for (target, identity, frozen) in crate::exact_resources::requests(&raw) {
@@ -3345,7 +3383,7 @@ mod tests {
     use super::*;
     use crate::crd::{
         KubericSetSpec, LabelKey, PlacementMode, PlacementSpec, PlacementTolerationSpec,
-        TolerationEffect, TolerationOperator,
+        PrimaryBalancingSpec, TolerationEffect, TolerationOperator,
     };
     use kuberic_runtime::protocol::command::{
         EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
@@ -3619,6 +3657,7 @@ mod tests {
             cluster_pods: Vec::new(),
             agents,
             failures: Vec::new(),
+            placement_inventory_failures: Vec::new(),
             now_unix_seconds: 0,
         };
         observation.pods.push(Pod {
@@ -3935,5 +3974,46 @@ mod tests {
         assert_eq!(toleration.operator.as_deref(), Some("Equal"));
         assert_eq!(toleration.value.as_deref(), Some("storage"));
         assert_eq!(toleration.effect.as_deref(), Some("NoSchedule"));
+    }
+
+    #[test]
+    fn inventory_scope_is_lazy_for_sets_without_opt_in_policy() {
+        let mut set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                placement: None,
+                primary_balancing: None,
+                switchover: None,
+            },
+        );
+        assert_eq!(
+            placement_inventory_scope(&set),
+            PlacementInventoryScope {
+                nodes: false,
+                cluster_sets_and_pods: false,
+            }
+        );
+        set.spec.placement = Some(PlacementSpec {
+            mode: PlacementMode::Required,
+            ..Default::default()
+        });
+        assert_eq!(
+            placement_inventory_scope(&set),
+            PlacementInventoryScope {
+                nodes: true,
+                cluster_sets_and_pods: false,
+            }
+        );
+        set.spec.primary_balancing = Some(PrimaryBalancingSpec::default());
+        assert_eq!(
+            placement_inventory_scope(&set),
+            PlacementInventoryScope {
+                nodes: true,
+                cluster_sets_and_pods: true,
+            }
+        );
     }
 }

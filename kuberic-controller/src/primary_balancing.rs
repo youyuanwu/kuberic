@@ -33,12 +33,7 @@ pub fn plan_primary_balance(
     match policy.mode {
         PrimaryBalancingMode::Automatic => {}
     }
-    if raw.failures.iter().any(|failure| {
-        matches!(
-            failure.source.as_str(),
-            "nodes" | "cluster-sets" | "cluster-pods"
-        )
-    }) {
+    if !raw.placement_inventory_failures.is_empty() {
         return None;
     }
     if !stable_for_automatic_balance(&raw.set, snapshot) {
@@ -279,7 +274,8 @@ fn configuration_primary(configuration: &ConfigurationDescriptor) -> Option<&Con
 mod tests {
     use super::*;
     use crate::crd::{
-        KubericSetSpec, KubericSetStatus, LabelKey, PrimaryBalancingMode, PrimaryBalancingSpec,
+        KubericSetSpec, KubericSetStatus, LabelKey, PlacementMode, PlacementSpec,
+        PrimaryBalancingMode, PrimaryBalancingSpec,
     };
     use crate::observation::RawObservation;
     use k8s_openapi::api::core::v1::{NodeSpec, PodSpec};
@@ -515,6 +511,7 @@ mod tests {
             agents: BTreeMap::new(),
             exact_resources: Vec::new(),
             failures: Vec::new(),
+            placement_inventory_failures: Vec::new(),
             now_unix_seconds: 1_000,
         }
     }
@@ -698,6 +695,40 @@ mod tests {
             vec![current.clone(), source_peer],
             Vec::new(),
         );
+        assert!(plan_primary_balance(&observation, &snapshot(&current, BTreeMap::new())).is_none());
+    }
+
+    #[test]
+    fn placement_inventory_failure_suppresses_balancing() {
+        let mut current = set("db", status(configuration(1, &[1, 2, 3])), true);
+        current.spec.placement = Some(PlacementSpec {
+            mode: PlacementMode::Required,
+            ..Default::default()
+        });
+        let other = set("other", singleton_status("other-pod-1"), false);
+        let mut observation = raw(
+            current.clone(),
+            vec![pod(1, "node-a"), pod(2, "node-b"), pod(3, "node-c")],
+            vec![
+                node("node-a", Some("a")),
+                node("node-b", Some("b")),
+                node("node-c", Some("c")),
+                node("node-a2", Some("a")),
+            ],
+            vec![current.clone(), other],
+            vec![
+                pod(1, "node-a"),
+                pod(2, "node-b"),
+                pod(3, "node-c"),
+                pod_with_uid("other-1", "other-pod-1", "node-a2"),
+            ],
+        );
+        observation
+            .placement_inventory_failures
+            .push(crate::observation::RawObservationFailure {
+                source: "nodes".to_string(),
+                message: "forbidden".to_string(),
+            });
         assert!(plan_primary_balance(&observation, &snapshot(&current, BTreeMap::new())).is_none());
     }
 }

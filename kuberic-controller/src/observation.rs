@@ -28,6 +28,7 @@ pub struct RawObservation {
     pub agents: BTreeMap<ReplicaObservationKey, RawAgentObservation>,
     pub exact_resources: Vec<RawScaleDownResources>,
     pub failures: Vec<RawObservationFailure>,
+    pub placement_inventory_failures: Vec<RawObservationFailure>,
     pub now_unix_seconds: i64,
 }
 

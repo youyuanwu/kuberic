@@ -2469,7 +2469,6 @@ fn terminal_switchover_receipt_writer_process() {
     let file = std::fs::File::create(&path).unwrap();
     serde_json::to_writer(&file, &model.snapshot.status).unwrap();
     file.sync_all().unwrap();
-    #[cfg(not(windows))]
     std::fs::File::open("target").unwrap().sync_all().unwrap();
     std::process::exit(73);
 }

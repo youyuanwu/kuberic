@@ -163,7 +163,10 @@ fn project_required_topology_conditions(
         .iter()
         .filter_map(|node| Some((node.metadata.name.as_deref()?, node)))
         .collect::<BTreeMap<_, _>>();
-    let node_inventory_failed = raw.failures.iter().any(|failure| failure.source == "nodes");
+    let node_inventory_failed = raw
+        .placement_inventory_failures
+        .iter()
+        .any(|failure| failure.source == "nodes");
     let mut unverified = Vec::new();
     let mut missing = Vec::new();
     let mut by_domain: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -316,6 +319,7 @@ mod tests {
             agents: BTreeMap::new(),
             exact_resources: Vec::new(),
             failures: Vec::new(),
+            placement_inventory_failures: Vec::new(),
             now_unix_seconds: 0,
         }
     }
@@ -370,5 +374,26 @@ mod tests {
             condition(REQUIRED_UNVERIFIED_CONDITION).status,
             ConditionStatus::Unknown
         );
+    }
+
+    #[test]
+    fn required_node_inventory_failure_reports_unverified_without_core_failure() {
+        let mut observation = raw(set(true), vec![pod("db-1", Some("node-a"))], Vec::new());
+        observation
+            .placement_inventory_failures
+            .push(crate::observation::RawObservationFailure {
+                source: "nodes".to_string(),
+                message: "forbidden".to_string(),
+            });
+
+        let status = project_conditions(&observation, AcceptedStatus::default());
+        assert!(observation.failures.is_empty());
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == REQUIRED_UNVERIFIED_CONDITION)
+            .expect("RequiredTopologyUnverified");
+        assert_eq!(condition.status, ConditionStatus::Unknown);
+        assert_eq!(condition.reason, "NodeInventoryUnavailable");
     }
 }

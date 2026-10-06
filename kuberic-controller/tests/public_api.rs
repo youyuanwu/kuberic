@@ -58,6 +58,7 @@ fn controller_exports_observation_and_evaluation_contracts() {
         agents: BTreeMap::new(),
         exact_resources: Vec::new(),
         failures: Vec::new(),
+        placement_inventory_failures: Vec::new(),
         now_unix_seconds: 100,
     };
     let snapshot: ObservationSnapshot = normalize(raw, BTreeMap::new()).unwrap();
