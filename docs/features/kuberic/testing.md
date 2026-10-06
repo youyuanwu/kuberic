@@ -60,6 +60,12 @@ coordinator. It does not snapshot every private method, field or consumer.
 These checks complement behavior suites and the external API/privacy guard;
 they do not replace either.
 
+The syntax guard is deliberately bounded rather than a whole-program Rust
+analyzer. New explicit Clippy suppressions, macro-generated lifecycle wiring,
+block-local capability trait graphs, reverse conversions, and transport child
+modules require direct review instead of extending the guard with another
+source-language model.
+
 ## Level-Triggered Unit and Durable Validation
 
 Use `just nextest-test` for the complete cluster-free tier. For focused
