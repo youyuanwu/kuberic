@@ -152,19 +152,18 @@ fn module_path(source_path: &Path, item: &syn::ItemMod) -> Option<PathBuf> {
 fn disallowed_type_lint_exempt(attributes: &[syn::Attribute], inherited: bool) -> bool {
     let mentions_lint =
         |attribute: &syn::Attribute| compact(&attribute.meta).contains("clippy::disallowed_types");
-    if attributes.iter().any(|attribute| {
-        (attribute.path().is_ident("deny") || attribute.path().is_ident("forbid"))
-            && mentions_lint(attribute)
-    }) {
-        false
-    } else if attributes
+    let mut exempt = inherited;
+    for attribute in attributes
         .iter()
-        .any(|attribute| attribute.path().is_ident("allow") && mentions_lint(attribute))
+        .filter(|attribute| mentions_lint(attribute))
     {
-        true
-    } else {
-        inherited
+        if attribute.path().is_ident("allow") {
+            exempt = true;
+        } else if attribute.path().is_ident("deny") || attribute.path().is_ident("forbid") {
+            exempt = false;
+        }
     }
+    exempt
 }
 
 fn production_modules(root: &Path) -> Vec<(PathBuf, bool)> {
@@ -223,14 +222,11 @@ fn production_modules(root: &Path) -> Vec<(PathBuf, bool)> {
             }
         }
     }
-    let exempt_dirs = modules
-        .iter()
-        .filter(|(_, exempt)| *exempt)
-        .map(|(path, _)| root.join(path).with_extension(""))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    for directory in exempt_dirs {
-        discover(root, &directory, &mut modules);
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() && path.file_name().and_then(|name| name.to_str()) != Some("tests") {
+            discover(root, &path, &mut modules);
+        }
     }
     modules.sort();
     modules
@@ -289,34 +285,30 @@ fn reject_transitive_capability_inheritance(file: &syn::File) -> Result<(), Stri
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    fn reaches_guarded(
+    fn reachable_capabilities(
         name: &str,
         graph: &BTreeMap<String, Vec<String>>,
         visited: &mut BTreeSet<String>,
-    ) -> bool {
-        graph.get(name).is_some_and(|parents| {
-            parents.iter().any(|parent| {
-                CAPABILITY_TRAITS.contains(&parent.as_str())
-                    || HOST_CAPABILITY_TRAITS.contains(&parent.as_str())
-                    || (visited.insert(parent.clone()) && reaches_guarded(parent, graph, visited))
-            })
-        })
-    }
-    for name in graph.keys().filter(|name| {
-        CAPABILITY_TRAITS.contains(&name.as_str())
-            || HOST_CAPABILITY_TRAITS.contains(&name.as_str())
-    }) {
-        let direct = graph[name].iter().any(|parent| {
-            CAPABILITY_TRAITS.contains(&parent.as_str())
+    ) -> BTreeSet<String> {
+        let mut capabilities = BTreeSet::new();
+        for parent in graph.get(name).into_iter().flatten() {
+            if CAPABILITY_TRAITS.contains(&parent.as_str())
                 || HOST_CAPABILITY_TRAITS.contains(&parent.as_str())
-        });
-        if !direct
-            && graph[name]
-                .iter()
-                .any(|parent| reaches_guarded(parent, &graph, &mut BTreeSet::new()))
-        {
+            {
+                capabilities.insert(parent.clone());
+            } else if visited.insert(parent.clone()) {
+                capabilities.extend(reachable_capabilities(parent, graph, visited));
+            }
+        }
+        capabilities
+    }
+    for name in graph.keys() {
+        let capabilities = reachable_capabilities(name, &graph, &mut BTreeSet::new());
+        let guarded = CAPABILITY_TRAITS.contains(&name.as_str())
+            || HOST_CAPABILITY_TRAITS.contains(&name.as_str());
+        if (guarded && !capabilities.is_empty()) || capabilities.len() >= 2 {
             return Err(format!(
-                "{name} transitively inherits an unrelated capability"
+                "{name} transitively aggregates lifecycle capabilities"
             ));
         }
     }
@@ -361,6 +353,7 @@ fn validate_module_policy(
                 if CAPABILITY_TYPES.contains(&target.as_str())
                     || CAPABILITY_TRAITS.contains(&target.as_str())
                     || HOST_CAPABILITY_TRAITS.contains(&target.as_str())
+                    || target == "PrimaryReplicator"
                     || (visitor.reject_broad && BROAD_OWNER_TYPES.contains(&target.as_str()))
                 {
                     visitor
@@ -384,7 +377,9 @@ fn validate_module_policy(
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
             let markers = type_markers(&item.ty);
-            if !markers.capabilities.is_empty() || (self.reject_broad && !markers.broad.is_empty())
+            if !markers.capabilities.is_empty()
+                || markers.direct_primary
+                || (self.reject_broad && !markers.broad.is_empty())
             {
                 let target = compact(&item.ty);
                 self.record(|| format!("guarded type alias {} -> {target}", item.ident));
@@ -456,7 +451,8 @@ fn validate_module_policy(
                 let mut markers = type_markers(&item.self_ty);
                 markers.visit_path(path);
                 if markers.broad.contains("LifecycleWiring")
-                    && markers.broad.contains("ReplicatorLifecycleRegistration")
+                    && (markers.broad.contains("ReplicatorLifecycleRegistration")
+                        || markers.broad.contains("RegisteredReplicator"))
                 {
                     self.record(|| "conversion exposes complete lifecycle wiring".into());
                 }
@@ -788,7 +784,8 @@ fn validate_cancellation_owner(file: &syn::File, owner: &str) -> Result<(), Stri
         .ok_or_else(|| format!("{owner}::new missing"))?;
     let signature = signature_markers(&method.sig);
     let expected = BTreeSet::from(["BuildAttemptRuntime".to_owned()]);
-    if signature.capabilities != expected || !signature.broad.is_empty() {
+    if signature.capabilities != expected || !signature.broad.is_empty() || signature.direct_primary
+    {
         return Err(format!(
             "{owner}::new does not retain cancellation-only ownership"
         ));
@@ -1082,8 +1079,11 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         "ReportRuntime",
     );
     reject_policy("trait ReportExtension: BuildHost {}\ntrait ReportHost: ReportExtension {}", true, "transitively");
+    reject_policy("trait ProcessExtension: ProcessLifecycle {} trait BuildExtension: BuildLifecycle {} trait RenamedFacade: ProcessExtension + BuildExtension {}", true, "RenamedFacade");
     reject_policy("trait ReportHost { fn primary(&self) -> Arc<dyn PrimaryReplicator>; }", true, "ReportHost::primary");
+    reject_policy("type DirectPrimary = dyn PrimaryReplicator;", true, "DirectPrimary");
     reject_policy("#[allow(clippy::disallowed_types)] mod worker { struct Facade { runtime: Arc<PodRuntime> } }", false, "Facade");
+    reject_policy("#[deny(clippy::disallowed_types)] mod worker { #![allow(clippy::disallowed_types)] struct Facade { runtime: Arc<PodRuntime> } }", false, "Facade");
 
     for gate in [
         "#[cfg(all())]",
@@ -1127,17 +1127,19 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         "all_capabilities",
     );
     reject_policy("impl From<ReplicatorLifecycleRegistration> for LifecycleWiring { fn from(value: ReplicatorLifecycleRegistration) -> Self { unreachable!() } }", true, "conversion");
+    reject_policy("impl From<RegisteredReplicator> for LifecycleWiring { fn from(value: RegisteredReplicator) -> Self { unreachable!() } }", true, "conversion");
 
     reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildRuntime) -> Self { unreachable!() } }", "cancellation-only");
     reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime) -> Self { let host: Option<Arc<PodRuntime>> = None; unreachable!() } }", "broader runtime");
     reject_cancellation("struct BuildRuntimeCancellation; impl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime) -> Self { let host = PodRuntime::new(); unreachable!() } }", "broader runtime");
+    reject_cancellation("struct BuildRuntimeCancellation; impl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime, primary: Arc<dyn PrimaryReplicator>) -> Self { unreachable!() } }", "cancellation-only");
 
     let module_root = tempfile::tempdir().unwrap();
     let hosting_dir = module_root.path().join("hosting");
     fs::create_dir(&hosting_dir).unwrap();
     fs::write(
         module_root.path().join("mod.rs"),
-        "#[allow(clippy::disallowed_types)] mod hosting;",
+        "#[allow(clippy::disallowed_types)] mod hosting; mod transport;",
     )
     .unwrap();
     fs::write(module_root.path().join("hosting.rs"), "mod worker;").unwrap();
@@ -1146,6 +1148,10 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         "struct NestedFacade { runtime: Arc<PodRuntime> }",
     )
     .unwrap();
+    let inline_worker = module_root.path().join("transport/helpers");
+    fs::create_dir_all(&inline_worker).unwrap();
+    fs::write(module_root.path().join("transport.rs"), "#[allow(clippy::disallowed_types)] mod helpers { mod worker; }").unwrap();
+    fs::write(inline_worker.join("worker.rs"), "struct InlineFacade { runtime: Arc<PodRuntime> }").unwrap();
     let relative = Path::new("hosting/worker.rs");
     let modules = production_modules(module_root.path());
     assert!(modules.contains(&(relative.to_path_buf(), true)));
@@ -1154,4 +1160,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         validate_production_module(relative, &source, true),
         "hosting/worker.rs",
     );
+    assert!(modules.contains(&(PathBuf::from("transport/helpers/worker.rs"), true)));
+    let inline = fs::read_to_string(module_root.path().join("transport/helpers/worker.rs")).unwrap();
+    assert_rejected(validate_production_module(Path::new("transport/helpers/worker.rs"), &inline, true), "InlineFacade");
 }
