@@ -6,6 +6,47 @@ use quote::ToTokens;
 use syn::visit::Visit;
 use syn::{ImplItem, Item, TraitItem, Type};
 
+const CAPABILITY_MARKERS: &[&str] = &[
+    "ProcessRuntime",
+    "AuthorityRuntime",
+    "PeerRuntime",
+    "AccessClosure",
+    "AccessRuntime",
+    "ReportLifecycle",
+    "EvidenceRuntime",
+    "EffectEvidenceRuntime",
+    "BuildLifecycleRuntime",
+    "BuildCancellationRuntime",
+    "OutboundLifecycleRuntime",
+    "RemovalWitnessRuntime",
+    "TopologyRuntime",
+    "RecoveryRuntime",
+    "ReportRuntime",
+    "BuildRuntime",
+    "BuildAttemptRuntime",
+    "PeerDiscoveryRuntime",
+    "OutboundRuntime",
+    "dynProcessLifecycle",
+    "dynAuthorityLifecycle",
+    "dynAccessLifecycle",
+    "dynBuildLifecycle",
+    "dynBuildCancellation",
+    "dynTopologyLifecycle",
+    "dynLifecycleObservation",
+    "dynOutboundLifecycle",
+];
+
+fn capability_marker_count(value: &str) -> usize {
+    let identifiers = value
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|identifier| !identifier.is_empty())
+        .collect::<BTreeSet<_>>();
+    CAPABILITY_MARKERS
+        .iter()
+        .filter(|marker| identifiers.contains(**marker))
+        .count()
+}
+
 fn source(path: &str) -> String {
     fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
 }
@@ -124,6 +165,11 @@ impl<'ast> Visit<'ast> for BroadAliasVisitor {
         let target = compact(&alias.ty);
         if FORBIDDEN.iter().any(|forbidden| target.contains(forbidden)) {
             self.issue = Some(format!("broad lifecycle alias {} -> {target}", alias.ident));
+        } else if capability_marker_count(&target) >= 2 {
+            self.issue = Some(format!(
+                "capability aggregate alias {} -> {target}",
+                alias.ident
+            ));
         }
         syn::visit::visit_item_type(self, alias);
     }
@@ -268,50 +314,87 @@ fn reject_unclassified_capability_aggregates(
     file: &syn::File,
     allowed: &[&str],
 ) -> Result<(), String> {
-    const MARKERS: &[&str] = &[
-        "ProcessRuntime",
-        "AuthorityRuntime",
-        "PeerRuntime",
-        "AccessClosure",
-        "AccessRuntime",
-        "ReportLifecycle",
-        "EvidenceRuntime",
-        "EffectEvidenceRuntime",
-        "BuildLifecycleRuntime",
-        "BuildCancellationRuntime",
-        "OutboundLifecycleRuntime",
-        "RemovalWitnessRuntime",
-        "TopologyRuntime",
-        "RecoveryRuntime",
-        "dynProcessLifecycle",
-        "dynAuthorityLifecycle",
-        "dynAccessLifecycle",
-        "dynBuildLifecycle",
-        "dynBuildCancellation",
-        "dynTopologyLifecycle",
-        "dynLifecycleObservation",
-        "dynOutboundLifecycle",
-    ];
-    for item in &file.items {
-        let Item::Struct(item) = item else {
-            continue;
-        };
-        let capability_fields = item
-            .fields
-            .iter()
-            .filter(|field| {
-                let ty = compact(&field.ty);
-                MARKERS.iter().any(|marker| ty.contains(marker))
-            })
-            .count();
-        if capability_fields >= 2 && !allowed.contains(&item.ident.to_string().as_str()) {
-            return Err(format!(
-                "{} is an unclassified capability aggregate",
-                item.ident
-            ));
+    fn inspect(items: &[Item], allowed: &[&str], nested: bool) -> Result<(), String> {
+        for item in items {
+            match item {
+                Item::Struct(item) => {
+                    let capability_fields = item
+                        .fields
+                        .iter()
+                        .filter(|field| {
+                            let ty = compact(&field.ty);
+                            capability_marker_count(&ty) > 0
+                        })
+                        .count();
+                    if capability_fields >= 2
+                        && (nested || !allowed.contains(&item.ident.to_string().as_str()))
+                    {
+                        return Err(format!(
+                            "{} is an unclassified capability aggregate",
+                            item.ident
+                        ));
+                    }
+                }
+                Item::Mod(item) => {
+                    if let Some((_, items)) = &item.content {
+                        inspect(items, allowed, true)?;
+                    }
+                }
+                _ => {}
+            }
         }
+        Ok(())
     }
-    Ok(())
+    inspect(&file.items, allowed, false)
+}
+
+fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
+    fn check_signature(owner: &str, signature: &syn::Signature) -> Result<(), String> {
+        let signature = compact(signature);
+        if capability_marker_count(&signature) >= 2 {
+            return Err(format!("{owner} exposes a capability aggregate signature"));
+        }
+        Ok(())
+    }
+
+    fn inspect(items: &[Item], module: &str) -> Result<(), String> {
+        for item in items {
+            match item {
+                Item::Fn(item) => {
+                    check_signature(&format!("{module}fn {}", item.sig.ident), &item.sig)?
+                }
+                Item::Trait(item) => {
+                    for method in &item.items {
+                        if let TraitItem::Fn(method) = method {
+                            check_signature(
+                                &format!("{module}{}::{}", item.ident, method.sig.ident),
+                                &method.sig,
+                            )?;
+                        }
+                    }
+                }
+                Item::Impl(item) => {
+                    for method in &item.items {
+                        if let ImplItem::Fn(method) = method {
+                            check_signature(
+                                &format!("{module}{}::{}", impl_name(item), method.sig.ident),
+                                &method.sig,
+                            )?;
+                        }
+                    }
+                }
+                Item::Mod(item) => {
+                    if let Some((_, items)) = &item.content {
+                        inspect(items, &format!("{module}{}::", item.ident))?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    inspect(&file.items, "")
 }
 
 fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> {
@@ -675,6 +758,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "RecoveryRuntime",
         ],
     )?;
+    reject_aggregate_signatures(&lifecycle_file)?;
 
     let custom_file =
         syn::parse_file(custom).map_err(|error| format!("parse custom host: {error}"))?;
@@ -754,6 +838,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         return Err("lifecycle registration retained complete wiring".into());
     }
     reject_unclassified_capability_aggregates(&custom_file, &["ReplicatorLifecycleRegistration"])?;
+    reject_aggregate_signatures(&custom_file)?;
     let expected_queue_fields = BTreeMap::from([
         ("generation".to_owned(), "u64".to_owned()),
         (
@@ -946,6 +1031,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "BuildRuntime",
         ],
     )?;
+    reject_aggregate_signatures(&hosting_file)?;
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
     let expected_registered_fields = BTreeMap::from([
@@ -1291,4 +1377,24 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "{hosting}\nstruct LifecycleBroker {{ process: lifecycle::ProcessRuntime, authority: lifecycle::AuthorityRuntime, topology: lifecycle::TopologyRuntime }}\n"
     );
     assert!(validate(&lifecycle, &custom, &renamed_wiring).is_err());
+
+    let host_view_broker = format!(
+        "{hosting}\nstruct HostViewBroker {{ build: BuildRuntime, report: ReportRuntime, outbound: OutboundRuntime }}\n"
+    );
+    assert!(validate(&lifecycle, &custom, &host_view_broker).is_err());
+
+    let nested_broker = format!(
+        "{hosting}\nmod leaked {{ struct Broker {{ process: lifecycle::ProcessRuntime, topology: lifecycle::TopologyRuntime }} }}\n"
+    );
+    assert!(validate(&lifecycle, &custom, &nested_broker).is_err());
+
+    let tuple_alias = format!(
+        "{hosting}\ntype CapabilityTuple = (BuildRuntime, ReportRuntime, OutboundRuntime);\n"
+    );
+    assert!(validate(&lifecycle, &custom, &tuple_alias).is_err());
+
+    let tuple_getter = format!(
+        "{hosting}\nfn all_views() -> (BuildRuntime, ReportRuntime) {{ unreachable!() }}\n"
+    );
+    assert!(validate(&lifecycle, &custom, &tuple_getter).is_err());
 }

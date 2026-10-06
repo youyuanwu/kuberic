@@ -14,6 +14,7 @@ use kuberic_runtime::host::hosting::{
 use kuberic_runtime::host::hosting::lifecycle::{
     LifecycleWiring, RecoveryRuntime, TopologyRuntime,
 };
+use kuberic_runtime::host::hosting::custom::ReplicatorLifecycleRegistration;
 
 pub fn extract_attachment(
     interfaces: &ReplicatorInterfaces,
