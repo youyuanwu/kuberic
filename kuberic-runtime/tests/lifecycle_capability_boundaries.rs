@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use quote::ToTokens;
+use syn::visit::Visit;
 use syn::{ImplItem, Item, TraitItem, Type};
 
 fn source(path: &str) -> String {
@@ -33,7 +34,16 @@ fn impl_name(item: &syn::ItemImpl) -> String {
 
 fn block_uses_transition_facade<T: ToTokens>(block: &T) -> bool {
     let block = compact(block);
-    block.contains(".lifecycle()") || block.contains(".lifecycle.")
+    let mut rest = block.as_str();
+    while let Some(index) = rest.find(".lifecycle") {
+        let following = rest[index + ".lifecycle".len()..].chars().next();
+        if following.is_none_or(|character| character != '_' && !character.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+        rest = &rest[index + ".lifecycle".len()..];
+    }
+    false
 }
 
 fn collect_transition_consumers(items: &[Item], module: &str, consumers: &mut BTreeSet<String>) {
@@ -97,57 +107,40 @@ fn struct_fields(file: &syn::File, name: &str) -> Option<BTreeMap<String, String
     None
 }
 
-fn reject_broad_aliases(file: &syn::File) -> Result<(), String> {
-    const FORBIDDEN: &[&str] = &[
-        "LifecycleWiring",
-        "ReplicatorLifecycleHost",
-        "RuntimeHost",
-        "PodRuntime",
-        "ManagedLifecycleBackend",
-        "CustomReplicatorHost",
-    ];
-    for item in &file.items {
-        let Item::Type(alias) = item else {
-            continue;
-        };
-        let target = compact(&alias.ty);
-        if FORBIDDEN.iter().any(|forbidden| target.contains(forbidden)) {
-            return Err(format!("broad lifecycle alias {} -> {target}", alias.ident));
-        }
-    }
-    Ok(())
+struct BroadAliasVisitor {
+    issue: Option<String>,
 }
 
-fn reject_local_broad_aliases(source: &str) -> Result<(), String> {
-    let compact = source
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    for forbidden in [
-        "LifecycleWiring",
-        "ReplicatorLifecycleHost",
-        "RuntimeHost",
-        "PodRuntime",
-        "ManagedLifecycleBackend",
-        "CustomReplicatorHost",
-    ] {
-        let needle = format!("={forbidden}");
-        let mut rest = compact.as_str();
-        while let Some(index) = rest.find(&needle) {
-            let prefix = &rest[..index];
-            let boundary = prefix
-                .rfind(|character| matches!(character, ';' | '{' | '}'))
-                .map_or(0, |boundary| boundary + 1);
-            if prefix[boundary..].starts_with("type") {
-                return Err(format!("broad local lifecycle alias targets {forbidden}"));
-            }
-            rest = &rest[index + needle.len()..];
+impl<'ast> Visit<'ast> for BroadAliasVisitor {
+    fn visit_item_type(&mut self, alias: &'ast syn::ItemType) {
+        const FORBIDDEN: &[&str] = &[
+            "LifecycleWiring",
+            "ReplicatorLifecycleHost",
+            "RuntimeHost",
+            "PodRuntime",
+            "ManagedLifecycleBackend",
+            "CustomReplicatorHost",
+        ];
+        let target = compact(&alias.ty);
+        if FORBIDDEN.iter().any(|forbidden| target.contains(forbidden)) {
+            self.issue = Some(format!("broad lifecycle alias {} -> {target}", alias.ident));
         }
+        syn::visit::visit_item_type(self, alias);
     }
-    Ok(())
+}
+
+fn reject_broad_aliases(file: &syn::File) -> Result<(), String> {
+    let mut visitor = BroadAliasVisitor { issue: None };
+    visitor.visit_file(file);
+    match visitor.issue {
+        Some(issue) => Err(issue),
+        None => Ok(()),
+    }
 }
 
 fn impl_methods(file: &syn::File, name: &str) -> Option<BTreeSet<String>> {
+    let mut found = false;
+    let mut methods = BTreeSet::new();
     for item in &file.items {
         let Item::Impl(item) = item else {
             continue;
@@ -155,17 +148,13 @@ fn impl_methods(file: &syn::File, name: &str) -> Option<BTreeSet<String>> {
         if item.trait_.is_some() || type_name(&item.self_ty).as_deref() != Some(name) {
             continue;
         }
-        return Some(
-            item.items
-                .iter()
-                .filter_map(|item| match item {
-                    ImplItem::Fn(method) => Some(method.sig.ident.to_string()),
-                    _ => None,
-                })
-                .collect(),
-        );
+        found = true;
+        methods.extend(item.items.iter().filter_map(|item| match item {
+            ImplItem::Fn(method) => Some(method.sig.ident.to_string()),
+            _ => None,
+        }));
     }
-    None
+    found.then_some(methods)
 }
 
 fn impl_method<'a>(file: &'a syn::File, owner: &str, method: &str) -> Option<&'a syn::ImplItemFn> {
@@ -217,7 +206,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
 
     let lifecycle_file =
         syn::parse_file(lifecycle).map_err(|error| format!("parse lifecycle: {error}"))?;
-    reject_local_broad_aliases(lifecycle)?;
     let expected_traits = BTreeMap::from([
         (
             "ProcessLifecycle",
@@ -427,7 +415,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
 
     let custom_file =
         syn::parse_file(custom).map_err(|error| format!("parse custom host: {error}"))?;
-    reject_local_broad_aliases(custom)?;
     reject_broad_aliases(&custom_file)?;
     let expected_facade = names(&[
         "managed",
@@ -467,26 +454,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "confirm_build_completion",
         "postcondition",
     ]);
-    let mut facade_methods = None;
-    for item in &custom_file.items {
-        let Item::Impl(item) = item else {
-            continue;
-        };
-        if item.trait_.is_some()
-            || type_name(&item.self_ty).as_deref() != Some("ReplicatorLifecycleHost")
-        {
-            continue;
-        }
-        let methods = item
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                ImplItem::Fn(method) => Some(method.sig.ident.to_string()),
-                _ => None,
-            })
-            .collect();
-        facade_methods = Some(methods);
-    }
+    let facade_methods = impl_methods(&custom_file, "ReplicatorLifecycleHost");
     if facade_methods.as_ref() != Some(&expected_facade) {
         return Err(format!(
             "transition facade allowance changed: {facade_methods:#?}"
@@ -567,7 +535,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
 
     let hosting_file =
         syn::parse_file(hosting).map_err(|error| format!("parse hosting: {error}"))?;
-    reject_local_broad_aliases(hosting)?;
     reject_broad_aliases(&hosting_file)?;
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
@@ -670,6 +637,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "RuntimeHost::lifecycle",
         "RuntimeHost::observe_build_completion",
         "RuntimeHost::prepare_effect",
+        "RuntimeHost::register_interfaces",
         "RuntimeHost::snapshot",
     ]);
     if actual_consumers != expected_consumers {
@@ -803,4 +771,21 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "pub(super) struct ReplicatorLifecycleRegistration {\n    pub(super) wiring: LifecycleWiring,\n",
     );
     assert!(validate(&lifecycle, &retained_wiring, &hosting).is_err());
+
+    let second_view_impl = format!(
+        "{lifecycle}\nimpl ProcessRuntime {{ fn build_capability(&self) -> Arc<dyn BuildLifecycle> {{ unreachable!() }} }}\n"
+    );
+    assert!(validate(&second_view_impl, &custom, &hosting).is_err());
+
+    let qualified_local_alias = lifecycle.replace(
+        "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n",
+        "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n        type AllCapabilities = super::lifecycle::LifecycleWiring;\n",
+    );
+    assert!(validate(&qualified_local_alias, &custom, &hosting).is_err());
+
+    let borrowed_facade_field = hosting.replace(
+        "impl PodRuntime {\n",
+        "impl PodRuntime {\n    fn leaked_field(&self) { let registered = self.host.registered.get().unwrap(); let _borrowed = &registered.lifecycle; }\n",
+    );
+    assert!(validate(&lifecycle, &custom, &borrowed_facade_field).is_err());
 }
