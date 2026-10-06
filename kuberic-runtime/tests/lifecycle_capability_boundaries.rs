@@ -55,6 +55,14 @@ fn names(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
+fn assert_rejected(result: Result<(), String>, expected: &str) {
+    let error = result.expect_err("mutation unexpectedly passed validation");
+    assert!(
+        error.contains(expected),
+        "diagnostic did not identify {expected:?}: {error}"
+    );
+}
+
 fn type_name(ty: &Type) -> Option<String> {
     let Type::Path(path) = ty else {
         return None;
@@ -233,12 +241,14 @@ fn assert_shape(
         .iter()
         .map(|(field, ty)| ((*field).to_owned(), (*ty).to_owned()))
         .collect::<BTreeMap<_, _>>();
-    if struct_fields(file, name).as_ref() != Some(&expected_fields) {
-        return Err(format!("{name} field budget changed"));
+    let actual_fields = struct_fields(file, name);
+    if actual_fields.as_ref() != Some(&expected_fields) {
+        return Err(format!("{name} field budget changed: {actual_fields:#?}"));
     }
     let expected_methods = names(expected_methods);
-    if impl_methods(file, name).as_ref() != Some(&expected_methods) {
-        return Err(format!("{name} method budget changed"));
+    let actual_methods = impl_methods(file, name);
+    if actual_methods.as_ref() != Some(&expected_methods) {
+        return Err(format!("{name} method budget changed: {actual_methods:#?}"));
     }
     Ok(())
 }
@@ -410,6 +420,52 @@ fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
     }
 
     inspect(&file.items, "")
+}
+
+fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
+    fn inspect(items: &[Item], module: &str, sites: &mut BTreeSet<String>) {
+        for item in items {
+            match item {
+                Item::Fn(item) => {
+                    if capability_marker_count(&compact(&item.sig)) > 0 {
+                        sites.insert(format!("{module}fn {}", item.sig.ident));
+                    }
+                }
+                Item::Trait(item) => {
+                    for method in &item.items {
+                        if let TraitItem::Fn(method) = method
+                            && capability_marker_count(&compact(&method.sig)) > 0
+                        {
+                            sites.insert(format!("{module}{}::{}", item.ident, method.sig.ident));
+                        }
+                    }
+                }
+                Item::Impl(item) => {
+                    for method in &item.items {
+                        if let ImplItem::Fn(method) = method
+                            && capability_marker_count(&compact(&method.sig)) > 0
+                        {
+                            sites.insert(format!(
+                                "{module}{}::{}",
+                                impl_name(item),
+                                method.sig.ident
+                            ));
+                        }
+                    }
+                }
+                Item::Mod(item) => {
+                    if let Some((_, items)) = &item.content {
+                        inspect(items, &format!("{module}{}::", item.ident), sites);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut sites = BTreeSet::new();
+    inspect(&file.items, "", &mut sites);
+    sites
 }
 
 fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> {
@@ -784,10 +840,11 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     {
         return Err("universal lifecycle facade remains".into());
     }
-    if impl_methods(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
-        != Some(&names(&["managed", "service", "from_wiring"]))
-    {
-        return Err("lifecycle registration assembly methods changed".into());
+    let registration_methods = impl_methods(&custom_file, "ReplicatorLifecycleRegistration");
+    if registration_methods.as_ref() != Some(&names(&["managed", "service", "from_wiring"])) {
+        return Err(format!(
+            "ReplicatorLifecycleRegistration methods changed: {registration_methods:#?}"
+        ));
     }
     let expected_registration_fields = BTreeMap::from([
         (
@@ -850,7 +907,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     if struct_fields(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
         != Some(&expected_registration_fields)
     {
-        return Err("lifecycle registration retained complete wiring".into());
+        return Err("ReplicatorLifecycleRegistration retained complete wiring".into());
     }
     reject_unclassified_capability_aggregates(&custom_file, &["ReplicatorLifecycleRegistration"])?;
     reject_aggregate_signatures(&custom_file)?;
@@ -1047,6 +1104,76 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         ],
     )?;
     reject_aggregate_signatures(&hosting_file)?;
+    let signature_sites = capability_signature_sites(&lifecycle_file)
+        .into_iter()
+        .map(|site| format!("lifecycle::{site}"))
+        .chain(
+            capability_signature_sites(&custom_file)
+                .into_iter()
+                .map(|site| format!("custom::{site}")),
+        )
+        .chain(
+            capability_signature_sites(&hosting_file)
+                .into_iter()
+                .map(|site| format!("hosting::{site}")),
+        )
+        .collect::<BTreeSet<_>>();
+    let expected_signature_sites = names(&[
+        "custom::BuildQueueAdmission::new",
+        "custom::CustomReplicatorHost::bind_build_cancellation",
+        "hosting::BuildRuntime::cancellation",
+        "hosting::BuildRuntimeCancellation::new",
+        "hosting::PodRuntime::build_attempt_runtime",
+        "hosting::PodRuntime::build_runtime",
+        "hosting::PodRuntime::outbound_runtime",
+        "hosting::PodRuntime::peer_discovery_runtime",
+        "hosting::PodRuntime::report_runtime",
+        "hosting::RegisteredReplicator::access_closure",
+        "hosting::RegisteredReplicator::access_lifecycle",
+        "hosting::RegisteredReplicator::authority_lifecycle",
+        "hosting::RegisteredReplicator::build_cancellation",
+        "hosting::RegisteredReplicator::build_lifecycle",
+        "hosting::RegisteredReplicator::effect_evidence",
+        "hosting::RegisteredReplicator::lifecycle_evidence",
+        "hosting::RegisteredReplicator::outbound_lifecycle",
+        "hosting::RegisteredReplicator::peer_lifecycle",
+        "hosting::RegisteredReplicator::process_lifecycle",
+        "hosting::RegisteredReplicator::recovery_lifecycle",
+        "hosting::RegisteredReplicator::removal_witness",
+        "hosting::RegisteredReplicator::report_lifecycle",
+        "hosting::RegisteredReplicator::topology_lifecycle",
+        "hosting::RuntimeHost::access_closure",
+        "hosting::RuntimeHost::authority_lifecycle",
+        "hosting::RuntimeHost::build_cancellation",
+        "hosting::RuntimeHost::build_lifecycle",
+        "hosting::RuntimeHost::lifecycle_evidence",
+        "hosting::RuntimeHost::peer_lifecycle",
+        "hosting::RuntimeHost::process_lifecycle",
+        "hosting::RuntimeHost::recovery_lifecycle",
+        "hosting::RuntimeHost::topology_lifecycle",
+        "lifecycle::LifecycleWiring::access_closure",
+        "lifecycle::LifecycleWiring::access_runtime",
+        "lifecycle::LifecycleWiring::authority_runtime",
+        "lifecycle::LifecycleWiring::build_cancellation",
+        "lifecycle::LifecycleWiring::build_runtime",
+        "lifecycle::LifecycleWiring::effect_evidence_runtime",
+        "lifecycle::LifecycleWiring::evidence_runtime",
+        "lifecycle::LifecycleWiring::outbound_runtime",
+        "lifecycle::LifecycleWiring::peer_runtime",
+        "lifecycle::LifecycleWiring::process_runtime",
+        "lifecycle::LifecycleWiring::recovery_runtime",
+        "lifecycle::LifecycleWiring::removal_witness_runtime",
+        "lifecycle::LifecycleWiring::report_lifecycle",
+        "lifecycle::LifecycleWiring::topology_runtime",
+        "lifecycle::fn begin_access_effect",
+        "lifecycle::fn commit_access",
+        "lifecycle::fn restore_access",
+    ]);
+    if signature_sites != expected_signature_sites {
+        return Err(format!(
+            "capability signature inventory changed: {signature_sites:#?}"
+        ));
+    }
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
     let expected_registered_fields = BTreeMap::from([
@@ -1122,10 +1249,11 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     ]);
     if registered_fields != expected_registered_fields {
         return Err(format!(
-            "registered lifecycle field inventory changed: {registered_fields:#?}"
+            "RegisteredReplicator field inventory changed: {registered_fields:#?}"
         ));
     }
-    if impl_methods(&hosting_file, "RegisteredReplicator").as_ref()
+    let registered_methods = impl_methods(&hosting_file, "RegisteredReplicator");
+    if registered_methods.as_ref()
         != Some(&names(&[
             "managed_data_plane",
             "process_lifecycle",
@@ -1152,7 +1280,9 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "abort",
         ]))
     {
-        return Err("registered capability projection methods changed".into());
+        return Err(format!(
+            "RegisteredReplicator methods changed: {registered_methods:#?}"
+        ));
     }
     let exact_cancellation = impl_method(&hosting_file, "BuildRuntimeCancellation", "new")
         .ok_or_else(|| "BuildRuntimeCancellation::new missing".to_owned())?;
@@ -1236,6 +1366,7 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
         "only the cfg(test) cancellation helper may retain PodRuntime"
     );
     let host_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/host");
+    let mut module_signature_sites = BTreeSet::new();
     for entry in fs::read_dir(&host_root).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
@@ -1247,7 +1378,33 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
             "{} introduced an unclassified transition-facade consumer",
             path.display()
         );
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("hosting.rs" | "custom.rs" | "lifecycle.rs")
+        ) {
+            continue;
+        }
+        let file = syn::parse_file(&source).unwrap();
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        module_signature_sites.extend(
+            capability_signature_sites(&file)
+                .into_iter()
+                .map(|site| format!("{file_name}::{site}")),
+        );
     }
+    let expected_module_signature_sites = names(&[
+        "report.rs::AgentReporter::report",
+        "transport.rs::BuildDispatchCancellation::new",
+        "transport.rs::GrpcOutboundDispatcher::new",
+        "transport.rs::fn deliver_outbound_with_runtime",
+        "transport.rs::fn dispatch_queued_with_retry",
+        "transport.rs::fn queued_matches_runtime_authority",
+        "transport.rs::fn run_outbound",
+        "transport.rs::fn run_peer_discovery",
+        "transport.rs::fn spawn_delivery_worker",
+        "transport.rs::fn spawn_outbound_worker",
+    ]);
+    assert_eq!(module_signature_sites, expected_module_signature_sites);
 }
 
 #[test]
@@ -1260,168 +1417,255 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "    async fn settle_primary_prefix(&self) -> Result<()>;\n",
         "    async fn settle_primary_prefix(&self) -> Result<()>;\n    async fn execute_build(&self, replica: ReplicaInformation) -> Result<Option<BuildAdmission>>;\n",
     );
-    assert!(validate(&broad_process, &custom, &hosting).is_err());
+    assert_rejected(validate(&broad_process, &custom, &hosting), "execute_build");
 
     let universal =
         format!("{lifecycle}\ntrait UniversalLifecycle: ProcessLifecycle + BuildLifecycle {{}}\n");
-    assert!(validate(&universal, &custom, &hosting).is_err());
+    assert_rejected(
+        validate(&universal, &custom, &hosting),
+        "UniversalLifecycle",
+    );
 
     let broad_facade = format!("{custom}\nstruct ReplicatorLifecycleHost;\n");
-    assert!(validate(&lifecycle, &broad_facade, &hosting).is_err());
+    assert_rejected(
+        validate(&lifecycle, &broad_facade, &hosting),
+        "universal lifecycle facade",
+    );
 
     let missing_peer_view =
         hosting.replace("    peer_lifecycle: Option<lifecycle::PeerRuntime>,\n", "");
-    assert!(validate(&lifecycle, &custom, &missing_peer_view).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &missing_peer_view),
+        "RegisteredReplicator",
+    );
 
     let broad_alias = format!("{lifecycle}\ntype Everything = LifecycleWiring;\n");
-    assert!(validate(&broad_alias, &custom, &hosting).is_err());
+    assert_rejected(validate(&broad_alias, &custom, &hosting), "Everything");
 
     let universal_getter = custom.replace(
         "impl ReplicatorLifecycleRegistration {\n",
         "impl ReplicatorLifecycleRegistration {\n    fn all_capabilities(&self) -> &LifecycleWiring { unreachable!() }\n",
     );
-    assert!(validate(&lifecycle, &universal_getter, &hosting).is_err());
+    assert_rejected(
+        validate(&lifecycle, &universal_getter, &hosting),
+        "all_capabilities",
+    );
 
     let broad_cancellation = hosting.replace(
         "struct BuildRuntimeCancellation {\n",
         "struct BuildRuntimeCancellation {\n    host: Arc<RuntimeHost>,\n",
     );
-    assert!(validate(&lifecycle, &custom, &broad_cancellation).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &broad_cancellation),
+        "BuildRuntimeCancellation",
+    );
 
     let new_facade_consumer = hosting.replace(
         "impl PodRuntime {\n",
         "impl PodRuntime {\n    async fn leaked_lifecycle(&self) { let _ = self.host.lifecycle(); }\n",
     );
-    assert!(validate(&lifecycle, &custom, &new_facade_consumer).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &new_facade_consumer),
+        "leaked_lifecycle",
+    );
 
     let universal_view_getter = lifecycle.replace(
         "impl ProcessRuntime {\n",
         "impl ProcessRuntime {\n    fn build_capability(&self) -> Arc<dyn BuildLifecycle> { unreachable!() }\n",
     );
-    assert!(validate(&universal_view_getter, &custom, &hosting).is_err());
+    assert_rejected(
+        validate(&universal_view_getter, &custom, &hosting),
+        "build_capability",
+    );
 
     let broad_view_field = lifecycle.replace(
         "pub(super) struct ProcessRuntime {\n",
         "pub(super) struct ProcessRuntime {\n    build: Arc<dyn BuildLifecycle>,\n",
     );
-    assert!(validate(&broad_view_field, &custom, &hosting).is_err());
+    assert_rejected(
+        validate(&broad_view_field, &custom, &hosting),
+        "ProcessRuntime",
+    );
 
     let local_alias = lifecycle.replace(
         "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n",
         "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n        type AllCapabilities = LifecycleWiring;\n",
     );
-    assert!(validate(&local_alias, &custom, &hosting).is_err());
+    assert_rejected(validate(&local_alias, &custom, &hosting), "AllCapabilities");
 
     let always_enabled_fixture = lifecycle.replacen(
         "#[cfg(any(all(test, kuberic_workspace_tests), feature = \"testing\"))]",
         "#[cfg(all())]",
         1,
     );
-    assert!(validate(&always_enabled_fixture, &custom, &hosting).is_err());
+    assert_rejected(
+        validate(&always_enabled_fixture, &custom, &hosting),
+        "fixture-gated",
+    );
 
     let nested_consumer = format!(
         "{hosting}\nmod leaked {{ async fn consume(host: &RuntimeHost) {{ let _ = host.lifecycle(); }} }}\n"
     );
-    assert!(validate(&lifecycle, &custom, &nested_consumer).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &nested_consumer),
+        "leaked::fn consume",
+    );
 
     let direct_field_consumer = hosting.replace(
         "impl PodRuntime {\n",
         "impl PodRuntime {\n    async fn leaked_field(&self) { let registered = self.host.registered.get().unwrap(); let _ = registered.lifecycle.snapshot().await; }\n",
     );
-    assert!(validate(&lifecycle, &custom, &direct_field_consumer).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &direct_field_consumer),
+        "leaked_field",
+    );
 
     let broad_closure_capture = hosting.replace(
         "    fn new(runtime: BuildAttemptRuntime, build_id: OperationId, generation: u64) -> Self {\n",
         "    fn new(runtime: BuildAttemptRuntime, build_id: OperationId, generation: u64) -> Self {\n        let broad_host: Option<Arc<RuntimeHost>> = None;\n",
     );
-    assert!(validate(&lifecycle, &custom, &broad_closure_capture).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &broad_closure_capture),
+        "build runtime cancellation",
+    );
 
     let retained_wiring = custom.replace(
         "pub(super) struct ReplicatorLifecycleRegistration {\n",
         "pub(super) struct ReplicatorLifecycleRegistration {\n    pub(super) wiring: LifecycleWiring,\n",
     );
-    assert!(validate(&lifecycle, &retained_wiring, &hosting).is_err());
+    assert_rejected(
+        validate(&lifecycle, &retained_wiring, &hosting),
+        "ReplicatorLifecycleRegistration",
+    );
 
     let second_view_impl = format!(
         "{lifecycle}\nimpl ProcessRuntime {{ fn build_capability(&self) -> Arc<dyn BuildLifecycle> {{ unreachable!() }} }}\n"
     );
-    assert!(validate(&second_view_impl, &custom, &hosting).is_err());
+    assert_rejected(
+        validate(&second_view_impl, &custom, &hosting),
+        "build_capability",
+    );
 
     let qualified_local_alias = lifecycle.replace(
         "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n",
         "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n        type AllCapabilities = super::lifecycle::LifecycleWiring;\n",
     );
-    assert!(validate(&qualified_local_alias, &custom, &hosting).is_err());
+    assert_rejected(
+        validate(&qualified_local_alias, &custom, &hosting),
+        "AllCapabilities",
+    );
 
     let borrowed_facade_field = hosting.replace(
         "impl PodRuntime {\n",
         "impl PodRuntime {\n    fn leaked_field(&self) { let registered = self.host.registered.get().unwrap(); let _borrowed = &registered.lifecycle; }\n",
     );
-    assert!(validate(&lifecycle, &custom, &borrowed_facade_field).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &borrowed_facade_field),
+        "leaked_field",
+    );
 
     let build_deref = format!(
         "{hosting}\nimpl std::ops::Deref for BuildRuntime {{ type Target = PodRuntime; fn deref(&self) -> &Self::Target {{ unreachable!() }} }}\n"
     );
-    assert!(validate(&lifecycle, &custom, &build_deref).is_err());
+    assert_rejected(validate(&lifecycle, &custom, &build_deref), "BuildRuntime");
 
     let broad_peer_signature = hosting.replace(
         "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {\n        self.inner.snapshot().await\n    }\n",
         "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> Arc<RuntimeHost> { unreachable!() }\n",
     );
-    assert!(validate(&lifecycle, &custom, &broad_peer_signature).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &broad_peer_signature),
+        "PeerDiscoveryRuntime::snapshot",
+    );
 
     let broad_coordinator_cleanup = hosting.replace(
         "    fn new(runtime: BuildAttemptRuntime, build_id: OperationId, generation: u64) -> Self {\n",
         "    fn new(runtime: BuildRuntime, build_id: OperationId, generation: u64) -> Self {\n",
     );
-    assert!(validate(&lifecycle, &custom, &broad_coordinator_cleanup).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &broad_coordinator_cleanup),
+        "build runtime cancellation",
+    );
 
     let concrete_backend_signature = hosting.replace(
         "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {\n",
         "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> Arc<custom::CustomReplicatorHost> {\n",
     );
-    assert!(validate(&lifecycle, &custom, &concrete_backend_signature).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &concrete_backend_signature),
+        "PeerDiscoveryRuntime::snapshot",
+    );
 
     let universal_registration_getter = hosting.replace(
         "impl RegisteredReplicator {\n",
         "impl RegisteredReplicator {\n    fn all_capabilities(&self) -> (&lifecycle::ProcessRuntime, &lifecycle::TopologyRuntime) { unreachable!() }\n",
     );
-    assert!(validate(&lifecycle, &custom, &universal_registration_getter).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &universal_registration_getter),
+        "all_capabilities",
+    );
 
     let renamed_wiring = format!(
         "{hosting}\nstruct LifecycleBroker {{ process: lifecycle::ProcessRuntime, authority: lifecycle::AuthorityRuntime, topology: lifecycle::TopologyRuntime }}\n"
     );
-    assert!(validate(&lifecycle, &custom, &renamed_wiring).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &renamed_wiring),
+        "LifecycleBroker",
+    );
 
     let host_view_broker = format!(
         "{hosting}\nstruct HostViewBroker {{ build: BuildRuntime, report: ReportRuntime, outbound: OutboundRuntime }}\n"
     );
-    assert!(validate(&lifecycle, &custom, &host_view_broker).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &host_view_broker),
+        "HostViewBroker",
+    );
 
     let nested_broker = format!(
         "{hosting}\nmod leaked {{ struct Broker {{ process: lifecycle::ProcessRuntime, topology: lifecycle::TopologyRuntime }} }}\n"
     );
-    assert!(validate(&lifecycle, &custom, &nested_broker).is_err());
+    assert_rejected(validate(&lifecycle, &custom, &nested_broker), "Broker");
 
     let tuple_alias = format!(
         "{hosting}\ntype CapabilityTuple = (BuildRuntime, ReportRuntime, OutboundRuntime);\n"
     );
-    assert!(validate(&lifecycle, &custom, &tuple_alias).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &tuple_alias),
+        "CapabilityTuple",
+    );
 
     let tuple_getter = format!(
         "{hosting}\nfn all_views() -> (BuildRuntime, ReportRuntime) {{ unreachable!() }}\n"
     );
-    assert!(validate(&lifecycle, &custom, &tuple_getter).is_err());
+    assert_rejected(validate(&lifecycle, &custom, &tuple_getter), "all_views");
 
     let tuple_struct = format!("{hosting}\nstruct TupleBroker((BuildRuntime, ReportRuntime));\n");
-    assert!(validate(&lifecycle, &custom, &tuple_struct).is_err());
+    assert_rejected(validate(&lifecycle, &custom, &tuple_struct), "TupleBroker");
 
     let tuple_field =
         format!("{hosting}\nstruct TupleFieldBroker {{ views: (BuildRuntime, ReportRuntime) }}\n");
-    assert!(validate(&lifecycle, &custom, &tuple_field).is_err());
+    assert_rejected(
+        validate(&lifecycle, &custom, &tuple_field),
+        "TupleFieldBroker",
+    );
 
     let local_broker = format!(
         "{hosting}\nfn leaked_local() {{ struct LocalBroker {{ build: BuildRuntime, report: ReportRuntime }} }}\n"
     );
-    assert!(validate(&lifecycle, &custom, &local_broker).is_err());
+    assert_rejected(validate(&lifecycle, &custom, &local_broker), "LocalBroker");
+
+    let report = source("src/host/report.rs");
+    let leaked_report =
+        format!("{report}\nfn leaked_consumer(runtime: BuildRuntime) {{ let _ = runtime; }}\n");
+    let leaked_report = syn::parse_file(&leaked_report).unwrap();
+    let report_sites = capability_signature_sites(&leaked_report);
+    let expected_report_sites = names(&["AgentReporter::report"]);
+    let result = if report_sites == expected_report_sites {
+        Ok(())
+    } else {
+        Err(format!(
+            "report capability consumer inventory changed: {report_sites:#?}"
+        ))
+    };
+    assert_rejected(result, "fn leaked_consumer");
 }
