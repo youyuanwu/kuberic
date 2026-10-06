@@ -1356,13 +1356,7 @@ impl ManagedLifecycleBackend {
     }
 }
 
-pub(super) struct ReplicatorLifecycleHost {
-    topology: Arc<dyn TopologyLifecycle>,
-    observation: Arc<dyn LifecycleObservation>,
-}
-
 pub(super) struct ReplicatorLifecycleRegistration {
-    pub(super) lifecycle: Arc<ReplicatorLifecycleHost>,
     pub(super) process: super::lifecycle::ProcessRuntime,
     pub(super) authority: super::lifecycle::AuthorityRuntime,
     pub(super) peer: super::lifecycle::PeerRuntime,
@@ -1375,15 +1369,17 @@ pub(super) struct ReplicatorLifecycleRegistration {
     pub(super) build_cancellation: super::lifecycle::BuildCancellationRuntime,
     pub(super) outbound: super::lifecycle::OutboundLifecycleRuntime,
     pub(super) removal_witness: super::lifecycle::RemovalWitnessRuntime,
+    pub(super) topology: super::lifecycle::TopologyRuntime,
+    pub(super) recovery: super::lifecycle::RecoveryRuntime,
 }
 
-impl ReplicatorLifecycleHost {
+impl ReplicatorLifecycleRegistration {
     pub(super) fn managed(
         host: Weak<RuntimeHost>,
         control: Arc<dyn Replicator>,
         primary: Arc<dyn PrimaryReplicator>,
         lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
-    ) -> ReplicatorLifecycleRegistration {
+    ) -> Self {
         let common = Arc::new(CustomReplicatorHost::new(host, control, primary, false));
         let backend = Arc::new(ManagedLifecycleBackend {
             legacy: lifecycle,
@@ -1393,21 +1389,21 @@ impl ReplicatorLifecycleHost {
         });
         let build: Arc<dyn BuildCancellation> = backend.clone();
         common.bind_build_cancellation(Arc::downgrade(&build));
-        Self::registration(LifecycleWiring::new(backend), true)
+        Self::from_wiring(LifecycleWiring::new(backend), true)
     }
 
     pub(super) fn service(
         host: Weak<RuntimeHost>,
         control: Arc<dyn Replicator>,
         primary: Arc<dyn PrimaryReplicator>,
-    ) -> ReplicatorLifecycleRegistration {
+    ) -> Self {
         let backend = Arc::new(CustomReplicatorHost::new(host, control, primary, true));
         let build: Arc<dyn BuildCancellation> = backend.clone();
         backend.bind_build_cancellation(Arc::downgrade(&build));
-        Self::registration(LifecycleWiring::new(backend), false)
+        Self::from_wiring(LifecycleWiring::new(backend), false)
     }
 
-    fn registration(wiring: LifecycleWiring, managed: bool) -> ReplicatorLifecycleRegistration {
+    fn from_wiring(wiring: LifecycleWiring, managed: bool) -> Self {
         let process = wiring.process_runtime();
         let authority = wiring.authority_runtime();
         let peer = wiring.peer_runtime();
@@ -1420,12 +1416,9 @@ impl ReplicatorLifecycleHost {
         let build_cancellation = wiring.build_cancellation();
         let outbound = wiring.outbound_runtime();
         let removal_witness = wiring.removal_witness_runtime();
-        let lifecycle = Arc::new(Self {
-            topology: wiring.topology,
-            observation: wiring.observation,
-        });
-        ReplicatorLifecycleRegistration {
-            lifecycle,
+        let topology = wiring.topology_runtime();
+        let recovery = wiring.recovery_runtime();
+        Self {
             process,
             authority,
             peer,
@@ -1438,105 +1431,9 @@ impl ReplicatorLifecycleHost {
             build_cancellation,
             outbound,
             removal_witness,
+            topology,
+            recovery,
         }
-    }
-
-    pub(super) async fn wait_for_catch_up(&self) -> Result<()> {
-        self.topology.wait_for_catch_up().await
-    }
-
-    pub(super) async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()> {
-        self.topology.authorize_failover_prefix(boundary).await
-    }
-
-    pub(super) async fn prepare_switchover(
-        &self,
-        preparation_generation: u64,
-        request_id: crate::protocol::types::SwitchoverRequestId,
-        source: ReplicaIdentity,
-        target: ReplicaIdentity,
-        starting_configuration_id: crate::protocol::types::ConfigurationId,
-        starting_epoch: crate::protocol::types::Epoch,
-    ) -> Result<()> {
-        self.topology
-            .prepare_switchover(
-                preparation_generation,
-                request_id,
-                source,
-                target,
-                starting_configuration_id,
-                starting_epoch,
-            )
-            .await
-    }
-
-    pub(super) async fn prepare_secondary_removal(
-        &self,
-        intent: crate::protocol::types::SecondaryScaleDownIntent,
-        process_session_id: ProcessSessionId,
-        report_sequence: u64,
-    ) -> Result<()> {
-        self.topology
-            .prepare_secondary_removal(intent, process_session_id, report_sequence)
-            .await
-    }
-
-    pub(super) async fn observe_secondary_removal(
-        &self,
-        witness: crate::protocol::types::SecondaryRemovalWitness,
-    ) -> Result<()> {
-        self.topology.observe_secondary_removal(witness).await
-    }
-
-    pub(super) async fn observe_secondary_removal_progress(
-        &self,
-        witness: crate::protocol::types::SecondaryRemovalWitness,
-        committed: crate::protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        self.topology
-            .observe_secondary_removal_progress(witness, committed)
-            .await
-    }
-
-    pub(super) async fn accept_secondary_removal(
-        &self,
-        committed: crate::protocol::types::SecondaryScaleDownCleanup,
-    ) -> Result<()> {
-        self.topology.accept_secondary_removal(committed).await
-    }
-
-    pub(super) async fn accept_historical_secondary_removal(
-        &self,
-        command: crate::protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<()> {
-        self.topology
-            .accept_historical_secondary_removal(command)
-            .await
-    }
-
-    pub(super) async fn fence_retirement(
-        &self,
-        retired: crate::authority::RetiredAuthority,
-    ) -> Result<()> {
-        self.topology.fence_retirement(retired).await
-    }
-
-    pub(super) async fn complete_retirement(
-        &self,
-        retired: crate::authority::RetiredAuthority,
-    ) -> Result<()> {
-        self.topology.complete_retirement(retired).await
-    }
-
-    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.observation.snapshot().await
-    }
-
-    pub(super) async fn topology_receipt(
-        &self,
-        action: &RuntimeEffectAction,
-    ) -> Option<TopologyReceipt> {
-        self.topology.topology_receipt(action).await
     }
 }
 

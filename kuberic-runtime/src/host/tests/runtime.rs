@@ -7490,14 +7490,17 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     assert!(!replication.contains("fn managed_replicator("));
     assert!(!replication.contains("ReplicatorInterfaces::new"));
     assert!(
-        hosting.contains("lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>")
+        !hosting.contains("ReplicatorLifecycleHost")
+            && !custom.contains("ReplicatorLifecycleHost")
             && hosting.contains("process_lifecycle: Option<lifecycle::ProcessRuntime>")
             && hosting.contains("authority_lifecycle: Option<lifecycle::AuthorityRuntime>")
             && hosting.contains("peer_lifecycle: Option<lifecycle::PeerRuntime>")
             && hosting.contains("access_closure: Option<lifecycle::AccessClosure>")
+            && hosting.contains("topology_lifecycle: Option<lifecycle::TopologyRuntime>")
+            && hosting.contains("recovery_lifecycle: Option<lifecycle::RecoveryRuntime>")
             && !hosting.contains("enum HostedLifecycle")
             && !hosting.contains("custom: Option<Arc<custom::CustomReplicatorHost>>"),
-        "registration must retain one shared owner and narrow migrated lifecycle views"
+        "registration must retain only narrow lifecycle views"
     );
     assert!(
         !custom.contains("ReplicatorLifecycleBackend")
@@ -7505,6 +7508,7 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
             && lifecycle.contains("trait AuthorityLifecycle")
             && lifecycle.contains("trait AccessLifecycle")
             && lifecycle.contains("trait BuildLifecycle")
+            && lifecycle.contains("trait BuildCancellation")
             && lifecycle.contains("trait TopologyLifecycle")
             && lifecycle.contains("trait LifecycleObservation")
             && lifecycle.contains("trait OutboundLifecycle"),

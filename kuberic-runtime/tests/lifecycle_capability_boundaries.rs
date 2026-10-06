@@ -447,6 +447,8 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "build_cancellation",
             "outbound_runtime",
             "removal_witness_runtime",
+            "topology_runtime",
+            "recovery_runtime",
         ],
     )?;
     assert_shape(
@@ -468,11 +470,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         &lifecycle_file,
         "AuthorityRuntime",
         &[("inner", "Arc<dynAuthorityLifecycle>")],
-        &[
-            "cancel_configuration_work",
-            "restore_authority",
-            "admit_authority",
-        ],
+        &["cancel_configuration_work", "admit_authority"],
     )?;
     assert_shape(
         &lifecycle_file,
@@ -496,7 +494,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         &lifecycle_file,
         "AccessRuntime",
         &[("inner", "Arc<dynAccessLifecycle>")],
-        &["begin_effect", "restore"],
+        &["begin_effect"],
     )?;
     assert_shape(
         &lifecycle_file,
@@ -554,6 +552,41 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         &[("inner", "Arc<dynTopologyLifecycle>")],
         &["observe"],
     )?;
+    assert_shape(
+        &lifecycle_file,
+        "TopologyRuntime",
+        &[("inner", "Arc<dynTopologyLifecycle>")],
+        &[
+            "wait_for_catch_up",
+            "authorize_failover_prefix",
+            "prepare_switchover",
+            "prepare_secondary_removal",
+            "observe_secondary_removal",
+            "observe_secondary_removal_progress",
+            "accept_secondary_removal",
+            "accept_historical_secondary_removal",
+            "fence_retirement",
+            "complete_retirement",
+            "receipt",
+        ],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "RecoveryRuntime",
+        &[
+            ("authority", "Arc<dynAuthorityLifecycle>"),
+            ("access", "Arc<dynAccessLifecycle>"),
+            ("topology", "Arc<dynTopologyLifecycle>"),
+            ("observation", "Arc<dynLifecycleObservation>"),
+        ],
+        &[
+            "restore_authority",
+            "snapshot",
+            "restore_access",
+            "accept_secondary_removal",
+            "accept_historical_secondary_removal",
+        ],
+    )?;
     reject_capability_escape_paths(
         &lifecycle_file,
         &[
@@ -579,55 +612,26 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "BuildCancellationRuntime",
             "OutboundLifecycleRuntime",
             "RemovalWitnessRuntime",
+            "TopologyRuntime",
+            "RecoveryRuntime",
         ],
     )?;
 
     let custom_file =
         syn::parse_file(custom).map_err(|error| format!("parse custom host: {error}"))?;
     reject_broad_aliases(&custom_file)?;
-    let expected_facade = names(&[
-        "managed",
-        "service",
-        "registration",
-        "wait_for_catch_up",
-        "authorize_failover_prefix",
-        "prepare_switchover",
-        "prepare_secondary_removal",
-        "observe_secondary_removal",
-        "observe_secondary_removal_progress",
-        "accept_secondary_removal",
-        "accept_historical_secondary_removal",
-        "fence_retirement",
-        "complete_retirement",
-        "snapshot",
-        "topology_receipt",
-    ]);
-    let facade_methods = impl_methods(&custom_file, "ReplicatorLifecycleHost");
-    if facade_methods.as_ref() != Some(&expected_facade) {
-        return Err(format!(
-            "transition facade allowance changed: {facade_methods:#?}"
-        ));
-    }
-    let expected_facade_fields = BTreeMap::from([
-        (
-            "topology".to_owned(),
-            "Arc<dynTopologyLifecycle>".to_owned(),
-        ),
-        (
-            "observation".to_owned(),
-            "Arc<dynLifecycleObservation>".to_owned(),
-        ),
-    ]);
-    if struct_fields(&custom_file, "ReplicatorLifecycleHost").as_ref()
-        != Some(&expected_facade_fields)
+    if custom.contains("ReplicatorLifecycleHost")
+        || impl_methods(&custom_file, "ReplicatorLifecycleHost").is_some()
+        || struct_fields(&custom_file, "ReplicatorLifecycleHost").is_some()
     {
-        return Err("transition facade retains unapproved capabilities".into());
+        return Err("universal lifecycle facade remains".into());
+    }
+    if impl_methods(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
+        != Some(&names(&["managed", "service", "from_wiring"]))
+    {
+        return Err("lifecycle registration assembly methods changed".into());
     }
     let expected_registration_fields = BTreeMap::from([
-        (
-            "lifecycle".to_owned(),
-            "Arc<ReplicatorLifecycleHost>".to_owned(),
-        ),
         (
             "process".to_owned(),
             "super::lifecycle::ProcessRuntime".to_owned(),
@@ -675,6 +679,14 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         (
             "removal_witness".to_owned(),
             "super::lifecycle::RemovalWitnessRuntime".to_owned(),
+        ),
+        (
+            "topology".to_owned(),
+            "super::lifecycle::TopologyRuntime".to_owned(),
+        ),
+        (
+            "recovery".to_owned(),
+            "super::lifecycle::RecoveryRuntime".to_owned(),
         ),
     ]);
     if struct_fields(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
@@ -879,10 +891,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "Option<Arc<dynStateProvider>>".to_owned(),
         ),
         (
-            "lifecycle".to_owned(),
-            "Option<Arc<custom::ReplicatorLifecycleHost>>".to_owned(),
-        ),
-        (
             "process_lifecycle".to_owned(),
             "Option<lifecycle::ProcessRuntime>".to_owned(),
         ),
@@ -931,6 +939,14 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "Option<lifecycle::RemovalWitnessRuntime>".to_owned(),
         ),
         (
+            "topology_lifecycle".to_owned(),
+            "Option<lifecycle::TopologyRuntime>".to_owned(),
+        ),
+        (
+            "recovery_lifecycle".to_owned(),
+            "Option<lifecycle::RecoveryRuntime>".to_owned(),
+        ),
+        (
             "managed_data_plane".to_owned(),
             "Option<Arc<dynManagedReplicatorDataPlane>>".to_owned(),
         ),
@@ -960,19 +976,10 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         .into_iter()
         .chain(transition_consumers(custom)?)
         .collect::<BTreeSet<_>>();
-    let expected_consumers = names(&[
-        "PodRuntime::reconstruct",
-        "PodRuntime::restore_accepted_removal",
-        "PodRuntime::testing_wait_for_catch_up",
-        "RegisteredReplicator::lifecycle",
-        "RuntimeHost::lifecycle",
-        "RuntimeHost::prepare_effect",
-        "RuntimeHost::register_interfaces",
-        "RuntimeHost::snapshot",
-    ]);
+    let expected_consumers = BTreeSet::new();
     if actual_consumers != expected_consumers {
         return Err(format!(
-            "transition facade consumer inventory changed: {actual_consumers:#?}"
+            "universal lifecycle consumer remains: {actual_consumers:#?}"
         ));
     }
 
@@ -1033,12 +1040,7 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
     let host_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/host");
     for entry in fs::read_dir(&host_root).unwrap() {
         let path = entry.unwrap().path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("rs")
-            || matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("hosting.rs" | "custom.rs")
-            )
-        {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
             continue;
         }
         let source = fs::read_to_string(&path).unwrap();
@@ -1066,10 +1068,7 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         format!("{lifecycle}\ntrait UniversalLifecycle: ProcessLifecycle + BuildLifecycle {{}}\n");
     assert!(validate(&universal, &custom, &hosting).is_err());
 
-    let broad_facade = custom.replace(
-        "impl ReplicatorLifecycleHost {\n",
-        "impl ReplicatorLifecycleHost {\n    async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> { self.wiring.authority.admit_authority(authority).await }\n",
-    );
+    let broad_facade = format!("{custom}\nstruct ReplicatorLifecycleHost;\n");
     assert!(validate(&lifecycle, &broad_facade, &hosting).is_err());
 
     let missing_peer_view =
@@ -1080,8 +1079,8 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     assert!(validate(&broad_alias, &custom, &hosting).is_err());
 
     let universal_getter = custom.replace(
-        "impl ReplicatorLifecycleHost {\n",
-        "impl ReplicatorLifecycleHost {\n    fn all_capabilities(&self) -> &LifecycleWiring { unreachable!() }\n",
+        "impl ReplicatorLifecycleRegistration {\n",
+        "impl ReplicatorLifecycleRegistration {\n    fn all_capabilities(&self) -> &LifecycleWiring { unreachable!() }\n",
     );
     assert!(validate(&lifecycle, &universal_getter, &hosting).is_err());
 

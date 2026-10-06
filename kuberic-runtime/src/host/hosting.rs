@@ -141,7 +141,6 @@ struct RegisteredReplicator {
     control: Arc<dyn Replicator>,
     primary: Option<Arc<dyn PrimaryReplicator>>,
     provider: Option<Arc<dyn StateProvider>>,
-    lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>,
     process_lifecycle: Option<lifecycle::ProcessRuntime>,
     authority_lifecycle: Option<lifecycle::AuthorityRuntime>,
     peer_lifecycle: Option<lifecycle::PeerRuntime>,
@@ -154,6 +153,8 @@ struct RegisteredReplicator {
     build_cancellation: Option<lifecycle::BuildCancellationRuntime>,
     outbound_lifecycle: Option<lifecycle::OutboundLifecycleRuntime>,
     removal_witness: Option<lifecycle::RemovalWitnessRuntime>,
+    topology_lifecycle: Option<lifecycle::TopologyRuntime>,
+    recovery_lifecycle: Option<lifecycle::RecoveryRuntime>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
@@ -252,9 +253,6 @@ impl RegisteredReplicator {
     fn managed_data_plane(&self) -> Option<Arc<dyn ManagedReplicatorDataPlane>> {
         self.managed_data_plane.clone()
     }
-    fn lifecycle(&self) -> Option<Arc<custom::ReplicatorLifecycleHost>> {
-        self.lifecycle.clone()
-    }
     fn process_lifecycle(&self) -> Option<lifecycle::ProcessRuntime> {
         self.process_lifecycle.clone()
     }
@@ -290,6 +288,12 @@ impl RegisteredReplicator {
     }
     fn removal_witness(&self) -> Option<lifecycle::RemovalWitnessRuntime> {
         self.removal_witness.clone()
+    }
+    fn topology_lifecycle(&self) -> Option<lifecycle::TopologyRuntime> {
+        self.topology_lifecycle.clone()
+    }
+    fn recovery_lifecycle(&self) -> Option<lifecycle::RecoveryRuntime> {
+        self.recovery_lifecycle.clone()
     }
     fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary.clone()
@@ -809,8 +813,9 @@ impl PodRuntime {
         Ok(())
     }
 
+    #[cfg(all(test, feature = "testing"))]
     pub(crate) async fn restore_authority(&self) -> Result<()> {
-        self.host.authority_lifecycle()?.restore_authority().await
+        self.host.recovery_lifecycle()?.restore_authority().await
     }
 
     pub(crate) fn bind_replica_session(
@@ -900,10 +905,10 @@ impl PodRuntime {
         if !self.host.snapshot().await.open {
             self.host.open(mode).await?;
         }
-        if let Ok(evidence) = self.host.lifecycle_evidence() {
-            self.restore_authority().await?;
+        if let Ok(recovery) = self.host.recovery_lifecycle() {
+            recovery.restore_authority().await?;
             self.host
-                .sync_access_projection(evidence.snapshot().await)
+                .sync_access_projection(recovery.snapshot().await)
                 .await;
         }
         if let Some((target_role, epoch_completed, application_completed)) = transition {
@@ -929,8 +934,7 @@ impl PodRuntime {
         } else {
             (read_status, write_status)
         };
-        if let Ok(access) = self.host.access_lifecycle() {
-            let evidence = self.host.lifecycle_evidence()?;
+        if let Ok(recovery) = self.host.recovery_lifecycle() {
             if write_status == AccessStatus::Granted
                 && let Some(committed) = self
                     .host
@@ -938,7 +942,7 @@ impl PodRuntime {
                     .replica_authority_store
                     .load_secondary_removal_commit()
                     .await?
-                && evidence
+                && recovery
                     .snapshot()
                     .await
                     .authority
@@ -948,19 +952,16 @@ impl PodRuntime {
                             && a.secondary_removal.as_ref() == Some(&committed.evidence)
                     })
             {
-                self.host
-                    .lifecycle()?
-                    .accept_secondary_removal(committed)
-                    .await?;
+                recovery.accept_secondary_removal(committed).await?;
             }
-            match access.restore(read_status, write_status).await {
+            match recovery.restore_access(read_status, write_status).await {
                 Err(RuntimeError::ReconfigurationPending) => {
                     tracing::info!("replica access restoration deferred");
                 }
                 result => result?,
             }
             self.host
-                .sync_access_projection(evidence.snapshot().await)
+                .sync_access_projection(recovery.snapshot().await)
                 .await;
         } else {
             let mut state = self.host.state.write().await;
@@ -975,10 +976,10 @@ impl PodRuntime {
         committed: crate::protocol::types::SecondaryScaleDownCleanup,
         historical: Option<crate::protocol::command::AcceptSecondaryRemovalCommit>,
     ) -> Result<()> {
-        let lifecycle = self.host.lifecycle()?;
+        let recovery = self.host.recovery_lifecycle()?;
         match historical {
-            Some(command) => lifecycle.accept_historical_secondary_removal(command).await,
-            None => lifecycle.accept_secondary_removal(committed).await,
+            Some(command) => recovery.accept_historical_secondary_removal(command).await,
+            None => recovery.accept_secondary_removal(committed).await,
         }
     }
 
@@ -1029,7 +1030,7 @@ impl PodRuntime {
 
     #[cfg(all(test, feature = "testing"))]
     pub(crate) async fn testing_wait_for_catch_up(&self) -> Result<()> {
-        self.host.lifecycle()?.wait_for_catch_up().await
+        self.host.topology_lifecycle()?.wait_for_catch_up().await
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -1747,18 +1748,20 @@ impl ReplicatorRegistration for RuntimeHost {
                 .await?;
         }
         let lifecycle_registration = match (managed_lifecycle.as_ref(), primary.clone()) {
-            (Some(lifecycle), Some(primary)) => Some(custom::ReplicatorLifecycleHost::managed(
-                self.weak_self.clone(),
-                control.clone(),
-                primary,
-                lifecycle.clone(),
-            )),
+            (Some(lifecycle), Some(primary)) => {
+                Some(custom::ReplicatorLifecycleRegistration::managed(
+                    self.weak_self.clone(),
+                    control.clone(),
+                    primary,
+                    lifecycle.clone(),
+                ))
+            }
             (Some(_), None) => {
                 return Err(RuntimeError::Application(
                     "managed lifecycle requires a primary replicator".into(),
                 ));
             }
-            (None, Some(primary)) => Some(custom::ReplicatorLifecycleHost::service(
+            (None, Some(primary)) => Some(custom::ReplicatorLifecycleRegistration::service(
                 self.weak_self.clone(),
                 control.clone(),
                 primary,
@@ -1766,7 +1769,6 @@ impl ReplicatorRegistration for RuntimeHost {
             (None, None) => None,
         };
         let (
-            lifecycle,
             process_lifecycle,
             authority_lifecycle,
             peer_lifecycle,
@@ -1779,9 +1781,10 @@ impl ReplicatorRegistration for RuntimeHost {
             build_cancellation,
             outbound_lifecycle,
             removal_witness,
+            topology_lifecycle,
+            recovery_lifecycle,
         ) = match lifecycle_registration {
             Some(registration) => (
-                Some(registration.lifecycle),
                 Some(registration.process),
                 Some(registration.authority),
                 Some(registration.peer),
@@ -1794,9 +1797,11 @@ impl ReplicatorRegistration for RuntimeHost {
                 Some(registration.build_cancellation),
                 Some(registration.outbound),
                 Some(registration.removal_witness),
+                Some(registration.topology),
+                Some(registration.recovery),
             ),
             None => (
-                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
             ),
         };
         let mut creation = self.replicator_creation.lock().map_err(|_| {
@@ -1817,7 +1822,6 @@ impl ReplicatorRegistration for RuntimeHost {
                 control,
                 primary,
                 provider,
-                lifecycle,
                 process_lifecycle,
                 authority_lifecycle,
                 peer_lifecycle,
@@ -1830,6 +1834,8 @@ impl ReplicatorRegistration for RuntimeHost {
                 build_cancellation,
                 outbound_lifecycle,
                 removal_witness,
+                topology_lifecycle,
+                recovery_lifecycle,
                 managed_data_plane,
             })
             .map_err(|_| {
@@ -1903,17 +1909,6 @@ impl RuntimeHost {
                 )
             })
     }
-    fn access_lifecycle(&self) -> Result<lifecycle::AccessRuntime> {
-        self.registered
-            .get()
-            .ok_or(RuntimeError::NotOpen)?
-            .access_lifecycle()
-            .ok_or_else(|| {
-                RuntimeError::Application(
-                    "replicator does not expose access lifecycle capabilities".into(),
-                )
-            })
-    }
     fn lifecycle_evidence(&self) -> Result<lifecycle::EvidenceRuntime> {
         self.registered
             .get()
@@ -1947,14 +1942,25 @@ impl RuntimeHost {
                 )
             })
     }
-    fn lifecycle(&self) -> Result<Arc<custom::ReplicatorLifecycleHost>> {
+    fn topology_lifecycle(&self) -> Result<lifecycle::TopologyRuntime> {
         self.registered
             .get()
             .ok_or(RuntimeError::NotOpen)?
-            .lifecycle()
+            .topology_lifecycle()
             .ok_or_else(|| {
                 RuntimeError::Application(
-                    "replicator does not expose primary lifecycle capabilities".into(),
+                    "replicator does not expose topology lifecycle capabilities".into(),
+                )
+            })
+    }
+    fn recovery_lifecycle(&self) -> Result<lifecycle::RecoveryRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .recovery_lifecycle()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose recovery lifecycle capabilities".into(),
                 )
             })
     }
@@ -2133,18 +2139,19 @@ impl RuntimeHost {
                             "conflicting terminal retirement".into(),
                         ));
                     }
-                    if let Ok(managed) = self.lifecycle() {
-                        managed.complete_retirement(*retired).await?;
+                    if let Ok(topology) = self.topology_lifecycle() {
+                        topology.complete_retirement(*retired).await?;
                     } else {
                         self.state.write().await.fallback_snapshot.retired_authority =
                             Some(durable);
                         self.closed.store(true, Ordering::Release);
                     }
                 } else {
-                    let managed = self.lifecycle()?;
+                    let topology = self.topology_lifecycle()?;
                     if !self.closed.load(Ordering::Acquire) {
-                        managed.fence_retirement(*retired.clone()).await?;
-                        self.sync_access_projection(managed.snapshot().await).await;
+                        topology.fence_retirement(*retired.clone()).await?;
+                        self.sync_access_projection(self.lifecycle_evidence()?.snapshot().await)
+                            .await;
                         self.change_replicator_role_at_epoch(
                             ReplicaRole::None,
                             Some(retired.report.epoch),
@@ -2153,7 +2160,7 @@ impl RuntimeHost {
                         self.change_application_role(ReplicaRole::None).await?;
                         self.close().await?;
                     }
-                    managed.complete_retirement(*retired).await?;
+                    topology.complete_retirement(*retired).await?;
                 }
             }
             RuntimeEffectAction::Open(mode) => self.open(mode).await?,
@@ -2238,10 +2245,10 @@ impl RuntimeHost {
                 }
             }
             RuntimeEffectAction::WaitForCatchup => {
-                self.lifecycle()?.wait_for_catch_up().await?;
+                self.topology_lifecycle()?.wait_for_catch_up().await?;
             }
             RuntimeEffectAction::AuthorizeFailoverPrefix(boundary) => {
-                self.lifecycle()?
+                self.topology_lifecycle()?
                     .authorize_failover_prefix(boundary)
                     .await?;
                 self.require_primary_application_refresh().await;
@@ -2254,7 +2261,7 @@ impl RuntimeHost {
                 starting_configuration_id,
                 starting_epoch,
             } => {
-                self.lifecycle()?
+                self.topology_lifecycle()?
                     .prepare_switchover(
                         preparation_generation,
                         request_id,
@@ -2282,17 +2289,17 @@ impl RuntimeHost {
                 process_session_id,
                 report_sequence,
             } => {
-                self.lifecycle()?
+                self.topology_lifecycle()?
                     .prepare_secondary_removal(*intent, process_session_id, report_sequence)
                     .await?;
             }
             RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness) => {
-                self.lifecycle()?
+                self.topology_lifecycle()?
                     .observe_secondary_removal(*witness)
                     .await?;
             }
             RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
-                self.lifecycle()?
+                self.topology_lifecycle()?
                     .observe_secondary_removal_progress(*witness, *committed)
                     .await?;
             }
@@ -2305,20 +2312,24 @@ impl RuntimeHost {
                     .await?;
             }
             RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
-                self.lifecycle()?
+                self.topology_lifecycle()?
                     .accept_secondary_removal(*committed)
                     .await?;
             }
             RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
-                self.lifecycle()?
+                self.topology_lifecycle()?
                     .accept_historical_secondary_removal(*command)
                     .await?;
             }
             RuntimeEffectAction::FenceRetirement(retired) => {
-                self.lifecycle()?.fence_retirement(*retired).await?;
+                self.topology_lifecycle()?
+                    .fence_retirement(*retired)
+                    .await?;
             }
             RuntimeEffectAction::CompleteRetirement(retired) => {
-                self.lifecycle()?.complete_retirement(*retired).await?;
+                self.topology_lifecycle()?
+                    .complete_retirement(*retired)
+                    .await?;
             }
             RuntimeEffectAction::Close => self.close().await?,
             RuntimeEffectAction::Abort => self.abort_action().await,
@@ -2338,12 +2349,12 @@ impl RuntimeHost {
             }
             None => (None, None),
         };
-        let lifecycle = self.lifecycle().ok();
-        let topology_receipt = match lifecycle.as_ref() {
-            Some(lifecycle) => lifecycle
-                .topology_receipt(&effect.action)
-                .await
-                .map(Box::new),
+        let topology_receipt = match self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::topology_lifecycle)
+        {
+            Some(topology) => topology.receipt(&effect.action).await.map(Box::new),
             None => None,
         };
         let postcondition = match self
@@ -2956,8 +2967,8 @@ impl RuntimeHost {
     }
 
     async fn snapshot(&self) -> RuntimeSnapshot {
-        let managed = match self.lifecycle() {
-            Ok(managed) => Some(managed.snapshot().await),
+        let managed = match self.lifecycle_evidence() {
+            Ok(evidence) => Some(evidence.snapshot().await),
             Err(_) => None,
         };
         self.compose_snapshot(managed).await

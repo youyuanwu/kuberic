@@ -257,6 +257,21 @@ impl LifecycleWiring {
             inner: self.topology.clone(),
         }
     }
+
+    pub(super) fn topology_runtime(&self) -> TopologyRuntime {
+        TopologyRuntime {
+            inner: self.topology.clone(),
+        }
+    }
+
+    pub(super) fn recovery_runtime(&self) -> RecoveryRuntime {
+        RecoveryRuntime {
+            authority: self.authority.clone(),
+            access: self.access.clone(),
+            topology: self.topology.clone(),
+            observation: self.observation.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -307,10 +322,6 @@ pub(super) struct AuthorityRuntime {
 impl AuthorityRuntime {
     pub(super) async fn cancel_configuration_work(&self) -> Result<()> {
         self.inner.cancel_configuration_work().await
-    }
-
-    pub(super) async fn restore_authority(&self) -> Result<()> {
-        self.inner.restore_authority().await
     }
 
     pub(super) async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
@@ -471,6 +482,140 @@ impl RemovalWitnessRuntime {
 }
 
 #[derive(Clone)]
+pub(super) struct TopologyRuntime {
+    inner: Arc<dyn TopologyLifecycle>,
+}
+
+impl TopologyRuntime {
+    pub(super) async fn wait_for_catch_up(&self) -> Result<()> {
+        self.inner.wait_for_catch_up().await
+    }
+
+    pub(super) async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()> {
+        self.inner.authorize_failover_prefix(boundary).await
+    }
+
+    pub(super) async fn prepare_switchover(
+        &self,
+        preparation_generation: u64,
+        request_id: SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: ConfigurationId,
+        starting_epoch: Epoch,
+    ) -> Result<()> {
+        self.inner
+            .prepare_switchover(
+                preparation_generation,
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            )
+            .await
+    }
+
+    pub(super) async fn prepare_secondary_removal(
+        &self,
+        intent: SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<()> {
+        self.inner
+            .prepare_secondary_removal(intent, process_session_id, report_sequence)
+            .await
+    }
+
+    pub(super) async fn observe_secondary_removal(
+        &self,
+        witness: SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.inner.observe_secondary_removal(witness).await
+    }
+
+    pub(super) async fn observe_secondary_removal_progress(
+        &self,
+        witness: SecondaryRemovalWitness,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.inner
+            .observe_secondary_removal_progress(witness, committed)
+            .await
+    }
+
+    pub(super) async fn accept_secondary_removal(
+        &self,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.inner.accept_secondary_removal(committed).await
+    }
+
+    pub(super) async fn accept_historical_secondary_removal(
+        &self,
+        command: AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        self.inner
+            .accept_historical_secondary_removal(command)
+            .await
+    }
+
+    pub(super) async fn fence_retirement(&self, retired: RetiredAuthority) -> Result<()> {
+        self.inner.fence_retirement(retired).await
+    }
+
+    pub(super) async fn complete_retirement(&self, retired: RetiredAuthority) -> Result<()> {
+        self.inner.complete_retirement(retired).await
+    }
+
+    pub(super) async fn receipt(&self, action: &RuntimeEffectAction) -> Option<TopologyReceipt> {
+        self.inner.topology_receipt(action).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RecoveryRuntime {
+    authority: Arc<dyn AuthorityLifecycle>,
+    access: Arc<dyn AccessLifecycle>,
+    topology: Arc<dyn TopologyLifecycle>,
+    observation: Arc<dyn LifecycleObservation>,
+}
+
+impl RecoveryRuntime {
+    pub(super) async fn restore_authority(&self) -> Result<()> {
+        self.authority.restore_authority().await
+    }
+
+    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
+        self.observation.snapshot().await
+    }
+
+    pub(super) async fn restore_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        restore_access(self.access.clone(), read, write).await
+    }
+
+    pub(super) async fn accept_secondary_removal(
+        &self,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.topology.accept_secondary_removal(committed).await
+    }
+
+    pub(super) async fn accept_historical_secondary_removal(
+        &self,
+        command: AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        self.topology
+            .accept_historical_secondary_removal(command)
+            .await
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct AccessClosure {
     inner: Arc<dyn AccessLifecycle>,
 }
@@ -545,10 +690,6 @@ impl AccessRuntime {
         write: AccessStatus,
     ) -> Result<ReadyAccessTransaction> {
         begin_access_effect(self.inner.clone(), read, write).await
-    }
-
-    pub(super) async fn restore(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
-        restore_access(self.inner.clone(), read, write).await
     }
 }
 
