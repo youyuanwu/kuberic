@@ -146,6 +146,7 @@ struct RegisteredReplicator {
     authority_lifecycle: Option<lifecycle::AuthorityRuntime>,
     peer_lifecycle: Option<lifecycle::PeerRuntime>,
     access_closure: Option<lifecycle::AccessClosure>,
+    lifecycle_evidence: Option<lifecycle::EvidenceRuntime>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
@@ -258,6 +259,9 @@ impl RegisteredReplicator {
     }
     fn access_closure(&self) -> Option<lifecycle::AccessClosure> {
         self.access_closure.clone()
+    }
+    fn lifecycle_evidence(&self) -> Option<lifecycle::EvidenceRuntime> {
+        self.lifecycle_evidence.clone()
     }
     fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary.clone()
@@ -1331,37 +1335,43 @@ impl ReplicatorRegistration for RuntimeHost {
                 .attach_interfaces(control.clone(), primary.clone())
                 .await?;
         }
-        let lifecycle = match (managed_lifecycle.as_ref(), primary.clone()) {
-            (Some(lifecycle), Some(primary)) => {
-                Some(Arc::new(custom::ReplicatorLifecycleHost::managed(
-                    self.weak_self.clone(),
-                    control.clone(),
-                    primary,
-                    lifecycle.clone(),
-                )))
-            }
+        let lifecycle_registration = match (managed_lifecycle.as_ref(), primary.clone()) {
+            (Some(lifecycle), Some(primary)) => Some(custom::ReplicatorLifecycleHost::managed(
+                self.weak_self.clone(),
+                control.clone(),
+                primary,
+                lifecycle.clone(),
+            )),
             (Some(_), None) => {
                 return Err(RuntimeError::Application(
                     "managed lifecycle requires a primary replicator".into(),
                 ));
             }
-            (None, Some(primary)) => Some(Arc::new(custom::ReplicatorLifecycleHost::service(
+            (None, Some(primary)) => Some(custom::ReplicatorLifecycleHost::service(
                 self.weak_self.clone(),
                 control.clone(),
                 primary,
-            ))),
+            )),
             (None, None) => None,
         };
-        let process_lifecycle = lifecycle
-            .as_ref()
-            .map(|lifecycle| lifecycle.process_runtime());
-        let authority_lifecycle = lifecycle
-            .as_ref()
-            .map(|lifecycle| lifecycle.authority_runtime());
-        let peer_lifecycle = lifecycle.as_ref().map(|lifecycle| lifecycle.peer_runtime());
-        let access_closure = lifecycle
-            .as_ref()
-            .map(|lifecycle| lifecycle.access_closure());
+        let (
+            lifecycle,
+            process_lifecycle,
+            authority_lifecycle,
+            peer_lifecycle,
+            access_closure,
+            lifecycle_evidence,
+        ) = match lifecycle_registration {
+            Some(registration) => (
+                Some(registration.lifecycle),
+                Some(registration.process),
+                Some(registration.authority),
+                Some(registration.peer),
+                Some(registration.access_closure),
+                Some(registration.evidence),
+            ),
+            None => (None, None, None, None, None, None),
+        };
         let mut creation = self.replicator_creation.lock().map_err(|_| {
             RuntimeError::Application("replicator creation state was poisoned".into())
         })?;
@@ -1385,6 +1395,7 @@ impl ReplicatorRegistration for RuntimeHost {
                 authority_lifecycle,
                 peer_lifecycle,
                 access_closure,
+                lifecycle_evidence,
                 managed_data_plane,
             })
             .map_err(|_| {
@@ -1455,6 +1466,17 @@ impl RuntimeHost {
             .ok_or_else(|| {
                 RuntimeError::Application(
                     "replicator does not expose access lifecycle capabilities".into(),
+                )
+            })
+    }
+    fn lifecycle_evidence(&self) -> Result<lifecycle::EvidenceRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .lifecycle_evidence()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose lifecycle evidence capabilities".into(),
                 )
             })
     }
@@ -1626,7 +1648,7 @@ impl RuntimeHost {
                 self.authority_lifecycle()?
                     .admit_authority(*authority)
                     .await?;
-                self.sync_access_projection(self.lifecycle()?.snapshot().await)
+                self.sync_access_projection(self.lifecycle_evidence()?.snapshot().await)
                     .await;
             }
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
@@ -1987,8 +2009,8 @@ impl RuntimeHost {
             ));
         }
         let address = registered.open().await?;
-        if let Some(hosted) = registered.lifecycle() {
-            self.sync_access_projection(hosted.snapshot().await).await;
+        if let Some(evidence) = registered.lifecycle_evidence() {
+            self.sync_access_projection(evidence.snapshot().await).await;
         } else {
             let progress = registered.current_progress().await?;
             let committed = match registered.provider.as_ref() {

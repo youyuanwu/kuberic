@@ -197,6 +197,12 @@ impl LifecycleWiring {
             inner: self.access.clone(),
         }
     }
+
+    pub(super) fn evidence_runtime(&self) -> EvidenceRuntime {
+        EvidenceRuntime {
+            inner: self.observation.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -294,16 +300,76 @@ impl AccessClosure {
                 .run_access_transaction(read, write, ready_tx, accept_rx, accepted_tx, decision_rx)
                 .await
         });
-        ready_rx
-            .await
-            .map_err(|_| RuntimeError::OperationCancelled)?;
-        let _ = accept_tx.send(());
-        accepted_rx
-            .await
-            .map_err(|_| RuntimeError::OperationCancelled)?;
-        let _ = decision_tx.send(AccessDecision::Commit(AccessCommit::Direct));
-        completion
-            .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
+        match ready_rx.await {
+            Ok(()) => {
+                let _ = accept_tx.send(());
+                accepted_rx
+                    .await
+                    .map_err(|_| RuntimeError::OperationCancelled)?;
+                let _ = decision_tx.send(AccessDecision::Commit(AccessCommit::Direct));
+                completion
+                    .await
+                    .map_err(|error| RuntimeError::Application(error.to_string()))?
+            }
+            Err(_) => completion
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?
+                .and(Err(RuntimeError::OperationCancelled)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct EvidenceRuntime {
+    inner: Arc<dyn LifecycleObservation>,
+}
+
+impl EvidenceRuntime {
+    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
+        self.inner.snapshot().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingAccess;
+
+    #[async_trait]
+    impl AccessLifecycle for FailingAccess {
+        async fn defer_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
+
+        async fn run_access_transaction(
+            &self,
+            _read: AccessStatus,
+            _write: AccessStatus,
+            _ready: oneshot::Sender<()>,
+            _accept: oneshot::Receiver<()>,
+            _accepted: oneshot::Sender<Option<NativeProgressStatus>>,
+            _decision: oneshot::Receiver<AccessDecision>,
+        ) -> Result<()> {
+            Err(RuntimeError::Application("pre-ready failure".into()))
+        }
+
+        async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn access_closure_preserves_pre_ready_failure() {
+        let closure = AccessClosure {
+            inner: Arc::new(FailingAccess),
+        };
+        assert!(matches!(
+            closure
+                .set_access(
+                    AccessStatus::ReconfigurationPending,
+                    AccessStatus::ReconfigurationPending,
+                )
+                .await,
+            Err(RuntimeError::Application(message)) if message == "pre-ready failure"
+        ));
     }
 }

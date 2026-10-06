@@ -1355,7 +1355,21 @@ impl ManagedLifecycleBackend {
 }
 
 pub(super) struct ReplicatorLifecycleHost {
-    wiring: LifecycleWiring,
+    managed: bool,
+    access: Arc<dyn AccessLifecycle>,
+    build: Arc<dyn BuildLifecycle>,
+    topology: Arc<dyn TopologyLifecycle>,
+    observation: Arc<dyn LifecycleObservation>,
+    outbound: Arc<dyn OutboundLifecycle>,
+}
+
+pub(super) struct ReplicatorLifecycleRegistration {
+    pub(super) lifecycle: Arc<ReplicatorLifecycleHost>,
+    pub(super) process: super::lifecycle::ProcessRuntime,
+    pub(super) authority: super::lifecycle::AuthorityRuntime,
+    pub(super) peer: super::lifecycle::PeerRuntime,
+    pub(super) access_closure: super::lifecycle::AccessClosure,
+    pub(super) evidence: super::lifecycle::EvidenceRuntime,
 }
 
 impl ReplicatorLifecycleHost {
@@ -1364,47 +1378,51 @@ impl ReplicatorLifecycleHost {
         control: Arc<dyn Replicator>,
         primary: Arc<dyn PrimaryReplicator>,
         lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
-    ) -> Self {
+    ) -> ReplicatorLifecycleRegistration {
         let backend = Arc::new(ManagedLifecycleBackend {
             legacy: lifecycle,
             common: CustomReplicatorHost::new(host, control, primary, false),
             accepted_builds: RwLock::default(),
             topology_receipt: RwLock::default(),
         });
-        Self {
-            wiring: LifecycleWiring::new(backend),
-        }
+        Self::registration(LifecycleWiring::new(backend), true)
     }
 
     pub(super) fn service(
         host: Weak<RuntimeHost>,
         control: Arc<dyn Replicator>,
         primary: Arc<dyn PrimaryReplicator>,
-    ) -> Self {
+    ) -> ReplicatorLifecycleRegistration {
         let backend = Arc::new(CustomReplicatorHost::new(host, control, primary, true));
-        Self {
-            wiring: LifecycleWiring::new(backend),
+        Self::registration(LifecycleWiring::new(backend), false)
+    }
+
+    fn registration(wiring: LifecycleWiring, managed: bool) -> ReplicatorLifecycleRegistration {
+        let process = wiring.process_runtime();
+        let authority = wiring.authority_runtime();
+        let peer = wiring.peer_runtime();
+        let access_closure = wiring.access_closure();
+        let evidence = wiring.evidence_runtime();
+        let lifecycle = Arc::new(Self {
+            managed,
+            access: wiring.access,
+            build: wiring.build,
+            topology: wiring.topology,
+            observation: wiring.observation,
+            outbound: wiring.outbound,
+        });
+        ReplicatorLifecycleRegistration {
+            lifecycle,
+            process,
+            authority,
+            peer,
+            access_closure,
+            evidence,
         }
     }
 
-    pub(super) fn process_runtime(&self) -> super::lifecycle::ProcessRuntime {
-        self.wiring.process_runtime()
-    }
-
-    pub(super) fn authority_runtime(&self) -> super::lifecycle::AuthorityRuntime {
-        self.wiring.authority_runtime()
-    }
-
-    pub(super) fn peer_runtime(&self) -> super::lifecycle::PeerRuntime {
-        self.wiring.peer_runtime()
-    }
-
-    pub(super) fn access_closure(&self) -> super::lifecycle::AccessClosure {
-        self.wiring.access_closure()
-    }
-
     pub(super) fn is_managed(&self) -> bool {
-        self.wiring.process.owns_stream_session()
+        self.managed
     }
 
     pub(super) async fn restore_access(
@@ -1414,7 +1432,7 @@ impl ReplicatorLifecycleHost {
     ) -> Result<()> {
         match self.commit_access_transaction(read, write).await {
             Err(RuntimeError::ReconfigurationPending) => {
-                self.wiring.access.defer_restored_access(read, write).await;
+                self.access.defer_restored_access(read, write).await;
                 Err(RuntimeError::ReconfigurationPending)
             }
             result => result,
@@ -1422,11 +1440,11 @@ impl ReplicatorLifecycleHost {
     }
 
     pub(super) async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()> {
-        self.wiring.build.admit_build_authority(authority).await
+        self.build.admit_build_authority(authority).await
     }
 
     pub(super) async fn retire_build(&self, build_id: OperationId) -> Result<()> {
-        self.wiring.build.retire_build(build_id).await
+        self.build.retire_build(build_id).await
     }
 
     async fn commit_access_transaction(
@@ -1444,7 +1462,7 @@ impl ReplicatorLifecycleHost {
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<ReadyAccessTransaction> {
-        let access = self.wiring.access.clone();
+        let access = self.access.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (accept_tx, accept_rx) = oneshot::channel();
         let (accepted_tx, accepted_rx) = oneshot::channel();
@@ -1469,14 +1487,11 @@ impl ReplicatorLifecycleHost {
     }
 
     pub(super) async fn wait_for_catch_up(&self) -> Result<()> {
-        self.wiring.topology.wait_for_catch_up().await
+        self.topology.wait_for_catch_up().await
     }
 
     pub(super) async fn authorize_failover_prefix(&self, boundary: i64) -> Result<()> {
-        self.wiring
-            .topology
-            .authorize_failover_prefix(boundary)
-            .await
+        self.topology.authorize_failover_prefix(boundary).await
     }
 
     pub(super) async fn prepare_switchover(
@@ -1488,8 +1503,7 @@ impl ReplicatorLifecycleHost {
         starting_configuration_id: crate::protocol::types::ConfigurationId,
         starting_epoch: crate::protocol::types::Epoch,
     ) -> Result<()> {
-        self.wiring
-            .topology
+        self.topology
             .prepare_switchover(
                 preparation_generation,
                 request_id,
@@ -1502,12 +1516,12 @@ impl ReplicatorLifecycleHost {
     }
 
     pub(super) async fn refresh_progress(&self) -> Result<()> {
-        self.wiring.observation.refresh_progress().await
+        self.observation.refresh_progress().await
     }
 
     pub(super) async fn observe_progress(&self) -> Result<()> {
-        self.wiring.observation.observe_progress().await?;
-        if let Some((read, write)) = self.wiring.access.restored_access().await {
+        self.observation.observe_progress().await?;
+        if let Some((read, write)) = self.access.restored_access().await {
             self.commit_access_transaction(read, write).await?;
         }
         Ok(())
@@ -1519,8 +1533,7 @@ impl ReplicatorLifecycleHost {
         process_session_id: ProcessSessionId,
         report_sequence: u64,
     ) -> Result<()> {
-        self.wiring
-            .topology
+        self.topology
             .prepare_secondary_removal(intent, process_session_id, report_sequence)
             .await
     }
@@ -1529,10 +1542,7 @@ impl ReplicatorLifecycleHost {
         &self,
         witness: crate::protocol::types::SecondaryRemovalWitness,
     ) -> Result<()> {
-        self.wiring
-            .topology
-            .observe_secondary_removal(witness)
-            .await
+        self.topology.observe_secondary_removal(witness).await
     }
 
     pub(super) async fn observe_secondary_removal_progress(
@@ -1540,8 +1550,7 @@ impl ReplicatorLifecycleHost {
         witness: crate::protocol::types::SecondaryRemovalWitness,
         committed: crate::protocol::types::SecondaryScaleDownCleanup,
     ) -> Result<()> {
-        self.wiring
-            .topology
+        self.topology
             .observe_secondary_removal_progress(witness, committed)
             .await
     }
@@ -1550,18 +1559,14 @@ impl ReplicatorLifecycleHost {
         &self,
         committed: crate::protocol::types::SecondaryScaleDownCleanup,
     ) -> Result<()> {
-        self.wiring
-            .topology
-            .accept_secondary_removal(committed)
-            .await
+        self.topology.accept_secondary_removal(committed).await
     }
 
     pub(super) async fn accept_historical_secondary_removal(
         &self,
         command: crate::protocol::command::AcceptSecondaryRemovalCommit,
     ) -> Result<()> {
-        self.wiring
-            .topology
+        self.topology
             .accept_historical_secondary_removal(command)
             .await
     }
@@ -1570,23 +1575,23 @@ impl ReplicatorLifecycleHost {
         &self,
         retired: crate::authority::RetiredAuthority,
     ) -> Result<()> {
-        self.wiring.topology.fence_retirement(retired).await
+        self.topology.fence_retirement(retired).await
     }
 
     pub(super) async fn complete_retirement(
         &self,
         retired: crate::authority::RetiredAuthority,
     ) -> Result<()> {
-        self.wiring.topology.complete_retirement(retired).await
+        self.topology.complete_retirement(retired).await
     }
 
     pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.wiring.observation.snapshot().await
+        self.observation.snapshot().await
     }
 
     pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        let generation = self.wiring.build.build_generation(id).await;
-        let build = self.wiring.build.clone();
+        let generation = self.build.build_generation(id).await;
+        let build = self.build.clone();
         let id = id.clone();
         tokio::spawn(async move { build.cancel_outbound_build(&id, generation).await })
             .await
@@ -1599,18 +1604,17 @@ impl ReplicatorLifecycleHost {
         generation: u64,
         public_cleanup: bool,
     ) -> Result<()> {
-        self.wiring
-            .build
+        self.build
             .cancel_outbound_build_attempt(id, generation, public_cleanup)
             .await
     }
 
     pub(super) async fn build_generation(&self, id: &OperationId) -> u64 {
-        self.wiring.build.build_generation(id).await
+        self.build.build_generation(id).await
     }
 
     pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
-        self.wiring.outbound.next_outbound().await
+        self.outbound.next_outbound().await
     }
 
     pub(super) async fn wait_for_build_completion(
@@ -1618,15 +1622,12 @@ impl ReplicatorLifecycleHost {
         build_id: &OperationId,
         target: &ReplicaIdentity,
     ) -> Result<()> {
-        self.wiring
-            .build
-            .wait_for_build_completion(build_id, target)
-            .await
+        self.build.wait_for_build_completion(build_id, target).await
     }
 
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(super) async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.wiring.build.build_replica(replica).await
+        self.build.build_replica(replica).await
     }
 
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -1634,33 +1635,33 @@ impl ReplicatorLifecycleHost {
         &self,
         replica_id: crate::protocol::types::ReplicaId,
     ) -> Result<()> {
-        self.wiring.build.remove_replica(replica_id).await
+        self.build.remove_replica(replica_id).await
     }
 
     pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
-        self.wiring.build.select_build(authority).await
+        self.build.select_build(authority).await
     }
 
     pub(super) async fn execute_build(
         &self,
         replica: ReplicaInformation,
     ) -> Result<Option<BuildAdmission>> {
-        self.wiring.build.execute_build(replica).await
+        self.build.execute_build(replica).await
     }
 
     pub(super) async fn accept_build(&self, receipt: Option<BuildAdmission>) -> Result<()> {
-        self.wiring.build.accept_build(receipt).await
+        self.build.accept_build(receipt).await
     }
 
     pub(super) async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
-        self.wiring.build.enqueue_build(endpoint).await
+        self.build.enqueue_build(endpoint).await
     }
 
     pub(super) async fn topology_receipt(
         &self,
         action: &RuntimeEffectAction,
     ) -> Option<TopologyReceipt> {
-        self.wiring.topology.topology_receipt(action).await
+        self.topology.topology_receipt(action).await
     }
 
     pub(super) async fn confirm_build_completion(
@@ -1668,17 +1669,14 @@ impl ReplicatorLifecycleHost {
         build_id: &OperationId,
         target: &ReplicaIdentity,
     ) -> Result<BuildCompletionConfirmation> {
-        self.wiring
-            .build
-            .confirm_build_completion(build_id, target)
-            .await
+        self.build.confirm_build_completion(build_id, target).await
     }
 
     pub(super) async fn postcondition(
         &self,
         progress: Option<&NativeProgressStatus>,
     ) -> RuntimePostcondition {
-        self.wiring.observation.postcondition(progress).await
+        self.observation.postcondition(progress).await
     }
 }
 
