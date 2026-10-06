@@ -4362,6 +4362,7 @@ struct CustomRoleGate {
     fail: AtomicBool,
     grant_error: AtomicUsize,
     block_progress: AtomicBool,
+    block_grant_progress: AtomicBool,
     progress_entered: Notify,
     progress_released: Notify,
     native_access_granted: AtomicBool,
@@ -4424,6 +4425,10 @@ impl Replicator for CustomRoleGate {
             Some(partition) => partition.get_write_status().await? == AccessStatus::Granted,
             None => false,
         };
+        if grant_attempt && self.block_grant_progress.swap(false, Ordering::SeqCst) {
+            self.progress_entered.notify_one();
+            self.progress_released.notified().await;
+        }
         if grant_attempt {
             match self.grant_error.load(Ordering::SeqCst) {
                 1 => return Err(RuntimeError::ReconfigurationPending),
@@ -9079,7 +9084,7 @@ async fn prepared_access_effect_reconstructs_at_each_durable_cutpoint() {
         let reopened = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
         let recovered_control = Arc::new(CustomRoleGate::default());
         recovered_control
-            .block_progress
+            .block_grant_progress
             .store(true, Ordering::SeqCst);
         let recovered = Arc::new(PodRuntime::new(
             local,
@@ -9136,7 +9141,7 @@ async fn prepared_access_effect_reconstructs_at_each_durable_cutpoint() {
             assert!(!recovered.testing_has_applied_effect(5).await, "{suffix}");
             let before = recovered.snapshot().await;
             recovered_control
-                .block_progress
+                .block_grant_progress
                 .store(true, Ordering::SeqCst);
             let replay = timeout(
                 Duration::from_millis(100),
@@ -9152,7 +9157,7 @@ async fn prepared_access_effect_reconstructs_at_each_durable_cutpoint() {
             assert!(!recovered.testing_has_applied_effect(5).await, "{suffix}");
             assert!(
                 recovered_control
-                    .block_progress
+                    .block_grant_progress
                     .swap(false, Ordering::SeqCst),
                 "{suffix}: retained replay consumed the publication proof gate"
             );
