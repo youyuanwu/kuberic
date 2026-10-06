@@ -31,13 +31,16 @@ fn impl_name(item: &syn::ItemImpl) -> String {
     type_name(&item.self_ty).unwrap_or_else(|| "<unknown>".into())
 }
 
-fn transition_consumers(source: &str) -> Result<BTreeSet<String>, String> {
-    let file = syn::parse_file(source).map_err(|error| format!("parse consumers: {error}"))?;
-    let mut consumers = BTreeSet::new();
-    for item in &file.items {
+fn block_uses_transition_facade<T: ToTokens>(block: &T) -> bool {
+    let block = compact(block);
+    block.contains(".lifecycle()") || block.contains(".lifecycle.")
+}
+
+fn collect_transition_consumers(items: &[Item], module: &str, consumers: &mut BTreeSet<String>) {
+    for item in items {
         match item {
-            Item::Fn(function) if compact(&function.block).contains(".lifecycle()") => {
-                consumers.insert(format!("fn {}", function.sig.ident));
+            Item::Fn(function) if block_uses_transition_facade(&function.block) => {
+                consumers.insert(format!("{module}fn {}", function.sig.ident));
             }
             Item::Impl(item) => {
                 let owner = impl_name(item);
@@ -45,14 +48,29 @@ fn transition_consumers(source: &str) -> Result<BTreeSet<String>, String> {
                     let ImplItem::Fn(method) = implementation else {
                         continue;
                     };
-                    if compact(&method.block).contains(".lifecycle()") {
-                        consumers.insert(format!("{owner}::{}", method.sig.ident));
+                    if block_uses_transition_facade(&method.block) {
+                        consumers.insert(format!("{module}{owner}::{}", method.sig.ident));
                     }
+                }
+            }
+            Item::Mod(item) => {
+                if let Some((_, items)) = &item.content {
+                    collect_transition_consumers(
+                        items,
+                        &format!("{module}{}::", item.ident),
+                        consumers,
+                    );
                 }
             }
             _ => {}
         }
     }
+}
+
+fn transition_consumers(source: &str) -> Result<BTreeSet<String>, String> {
+    let file = syn::parse_file(source).map_err(|error| format!("parse consumers: {error}"))?;
+    let mut consumers = BTreeSet::new();
+    collect_transition_consumers(&file.items, "", &mut consumers);
     Ok(consumers)
 }
 
@@ -100,6 +118,96 @@ fn reject_broad_aliases(file: &syn::File) -> Result<(), String> {
     Ok(())
 }
 
+fn reject_local_broad_aliases(source: &str) -> Result<(), String> {
+    let compact = source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    for forbidden in [
+        "LifecycleWiring",
+        "ReplicatorLifecycleHost",
+        "RuntimeHost",
+        "PodRuntime",
+        "ManagedLifecycleBackend",
+        "CustomReplicatorHost",
+    ] {
+        let needle = format!("={forbidden}");
+        let mut rest = compact.as_str();
+        while let Some(index) = rest.find(&needle) {
+            let prefix = &rest[..index];
+            let boundary = prefix
+                .rfind(|character| matches!(character, ';' | '{' | '}'))
+                .map_or(0, |boundary| boundary + 1);
+            if prefix[boundary..].starts_with("type") {
+                return Err(format!("broad local lifecycle alias targets {forbidden}"));
+            }
+            rest = &rest[index + needle.len()..];
+        }
+    }
+    Ok(())
+}
+
+fn impl_methods(file: &syn::File, name: &str) -> Option<BTreeSet<String>> {
+    for item in &file.items {
+        let Item::Impl(item) = item else {
+            continue;
+        };
+        if item.trait_.is_some() || type_name(&item.self_ty).as_deref() != Some(name) {
+            continue;
+        }
+        return Some(
+            item.items
+                .iter()
+                .filter_map(|item| match item {
+                    ImplItem::Fn(method) => Some(method.sig.ident.to_string()),
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
+fn impl_method<'a>(file: &'a syn::File, owner: &str, method: &str) -> Option<&'a syn::ImplItemFn> {
+    for item in &file.items {
+        let Item::Impl(item) = item else {
+            continue;
+        };
+        if item.trait_.is_some() || type_name(&item.self_ty).as_deref() != Some(owner) {
+            continue;
+        }
+        for implementation in &item.items {
+            let ImplItem::Fn(implementation) = implementation else {
+                continue;
+            };
+            if implementation.sig.ident == method {
+                return Some(implementation);
+            }
+        }
+    }
+    None
+}
+
+fn assert_shape(
+    file: &syn::File,
+    name: &str,
+    expected_fields: &[(&str, &str)],
+    expected_methods: &[&str],
+) -> Result<(), String> {
+    let expected_fields = expected_fields
+        .iter()
+        .map(|(field, ty)| ((*field).to_owned(), (*ty).to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    if struct_fields(file, name).as_ref() != Some(&expected_fields) {
+        return Err(format!("{name} field budget changed"));
+    }
+    let expected_methods = names(expected_methods);
+    if impl_methods(file, name).as_ref() != Some(&expected_methods) {
+        return Err(format!("{name} method budget changed"));
+    }
+    Ok(())
+}
+
 fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> {
     for source in [lifecycle, custom, hosting] {
         if source.contains("ReplicatorLifecycleBackend") {
@@ -109,6 +217,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
 
     let lifecycle_file =
         syn::parse_file(lifecycle).map_err(|error| format!("parse lifecycle: {error}"))?;
+    reject_local_broad_aliases(lifecycle)?;
     let expected_traits = BTreeMap::from([
         (
             "ProcessLifecycle",
@@ -190,7 +299,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     .map(|(name, methods)| (name.to_owned(), methods))
     .collect::<BTreeMap<_, _>>();
     let mut actual_traits = BTreeMap::new();
-    let mut fixture_methods = BTreeSet::new();
+    let mut fixture_methods = BTreeMap::new();
     for item in &lifecycle_file.items {
         let Item::Trait(item) = item else {
             continue;
@@ -216,7 +325,13 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
                         .iter()
                         .any(|attribute| attribute.path().is_ident("cfg"))
                     {
-                        fixture_methods.insert(method.sig.ident.to_string());
+                        let cfg = method
+                            .attrs
+                            .iter()
+                            .find(|attribute| attribute.path().is_ident("cfg"))
+                            .map(compact)
+                            .unwrap();
+                        fixture_methods.insert(method.sig.ident.to_string(), cfg);
                     }
                     Some(method.sig.ident.to_string())
                 }
@@ -230,21 +345,89 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "capability method budgets changed: {actual_traits:#?}"
         ));
     }
-    if fixture_methods
-        != names(&[
-            "invalidate_public_access",
-            "build_replica",
-            "remove_replica",
-        ])
-    {
+    let fixture_cfg = "#[cfg(any(all(test,kuberic_workspace_tests),feature=\"testing\"))]";
+    let expected_fixture_methods = BTreeMap::from([
+        ("build_replica".to_owned(), fixture_cfg.to_owned()),
+        (
+            "invalidate_public_access".to_owned(),
+            fixture_cfg.to_owned(),
+        ),
+        ("remove_replica".to_owned(), fixture_cfg.to_owned()),
+    ]);
+    if fixture_methods != expected_fixture_methods {
         return Err(format!(
             "fixture-gated capability methods changed: {fixture_methods:#?}"
         ));
     }
     reject_broad_aliases(&lifecycle_file)?;
+    assert_shape(
+        &lifecycle_file,
+        "LifecycleWiring",
+        &[
+            ("process", "Arc<dynProcessLifecycle>"),
+            ("authority", "Arc<dynAuthorityLifecycle>"),
+            ("access", "Arc<dynAccessLifecycle>"),
+            ("build", "Arc<dynBuildLifecycle>"),
+            ("topology", "Arc<dynTopologyLifecycle>"),
+            ("observation", "Arc<dynLifecycleObservation>"),
+            ("outbound", "Arc<dynOutboundLifecycle>"),
+        ],
+        &[
+            "new",
+            "process_runtime",
+            "authority_runtime",
+            "peer_runtime",
+            "access_closure",
+            "evidence_runtime",
+        ],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "ProcessRuntime",
+        &[("inner", "Arc<dynProcessLifecycle>")],
+        &[
+            "owns_stream_session",
+            "complete_open",
+            "complete_close",
+            "complete_abort",
+            "notify_abort",
+            "fence_writes",
+            "invalidate_public_access",
+            "settle_primary_prefix",
+        ],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "AuthorityRuntime",
+        &[("inner", "Arc<dynAuthorityLifecycle>")],
+        &[
+            "cancel_configuration_work",
+            "restore_authority",
+            "admit_authority",
+        ],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "PeerRuntime",
+        &[("inner", "Arc<dynAuthorityLifecycle>")],
+        &["register_peer_session", "describe_peer"],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "AccessClosure",
+        &[("inner", "Arc<dynAccessLifecycle>")],
+        &["set_access"],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "EvidenceRuntime",
+        &[("inner", "Arc<dynLifecycleObservation>")],
+        &["snapshot"],
+    )?;
 
     let custom_file =
         syn::parse_file(custom).map_err(|error| format!("parse custom host: {error}"))?;
+    reject_local_broad_aliases(custom)?;
     reject_broad_aliases(&custom_file)?;
     let expected_facade = names(&[
         "managed",
@@ -331,6 +514,37 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     {
         return Err("transition facade retains unapproved capabilities".into());
     }
+    let expected_registration_fields = BTreeMap::from([
+        (
+            "lifecycle".to_owned(),
+            "Arc<ReplicatorLifecycleHost>".to_owned(),
+        ),
+        (
+            "process".to_owned(),
+            "super::lifecycle::ProcessRuntime".to_owned(),
+        ),
+        (
+            "authority".to_owned(),
+            "super::lifecycle::AuthorityRuntime".to_owned(),
+        ),
+        (
+            "peer".to_owned(),
+            "super::lifecycle::PeerRuntime".to_owned(),
+        ),
+        (
+            "access_closure".to_owned(),
+            "super::lifecycle::AccessClosure".to_owned(),
+        ),
+        (
+            "evidence".to_owned(),
+            "super::lifecycle::EvidenceRuntime".to_owned(),
+        ),
+    ]);
+    if struct_fields(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
+        != Some(&expected_registration_fields)
+    {
+        return Err("lifecycle registration retained complete wiring".into());
+    }
     let expected_queue_fields = BTreeMap::from([
         ("generation".to_owned(), "u64".to_owned()),
         (
@@ -345,24 +559,61 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     if struct_fields(&custom_file, "BuildQueueAdmission").as_ref() != Some(&expected_queue_fields) {
         return Err("build queue cancellation capture changed".into());
     }
+    let queue_cancellation = impl_method(&custom_file, "BuildQueueAdmission", "new")
+        .ok_or_else(|| "BuildQueueAdmission::new missing".to_owned())?;
+    if !compact(&queue_cancellation.sig).contains("host:Weak<RuntimeHost>") {
+        return Err("build queue cancellation no longer receives a weak host".into());
+    }
 
     let hosting_file =
         syn::parse_file(hosting).map_err(|error| format!("parse hosting: {error}"))?;
+    reject_local_broad_aliases(hosting)?;
     reject_broad_aliases(&hosting_file)?;
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
-    for (field, expected_type) in [
-        ("process_lifecycle", "Option<lifecycle::ProcessRuntime>"),
-        ("authority_lifecycle", "Option<lifecycle::AuthorityRuntime>"),
-        ("peer_lifecycle", "Option<lifecycle::PeerRuntime>"),
-        ("access_closure", "Option<lifecycle::AccessClosure>"),
-        ("lifecycle_evidence", "Option<lifecycle::EvidenceRuntime>"),
-    ] {
-        if registered_fields.get(field).map(String::as_str) != Some(expected_type) {
-            return Err(format!(
-                "registered lifecycle field {field} missing or changed: {registered_fields:#?}"
-            ));
-        }
+    let expected_registered_fields = BTreeMap::from([
+        ("control".to_owned(), "Arc<dynReplicator>".to_owned()),
+        (
+            "primary".to_owned(),
+            "Option<Arc<dynPrimaryReplicator>>".to_owned(),
+        ),
+        (
+            "provider".to_owned(),
+            "Option<Arc<dynStateProvider>>".to_owned(),
+        ),
+        (
+            "lifecycle".to_owned(),
+            "Option<Arc<custom::ReplicatorLifecycleHost>>".to_owned(),
+        ),
+        (
+            "process_lifecycle".to_owned(),
+            "Option<lifecycle::ProcessRuntime>".to_owned(),
+        ),
+        (
+            "authority_lifecycle".to_owned(),
+            "Option<lifecycle::AuthorityRuntime>".to_owned(),
+        ),
+        (
+            "peer_lifecycle".to_owned(),
+            "Option<lifecycle::PeerRuntime>".to_owned(),
+        ),
+        (
+            "access_closure".to_owned(),
+            "Option<lifecycle::AccessClosure>".to_owned(),
+        ),
+        (
+            "lifecycle_evidence".to_owned(),
+            "Option<lifecycle::EvidenceRuntime>".to_owned(),
+        ),
+        (
+            "managed_data_plane".to_owned(),
+            "Option<Arc<dynManagedReplicatorDataPlane>>".to_owned(),
+        ),
+    ]);
+    if registered_fields != expected_registered_fields {
+        return Err(format!(
+            "registered lifecycle field inventory changed: {registered_fields:#?}"
+        ));
     }
     let expected_cancellation_fields = BTreeMap::from([
         (
@@ -379,6 +630,15 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     {
         return Err("exact build cancellation capture changed".into());
     }
+    let exact_cancellation = impl_method(&hosting_file, "ExactBuildCancellation", "new")
+        .ok_or_else(|| "ExactBuildCancellation::new missing".to_owned())?;
+    let cancellation_body = compact(&exact_cancellation.block);
+    if cancellation_body.matches("Arc::downgrade(host)").count() != 1
+        || cancellation_body.contains("Arc::clone(host)")
+        || cancellation_body.contains("host.clone()")
+    {
+        return Err("exact build cancellation captured a broad host owner".into());
+    }
 
     let actual_consumers = transition_consumers(hosting)?
         .into_iter()
@@ -387,6 +647,8 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     let expected_consumers = names(&[
         "BuildQueueAdmission::new",
         "ExactBuildCancellation::new",
+        "HostedPrimaryReplicator::build_replica",
+        "HostedPrimaryReplicator::remove_replica",
         "PodRuntime::authorize_build",
         "PodRuntime::build_generation",
         "PodRuntime::cancel_outbound_build",
@@ -402,6 +664,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "PodRuntime::restore_accepted_removal",
         "PodRuntime::testing_wait_for_catch_up",
         "PodRuntime::wait_for_build_completion",
+        "RegisteredReplicator::lifecycle",
         "RuntimeDataPlane::next_outbound",
         "RuntimeHost::consume_cancelled_build_effect",
         "RuntimeHost::lifecycle",
@@ -492,4 +755,52 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "impl PodRuntime {\n    async fn leaked_lifecycle(&self) { let _ = self.host.lifecycle(); }\n",
     );
     assert!(validate(&lifecycle, &custom, &new_facade_consumer).is_err());
+
+    let universal_view_getter = lifecycle.replace(
+        "impl ProcessRuntime {\n",
+        "impl ProcessRuntime {\n    fn build_capability(&self) -> Arc<dyn BuildLifecycle> { unreachable!() }\n",
+    );
+    assert!(validate(&universal_view_getter, &custom, &hosting).is_err());
+
+    let broad_view_field = lifecycle.replace(
+        "pub(super) struct ProcessRuntime {\n",
+        "pub(super) struct ProcessRuntime {\n    build: Arc<dyn BuildLifecycle>,\n",
+    );
+    assert!(validate(&broad_view_field, &custom, &hosting).is_err());
+
+    let local_alias = lifecycle.replace(
+        "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n",
+        "    pub(super) async fn set_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {\n        type AllCapabilities = LifecycleWiring;\n",
+    );
+    assert!(validate(&local_alias, &custom, &hosting).is_err());
+
+    let always_enabled_fixture = lifecycle.replacen(
+        "#[cfg(any(all(test, kuberic_workspace_tests), feature = \"testing\"))]",
+        "#[cfg(all())]",
+        1,
+    );
+    assert!(validate(&always_enabled_fixture, &custom, &hosting).is_err());
+
+    let nested_consumer = format!(
+        "{hosting}\nmod leaked {{ async fn consume(host: &RuntimeHost) {{ let _ = host.lifecycle(); }} }}\n"
+    );
+    assert!(validate(&lifecycle, &custom, &nested_consumer).is_err());
+
+    let direct_field_consumer = hosting.replace(
+        "impl PodRuntime {\n",
+        "impl PodRuntime {\n    async fn leaked_field(&self) { let registered = self.host.registered.get().unwrap(); let _ = registered.lifecycle.snapshot().await; }\n",
+    );
+    assert!(validate(&lifecycle, &custom, &direct_field_consumer).is_err());
+
+    let broad_closure_capture = hosting.replace(
+        "        let host = Arc::downgrade(host);\n",
+        "        let broad_host = host.clone();\n        let host = Arc::downgrade(host);\n",
+    );
+    assert!(validate(&lifecycle, &custom, &broad_closure_capture).is_err());
+
+    let retained_wiring = custom.replace(
+        "pub(super) struct ReplicatorLifecycleRegistration {\n",
+        "pub(super) struct ReplicatorLifecycleRegistration {\n    pub(super) wiring: LifecycleWiring,\n",
+    );
+    assert!(validate(&lifecycle, &retained_wiring, &hosting).is_err());
 }
