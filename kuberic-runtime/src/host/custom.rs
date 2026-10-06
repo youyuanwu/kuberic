@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 
 use super::lifecycle::{
-    AccessLifecycle, AuthorityLifecycle, BuildLifecycle, LifecycleObservation, LifecycleWiring,
-    OutboundLifecycle, ProcessLifecycle, TopologyLifecycle,
+    AccessLifecycle, AuthorityLifecycle, BuildCancellation, BuildLifecycle, LifecycleObservation,
+    LifecycleWiring, OutboundLifecycle, ProcessLifecycle, TopologyLifecycle,
 };
 use super::{AppliedEffect, RuntimeHost, empty_snapshot};
 #[path = "custom_removal.rs"]
@@ -112,7 +112,7 @@ pub(super) struct BuildCompletionConfirmation {
 }
 
 impl BuildQueueAdmission {
-    fn new(build: Weak<dyn BuildLifecycle>, build_id: OperationId, generation: u64) -> Self {
+    fn new(build: Weak<dyn BuildCancellation>, build_id: OperationId, generation: u64) -> Self {
         let (decision, completion) = oneshot::channel();
         let completion = tokio::spawn(async move {
             if completion.await != Ok(true)
@@ -521,53 +521,6 @@ impl BuildLifecycle for ManagedLifecycleBackend {
         Ok(())
     }
 
-    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()> {
-        let _cleanup = self.common.build_cleanup_lock(id).await;
-        if !self
-            .common
-            .cancel_common_build_attempt(id, generation)
-            .await?
-        {
-            return Ok(());
-        }
-        self.accepted_builds.write().await.remove(id);
-        let result = self.legacy.cancel_outbound_build(id).await;
-        if cleanup_releases_claim(&result) {
-            self.common
-                .complete_common_build_cancellation(id, generation)
-                .await;
-        }
-        result
-    }
-
-    async fn cancel_outbound_build_attempt(
-        &self,
-        id: &OperationId,
-        generation: u64,
-        _public_cleanup: bool,
-    ) -> Result<()> {
-        let _cleanup = self.common.build_cleanup_lock(id).await;
-        if !self
-            .common
-            .cancel_common_build_attempt(id, generation)
-            .await?
-        {
-            return Ok(());
-        }
-        self.accepted_builds.write().await.remove(id);
-        let result = self.legacy.cancel_outbound_build(id).await;
-        if cleanup_releases_claim(&result) {
-            self.common
-                .complete_common_build_cancellation(id, generation)
-                .await;
-        }
-        result
-    }
-
-    async fn build_generation(&self, id: &OperationId) -> u64 {
-        self.common.build_generation(id).await
-    }
-
     async fn wait_for_build_completion(
         &self,
         build_id: &OperationId,
@@ -734,6 +687,56 @@ impl BuildLifecycle for ManagedLifecycleBackend {
             postcondition,
             _native: Some(native_guard),
         })
+    }
+}
+
+#[async_trait]
+impl BuildCancellation for ManagedLifecycleBackend {
+    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()> {
+        let _cleanup = self.common.build_cleanup_lock(id).await;
+        if !self
+            .common
+            .cancel_common_build_attempt(id, generation)
+            .await?
+        {
+            return Ok(());
+        }
+        self.accepted_builds.write().await.remove(id);
+        let result = self.legacy.cancel_outbound_build(id).await;
+        if cleanup_releases_claim(&result) {
+            self.common
+                .complete_common_build_cancellation(id, generation)
+                .await;
+        }
+        result
+    }
+
+    async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        _public_cleanup: bool,
+    ) -> Result<()> {
+        let _cleanup = self.common.build_cleanup_lock(id).await;
+        if !self
+            .common
+            .cancel_common_build_attempt(id, generation)
+            .await?
+        {
+            return Ok(());
+        }
+        self.accepted_builds.write().await.remove(id);
+        let result = self.legacy.cancel_outbound_build(id).await;
+        if cleanup_releases_claim(&result) {
+            self.common
+                .complete_common_build_cancellation(id, generation)
+                .await;
+        }
+        result
+    }
+
+    async fn build_generation(&self, id: &OperationId) -> u64 {
+        self.common.build_generation(id).await
     }
 }
 
@@ -1371,6 +1374,7 @@ pub(super) struct ReplicatorLifecycleRegistration {
     pub(super) build: super::lifecycle::BuildLifecycleRuntime,
     pub(super) build_cancellation: super::lifecycle::BuildCancellationRuntime,
     pub(super) outbound: super::lifecycle::OutboundLifecycleRuntime,
+    pub(super) removal_witness: super::lifecycle::RemovalWitnessRuntime,
 }
 
 impl ReplicatorLifecycleHost {
@@ -1387,7 +1391,7 @@ impl ReplicatorLifecycleHost {
             accepted_builds: RwLock::default(),
             topology_receipt: RwLock::default(),
         });
-        let build: Arc<dyn BuildLifecycle> = backend.clone();
+        let build: Arc<dyn BuildCancellation> = backend.clone();
         common.bind_build_cancellation(Arc::downgrade(&build));
         Self::registration(LifecycleWiring::new(backend), true)
     }
@@ -1398,7 +1402,7 @@ impl ReplicatorLifecycleHost {
         primary: Arc<dyn PrimaryReplicator>,
     ) -> ReplicatorLifecycleRegistration {
         let backend = Arc::new(CustomReplicatorHost::new(host, control, primary, true));
-        let build: Arc<dyn BuildLifecycle> = backend.clone();
+        let build: Arc<dyn BuildCancellation> = backend.clone();
         backend.bind_build_cancellation(Arc::downgrade(&build));
         Self::registration(LifecycleWiring::new(backend), false)
     }
@@ -1415,6 +1419,7 @@ impl ReplicatorLifecycleHost {
         let build = wiring.build_runtime(managed);
         let build_cancellation = wiring.build_cancellation();
         let outbound = wiring.outbound_runtime();
+        let removal_witness = wiring.removal_witness_runtime();
         let lifecycle = Arc::new(Self {
             topology: wiring.topology,
             observation: wiring.observation,
@@ -1432,6 +1437,7 @@ impl ReplicatorLifecycleHost {
             build,
             build_cancellation,
             outbound,
+            removal_witness,
         }
     }
 
@@ -1549,7 +1555,7 @@ pub(super) struct CustomReplicatorHost {
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     cancelling_builds: RwLock<BTreeMap<OperationId, u64>>,
     build_cleanup_locks: Mutex<BTreeMap<OperationId, Arc<Mutex<()>>>>,
-    build_cancellation: OnceLock<Weak<dyn BuildLifecycle>>,
+    build_cancellation: OnceLock<Weak<dyn BuildCancellation>>,
     pending_builds: RwLock<BTreeMap<OperationId, ReplicaEndpoint>>,
     receipts: RwLock<BTreeMap<OperationId, BuildAdmission>>,
     configuration: Arc<RwLock<Option<ReplicaSetConfiguration>>>,
@@ -1619,7 +1625,7 @@ impl CustomReplicatorHost {
         }
     }
 
-    fn bind_build_cancellation(&self, build: Weak<dyn BuildLifecycle>) {
+    fn bind_build_cancellation(&self, build: Weak<dyn BuildCancellation>) {
         self.build_cancellation
             .set(build)
             .expect("build cancellation owner is bound once");
@@ -4024,47 +4030,6 @@ impl BuildLifecycle for CustomReplicatorHost {
             .await
     }
 
-    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()> {
-        CustomReplicatorHost::cancel_outbound_build(self, id, generation).await
-    }
-
-    async fn cancel_outbound_build_attempt(
-        &self,
-        id: &OperationId,
-        generation: u64,
-        public_cleanup: bool,
-    ) -> Result<()> {
-        let _cleanup = self.build_cleanup_lock(id).await;
-        if !self.cancel_common_build_attempt(id, generation).await? {
-            return Ok(());
-        }
-        let result = async {
-            if public_cleanup {
-                let _gate = self.gate.lock().await;
-                if let Some(build) = self
-                    .host()?
-                    .default_dependencies
-                    .build_authority_store
-                    .load_build(id)
-                    .await?
-                {
-                    self.primary.remove_replica(build.target.replica_id).await?;
-                }
-            }
-            self.configure().await
-        }
-        .await;
-        if cleanup_releases_claim(&result) {
-            self.complete_common_build_cancellation(id, generation)
-                .await;
-        }
-        result
-    }
-
-    async fn build_generation(&self, id: &OperationId) -> u64 {
-        CustomReplicatorHost::build_generation(self, id).await
-    }
-
     async fn wait_for_build_completion(
         &self,
         build_id: &OperationId,
@@ -4182,6 +4147,50 @@ impl BuildLifecycle for CustomReplicatorHost {
             postcondition: self.narrow_postcondition().await,
             _native: None,
         })
+    }
+}
+
+#[async_trait]
+impl BuildCancellation for CustomReplicatorHost {
+    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()> {
+        CustomReplicatorHost::cancel_outbound_build(self, id, generation).await
+    }
+
+    async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()> {
+        let _cleanup = self.build_cleanup_lock(id).await;
+        if !self.cancel_common_build_attempt(id, generation).await? {
+            return Ok(());
+        }
+        let result = async {
+            if public_cleanup {
+                let _gate = self.gate.lock().await;
+                if let Some(build) = self
+                    .host()?
+                    .default_dependencies
+                    .build_authority_store
+                    .load_build(id)
+                    .await?
+                {
+                    self.primary.remove_replica(build.target.replica_id).await?;
+                }
+            }
+            self.configure().await
+        }
+        .await;
+        if cleanup_releases_claim(&result) {
+            self.complete_common_build_cancellation(id, generation)
+                .await;
+        }
+        result
+    }
+
+    async fn build_generation(&self, id: &OperationId) -> u64 {
+        CustomReplicatorHost::build_generation(self, id).await
     }
 }
 

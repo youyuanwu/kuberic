@@ -197,6 +197,71 @@ fn assert_shape(
     Ok(())
 }
 
+fn reject_capability_escape_paths(
+    file: &syn::File,
+    traits: &[&str],
+    views: &[&str],
+) -> Result<(), String> {
+    const FORBIDDEN: &[&str] = &[
+        "LifecycleWiring",
+        "ReplicatorLifecycleHost",
+        "RegisteredReplicator",
+        "RuntimeHost",
+        "PodRuntime",
+    ];
+    for item in &file.items {
+        match item {
+            Item::Trait(item) if traits.contains(&item.ident.to_string().as_str()) => {
+                for method in &item.items {
+                    let TraitItem::Fn(method) = method else {
+                        continue;
+                    };
+                    let signature = compact(&method.sig);
+                    if FORBIDDEN
+                        .iter()
+                        .any(|forbidden| signature.contains(forbidden))
+                    {
+                        return Err(format!(
+                            "{}::{} exposes a broad type",
+                            item.ident, method.sig.ident
+                        ));
+                    }
+                }
+            }
+            Item::Impl(item)
+                if type_name(&item.self_ty)
+                    .as_deref()
+                    .is_some_and(|name| views.contains(&name)) =>
+            {
+                if item.trait_.is_some() {
+                    return Err(format!(
+                        "{} implements an unapproved conversion trait",
+                        impl_name(item)
+                    ));
+                }
+                for method in &item.items {
+                    let ImplItem::Fn(method) = method else {
+                        continue;
+                    };
+                    let signature = compact(&method.sig);
+                    if FORBIDDEN
+                        .iter()
+                        .any(|forbidden| signature.contains(forbidden))
+                    {
+                        return Err(format!(
+                            "{}::{} exposes a broad type",
+                            impl_name(item),
+                            method.sig.ident
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> {
     for source in [lifecycle, custom, hosting] {
         if source.contains("ReplicatorLifecycleBackend") {
@@ -243,9 +308,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             names(&[
                 "admit_build_authority",
                 "retire_build",
-                "cancel_outbound_build",
-                "cancel_outbound_build_attempt",
-                "build_generation",
                 "wait_for_build_completion",
                 "build_replica",
                 "remove_replica",
@@ -254,6 +316,14 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
                 "accept_build",
                 "enqueue_build",
                 "confirm_build_completion",
+            ]),
+        ),
+        (
+            "BuildCancellation",
+            names(&[
+                "cancel_outbound_build",
+                "cancel_outbound_build_attempt",
+                "build_generation",
             ]),
         ),
         (
@@ -356,6 +426,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             ("authority", "Arc<dynAuthorityLifecycle>"),
             ("access", "Arc<dynAccessLifecycle>"),
             ("build", "Arc<dynBuildLifecycle>"),
+            ("build_cancellation", "Arc<dynBuildCancellation>"),
             ("topology", "Arc<dynTopologyLifecycle>"),
             ("observation", "Arc<dynLifecycleObservation>"),
             ("outbound", "Arc<dynOutboundLifecycle>"),
@@ -373,6 +444,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "build_runtime",
             "build_cancellation",
             "outbound_runtime",
+            "removal_witness_runtime",
         ],
     )?;
     assert_shape(
@@ -442,7 +514,11 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     assert_shape(
         &lifecycle_file,
         "BuildLifecycleRuntime",
-        &[("inner", "Arc<dynBuildLifecycle>"), ("managed", "bool")],
+        &[
+            ("inner", "Arc<dynBuildLifecycle>"),
+            ("cancellation", "Arc<dynBuildCancellation>"),
+            ("managed", "bool"),
+        ],
         &[
             "is_managed",
             "admit_authority",
@@ -461,7 +537,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     assert_shape(
         &lifecycle_file,
         "BuildCancellationRuntime",
-        &[("inner", "Arc<dynBuildLifecycle>")],
+        &[("inner", "Arc<dynBuildCancellation>")],
         &["generation", "cancel_attempt"],
     )?;
     assert_shape(
@@ -469,6 +545,39 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "OutboundLifecycleRuntime",
         &[("inner", "Arc<dynOutboundLifecycle>")],
         &["next"],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "RemovalWitnessRuntime",
+        &[("inner", "Arc<dynTopologyLifecycle>")],
+        &["observe"],
+    )?;
+    reject_capability_escape_paths(
+        &lifecycle_file,
+        &[
+            "ProcessLifecycle",
+            "AuthorityLifecycle",
+            "AccessLifecycle",
+            "BuildLifecycle",
+            "BuildCancellation",
+            "TopologyLifecycle",
+            "LifecycleObservation",
+            "OutboundLifecycle",
+        ],
+        &[
+            "ProcessRuntime",
+            "AuthorityRuntime",
+            "PeerRuntime",
+            "AccessClosure",
+            "AccessRuntime",
+            "ReportLifecycle",
+            "EvidenceRuntime",
+            "EffectEvidenceRuntime",
+            "BuildLifecycleRuntime",
+            "BuildCancellationRuntime",
+            "OutboundLifecycleRuntime",
+            "RemovalWitnessRuntime",
+        ],
     )?;
 
     let custom_file =
@@ -561,6 +670,10 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "outbound".to_owned(),
             "super::lifecycle::OutboundLifecycleRuntime".to_owned(),
         ),
+        (
+            "removal_witness".to_owned(),
+            "super::lifecycle::RemovalWitnessRuntime".to_owned(),
+        ),
     ]);
     if struct_fields(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
         != Some(&expected_registration_fields)
@@ -583,7 +696,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     }
     let queue_cancellation = impl_method(&custom_file, "BuildQueueAdmission", "new")
         .ok_or_else(|| "BuildQueueAdmission::new missing".to_owned())?;
-    if !compact(&queue_cancellation.sig).contains("build:Weak<dynBuildLifecycle>") {
+    if !compact(&queue_cancellation.sig).contains("build:Weak<dynBuildCancellation>") {
         return Err("build queue cancellation no longer receives a weak build owner".into());
     }
 
@@ -635,8 +748,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             names(&[
                 "is_managed",
                 "describe_peer",
-                "generation",
-                "cancel_attempt",
                 "snapshot",
                 "register_peer_session",
                 "authorize_build",
@@ -647,6 +758,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
                 "accept_acknowledgement",
             ]),
         ),
+        ("BuildAttemptHost", names(&["generation", "cancel_attempt"])),
         (
             "PeerDiscoveryHost",
             names(&[
@@ -682,11 +794,14 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     assert_shape(
         &hosting_file,
         "BuildRuntime",
-        &[("inner", "Arc<dynBuildHost>")],
+        &[
+            ("inner", "Arc<dynBuildHost>"),
+            ("cancellation", "BuildAttemptRuntime"),
+        ],
         &[
             "describe_peer",
             "generation",
-            "cancel_attempt",
+            "cancellation",
             "snapshot",
             "register_peer_session",
             "authorize_build",
@@ -695,6 +810,12 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "accept_acknowledgement",
             "execute_admitted_build",
         ],
+    )?;
+    assert_shape(
+        &hosting_file,
+        "BuildAttemptRuntime",
+        &[("inner", "Arc<dynBuildAttemptHost>")],
+        &["generation", "cancel_attempt"],
     )?;
     assert_shape(
         &hosting_file,
@@ -725,6 +846,23 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "OutboundRuntime",
         &[("inner", "Arc<dynOutboundHost>")],
         &["next_outbound", "snapshot"],
+    )?;
+    reject_capability_escape_paths(
+        &hosting_file,
+        &[
+            "ReportHost",
+            "BuildHost",
+            "BuildAttemptHost",
+            "PeerDiscoveryHost",
+            "OutboundHost",
+        ],
+        &[
+            "ReportRuntime",
+            "BuildRuntime",
+            "BuildAttemptRuntime",
+            "PeerDiscoveryRuntime",
+            "OutboundRuntime",
+        ],
     )?;
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
@@ -787,6 +925,10 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "Option<lifecycle::OutboundLifecycleRuntime>".to_owned(),
         ),
         (
+            "removal_witness".to_owned(),
+            "Option<lifecycle::RemovalWitnessRuntime>".to_owned(),
+        ),
+        (
             "managed_data_plane".to_owned(),
             "Option<Arc<dynManagedReplicatorDataPlane>>".to_owned(),
         ),
@@ -816,7 +958,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "PodRuntime::testing_wait_for_catch_up",
         "RegisteredReplicator::lifecycle",
         "RuntimeHost::lifecycle",
-        "RuntimeHost::observe_secondary_removal_witness",
         "RuntimeHost::prepare_effect",
         "RuntimeHost::register_interfaces",
         "RuntimeHost::snapshot",
@@ -855,7 +996,27 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
     );
     let dispatch_cancellation =
         impl_method(&transport_file, "BuildDispatchCancellation", "new").unwrap();
-    assert!(compact(&dispatch_cancellation.sig).contains("runtime:BuildRuntime"));
+    assert!(compact(&dispatch_cancellation.sig).contains("runtime:BuildAttemptRuntime"));
+    let peer_reporter = transport_file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Trait(item) if item.ident == "PeerReporter" => Some(item),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        peer_reporter
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TraitItem::Fn(method) => Some(method.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>(),
+        names(&["peer_report"])
+    );
+    assert!(transport.contains("dispatcher: Arc<dyn PeerReporter>"));
     assert_eq!(
         transport.matches("PodRuntime").count(),
         2,
@@ -965,8 +1126,8 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     assert!(validate(&lifecycle, &custom, &direct_field_consumer).is_err());
 
     let broad_closure_capture = hosting.replace(
-        "    fn new(runtime: BuildRuntime, build_id: OperationId, generation: u64) -> Self {\n",
-        "    fn new(runtime: BuildRuntime, build_id: OperationId, generation: u64) -> Self {\n        let broad_host: Option<Arc<RuntimeHost>> = None;\n",
+        "    fn new(runtime: BuildAttemptRuntime, build_id: OperationId, generation: u64) -> Self {\n",
+        "    fn new(runtime: BuildAttemptRuntime, build_id: OperationId, generation: u64) -> Self {\n        let broad_host: Option<Arc<RuntimeHost>> = None;\n",
     );
     assert!(validate(&lifecycle, &custom, &broad_closure_capture).is_err());
 
@@ -992,4 +1153,15 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "impl PodRuntime {\n    fn leaked_field(&self) { let registered = self.host.registered.get().unwrap(); let _borrowed = &registered.lifecycle; }\n",
     );
     assert!(validate(&lifecycle, &custom, &borrowed_facade_field).is_err());
+
+    let build_deref = format!(
+        "{hosting}\nimpl std::ops::Deref for BuildRuntime {{ type Target = PodRuntime; fn deref(&self) -> &Self::Target {{ unreachable!() }} }}\n"
+    );
+    assert!(validate(&lifecycle, &custom, &build_deref).is_err());
+
+    let broad_peer_signature = hosting.replace(
+        "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {\n        self.inner.snapshot().await\n    }\n",
+        "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> Arc<RuntimeHost> { unreachable!() }\n",
+    );
+    assert!(validate(&lifecycle, &custom, &broad_peer_signature).is_err());
 }

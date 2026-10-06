@@ -66,14 +66,6 @@ pub(super) trait AccessLifecycle: Send + Sync {
 pub(super) trait BuildLifecycle: Send + Sync {
     async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()>;
     async fn retire_build(&self, build_id: OperationId) -> Result<()>;
-    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()>;
-    async fn cancel_outbound_build_attempt(
-        &self,
-        id: &OperationId,
-        generation: u64,
-        public_cleanup: bool,
-    ) -> Result<()>;
-    async fn build_generation(&self, id: &OperationId) -> u64;
     async fn wait_for_build_completion(
         &self,
         build_id: &OperationId,
@@ -92,6 +84,18 @@ pub(super) trait BuildLifecycle: Send + Sync {
         build_id: &OperationId,
         target: &ReplicaIdentity,
     ) -> Result<BuildCompletionConfirmation>;
+}
+
+#[async_trait]
+pub(super) trait BuildCancellation: Send + Sync {
+    async fn cancel_outbound_build(&self, id: &OperationId, generation: u64) -> Result<()>;
+    async fn cancel_outbound_build_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()>;
+    async fn build_generation(&self, id: &OperationId) -> u64;
 }
 
 #[async_trait]
@@ -148,6 +152,7 @@ pub(super) struct LifecycleWiring {
     pub(super) authority: Arc<dyn AuthorityLifecycle>,
     pub(super) access: Arc<dyn AccessLifecycle>,
     pub(super) build: Arc<dyn BuildLifecycle>,
+    pub(super) build_cancellation: Arc<dyn BuildCancellation>,
     pub(super) topology: Arc<dyn TopologyLifecycle>,
     pub(super) observation: Arc<dyn LifecycleObservation>,
     pub(super) outbound: Arc<dyn OutboundLifecycle>,
@@ -160,6 +165,7 @@ impl LifecycleWiring {
             + AuthorityLifecycle
             + AccessLifecycle
             + BuildLifecycle
+            + BuildCancellation
             + TopologyLifecycle
             + LifecycleObservation
             + OutboundLifecycle
@@ -170,6 +176,7 @@ impl LifecycleWiring {
             authority: backend.clone(),
             access: backend.clone(),
             build: backend.clone(),
+            build_cancellation: backend.clone(),
             topology: backend.clone(),
             observation: backend.clone(),
             outbound: backend,
@@ -228,19 +235,26 @@ impl LifecycleWiring {
     pub(super) fn build_runtime(&self, managed: bool) -> BuildLifecycleRuntime {
         BuildLifecycleRuntime {
             inner: self.build.clone(),
+            cancellation: self.build_cancellation.clone(),
             managed,
         }
     }
 
     pub(super) fn build_cancellation(&self) -> BuildCancellationRuntime {
         BuildCancellationRuntime {
-            inner: self.build.clone(),
+            inner: self.build_cancellation.clone(),
         }
     }
 
     pub(super) fn outbound_runtime(&self) -> OutboundLifecycleRuntime {
         OutboundLifecycleRuntime {
             inner: self.outbound.clone(),
+        }
+    }
+
+    pub(super) fn removal_witness_runtime(&self) -> RemovalWitnessRuntime {
+        RemovalWitnessRuntime {
+            inner: self.topology.clone(),
         }
     }
 }
@@ -326,6 +340,7 @@ impl PeerRuntime {
 #[derive(Clone)]
 pub(super) struct BuildLifecycleRuntime {
     inner: Arc<dyn BuildLifecycle>,
+    cancellation: Arc<dyn BuildCancellation>,
     managed: bool,
 }
 
@@ -343,8 +358,8 @@ impl BuildLifecycleRuntime {
     }
 
     pub(super) async fn cancel(&self, id: &OperationId) -> Result<()> {
-        let generation = self.inner.build_generation(id).await;
-        let build = self.inner.clone();
+        let generation = self.cancellation.build_generation(id).await;
+        let build = self.cancellation.clone();
         let id = id.clone();
         tokio::spawn(async move { build.cancel_outbound_build(&id, generation).await })
             .await
@@ -402,7 +417,7 @@ impl BuildLifecycleRuntime {
 
 #[derive(Clone)]
 pub(super) struct BuildCancellationRuntime {
-    inner: Arc<dyn BuildLifecycle>,
+    inner: Arc<dyn BuildCancellation>,
 }
 
 impl BuildCancellationRuntime {
@@ -430,6 +445,28 @@ pub(super) struct OutboundLifecycleRuntime {
 impl OutboundLifecycleRuntime {
     pub(super) async fn next(&self) -> Option<OutboundOperation> {
         self.inner.next_outbound().await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RemovalWitnessRuntime {
+    inner: Arc<dyn TopologyLifecycle>,
+}
+
+impl RemovalWitnessRuntime {
+    pub(super) async fn observe(
+        &self,
+        witness: SecondaryRemovalWitness,
+        committed: Option<SecondaryScaleDownCleanup>,
+    ) -> Result<()> {
+        match committed {
+            Some(committed) => {
+                self.inner
+                    .observe_secondary_removal_progress(witness, committed)
+                    .await
+            }
+            None => self.inner.observe_secondary_removal(witness).await,
+        }
     }
 }
 

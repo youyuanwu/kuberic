@@ -23,7 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::host::Result;
 #[cfg(all(test, feature = "testing"))]
 use crate::host::hosting::PodRuntime;
-use crate::host::hosting::{BuildRuntime, OutboundRuntime, PeerDiscoveryRuntime};
+use crate::host::hosting::{
+    BuildAttemptRuntime, BuildRuntime, OutboundRuntime, PeerDiscoveryRuntime,
+};
 use crate::host::service::SessionRegistry;
 use crate::host::store::AgentStore;
 use async_trait::async_trait;
@@ -108,6 +110,11 @@ pub(crate) struct GrpcOutboundDispatcher<R> {
     completed_builds: Mutex<BTreeSet<(crate::protocol::types::OperationId, ProcessSessionId)>>,
 }
 
+#[async_trait]
+pub(crate) trait PeerReporter: Send + Sync {
+    async fn peer_report(&self, receiver: &ReplicaIdentity) -> Result<AgentReport>;
+}
+
 struct BuildDispatchCancellation {
     decision: Option<tokio::sync::oneshot::Sender<bool>>,
     completion: tokio::task::JoinHandle<()>,
@@ -115,7 +122,7 @@ struct BuildDispatchCancellation {
 
 impl BuildDispatchCancellation {
     fn new(
-        runtime: BuildRuntime,
+        runtime: BuildAttemptRuntime,
         build_id: crate::protocol::types::OperationId,
         generation: u64,
         guard: OwnedMutexGuard<()>,
@@ -150,7 +157,7 @@ pub(crate) async fn testing_cancel_build_dispatch(
     lock: Arc<Mutex<()>>,
 ) {
     let guard = lock.lock_owned().await;
-    BuildDispatchCancellation::new(runtime.build_runtime(), build_id, generation, guard)
+    BuildDispatchCancellation::new(runtime.build_attempt_runtime(), build_id, generation, guard)
         .finish(false)
         .await;
 }
@@ -173,6 +180,7 @@ where
                 "agent bearer token must not be empty".into(),
             ));
         }
+
         Ok(Self {
             runtime,
             transport,
@@ -254,8 +262,12 @@ where
         let build_id = endpoint.build_id.clone();
         let guard = build_lock.lock_owned().await;
         let generation = self.runtime.generation(&build_id).await?;
-        let cancellation =
-            BuildDispatchCancellation::new(self.runtime.clone(), build_id, generation, guard);
+        let cancellation = BuildDispatchCancellation::new(
+            self.runtime.cancellation(),
+            build_id,
+            generation,
+            guard,
+        );
         let result = self.dispatch_build_locked(endpoint).await;
         cancellation.finish(result.is_ok()).await;
         result
@@ -439,6 +451,16 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<R> PeerReporter for GrpcOutboundDispatcher<R>
+where
+    R: ReplicaEndpointResolver,
+{
+    async fn peer_report(&self, receiver: &ReplicaIdentity) -> Result<AgentReport> {
+        GrpcOutboundDispatcher::peer_report(self, receiver).await
     }
 }
 
@@ -905,18 +927,17 @@ async fn queued_matches_runtime_authority(
     }
 }
 
-pub(crate) async fn run_peer_discovery<S, R>(
+pub(crate) async fn run_peer_discovery<S>(
     local: ReplicaIdentity,
     runtime: Arc<PeerDiscoveryRuntime>,
     store: Arc<S>,
     transport: Arc<Mutex<ReliableTransport>>,
-    dispatcher: Arc<GrpcOutboundDispatcher<R>>,
+    dispatcher: Arc<dyn PeerReporter>,
     sessions: Arc<SessionRegistry>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()>
 where
     S: AgentStore + 'static,
-    R: ReplicaEndpointResolver + 'static,
 {
     loop {
         if *shutdown.borrow_and_update() {

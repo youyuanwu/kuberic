@@ -620,7 +620,7 @@ pub(crate) async fn cancel_build_attempt(
     generation: u64,
 ) -> crate::Result<()> {
     runtime
-        .build_runtime()
+        .build_attempt_runtime()
         .cancel_attempt(build_id, generation, true)
         .await
 }
