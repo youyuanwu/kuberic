@@ -151,6 +151,39 @@ fn production_rust_files(root: &std::path::Path) -> Vec<PathBuf> {
     files
 }
 
+fn validate_production_module(
+    relative: &std::path::Path,
+    source: &str,
+) -> Result<BTreeSet<String>, String> {
+    let display = relative.to_string_lossy();
+    if source.contains("ReplicatorLifecycleHost") {
+        return Err(format!(
+            "{display}: unclassified transition-facade consumer"
+        ));
+    }
+    if matches!(
+        relative.to_str(),
+        Some("hosting.rs" | "custom.rs" | "lifecycle.rs")
+    ) {
+        return Ok(BTreeSet::new());
+    }
+    let file = syn::parse_file(source).map_err(|error| format!("{display}: {error}"))?;
+    let allowed_aggregates: &[&str] = match relative.to_str() {
+        Some("process.rs") => &["ReplicaHandle"],
+        Some("service.rs") => &["AgentService"],
+        Some("testing.rs") => &["Endpoint"],
+        _ => &[],
+    };
+    reject_broad_aliases(&file).map_err(|error| format!("{display}: {error}"))?;
+    reject_unclassified_capability_aggregates(&file, allowed_aggregates)
+        .map_err(|error| format!("{display}: {error}"))?;
+    reject_aggregate_signatures(&file).map_err(|error| format!("{display}: {error}"))?;
+    Ok(capability_signature_sites(&file)
+        .into_iter()
+        .map(|site| format!("{display}::{site}"))
+        .collect())
+}
+
 fn names(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -273,11 +306,8 @@ impl<'ast> Visit<'ast> for BroadAliasVisitor {
         let target = compact(&alias.ty);
         if FORBIDDEN.iter().any(|forbidden| target.contains(forbidden)) {
             self.issue = Some(format!("broad lifecycle alias {} -> {target}", alias.ident));
-        } else if capability_marker_count(&target) >= 2 {
-            self.issue = Some(format!(
-                "capability aggregate alias {} -> {target}",
-                alias.ident
-            ));
+        } else if capability_marker_count(&target) >= 1 {
+            self.issue = Some(format!("capability alias {} -> {target}", alias.ident));
         }
         syn::visit::visit_item_type(self, alias);
     }
@@ -287,6 +317,44 @@ fn reject_broad_aliases(file: &syn::File) -> Result<(), String> {
     let mut visitor = BroadAliasVisitor { issue: None };
     visitor.visit_file(file);
     let aliases = local_use_aliases(file);
+
+    struct GuardedUseAliasVisitor {
+        issue: Option<String>,
+    }
+
+    fn inspect_use(tree: &syn::UseTree, issue: &mut Option<String>) {
+        match tree {
+            syn::UseTree::Path(path) => inspect_use(&path.tree, issue),
+            syn::UseTree::Rename(rename)
+                if CAPABILITY_MARKERS.contains(&rename.ident.to_string().as_str())
+                    || BROAD_OWNER_MARKERS.contains(&rename.ident.to_string().as_str()) =>
+            {
+                *issue = Some(format!(
+                    "guarded import alias {} -> {}",
+                    rename.rename, rename.ident
+                ));
+            }
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    inspect_use(tree, issue);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    impl<'ast> Visit<'ast> for GuardedUseAliasVisitor {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            inspect_use(&item.tree, &mut self.issue);
+            syn::visit::visit_item_use(self, item);
+        }
+    }
+
+    let mut guarded_use = GuardedUseAliasVisitor { issue: None };
+    guarded_use.visit_file(file);
+    if let Some(issue) = guarded_use.issue {
+        return Err(issue);
+    }
 
     struct ResolvedAliasVisitor<'a> {
         aliases: &'a BTreeMap<String, String>,
@@ -298,11 +366,8 @@ fn reject_broad_aliases(file: &syn::File) -> Result<(), String> {
             let target = compact(&alias.ty);
             if marker_count(&target, BROAD_OWNER_MARKERS, self.aliases) > 0 {
                 self.issue = Some(format!("broad lifecycle alias {} -> {target}", alias.ident));
-            } else if marker_count(&target, CAPABILITY_MARKERS, self.aliases) >= 2 {
-                self.issue = Some(format!(
-                    "capability aggregate alias {} -> {target}",
-                    alias.ident
-                ));
+            } else if marker_count(&target, CAPABILITY_MARKERS, self.aliases) >= 1 {
+                self.issue = Some(format!("capability alias {} -> {target}", alias.ident));
             }
             syn::visit::visit_item_type(self, alias);
         }
@@ -1636,34 +1701,9 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
     let host_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/host");
     let mut module_signature_sites = BTreeSet::new();
     for path in production_rust_files(&host_root) {
+        let relative = path.strip_prefix(&host_root).unwrap();
         let source = fs::read_to_string(&path).unwrap();
-        assert!(
-            !source.contains("ReplicatorLifecycleHost"),
-            "{} introduced an unclassified transition-facade consumer",
-            path.display()
-        );
-        if matches!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("hosting.rs" | "custom.rs" | "lifecycle.rs")
-        ) {
-            continue;
-        }
-        let file = syn::parse_file(&source).unwrap();
-        let file_name = path.strip_prefix(&host_root).unwrap().to_string_lossy();
-        let allowed_aggregates: &[&str] = match file_name.as_ref() {
-            "process.rs" => &["ReplicaHandle"],
-            "service.rs" => &["AgentService"],
-            "testing.rs" => &["Endpoint"],
-            _ => &[],
-        };
-        reject_broad_aliases(&file).unwrap();
-        reject_unclassified_capability_aggregates(&file, allowed_aggregates).unwrap();
-        reject_aggregate_signatures(&file).unwrap();
-        module_signature_sites.extend(
-            capability_signature_sites(&file)
-                .into_iter()
-                .map(|site| format!("{file_name}::{site}")),
-        );
+        module_signature_sites.extend(validate_production_module(relative, &source).unwrap());
     }
     let expected_module_signature_sites = names(&[
         "report.rs::AgentReporter::report",
@@ -1978,7 +2018,7 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     );
     assert_rejected(
         validate(&lifecycle, &custom, &aliased_broker),
-        "RenamedBroker",
+        "guarded import alias",
     );
 
     let broad_report = format!(
@@ -2009,7 +2049,7 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     );
     assert_rejected(
         validate(&lifecycle, &custom, &type_alias_broker),
-        "TypeAliasBroker",
+        "capability alias",
     );
 
     let scoped_alias_broker = format!(
@@ -2017,7 +2057,7 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     );
     assert_rejected(
         validate(&lifecycle, &custom, &scoped_alias_broker),
-        "ScopeBroker",
+        "guarded import alias",
     );
 
     let transport = source("src/host/transport.rs");
@@ -2029,5 +2069,58 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     assert_rejected(
         reject_aggregate_signatures(&broadened_outbound),
         "run_outbound",
+    );
+
+    let reversed_scope_aliases = format!(
+        "{hosting}\nmod unrelated_first {{ use std::string::String as B; use std::string::String as R; use std::string::String as O; }}\nuse self::BuildRuntime as B;\nuse self::ReportRuntime as R;\nuse self::OutboundRuntime as O;\nstruct ReversedScopeBroker {{ build: B, report: R, outbound: O }}\n"
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &reversed_scope_aliases),
+        "guarded import alias",
+    );
+
+    let wrapped_aliases = format!(
+        "{hosting}\ntype B = Arc<BuildRuntime>;\ntype R = Arc<ReportRuntime>;\ntype O = Arc<OutboundRuntime>;\nstruct WrappedAliasBroker {{ build: B, report: R, outbound: O }}\n"
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &wrapped_aliases),
+        "capability alias",
+    );
+
+    let forward_aliases = format!(
+        "{hosting}\ntype B = LaterB;\ntype R = LaterR;\ntype O = LaterO;\ntype LaterB = BuildRuntime;\ntype LaterR = ReportRuntime;\ntype LaterO = OutboundRuntime;\nstruct ForwardAliasBroker {{ build: B, report: R, outbound: O }}\n"
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &forward_aliases),
+        "capability alias",
+    );
+
+    let aliased_outbound = format!(
+        "type ExtraReport = std::sync::Arc<crate::host::hosting::ReportRuntime>;\n{transport}"
+    )
+    .replace(
+        "    runtime: Arc<OutboundRuntime>,\n    transport: Arc<Mutex<ReliableTransport>>,",
+        "    runtime: Arc<OutboundRuntime>,\n    unrelated_report: ExtraReport,\n    transport: Arc<Mutex<ReliableTransport>>,",
+    );
+    let aliased_outbound = syn::parse_file(&aliased_outbound).unwrap();
+    assert_rejected(reject_broad_aliases(&aliased_outbound), "ExtraReport");
+
+    let module_root = tempfile::tempdir().unwrap();
+    let workers = module_root.path().join("workers");
+    fs::create_dir(&workers).unwrap();
+    fs::write(
+        workers.join("hosting.rs"),
+        "struct UncheckedOutOfLineFacade { runtime: std::sync::Arc<crate::host::hosting::PodRuntime> }",
+    )
+    .unwrap();
+    let path = production_rust_files(module_root.path())
+        .into_iter()
+        .next()
+        .unwrap();
+    let relative = path.strip_prefix(module_root.path()).unwrap();
+    let source = fs::read_to_string(&path).unwrap();
+    assert_rejected(
+        validate_production_module(relative, &source).map(|_| ()),
+        "workers/hosting.rs",
     );
 }
