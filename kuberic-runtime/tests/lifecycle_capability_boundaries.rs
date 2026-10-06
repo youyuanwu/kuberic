@@ -222,12 +222,7 @@ fn production_modules(root: &Path) -> Vec<(PathBuf, bool)> {
             }
         }
     }
-    for entry in fs::read_dir(root).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() && path.file_name().and_then(|name| name.to_str()) != Some("tests") {
-            discover(root, &path, &mut modules);
-        }
-    }
+    discover(root, root, &mut modules);
     modules.sort();
     modules
 }
@@ -310,6 +305,18 @@ fn reject_transitive_capability_inheritance(file: &syn::File) -> Result<(), Stri
             return Err(format!(
                 "{name} transitively aggregates lifecycle capabilities"
             ));
+        }
+    }
+    for item in &file.items {
+        if let Item::Mod(item) = item
+            && let Some((_, items)) = &item.content
+        {
+            reject_transitive_capability_inheritance(&syn::File {
+                frontmatter: None,
+                shebang: None,
+                attrs: Vec::new(),
+                items: items.clone(),
+            })?;
         }
     }
     Ok(())
@@ -450,10 +457,16 @@ fn validate_module_policy(
             if let Some((path, _)) = &item.trait_ {
                 let mut markers = type_markers(&item.self_ty);
                 markers.visit_path(path);
-                if markers.broad.contains("LifecycleWiring")
-                    && (markers.broad.contains("ReplicatorLifecycleRegistration")
-                        || markers.broad.contains("RegisteredReplicator"))
-                {
+                let registration = markers.broad.contains("ReplicatorLifecycleRegistration")
+                    || markers.broad.contains("RegisteredReplicator");
+                let complete = [
+                    "LifecycleWiring",
+                    "ManagedLifecycleBackend",
+                    "CustomReplicatorHost",
+                ]
+                .iter()
+                .any(|name| markers.broad.contains(*name));
+                if registration && complete {
                     self.record(|| "conversion exposes complete lifecycle wiring".into());
                 }
             }
@@ -494,6 +507,46 @@ fn validate_module_policy(
     visitor.issue.map_or(Ok(()), Err)
 }
 
+struct ViewImplValidator<'a> {
+    view: &'a str,
+    allowed: &'a [&'a str],
+    issue: Option<String>,
+}
+
+impl<'ast> Visit<'ast> for ViewImplValidator<'_> {
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if type_name(&item.self_ty).as_deref() == Some(self.view) {
+            if item.trait_.is_some() {
+                self.issue = Some(format!(
+                    "{} implements an unapproved conversion trait",
+                    self.view
+                ));
+            }
+            for member in &item.items {
+                if let ImplItem::Fn(method) = member {
+                    let markers = signature_markers(&method.sig);
+                    if !markers.broad.is_empty() || markers.direct_primary {
+                        self.issue = Some(format!(
+                            "{}::{} exposes a broad owner",
+                            self.view, method.sig.ident
+                        ));
+                    } else if markers
+                        .capabilities
+                        .iter()
+                        .any(|capability| !self.allowed.contains(&capability.as_str()))
+                    {
+                        self.issue = Some(format!(
+                            "{}::{} exposes an unrelated capability",
+                            self.view, method.sig.ident
+                        ));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_item_impl(self, item);
+    }
+}
+
 fn validate_view_boundaries(file: &syn::File, rules: &[(&str, &[&str])]) -> Result<(), String> {
     for (view, allowed) in rules {
         let item = file
@@ -517,38 +570,14 @@ fn validate_view_boundaries(file: &syn::File, rules: &[(&str, &[&str])]) -> Resu
                 return Err(format!("{view} retains an unrelated capability"));
             }
         }
-        for item in &file.items {
-            let Item::Impl(item) = item else {
-                continue;
-            };
-            if type_name(&item.self_ty).as_deref() != Some(*view) {
-                continue;
-            }
-            if item.trait_.is_some() {
-                return Err(format!("{view} implements an unapproved conversion trait"));
-            }
-            for member in &item.items {
-                let ImplItem::Fn(method) = member else {
-                    continue;
-                };
-                let markers = signature_markers(&method.sig);
-                if !markers.broad.is_empty() || markers.direct_primary {
-                    return Err(format!(
-                        "{view}::{} exposes a broad owner",
-                        method.sig.ident
-                    ));
-                }
-                if markers
-                    .capabilities
-                    .iter()
-                    .any(|capability| !allowed.contains(&capability.as_str()))
-                {
-                    return Err(format!(
-                        "{view}::{} exposes an unrelated capability",
-                        method.sig.ident
-                    ));
-                }
-            }
+        let mut validator = ViewImplValidator {
+            view,
+            allowed,
+            issue: None,
+        };
+        validator.visit_file(file);
+        if let Some(issue) = validator.issue {
+            return Err(issue);
         }
     }
     Ok(())
@@ -1021,28 +1050,18 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         "pub(super) trait ProcessLifecycle: Send + Sync {",
         "pub(super) trait ProcessLifecycle: Send + Sync + BuildLifecycle {",
     );
-    assert_rejected(
-        validate_module_policy(&syn::parse_file(&inherited_capability).unwrap(), &[], true),
-        "ProcessLifecycle",
-    );
+    assert_rejected(validate_module_policy(&parsed(&inherited_capability), &[], true), "ProcessLifecycle");
 
     let trait_escape = lifecycle.replace(
         "    async fn settle_primary_prefix(&self) -> Result<()>;\n",
         "    async fn settle_primary_prefix(&self) -> Result<()>;\n    fn build(&self) -> Arc<dyn self::BuildLifecycle>;\n",
     );
-    assert_rejected(
-        validate_module_policy(&syn::parse_file(&trait_escape).unwrap(), &[], true),
-        "ProcessLifecycle::build",
-    );
+    assert_rejected(validate_module_policy(&parsed(&trait_escape), &[], true), "ProcessLifecycle::build");
 
     let harmless_method = format!(
         "{lifecycle}\nimpl ProcessRuntime {{ fn harmless_narrow_helper(&self) -> bool {{ true }} }}\n"
     );
-    validate_view_boundaries(
-        &syn::parse_file(&harmless_method).unwrap(),
-        LIFECYCLE_VIEW_RULES,
-    )
-    .unwrap();
+    validate_view_boundaries(&parsed(&harmless_method), LIFECYCLE_VIEW_RULES).unwrap();
 
     reject_policy("use self::BuildRuntime as B;\ntype R = ReportRuntime;\nstruct Broker { build: B, report: R }", false, "guarded");
     reject_policy("use self::BuildLifecycle as Other;", false, "guarded import alias");
@@ -1053,21 +1072,12 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     let view_escape = format!(
         "{lifecycle}\nimpl ProcessRuntime {{ fn build_capability(&self) -> Arc<dyn self::BuildLifecycle> {{ unreachable!() }} }}\n"
     );
-    assert_rejected(
-        validate_view_boundaries(
-            &syn::parse_file(&view_escape).unwrap(),
-            LIFECYCLE_VIEW_RULES,
-        ),
-        "build_capability",
-    );
+    assert_rejected(validate_view_boundaries(&parsed(&view_escape), LIFECYCLE_VIEW_RULES), "build_capability");
 
     let conversion = format!(
         "{lifecycle}\nimpl std::ops::Deref for ProcessRuntime {{ type Target = RuntimeHost; fn deref(&self) -> &Self::Target {{ unreachable!() }} }}\n"
     );
-    assert_rejected(
-        validate_view_boundaries(&syn::parse_file(&conversion).unwrap(), LIFECYCLE_VIEW_RULES),
-        "conversion",
-    );
+    assert_rejected(validate_view_boundaries(&parsed(&conversion), LIFECYCLE_VIEW_RULES), "conversion");
 
     reject_policy("trait ReportHost { fn broad(&self) -> &PodRuntime; }", true, "ReportHost::broad");
     let host_view_escape = syn::parse_file(
@@ -1080,6 +1090,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     );
     reject_policy("trait ReportExtension: BuildHost {}\ntrait ReportHost: ReportExtension {}", true, "transitively");
     reject_policy("trait ProcessExtension: ProcessLifecycle {} trait BuildExtension: BuildLifecycle {} trait RenamedFacade: ProcessExtension + BuildExtension {}", true, "RenamedFacade");
+    reject_policy("mod nested { trait ProcessExtension: ProcessLifecycle {} trait BuildExtension: BuildLifecycle {} trait RenamedFacade: ProcessExtension + BuildExtension {} }", true, "RenamedFacade");
     reject_policy("trait ReportHost { fn primary(&self) -> Arc<dyn PrimaryReplicator>; }", true, "ReportHost::primary");
     reject_policy("type DirectPrimary = dyn PrimaryReplicator;", true, "DirectPrimary");
     reject_policy("#[allow(clippy::disallowed_types)] mod worker { struct Facade { runtime: Arc<PodRuntime> } }", false, "Facade");
@@ -1128,6 +1139,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     );
     reject_policy("impl From<ReplicatorLifecycleRegistration> for LifecycleWiring { fn from(value: ReplicatorLifecycleRegistration) -> Self { unreachable!() } }", true, "conversion");
     reject_policy("impl From<RegisteredReplicator> for LifecycleWiring { fn from(value: RegisteredReplicator) -> Self { unreachable!() } }", true, "conversion");
+    reject_policy("impl From<ReplicatorLifecycleRegistration> for ManagedLifecycleBackend { fn from(value: ReplicatorLifecycleRegistration) -> Self { unreachable!() } }", true, "conversion");
 
     reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildRuntime) -> Self { unreachable!() } }", "cancellation-only");
     reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime) -> Self { let host: Option<Arc<PodRuntime>> = None; unreachable!() } }", "broader runtime");
@@ -1139,7 +1151,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     fs::create_dir(&hosting_dir).unwrap();
     fs::write(
         module_root.path().join("mod.rs"),
-        "#[allow(clippy::disallowed_types)] mod hosting; mod transport;",
+        "#[allow(clippy::disallowed_types)] mod hosting; mod transport; #[allow(clippy::disallowed_types)] #[path = \".\"] mod helpers { mod root_worker; }",
     )
     .unwrap();
     fs::write(module_root.path().join("hosting.rs"), "mod worker;").unwrap();
@@ -1152,6 +1164,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     fs::create_dir_all(&inline_worker).unwrap();
     fs::write(module_root.path().join("transport.rs"), "#[allow(clippy::disallowed_types)] mod helpers { mod worker; }").unwrap();
     fs::write(inline_worker.join("worker.rs"), "struct InlineFacade { runtime: Arc<PodRuntime> }").unwrap();
+    fs::write(module_root.path().join("root_worker.rs"), "struct RootFacade { runtime: Arc<PodRuntime> }").unwrap();
     let relative = Path::new("hosting/worker.rs");
     let modules = production_modules(module_root.path());
     assert!(modules.contains(&(relative.to_path_buf(), true)));
@@ -1163,4 +1176,8 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     assert!(modules.contains(&(PathBuf::from("transport/helpers/worker.rs"), true)));
     let inline = fs::read_to_string(module_root.path().join("transport/helpers/worker.rs")).unwrap();
     assert_rejected(validate_production_module(Path::new("transport/helpers/worker.rs"), &inline, true), "InlineFacade");
+    assert!(modules.contains(&(PathBuf::from("root_worker.rs"), true)));
+
+    let nested_view = format!("{lifecycle}\nmod nested {{ impl super::ProcessRuntime {{ fn leak(&self) -> super::BuildLifecycleRuntime {{ unreachable!() }} }} }}");
+    assert_rejected(validate_view_boundaries(&parsed(&nested_view), LIFECYCLE_VIEW_RULES), "leak");
 }
