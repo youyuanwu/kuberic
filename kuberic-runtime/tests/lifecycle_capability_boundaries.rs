@@ -423,6 +423,55 @@ fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
 }
 
 fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
+    struct NestedSignatureVisitor<'a> {
+        prefix: &'a str,
+        sites: &'a mut BTreeSet<String>,
+    }
+
+    impl<'ast> Visit<'ast> for NestedSignatureVisitor<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if capability_marker_count(&compact(&item.sig)) > 0 {
+                self.sites
+                    .insert(format!("{}fn {}", self.prefix, item.sig.ident));
+            }
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            for method in &item.items {
+                if let TraitItem::Fn(method) = method
+                    && capability_marker_count(&compact(&method.sig)) > 0
+                {
+                    self.sites.insert(format!(
+                        "{}{}::{}",
+                        self.prefix, item.ident, method.sig.ident
+                    ));
+                }
+            }
+            syn::visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            for method in &item.items {
+                if let ImplItem::Fn(method) = method
+                    && capability_marker_count(&compact(&method.sig)) > 0
+                {
+                    self.sites.insert(format!(
+                        "{}{}::{}",
+                        self.prefix,
+                        impl_name(item),
+                        method.sig.ident
+                    ));
+                }
+            }
+            syn::visit::visit_item_impl(self, item);
+        }
+    }
+
+    fn inspect_nested(block: &syn::Block, prefix: &str, sites: &mut BTreeSet<String>) {
+        NestedSignatureVisitor { prefix, sites }.visit_block(block);
+    }
+
     fn inspect(items: &[Item], module: &str, sites: &mut BTreeSet<String>) {
         for item in items {
             match item {
@@ -430,26 +479,46 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
                     if capability_marker_count(&compact(&item.sig)) > 0 {
                         sites.insert(format!("{module}fn {}", item.sig.ident));
                     }
+                    inspect_nested(
+                        &item.block,
+                        &format!("{module}fn {}::", item.sig.ident),
+                        sites,
+                    );
                 }
                 Item::Trait(item) => {
                     for method in &item.items {
-                        if let TraitItem::Fn(method) = method
-                            && capability_marker_count(&compact(&method.sig)) > 0
-                        {
-                            sites.insert(format!("{module}{}::{}", item.ident, method.sig.ident));
+                        if let TraitItem::Fn(method) = method {
+                            if capability_marker_count(&compact(&method.sig)) > 0 {
+                                sites.insert(format!(
+                                    "{module}{}::{}",
+                                    item.ident, method.sig.ident
+                                ));
+                            }
+                            if let Some(block) = &method.default {
+                                inspect_nested(
+                                    block,
+                                    &format!("{module}{}::{}::", item.ident, method.sig.ident),
+                                    sites,
+                                );
+                            }
                         }
                     }
                 }
                 Item::Impl(item) => {
                     for method in &item.items {
-                        if let ImplItem::Fn(method) = method
-                            && capability_marker_count(&compact(&method.sig)) > 0
-                        {
-                            sites.insert(format!(
-                                "{module}{}::{}",
-                                impl_name(item),
-                                method.sig.ident
-                            ));
+                        if let ImplItem::Fn(method) = method {
+                            if capability_marker_count(&compact(&method.sig)) > 0 {
+                                sites.insert(format!(
+                                    "{module}{}::{}",
+                                    impl_name(item),
+                                    method.sig.ident
+                                ));
+                            }
+                            inspect_nested(
+                                &method.block,
+                                &format!("{module}{}::{}::", impl_name(item), method.sig.ident),
+                                sites,
+                            );
                         }
                     }
                 }
@@ -1668,4 +1737,13 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         ))
     };
     assert_rejected(result, "fn leaked_consumer");
+
+    let nested_signature_consumer = hosting.replace(
+        "    fn abort(&self) {\n",
+        "    fn abort(&self) {\n        fn nested_view_consumer(runtime: BuildRuntime) { let _ = runtime; }\n",
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &nested_signature_consumer),
+        "fn nested_view_consumer",
+    );
 }
