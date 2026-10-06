@@ -8719,6 +8719,95 @@ async fn peer_session_replacement_waits_for_the_durable_access_decision() {
     );
 }
 
+enum ProductionAckView {
+    Build,
+    PeerDiscovery,
+}
+
+async fn assert_production_ack_view_rejects_obsolete_session(
+    view: ProductionAckView,
+    suffix: &str,
+) {
+    let local_instance = format!("{suffix}-primary");
+    let peer_instance = format!("{suffix}-peer");
+    let local = identity(1, &local_instance);
+    let peer = identity(2, &peer_instance);
+    let runtime = open_primary_with_session(
+        Arc::new(TestApplication::default()),
+        vec![local, peer.clone()],
+        suffix,
+    )
+    .await;
+    let first_session = ProcessSessionId::new(format!("{suffix}-session-a"));
+    crate::host::testing::register_lifecycle_peer_session(
+        &runtime,
+        peer.clone(),
+        first_session.clone(),
+    )
+    .await
+    .unwrap();
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new(format!("{suffix}-write")),
+            data: Bytes::from_static(b"session-fenced"),
+        })
+        .await
+        .unwrap();
+    let authority = runtime.snapshot().await.authority.unwrap();
+    let replacement = ProcessSessionId::new(format!("{suffix}-session-b"));
+    crate::host::testing::register_lifecycle_peer_session(
+        &runtime,
+        peer.clone(),
+        replacement.clone(),
+    )
+    .await
+    .unwrap();
+    let mut stale = acknowledgement(&authority, peer.clone(), pending.lsn);
+    stale.receiver_session_id = first_session.to_string();
+    let stale_result = match view {
+        ProductionAckView::Build => runtime.build_runtime().accept_acknowledgement(stale).await,
+        ProductionAckView::PeerDiscovery => {
+            runtime
+                .peer_discovery_runtime()
+                .accept_acknowledgement(stale)
+                .await
+        }
+    };
+    assert!(matches!(
+        stale_result,
+        Err(RuntimeError::AuthorityMismatch(message))
+            if message.contains("obsolete peer session")
+    ));
+
+    let mut current = acknowledgement(&authority, peer, pending.lsn);
+    current.receiver_session_id = replacement.to_string();
+    match view {
+        ProductionAckView::Build => runtime
+            .build_runtime()
+            .accept_acknowledgement(current)
+            .await
+            .unwrap(),
+        ProductionAckView::PeerDiscovery => runtime
+            .peer_discovery_runtime()
+            .accept_acknowledgement(current)
+            .await
+            .unwrap(),
+    }
+    pending.committed().await.unwrap();
+}
+
+#[tokio::test]
+async fn production_ack_views_preserve_current_peer_session_fencing() {
+    assert_production_ack_view_rejects_obsolete_session(ProductionAckView::Build, "build-view-ack")
+        .await;
+    assert_production_ack_view_rejects_obsolete_session(
+        ProductionAckView::PeerDiscovery,
+        "peer-view-ack",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn abort_rejects_prepared_managed_and_custom_access() {
     let primary = identity(1, "managed-access-abort");

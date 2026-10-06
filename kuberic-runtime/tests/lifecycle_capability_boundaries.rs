@@ -36,19 +36,101 @@ const CAPABILITY_MARKERS: &[&str] = &[
     "dynOutboundLifecycle",
 ];
 
-fn capability_marker_count(value: &str) -> usize {
+const BROAD_OWNER_MARKERS: &[&str] = &[
+    "RuntimeHost",
+    "PodRuntime",
+    "RegisteredReplicator",
+    "LifecycleWiring",
+    "ReplicatorLifecycleRegistration",
+    "ManagedLifecycleBackend",
+    "CustomReplicatorHost",
+];
+
+fn marker_count(value: &str, markers: &[&str], aliases: &BTreeMap<String, String>) -> usize {
     let identifiers = value
         .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
         .filter(|identifier| !identifier.is_empty())
         .collect::<BTreeSet<_>>();
-    CAPABILITY_MARKERS
+    markers
         .iter()
-        .filter(|marker| identifiers.contains(**marker))
+        .filter(|marker| {
+            identifiers.contains(**marker)
+                || aliases.iter().any(|(alias, target)| {
+                    target == **marker && identifiers.contains(alias.as_str())
+                })
+        })
         .count()
+}
+
+fn capability_marker_count(value: &str) -> usize {
+    marker_count(value, CAPABILITY_MARKERS, &BTreeMap::new())
+}
+
+fn guarded_signature(signature: &syn::Signature, aliases: &BTreeMap<String, String>) -> bool {
+    let signature = compact(signature);
+    marker_count(&signature, CAPABILITY_MARKERS, aliases) > 0
+        || marker_count(&signature, BROAD_OWNER_MARKERS, aliases) > 0
+}
+
+fn local_use_aliases(file: &syn::File) -> BTreeMap<String, String> {
+    struct UseAliasVisitor {
+        aliases: BTreeMap<String, String>,
+    }
+
+    fn collect(tree: &syn::UseTree, aliases: &mut BTreeMap<String, String>) {
+        match tree {
+            syn::UseTree::Path(path) => collect(&path.tree, aliases),
+            syn::UseTree::Name(name) => {
+                aliases.insert(name.ident.to_string(), name.ident.to_string());
+            }
+            syn::UseTree::Rename(rename) => {
+                aliases.insert(rename.rename.to_string(), rename.ident.to_string());
+            }
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    collect(tree, aliases);
+                }
+            }
+            syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    impl<'ast> Visit<'ast> for UseAliasVisitor {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            collect(&item.tree, &mut self.aliases);
+            syn::visit::visit_item_use(self, item);
+        }
+    }
+
+    let mut visitor = UseAliasVisitor {
+        aliases: BTreeMap::new(),
+    };
+    visitor.visit_file(file);
+    visitor.aliases
 }
 
 fn source(path: &str) -> String {
     fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
+}
+
+fn production_rust_files(root: &std::path::Path) -> Vec<PathBuf> {
+    fn collect(path: &std::path::Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) != Some("tests") {
+                    collect(&path, files);
+                }
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(root, &mut files);
+    files.sort();
+    files
 }
 
 fn names(values: &[&str]) -> BTreeSet<String> {
@@ -186,6 +268,36 @@ impl<'ast> Visit<'ast> for BroadAliasVisitor {
 fn reject_broad_aliases(file: &syn::File) -> Result<(), String> {
     let mut visitor = BroadAliasVisitor { issue: None };
     visitor.visit_file(file);
+    let aliases = local_use_aliases(file);
+
+    struct ResolvedAliasVisitor<'a> {
+        aliases: &'a BTreeMap<String, String>,
+        issue: Option<String>,
+    }
+
+    impl<'ast> Visit<'ast> for ResolvedAliasVisitor<'_> {
+        fn visit_item_type(&mut self, alias: &'ast syn::ItemType) {
+            let target = compact(&alias.ty);
+            if marker_count(&target, BROAD_OWNER_MARKERS, self.aliases) > 0 {
+                self.issue = Some(format!("broad lifecycle alias {} -> {target}", alias.ident));
+            } else if marker_count(&target, CAPABILITY_MARKERS, self.aliases) >= 2 {
+                self.issue = Some(format!(
+                    "capability aggregate alias {} -> {target}",
+                    alias.ident
+                ));
+            }
+            syn::visit::visit_item_type(self, alias);
+        }
+    }
+
+    let mut resolved = ResolvedAliasVisitor {
+        aliases: &aliases,
+        issue: None,
+    };
+    resolved.visit_file(file);
+    if let Some(issue) = resolved.issue {
+        return Err(issue);
+    }
     match visitor.issue {
         Some(issue) => Err(issue),
         None => Ok(()),
@@ -326,6 +438,7 @@ fn reject_unclassified_capability_aggregates(
 ) -> Result<(), String> {
     struct AggregateVisitor<'a> {
         allowed: &'a [&'a str],
+        aliases: &'a BTreeMap<String, String>,
         depth: usize,
         issue: Option<String>,
     }
@@ -335,7 +448,12 @@ fn reject_unclassified_capability_aggregates(
             let capabilities = item
                 .fields
                 .iter()
-                .map(|field| capability_marker_count(&compact(&field.ty)))
+                .map(|field| marker_count(&compact(&field.ty), CAPABILITY_MARKERS, self.aliases))
+                .sum::<usize>();
+            let broad_owners = item
+                .fields
+                .iter()
+                .map(|field| marker_count(&compact(&field.ty), BROAD_OWNER_MARKERS, self.aliases))
                 .sum::<usize>();
             if capabilities >= 2
                 && (self.depth > 0 || !self.allowed.contains(&item.ident.to_string().as_str()))
@@ -344,6 +462,11 @@ fn reject_unclassified_capability_aggregates(
                     "{} is an unclassified capability aggregate",
                     item.ident
                 ));
+            }
+            if broad_owners > 0
+                && (self.depth > 0 || !self.allowed.contains(&item.ident.to_string().as_str()))
+            {
+                self.issue = Some(format!("{} retains an unapproved broad owner", item.ident));
             }
             syn::visit::visit_item_struct(self, item);
         }
@@ -361,8 +484,10 @@ fn reject_unclassified_capability_aggregates(
         }
     }
 
+    let aliases = local_use_aliases(file);
     let mut visitor = AggregateVisitor {
         allowed,
+        aliases: &aliases,
         depth: 0,
         issue: None,
     };
@@ -425,12 +550,13 @@ fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
 fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
     struct NestedSignatureVisitor<'a> {
         prefix: &'a str,
+        aliases: &'a BTreeMap<String, String>,
         sites: &'a mut BTreeSet<String>,
     }
 
     impl<'ast> Visit<'ast> for NestedSignatureVisitor<'_> {
         fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-            if capability_marker_count(&compact(&item.sig)) > 0 {
+            if guarded_signature(&item.sig, self.aliases) {
                 self.sites
                     .insert(format!("{}fn {}", self.prefix, item.sig.ident));
             }
@@ -440,7 +566,7 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
         fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
             for method in &item.items {
                 if let TraitItem::Fn(method) = method
-                    && capability_marker_count(&compact(&method.sig)) > 0
+                    && guarded_signature(&method.sig, self.aliases)
                 {
                     self.sites.insert(format!(
                         "{}{}::{}",
@@ -454,7 +580,7 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
             for method in &item.items {
                 if let ImplItem::Fn(method) = method
-                    && capability_marker_count(&compact(&method.sig)) > 0
+                    && guarded_signature(&method.sig, self.aliases)
                 {
                     self.sites.insert(format!(
                         "{}{}::{}",
@@ -468,27 +594,43 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
         }
     }
 
-    fn inspect_nested(block: &syn::Block, prefix: &str, sites: &mut BTreeSet<String>) {
-        NestedSignatureVisitor { prefix, sites }.visit_block(block);
+    fn inspect_nested(
+        block: &syn::Block,
+        prefix: &str,
+        aliases: &BTreeMap<String, String>,
+        sites: &mut BTreeSet<String>,
+    ) {
+        NestedSignatureVisitor {
+            prefix,
+            aliases,
+            sites,
+        }
+        .visit_block(block);
     }
 
-    fn inspect(items: &[Item], module: &str, sites: &mut BTreeSet<String>) {
+    fn inspect(
+        items: &[Item],
+        module: &str,
+        aliases: &BTreeMap<String, String>,
+        sites: &mut BTreeSet<String>,
+    ) {
         for item in items {
             match item {
                 Item::Fn(item) => {
-                    if capability_marker_count(&compact(&item.sig)) > 0 {
+                    if guarded_signature(&item.sig, aliases) {
                         sites.insert(format!("{module}fn {}", item.sig.ident));
                     }
                     inspect_nested(
                         &item.block,
                         &format!("{module}fn {}::", item.sig.ident),
+                        aliases,
                         sites,
                     );
                 }
                 Item::Trait(item) => {
                     for method in &item.items {
                         if let TraitItem::Fn(method) = method {
-                            if capability_marker_count(&compact(&method.sig)) > 0 {
+                            if guarded_signature(&method.sig, aliases) {
                                 sites.insert(format!(
                                     "{module}{}::{}",
                                     item.ident, method.sig.ident
@@ -498,6 +640,7 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
                                 inspect_nested(
                                     block,
                                     &format!("{module}{}::{}::", item.ident, method.sig.ident),
+                                    aliases,
                                     sites,
                                 );
                             }
@@ -507,7 +650,7 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
                 Item::Impl(item) => {
                     for method in &item.items {
                         if let ImplItem::Fn(method) = method {
-                            if capability_marker_count(&compact(&method.sig)) > 0 {
+                            if guarded_signature(&method.sig, aliases) {
                                 sites.insert(format!(
                                     "{module}{}::{}",
                                     impl_name(item),
@@ -517,6 +660,7 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
                             inspect_nested(
                                 &method.block,
                                 &format!("{module}{}::{}::", impl_name(item), method.sig.ident),
+                                aliases,
                                 sites,
                             );
                         }
@@ -524,7 +668,7 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
                 }
                 Item::Mod(item) => {
                     if let Some((_, items)) = &item.content {
-                        inspect(items, &format!("{module}{}::", item.ident), sites);
+                        inspect(items, &format!("{module}{}::", item.ident), aliases, sites);
                     }
                 }
                 _ => {}
@@ -533,7 +677,8 @@ fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
     }
 
     let mut sites = BTreeSet::new();
-    inspect(&file.items, "", &mut sites);
+    let aliases = local_use_aliases(file);
+    inspect(&file.items, "", &aliases, &mut sites);
     sites
 }
 
@@ -978,7 +1123,15 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     {
         return Err("ReplicatorLifecycleRegistration retained complete wiring".into());
     }
-    reject_unclassified_capability_aggregates(&custom_file, &["ReplicatorLifecycleRegistration"])?;
+    reject_unclassified_capability_aggregates(
+        &custom_file,
+        &[
+            "ReplicatorLifecycleRegistration",
+            "AcceptedAccessEffect",
+            "ManagedLifecycleBackend",
+            "CustomReplicatorHost",
+        ],
+    )?;
     reject_aggregate_signatures(&custom_file)?;
     let expected_queue_fields = BTreeMap::from([
         ("generation".to_owned(), "u64".to_owned()),
@@ -1170,6 +1323,11 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "RegisteredReplicator",
             "HostedPrimaryReplicator",
             "BuildRuntime",
+            "PodRuntime",
+            "RuntimeDataPlane",
+            "RuntimeHost",
+            "HostAccessView",
+            "OpenAttempt",
         ],
     )?;
     reject_aggregate_signatures(&hosting_file)?;
@@ -1188,8 +1346,15 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         )
         .collect::<BTreeSet<_>>();
     let expected_signature_sites = names(&[
+        "custom::AcceptedAccessTransaction::into_effect",
         "custom::BuildQueueAdmission::new",
+        "custom::CustomReplicatorHost::active_host",
         "custom::CustomReplicatorHost::bind_build_cancellation",
+        "custom::CustomReplicatorHost::host",
+        "custom::CustomReplicatorHost::new",
+        "custom::ReplicatorLifecycleRegistration::from_wiring",
+        "custom::ReplicatorLifecycleRegistration::managed",
+        "custom::ReplicatorLifecycleRegistration::service",
         "hosting::BuildRuntime::cancellation",
         "hosting::BuildRuntimeCancellation::new",
         "hosting::PodRuntime::build_attempt_runtime",
@@ -1436,11 +1601,7 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
     );
     let host_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/host");
     let mut module_signature_sites = BTreeSet::new();
-    for entry in fs::read_dir(&host_root).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-            continue;
-        }
+    for path in production_rust_files(&host_root) {
         let source = fs::read_to_string(&path).unwrap();
         assert!(
             !source.contains("ReplicatorLifecycleHost"),
@@ -1454,7 +1615,7 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
             continue;
         }
         let file = syn::parse_file(&source).unwrap();
-        let file_name = path.file_name().unwrap().to_string_lossy();
+        let file_name = path.strip_prefix(&host_root).unwrap().to_string_lossy();
         module_signature_sites.extend(
             capability_signature_sites(&file)
                 .into_iter()
@@ -1463,6 +1624,19 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
     }
     let expected_module_signature_sites = names(&[
         "report.rs::AgentReporter::report",
+        "service.rs::AgentService::new",
+        "testing.rs::InProcessTransport::register",
+        "testing.rs::fn admit_lifecycle_authority",
+        "testing.rs::fn build_generation",
+        "testing.rs::fn cancel_build_attempt",
+        "testing.rs::fn close_lifecycle",
+        "testing.rs::fn describe_peer",
+        "testing.rs::fn execute_build",
+        "testing.rs::fn execute_build_with_copy",
+        "testing.rs::fn outbound",
+        "testing.rs::fn register_lifecycle_peer_session",
+        "testing.rs::fn set_lifecycle_access",
+        "testing.rs::fn wait_for_lifecycle_catch_up",
         "transport.rs::BuildDispatchCancellation::new",
         "transport.rs::GrpcOutboundDispatcher::new",
         "transport.rs::fn deliver_outbound_with_runtime",
@@ -1472,6 +1646,7 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
         "transport.rs::fn run_peer_discovery",
         "transport.rs::fn spawn_delivery_worker",
         "transport.rs::fn spawn_outbound_worker",
+        "transport.rs::fn testing_cancel_build_dispatch",
     ]);
     assert_eq!(module_signature_sites, expected_module_signature_sites);
 }
@@ -1746,4 +1921,34 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         validate(&lifecycle, &custom, &nested_signature_consumer),
         "fn nested_view_consumer",
     );
+
+    let universal_effect_facade = format!(
+        "{hosting}\nstruct UniversalEffectFacade {{ host: Arc<RuntimeHost> }}\nimpl UniversalEffectFacade {{ async fn execute(&self, effect: RuntimeEffect) -> Result<RuntimeEffectExecution> {{ self.host.prepare_effect(effect).await }} }}\n"
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &universal_effect_facade),
+        "UniversalEffectFacade",
+    );
+
+    let aliased_broker = format!(
+        "{hosting}\nuse self::BuildRuntime as B;\nuse self::ReportRuntime as R;\nuse self::OutboundRuntime as O;\nstruct RenamedBroker {{ build: B, report: R, outbound: O }}\n"
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &aliased_broker),
+        "RenamedBroker",
+    );
+
+    let broad_report = format!(
+        "{report}\nasync fn additional_report_worker(runtime: &crate::host::hosting::PodRuntime) {{ runtime.abort(); }}\n"
+    );
+    let broad_report = syn::parse_file(&broad_report).unwrap();
+    let report_sites = capability_signature_sites(&broad_report);
+    let result = if report_sites == expected_report_sites {
+        Ok(())
+    } else {
+        Err(format!(
+            "report capability consumer inventory changed: {report_sites:#?}"
+        ))
+    };
+    assert_rejected(result, "fn additional_report_worker");
 }

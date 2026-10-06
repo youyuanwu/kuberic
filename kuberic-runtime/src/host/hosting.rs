@@ -1275,21 +1275,8 @@ impl RuntimeDataPlane {
         &self,
         acknowledgement: proto::ReplicationAck,
     ) -> Result<()> {
-        let session = acknowledgement.receiver_session_id.clone();
-        let acknowledgement = replication_ack_from_proto(acknowledgement)?;
-        if !session.is_empty() {
-            return self
-                .host
-                .streams()?
-                .observe_acknowledgement(
-                    acknowledgement,
-                    crate::protocol::types::ProcessSessionId::new(session),
-                )
-                .await;
-        }
         self.host
-            .streams()?
-            .accept_acknowledgement(acknowledgement)
+            .accept_replication_acknowledgement(acknowledgement)
             .await
     }
 
@@ -1522,8 +1509,7 @@ impl BuildHost for RuntimeHost {
     }
 
     async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()> {
-        self.streams()?
-            .accept_acknowledgement(replication_ack_from_proto(acknowledgement)?)
+        self.accept_replication_acknowledgement(acknowledgement)
             .await
     }
 }
@@ -1581,8 +1567,7 @@ impl PeerDiscoveryHost for RuntimeHost {
     }
 
     async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()> {
-        self.streams()?
-            .accept_acknowledgement(replication_ack_from_proto(acknowledgement)?)
+        self.accept_replication_acknowledgement(acknowledgement)
             .await
     }
 
@@ -1864,6 +1849,25 @@ impl Drop for OpenAttempt<'_> {
 impl RuntimeHost {
     fn streams(&self) -> Result<Arc<dyn ManagedReplicatorDataPlane>> {
         self.managed_data_plane()
+    }
+    async fn accept_replication_acknowledgement(
+        &self,
+        acknowledgement: proto::ReplicationAck,
+    ) -> Result<()> {
+        let session = acknowledgement.receiver_session_id.clone();
+        let acknowledgement = replication_ack_from_proto(acknowledgement)?;
+        if !session.is_empty() {
+            return self
+                .streams()?
+                .observe_acknowledgement(
+                    acknowledgement,
+                    crate::protocol::types::ProcessSessionId::new(session),
+                )
+                .await;
+        }
+        self.streams()?
+            .accept_acknowledgement(acknowledgement)
+            .await
     }
     fn process_lifecycle(&self) -> Result<lifecycle::ProcessRuntime> {
         self.registered
