@@ -370,6 +370,9 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "report_lifecycle",
             "evidence_runtime",
             "effect_evidence_runtime",
+            "build_runtime",
+            "build_cancellation",
+            "outbound_runtime",
         ],
     )?;
     assert_shape(
@@ -436,6 +439,37 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         &[("inner", "Arc<dynLifecycleObservation>")],
         &["refresh_progress", "postcondition"],
     )?;
+    assert_shape(
+        &lifecycle_file,
+        "BuildLifecycleRuntime",
+        &[("inner", "Arc<dynBuildLifecycle>"), ("managed", "bool")],
+        &[
+            "is_managed",
+            "admit_authority",
+            "retire",
+            "cancel",
+            "wait_for_completion",
+            "build_replica",
+            "remove_replica",
+            "select",
+            "execute",
+            "accept",
+            "enqueue",
+            "confirm",
+        ],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "BuildCancellationRuntime",
+        &[("inner", "Arc<dynBuildLifecycle>")],
+        &["generation", "cancel_attempt"],
+    )?;
+    assert_shape(
+        &lifecycle_file,
+        "OutboundLifecycleRuntime",
+        &[("inner", "Arc<dynOutboundLifecycle>")],
+        &["next"],
+    )?;
 
     let custom_file =
         syn::parse_file(custom).map_err(|error| format!("parse custom host: {error}"))?;
@@ -444,9 +478,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "managed",
         "service",
         "registration",
-        "is_managed",
-        "admit_build_authority",
-        "retire_build",
         "wait_for_catch_up",
         "authorize_failover_prefix",
         "prepare_switchover",
@@ -458,19 +489,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         "fence_retirement",
         "complete_retirement",
         "snapshot",
-        "cancel_outbound_build",
-        "cancel_outbound_build_attempt",
-        "build_generation",
-        "next_outbound",
-        "wait_for_build_completion",
-        "build_replica",
-        "remove_replica",
-        "select_build",
-        "execute_build",
-        "accept_build",
-        "enqueue_build",
         "topology_receipt",
-        "confirm_build_completion",
     ]);
     let facade_methods = impl_methods(&custom_file, "ReplicatorLifecycleHost");
     if facade_methods.as_ref() != Some(&expected_facade) {
@@ -479,8 +498,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         ));
     }
     let expected_facade_fields = BTreeMap::from([
-        ("managed".to_owned(), "bool".to_owned()),
-        ("build".to_owned(), "Arc<dynBuildLifecycle>".to_owned()),
         (
             "topology".to_owned(),
             "Arc<dynTopologyLifecycle>".to_owned(),
@@ -488,10 +505,6 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         (
             "observation".to_owned(),
             "Arc<dynLifecycleObservation>".to_owned(),
-        ),
-        (
-            "outbound".to_owned(),
-            "Arc<dynOutboundLifecycle>".to_owned(),
         ),
     ]);
     if struct_fields(&custom_file, "ReplicatorLifecycleHost").as_ref()
@@ -536,6 +549,18 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "effect_evidence".to_owned(),
             "super::lifecycle::EffectEvidenceRuntime".to_owned(),
         ),
+        (
+            "build".to_owned(),
+            "super::lifecycle::BuildLifecycleRuntime".to_owned(),
+        ),
+        (
+            "build_cancellation".to_owned(),
+            "super::lifecycle::BuildCancellationRuntime".to_owned(),
+        ),
+        (
+            "outbound".to_owned(),
+            "super::lifecycle::OutboundLifecycleRuntime".to_owned(),
+        ),
     ]);
     if struct_fields(&custom_file, "ReplicatorLifecycleRegistration").as_ref()
         != Some(&expected_registration_fields)
@@ -558,8 +583,8 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     }
     let queue_cancellation = impl_method(&custom_file, "BuildQueueAdmission", "new")
         .ok_or_else(|| "BuildQueueAdmission::new missing".to_owned())?;
-    if !compact(&queue_cancellation.sig).contains("host:Weak<RuntimeHost>") {
-        return Err("build queue cancellation no longer receives a weak host".into());
+    if !compact(&queue_cancellation.sig).contains("build:Weak<dynBuildLifecycle>") {
+        return Err("build queue cancellation no longer receives a weak build owner".into());
     }
 
     let hosting_file =
@@ -603,6 +628,103 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "partition_report",
             "catch_up_capability",
         ],
+    )?;
+    for (trait_name, expected_methods) in [
+        (
+            "BuildHost",
+            names(&[
+                "is_managed",
+                "describe_peer",
+                "generation",
+                "cancel_attempt",
+                "snapshot",
+                "register_peer_session",
+                "authorize_build",
+                "execute_build",
+                "accept_build",
+                "prepare_copy",
+                "accept_copy_acknowledgement",
+                "accept_acknowledgement",
+            ]),
+        ),
+        (
+            "PeerDiscoveryHost",
+            names(&[
+                "snapshot",
+                "register_peer_session",
+                "observe_secondary_removal_witness",
+                "accept_acknowledgement",
+                "repair_peer",
+            ]),
+        ),
+        ("OutboundHost", names(&["next_outbound", "snapshot"])),
+    ] {
+        let item = hosting_file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Trait(item) if item.ident == trait_name => Some(item),
+                _ => None,
+            })
+            .ok_or_else(|| format!("{trait_name} missing"))?;
+        let methods = item
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TraitItem::Fn(method) => Some(method.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if compact(&item.supertraits) != "Send+Sync" || methods != expected_methods {
+            return Err(format!("{trait_name} capability budget changed"));
+        }
+    }
+    assert_shape(
+        &hosting_file,
+        "BuildRuntime",
+        &[("inner", "Arc<dynBuildHost>")],
+        &[
+            "describe_peer",
+            "generation",
+            "cancel_attempt",
+            "snapshot",
+            "register_peer_session",
+            "authorize_build",
+            "prepare_copy",
+            "accept_copy_acknowledgement",
+            "accept_acknowledgement",
+            "execute_admitted_build",
+        ],
+    )?;
+    assert_shape(
+        &hosting_file,
+        "BuildRuntimeCancellation",
+        &[
+            (
+                "decision",
+                "Option<tokio::sync::oneshot::Sender<BuildCancellationDecision>>",
+            ),
+            ("completion", "tokio::task::JoinHandle<Result<()>>"),
+        ],
+        &["new", "finish"],
+    )?;
+    assert_shape(
+        &hosting_file,
+        "PeerDiscoveryRuntime",
+        &[("inner", "Arc<dynPeerDiscoveryHost>")],
+        &[
+            "snapshot",
+            "register_peer_session",
+            "observe_secondary_removal_witness",
+            "accept_acknowledgement",
+            "repair_peer",
+        ],
+    )?;
+    assert_shape(
+        &hosting_file,
+        "OutboundRuntime",
+        &[("inner", "Arc<dynOutboundHost>")],
+        &["next_outbound", "snapshot"],
     )?;
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
@@ -653,6 +775,18 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "Option<lifecycle::EffectEvidenceRuntime>".to_owned(),
         ),
         (
+            "build_lifecycle".to_owned(),
+            "Option<lifecycle::BuildLifecycleRuntime>".to_owned(),
+        ),
+        (
+            "build_cancellation".to_owned(),
+            "Option<lifecycle::BuildCancellationRuntime>".to_owned(),
+        ),
+        (
+            "outbound_lifecycle".to_owned(),
+            "Option<lifecycle::OutboundLifecycleRuntime>".to_owned(),
+        ),
+        (
             "managed_data_plane".to_owned(),
             "Option<Arc<dynManagedReplicatorDataPlane>>".to_owned(),
         ),
@@ -662,29 +796,14 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "registered lifecycle field inventory changed: {registered_fields:#?}"
         ));
     }
-    let expected_cancellation_fields = BTreeMap::from([
-        (
-            "decision".to_owned(),
-            "Option<tokio::sync::oneshot::Sender<BuildCancellationDecision>>".to_owned(),
-        ),
-        (
-            "completion".to_owned(),
-            "tokio::task::JoinHandle<Result<()>>".to_owned(),
-        ),
-    ]);
-    if struct_fields(&hosting_file, "ExactBuildCancellation").as_ref()
-        != Some(&expected_cancellation_fields)
-    {
-        return Err("exact build cancellation capture changed".into());
-    }
-    let exact_cancellation = impl_method(&hosting_file, "ExactBuildCancellation", "new")
-        .ok_or_else(|| "ExactBuildCancellation::new missing".to_owned())?;
+    let exact_cancellation = impl_method(&hosting_file, "BuildRuntimeCancellation", "new")
+        .ok_or_else(|| "BuildRuntimeCancellation::new missing".to_owned())?;
     let cancellation_body = compact(&exact_cancellation.block);
-    if cancellation_body.matches("Arc::downgrade(host)").count() != 1
-        || cancellation_body.contains("Arc::clone(host)")
-        || cancellation_body.contains("host.clone()")
+    if cancellation_body.contains("RuntimeHost")
+        || cancellation_body.contains("PodRuntime")
+        || cancellation_body.contains(".lifecycle")
     {
-        return Err("exact build cancellation captured a broad host owner".into());
+        return Err("build runtime cancellation captured a broad owner".into());
     }
 
     let actual_consumers = transition_consumers(hosting)?
@@ -692,28 +811,12 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         .chain(transition_consumers(custom)?)
         .collect::<BTreeSet<_>>();
     let expected_consumers = names(&[
-        "BuildQueueAdmission::new",
-        "ExactBuildCancellation::new",
-        "HostedPrimaryReplicator::build_replica",
-        "HostedPrimaryReplicator::remove_replica",
-        "PodRuntime::authorize_build",
-        "PodRuntime::build_generation",
-        "PodRuntime::cancel_outbound_build",
-        "PodRuntime::cancel_outbound_build_attempt",
-        "PodRuntime::execute_admitted_build",
-        "PodRuntime::next_outbound",
-        "PodRuntime::observe_secondary_removal_witness",
-        "PodRuntime::primary_replicator",
         "PodRuntime::reconstruct",
-        "PodRuntime::reissue_outbound_build",
         "PodRuntime::restore_accepted_removal",
         "PodRuntime::testing_wait_for_catch_up",
-        "PodRuntime::wait_for_build_completion",
         "RegisteredReplicator::lifecycle",
-        "RuntimeDataPlane::next_outbound",
-        "RuntimeHost::consume_cancelled_build_effect",
         "RuntimeHost::lifecycle",
-        "RuntimeHost::observe_build_completion",
+        "RuntimeHost::observe_secondary_removal_witness",
         "RuntimeHost::prepare_effect",
         "RuntimeHost::register_interfaces",
         "RuntimeHost::snapshot",
@@ -733,6 +836,7 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
     let custom = source("src/host/custom.rs");
     let hosting = source("src/host/hosting.rs");
     let report = source("src/host/report.rs");
+    let transport = source("src/host/transport.rs");
     validate(&lifecycle, &custom, &hosting).unwrap();
 
     assert!(hosting.contains("#[path = \"lifecycle.rs\"]\nmod lifecycle;"));
@@ -740,6 +844,22 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
         report.contains("use crate::host::hosting::ReportRuntime;")
             && !report.contains("use crate::host::hosting::PodRuntime;")
             && report.contains("report(&self, runtime: &ReportRuntime)")
+    );
+    let transport_file = syn::parse_file(&transport).unwrap();
+    assert_eq!(
+        struct_fields(&transport_file, "GrpcOutboundDispatcher")
+            .unwrap()
+            .get("runtime")
+            .map(String::as_str),
+        Some("BuildRuntime")
+    );
+    let dispatch_cancellation =
+        impl_method(&transport_file, "BuildDispatchCancellation", "new").unwrap();
+    assert!(compact(&dispatch_cancellation.sig).contains("runtime:BuildRuntime"));
+    assert_eq!(
+        transport.matches("PodRuntime").count(),
+        2,
+        "only the cfg(test) cancellation helper may retain PodRuntime"
     );
     let host_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/host");
     for entry in fs::read_dir(&host_root).unwrap() {
@@ -797,8 +917,8 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     assert!(validate(&lifecycle, &universal_getter, &hosting).is_err());
 
     let broad_cancellation = hosting.replace(
-        "struct ExactBuildCancellation {\n",
-        "struct ExactBuildCancellation {\n    host: Weak<RuntimeHost>,\n",
+        "struct BuildRuntimeCancellation {\n",
+        "struct BuildRuntimeCancellation {\n    host: Arc<RuntimeHost>,\n",
     );
     assert!(validate(&lifecycle, &custom, &broad_cancellation).is_err());
 
@@ -845,8 +965,8 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
     assert!(validate(&lifecycle, &custom, &direct_field_consumer).is_err());
 
     let broad_closure_capture = hosting.replace(
-        "        let host = Arc::downgrade(host);\n",
-        "        let broad_host = host.clone();\n        let host = Arc::downgrade(host);\n",
+        "    fn new(runtime: BuildRuntime, build_id: OperationId, generation: u64) -> Self {\n",
+        "    fn new(runtime: BuildRuntime, build_id: OperationId, generation: u64) -> Self {\n        let broad_host: Option<Arc<RuntimeHost>> = None;\n",
     );
     assert!(validate(&lifecycle, &custom, &broad_closure_capture).is_err());
 

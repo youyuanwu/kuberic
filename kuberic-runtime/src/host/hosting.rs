@@ -150,6 +150,9 @@ struct RegisteredReplicator {
     report_lifecycle: Option<lifecycle::ReportLifecycle>,
     lifecycle_evidence: Option<lifecycle::EvidenceRuntime>,
     effect_evidence: Option<lifecycle::EffectEvidenceRuntime>,
+    build_lifecycle: Option<lifecycle::BuildLifecycleRuntime>,
+    build_cancellation: Option<lifecycle::BuildCancellationRuntime>,
+    outbound_lifecycle: Option<lifecycle::OutboundLifecycleRuntime>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
@@ -163,7 +166,7 @@ enum ReplicatorCreationState {
 struct HostedPrimaryReplicator {
     inner: Arc<dyn PrimaryReplicator>,
     process_lifecycle: lifecycle::ProcessRuntime,
-    lifecycle: Arc<custom::ReplicatorLifecycleHost>,
+    build_lifecycle: lifecycle::BuildLifecycleRuntime,
 }
 
 #[async_trait]
@@ -236,11 +239,11 @@ impl PrimaryReplicator for HostedPrimaryReplicator {
     }
 
     async fn build_replica(&self, replica: crate::replicator::ReplicaInformation) -> Result<()> {
-        self.lifecycle.build_replica(replica).await
+        self.build_lifecycle.build_replica(replica).await
     }
 
     async fn remove_replica(&self, replica_id: crate::protocol::types::ReplicaId) -> Result<()> {
-        self.lifecycle.remove_replica(replica_id).await
+        self.build_lifecycle.remove_replica(replica_id).await
     }
 }
 
@@ -274,6 +277,15 @@ impl RegisteredReplicator {
     }
     fn effect_evidence(&self) -> Option<lifecycle::EffectEvidenceRuntime> {
         self.effect_evidence.clone()
+    }
+    fn build_lifecycle(&self) -> Option<lifecycle::BuildLifecycleRuntime> {
+        self.build_lifecycle.clone()
+    }
+    fn build_cancellation(&self) -> Option<lifecycle::BuildCancellationRuntime> {
+        self.build_cancellation.clone()
+    }
+    fn outbound_lifecycle(&self) -> Option<lifecycle::OutboundLifecycleRuntime> {
+        self.outbound_lifecycle.clone()
     }
     fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary.clone()
@@ -309,47 +321,9 @@ pub(crate) struct PodRuntime {
     host: Arc<RuntimeHost>,
 }
 
-struct ExactBuildCancellation {
-    decision: Option<tokio::sync::oneshot::Sender<BuildCancellationDecision>>,
-    completion: tokio::task::JoinHandle<Result<()>>,
-}
-
 enum BuildCancellationDecision {
     Commit,
     Cancel { public_cleanup: bool },
-}
-
-impl ExactBuildCancellation {
-    fn new(host: &Arc<RuntimeHost>, build_id: OperationId, generation: u64) -> Self {
-        let host = Arc::downgrade(host);
-        let (decision, completion) = tokio::sync::oneshot::channel();
-        let completion = tokio::spawn(async move {
-            let public_cleanup = match completion.await {
-                Ok(BuildCancellationDecision::Commit) => return Ok(()),
-                Ok(BuildCancellationDecision::Cancel { public_cleanup }) => public_cleanup,
-                Err(_) => true,
-            };
-            let Some(host) = host.upgrade() else {
-                return Ok(());
-            };
-            host.lifecycle()?
-                .cancel_outbound_build_attempt(&build_id, generation, public_cleanup)
-                .await
-        });
-        Self {
-            decision: Some(decision),
-            completion,
-        }
-    }
-
-    async fn finish(mut self, decision: BuildCancellationDecision) -> Result<()> {
-        if let Some(sender) = self.decision.take() {
-            let _ = sender.send(decision);
-        }
-        self.completion
-            .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
-    }
 }
 
 #[derive(Clone)]
@@ -403,6 +377,280 @@ impl ReportRuntime {
 
     pub(crate) async fn catch_up_capability(&self) -> Result<i64> {
         self.inner.catch_up_capability().await
+    }
+}
+
+#[async_trait]
+trait BuildHost: Send + Sync {
+    fn is_managed(&self) -> bool;
+    async fn describe_peer(&self, replica: crate::replicator::ReplicaInformation) -> Result<()>;
+    async fn generation(&self, build_id: &OperationId) -> Result<u64>;
+    async fn cancel_attempt(
+        &self,
+        build_id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()>;
+    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: crate::protocol::types::ProcessSessionId,
+    ) -> Result<()>;
+    async fn authorize_build(
+        &self,
+        build_id: OperationId,
+        target: ReplicaIdentity,
+        configuration: BuildConfiguration,
+    ) -> Result<BuildAuthority>;
+    async fn execute_build(
+        &self,
+        replica: crate::replicator::ReplicaInformation,
+    ) -> Result<Option<custom::BuildAdmission>>;
+    async fn accept_build(&self, receipt: Option<custom::BuildAdmission>) -> Result<()>;
+    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy>;
+    async fn accept_copy_acknowledgement(&self, acknowledgement: proto::CopyAck) -> Result<()>;
+    async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()>;
+}
+
+#[derive(Clone)]
+pub(crate) struct BuildRuntime {
+    inner: Arc<dyn BuildHost>,
+}
+
+impl BuildRuntime {
+    pub(crate) async fn describe_peer(
+        &self,
+        replica: crate::replicator::ReplicaInformation,
+    ) -> Result<()> {
+        self.inner.describe_peer(replica).await
+    }
+
+    pub(crate) async fn generation(&self, build_id: &OperationId) -> Result<u64> {
+        self.inner.generation(build_id).await
+    }
+
+    pub(crate) async fn cancel_attempt(
+        &self,
+        build_id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()> {
+        self.inner
+            .cancel_attempt(build_id, generation, public_cleanup)
+            .await
+    }
+
+    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
+        self.inner.snapshot().await
+    }
+
+    pub(crate) async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: crate::protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        self.inner.register_peer_session(identity, session).await
+    }
+
+    pub(crate) async fn authorize_build(
+        &self,
+        build_id: OperationId,
+        target: ReplicaIdentity,
+        configuration: BuildConfiguration,
+    ) -> Result<BuildAuthority> {
+        self.inner
+            .authorize_build(build_id, target, configuration)
+            .await
+    }
+
+    pub(crate) async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        self.inner.prepare_copy(request).await
+    }
+
+    pub(crate) async fn accept_copy_acknowledgement(
+        &self,
+        acknowledgement: proto::CopyAck,
+    ) -> Result<()> {
+        self.inner
+            .accept_copy_acknowledgement(acknowledgement)
+            .await
+    }
+
+    pub(crate) async fn accept_acknowledgement(
+        &self,
+        acknowledgement: proto::ReplicationAck,
+    ) -> Result<()> {
+        self.inner.accept_acknowledgement(acknowledgement).await
+    }
+
+    pub(crate) async fn execute_admitted_build<F, Fut, E>(
+        &self,
+        replica: crate::replicator::ReplicaInformation,
+        managed_copy: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<(), E>>,
+        E: From<RuntimeError>,
+    {
+        let generation = self.generation(&replica.build_id).await.map_err(E::from)?;
+        let cancellation =
+            BuildRuntimeCancellation::new(self.clone(), replica.build_id.clone(), generation);
+        let (result, public_cleanup) = if self.inner.is_managed() {
+            (
+                async {
+                    let execution =
+                        async { self.inner.execute_build(replica).await.map_err(E::from) };
+                    let (receipt, ()) = tokio::try_join!(execution, managed_copy())?;
+                    self.inner.accept_build(receipt).await.map_err(E::from)
+                }
+                .await,
+                true,
+            )
+        } else {
+            match self.inner.execute_build(replica).await {
+                Ok(receipt) => (
+                    self.inner.accept_build(receipt).await.map_err(E::from),
+                    true,
+                ),
+                Err(error) => (Err(E::from(error)), false),
+            }
+        };
+        match result {
+            Ok(()) => {
+                cancellation
+                    .finish(BuildCancellationDecision::Commit)
+                    .await?;
+                Ok(())
+            }
+            Err(error) => {
+                cancellation
+                    .finish(BuildCancellationDecision::Cancel { public_cleanup })
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+}
+
+struct BuildRuntimeCancellation {
+    decision: Option<tokio::sync::oneshot::Sender<BuildCancellationDecision>>,
+    completion: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl BuildRuntimeCancellation {
+    fn new(runtime: BuildRuntime, build_id: OperationId, generation: u64) -> Self {
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let completion = tokio::spawn(async move {
+            let public_cleanup = match completion.await {
+                Ok(BuildCancellationDecision::Commit) => return Ok(()),
+                Ok(BuildCancellationDecision::Cancel { public_cleanup }) => public_cleanup,
+                Err(_) => true,
+            };
+            match runtime
+                .cancel_attempt(&build_id, generation, public_cleanup)
+                .await
+            {
+                Err(RuntimeError::Closed) => Ok(()),
+                result => result,
+            }
+        });
+        Self {
+            decision: Some(decision),
+            completion,
+        }
+    }
+
+    async fn finish<E>(mut self, decision: BuildCancellationDecision) -> std::result::Result<(), E>
+    where
+        E: From<RuntimeError>,
+    {
+        if let Some(sender) = self.decision.take() {
+            let _ = sender.send(decision);
+        }
+        self.completion
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .map_err(E::from)
+    }
+}
+
+#[async_trait]
+trait PeerDiscoveryHost: Send + Sync {
+    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: crate::protocol::types::ProcessSessionId,
+    ) -> Result<()>;
+    async fn observe_secondary_removal_witness(
+        &self,
+        witness: crate::protocol::types::SecondaryRemovalWitness,
+        committed: Option<crate::protocol::types::SecondaryScaleDownCleanup>,
+    ) -> Result<()>;
+    async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()>;
+    async fn repair_peer(&self, identity: ReplicaIdentity, progress: i64) -> Result<()>;
+}
+
+#[derive(Clone)]
+pub(crate) struct PeerDiscoveryRuntime {
+    inner: Arc<dyn PeerDiscoveryHost>,
+}
+
+impl PeerDiscoveryRuntime {
+    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
+        self.inner.snapshot().await
+    }
+
+    pub(crate) async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: crate::protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        self.inner.register_peer_session(identity, session).await
+    }
+
+    pub(crate) async fn observe_secondary_removal_witness(
+        &self,
+        witness: crate::protocol::types::SecondaryRemovalWitness,
+        committed: Option<crate::protocol::types::SecondaryScaleDownCleanup>,
+    ) -> Result<()> {
+        self.inner
+            .observe_secondary_removal_witness(witness, committed)
+            .await
+    }
+
+    pub(crate) async fn accept_acknowledgement(
+        &self,
+        acknowledgement: proto::ReplicationAck,
+    ) -> Result<()> {
+        self.inner.accept_acknowledgement(acknowledgement).await
+    }
+
+    pub(crate) async fn repair_peer(&self, identity: ReplicaIdentity, progress: i64) -> Result<()> {
+        self.inner.repair_peer(identity, progress).await
+    }
+}
+
+#[async_trait]
+trait OutboundHost: Send + Sync {
+    async fn next_outbound(&self) -> Option<OutboundOperation>;
+    async fn snapshot(&self) -> RuntimeSnapshot;
+}
+
+#[derive(Clone)]
+pub(crate) struct OutboundRuntime {
+    inner: Arc<dyn OutboundHost>,
+}
+
+impl OutboundRuntime {
+    pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
+        self.inner.next_outbound().await
+    }
+
+    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
+        self.inner.snapshot().await
     }
 }
 
@@ -573,73 +821,16 @@ impl PodRuntime {
             .map_err(|_| RuntimeError::AuthorityNotAdmitted)
     }
 
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn authorize_build(
         &self,
         build_id: crate::protocol::types::OperationId,
         target: ReplicaIdentity,
         configuration: BuildConfiguration,
     ) -> Result<BuildAuthority> {
-        let lifecycle = self.host.lifecycle()?;
-        let snapshot = self.snapshot().await;
-        let (kind, current_configuration) = match configuration {
-            BuildConfiguration::Current => {
-                let authority = snapshot
-                    .authority
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                let kind = if authority
-                    .current_configuration
-                    .members
-                    .iter()
-                    .any(|member| member.identity == target)
-                    || authority.transition_kind
-                        == Some(crate::protocol::types::TransitionKind::Failover)
-                {
-                    BuildAuthorityKind::Failover
-                } else {
-                    BuildAuthorityKind::Provisioning
-                };
-                (kind, authority.current_configuration)
-            }
-            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
-            BuildConfiguration::Bootstrap(configuration) => {
-                (BuildAuthorityKind::Bootstrap, configuration)
-            }
-        };
-        if let Some(existing) = self
-            .host
-            .default_dependencies
-            .build_authority_store
-            .load_build(&build_id)
-            .await?
-        {
-            if existing.kind != kind
-                || existing.source != self.host.identity
-                || existing.target != target
-                || existing.current_configuration != current_configuration
-            {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "build ID is already bound to different exact authority".into(),
-                ));
-            }
-            lifecycle.select_build(&existing).await?;
-            return Ok(existing);
-        }
-        let authority = BuildAuthority {
-            build_id,
-            kind,
-            source: self.host.identity.clone(),
-            target,
-            current_configuration,
-            replication_boundary_lsn: snapshot.committed_lsn,
-        };
-        authority.validate()?;
         self.host
-            .default_dependencies
-            .build_authority_store
-            .admit_build(&authority)
-            .await?;
-        lifecycle.select_build(&authority).await?;
-        Ok(authority)
+            .authorize_build(build_id, target, configuration)
+            .await
     }
 
     pub(crate) async fn reconstruct(
@@ -882,40 +1073,42 @@ impl PodRuntime {
         }
     }
 
+    pub(crate) fn build_runtime(&self) -> BuildRuntime {
+        BuildRuntime {
+            inner: self.host.clone(),
+        }
+    }
+
+    pub(crate) fn peer_discovery_runtime(&self) -> PeerDiscoveryRuntime {
+        PeerDiscoveryRuntime {
+            inner: self.host.clone(),
+        }
+    }
+
+    pub(crate) fn outbound_runtime(&self) -> OutboundRuntime {
+        OutboundRuntime {
+            inner: self.host.clone(),
+        }
+    }
+
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn primary_replicator(&self) -> Result<Arc<dyn PrimaryReplicator>> {
         let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
         let primary = registered.primary().ok_or(RuntimeError::NotPrimary)?;
-        match registered.lifecycle() {
-            Some(lifecycle) => Ok(Arc::new(HostedPrimaryReplicator {
+        match registered.build_lifecycle() {
+            Some(build_lifecycle) => Ok(Arc::new(HostedPrimaryReplicator {
                 inner: primary,
                 process_lifecycle: registered
                     .process_lifecycle()
                     .ok_or(RuntimeError::NotPrimary)?,
-                lifecycle,
+                build_lifecycle,
             })),
             None => Ok(primary),
         }
     }
 
     pub(crate) async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
-        self.host.lifecycle()?.cancel_outbound_build(build_id).await
-    }
-
-    pub(crate) async fn cancel_outbound_build_attempt(
-        &self,
-        build_id: &OperationId,
-        generation: u64,
-        public_cleanup: bool,
-    ) -> Result<()> {
-        self.host
-            .lifecycle()?
-            .cancel_outbound_build_attempt(build_id, generation, public_cleanup)
-            .await
-    }
-
-    pub(crate) async fn build_generation(&self, build_id: &OperationId) -> Result<u64> {
-        Ok(self.host.lifecycle()?.build_generation(build_id).await)
+        self.host.build_lifecycle()?.cancel(build_id).await
     }
 
     pub(crate) async fn wait_for_build_completion(
@@ -924,8 +1117,8 @@ impl PodRuntime {
         target: &ReplicaIdentity,
     ) -> Result<()> {
         self.host
-            .lifecycle()?
-            .wait_for_build_completion(build_id, target)
+            .build_lifecycle()?
+            .wait_for_completion(build_id, target)
             .await
     }
 
@@ -949,8 +1142,8 @@ impl PodRuntime {
         target: ReplicaIdentity,
         replication_address: String,
     ) -> Result<()> {
-        let lifecycle = self.host.lifecycle()?;
-        let snapshot = lifecycle.snapshot().await;
+        let build = self.host.build_lifecycle()?;
+        let snapshot = self.host.lifecycle_evidence()?.snapshot().await;
         if snapshot.builds.iter().any(|build| {
             build.authority.build_id == build_id
                 && build.authority.target == target
@@ -959,8 +1152,8 @@ impl PodRuntime {
         }) {
             return Ok(());
         }
-        lifecycle
-            .enqueue_build(ReplicaEndpoint {
+        build
+            .enqueue(ReplicaEndpoint {
                 build_id,
                 identity: target,
                 replication_address,
@@ -969,6 +1162,7 @@ impl PodRuntime {
         Ok(())
     }
 
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn repair_peer(&self, identity: ReplicaIdentity, progress: i64) -> Result<()> {
         self.host
             .managed_data_plane()?
@@ -987,6 +1181,7 @@ impl PodRuntime {
             .await
     }
 
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn describe_peer(
         &self,
         replica: crate::replicator::ReplicaInformation,
@@ -994,6 +1189,7 @@ impl PodRuntime {
         self.host.peer_lifecycle()?.describe_peer(replica).await
     }
 
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn execute_admitted_build<F, Fut, E>(
         &self,
         replica: crate::replicator::ReplicaInformation,
@@ -1004,75 +1200,9 @@ impl PodRuntime {
         Fut: Future<Output = std::result::Result<(), E>>,
         E: From<RuntimeError>,
     {
-        let lifecycle = self.host.lifecycle().map_err(E::from)?;
-        let managed = lifecycle.is_managed();
-        let generation = lifecycle.build_generation(&replica.build_id).await;
-        let cancellation =
-            ExactBuildCancellation::new(&self.host, replica.build_id.clone(), generation);
-        let (result, public_cleanup) = if managed {
-            (
-                async {
-                    let execution =
-                        async { lifecycle.execute_build(replica).await.map_err(E::from) };
-                    let (receipt, ()) = tokio::try_join!(execution, managed_copy())?;
-                    lifecycle.accept_build(receipt).await.map_err(E::from)
-                }
-                .await,
-                true,
-            )
-        } else {
-            match lifecycle.execute_build(replica).await {
-                Ok(receipt) => (lifecycle.accept_build(receipt).await.map_err(E::from), true),
-                Err(error) => (Err(E::from(error)), false),
-            }
-        };
-        match result {
-            Ok(()) => {
-                cancellation
-                    .finish(BuildCancellationDecision::Commit)
-                    .await
-                    .map_err(E::from)?;
-                Ok(())
-            }
-            Err(error) => {
-                cancellation
-                    .finish(BuildCancellationDecision::Cancel { public_cleanup })
-                    .await
-                    .map_err(E::from)?;
-                Err(error)
-            }
-        }
-    }
-
-    pub(crate) async fn next_outbound(&self) -> Option<OutboundOperation> {
-        let registered = self.host.registered.get()?;
-        match (registered.lifecycle(), registered.managed_data_plane()) {
-            (Some(lifecycle), Some(data_plane)) => {
-                tokio::select! {
-                    item = lifecycle.next_outbound() => item,
-                    item = data_plane.next_outbound_item() => item,
-                }
-            }
-            (Some(lifecycle), None) => lifecycle.next_outbound().await,
-            (None, Some(data_plane)) => data_plane.next_outbound_item().await,
-            (None, None) => None,
-        }
-    }
-
-    pub(crate) async fn observe_secondary_removal_witness(
-        &self,
-        witness: crate::protocol::types::SecondaryRemovalWitness,
-        committed: Option<crate::protocol::types::SecondaryScaleDownCleanup>,
-    ) -> Result<()> {
-        let lifecycle = self.host.lifecycle()?;
-        match committed {
-            Some(committed) => {
-                lifecycle
-                    .observe_secondary_removal_progress(witness, committed)
-                    .await
-            }
-            None => lifecycle.observe_secondary_removal(witness).await,
-        }
+        self.build_runtime()
+            .execute_admitted_build(replica, managed_copy)
+            .await
     }
 
     pub(crate) async fn partition_report(&self) -> PartitionReportSnapshot {
@@ -1102,6 +1232,7 @@ impl RuntimeDataPlane {
         })
     }
 
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn accept_acknowledgement(
         &self,
         acknowledgement: proto::ReplicationAck,
@@ -1137,6 +1268,7 @@ impl RuntimeDataPlane {
         })
     }
 
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn accept_copy_acknowledgement(&self, ack: proto::CopyAck) -> Result<()> {
         self.host
             .streams()?
@@ -1171,14 +1303,17 @@ impl RuntimeDataPlane {
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) async fn next_outbound(&self) -> Option<OutboundReplication> {
         let registered = self.host.registered.get()?;
-        let outbound = match (registered.lifecycle(), registered.managed_data_plane()) {
-            (Some(lifecycle), Some(data_plane)) => {
+        let outbound = match (
+            registered.outbound_lifecycle(),
+            registered.managed_data_plane(),
+        ) {
+            (Some(outbound), Some(data_plane)) => {
                 tokio::select! {
-                    item = lifecycle.next_outbound() => item,
+                    item = outbound.next() => item,
                     item = data_plane.next_outbound_item() => item,
                 }
             }
-            (Some(lifecycle), None) => lifecycle.next_outbound().await,
+            (Some(outbound), None) => outbound.next().await,
             (None, Some(data_plane)) => data_plane.next_outbound_item().await,
             (None, None) => None,
         }?;
@@ -1284,6 +1419,159 @@ impl ReportHost for RuntimeHost {
             .ok_or(RuntimeError::NotOpen)?
             .catch_up_capability()
             .await
+    }
+}
+
+#[async_trait]
+impl BuildHost for RuntimeHost {
+    fn is_managed(&self) -> bool {
+        self.registered
+            .get()
+            .and_then(RegisteredReplicator::build_lifecycle)
+            .is_some_and(|build| build.is_managed())
+    }
+
+    async fn describe_peer(&self, replica: crate::replicator::ReplicaInformation) -> Result<()> {
+        self.peer_lifecycle()?.describe_peer(replica).await
+    }
+
+    async fn generation(&self, build_id: &OperationId) -> Result<u64> {
+        Ok(self.build_cancellation()?.generation(build_id).await)
+    }
+
+    async fn cancel_attempt(
+        &self,
+        build_id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()> {
+        self.build_cancellation()?
+            .cancel_attempt(build_id, generation, public_cleanup)
+            .await
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        RuntimeHost::snapshot(self).await
+    }
+
+    async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: crate::protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        self.peer_lifecycle()?
+            .register_peer_session(identity, session)
+            .await
+    }
+
+    async fn authorize_build(
+        &self,
+        build_id: OperationId,
+        target: ReplicaIdentity,
+        configuration: BuildConfiguration,
+    ) -> Result<BuildAuthority> {
+        RuntimeHost::authorize_build(self, build_id, target, configuration).await
+    }
+
+    async fn execute_build(
+        &self,
+        replica: crate::replicator::ReplicaInformation,
+    ) -> Result<Option<custom::BuildAdmission>> {
+        self.build_lifecycle()?.execute(replica).await
+    }
+
+    async fn accept_build(&self, receipt: Option<custom::BuildAdmission>) -> Result<()> {
+        self.build_lifecycle()?.accept(receipt).await
+    }
+
+    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        RuntimeDataPlane {
+            host: self.weak_self.upgrade().ok_or(RuntimeError::Closed)?,
+        }
+        .prepare_copy(request)
+        .await
+    }
+
+    async fn accept_copy_acknowledgement(&self, acknowledgement: proto::CopyAck) -> Result<()> {
+        self.streams()?
+            .accept_copy_acknowledgement(copy_ack_from_proto(acknowledgement)?)
+            .await
+    }
+
+    async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()> {
+        self.streams()?
+            .accept_acknowledgement(replication_ack_from_proto(acknowledgement)?)
+            .await
+    }
+}
+
+#[async_trait]
+impl PeerDiscoveryHost for RuntimeHost {
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        RuntimeHost::snapshot(self).await
+    }
+
+    async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: crate::protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        self.peer_lifecycle()?
+            .register_peer_session(identity, session)
+            .await
+    }
+
+    async fn observe_secondary_removal_witness(
+        &self,
+        witness: crate::protocol::types::SecondaryRemovalWitness,
+        committed: Option<crate::protocol::types::SecondaryScaleDownCleanup>,
+    ) -> Result<()> {
+        let lifecycle = self.lifecycle()?;
+        match committed {
+            Some(committed) => {
+                lifecycle
+                    .observe_secondary_removal_progress(witness, committed)
+                    .await
+            }
+            None => lifecycle.observe_secondary_removal(witness).await,
+        }
+    }
+
+    async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()> {
+        self.streams()?
+            .accept_acknowledgement(replication_ack_from_proto(acknowledgement)?)
+            .await
+    }
+
+    async fn repair_peer(&self, identity: ReplicaIdentity, progress: i64) -> Result<()> {
+        self.managed_data_plane()?
+            .repair_peer(identity, progress)
+            .await
+    }
+}
+
+#[async_trait]
+impl OutboundHost for RuntimeHost {
+    async fn next_outbound(&self) -> Option<OutboundOperation> {
+        let registered = self.registered.get()?;
+        match (
+            registered.outbound_lifecycle(),
+            registered.managed_data_plane(),
+        ) {
+            (Some(outbound), Some(data_plane)) => {
+                tokio::select! {
+                    item = outbound.next() => item,
+                    item = data_plane.next_outbound_item() => item,
+                }
+            }
+            (Some(outbound), None) => outbound.next().await,
+            (None, Some(data_plane)) => data_plane.next_outbound_item().await,
+            (None, None) => None,
+        }
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        RuntimeHost::snapshot(self).await
     }
 }
 
@@ -1445,6 +1733,9 @@ impl ReplicatorRegistration for RuntimeHost {
             report_lifecycle,
             lifecycle_evidence,
             effect_evidence,
+            build_lifecycle,
+            build_cancellation,
+            outbound_lifecycle,
         ) = match lifecycle_registration {
             Some(registration) => (
                 Some(registration.lifecycle),
@@ -1456,8 +1747,13 @@ impl ReplicatorRegistration for RuntimeHost {
                 Some(registration.report),
                 Some(registration.evidence),
                 Some(registration.effect_evidence),
+                Some(registration.build),
+                Some(registration.build_cancellation),
+                Some(registration.outbound),
             ),
-            None => (None, None, None, None, None, None, None, None, None),
+            None => (
+                None, None, None, None, None, None, None, None, None, None, None, None,
+            ),
         };
         let mut creation = self.replicator_creation.lock().map_err(|_| {
             RuntimeError::Application("replicator creation state was poisoned".into())
@@ -1486,6 +1782,9 @@ impl ReplicatorRegistration for RuntimeHost {
                 report_lifecycle,
                 lifecycle_evidence,
                 effect_evidence,
+                build_lifecycle,
+                build_cancellation,
+                outbound_lifecycle,
                 managed_data_plane,
             })
             .map_err(|_| {
@@ -1581,6 +1880,28 @@ impl RuntimeHost {
                 )
             })
     }
+    fn build_lifecycle(&self) -> Result<lifecycle::BuildLifecycleRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .build_lifecycle()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose build lifecycle capabilities".into(),
+                )
+            })
+    }
+    fn build_cancellation(&self) -> Result<lifecycle::BuildCancellationRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .build_cancellation()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose build cancellation capabilities".into(),
+                )
+            })
+    }
     fn lifecycle(&self) -> Result<Arc<custom::ReplicatorLifecycleHost>> {
         self.registered
             .get()
@@ -1613,6 +1934,73 @@ impl RuntimeHost {
             registered.abort();
         }
         self.application.abort();
+    }
+
+    async fn authorize_build(
+        &self,
+        build_id: OperationId,
+        target: ReplicaIdentity,
+        configuration: BuildConfiguration,
+    ) -> Result<BuildAuthority> {
+        let build = self.build_lifecycle()?;
+        let snapshot = self.snapshot().await;
+        let (kind, current_configuration) = match configuration {
+            BuildConfiguration::Current => {
+                let authority = snapshot
+                    .authority
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let kind = if authority
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == target)
+                    || authority.transition_kind
+                        == Some(crate::protocol::types::TransitionKind::Failover)
+                {
+                    BuildAuthorityKind::Failover
+                } else {
+                    BuildAuthorityKind::Provisioning
+                };
+                (kind, authority.current_configuration)
+            }
+            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+            BuildConfiguration::Bootstrap(configuration) => {
+                (BuildAuthorityKind::Bootstrap, configuration)
+            }
+        };
+        if let Some(existing) = self
+            .default_dependencies
+            .build_authority_store
+            .load_build(&build_id)
+            .await?
+        {
+            if existing.kind != kind
+                || existing.source != self.identity
+                || existing.target != target
+                || existing.current_configuration != current_configuration
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "build ID is already bound to different exact authority".into(),
+                ));
+            }
+            build.select(&existing).await?;
+            return Ok(existing);
+        }
+        let authority = BuildAuthority {
+            build_id,
+            kind,
+            source: self.identity.clone(),
+            target,
+            current_configuration,
+            replication_boundary_lsn: snapshot.committed_lsn,
+        };
+        authority.validate()?;
+        self.default_dependencies
+            .build_authority_store
+            .admit_build(&authority)
+            .await?;
+        build.select(&authority).await?;
+        Ok(authority)
     }
 
     async fn prepare_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectExecution> {
@@ -1737,8 +2125,8 @@ impl RuntimeHost {
                 target,
                 replication_address,
             } => {
-                self.lifecycle()?
-                    .enqueue_build(ReplicaEndpoint {
+                self.build_lifecycle()?
+                    .enqueue(ReplicaEndpoint {
                         build_id,
                         identity: target,
                         replication_address,
@@ -1753,7 +2141,7 @@ impl RuntimeHost {
                     .await;
             }
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
-                self.lifecycle()?.admit_build_authority(*authority).await?;
+                self.build_lifecycle()?.admit_authority(*authority).await?;
             }
             RuntimeEffectAction::RegisterPeerSession { identity, session } => {
                 self.peer_lifecycle()?
@@ -1761,7 +2149,7 @@ impl RuntimeHost {
                     .await?;
             }
             RuntimeEffectAction::RetireBuild(build_id) => {
-                self.lifecycle()?.retire_build(build_id).await?;
+                self.build_lifecycle()?.retire(build_id).await?;
             }
             RuntimeEffectAction::SetAccessStatus { read, write } => {
                 if let Some(access) = self
@@ -1984,7 +2372,7 @@ impl RuntimeHost {
                 }
             }
         }
-        self.lifecycle()?.cancel_outbound_build(build_id).await?;
+        self.build_lifecycle()?.cancel(build_id).await?;
         let snapshot = self.snapshot().await;
         if snapshot
             .builds
@@ -2057,8 +2445,7 @@ impl RuntimeHost {
                 sequence: effect.sequence,
             });
         }
-        let lifecycle = self.lifecycle()?;
-        let confirmation = lifecycle.confirm_build_completion(build_id, target).await?;
+        let confirmation = self.build_lifecycle()?.confirm(build_id, target).await?;
         let result = RuntimeEffectResult {
             operation_id: effect.operation_id.clone(),
             sequence: effect.sequence,

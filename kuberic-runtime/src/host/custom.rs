@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use crate::authority::{AdmittedAuthority, BuildAuthority, BuildSelection, DurableBuildProgress};
 use crate::effects::{
@@ -112,14 +112,13 @@ pub(super) struct BuildCompletionConfirmation {
 }
 
 impl BuildQueueAdmission {
-    fn new(host: Weak<RuntimeHost>, build_id: OperationId, generation: u64) -> Self {
+    fn new(build: Weak<dyn BuildLifecycle>, build_id: OperationId, generation: u64) -> Self {
         let (decision, completion) = oneshot::channel();
         let completion = tokio::spawn(async move {
             if completion.await != Ok(true)
-                && let Some(host) = host.upgrade()
-                && let Ok(lifecycle) = host.lifecycle()
+                && let Some(build) = build.upgrade()
             {
-                let _ = lifecycle
+                let _ = build
                     .cancel_outbound_build_attempt(&build_id, generation, false)
                     .await;
             }
@@ -353,7 +352,7 @@ type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConf
 
 struct ManagedLifecycleBackend {
     legacy: Arc<dyn ManagedReplicatorLifecycle>,
-    common: CustomReplicatorHost,
+    common: Arc<CustomReplicatorHost>,
     accepted_builds: RwLock<BTreeMap<OperationId, AcceptedBuild>>,
     topology_receipt: RwLock<Option<TopologyReceipt>>,
 }
@@ -1355,11 +1354,8 @@ impl ManagedLifecycleBackend {
 }
 
 pub(super) struct ReplicatorLifecycleHost {
-    managed: bool,
-    build: Arc<dyn BuildLifecycle>,
     topology: Arc<dyn TopologyLifecycle>,
     observation: Arc<dyn LifecycleObservation>,
-    outbound: Arc<dyn OutboundLifecycle>,
 }
 
 pub(super) struct ReplicatorLifecycleRegistration {
@@ -1372,6 +1368,9 @@ pub(super) struct ReplicatorLifecycleRegistration {
     pub(super) report: super::lifecycle::ReportLifecycle,
     pub(super) evidence: super::lifecycle::EvidenceRuntime,
     pub(super) effect_evidence: super::lifecycle::EffectEvidenceRuntime,
+    pub(super) build: super::lifecycle::BuildLifecycleRuntime,
+    pub(super) build_cancellation: super::lifecycle::BuildCancellationRuntime,
+    pub(super) outbound: super::lifecycle::OutboundLifecycleRuntime,
 }
 
 impl ReplicatorLifecycleHost {
@@ -1381,12 +1380,15 @@ impl ReplicatorLifecycleHost {
         primary: Arc<dyn PrimaryReplicator>,
         lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
     ) -> ReplicatorLifecycleRegistration {
+        let common = Arc::new(CustomReplicatorHost::new(host, control, primary, false));
         let backend = Arc::new(ManagedLifecycleBackend {
             legacy: lifecycle,
-            common: CustomReplicatorHost::new(host, control, primary, false),
+            common: common.clone(),
             accepted_builds: RwLock::default(),
             topology_receipt: RwLock::default(),
         });
+        let build: Arc<dyn BuildLifecycle> = backend.clone();
+        common.bind_build_cancellation(Arc::downgrade(&build));
         Self::registration(LifecycleWiring::new(backend), true)
     }
 
@@ -1396,6 +1398,8 @@ impl ReplicatorLifecycleHost {
         primary: Arc<dyn PrimaryReplicator>,
     ) -> ReplicatorLifecycleRegistration {
         let backend = Arc::new(CustomReplicatorHost::new(host, control, primary, true));
+        let build: Arc<dyn BuildLifecycle> = backend.clone();
+        backend.bind_build_cancellation(Arc::downgrade(&build));
         Self::registration(LifecycleWiring::new(backend), false)
     }
 
@@ -1408,12 +1412,12 @@ impl ReplicatorLifecycleHost {
         let report = wiring.report_lifecycle();
         let evidence = wiring.evidence_runtime();
         let effect_evidence = wiring.effect_evidence_runtime();
+        let build = wiring.build_runtime(managed);
+        let build_cancellation = wiring.build_cancellation();
+        let outbound = wiring.outbound_runtime();
         let lifecycle = Arc::new(Self {
-            managed,
-            build: wiring.build,
             topology: wiring.topology,
             observation: wiring.observation,
-            outbound: wiring.outbound,
         });
         ReplicatorLifecycleRegistration {
             lifecycle,
@@ -1425,19 +1429,10 @@ impl ReplicatorLifecycleHost {
             report,
             evidence,
             effect_evidence,
+            build,
+            build_cancellation,
+            outbound,
         }
-    }
-
-    pub(super) fn is_managed(&self) -> bool {
-        self.managed
-    }
-
-    pub(super) async fn admit_build_authority(&self, authority: BuildAuthority) -> Result<()> {
-        self.build.admit_build_authority(authority).await
-    }
-
-    pub(super) async fn retire_build(&self, build_id: OperationId) -> Result<()> {
-        self.build.retire_build(build_id).await
     }
 
     pub(super) async fn wait_for_catch_up(&self) -> Result<()> {
@@ -1531,87 +1526,11 @@ impl ReplicatorLifecycleHost {
         self.observation.snapshot().await
     }
 
-    pub(super) async fn cancel_outbound_build(&self, id: &OperationId) -> Result<()> {
-        let generation = self.build.build_generation(id).await;
-        let build = self.build.clone();
-        let id = id.clone();
-        tokio::spawn(async move { build.cancel_outbound_build(&id, generation).await })
-            .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
-    }
-
-    pub(super) async fn cancel_outbound_build_attempt(
-        &self,
-        id: &OperationId,
-        generation: u64,
-        public_cleanup: bool,
-    ) -> Result<()> {
-        self.build
-            .cancel_outbound_build_attempt(id, generation, public_cleanup)
-            .await
-    }
-
-    pub(super) async fn build_generation(&self, id: &OperationId) -> u64 {
-        self.build.build_generation(id).await
-    }
-
-    pub(super) async fn next_outbound(&self) -> Option<OutboundOperation> {
-        self.outbound.next_outbound().await
-    }
-
-    pub(super) async fn wait_for_build_completion(
-        &self,
-        build_id: &OperationId,
-        target: &ReplicaIdentity,
-    ) -> Result<()> {
-        self.build.wait_for_build_completion(build_id, target).await
-    }
-
-    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
-    pub(super) async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.build.build_replica(replica).await
-    }
-
-    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
-    pub(super) async fn remove_replica(
-        &self,
-        replica_id: crate::protocol::types::ReplicaId,
-    ) -> Result<()> {
-        self.build.remove_replica(replica_id).await
-    }
-
-    pub(super) async fn select_build(&self, authority: &BuildAuthority) -> Result<()> {
-        self.build.select_build(authority).await
-    }
-
-    pub(super) async fn execute_build(
-        &self,
-        replica: ReplicaInformation,
-    ) -> Result<Option<BuildAdmission>> {
-        self.build.execute_build(replica).await
-    }
-
-    pub(super) async fn accept_build(&self, receipt: Option<BuildAdmission>) -> Result<()> {
-        self.build.accept_build(receipt).await
-    }
-
-    pub(super) async fn enqueue_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
-        self.build.enqueue_build(endpoint).await
-    }
-
     pub(super) async fn topology_receipt(
         &self,
         action: &RuntimeEffectAction,
     ) -> Option<TopologyReceipt> {
         self.topology.topology_receipt(action).await
-    }
-
-    pub(super) async fn confirm_build_completion(
-        &self,
-        build_id: &OperationId,
-        target: &ReplicaIdentity,
-    ) -> Result<BuildCompletionConfirmation> {
-        self.build.confirm_build_completion(build_id, target).await
     }
 }
 
@@ -1630,6 +1549,7 @@ pub(super) struct CustomReplicatorHost {
     build_generations: RwLock<BTreeMap<OperationId, u64>>,
     cancelling_builds: RwLock<BTreeMap<OperationId, u64>>,
     build_cleanup_locks: Mutex<BTreeMap<OperationId, Arc<Mutex<()>>>>,
+    build_cancellation: OnceLock<Weak<dyn BuildLifecycle>>,
     pending_builds: RwLock<BTreeMap<OperationId, ReplicaEndpoint>>,
     receipts: RwLock<BTreeMap<OperationId, BuildAdmission>>,
     configuration: Arc<RwLock<Option<ReplicaSetConfiguration>>>,
@@ -1679,6 +1599,7 @@ impl CustomReplicatorHost {
             build_generations: RwLock::default(),
             cancelling_builds: RwLock::default(),
             build_cleanup_locks: Mutex::default(),
+            build_cancellation: OnceLock::new(),
             pending_builds: RwLock::default(),
             receipts: RwLock::default(),
             configuration: Arc::new(RwLock::default()),
@@ -1696,6 +1617,12 @@ impl CustomReplicatorHost {
             receiver: Mutex::new(receiver),
             changed: Notify::new(),
         }
+    }
+
+    fn bind_build_cancellation(&self, build: Weak<dyn BuildLifecycle>) {
+        self.build_cancellation
+            .set(build)
+            .expect("build cancellation owner is bound once");
     }
 
     fn host(&self) -> Result<Arc<RuntimeHost>> {
@@ -2886,8 +2813,13 @@ impl CustomReplicatorHost {
             .ok_or(RuntimeError::OperationCancelled)?;
         let attempt_generation = *generation;
         pending.insert(endpoint.build_id.clone(), endpoint.clone());
+        let build = self
+            .build_cancellation
+            .get()
+            .cloned()
+            .ok_or(RuntimeError::Closed)?;
         Ok(Some(BuildQueueAdmission::new(
-            self.host.clone(),
+            build,
             endpoint.build_id.clone(),
             attempt_generation,
         )))

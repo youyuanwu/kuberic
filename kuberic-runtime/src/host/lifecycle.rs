@@ -224,6 +224,25 @@ impl LifecycleWiring {
             inner: self.observation.clone(),
         }
     }
+
+    pub(super) fn build_runtime(&self, managed: bool) -> BuildLifecycleRuntime {
+        BuildLifecycleRuntime {
+            inner: self.build.clone(),
+            managed,
+        }
+    }
+
+    pub(super) fn build_cancellation(&self) -> BuildCancellationRuntime {
+        BuildCancellationRuntime {
+            inner: self.build.clone(),
+        }
+    }
+
+    pub(super) fn outbound_runtime(&self) -> OutboundLifecycleRuntime {
+        OutboundLifecycleRuntime {
+            inner: self.outbound.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -301,6 +320,116 @@ impl PeerRuntime {
 
     pub(super) async fn describe_peer(&self, replica: ReplicaInformation) -> Result<()> {
         self.inner.describe_peer(replica).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct BuildLifecycleRuntime {
+    inner: Arc<dyn BuildLifecycle>,
+    managed: bool,
+}
+
+impl BuildLifecycleRuntime {
+    pub(super) fn is_managed(&self) -> bool {
+        self.managed
+    }
+
+    pub(super) async fn admit_authority(&self, authority: BuildAuthority) -> Result<()> {
+        self.inner.admit_build_authority(authority).await
+    }
+
+    pub(super) async fn retire(&self, build_id: OperationId) -> Result<()> {
+        self.inner.retire_build(build_id).await
+    }
+
+    pub(super) async fn cancel(&self, id: &OperationId) -> Result<()> {
+        let generation = self.inner.build_generation(id).await;
+        let build = self.inner.clone();
+        let id = id.clone();
+        tokio::spawn(async move { build.cancel_outbound_build(&id, generation).await })
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
+    }
+
+    pub(super) async fn wait_for_completion(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<()> {
+        self.inner.wait_for_build_completion(build_id, target).await
+    }
+
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+    pub(super) async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        self.inner.build_replica(replica).await
+    }
+
+    #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+    pub(super) async fn remove_replica(
+        &self,
+        replica_id: crate::protocol::types::ReplicaId,
+    ) -> Result<()> {
+        self.inner.remove_replica(replica_id).await
+    }
+
+    pub(super) async fn select(&self, authority: &BuildAuthority) -> Result<()> {
+        self.inner.select_build(authority).await
+    }
+
+    pub(super) async fn execute(
+        &self,
+        replica: ReplicaInformation,
+    ) -> Result<Option<BuildAdmission>> {
+        self.inner.execute_build(replica).await
+    }
+
+    pub(super) async fn accept(&self, receipt: Option<BuildAdmission>) -> Result<()> {
+        self.inner.accept_build(receipt).await
+    }
+
+    pub(super) async fn enqueue(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        self.inner.enqueue_build(endpoint).await
+    }
+
+    pub(super) async fn confirm(
+        &self,
+        build_id: &OperationId,
+        target: &ReplicaIdentity,
+    ) -> Result<BuildCompletionConfirmation> {
+        self.inner.confirm_build_completion(build_id, target).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct BuildCancellationRuntime {
+    inner: Arc<dyn BuildLifecycle>,
+}
+
+impl BuildCancellationRuntime {
+    pub(super) async fn generation(&self, id: &OperationId) -> u64 {
+        self.inner.build_generation(id).await
+    }
+
+    pub(super) async fn cancel_attempt(
+        &self,
+        id: &OperationId,
+        generation: u64,
+        public_cleanup: bool,
+    ) -> Result<()> {
+        self.inner
+            .cancel_outbound_build_attempt(id, generation, public_cleanup)
+            .await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct OutboundLifecycleRuntime {
+    inner: Arc<dyn OutboundLifecycle>,
+}
+
+impl OutboundLifecycleRuntime {
+    pub(super) async fn next(&self) -> Option<OutboundOperation> {
+        self.inner.next_outbound().await
     }
 }
 
