@@ -87,7 +87,7 @@ enum AccessCommit {
     Direct,
     Durable {
         host: Weak<RuntimeHost>,
-        applied: AppliedEffect,
+        applied: Box<AppliedEffect>,
     },
 }
 
@@ -148,7 +148,7 @@ impl AccessCommit {
                 .write()
                 .await
                 .effects
-                .insert(applied.result.sequence, applied);
+                .insert(applied.result.sequence, *applied);
         }
     }
 }
@@ -214,7 +214,10 @@ impl AcceptedAccessEffect {
             #[cfg(test)]
             observer_gate,
         } = self;
-        let decision = AccessDecision::Commit(AccessCommit::Durable { host, applied });
+        let decision = AccessDecision::Commit(AccessCommit::Durable {
+            host,
+            applied: Box::new(applied),
+        });
         let _ = transaction.decision.send(decision);
         #[cfg(test)]
         if let Some(gate) = observer_gate {
