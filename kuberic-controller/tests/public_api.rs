@@ -35,6 +35,8 @@ fn controller_exports_observation_and_evaluation_contracts() {
             replicas: 1,
             image: "example/db:latest".into(),
             failover_delay_seconds: 30,
+            placement: None,
+            primary_balancing: None,
             switchover: None,
         },
     );
@@ -50,6 +52,9 @@ fn controller_exports_observation_and_evaluation_contracts() {
         pvcs: Vec::new(),
         services: Vec::new(),
         secrets: Vec::new(),
+        nodes: Vec::new(),
+        cluster_sets: Vec::new(),
+        cluster_pods: Vec::new(),
         agents: BTreeMap::new(),
         exact_resources: Vec::new(),
         failures: Vec::new(),

@@ -86,3 +86,6 @@ See also [secondary scale-down usage and conditions](../docs/features/kuberic/le
 See [sequential scale-up usage and diagnostics](../docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
 for fresh-incarnation restoration, write-availability boundaries, failover,
 cleanup, and limitations.
+See [topology-aware placement and primary balancing](../docs/features/kuberic/topology-placement.md)
+for compact `spec.placement`, `spec.primaryBalancing`, placement diagnostics,
+and the intentionally deferred V1 placement items.

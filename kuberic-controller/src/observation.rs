@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{Node, PersistentVolumeClaim, Pod, Secret, Service};
 use kuberic_runtime::control::proto;
 use kuberic_runtime::protocol::observation::ReplicaObservationKey;
 use kuberic_runtime::protocol::types::{ReplicaCleanupIdentity, ReplicaIdentity};
@@ -22,6 +22,9 @@ pub struct RawObservation {
     pub pvcs: Vec<PersistentVolumeClaim>,
     pub services: Vec<Service>,
     pub secrets: Vec<Secret>,
+    pub nodes: Vec<Node>,
+    pub cluster_sets: Vec<KubericSet>,
+    pub cluster_pods: Vec<Pod>,
     pub agents: BTreeMap<ReplicaObservationKey, RawAgentObservation>,
     pub exact_resources: Vec<RawScaleDownResources>,
     pub failures: Vec<RawObservationFailure>,

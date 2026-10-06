@@ -9,7 +9,10 @@ use tokio::sync::Mutex;
 use crate::cluster_api::ClusterApi;
 use crate::executor::{ExecutionKind, ExecutionOutcome, execute_plan};
 use crate::normalize::{normalize, report_watermarks};
+use crate::plan::Plan;
 use crate::{ControllerError, Result};
+use kuberic_runtime::protocol::command::KubernetesChange;
+use kuberic_runtime::protocol::types::AcceptedStatus;
 
 type Watermarks = BTreeMap<ReplicaObservationKey, ReportWatermark>;
 
@@ -54,7 +57,26 @@ impl Reconciler {
             .lock()
             .await
             .insert(key.clone(), next_watermarks);
-        let plan = evaluate(&snapshot, &self.evaluation);
+        let plan = project_placement_conditions(&raw, evaluate(&snapshot, &self.evaluation));
+        if plan_allows_auto_balance(&plan, &snapshot.status)
+            && let Some(request) = crate::primary_balancing::plan_primary_balance(&raw, &snapshot)
+        {
+            match self.api.patch_switchover(&raw, &request).await {
+                Ok(()) => {
+                    return Ok(ReconcileAction {
+                        requeue_after: Duration::ZERO,
+                        kind: ReconcileKind::Applied,
+                    });
+                }
+                Err(ControllerError::ObservationStale) => {
+                    return Ok(ReconcileAction {
+                        requeue_after: Duration::ZERO,
+                        kind: ReconcileKind::ObservationStale,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let outcome = match execute_plan(self.api.as_ref(), &raw, &snapshot, plan).await {
             Ok(outcome) => outcome,
             Err(ControllerError::ObservationStale) => {
@@ -99,6 +121,51 @@ impl Reconciler {
         };
         Ok(action(outcome))
     }
+}
+
+fn project_placement_conditions(raw: &crate::observation::RawObservation, plan: Plan) -> Plan {
+    match plan {
+        Plan::Stable {
+            status,
+            requeue_after_seconds,
+        } => Plan::Stable {
+            status: crate::placement::project_conditions(raw, status),
+            requeue_after_seconds,
+        },
+        Plan::Wait {
+            reason,
+            status,
+            requeue_after_seconds,
+        } => Plan::Wait {
+            reason,
+            status: crate::placement::project_conditions(raw, status),
+            requeue_after_seconds,
+        },
+        Plan::Unsafe {
+            reason,
+            status,
+            safety_changes,
+            requeue_after_seconds,
+        } => Plan::Unsafe {
+            reason,
+            status: crate::placement::project_conditions(raw, status),
+            safety_changes,
+            requeue_after_seconds,
+        },
+        Plan::Apply { mut changes } => {
+            for change in &mut changes {
+                if let KubernetesChange::PersistStatus { status } = change {
+                    **status = crate::placement::project_conditions(raw, (**status).clone());
+                }
+            }
+            Plan::Apply { changes }
+        }
+        Plan::Execute { command } => Plan::Execute { command },
+    }
+}
+
+fn plan_allows_auto_balance(plan: &Plan, current: &AcceptedStatus) -> bool {
+    matches!(plan, Plan::Stable { status, .. } if status == current)
 }
 
 fn merge_watermarks(mut previous: Watermarks, observed: Watermarks) -> Watermarks {

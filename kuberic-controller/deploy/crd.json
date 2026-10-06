@@ -51,6 +51,100 @@
                     "minLength": 1,
                     "type": "string"
                   },
+                  "placement": {
+                    "nullable": true,
+                    "properties": {
+                      "mode": {
+                        "default": "Preferred",
+                        "enum": [
+                          "Preferred",
+                          "Required"
+                        ],
+                        "type": "string"
+                      },
+                      "nodeSelector": {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "type": "object"
+                      },
+                      "tolerations": {
+                        "items": {
+                          "properties": {
+                            "effect": {
+                              "enum": [
+                                "NoSchedule",
+                                "PreferNoSchedule",
+                                "NoExecute",
+                                null
+                              ],
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "key": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "operator": {
+                              "default": "Equal",
+                              "enum": [
+                                "Exists",
+                                "Equal"
+                              ],
+                              "type": "string"
+                            },
+                            "value": {
+                              "nullable": true,
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "topologyKey": {
+                        "default": "kubernetes.io/hostname",
+                        "maxLength": 317,
+                        "minLength": 1,
+                        "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "primaryBalancing": {
+                    "nullable": true,
+                    "properties": {
+                      "cooldownSeconds": {
+                        "default": 300,
+                        "format": "uint64",
+                        "maximum": 86400.0,
+                        "minimum": 30.0,
+                        "type": "integer"
+                      },
+                      "minimumImprovement": {
+                        "default": 1,
+                        "format": "uint32",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      },
+                      "mode": {
+                        "default": "Automatic",
+                        "enum": [
+                          "Automatic"
+                        ],
+                        "type": "string"
+                      },
+                      "topologyKey": {
+                        "default": "kubernetes.io/hostname",
+                        "maxLength": 317,
+                        "minLength": 1,
+                        "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "replicas": {
                     "format": "uint32",
                     "minimum": 1.0,

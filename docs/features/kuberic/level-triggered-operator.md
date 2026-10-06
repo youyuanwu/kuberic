@@ -118,6 +118,12 @@ spec:
 [sequential scale-up](#sequential-scale-up). The desired count is both target
 and minimum by Kuberic policy. `spec.image` selects the application image.
 `spec.failoverDelaySeconds` defaults to 30.
+`spec.placement` configures compact topology-aware scheduling for newly
+created replica Pods, defaulting to preferred self-set hostname anti-affinity.
+`spec.primaryBalancing` opts into automatic planned-switchovers that rebalance
+accepted primaries across observed topology domains. See
+[topology-aware placement and primary balancing](topology-placement.md) for
+the compact schema, diagnostics, safety gates, and V1-deferred items.
 
 Status is controller-owned durable authority. Users must not author or repair
 it manually. Important projections include:

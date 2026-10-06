@@ -5,9 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures::future::join_all;
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, ObjectFieldSelector, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, Pod, PodSecurityContext, PodSpec, Secret, SecretKeySelector,
-    Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    Container, ContainerPort, EnvVar, EnvVarSource, Node, ObjectFieldSelector,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSecurityContext, PodSpec, Secret,
+    SecretKeySelector, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
@@ -30,7 +30,7 @@ use tonic::Code;
 
 use crate::crd::{
     CONTROL_ADDRESS_ANNOTATION, CONTROLLER_NAME, INSTANCE_LABEL, KubericSet, KubericSetStatus,
-    REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL,
+    PlannedSwitchoverRequestSpec, REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL,
 };
 use crate::observation::{
     ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
@@ -66,6 +66,10 @@ pub enum EffectRecord {
     RemoveWriteRouting,
     PublishWriteRouting(ReplicaIdentity),
     Execute(ProtocolCommand),
+    PatchSwitchover {
+        request_id: String,
+        target_replica_id: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +151,12 @@ pub trait ClusterApi: Send + Sync {
         &self,
         observation: &RawObservation,
         status: &AcceptedStatus,
+    ) -> Result<()>;
+
+    async fn patch_switchover(
+        &self,
+        observation: &RawObservation,
+        request: &PlannedSwitchoverRequestSpec,
     ) -> Result<()>;
 
     async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()>;
@@ -338,17 +348,36 @@ where
         let services_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let secrets_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let params = ListParams::default().labels(&selector);
-        let (pods_result, pvcs_result, services_result, secrets_result) = tokio::join!(
+        let all_sets_api: Api<KubericSet> = Api::all(self.client.clone());
+        let all_pods_api: Api<Pod> = Api::all(self.client.clone());
+        let nodes_api: Api<Node> = Api::all(self.client.clone());
+        let all_pods_params = ListParams::default().labels(SET_UID_LABEL);
+        let cluster_params = ListParams::default();
+        let (
+            pods_result,
+            pvcs_result,
+            services_result,
+            secrets_result,
+            nodes_result,
+            cluster_sets_result,
+            cluster_pods_result,
+        ) = tokio::join!(
             pods_api.list(&params),
             pvcs_api.list(&params),
             services_api.list(&params),
-            secrets_api.list(&params)
+            secrets_api.list(&params),
+            nodes_api.list(&cluster_params),
+            all_sets_api.list(&cluster_params),
+            all_pods_api.list(&all_pods_params)
         );
         let mut failures = Vec::new();
         let pods = list_or_failure(pods_result, "pods", &mut failures);
         let pvcs = list_or_failure(pvcs_result, "pvcs", &mut failures);
         let services = list_or_failure(services_result, "services", &mut failures);
         let secrets = list_or_failure(secrets_result, "secrets", &mut failures);
+        let nodes = list_or_failure(nodes_result, "nodes", &mut failures);
+        let cluster_sets = list_or_failure(cluster_sets_result, "cluster-sets", &mut failures);
+        let cluster_pods = list_or_failure(cluster_pods_result, "cluster-pods", &mut failures);
         let resource_uid = ResourceUid::new(uid);
         let mut raw = RawObservation {
             set,
@@ -356,6 +385,9 @@ where
             pvcs,
             services,
             secrets,
+            nodes,
+            cluster_sets,
+            cluster_pods,
             failures,
             agents: BTreeMap::new(),
             exact_resources: Vec::new(),
@@ -852,6 +884,44 @@ where
             .map_err(map_kube_status_error)
     }
 
+    async fn patch_switchover(
+        &self,
+        observation: &RawObservation,
+        request: &PlannedSwitchoverRequestSpec,
+    ) -> Result<()> {
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        let resource_version = observation
+            .set
+            .resource_version()
+            .ok_or(ControllerError::ObservationStale)?;
+        let patch = serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {
+                "switchover": {
+                    "requestId": &request.request_id,
+                    "targetReplicaId": request.target_replica_id,
+                }
+            }
+        });
+        Api::<KubericSet>::namespaced(self.client.clone(), &namespace)
+            .patch(
+                &observation.set.name_any(),
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                kube::Error::Api(response) if matches!(response.code, 409 | 422) => {
+                    ControllerError::ObservationStale
+                }
+                other => ControllerError::Effect(format!("patching switchover: {other}")),
+            })
+    }
+
     async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()> {
         if service_observation_failed(observation) {
             return Err(ControllerError::Observation(
@@ -1343,6 +1413,57 @@ fn replica_pod_named(
             ..Default::default()
         });
     }
+    let mut spec = PodSpec {
+        hostname: Some(pod_name.to_string()),
+        subdomain: Some(format!("{}-peer", set.name_any())),
+        security_context: Some(PodSecurityContext {
+            fs_group: Some(10001),
+            run_as_non_root: Some(true),
+            run_as_user: Some(10001),
+            ..Default::default()
+        }),
+        containers: vec![Container {
+            name: "application".to_string(),
+            image: Some(image.to_string()),
+            image_pull_policy: Some("IfNotPresent".to_string()),
+            ports: Some(vec![
+                ContainerPort {
+                    container_port: CONTROL_PORT,
+                    name: Some("control".to_string()),
+                    ..Default::default()
+                },
+                ContainerPort {
+                    container_port: REPLICATION_PORT,
+                    name: Some("replication".to_string()),
+                    ..Default::default()
+                },
+                ContainerPort {
+                    container_port: 8080,
+                    name: Some("application".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            env: Some(env),
+            volume_mounts: Some(vec![VolumeMount {
+                mount_path: "/var/lib/kuberic".to_string(),
+                name: "data".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }],
+        volumes: Some(vec![Volume {
+            name: "data".to_string(),
+            persistent_volume_claim: Some(
+                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                    claim_name: pvc_name.to_string(),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    crate::placement::apply_pod_spec_placement(set, uid, &mut spec);
     Pod {
         metadata: kube::core::ObjectMeta {
             name: Some(pod_name.to_string()),
@@ -1351,56 +1472,7 @@ fn replica_pod_named(
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
         },
-        spec: Some(PodSpec {
-            hostname: Some(pod_name.to_string()),
-            subdomain: Some(format!("{}-peer", set.name_any())),
-            security_context: Some(PodSecurityContext {
-                fs_group: Some(10001),
-                run_as_non_root: Some(true),
-                run_as_user: Some(10001),
-                ..Default::default()
-            }),
-            containers: vec![Container {
-                name: "application".to_string(),
-                image: Some(image.to_string()),
-                image_pull_policy: Some("IfNotPresent".to_string()),
-                ports: Some(vec![
-                    ContainerPort {
-                        container_port: CONTROL_PORT,
-                        name: Some("control".to_string()),
-                        ..Default::default()
-                    },
-                    ContainerPort {
-                        container_port: REPLICATION_PORT,
-                        name: Some("replication".to_string()),
-                        ..Default::default()
-                    },
-                    ContainerPort {
-                        container_port: 8080,
-                        name: Some("application".to_string()),
-                        ..Default::default()
-                    },
-                ]),
-                env: Some(env),
-                volume_mounts: Some(vec![VolumeMount {
-                    mount_path: "/var/lib/kuberic".to_string(),
-                    name: "data".to_string(),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }],
-            volumes: Some(vec![Volume {
-                name: "data".to_string(),
-                persistent_volume_claim: Some(
-                    k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                        claim_name: pvc_name.to_string(),
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        }),
+        spec: Some(spec),
         ..Default::default()
     }
 }
@@ -2282,6 +2354,12 @@ impl ClusterApi for InMemoryClusterApi {
             .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
         raw.services
             .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
+        if raw.cluster_sets.is_empty() {
+            raw.cluster_sets = vec![raw.set.clone()];
+        }
+        if raw.cluster_pods.is_empty() {
+            raw.cluster_pods = physical.pods.clone();
+        }
         for (target, identity, frozen) in crate::exact_resources::requests(&raw) {
             let pod = memory_lookup(
                 &physical.pods,
@@ -2927,6 +3005,40 @@ impl ClusterApi for InMemoryClusterApi {
         Ok(())
     }
 
+    async fn patch_switchover(
+        &self,
+        observation: &RawObservation,
+        request: &PlannedSwitchoverRequestSpec,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.observation.set.resource_version() != observation.set.resource_version() {
+            return Err(ControllerError::ObservationStale);
+        }
+        state.observation.set.spec.switchover = Some(request.clone());
+        let next = state
+            .observation
+            .set
+            .resource_version()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default()
+            + 1;
+        state.observation.set.metadata.resource_version = Some(next.to_string());
+        state.observation.set.metadata.generation = Some(
+            state
+                .observation
+                .set
+                .metadata
+                .generation
+                .unwrap_or_default()
+                + 1,
+        );
+        state.effects.push(EffectRecord::PatchSwitchover {
+            request_id: request.request_id.clone(),
+            target_replica_id: request.target_replica_id,
+        });
+        Ok(())
+    }
+
     async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()> {
         if service_observation_failed(observation) {
             return Err(ControllerError::Observation(
@@ -3231,7 +3343,10 @@ mod scale_down_fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::KubericSetSpec;
+    use crate::crd::{
+        KubericSetSpec, LabelKey, PlacementMode, PlacementSpec, PlacementTolerationSpec,
+        TolerationEffect, TolerationOperator,
+    };
     use kuberic_runtime::protocol::command::{
         EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
     };
@@ -3249,6 +3364,16 @@ mod tests {
     }
 
     fn replica_environment(set: &KubericSet) -> Vec<EnvVar> {
+        replica_spec(set)
+            .containers
+            .into_iter()
+            .find(|container| container.name == "application")
+            .unwrap()
+            .env
+            .unwrap()
+    }
+
+    fn replica_spec(set: &KubericSet) -> PodSpec {
         let owner = OwnerReference {
             api_version: "operator.kuberic.io/v1alpha1".to_string(),
             kind: "KubericSet".to_string(),
@@ -3268,12 +3393,6 @@ mod tests {
             None,
         )
         .spec
-        .unwrap()
-        .containers
-        .into_iter()
-        .find(|container| container.name == "application")
-        .unwrap()
-        .env
         .unwrap()
     }
 
@@ -3486,6 +3605,8 @@ mod tests {
                     replicas: 2,
                     image: "example/db:latest".to_string(),
                     failover_delay_seconds: 30,
+                    placement: None,
+                    primary_balancing: None,
                     switchover: None,
                 },
             ),
@@ -3493,6 +3614,9 @@ mod tests {
             pvcs: Vec::new(),
             services: Vec::new(),
             secrets: Vec::new(),
+            nodes: Vec::new(),
+            cluster_sets: Vec::new(),
+            cluster_pods: Vec::new(),
             agents,
             failures: Vec::new(),
             now_unix_seconds: 0,
@@ -3653,6 +3777,8 @@ mod tests {
                 replicas: 3,
                 image: "kvstore2:test".to_string(),
                 failover_delay_seconds: 10,
+                placement: None,
+                primary_balancing: None,
                 switchover: None,
             },
         );
@@ -3671,6 +3797,8 @@ mod tests {
                 replicas: 3,
                 image: "kvstore2:test".to_string(),
                 failover_delay_seconds: 10,
+                placement: None,
+                primary_balancing: None,
                 switchover: None,
             },
         );
@@ -3686,5 +3814,126 @@ mod tests {
                 .and_then(|variable| variable.value.as_deref()),
             Some(LIVE_TEST_COPY_GATE_ADDRESS)
         );
+    }
+
+    #[test]
+    fn default_replica_pod_has_preferred_self_set_hostname_spread() {
+        let set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                placement: None,
+                primary_balancing: None,
+                switchover: None,
+            },
+        );
+        let spec = replica_spec(&set);
+        let preferred = spec
+            .affinity
+            .unwrap()
+            .pod_anti_affinity
+            .unwrap()
+            .preferred_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].weight, 100);
+        assert_eq!(
+            preferred[0].pod_affinity_term.topology_key,
+            "kubernetes.io/hostname"
+        );
+        assert_eq!(
+            preferred[0]
+                .pod_affinity_term
+                .label_selector
+                .as_ref()
+                .and_then(|selector| selector.match_labels.as_ref())
+                .and_then(|labels| labels.get(SET_UID_LABEL))
+                .map(String::as_str),
+            Some("set-uid")
+        );
+    }
+
+    #[test]
+    fn required_replica_pod_has_hard_self_set_spread_and_topology_node_affinity() {
+        let mut set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                placement: Some(PlacementSpec {
+                    mode: PlacementMode::Required,
+                    topology_key: LabelKey::hostname(),
+                    ..Default::default()
+                }),
+                primary_balancing: None,
+                switchover: None,
+            },
+        );
+        set.metadata.uid = Some("set-uid".to_string());
+        let spec = replica_spec(&set);
+        let affinity = spec.affinity.unwrap();
+        let required = affinity
+            .pod_anti_affinity
+            .unwrap()
+            .required_during_scheduling_ignored_during_execution
+            .unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].topology_key, "kubernetes.io/hostname");
+        assert_eq!(
+            required[0]
+                .label_selector
+                .as_ref()
+                .and_then(|selector| selector.match_labels.as_ref())
+                .and_then(|labels| labels.get(SET_UID_LABEL))
+                .map(String::as_str),
+            Some("set-uid")
+        );
+        let node_terms = affinity
+            .node_affinity
+            .unwrap()
+            .required_during_scheduling_ignored_during_execution
+            .unwrap()
+            .node_selector_terms;
+        assert_eq!(node_terms.len(), 1);
+        let expression = &node_terms[0].match_expressions.as_ref().unwrap()[0];
+        assert_eq!(expression.key, "kubernetes.io/hostname");
+        assert_eq!(expression.operator, "Exists");
+    }
+
+    #[test]
+    fn placement_node_selector_and_tolerations_are_passed_to_replica_pod() {
+        let set = KubericSet::new(
+            "kvstore2",
+            KubericSetSpec {
+                replicas: 3,
+                image: "kvstore2:test".to_string(),
+                failover_delay_seconds: 10,
+                placement: Some(PlacementSpec {
+                    node_selector: BTreeMap::from([("pool".to_string(), "storage".to_string())]),
+                    tolerations: vec![PlacementTolerationSpec {
+                        key: Some("dedicated".to_string()),
+                        operator: TolerationOperator::Equal,
+                        value: Some("storage".to_string()),
+                        effect: Some(TolerationEffect::NoSchedule),
+                    }],
+                    ..Default::default()
+                }),
+                primary_balancing: None,
+                switchover: None,
+            },
+        );
+        let spec = replica_spec(&set);
+        assert_eq!(
+            spec.node_selector.unwrap().get("pool").map(String::as_str),
+            Some("storage")
+        );
+        let toleration = &spec.tolerations.unwrap()[0];
+        assert_eq!(toleration.key.as_deref(), Some("dedicated"));
+        assert_eq!(toleration.operator.as_deref(), Some("Equal"));
+        assert_eq!(toleration.value.as_deref(), Some("storage"));
+        assert_eq!(toleration.effect.as_deref(), Some("NoSchedule"));
     }
 }

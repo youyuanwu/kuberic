@@ -23,7 +23,9 @@ mod exact_resources;
 pub mod executor;
 pub mod normalize;
 pub mod observation;
+mod placement;
 pub mod plan;
+pub mod primary_balancing;
 pub mod reconciler;
 
 pub use error::{ControllerError, Result};

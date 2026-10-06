@@ -54,6 +54,8 @@ fn raw(replicas: u32) -> RawObservation {
             replicas,
             image: "example/db:latest".to_string(),
             failover_delay_seconds: 9,
+            placement: None,
+            primary_balancing: None,
             switchover: None,
         },
     );
@@ -68,6 +70,9 @@ fn raw(replicas: u32) -> RawObservation {
         pvcs: Vec::new(),
         services: vec![peer_service()],
         secrets: vec![credential_secret()],
+        nodes: Vec::new(),
+        cluster_sets: Vec::new(),
+        cluster_pods: Vec::new(),
         agents: BTreeMap::new(),
         failures: Vec::new(),
         now_unix_seconds: 100,

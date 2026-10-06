@@ -1,7 +1,10 @@
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
 use kube::CustomResource;
 use kuberic_runtime::protocol::types::AcceptedStatus;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const API_GROUP: &str = "operator.kuberic.io";
 pub const API_VERSION: &str = "v1alpha1";
@@ -12,6 +15,7 @@ pub const INSTANCE_LABEL: &str = "operator.kuberic.io/instance";
 pub const CONTROL_ADDRESS_ANNOTATION: &str = "operator.kuberic.io/control-address";
 pub const SCALE_UP_ALLOCATION_ANNOTATION: &str =
     "operator.kuberic.io/scale-up-allocation-operation";
+pub const DEFAULT_TOPOLOGY_KEY: &str = "kubernetes.io/hostname";
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[kube(
@@ -36,7 +40,153 @@ pub struct KubericSetSpec {
     #[serde(default = "default_failover_delay_seconds")]
     pub failover_delay_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_balancing: Option<PrimaryBalancingSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switchover: Option<PlannedSwitchoverRequestSpec>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
+pub struct LabelKey(String);
+
+impl LabelKey {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        validate_label_key(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn hostname() -> Self {
+        Self(DEFAULT_TOPOLOGY_KEY.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for LabelKey {
+    fn default() -> Self {
+        Self::hostname()
+    }
+}
+
+impl Serialize for LabelKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for LabelKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for LabelKey {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("LabelKey")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 317,
+            "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, JsonSchema, Default)]
+pub enum PlacementMode {
+    #[default]
+    Preferred,
+    Required,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementSpec {
+    #[serde(default)]
+    pub mode: PlacementMode,
+    #[serde(default)]
+    pub topology_key: LabelKey,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_selector: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<PlacementTolerationSpec>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, JsonSchema, Default)]
+pub enum TolerationOperator {
+    Exists,
+    #[default]
+    Equal,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, JsonSchema)]
+pub enum TolerationEffect {
+    NoSchedule,
+    PreferNoSchedule,
+    NoExecute,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementTolerationSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub operator: TolerationOperator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<TolerationEffect>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, JsonSchema, Default)]
+pub enum PrimaryBalancingMode {
+    #[default]
+    Automatic,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimaryBalancingSpec {
+    #[serde(default)]
+    pub mode: PrimaryBalancingMode,
+    #[serde(default)]
+    pub topology_key: LabelKey,
+    #[serde(default = "default_primary_balance_cooldown_seconds")]
+    #[schemars(range(min = 30, max = 86_400))]
+    pub cooldown_seconds: u64,
+    #[serde(default = "default_primary_balance_minimum_improvement")]
+    #[schemars(range(min = 1))]
+    pub minimum_improvement: u32,
+}
+
+impl Default for PrimaryBalancingSpec {
+    fn default() -> Self {
+        Self {
+            mode: PrimaryBalancingMode::Automatic,
+            topology_key: LabelKey::hostname(),
+            cooldown_seconds: default_primary_balance_cooldown_seconds(),
+            minimum_improvement: default_primary_balance_minimum_improvement(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -57,6 +207,84 @@ pub struct KubericSetStatus {
 
 const fn default_failover_delay_seconds() -> u64 {
     30
+}
+
+const fn default_primary_balance_cooldown_seconds() -> u64 {
+    300
+}
+
+const fn default_primary_balance_minimum_improvement() -> u32 {
+    1
+}
+
+fn validate_label_key(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("label key must not be empty".to_string());
+    }
+    if value.len() > 317 {
+        return Err("label key must be at most 317 characters".to_string());
+    }
+    let mut split = value.split('/');
+    let first = split.next().expect("split returns one item");
+    let (prefix, name) = if let Some(name) = split.next() {
+        if split.next().is_some() {
+            return Err("label key must contain at most one '/'".to_string());
+        }
+        (Some(first), name)
+    } else {
+        (None, first)
+    };
+    if let Some(prefix) = prefix {
+        validate_dns_subdomain(prefix)?;
+    }
+    validate_label_name(name)
+}
+
+fn validate_dns_subdomain(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 253 {
+        return Err("label key prefix must be 1-253 characters".to_string());
+    }
+    for segment in value.split('.') {
+        if segment.is_empty() || segment.len() > 63 {
+            return Err("label key prefix segments must be 1-63 characters".to_string());
+        }
+        if !segment
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !segment
+                .bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err("label key prefix must be a DNS subdomain".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_label_name(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 63 {
+        return Err("label key name must be 1-63 characters".to_string());
+    }
+    if !value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !value
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("label key name must start and end with an alphanumeric character".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -286,8 +514,8 @@ mod tests {
             generated.len()
         );
         assert!(
-            generated.len() <= 345_000,
-            "compact final-election schema lost its reviewed headroom at {} bytes",
+            generated.len() <= 348_700,
+            "compact placement schema lost its reviewed CRD headroom at {} bytes",
             generated.len()
         );
     }
@@ -311,6 +539,55 @@ mod tests {
             ["spec"]["properties"]["switchover"]["properties"];
         assert_eq!(switchover["requestId"]["minLength"].as_u64(), Some(1));
         assert_eq!(switchover["targetReplicaId"]["minimum"].as_f64(), Some(1.0));
+        let spec = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"];
+        let placement = &spec["placement"]["properties"];
+        assert_eq!(placement["mode"]["enum"], json!(["Preferred", "Required"]));
+        assert_eq!(
+            placement["topologyKey"]["pattern"].as_str(),
+            Some("^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$")
+        );
+        let toleration = &placement["tolerations"]["items"]["properties"];
+        assert_eq!(toleration["operator"]["enum"], json!(["Exists", "Equal"]));
+        assert_eq!(
+            toleration["effect"]["enum"],
+            json!(["NoSchedule", "PreferNoSchedule", "NoExecute", null])
+        );
+        let primary_balancing = &spec["primaryBalancing"]["properties"];
+        assert_eq!(primary_balancing["mode"]["enum"], json!(["Automatic"]));
+        assert_eq!(
+            primary_balancing["cooldownSeconds"]["minimum"].as_f64(),
+            Some(30.0)
+        );
+        assert_eq!(
+            primary_balancing["cooldownSeconds"]["maximum"].as_f64(),
+            Some(86_400.0)
+        );
+        assert_eq!(
+            primary_balancing["minimumImprovement"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+        let defaulted: KubericSetSpec = serde_json::from_value(
+            json!({"replicas": 1, "image": "db", "placement": {}, "primaryBalancing": {}}),
+        )
+        .unwrap();
+        assert_eq!(defaulted.placement.unwrap().mode, PlacementMode::Preferred);
+        assert_eq!(
+            defaulted.primary_balancing.unwrap().cooldown_seconds,
+            default_primary_balance_cooldown_seconds()
+        );
+        assert!(
+            serde_json::from_value::<KubericSetSpec>(json!({
+                "replicas": 1, "image": "db", "placement": {"topologyKey": "bad/key/"}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<KubericSetSpec>(json!({
+                "replicas": 1, "image": "db", "placement": {"mode": "Disabled"}
+            }))
+            .is_err()
+        );
 
         let status =
             &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"];
