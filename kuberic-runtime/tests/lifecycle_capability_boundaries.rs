@@ -81,10 +81,14 @@ fn local_use_aliases(file: &syn::File) -> BTreeMap<String, String> {
         match tree {
             syn::UseTree::Path(path) => collect(&path.tree, aliases),
             syn::UseTree::Name(name) => {
-                aliases.insert(name.ident.to_string(), name.ident.to_string());
+                aliases
+                    .entry(name.ident.to_string())
+                    .or_insert_with(|| name.ident.to_string());
             }
             syn::UseTree::Rename(rename) => {
-                aliases.insert(rename.rename.to_string(), rename.ident.to_string());
+                aliases
+                    .entry(rename.rename.to_string())
+                    .or_insert_with(|| rename.ident.to_string());
             }
             syn::UseTree::Group(group) => {
                 for tree in &group.items {
@@ -99,6 +103,20 @@ fn local_use_aliases(file: &syn::File) -> BTreeMap<String, String> {
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
             collect(&item.tree, &mut self.aliases);
             syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if let Type::Path(path) = item.ty.as_ref()
+                && let Some(target) = path.path.segments.last()
+            {
+                let target = self
+                    .aliases
+                    .get(&target.ident.to_string())
+                    .cloned()
+                    .unwrap_or_else(|| target.ident.to_string());
+                self.aliases.entry(item.ident.to_string()).or_insert(target);
+            }
+            syn::visit::visit_item_type(self, item);
         }
     }
 
@@ -499,26 +517,40 @@ fn reject_unclassified_capability_aggregates(
 }
 
 fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
-    fn check_signature(owner: &str, signature: &syn::Signature) -> Result<(), String> {
+    fn check_signature(
+        owner: &str,
+        signature: &syn::Signature,
+        aliases: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
         let signature = compact(signature);
-        if capability_marker_count(&signature) >= 2 {
+        if marker_count(&signature, CAPABILITY_MARKERS, aliases)
+            + marker_count(&signature, BROAD_OWNER_MARKERS, aliases)
+            >= 2
+        {
             return Err(format!("{owner} exposes a capability aggregate signature"));
         }
         Ok(())
     }
 
-    fn inspect(items: &[Item], module: &str) -> Result<(), String> {
+    fn inspect(
+        items: &[Item],
+        module: &str,
+        aliases: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
         for item in items {
             match item {
-                Item::Fn(item) => {
-                    check_signature(&format!("{module}fn {}", item.sig.ident), &item.sig)?
-                }
+                Item::Fn(item) => check_signature(
+                    &format!("{module}fn {}", item.sig.ident),
+                    &item.sig,
+                    aliases,
+                )?,
                 Item::Trait(item) => {
                     for method in &item.items {
                         if let TraitItem::Fn(method) = method {
                             check_signature(
                                 &format!("{module}{}::{}", item.ident, method.sig.ident),
                                 &method.sig,
+                                aliases,
                             )?;
                         }
                     }
@@ -529,13 +561,14 @@ fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
                             check_signature(
                                 &format!("{module}{}::{}", impl_name(item), method.sig.ident),
                                 &method.sig,
+                                aliases,
                             )?;
                         }
                     }
                 }
                 Item::Mod(item) => {
                     if let Some((_, items)) = &item.content {
-                        inspect(items, &format!("{module}{}::", item.ident))?;
+                        inspect(items, &format!("{module}{}::", item.ident), aliases)?;
                     }
                 }
                 _ => {}
@@ -544,7 +577,8 @@ fn reject_aggregate_signatures(file: &syn::File) -> Result<(), String> {
         Ok(())
     }
 
-    inspect(&file.items, "")
+    let aliases = local_use_aliases(file);
+    inspect(&file.items, "", &aliases)
 }
 
 fn capability_signature_sites(file: &syn::File) -> BTreeSet<String> {
@@ -1616,6 +1650,15 @@ fn lifecycle_capabilities_have_bounded_method_and_consumer_budgets() {
         }
         let file = syn::parse_file(&source).unwrap();
         let file_name = path.strip_prefix(&host_root).unwrap().to_string_lossy();
+        let allowed_aggregates: &[&str] = match file_name.as_ref() {
+            "process.rs" => &["ReplicaHandle"],
+            "service.rs" => &["AgentService"],
+            "testing.rs" => &["Endpoint"],
+            _ => &[],
+        };
+        reject_broad_aliases(&file).unwrap();
+        reject_unclassified_capability_aggregates(&file, allowed_aggregates).unwrap();
+        reject_aggregate_signatures(&file).unwrap();
         module_signature_sites.extend(
             capability_signature_sites(&file)
                 .into_iter()
@@ -1951,4 +1994,40 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         ))
     };
     assert_rejected(result, "fn additional_report_worker");
+
+    let report_broad_field = format!(
+        "{report}\nstruct UniversalReportFacade {{ runtime: std::sync::Arc<crate::host::hosting::PodRuntime> }}\n"
+    );
+    let report_broad_field = syn::parse_file(&report_broad_field).unwrap();
+    assert_rejected(
+        reject_unclassified_capability_aggregates(&report_broad_field, &[]),
+        "UniversalReportFacade",
+    );
+
+    let type_alias_broker = format!(
+        "{hosting}\ntype B = BuildRuntime;\ntype R = ReportRuntime;\ntype O = OutboundRuntime;\nstruct TypeAliasBroker {{ build: B, report: R, outbound: O }}\n"
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &type_alias_broker),
+        "TypeAliasBroker",
+    );
+
+    let scoped_alias_broker = format!(
+        "{hosting}\nuse self::BuildRuntime as B;\nuse self::ReportRuntime as R;\nuse self::OutboundRuntime as O;\nstruct ScopeBroker {{ build: B, report: R, outbound: O }}\nmod unrelated {{ use std::string::String as B; use std::string::String as R; use std::string::String as O; }}\n"
+    );
+    assert_rejected(
+        validate(&lifecycle, &custom, &scoped_alias_broker),
+        "ScopeBroker",
+    );
+
+    let transport = source("src/host/transport.rs");
+    let broadened_outbound = transport.replace(
+        "    runtime: Arc<OutboundRuntime>,\n    transport: Arc<Mutex<ReliableTransport>>,",
+        "    runtime: Arc<OutboundRuntime>,\n    unrelated_report: crate::host::hosting::ReportRuntime,\n    transport: Arc<Mutex<ReliableTransport>>,",
+    );
+    let broadened_outbound = syn::parse_file(&broadened_outbound).unwrap();
+    assert_rejected(
+        reject_aggregate_signatures(&broadened_outbound),
+        "run_outbound",
+    );
 }
