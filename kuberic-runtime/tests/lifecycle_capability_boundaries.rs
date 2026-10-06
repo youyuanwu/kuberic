@@ -208,6 +208,8 @@ fn reject_capability_escape_paths(
         "RegisteredReplicator",
         "RuntimeHost",
         "PodRuntime",
+        "ManagedLifecycleBackend",
+        "CustomReplicatorHost",
     ];
     for item in &file.items {
         match item {
@@ -940,6 +942,12 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     }
     let exact_cancellation = impl_method(&hosting_file, "BuildRuntimeCancellation", "new")
         .ok_or_else(|| "BuildRuntimeCancellation::new missing".to_owned())?;
+    let cancellation_signature = compact(&exact_cancellation.sig);
+    if !cancellation_signature.contains("runtime:BuildAttemptRuntime")
+        || cancellation_signature.contains("runtime:BuildRuntime")
+    {
+        return Err("build runtime cancellation constructor is not cancellation-only".into());
+    }
     let cancellation_body = compact(&exact_cancellation.block);
     if cancellation_body.contains("RuntimeHost")
         || cancellation_body.contains("PodRuntime")
@@ -1164,4 +1172,16 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> Arc<RuntimeHost> { unreachable!() }\n",
     );
     assert!(validate(&lifecycle, &custom, &broad_peer_signature).is_err());
+
+    let broad_coordinator_cleanup = hosting.replace(
+        "    fn new(runtime: BuildAttemptRuntime, build_id: OperationId, generation: u64) -> Self {\n",
+        "    fn new(runtime: BuildRuntime, build_id: OperationId, generation: u64) -> Self {\n",
+    );
+    assert!(validate(&lifecycle, &custom, &broad_coordinator_cleanup).is_err());
+
+    let concrete_backend_signature = hosting.replace(
+        "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {\n",
+        "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> Arc<custom::CustomReplicatorHost> {\n",
+    );
+    assert!(validate(&lifecycle, &custom, &concrete_backend_signature).is_err());
 }
