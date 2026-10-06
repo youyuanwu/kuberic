@@ -65,6 +65,8 @@ use crate::host::transport::{
 
 #[path = "custom.rs"]
 mod custom;
+#[path = "lifecycle.rs"]
+mod lifecycle;
 pub(crate) use custom::AcceptedAccessEffect;
 
 #[async_trait]
@@ -140,6 +142,10 @@ struct RegisteredReplicator {
     primary: Option<Arc<dyn PrimaryReplicator>>,
     provider: Option<Arc<dyn StateProvider>>,
     lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>,
+    process_lifecycle: Option<lifecycle::ProcessRuntime>,
+    authority_lifecycle: Option<lifecycle::AuthorityRuntime>,
+    peer_lifecycle: Option<lifecycle::PeerRuntime>,
+    access_closure: Option<lifecycle::AccessClosure>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
 }
 
@@ -152,6 +158,7 @@ enum ReplicatorCreationState {
 #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
 struct HostedPrimaryReplicator {
     inner: Arc<dyn PrimaryReplicator>,
+    process_lifecycle: lifecycle::ProcessRuntime,
     lifecycle: Arc<custom::ReplicatorLifecycleHost>,
 }
 
@@ -163,22 +170,22 @@ impl Replicator for HostedPrimaryReplicator {
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
-        self.lifecycle.invalidate_public_access().await?;
+        self.process_lifecycle.invalidate_public_access().await?;
         self.inner.change_role(epoch, role).await
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
-        self.lifecycle.invalidate_public_access().await?;
+        self.process_lifecycle.invalidate_public_access().await?;
         self.inner.update_epoch(epoch).await
     }
 
     async fn close(&self) -> Result<()> {
-        self.lifecycle.invalidate_public_access().await?;
+        self.process_lifecycle.invalidate_public_access().await?;
         self.inner.close().await
     }
 
     fn abort(&self) {
-        self.lifecycle.notify_abort();
+        self.process_lifecycle.notify_abort();
         self.inner.abort();
     }
 
@@ -240,12 +247,24 @@ impl RegisteredReplicator {
     fn lifecycle(&self) -> Option<Arc<custom::ReplicatorLifecycleHost>> {
         self.lifecycle.clone()
     }
+    fn process_lifecycle(&self) -> Option<lifecycle::ProcessRuntime> {
+        self.process_lifecycle.clone()
+    }
+    fn authority_lifecycle(&self) -> Option<lifecycle::AuthorityRuntime> {
+        self.authority_lifecycle.clone()
+    }
+    fn peer_lifecycle(&self) -> Option<lifecycle::PeerRuntime> {
+        self.peer_lifecycle.clone()
+    }
+    fn access_closure(&self) -> Option<lifecycle::AccessClosure> {
+        self.access_closure.clone()
+    }
     fn primary(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary.clone()
     }
     async fn open(&self) -> Result<Option<String>> {
         let address = self.control.open().await?;
-        if let Some(hosted) = self.lifecycle() {
+        if let Some(hosted) = self.process_lifecycle() {
             hosted.complete_open(address.clone()).await?;
         }
         Ok(Some(address))
@@ -444,7 +463,10 @@ impl PodRuntime {
 
     #[cfg(all(test, feature = "testing"))]
     pub(crate) async fn testing_cancel_configuration_work(&self) -> Result<()> {
-        self.host.lifecycle()?.cancel_configuration_work().await
+        self.host
+            .authority_lifecycle()?
+            .cancel_configuration_work()
+            .await
     }
 
     #[cfg(all(test, kuberic_workspace_tests))]
@@ -457,7 +479,7 @@ impl PodRuntime {
     }
 
     pub(crate) async fn restore_authority(&self) -> Result<()> {
-        self.host.lifecycle()?.restore_authority().await
+        self.host.authority_lifecycle()?.restore_authority().await
     }
 
     pub(crate) fn bind_replica_session(
@@ -475,8 +497,8 @@ impl PodRuntime {
             .host
             .registered
             .get()
-            .and_then(|r| r.lifecycle.as_ref())
-            .is_some_and(|lifecycle| lifecycle.is_managed())
+            .and_then(RegisteredReplicator::process_lifecycle)
+            .is_some_and(|lifecycle| lifecycle.owns_stream_session())
         {
             return Ok(());
         }
@@ -712,7 +734,10 @@ impl PodRuntime {
     }
 
     pub(crate) async fn cancel_configuration_work(&self) -> Result<()> {
-        self.host.lifecycle()?.cancel_configuration_work().await
+        self.host
+            .authority_lifecycle()?
+            .cancel_configuration_work()
+            .await
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -721,7 +746,7 @@ impl PodRuntime {
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<()> {
-        self.host.lifecycle()?.set_access(read, write).await
+        self.host.access_closure()?.set_access(read, write).await
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -731,7 +756,10 @@ impl PodRuntime {
 
     #[cfg(all(test, feature = "testing"))]
     pub(crate) async fn testing_admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
-        self.host.lifecycle()?.admit_authority(authority).await
+        self.host
+            .authority_lifecycle()?
+            .admit_authority(authority)
+            .await
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -758,9 +786,8 @@ impl PodRuntime {
             .map_or((None, false), |registered| {
                 (
                     registered
-                        .lifecycle
-                        .as_ref()
-                        .map(|lifecycle| lifecycle.is_managed()),
+                        .process_lifecycle()
+                        .map(|lifecycle| lifecycle.owns_stream_session()),
                     registered.managed_data_plane.is_some(),
                 )
             })
@@ -811,6 +838,9 @@ impl PodRuntime {
         match registered.lifecycle() {
             Some(lifecycle) => Ok(Arc::new(HostedPrimaryReplicator {
                 inner: primary,
+                process_lifecycle: registered
+                    .process_lifecycle()
+                    .ok_or(RuntimeError::NotPrimary)?,
                 lifecycle,
             })),
             None => Ok(primary),
@@ -910,7 +940,7 @@ impl PodRuntime {
         session: crate::protocol::types::ProcessSessionId,
     ) -> Result<()> {
         self.host
-            .lifecycle()?
+            .peer_lifecycle()?
             .register_peer_session(identity, session)
             .await
     }
@@ -919,7 +949,7 @@ impl PodRuntime {
         &self,
         replica: crate::replicator::ReplicaInformation,
     ) -> Result<()> {
-        self.host.lifecycle()?.describe_peer(replica).await
+        self.host.peer_lifecycle()?.describe_peer(replica).await
     }
 
     pub(crate) async fn observe_progress(&self) -> Result<()> {
@@ -1322,6 +1352,16 @@ impl ReplicatorRegistration for RuntimeHost {
             ))),
             (None, None) => None,
         };
+        let process_lifecycle = lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.process_runtime());
+        let authority_lifecycle = lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.authority_runtime());
+        let peer_lifecycle = lifecycle.as_ref().map(|lifecycle| lifecycle.peer_runtime());
+        let access_closure = lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.access_closure());
         let mut creation = self.replicator_creation.lock().map_err(|_| {
             RuntimeError::Application("replicator creation state was poisoned".into())
         })?;
@@ -1341,6 +1381,10 @@ impl ReplicatorRegistration for RuntimeHost {
                 primary,
                 provider,
                 lifecycle,
+                process_lifecycle,
+                authority_lifecycle,
+                peer_lifecycle,
+                access_closure,
                 managed_data_plane,
             })
             .map_err(|_| {
@@ -1370,6 +1414,50 @@ impl RuntimeHost {
     fn streams(&self) -> Result<Arc<dyn ManagedReplicatorDataPlane>> {
         self.managed_data_plane()
     }
+    fn process_lifecycle(&self) -> Result<lifecycle::ProcessRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .process_lifecycle()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose process lifecycle capabilities".into(),
+                )
+            })
+    }
+    fn authority_lifecycle(&self) -> Result<lifecycle::AuthorityRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .authority_lifecycle()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose authority lifecycle capabilities".into(),
+                )
+            })
+    }
+    fn peer_lifecycle(&self) -> Result<lifecycle::PeerRuntime> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .peer_lifecycle()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose peer lifecycle capabilities".into(),
+                )
+            })
+    }
+    fn access_closure(&self) -> Result<lifecycle::AccessClosure> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .access_closure()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not expose access lifecycle capabilities".into(),
+                )
+            })
+    }
     fn lifecycle(&self) -> Result<Arc<custom::ReplicatorLifecycleHost>> {
         self.registered
             .get()
@@ -1396,7 +1484,7 @@ impl RuntimeHost {
             return;
         }
         if let Some(registered) = self.registered.get() {
-            if let Some(lifecycle) = registered.lifecycle() {
+            if let Some(lifecycle) = registered.process_lifecycle() {
                 lifecycle.notify_abort();
             }
             registered.abort();
@@ -1535,16 +1623,17 @@ impl RuntimeHost {
                     .await?;
             }
             RuntimeEffectAction::AdmitAuthority(authority) => {
-                let lifecycle = self.lifecycle()?;
-                lifecycle.admit_authority(*authority).await?;
-                self.sync_access_projection(lifecycle.snapshot().await)
+                self.authority_lifecycle()?
+                    .admit_authority(*authority)
+                    .await?;
+                self.sync_access_projection(self.lifecycle()?.snapshot().await)
                     .await;
             }
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
                 self.lifecycle()?.admit_build_authority(*authority).await?;
             }
             RuntimeEffectAction::RegisterPeerSession { identity, session } => {
-                self.lifecycle()?
+                self.peer_lifecycle()?
                     .register_peer_session(identity, session)
                     .await?;
             }
@@ -2020,7 +2109,7 @@ impl RuntimeHost {
             }
         };
         if !transition.replicator_completed {
-            if let Ok(managed) = self.lifecycle() {
+            if let Ok(managed) = self.process_lifecycle() {
                 managed.fence_writes().await?;
             }
             self.state.write().await.fallback_snapshot.read_status =
@@ -2088,7 +2177,10 @@ impl RuntimeHost {
         }
         if !transition.application_completed {
             if role == ReplicaRole::Primary
-                && let Some(managed) = self.registered.get().and_then(|r| r.lifecycle())
+                && let Some(managed) = self
+                    .registered
+                    .get()
+                    .and_then(RegisteredReplicator::process_lifecycle)
             {
                 managed.settle_primary_prefix().await?;
             }
@@ -2114,9 +2206,9 @@ impl RuntimeHost {
             state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
             state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
         }
-        if let Ok(managed) = self.lifecycle() {
-            managed.cancel_configuration_work().await?;
-            managed
+        if let Ok(authority) = self.authority_lifecycle() {
+            authority.cancel_configuration_work().await?;
+            self.access_closure()?
                 .set_access(
                     AccessStatus::ReconfigurationPending,
                     AccessStatus::ReconfigurationPending,
@@ -2124,14 +2216,14 @@ impl RuntimeHost {
                 .await?;
         }
         if let Err(error) = registered.close().await {
-            if let Ok(managed) = self.lifecycle() {
+            if let Ok(managed) = self.process_lifecycle() {
                 managed.complete_abort().await;
             }
             self.abort();
             return Err(error);
         }
         if let Err(error) = self.application.close().await {
-            if let Ok(managed) = self.lifecycle() {
+            if let Ok(managed) = self.process_lifecycle() {
                 managed.complete_abort().await;
             }
             self.application.abort();
@@ -2143,7 +2235,7 @@ impl RuntimeHost {
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
             return Err(error);
         }
-        if let Ok(managed) = self.lifecycle()
+        if let Ok(managed) = self.process_lifecycle()
             && let Err(error) = managed.complete_close().await
         {
             self.abort();
@@ -2167,7 +2259,7 @@ impl RuntimeHost {
             state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
         }
-        if let Ok(managed) = self.lifecycle() {
+        if let Ok(managed) = self.process_lifecycle() {
             managed.complete_abort().await;
         }
         self.abort();

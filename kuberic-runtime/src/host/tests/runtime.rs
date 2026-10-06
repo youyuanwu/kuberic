@@ -7403,7 +7403,8 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     let application = include_str!("../../application.rs");
     let library = include_str!("../../lib.rs");
     let hosting = include_str!("../hosting.rs");
-    let lifecycle = include_str!("../custom.rs");
+    let lifecycle = include_str!("../lifecycle.rs");
+    let custom = include_str!("../custom.rs");
     let report = include_str!("../report.rs");
     let service = include_str!("../service.rs");
     let testing = include_str!("../testing.rs");
@@ -7421,21 +7422,15 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         !include_str!("../transport.rs").contains(".record_durable_peer_progress("),
         "peer discovery may use reported progress for repair, never commit quorum credit"
     );
-    let backend_trait = lifecycle
-        .split_once("trait ReplicatorLifecycleBackend")
-        .unwrap()
-        .1
-        .split_once("\n}")
-        .unwrap()
-        .0;
     assert!(
         !replication.contains("async fn execute_action(&self, action: RuntimeEffectAction)")
-            && !lifecycle.contains("async fn execute_action")
-            && !lifecycle.contains(".legacy.execute_action(")
-            && !backend_trait.contains("fn owns_stream_session(&self) -> bool {"),
+            && !lifecycle.contains("execute_action")
+            && !custom.contains("async fn execute_action")
+            && !custom.contains(".legacy.execute_action(")
+            && !custom.contains("ReplicatorLifecycleBackend"),
         "ordinary lifecycle work must use explicit common routing and private proof hooks"
     );
-    for source in [hosting, lifecycle, report, service, transport] {
+    for source in [hosting, lifecycle, custom, report, service, transport] {
         for origin_name in [
             "refresh_custom_progress",
             "register_custom_peer_session",
@@ -7472,10 +7467,10 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         "only the optional built-in data plane may expose replication/copy outbound polling"
     );
     assert!(
-        !lifecycle.contains("install_engine_removal_proof"),
+        !custom.contains("install_engine_removal_proof"),
         "migrated topology completion must not restore a broad runtime snapshot"
     );
-    let removal_completion = lifecycle
+    let removal_completion = custom
         .split_once("async fn execute_removal_action")
         .unwrap()
         .1
@@ -7496,13 +7491,24 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     assert!(!replication.contains("ReplicatorInterfaces::new"));
     assert!(
         hosting.contains("lifecycle: Option<Arc<custom::ReplicatorLifecycleHost>>")
+            && hosting.contains("process_lifecycle: Option<lifecycle::ProcessRuntime>")
+            && hosting.contains("authority_lifecycle: Option<lifecycle::AuthorityRuntime>")
+            && hosting.contains("peer_lifecycle: Option<lifecycle::PeerRuntime>")
+            && hosting.contains("access_closure: Option<lifecycle::AccessClosure>")
             && !hosting.contains("enum HostedLifecycle")
             && !hosting.contains("custom: Option<Arc<custom::CustomReplicatorHost>>"),
-        "agent registration must retain one lifecycle facade rather than default/custom hosts"
+        "registration must retain one shared owner and narrow migrated lifecycle views"
     );
     assert!(
-        !include_str!("../custom.rs").contains("enum ReplicatorLifecycleBackend"),
-        "the lifecycle facade must use capability polymorphism rather than an origin enum"
+        !custom.contains("ReplicatorLifecycleBackend")
+            && lifecycle.contains("trait ProcessLifecycle")
+            && lifecycle.contains("trait AuthorityLifecycle")
+            && lifecycle.contains("trait AccessLifecycle")
+            && lifecycle.contains("trait BuildLifecycle")
+            && lifecycle.contains("trait TopologyLifecycle")
+            && lifecycle.contains("trait LifecycleObservation")
+            && lifecycle.contains("trait OutboundLifecycle"),
+        "lifecycle routing must use explicit private capabilities rather than a universal backend"
     );
     for internal_module in ["authority", "effects", "runtime"] {
         assert!(
