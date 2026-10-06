@@ -264,6 +264,56 @@ fn reject_capability_escape_paths(
     Ok(())
 }
 
+fn reject_unclassified_capability_aggregates(
+    file: &syn::File,
+    allowed: &[&str],
+) -> Result<(), String> {
+    const MARKERS: &[&str] = &[
+        "ProcessRuntime",
+        "AuthorityRuntime",
+        "PeerRuntime",
+        "AccessClosure",
+        "AccessRuntime",
+        "ReportLifecycle",
+        "EvidenceRuntime",
+        "EffectEvidenceRuntime",
+        "BuildLifecycleRuntime",
+        "BuildCancellationRuntime",
+        "OutboundLifecycleRuntime",
+        "RemovalWitnessRuntime",
+        "TopologyRuntime",
+        "RecoveryRuntime",
+        "dynProcessLifecycle",
+        "dynAuthorityLifecycle",
+        "dynAccessLifecycle",
+        "dynBuildLifecycle",
+        "dynBuildCancellation",
+        "dynTopologyLifecycle",
+        "dynLifecycleObservation",
+        "dynOutboundLifecycle",
+    ];
+    for item in &file.items {
+        let Item::Struct(item) = item else {
+            continue;
+        };
+        let capability_fields = item
+            .fields
+            .iter()
+            .filter(|field| {
+                let ty = compact(&field.ty);
+                MARKERS.iter().any(|marker| ty.contains(marker))
+            })
+            .count();
+        if capability_fields >= 2 && !allowed.contains(&item.ident.to_string().as_str()) {
+            return Err(format!(
+                "{} is an unclassified capability aggregate",
+                item.ident
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> {
     for source in [lifecycle, custom, hosting] {
         if source.contains("ReplicatorLifecycleBackend") {
@@ -616,6 +666,15 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "RecoveryRuntime",
         ],
     )?;
+    reject_unclassified_capability_aggregates(
+        &lifecycle_file,
+        &[
+            "LifecycleWiring",
+            "ReportLifecycle",
+            "BuildLifecycleRuntime",
+            "RecoveryRuntime",
+        ],
+    )?;
 
     let custom_file =
         syn::parse_file(custom).map_err(|error| format!("parse custom host: {error}"))?;
@@ -694,6 +753,7 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
     {
         return Err("lifecycle registration retained complete wiring".into());
     }
+    reject_unclassified_capability_aggregates(&custom_file, &["ReplicatorLifecycleRegistration"])?;
     let expected_queue_fields = BTreeMap::from([
         ("generation".to_owned(), "u64".to_owned()),
         (
@@ -878,6 +938,14 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
             "OutboundRuntime",
         ],
     )?;
+    reject_unclassified_capability_aggregates(
+        &hosting_file,
+        &[
+            "RegisteredReplicator",
+            "HostedPrimaryReplicator",
+            "BuildRuntime",
+        ],
+    )?;
     let registered_fields = struct_fields(&hosting_file, "RegisteredReplicator")
         .ok_or_else(|| "RegisteredReplicator missing".to_owned())?;
     let expected_registered_fields = BTreeMap::from([
@@ -955,6 +1023,35 @@ fn validate(lifecycle: &str, custom: &str, hosting: &str) -> Result<(), String> 
         return Err(format!(
             "registered lifecycle field inventory changed: {registered_fields:#?}"
         ));
+    }
+    if impl_methods(&hosting_file, "RegisteredReplicator").as_ref()
+        != Some(&names(&[
+            "managed_data_plane",
+            "process_lifecycle",
+            "authority_lifecycle",
+            "peer_lifecycle",
+            "access_closure",
+            "access_lifecycle",
+            "report_lifecycle",
+            "lifecycle_evidence",
+            "effect_evidence",
+            "build_lifecycle",
+            "build_cancellation",
+            "outbound_lifecycle",
+            "removal_witness",
+            "topology_lifecycle",
+            "recovery_lifecycle",
+            "primary",
+            "open",
+            "change_role",
+            "update_epoch",
+            "close",
+            "current_progress",
+            "catch_up_capability",
+            "abort",
+        ]))
+    {
+        return Err("registered capability projection methods changed".into());
     }
     let exact_cancellation = impl_method(&hosting_file, "BuildRuntimeCancellation", "new")
         .ok_or_else(|| "BuildRuntimeCancellation::new missing".to_owned())?;
@@ -1183,4 +1280,15 @@ fn lifecycle_capability_guard_rejects_broadening_mutations() {
         "impl PeerDiscoveryRuntime {\n    pub(crate) async fn snapshot(&self) -> Arc<custom::CustomReplicatorHost> {\n",
     );
     assert!(validate(&lifecycle, &custom, &concrete_backend_signature).is_err());
+
+    let universal_registration_getter = hosting.replace(
+        "impl RegisteredReplicator {\n",
+        "impl RegisteredReplicator {\n    fn all_capabilities(&self) -> (&lifecycle::ProcessRuntime, &lifecycle::TopologyRuntime) { unreachable!() }\n",
+    );
+    assert!(validate(&lifecycle, &custom, &universal_registration_getter).is_err());
+
+    let renamed_wiring = format!(
+        "{hosting}\nstruct LifecycleBroker {{ process: lifecycle::ProcessRuntime, authority: lifecycle::AuthorityRuntime, topology: lifecycle::TopologyRuntime }}\n"
+    );
+    assert!(validate(&lifecycle, &custom, &renamed_wiring).is_err());
 }
