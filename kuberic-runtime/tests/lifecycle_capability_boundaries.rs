@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -66,11 +66,12 @@ fn compact<T: ToTokens>(value: &T) -> String {
 struct GuardedMarkers {
     capabilities: BTreeSet<String>,
     broad: BTreeSet<String>,
+    direct_primary: bool,
 }
 
 impl<'ast> Visit<'ast> for GuardedMarkers {
     fn visit_path(&mut self, path: &'ast syn::Path) {
-        if let Some(segment) = path.segments.last() {
+        for segment in &path.segments {
             let name = segment.ident.to_string();
             if CAPABILITY_TYPES.contains(&name.as_str()) {
                 self.capabilities.insert(name.clone());
@@ -81,6 +82,9 @@ impl<'ast> Visit<'ast> for GuardedMarkers {
             }
             if BROAD_OWNER_TYPES.contains(&name.as_str()) {
                 self.broad.insert(name);
+            }
+            if segment.ident == "PrimaryReplicator" {
+                self.direct_primary = true;
             }
         }
         syn::visit::visit_path(self, path);
@@ -204,6 +208,30 @@ fn production_modules(root: &Path) -> Vec<(PathBuf, bool)> {
         &mut modules,
         &mut visited,
     );
+    fn discover(root: &Path, path: &Path, modules: &mut Vec<(PathBuf, bool)>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) != Some("tests") {
+                    discover(root, &path, modules);
+                }
+            } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if !modules.iter().any(|(known, _)| known == &relative) {
+                    modules.push((relative, true));
+                }
+            }
+        }
+    }
+    let exempt_dirs = modules
+        .iter()
+        .filter(|(_, exempt)| *exempt)
+        .map(|(path, _)| root.join(path).with_extension(""))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    for directory in exempt_dirs {
+        discover(root, &directory, &mut modules);
+    }
     modules.sort();
     modules
 }
@@ -239,11 +267,68 @@ fn allowed_aggregates(relative: &Path) -> &'static [&'static str] {
     }
 }
 
+fn reject_transitive_capability_inheritance(file: &syn::File) -> Result<(), String> {
+    let graph = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Trait(item) => Some((
+                item.ident.to_string(),
+                item.supertraits
+                    .iter()
+                    .filter_map(|bound| match bound {
+                        syn::TypeParamBound::Trait(bound) => bound
+                            .path
+                            .segments
+                            .last()
+                            .map(|value| value.ident.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    fn reaches_guarded(
+        name: &str,
+        graph: &BTreeMap<String, Vec<String>>,
+        visited: &mut BTreeSet<String>,
+    ) -> bool {
+        graph.get(name).is_some_and(|parents| {
+            parents.iter().any(|parent| {
+                CAPABILITY_TRAITS.contains(&parent.as_str())
+                    || HOST_CAPABILITY_TRAITS.contains(&parent.as_str())
+                    || (visited.insert(parent.clone()) && reaches_guarded(parent, graph, visited))
+            })
+        })
+    }
+    for name in graph.keys().filter(|name| {
+        CAPABILITY_TRAITS.contains(&name.as_str())
+            || HOST_CAPABILITY_TRAITS.contains(&name.as_str())
+    }) {
+        let direct = graph[name].iter().any(|parent| {
+            CAPABILITY_TRAITS.contains(&parent.as_str())
+                || HOST_CAPABILITY_TRAITS.contains(&parent.as_str())
+        });
+        if !direct
+            && graph[name]
+                .iter()
+                .any(|parent| reaches_guarded(parent, &graph, &mut BTreeSet::new()))
+        {
+            return Err(format!(
+                "{name} transitively inherits an unrelated capability"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_module_policy(
     file: &syn::File,
     allowed: &[&str],
     reject_broad: bool,
 ) -> Result<(), String> {
+    reject_transitive_capability_inheritance(file)?;
     struct PolicyVisitor<'a> {
         allowed: &'a [&'a str],
         reject_broad: bool,
@@ -352,7 +437,11 @@ fn validate_module_policy(
                 if let TraitItem::Fn(method) = member {
                     let owner = format!("{}::{}", item.ident, method.sig.ident);
                     let markers = signature_markers(&method.sig);
-                    if guarded && (!markers.capabilities.is_empty() || !markers.broad.is_empty()) {
+                    if guarded
+                        && (!markers.capabilities.is_empty()
+                            || !markers.broad.is_empty()
+                            || markers.direct_primary)
+                    {
                         self.record(|| format!("{owner} exposes another lifecycle capability"));
                     } else {
                         self.signature(&owner, &method.sig);
@@ -363,6 +452,15 @@ fn validate_module_policy(
         }
 
         fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if let Some((path, _)) = &item.trait_ {
+                let mut markers = type_markers(&item.self_ty);
+                markers.visit_path(path);
+                if markers.broad.contains("LifecycleWiring")
+                    && markers.broad.contains("ReplicatorLifecycleRegistration")
+                {
+                    self.record(|| "conversion exposes complete lifecycle wiring".into());
+                }
+            }
             for member in &item.items {
                 if let ImplItem::Fn(method) = member {
                     self.signature(
@@ -375,9 +473,12 @@ fn validate_module_policy(
         }
 
         fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let parent = self.reject_broad;
+            self.reject_broad = disallowed_type_lint_exempt(&item.attrs, parent);
             self.depth += 1;
             syn::visit::visit_item_mod(self, item);
             self.depth -= 1;
+            self.reject_broad = parent;
         }
 
         fn visit_block(&mut self, block: &'ast syn::Block) {
@@ -409,7 +510,7 @@ fn validate_view_boundaries(file: &syn::File, rules: &[(&str, &[&str])]) -> Resu
             .ok_or_else(|| format!("{view} missing"))?;
         for field in &item.fields {
             let markers = type_markers(&field.ty);
-            if !markers.broad.is_empty() {
+            if !markers.broad.is_empty() || markers.direct_primary {
                 return Err(format!("{view} retains a broad owner"));
             }
             if markers
@@ -435,7 +536,7 @@ fn validate_view_boundaries(file: &syn::File, rules: &[(&str, &[&str])]) -> Resu
                     continue;
                 };
                 let markers = signature_markers(&method.sig);
-                if !markers.broad.is_empty() {
+                if !markers.broad.is_empty() || markers.direct_primary {
                     return Err(format!(
                         "{view}::{} exposes a broad owner",
                         method.sig.ident
@@ -466,9 +567,7 @@ enum ProductionCfg {
 
 fn cfg_in_production(meta: &Meta) -> ProductionCfg {
     match meta {
-        Meta::Path(path) if path.is_ident("test") || path.is_ident("kuberic_workspace_tests") => {
-            ProductionCfg::Disabled
-        }
+        Meta::Path(path) if path.is_ident("test") => ProductionCfg::Disabled,
         Meta::Path(_) => ProductionCfg::Unknown,
         Meta::NameValue(value) if value.path.is_ident("feature") => {
             if matches!(
@@ -696,6 +795,7 @@ fn validate_cancellation_owner(file: &syn::File, owner: &str) -> Result<(), Stri
     }
     let body = block_markers(&method.block);
     if !body.broad.is_empty()
+        || body.direct_primary
         || body
             .capabilities
             .iter()
@@ -707,6 +807,15 @@ fn validate_cancellation_owner(file: &syn::File, owner: &str) -> Result<(), Stri
 }
 
 fn validate_transport_routing(source: &str) -> Result<(), String> {
+    fn called_path(expression: &Expr) -> Option<&syn::Path> {
+        match expression {
+            Expr::Path(path) => Some(&path.path),
+            Expr::Paren(value) => called_path(&value.expr),
+            Expr::Group(value) => called_path(&value.expr),
+            _ => None,
+        }
+    }
+
     struct CallVisitor {
         admitted: usize,
         direct: usize,
@@ -747,6 +856,24 @@ fn validate_transport_routing(source: &str) -> Result<(), String> {
             }
         }
 
+        fn visit_local(&mut self, item: &'ast syn::Local) {
+            if !excluded_from_production(&item.attrs) {
+                syn::visit::visit_local(self, item);
+            }
+        }
+
+        fn visit_arm(&mut self, item: &'ast syn::Arm) {
+            if !excluded_from_production(&item.attrs) {
+                syn::visit::visit_arm(self, item);
+            }
+        }
+
+        fn visit_stmt_macro(&mut self, item: &'ast syn::StmtMacro) {
+            if !excluded_from_production(&item.attrs) {
+                syn::visit::visit_stmt_macro(self, item);
+            }
+        }
+
         fn visit_expr(&mut self, expression: &'ast Expr) {
             if !excluded_from_production(expression_attributes(expression)) {
                 syn::visit::visit_expr(self, expression);
@@ -759,19 +886,12 @@ fn validate_transport_routing(source: &str) -> Result<(), String> {
         }
 
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if let Expr::Path(function) = call.func.as_ref()
-                && let Some(segment) = function.path.segments.last()
+            if let Some(path) = called_path(&call.func)
+                && let Some(segment) = path.segments.last()
             {
                 self.observe(&segment.ident.to_string());
             }
             syn::visit::visit_expr_call(self, call);
-        }
-
-        fn visit_macro(&mut self, item: &'ast syn::Macro) {
-            let tokens = compact(&item.tokens);
-            self.admitted += tokens.matches("execute_admitted_build").count();
-            self.direct += tokens.matches("build_replica").count();
-            syn::visit::visit_macro(self, item);
         }
     }
 
@@ -867,21 +987,37 @@ fn assert_rejected(result: Result<(), String>, expected: &str) {
     );
 }
 
+fn parsed(source: &str) -> syn::File {
+    syn::parse_file(source).unwrap()
+}
+
+fn reject_policy(source: &str, broad: bool, expected: &str) {
+    assert_rejected(
+        validate_module_policy(&parsed(source), &[], broad),
+        expected,
+    );
+}
+
+fn reject_transport(source: &str, expected: &str) {
+    assert_rejected(validate_transport_routing(source), expected);
+}
+
+fn reject_cancellation(source: &str, expected: &str) {
+    assert_rejected(
+        validate_cancellation_owner(&parsed(source), "BuildRuntimeCancellation"),
+        expected,
+    );
+}
+
 #[test]
 fn lifecycle_capability_boundaries_are_narrow() {
     validate_project().unwrap();
 }
 
 #[test]
+#[rustfmt::skip]
 fn lifecycle_capability_guard_rejects_representative_escapes() {
-    let aggregate_trait = syn::parse_file(
-        "trait ProcessLifecycle {}\ntrait BuildLifecycle {}\ntrait UniversalLifecycle: ProcessLifecycle + BuildLifecycle {}",
-    )
-    .unwrap();
-    assert_rejected(
-        validate_module_policy(&aggregate_trait, &[], false),
-        "UniversalLifecycle",
-    );
+    reject_policy("trait ProcessLifecycle {}\ntrait BuildLifecycle {}\ntrait UniversalLifecycle: ProcessLifecycle + BuildLifecycle {}", false, "UniversalLifecycle");
 
     let lifecycle = source("src/host/lifecycle.rs");
     let inherited_capability = lifecycle.replace(
@@ -911,30 +1047,11 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     )
     .unwrap();
 
-    let alias = syn::parse_file(
-        "use self::BuildRuntime as B;\ntype R = ReportRuntime;\nstruct Broker { build: B, report: R }",
-    )
-    .unwrap();
-    assert_rejected(validate_module_policy(&alias, &[], false), "guarded");
-    let trait_alias = syn::parse_file("use self::BuildLifecycle as Other;").unwrap();
-    assert_rejected(
-        validate_module_policy(&trait_alias, &[], false),
-        "guarded import alias",
-    );
-
-    let aggregate = syn::parse_file(
-        "struct Broker { build: BuildRuntime, report: ReportRuntime }\nfn local() { struct Local(BuildRuntime, ReportRuntime); }",
-    )
-    .unwrap();
-    assert_rejected(validate_module_policy(&aggregate, &[], false), "aggregate");
-
-    let broad = syn::parse_file("struct UniversalFacade { host: Arc<RuntimeHost> }").unwrap();
-    assert_rejected(validate_module_policy(&broad, &[], true), "UniversalFacade");
-
-    let signature =
-        syn::parse_file("fn all_views() -> (BuildRuntime, ReportRuntime) { unreachable!() }")
-            .unwrap();
-    assert_rejected(validate_module_policy(&signature, &[], false), "all_views");
+    reject_policy("use self::BuildRuntime as B;\ntype R = ReportRuntime;\nstruct Broker { build: B, report: R }", false, "guarded");
+    reject_policy("use self::BuildLifecycle as Other;", false, "guarded import alias");
+    reject_policy("struct Broker { build: BuildRuntime, report: ReportRuntime }\nfn local() { struct Local(BuildRuntime, ReportRuntime); }", false, "aggregate");
+    reject_policy("struct UniversalFacade { host: Arc<RuntimeHost> }", true, "UniversalFacade");
+    reject_policy("fn all_views() -> (BuildRuntime, ReportRuntime) { unreachable!() }", false, "all_views");
 
     let view_escape = format!(
         "{lifecycle}\nimpl ProcessRuntime {{ fn build_capability(&self) -> Arc<dyn self::BuildLifecycle> {{ unreachable!() }} }}\n"
@@ -955,12 +1072,7 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         "conversion",
     );
 
-    let host_trait_escape =
-        syn::parse_file("trait ReportHost { fn broad(&self) -> &PodRuntime; }").unwrap();
-    assert_rejected(
-        validate_module_policy(&host_trait_escape, &[], true),
-        "ReportHost::broad",
-    );
+    reject_policy("trait ReportHost { fn broad(&self) -> &PodRuntime; }", true, "ReportHost::broad");
     let host_view_escape = syn::parse_file(
         "struct ReportRuntime { inner: Arc<dyn ReportHost>, build: Arc<dyn BuildHost> }",
     )
@@ -969,66 +1081,33 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         validate_view_boundaries(&host_view_escape, &[("ReportRuntime", &["dynReportHost"])]),
         "ReportRuntime",
     );
+    reject_policy("trait ReportExtension: BuildHost {}\ntrait ReportHost: ReportExtension {}", true, "transitively");
+    reject_policy("trait ReportHost { fn primary(&self) -> Arc<dyn PrimaryReplicator>; }", true, "ReportHost::primary");
+    reject_policy("#[allow(clippy::disallowed_types)] mod worker { struct Facade { runtime: Arc<PodRuntime> } }", false, "Facade");
 
-    let ungated_fixture = lifecycle.replacen(
-        "#[cfg(any(all(test, kuberic_workspace_tests), feature = \"testing\"))]",
+    for gate in [
         "#[cfg(all())]",
-        1,
-    );
-    assert_rejected(
-        validate_fixture_gates(&syn::parse_file(&ungated_fixture).unwrap()),
-        "production",
-    );
-    let platform_fixture = lifecycle.replacen(
-        "#[cfg(any(all(test, kuberic_workspace_tests), feature = \"testing\"))]",
         "#[cfg(not(windows))]",
-        1,
-    );
-    assert_rejected(
-        validate_fixture_gates(&syn::parse_file(&platform_fixture).unwrap()),
-        "production",
-    );
+        "#[cfg(kuberic_workspace_tests)]",
+    ] {
+        let mutation = lifecycle.replacen(
+            "#[cfg(any(all(test, kuberic_workspace_tests), feature = \"testing\"))]",
+            gate,
+            1,
+        );
+        assert_rejected(validate_fixture_gates(&parsed(&mutation)), "production");
+    }
 
-    assert_rejected(
-        validate_transport_routing(
-            "fn dispatch(runtime: BuildRuntime) { runtime.execute_admitted_build(); runtime.execute_admitted_build(); }",
-        ),
-        "2 admitted-build",
-    );
-    assert_rejected(
-        validate_transport_routing(
-            "fn dispatch(runtime: BuildRuntime, primary: PrimaryReplicator) { runtime.execute_admitted_build(); primary.build_replica(); }",
-        ),
-        "direct primary",
-    );
-    assert_rejected(
-        validate_transport_routing(
-            "fn dispatch(runtime: BuildRuntime) { runtime.execute_admitted_build(); BuildRuntime::execute_admitted_build(&runtime); }",
-        ),
-        "2 admitted-build",
-    );
-    assert_rejected(
-        validate_transport_routing(
-            "fn dispatch(runtime: BuildRuntime) { runtime.execute_admitted_build(); invoke!(runtime.execute_admitted_build()); }",
-        ),
-        "2 admitted-build",
-    );
-    assert_rejected(
-        validate_transport_routing(
-            "fn dispatch(runtime: BuildRuntime, primary: PrimaryReplicator) { runtime.execute_admitted_build(); PrimaryReplicator::build_replica(&primary); }",
-        ),
-        "direct primary",
-    );
+    reject_transport("fn dispatch(runtime: BuildRuntime) { runtime.execute_admitted_build(); runtime.execute_admitted_build(); }", "2 admitted-build");
+    reject_transport("fn dispatch(runtime: BuildRuntime, primary: PrimaryReplicator) { runtime.execute_admitted_build(); primary.build_replica(); }", "direct primary");
+    reject_transport("fn dispatch(runtime: BuildRuntime) { runtime.execute_admitted_build(); BuildRuntime::execute_admitted_build(&runtime); }", "2 admitted-build");
+    reject_transport("fn dispatch(runtime: BuildRuntime) { runtime.execute_admitted_build(); (BuildRuntime::execute_admitted_build)(&runtime); }", "2 admitted-build");
+    reject_transport("fn dispatch(runtime: BuildRuntime, primary: PrimaryReplicator) { runtime.execute_admitted_build(); PrimaryReplicator::build_replica(&primary); }", "direct primary");
     validate_transport_routing(
-        "#[cfg(test)] fn test_only(runtime: BuildRuntime) { runtime.execute_admitted_build(); }\nfn production(runtime: BuildRuntime) { runtime.execute_admitted_build(); }",
+        "fn production(r: BuildRuntime) { r.execute_admitted_build(); #[cfg(test)] let _x = r.execute_admitted_build(); match true { #[cfg(test)] true => r.execute_admitted_build(), _ => {} } tracing::debug!(\"build_replica retry\"); }",
     )
     .unwrap();
-    assert_rejected(
-        validate_transport_routing(
-            "#[cfg(test)] fn test_only(runtime: BuildRuntime) { runtime.execute_admitted_build(); }",
-        ),
-        "0 admitted-build",
-    );
+    reject_transport("#[cfg(test)] fn test_only(runtime: BuildRuntime) { runtime.execute_admitted_build(); }", "0 admitted-build");
 
     let custom = source("src/host/custom.rs");
     let wiring_getter = custom.replace(
@@ -1047,23 +1126,11 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
         ),
         "all_capabilities",
     );
+    reject_policy("impl From<ReplicatorLifecycleRegistration> for LifecycleWiring { fn from(value: ReplicatorLifecycleRegistration) -> Self { unreachable!() } }", true, "conversion");
 
-    let broad_cancellation = syn::parse_file(
-        "struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildRuntime) -> Self { unreachable!() } }",
-    )
-    .unwrap();
-    assert_rejected(
-        validate_cancellation_owner(&broad_cancellation, "BuildRuntimeCancellation"),
-        "cancellation-only",
-    );
-    let captured_host = syn::parse_file(
-        "struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime) -> Self { let host: Option<Arc<PodRuntime>> = None; unreachable!() } }",
-    )
-    .unwrap();
-    assert_rejected(
-        validate_cancellation_owner(&captured_host, "BuildRuntimeCancellation"),
-        "broader runtime",
-    );
+    reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildRuntime) -> Self { unreachable!() } }", "cancellation-only");
+    reject_cancellation("struct BuildRuntimeCancellation;\nimpl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime) -> Self { let host: Option<Arc<PodRuntime>> = None; unreachable!() } }", "broader runtime");
+    reject_cancellation("struct BuildRuntimeCancellation; impl BuildRuntimeCancellation { fn new(runtime: BuildAttemptRuntime) -> Self { let host = PodRuntime::new(); unreachable!() } }", "broader runtime");
 
     let module_root = tempfile::tempdir().unwrap();
     let hosting_dir = module_root.path().join("hosting");
