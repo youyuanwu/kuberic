@@ -1501,6 +1501,52 @@ impl RuntimeHost {
 #[async_trait]
 impl ReportHost for RuntimeHost {
     async fn observe_progress(&self) -> Result<()> {
+        if !BuildHost::is_managed(self) {
+            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+            return tokio::spawn(async move { host.observe_report_progress().await })
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        }
+        self.observe_report_progress().await
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        let lifecycle = self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle);
+        let snapshot = match lifecycle {
+            Some(lifecycle) => Some(lifecycle.snapshot().await),
+            None => None,
+        };
+        self.compose_snapshot(snapshot).await
+    }
+
+    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+        if !BuildHost::is_managed(self) {
+            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+            return tokio::spawn(async move { host.reconcile_report_access(read, write).await })
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        }
+        self.reconcile_report_access(read, write).await
+    }
+
+    async fn partition_report(&self) -> PartitionReportSnapshot {
+        self.partition_report_snapshot().await
+    }
+
+    async fn catch_up_capability(&self) -> Result<i64> {
+        self.registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .catch_up_capability()
+            .await
+    }
+}
+
+impl RuntimeHost {
+    async fn observe_report_progress(&self) -> Result<()> {
         let _restoration = if !BuildHost::is_managed(self) {
             Some(self.custom_restoration.lock().await)
         } else {
@@ -1539,19 +1585,7 @@ impl ReportHost for RuntimeHost {
         Ok(())
     }
 
-    async fn snapshot(&self) -> RuntimeSnapshot {
-        let lifecycle = self
-            .registered
-            .get()
-            .and_then(RegisteredReplicator::report_lifecycle);
-        let snapshot = match lifecycle {
-            Some(lifecycle) => Some(lifecycle.snapshot().await),
-            None => None,
-        };
-        self.compose_snapshot(snapshot).await
-    }
-
-    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
+    async fn reconcile_report_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         let _restoration = if !BuildHost::is_managed(self) {
             Some(self.custom_restoration.lock().await)
         } else {
@@ -1579,18 +1613,6 @@ impl ReportHost for RuntimeHost {
         }
 
         Ok(())
-    }
-
-    async fn partition_report(&self) -> PartitionReportSnapshot {
-        self.partition_report_snapshot().await
-    }
-
-    async fn catch_up_capability(&self) -> Result<i64> {
-        self.registered
-            .get()
-            .ok_or(RuntimeError::NotOpen)?
-            .catch_up_capability()
-            .await
     }
 }
 

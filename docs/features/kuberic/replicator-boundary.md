@@ -123,8 +123,13 @@ The custom host first checks structural, durable-conflict and required build
 evidence. It then invalidates old work and saved grants, explicitly closes both
 read/write projections, and completes bounded native access revocation before
 calling the application. This also interrupts identical-authority replay and
-same-primary scale-up access. Live report/deferred restoration accepted earlier
-is serialized before staging; subsequent stale restoration cannot reopen access.
+same-primary scale-up access. Report/deferred restoration accepted earlier
+is serialized before staging; its host-owned continuation retains ownership even
+if the requesting reporter is dropped. Already-entered incidental configuration
+callbacks likewise finish before candidate application. Independent direct and
+deferred configuration share a private callback owner; dropping a peer-discovery
+observer does not release a stateful callback into a newer authority. Subsequent
+stale restoration cannot reopen access.
 Successful admission requires callback acceptance, authority-store success and
 owned generation/session-valid publication. It remains closed until fresh
 explicit access authorization.
