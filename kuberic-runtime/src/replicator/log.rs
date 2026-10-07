@@ -54,23 +54,18 @@ impl ReplicationLog {
         }
     }
 
-    fn configure(
+    fn configure_prevalidated(
         &mut self,
         authority: ManagedReplicaConfiguration,
         local_progress: Lsn,
-    ) -> Result<()> {
-        if authority.local_identity != self.local_identity {
-            return Err(RuntimeError::AuthorityMismatch(
-                "admitted local identity differs from runtime identity".to_string(),
-            ));
-        }
+    ) {
         if self.authority.as_ref() != Some(&authority) {
             self.pending_local_write = None;
         }
         self.next_lsn = self.next_lsn.max(local_progress);
-        self.quorum.configure(authority.clone(), local_progress)?;
+        self.quorum
+            .configure_prevalidated(authority.clone(), local_progress);
         self.authority = Some(authority);
-        Ok(())
     }
 
     fn reserve_write_inner(&mut self, write: &ClientWrite) -> Result<Lsn> {
@@ -309,23 +304,19 @@ impl ReplicationLog {
         Ok(())
     }
 
-    pub(crate) fn admit_authority(
+    pub(crate) fn admit_prepared_authority(
         &mut self,
         authority: ManagedReplicaConfiguration,
         local_progress: Lsn,
         preserve_write_access: bool,
-    ) -> Result<()> {
+    ) {
         if preserve_write_access {
-            if authority.current_configuration.epoch < self.epoch {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "replicator epoch cannot regress".to_string(),
-                ));
-            }
             self.epoch = authority.current_configuration.epoch;
-        } else {
-            self.update_epoch(authority.current_configuration.epoch)?;
+        } else if authority.current_configuration.epoch != self.epoch {
+            self.fence_client_writes_inner();
+            self.epoch = authority.current_configuration.epoch;
         }
-        self.configure(authority, local_progress)
+        self.configure_prevalidated(authority, local_progress);
     }
 
     pub(crate) fn current_progress(&self) -> Lsn {
@@ -350,12 +341,13 @@ impl ReplicationLog {
         self.record_local_progress_inner(lsn)
     }
 
-    pub(crate) fn record_build_handoff_progress(
+    pub(crate) fn record_prepared_build_handoff_progress(
         &mut self,
         identity: ReplicaIdentity,
         lsn: Lsn,
-    ) -> Result<()> {
-        self.quorum.record_build_handoff_progress(identity, lsn)
+    ) {
+        self.quorum
+            .record_prepared_build_handoff_progress(identity, lsn);
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {

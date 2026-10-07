@@ -28,12 +28,22 @@ pub(crate) struct QuorumTracker {
 }
 
 impl QuorumTracker {
+    #[cfg(test)]
     pub(crate) fn configure(
         &mut self,
         authority: ManagedReplicaConfiguration,
         local_progress: Lsn,
     ) -> Result<()> {
         authority.validate()?;
+        self.configure_prevalidated(authority, local_progress);
+        Ok(())
+    }
+
+    pub(crate) fn configure_prevalidated(
+        &mut self,
+        authority: ManagedReplicaConfiguration,
+        local_progress: Lsn,
+    ) {
         let same_fence = self.authority.as_ref() == Some(&authority);
         let current_only_completion = self.authority.as_ref().is_some_and(|existing| {
             authority.scale_up.is_some() && authority.is_current_only_completion_of(existing)
@@ -85,7 +95,6 @@ impl QuorumTracker {
             self.must_catch_up = derive_must_catch_up(&authority);
         }
         self.authority = Some(authority);
-        Ok(())
     }
 
     pub(crate) fn register_peer_session(
@@ -388,6 +397,7 @@ impl QuorumTracker {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn record_build_handoff_progress(
         &mut self,
         identity: ReplicaIdentity,
@@ -408,6 +418,18 @@ impl QuorumTracker {
             .or_insert(lsn);
         self.highest_lsn = self.highest_lsn.max(lsn);
         Ok(())
+    }
+
+    pub(crate) fn record_prepared_build_handoff_progress(
+        &mut self,
+        identity: ReplicaIdentity,
+        lsn: Lsn,
+    ) {
+        self.progress
+            .entry(identity)
+            .and_modify(|progress| *progress = (*progress).max(lsn))
+            .or_insert(lsn);
+        self.highest_lsn = self.highest_lsn.max(lsn);
     }
 
     pub(crate) fn acknowledge(&mut self, acknowledgement: &ReplicationAck) -> Result<()> {

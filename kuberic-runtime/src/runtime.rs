@@ -83,6 +83,7 @@ struct PendingManagedConfiguration {
     prior_access: (AccessStatus, AccessStatus),
     authority_changed: bool,
     preserve_access: bool,
+    completed_builds: Vec<(ReplicaIdentity, i64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -688,7 +689,7 @@ impl DefaultReplicatorInner {
         self.replicator
             .lock()
             .await
-            .admit_authority(authority, progress, false)?;
+            .admit_prepared_authority(authority, progress, false);
         self.changed.notify_waiters();
         Ok(())
     }
@@ -932,8 +933,14 @@ impl DefaultReplicatorInner {
             .load_replication_progress_with_handoff(&authority)
             .await?;
         let preserve_scale_up_access = restores_same_primary_scale_up_access(&authority);
-        self.configure_admitted_authority(&authority, current_progress, preserve_scale_up_access)
-            .await?;
+        let completed_builds = self.load_completed_build_handoffs(&authority).await?;
+        self.configure_admitted_authority(
+            &authority,
+            current_progress,
+            preserve_scale_up_access,
+            completed_builds,
+        )
+        .await?;
         self.replicator
             .lock()
             .await
@@ -2952,44 +2959,55 @@ impl DefaultReplicatorInner {
         Ok(())
     }
 
+    async fn load_completed_build_handoffs(
+        &self,
+        authority: &ManagedReplicaConfiguration,
+    ) -> Result<Vec<(ReplicaIdentity, i64)>> {
+        if authority.local_role() != ReplicaRole::Primary {
+            return Ok(Vec::new());
+        }
+        let mut completed_builds = self
+            .state
+            .read()
+            .await
+            .outbound_builds
+            .values()
+            .filter_map(|build| {
+                completed_build_handoff_lsn(&build.progress, authority)
+                    .map(|lsn| (build.progress.authority.target.clone(), lsn))
+            })
+            .collect::<Vec<_>>();
+        if let Some(evidence) = authority.scale_up.as_deref()
+            && let Some(progress) = self
+                .build_progress_store
+                .load_build_progress(&evidence.intent().build_id)
+                .await?
+            && let Some(lsn) = completed_build_handoff_lsn(&progress, authority)
+            && !completed_builds
+                .iter()
+                .any(|(identity, _)| identity == &progress.authority.target)
+        {
+            completed_builds.push((progress.authority.target.clone(), lsn));
+        }
+        Ok(completed_builds)
+    }
+
     async fn configure_admitted_authority(
         &self,
         authority: &ManagedReplicaConfiguration,
         progress: i64,
         preserve_write_access: bool,
+        completed_builds: Vec<(ReplicaIdentity, i64)>,
     ) -> Result<()> {
-        self.replicator.lock().await.admit_authority(
+        self.replicator.lock().await.admit_prepared_authority(
             authority.clone(),
             progress,
             preserve_write_access,
-        )?;
+        );
         if authority.local_role() == ReplicaRole::Primary {
-            let mut completed_builds = self
-                .state
-                .read()
-                .await
-                .outbound_builds
-                .values()
-                .filter_map(|build| {
-                    completed_build_handoff_lsn(&build.progress, authority)
-                        .map(|lsn| (build.progress.authority.target.clone(), lsn))
-                })
-                .collect::<Vec<_>>();
-            if let Some(evidence) = authority.scale_up.as_deref()
-                && let Some(progress) = self
-                    .build_progress_store
-                    .load_build_progress(&evidence.intent().build_id)
-                    .await?
-                && let Some(lsn) = completed_build_handoff_lsn(&progress, authority)
-                && !completed_builds
-                    .iter()
-                    .any(|(identity, _)| identity == &progress.authority.target)
-            {
-                completed_builds.push((progress.authority.target.clone(), lsn));
-            }
             let mut replicator = self.replicator.lock().await;
             for (identity, progress) in completed_builds {
-                replicator.record_build_handoff_progress(identity, progress)?;
+                replicator.record_prepared_build_handoff_progress(identity, progress);
             }
         }
         if authority.local_role() == ReplicaRole::Primary {
@@ -3355,6 +3373,7 @@ impl DefaultReplicatorInner {
             prior_access,
             authority_changed,
             preserve_access: preserve_scale_up_access,
+            completed_builds,
             ..
         } = pending;
         if authority_changed {
@@ -3391,8 +3410,13 @@ impl DefaultReplicatorInner {
                 .update_epoch(authority.current_configuration.epoch)
                 .await?;
         }
-        self.configure_admitted_authority(&authority, current_progress, preserve_scale_up_access)
-            .await?;
+        self.configure_admitted_authority(
+            &authority,
+            current_progress,
+            preserve_scale_up_access,
+            completed_builds,
+        )
+        .await?;
         self.replicator
             .lock()
             .await
@@ -3852,9 +3876,15 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         let authority_changed = existing.as_ref() != Some(&configuration);
         let changed = authority_changed
             || self.state.read().await.configuration_generation != host_generation;
+        if configuration.current_configuration.epoch < self.replicator.lock().await.epoch() {
+            return Err(RuntimeError::AuthorityMismatch(
+                "replicator epoch cannot regress".into(),
+            ));
+        }
         let replication_progress = self
             .load_replication_progress_with_handoff(&configuration)
             .await?;
+        let completed_builds = self.load_completed_build_handoffs(&configuration).await?;
         if changed {
             self.fence_generation.fetch_add(1, Ordering::AcqRel);
             if !preserve_access {
@@ -3887,6 +3917,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             prior_access,
             authority_changed,
             preserve_access,
+            completed_builds,
         });
         self.changed.notify_waiters();
         Ok(preparation)
