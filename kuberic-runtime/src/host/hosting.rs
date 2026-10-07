@@ -60,10 +60,6 @@ fn managed_configuration(authority: AdmittedAuthority) -> ManagedReplicaConfigur
         switchover_handoff: authority.switchover_handoff,
         secondary_removal: authority.secondary_removal,
         scale_up: authority.scale_up,
-        failover_build: authority.transition_kind
-            == Some(crate::protocol::types::TransitionKind::Failover),
-        bootstrap: authority.transition_kind
-            == Some(crate::protocol::types::TransitionKind::Bootstrap),
     }
 }
 

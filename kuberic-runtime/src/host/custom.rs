@@ -357,10 +357,6 @@ fn managed_configuration(authority: &AdmittedAuthority) -> ManagedReplicaConfigu
         switchover_handoff: authority.switchover_handoff.clone(),
         secondary_removal: authority.secondary_removal.clone(),
         scale_up: authority.scale_up.clone(),
-        failover_build: authority.transition_kind
-            == Some(crate::protocol::types::TransitionKind::Failover),
-        bootstrap: authority.transition_kind
-            == Some(crate::protocol::types::TransitionKind::Bootstrap),
     }
 }
 
@@ -479,13 +475,11 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
 
     async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
         self.common.prepare_authority_admission(&authority).await?;
-        let previous = self.common.state.read().await.authority.clone();
-        let preserve_access = previous.as_ref().is_some_and(|existing| {
-            existing == &authority || preserves_same_primary_scale_up_access(existing, &authority)
-        });
-        if !preserve_access {
-            self.legacy.fence_writes().await?;
-        }
+        let generation = self.common.configuration_generation.load(Ordering::Acquire);
+        let preparation = self
+            .legacy
+            .prepare_replica_configuration(managed_configuration(&authority), generation)
+            .await?;
         self.common
             .host()?
             .default_dependencies
@@ -493,9 +487,14 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
             .admit(&authority)
             .await?;
         self.legacy
-            .admit_replica_configuration(managed_configuration(&authority))
+            .commit_replica_configuration(preparation)
             .await?;
         self.common.install_managed_authority(&authority).await?;
+        self.legacy
+            .synchronize_replica_configuration(
+                self.common.configuration_generation.load(Ordering::Acquire),
+            )
+            .await?;
         self.sync_topology_status().await
     }
 
@@ -925,22 +924,52 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
         process_session_id: ProcessSessionId,
         report_sequence: u64,
     ) -> Result<()> {
-        self.execute_removal_action(RuntimeEffectAction::PrepareSecondaryRemoval {
-            intent: Box::new(intent),
-            process_session_id,
-            report_sequence,
-        })
-        .await
+        let authority = self.common.state.read().await.authority.clone();
+        let token = self.legacy.native_fence().await?;
+        let expected_intent = intent.clone();
+        let expected_session = process_session_id.clone();
+        self.common.fence_managed_access().await?;
+        let outcome = self
+            .legacy
+            .prepare_secondary_removal(intent, process_session_id, report_sequence)
+            .await?;
+        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        validate_secondary_removal_receipt(&receipt, &receipt.token)?;
+        if receipt.preparation.as_ref().is_none_or(|preparation| {
+            preparation.intent != expected_intent
+                || preparation.process_session_id != expected_session
+                || preparation.report_sequence != report_sequence
+        }) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.common
+            .accept_secondary_removal_receipt(&receipt)
+            .await?;
+        *self.topology_receipt.write().await = Some(TopologyReceipt::SecondaryRemoval(receipt));
+        Ok(())
     }
 
     async fn observe_secondary_removal(
         &self,
         witness: crate::protocol::types::SecondaryRemovalWitness,
     ) -> Result<()> {
-        self.execute_removal_action(RuntimeEffectAction::ObserveSecondaryRemovalWitness(
-            Box::new(witness),
-        ))
-        .await
+        let authority = self.common.state.read().await.authority.clone();
+        let token = self.legacy.native_fence().await?;
+        let expected = witness.clone();
+        let outcome = self
+            .legacy
+            .observe_secondary_removal_witness(witness)
+            .await?;
+        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        validate_secondary_removal_receipt(&receipt, &receipt.token)?;
+        if receipt.witness.as_ref() != Some(&expected) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.common
+            .accept_secondary_removal_receipt(&receipt)
+            .await?;
+        *self.topology_receipt.write().await = Some(TopologyReceipt::SecondaryRemoval(receipt));
+        Ok(())
     }
 
     async fn observe_secondary_removal_progress(
@@ -948,41 +977,96 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
         witness: crate::protocol::types::SecondaryRemovalWitness,
         committed: crate::protocol::types::SecondaryScaleDownCleanup,
     ) -> Result<()> {
-        self.execute_removal_action(RuntimeEffectAction::ObserveSecondaryRemovalProgress {
-            witness: Box::new(witness),
-            committed: Box::new(committed),
-        })
-        .await
+        let authority = self.common.state.read().await.authority.clone();
+        let token = self.legacy.native_fence().await?;
+        let expected_witness = witness.clone();
+        let expected_committed = committed.clone();
+        let outcome = self
+            .legacy
+            .observe_secondary_removal_progress(witness, committed)
+            .await?;
+        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        validate_secondary_removal_receipt(&receipt, &receipt.token)?;
+        if receipt.witness.as_ref() != Some(&expected_witness)
+            || receipt.accepted.as_ref() != Some(&expected_committed)
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.common
+            .accept_secondary_removal_receipt(&receipt)
+            .await?;
+        *self.topology_receipt.write().await = Some(TopologyReceipt::SecondaryRemoval(receipt));
+        Ok(())
     }
 
     async fn accept_secondary_removal(
         &self,
         committed: crate::protocol::types::SecondaryScaleDownCleanup,
     ) -> Result<()> {
-        self.execute_removal_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(
-            committed,
-        )))
-        .await
+        let authority = self.common.state.read().await.authority.clone();
+        let token = self.legacy.native_fence().await?;
+        let expected = committed.clone();
+        let outcome = self
+            .legacy
+            .accept_secondary_removal_commit(committed)
+            .await?;
+        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        validate_secondary_removal_receipt(&receipt, &receipt.token)?;
+        if receipt.accepted.as_ref() != Some(&expected) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.common
+            .accept_secondary_removal_receipt(&receipt)
+            .await?;
+        *self.topology_receipt.write().await = Some(TopologyReceipt::SecondaryRemoval(receipt));
+        Ok(())
     }
 
     async fn accept_historical_secondary_removal(
         &self,
         command: crate::protocol::command::AcceptSecondaryRemovalCommit,
     ) -> Result<()> {
-        self.execute_removal_action(RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(
-            Box::new(command),
-        ))
-        .await
+        let authority = self.common.state.read().await.authority.clone();
+        let token = self.legacy.native_fence().await?;
+        let outcome = self
+            .legacy
+            .accept_historical_secondary_removal_commit(command)
+            .await?;
+        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        validate_secondary_removal_receipt(&receipt, &receipt.token)?;
+        self.common
+            .accept_secondary_removal_receipt(&receipt)
+            .await?;
+        *self.topology_receipt.write().await = Some(TopologyReceipt::SecondaryRemoval(receipt));
+        Ok(())
     }
 
     async fn fence_retirement(&self, retired: crate::authority::RetiredAuthority) -> Result<()> {
-        self.execute_removal_action(RuntimeEffectAction::FenceRetirement(Box::new(retired)))
-            .await
+        let outcome = self.legacy.fence_retirement(retired.clone()).await?;
+        let receipt = Box::new(RetirementReceipt {
+            engine_session_id: outcome.engine_session_id,
+            engine_generation: outcome.engine_generation,
+            retired: outcome.retired,
+            completed: outcome.completed,
+        });
+        validate_retirement_receipt(&receipt, &retired, false)?;
+        self.common.fence_retirement_state(&retired).await?;
+        *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
+        Ok(())
     }
 
     async fn complete_retirement(&self, retired: crate::authority::RetiredAuthority) -> Result<()> {
-        self.execute_removal_action(RuntimeEffectAction::CompleteRetirement(Box::new(retired)))
-            .await
+        let outcome = self.legacy.complete_retirement(retired.clone()).await?;
+        let receipt = Box::new(RetirementReceipt {
+            engine_session_id: outcome.engine_session_id,
+            engine_generation: outcome.engine_generation,
+            retired: outcome.retired,
+            completed: outcome.completed,
+        });
+        validate_retirement_receipt(&receipt, &retired, true)?;
+        self.common.complete_retirement_state(&retired).await?;
+        *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
+        Ok(())
     }
 
     async fn topology_receipt(&self, action: &RuntimeEffectAction) -> Option<TopologyReceipt> {
@@ -1103,149 +1187,6 @@ impl ManagedLifecycleBackend {
             };
         }
         snapshot
-    }
-
-    async fn execute_removal_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        match action {
-            RuntimeEffectAction::PrepareSecondaryRemoval {
-                intent,
-                process_session_id,
-                report_sequence,
-            } => {
-                let authority = self.common.state.read().await.authority.clone();
-                let token = self.legacy.native_fence().await?;
-                let expected_intent = (*intent).clone();
-                let expected_session = process_session_id.clone();
-                self.common.fence_managed_access().await?;
-                let outcome = self
-                    .legacy
-                    .prepare_secondary_removal(*intent, process_session_id, report_sequence)
-                    .await?;
-                let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
-                validate_secondary_removal_receipt(&receipt, &receipt.token)?;
-                if receipt.preparation.as_ref().is_none_or(|preparation| {
-                    preparation.intent != expected_intent
-                        || preparation.process_session_id != expected_session
-                        || preparation.report_sequence != report_sequence
-                }) {
-                    return Err(RuntimeError::OperationCancelled);
-                }
-                self.common
-                    .accept_secondary_removal_receipt(&receipt)
-                    .await?;
-                *self.topology_receipt.write().await =
-                    Some(TopologyReceipt::SecondaryRemoval(receipt));
-                Ok(())
-            }
-            RuntimeEffectAction::ObserveSecondaryRemovalWitness(witness) => {
-                let authority = self.common.state.read().await.authority.clone();
-                let token = self.legacy.native_fence().await?;
-                let expected = (*witness).clone();
-                let outcome = self
-                    .legacy
-                    .observe_secondary_removal_witness(*witness)
-                    .await?;
-                let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
-                validate_secondary_removal_receipt(&receipt, &receipt.token)?;
-                if receipt.witness.as_ref() != Some(&expected) {
-                    return Err(RuntimeError::OperationCancelled);
-                }
-                self.common
-                    .accept_secondary_removal_receipt(&receipt)
-                    .await?;
-                *self.topology_receipt.write().await =
-                    Some(TopologyReceipt::SecondaryRemoval(receipt));
-                Ok(())
-            }
-            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
-                let authority = self.common.state.read().await.authority.clone();
-                let token = self.legacy.native_fence().await?;
-                let expected_witness = (*witness).clone();
-                let expected_committed = (*committed).clone();
-                let outcome = self
-                    .legacy
-                    .observe_secondary_removal_progress(*witness, *committed)
-                    .await?;
-                let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
-                validate_secondary_removal_receipt(&receipt, &receipt.token)?;
-                if receipt.witness.as_ref() != Some(&expected_witness)
-                    || receipt.accepted.as_ref() != Some(&expected_committed)
-                {
-                    return Err(RuntimeError::OperationCancelled);
-                }
-                self.common
-                    .accept_secondary_removal_receipt(&receipt)
-                    .await?;
-                *self.topology_receipt.write().await =
-                    Some(TopologyReceipt::SecondaryRemoval(receipt));
-                Ok(())
-            }
-            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
-                let authority = self.common.state.read().await.authority.clone();
-                let token = self.legacy.native_fence().await?;
-                let expected = (*committed).clone();
-                let outcome = self
-                    .legacy
-                    .accept_secondary_removal_commit(*committed)
-                    .await?;
-                let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
-                validate_secondary_removal_receipt(&receipt, &receipt.token)?;
-                if receipt.accepted.as_ref() != Some(&expected) {
-                    return Err(RuntimeError::OperationCancelled);
-                }
-                self.common
-                    .accept_secondary_removal_receipt(&receipt)
-                    .await?;
-                *self.topology_receipt.write().await =
-                    Some(TopologyReceipt::SecondaryRemoval(receipt));
-                Ok(())
-            }
-            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
-                let authority = self.common.state.read().await.authority.clone();
-                let token = self.legacy.native_fence().await?;
-                let outcome = self
-                    .legacy
-                    .accept_historical_secondary_removal_commit(*command)
-                    .await?;
-                let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
-                validate_secondary_removal_receipt(&receipt, &receipt.token)?;
-                self.common
-                    .accept_secondary_removal_receipt(&receipt)
-                    .await?;
-                *self.topology_receipt.write().await =
-                    Some(TopologyReceipt::SecondaryRemoval(receipt));
-                Ok(())
-            }
-            RuntimeEffectAction::FenceRetirement(retired) => {
-                let outcome = self.legacy.fence_retirement(*retired.clone()).await?;
-                let receipt = Box::new(RetirementReceipt {
-                    engine_session_id: outcome.engine_session_id,
-                    engine_generation: outcome.engine_generation,
-                    retired: outcome.retired,
-                    completed: outcome.completed,
-                });
-                validate_retirement_receipt(&receipt, &retired, false)?;
-                self.common.fence_retirement_state(&retired).await?;
-                *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
-                Ok(())
-            }
-            RuntimeEffectAction::CompleteRetirement(retired) => {
-                let outcome = self.legacy.complete_retirement(*retired.clone()).await?;
-                let receipt = Box::new(RetirementReceipt {
-                    engine_session_id: outcome.engine_session_id,
-                    engine_generation: outcome.engine_generation,
-                    retired: outcome.retired,
-                    completed: outcome.completed,
-                });
-                validate_retirement_receipt(&receipt, &retired, true)?;
-                self.common.complete_retirement_state(&retired).await?;
-                *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
-                Ok(())
-            }
-            _ => Err(RuntimeError::Application(
-                "managed removal proof requires a removal action".into(),
-            )),
-        }
     }
 
     async fn publish_managed_access(

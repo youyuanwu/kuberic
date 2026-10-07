@@ -37,9 +37,10 @@ use crate::replicator::copy::{
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
 use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
 use crate::replicator::{
-    ManagedAccessPreparation, ManagedFenceGuard, ManagedOperationFence, ManagedReplicaStore,
-    ManagedReplicatorDataPlane, ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation,
-    ReplicaSetQuorumMode, Replicator,
+    ManagedAccessPreparation, ManagedConfigurationPreparation, ManagedFenceGuard,
+    ManagedOperationFence, ManagedReplicaStore, ManagedReplicatorDataPlane,
+    ManagedReplicatorLifecycle, PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode,
+    Replicator,
 };
 use crate::{Result, RuntimeError};
 
@@ -51,6 +52,8 @@ struct RuntimeState {
     read_status: AccessStatus,
     write_status: AccessStatus,
     authority: Option<ManagedReplicaConfiguration>,
+    configuration_generation: u64,
+    pending_configuration: Option<crate::replicator::ManagedConfigurationPreparation>,
     prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
     removal_in_progress: Option<crate::protocol::types::SecondaryScaleDownIntent>,
     retired_authority: Option<RetiredAuthority>,
@@ -263,6 +266,8 @@ impl DefaultReplicatorInner {
                 read_status: AccessStatus::NotPrimary,
                 write_status: AccessStatus::NotPrimary,
                 authority: None,
+                configuration_generation: 0,
+                pending_configuration: None,
                 prepared_secondary_removal: None,
                 removal_in_progress: None,
                 retired_authority: None,
@@ -1272,7 +1277,7 @@ impl DefaultReplicatorInner {
                 if authority.primary_identity() != &self.identity {
                     return Err(RuntimeError::NotPrimary);
                 }
-                let kind = if authority.failover_build {
+                let kind = if authority.requires_failover_build() {
                     BuildAuthorityKind::Failover
                 } else {
                     BuildAuthorityKind::Provisioning
@@ -3226,9 +3231,9 @@ impl DefaultReplicatorInner {
 }
 
 impl DefaultReplicatorInner {
-    async fn admit_managed_configuration(
+    async fn validate_managed_configuration_candidate(
         &self,
-        authority: ManagedReplicaConfiguration,
+        authority: &ManagedReplicaConfiguration,
     ) -> Result<()> {
         authority.validate()?;
         if authority.local_identity != self.identity {
@@ -3249,6 +3254,60 @@ impl DefaultReplicatorInner {
         {
             return Err(RuntimeError::Closed);
         }
+        let state = self.state.read().await;
+        if state.authority.as_ref().is_some_and(|existing| {
+            authority.current_configuration.epoch < existing.current_configuration.epoch
+                || (authority.current_configuration.epoch == existing.current_configuration.epoch
+                    && existing != authority
+                    && !authority.is_current_only_completion_of(existing))
+        }) {
+            return Err(RuntimeError::AuthorityMismatch(
+                "configuration changed without a newer epoch".into(),
+            ));
+        }
+        if let Some(evidence) = &authority.secondary_removal {
+            let intent = &evidence.preparation.intent;
+            let existing = state
+                .authority
+                .as_ref()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if existing.secondary_removal.as_ref().map(|e| &e.preparation)
+                != Some(&evidence.preparation)
+                && (existing.previous_configuration.is_some()
+                    || existing.current_configuration != intent.previous_configuration)
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "reduction does not extend installed current-only configuration".into(),
+                ));
+            }
+            if self.identity == intent.primary
+                && state.accepted_secondary_removal.as_ref().is_none_or(|c| {
+                    c.evidence != *evidence
+                        || authority.previous_configuration.is_some()
+                        || authority.current_configuration != intent.current_configuration
+                })
+                && (state.prepared_secondary_removal.as_ref() != Some(&evidence.preparation)
+                    || state.current_progress < evidence.preparation.boundary_lsn
+                    || state
+                        .replication_progress
+                        .as_ref()
+                        .is_none_or(|p| p.verified_lsn < evidence.preparation.boundary_lsn))
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "primary lacks exact durable preparation".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn admit_managed_configuration(
+        &self,
+        authority: ManagedReplicaConfiguration,
+        prepared: bool,
+    ) -> Result<()> {
+        self.validate_managed_configuration_candidate(&authority)
+            .await?;
         {
             let state = self.state.read().await;
             if let Some(evidence) = &authority.secondary_removal {
@@ -3352,9 +3411,11 @@ impl DefaultReplicatorInner {
                     state.removal_in_progress = None;
                 }
             }
-            self.fence_generation.fetch_add(1, Ordering::AcqRel);
-            if !preserve_scale_up_access {
-                self.replicator.lock().await.fence_client_writes();
+            if !prepared {
+                self.fence_generation.fetch_add(1, Ordering::AcqRel);
+                if !preserve_scale_up_access {
+                    self.replicator.lock().await.fence_client_writes();
+                }
             }
             self.changed.notify_waiters();
             self.state.write().await.accepted_secondary_removal = None;
@@ -3487,11 +3548,13 @@ impl DefaultReplicatorInner {
         if self.state.read().await.retiring_authority.is_some() {
             return Err(RuntimeError::Closed);
         }
+        let state = self.state.read().await;
         let token = ManagedOperationFence {
-            configuration: self.state.read().await.authority.clone(),
+            configuration: state.authority.clone(),
             engine_session_id: self.session_id.clone(),
             engine_generation: self.fence_generation.load(Ordering::Acquire),
         };
+        drop(state);
         self.execute_instruction(action).await?;
         self.changed.notify_waiters();
         Ok(token)
@@ -3742,7 +3805,10 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         self.check_aborted()?;
         if expected.engine_session_id != self.session_id
             || expected.engine_generation != self.fence_generation.load(Ordering::Acquire)
-            || expected.configuration != self.state.read().await.authority
+            || {
+                let state = self.state.read().await;
+                expected.configuration != state.authority
+            }
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -3754,8 +3820,9 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         let _effect = self.effect_lock.lock().await;
         let _delivery = self.delivery_lock.lock().await;
         self.check_aborted()?;
+        let state = self.state.read().await;
         Ok(ManagedOperationFence {
-            configuration: self.state.read().await.authority.clone(),
+            configuration: state.authority.clone(),
             engine_session_id: self.session_id.clone(),
             engine_generation: self.fence_generation.load(Ordering::Acquire),
         })
@@ -3775,25 +3842,96 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         }
     }
 
-    async fn admit_replica_configuration(
+    async fn prepare_replica_configuration(
         &self,
         configuration: ManagedReplicaConfiguration,
-    ) -> Result<()> {
-        let recover_scale_up_writes = matches!(
-            configuration.scale_up.as_deref(),
-            Some(crate::protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
-        );
+        host_generation: u64,
+    ) -> Result<ManagedConfigurationPreparation> {
         let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
         self.check_aborted()?;
         if self.state.read().await.retiring_authority.is_some() {
             return Err(RuntimeError::Closed);
         }
-        self.admit_managed_configuration(configuration).await?;
+        self.validate_managed_configuration_candidate(&configuration)
+            .await?;
+        let existing = self.state.read().await.authority.clone();
+        let preserve_access = existing.as_ref().is_some_and(|current| {
+            current == &configuration
+                || preserves_same_primary_scale_up_access(current, &configuration)
+        });
+        let changed = existing.as_ref() != Some(&configuration)
+            || self.state.read().await.configuration_generation != host_generation;
+        if changed {
+            self.fence_generation.fetch_add(1, Ordering::AcqRel);
+            if !preserve_access {
+                let mut state = self.state.write().await;
+                state.read_status = AccessStatus::ReconfigurationPending;
+                state.write_status = AccessStatus::ReconfigurationPending;
+                drop(state);
+                self.replicator.lock().await.fence_client_writes();
+            }
+        }
+        let preparation = ManagedConfigurationPreparation {
+            fence: ManagedOperationFence {
+                configuration: Some(configuration.clone()),
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
+            configuration,
+            preserve_access,
+            host_generation,
+        };
+        self.state.write().await.pending_configuration = Some(preparation.clone());
+        self.changed.notify_waiters();
+        Ok(preparation)
+    }
+
+    async fn commit_replica_configuration(
+        &self,
+        preparation: ManagedConfigurationPreparation,
+    ) -> Result<()> {
+        let recover_scale_up_writes = matches!(
+            preparation.configuration.scale_up.as_deref(),
+            Some(crate::protocol::types::ScaleUpConfigurationEvidence::Admission { .. })
+        );
+        let _effect = self.effect_lock.lock().await;
+        self.check_aborted()?;
+        if preparation.fence.engine_session_id != self.session_id
+            || preparation.fence.engine_generation != self.fence_generation.load(Ordering::Acquire)
+            || preparation.fence.configuration.as_ref() != Some(&preparation.configuration)
+            || self.state.read().await.pending_configuration.as_ref() != Some(&preparation)
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.admit_managed_configuration(preparation.configuration.clone(), true)
+            .await?;
+        {
+            let mut state = self.state.write().await;
+            state.configuration_generation = preparation.host_generation;
+            state.pending_configuration = None;
+        }
         drop(_effect);
         if recover_scale_up_writes && !self.state.read().await.local_writes.is_empty() {
             self.recover_pending_local_writes().await?;
         }
         self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn synchronize_replica_configuration(&self, host_generation: u64) -> Result<()> {
+        let _effect = self.effect_lock.lock().await;
+        let _delivery = self.delivery_lock.lock().await;
+        self.check_aborted()?;
+        let mut state = self.state.write().await;
+        if state.authority.is_none() || state.pending_configuration.is_some() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if state.configuration_generation != host_generation {
+            self.fence_generation.fetch_add(1, Ordering::AcqRel);
+            state.configuration_generation = host_generation;
+            self.changed.notify_waiters();
+        }
         Ok(())
     }
 
@@ -4207,8 +4345,7 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &ManagedReplicaConfi
     }
     match build.kind {
         BuildAuthorityKind::Bootstrap => {
-            authority.bootstrap
-                && authority.previous_configuration.is_none()
+            authority.previous_configuration.is_none()
                 && authority.current_configuration.configuration_id
                     == build.current_configuration.configuration_id
         }
@@ -4236,7 +4373,7 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &ManagedReplicaConfi
         }
 
         BuildAuthorityKind::Failover => {
-            authority.failover_build
+            authority.requires_failover_build()
                 && authority.previous_configuration.is_some()
                 && authority.current_configuration.configuration_id
                     == build.current_configuration.configuration_id

@@ -19,8 +19,6 @@ pub(crate) struct ManagedReplicaConfiguration {
     pub(crate) switchover_handoff: Option<SwitchoverHandoff>,
     pub(crate) secondary_removal: Option<SecondaryRemovalEvidence>,
     pub(crate) scale_up: Option<Box<ScaleUpConfigurationEvidence>>,
-    pub(crate) failover_build: bool,
-    pub(crate) bootstrap: bool,
 }
 
 impl ManagedReplicaConfiguration {
@@ -114,6 +112,15 @@ impl ManagedReplicaConfiguration {
             })
             .expect("validated local identity belongs to configuration")
             .role
+    }
+
+    pub(crate) fn requires_failover_build(&self) -> bool {
+        self.previous_configuration
+            .as_ref()
+            .is_some_and(|previous| {
+                previous.primary_id != self.current_configuration.primary_id
+                    && self.switchover_handoff.is_none()
+            })
     }
 
     pub(crate) fn validate_envelope(&self, envelope: &ReplicationItem) -> Result<()> {

@@ -1007,9 +1007,11 @@ fn production_prefix(source: &str) -> &str {
 
 fn validate_managed_replica_runtime_boundary(
     replicator: &str,
+    configuration: &str,
     runtime: &str,
     log: &str,
     quorum: &str,
+    host: &str,
 ) -> Result<(), String> {
     let trait_body = replicator
         .split("pub(crate) trait ManagedReplicatorLifecycle")
@@ -1030,7 +1032,9 @@ fn validate_managed_replica_runtime_boundary(
         }
     }
     for required in [
-        "admit_replica_configuration",
+        "prepare_replica_configuration",
+        "commit_replica_configuration",
+        "synchronize_replica_configuration",
         "authorize_failover_prefix",
         "prepare_switchover",
         "prepare_secondary_removal",
@@ -1052,6 +1056,10 @@ fn validate_managed_replica_runtime_boundary(
     }
     for (name, body) in [
         ("runtime.rs", production_prefix(runtime)),
+        (
+            "replicator/configuration.rs",
+            production_prefix(configuration),
+        ),
         ("replicator/log.rs", production_prefix(log)),
         ("replicator/quorum.rs", production_prefix(quorum)),
     ] {
@@ -1061,11 +1069,43 @@ fn validate_managed_replica_runtime_boundary(
             "RuntimeSnapshot",
             "RuntimePostcondition",
             "ReplicaAuthorityStore",
+            "TransitionKind",
         ] {
             if body.contains(forbidden) {
                 return Err(format!("{name} contains forbidden {forbidden}"));
             }
         }
+    }
+    let managed_host = host
+        .split("struct ManagedLifecycleBackend")
+        .nth(1)
+        .and_then(|body| body.split("struct CustomReplicatorHost").next())
+        .ok_or_else(|| "ManagedLifecycleBackend body was not found".to_string())?;
+    for forbidden in ["apply_topology", "execute_removal_action"] {
+        if managed_host.contains(forbidden) {
+            return Err(format!(
+                "managed host compatibility routing contains forbidden {forbidden}"
+            ));
+        }
+    }
+    let admission = managed_host
+        .split("async fn admit_authority")
+        .nth(1)
+        .and_then(|body| body.split("async fn register_peer_session").next())
+        .ok_or_else(|| "managed authority admission body was not found".to_string())?;
+    let ordered = [
+        "prepare_replica_configuration",
+        ".admit(&authority)",
+        "commit_replica_configuration",
+        "install_managed_authority",
+        "synchronize_replica_configuration",
+    ];
+    let mut cursor = 0;
+    for step in ordered {
+        let offset = admission[cursor..]
+            .find(step)
+            .ok_or_else(|| format!("managed authority admission is missing ordered step {step}"))?;
+        cursor += offset + step.len();
     }
     Ok(())
 }
@@ -1078,24 +1118,62 @@ fn lifecycle_capability_boundaries_are_narrow() {
 #[test]
 fn managed_replica_runtime_boundary_is_typed() {
     let replicator = source("src/replicator/mod.rs");
+    let configuration = source("src/replicator/configuration.rs");
     let runtime = source("src/runtime.rs");
     let log = source("src/replicator/log.rs");
     let quorum = source("src/replicator/quorum.rs");
-    validate_managed_replica_runtime_boundary(&replicator, &runtime, &log, &quorum).unwrap();
+    let host = source("src/host/custom.rs");
+    validate_managed_replica_runtime_boundary(
+        &replicator,
+        &configuration,
+        &runtime,
+        &log,
+        &quorum,
+        &host,
+    )
+    .unwrap();
 
     let leaked_trait = replicator.replace(
         "configuration: ManagedReplicaConfiguration",
         "configuration: AdmittedAuthority",
     );
     assert_rejected(
-        validate_managed_replica_runtime_boundary(&leaked_trait, &runtime, &log, &quorum),
+        validate_managed_replica_runtime_boundary(
+            &leaked_trait,
+            &configuration,
+            &runtime,
+            &log,
+            &quorum,
+            &host,
+        ),
         "AdmittedAuthority",
     );
 
     let leaked_runtime = format!("{runtime}\nuse crate::effects::RuntimeEffectAction;\n");
     assert_rejected(
-        validate_managed_replica_runtime_boundary(&replicator, &leaked_runtime, &log, &quorum),
+        validate_managed_replica_runtime_boundary(
+            &replicator,
+            &configuration,
+            &leaked_runtime,
+            &log,
+            &quorum,
+            &host,
+        ),
         "RuntimeEffectAction",
+    );
+
+    let leaked_configuration =
+        format!("{configuration}\nuse crate::protocol::types::TransitionKind;\n");
+    assert_rejected(
+        validate_managed_replica_runtime_boundary(
+            &replicator,
+            &leaked_configuration,
+            &runtime,
+            &log,
+            &quorum,
+            &host,
+        ),
+        "TransitionKind",
     );
 }
 

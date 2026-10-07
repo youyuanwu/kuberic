@@ -3562,11 +3562,23 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         panic!("registration tests do not request native topology status")
     }
 
-    async fn admit_replica_configuration(
+    async fn prepare_replica_configuration(
         &self,
         _configuration: crate::replicator::configuration::ManagedReplicaConfiguration,
+        _host_generation: u64,
+    ) -> Result<crate::replicator::ManagedConfigurationPreparation> {
+        panic!("registration tests do not prepare configuration")
+    }
+
+    async fn commit_replica_configuration(
+        &self,
+        _preparation: crate::replicator::ManagedConfigurationPreparation,
     ) -> Result<()> {
-        Ok(())
+        panic!("registration tests do not commit configuration")
+    }
+
+    async fn synchronize_replica_configuration(&self, _host_generation: u64) -> Result<()> {
+        panic!("registration tests do not synchronize configuration")
     }
 
     async fn authorize_failover_prefix(

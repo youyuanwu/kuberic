@@ -98,10 +98,16 @@ pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
     async fn native_fence(&self) -> Result<ManagedOperationFence>;
     async fn progress_status(&self) -> NativeProgressStatus;
     async fn topology_status(&self) -> NativeTopologyStatus;
-    async fn admit_replica_configuration(
+    async fn prepare_replica_configuration(
         &self,
         configuration: ManagedReplicaConfiguration,
+        host_generation: u64,
+    ) -> Result<ManagedConfigurationPreparation>;
+    async fn commit_replica_configuration(
+        &self,
+        preparation: ManagedConfigurationPreparation,
     ) -> Result<()>;
+    async fn synchronize_replica_configuration(&self, host_generation: u64) -> Result<()>;
     async fn authorize_failover_prefix(
         &self,
         boundary: Lsn,
@@ -170,6 +176,14 @@ pub(crate) struct ManagedOperationFence {
     pub(crate) configuration: Option<ManagedReplicaConfiguration>,
     pub(crate) engine_session_id: String,
     pub(crate) engine_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedConfigurationPreparation {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) configuration: ManagedReplicaConfiguration,
+    pub(crate) preserve_access: bool,
+    pub(crate) host_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
