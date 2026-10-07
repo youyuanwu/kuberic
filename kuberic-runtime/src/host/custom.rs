@@ -1457,6 +1457,7 @@ pub(super) struct CustomReplicatorHost {
     deferred_configuration_abort: StdMutex<Option<tokio::task::AbortHandle>>,
     configuration_generation: Arc<AtomicU64>,
     configuration_commit: Arc<Mutex<()>>,
+    configuration_callback: Arc<Mutex<()>>,
     access_generation: Arc<AtomicU64>,
     published_access_generation: Arc<AtomicU64>,
     access_commit: Arc<Mutex<()>>,
@@ -1507,6 +1508,7 @@ impl CustomReplicatorHost {
             deferred_configuration_abort: StdMutex::new(None),
             configuration_generation: Arc::new(AtomicU64::new(0)),
             configuration_commit: Arc::new(Mutex::new(())),
+            configuration_callback: Arc::new(Mutex::new(())),
             access_generation: Arc::new(AtomicU64::new(0)),
             published_access_generation: Arc::new(AtomicU64::new(0)),
             access_commit: Arc::new(Mutex::new(())),
@@ -1949,7 +1951,25 @@ impl CustomReplicatorHost {
         let configuration_commit = self.configuration_commit.clone();
         let host = self.host.clone();
         let primary = self.primary.clone();
+        let callback = self
+            .native_receipts
+            .then(|| self.configuration_callback.clone());
         let handle = tokio::spawn(async move {
+            let independent = callback.is_some();
+            let _callback = match callback {
+                Some(callback) => Some(callback.lock_owned().await),
+                None => None,
+            };
+            if independent
+                && (configuration_generation.load(Ordering::Acquire) != generation
+                    || host.upgrade().is_none_or(|host| {
+                        host.aborted.load(Ordering::Acquire)
+                            || host.closed.load(Ordering::Acquire)
+                            || host.custom_configuration_blocked()
+                    }))
+            {
+                return Err(RuntimeError::OperationCancelled);
+            }
             let current = tokio::time::timeout(
                 std::time::Duration::from_secs(75),
                 Self::apply_configuration_update(primary, current, previous),
@@ -1984,6 +2004,9 @@ impl CustomReplicatorHost {
     }
 
     async fn configure(&self) -> Result<()> {
+        if self.native_receipts {
+            return self.configure_custom().await;
+        }
         if self.host()?.custom_configuration_blocked() {
             return Ok(());
         }
@@ -2012,6 +2035,53 @@ impl CustomReplicatorHost {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn configure_custom(&self) -> Result<()> {
+        self.finish_deferred_configuration().await?;
+        let callback = self.configuration_callback.clone().lock_owned().await;
+        let host = self.active_host()?;
+        if host.custom_configuration_blocked() {
+            return Ok(());
+        }
+        let Some((current, previous)) = self.configuration_update().await? else {
+            return Ok(());
+        };
+        let generation = {
+            let _commit = self.configuration_commit.lock().await;
+            self.active_host()?;
+            if host.custom_configuration_blocked() {
+                return Ok(());
+            }
+            if self.configuration.read().await.as_ref() == Some(&current) {
+                self.configuration_generation.load(Ordering::Acquire)
+            } else {
+                self.advance_configuration_generation()?
+            }
+        };
+        let primary = self.primary.clone();
+        let configuration = self.configuration.clone();
+        let commit = self.configuration_commit.clone();
+        let generations = self.configuration_generation.clone();
+        // The callback task, not its waiting caller, owns serialization through
+        // application and publication. Dropping peer discovery cannot release
+        // an already-entered stateful callback into a newer authority.
+        tokio::spawn(async move {
+            let _callback = callback;
+            let current = Self::apply_configuration_update(primary, current, previous).await?;
+            let _commit = commit.lock().await;
+            let mut configuration = configuration.write().await;
+            if host.aborted.load(Ordering::Acquire)
+                || host.closed.load(Ordering::Acquire)
+                || generations.load(Ordering::Acquire) != generation
+            {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            *configuration = Some(current);
+            Ok(())
+        })
+        .await
+        .map_err(|error| RuntimeError::Application(error.to_string()))?
     }
 
     async fn reserve_access_projection(
@@ -3754,6 +3824,8 @@ impl CustomReplicatorHost {
                     .descriptions_with_policy(Some(*authority.clone()), true)
                     .await?
                     .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let _callback = self.configuration_callback.lock().await;
+                self.active_host()?;
                 let attempt = OpenAttempt::authority(&host);
                 self.close_for_custom_authority(&attempt).await?;
                 self.close_custom_native_access(false).await?;
