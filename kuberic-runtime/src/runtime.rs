@@ -71,12 +71,18 @@ struct RuntimeState {
     peer_repair_targets: BTreeMap<ReplicaIdentity, i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingManagedConfiguration {
     configuration: ManagedReplicaConfiguration,
     engine_generation: u64,
     host_generation: u64,
     active: Arc<AtomicBool>,
+    replication_progress: ReplicationProgress,
+    current_progress: i64,
+    previous_epoch: Option<Epoch>,
+    prior_access: (AccessStatus, AccessStatus),
+    authority_changed: bool,
+    preserve_access: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3273,6 +3279,13 @@ impl DefaultReplicatorInner {
             return Err(RuntimeError::Closed);
         }
         let state = self.state.read().await;
+        if matches!(
+            authority.scale_up.as_deref(),
+            Some(crate::protocol::types::ScaleUpConfigurationEvidence::Failover { .. })
+        ) && state.authority.is_none()
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         if state.authority.as_ref().is_some_and(|existing| {
             authority.current_configuration.epoch < existing.current_configuration.epoch
                 || (authority.current_configuration.epoch == existing.current_configuration.epoch
@@ -3330,100 +3343,21 @@ impl DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn admit_managed_configuration(
+    async fn install_managed_configuration(
         &self,
-        authority: ManagedReplicaConfiguration,
-        prepared: bool,
+        pending: PendingManagedConfiguration,
     ) -> Result<()> {
-        self.validate_managed_configuration_candidate(&authority)
-            .await?;
-        {
-            let state = self.state.read().await;
-            if let Some(evidence) = &authority.secondary_removal {
-                let intent = &evidence.preparation.intent;
-                let existing = state
-                    .authority
-                    .as_ref()
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                if existing.secondary_removal.as_ref().map(|e| &e.preparation)
-                    != Some(&evidence.preparation)
-                    && (existing.previous_configuration.is_some()
-                        || existing.current_configuration != intent.previous_configuration)
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "reduction does not extend installed current-only configuration".into(),
-                    ));
-                }
-                if self.identity == intent.primary
-                    && state.accepted_secondary_removal.as_ref().is_none_or(|c| {
-                        c.evidence != *evidence
-                            || authority.previous_configuration.is_some()
-                            || authority.current_configuration != intent.current_configuration
-                    })
-                    && (state.prepared_secondary_removal.as_ref() != Some(&evidence.preparation)
-                        || state.current_progress < evidence.preparation.boundary_lsn
-                        || state
-                            .replication_progress
-                            .as_ref()
-                            .is_none_or(|p| p.verified_lsn < evidence.preparation.boundary_lsn))
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "primary lacks exact durable preparation".into(),
-                    ));
-                }
-            }
-            if let Some(preparation) = &state.prepared_secondary_removal
-                && authority.secondary_removal.as_ref().map(|e| &e.preparation) != Some(preparation)
-                && state
-                    .accepted_secondary_removal
-                    .as_ref()
-                    .is_none_or(|committed| committed.evidence.preparation != *preparation)
-            {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "prepared removal may only roll forward".into(),
-                ));
-            }
-        }
-        if self
-            .state
-            .read()
-            .await
-            .authority
-            .as_ref()
-            .is_some_and(|existing| {
-                authority.current_configuration.epoch < existing.current_configuration.epoch
-            })
-        {
-            return Err(RuntimeError::AuthorityMismatch(
-                "configuration epoch cannot regress".into(),
-            ));
-        }
-        let prior_access = {
-            let state = self.state.read().await;
-            (state.read_status, state.write_status)
-        };
-        let existing_authority = self.state.read().await.authority.clone();
-        if matches!(
-            authority.scale_up.as_deref(),
-            Some(crate::protocol::types::ScaleUpConfigurationEvidence::Failover { .. })
-        ) && existing_authority.is_none()
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        let authority_changed = existing_authority.as_ref() != Some(&authority);
-        let preserve_scale_up_access = existing_authority
-            .as_ref()
-            .is_some_and(|existing| preserves_same_primary_scale_up_access(existing, &authority));
+        let PendingManagedConfiguration {
+            configuration: authority,
+            replication_progress,
+            current_progress,
+            previous_epoch,
+            prior_access,
+            authority_changed,
+            preserve_access: preserve_scale_up_access,
+            ..
+        } = pending;
         if authority_changed {
-            if existing_authority.as_ref().is_some_and(|existing| {
-                existing.current_configuration.epoch == authority.current_configuration.epoch
-                    && existing != &authority
-                    && !authority.is_current_only_completion_of(existing)
-            }) {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "configuration changed without a newer epoch".into(),
-                ));
-            }
             if !preserve_scale_up_access {
                 let mut state = self.state.write().await;
                 state.read_status = AccessStatus::ReconfigurationPending;
@@ -3440,12 +3374,6 @@ impl DefaultReplicatorInner {
                     state.removal_in_progress = None;
                 }
             }
-            if !prepared {
-                self.fence_generation.fetch_add(1, Ordering::AcqRel);
-                if !preserve_scale_up_access {
-                    self.replicator.lock().await.fence_client_writes();
-                }
-            }
             self.changed.notify_waiters();
             self.state.write().await.accepted_secondary_removal = None;
         }
@@ -3453,13 +3381,6 @@ impl DefaultReplicatorInner {
             self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
             self.replicator.lock().await.fence_client_writes();
         }
-        let state = self.state.read().await;
-        let current_progress = state.current_progress;
-        let previous_epoch = state
-            .authority
-            .as_ref()
-            .map(|accepted| accepted.current_configuration.epoch);
-        drop(state);
         let secondary = matches!(
             authority.local_role(),
             ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary
@@ -3470,9 +3391,6 @@ impl DefaultReplicatorInner {
                 .update_epoch(authority.current_configuration.epoch)
                 .await?;
         }
-        let replication_progress = self
-            .load_replication_progress_with_handoff(&authority)
-            .await?;
         self.configure_admitted_authority(&authority, current_progress, preserve_scale_up_access)
             .await?;
         self.replicator
@@ -3915,13 +3833,28 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let existing = self.state.read().await.authority.clone();
+        let (existing, current_progress, previous_epoch, prior_access) = {
+            let state = self.state.read().await;
+            (
+                state.authority.clone(),
+                state.current_progress,
+                state
+                    .authority
+                    .as_ref()
+                    .map(|authority| authority.current_configuration.epoch),
+                (state.read_status, state.write_status),
+            )
+        };
         let preserve_access = existing.as_ref().is_some_and(|current| {
             current == &configuration
                 || preserves_same_primary_scale_up_access(current, &configuration)
         });
-        let changed = existing.as_ref() != Some(&configuration)
+        let authority_changed = existing.as_ref() != Some(&configuration);
+        let changed = authority_changed
             || self.state.read().await.configuration_generation != host_generation;
+        let replication_progress = self
+            .load_replication_progress_with_handoff(&configuration)
+            .await?;
         if changed {
             self.fence_generation.fetch_add(1, Ordering::AcqRel);
             if !preserve_access {
@@ -3948,6 +3881,12 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             engine_generation: preparation.fence.engine_generation,
             host_generation,
             active,
+            replication_progress,
+            current_progress,
+            previous_epoch,
+            prior_access,
+            authority_changed,
+            preserve_access,
         });
         self.changed.notify_waiters();
         Ok(preparation)
@@ -3963,18 +3902,13 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         );
         let _effect = self.effect_lock.lock().await;
         self.check_aborted()?;
-        let pending_matches = self
-            .state
-            .read()
-            .await
-            .pending_configuration
-            .as_ref()
-            .is_some_and(|pending| {
-                pending.active.load(Ordering::Acquire)
-                    && pending.configuration == preparation.configuration
-                    && pending.engine_generation == preparation.fence.engine_generation
-                    && pending.host_generation == preparation.host_generation
-            });
+        let pending = self.state.read().await.pending_configuration.clone();
+        let pending_matches = pending.as_ref().is_some_and(|pending| {
+            pending.active.load(Ordering::Acquire)
+                && pending.configuration == preparation.configuration
+                && pending.engine_generation == preparation.fence.engine_generation
+                && pending.host_generation == preparation.host_generation
+        });
         if !preparation.active.load(Ordering::Acquire)
             || preparation.fence.engine_session_id != self.session_id
             || preparation.fence.engine_generation != self.fence_generation.load(Ordering::Acquire)
@@ -3983,8 +3917,8 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         {
             return Err(RuntimeError::OperationCancelled);
         }
-        self.admit_managed_configuration(preparation.configuration.clone(), true)
-            .await?;
+        let pending = pending.expect("matching pending configuration exists");
+        self.install_managed_configuration(pending).await?;
         {
             let mut state = self.state.write().await;
             state.configuration_generation = preparation.host_generation;
