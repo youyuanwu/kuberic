@@ -178,12 +178,18 @@ pub(crate) struct ManagedOperationFence {
     pub(crate) engine_generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct ManagedConfigurationPreparation {
     pub(crate) fence: ManagedOperationFence,
     pub(crate) configuration: ManagedReplicaConfiguration,
-    pub(crate) preserve_access: bool,
     pub(crate) host_generation: u64,
+    pub(crate) active: Arc<AtomicBool>,
+}
+
+impl Drop for ManagedConfigurationPreparation {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

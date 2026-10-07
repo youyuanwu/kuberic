@@ -1069,6 +1069,7 @@ fn validate_managed_replica_runtime_boundary(
             "RuntimeSnapshot",
             "RuntimePostcondition",
             "ReplicaAuthorityStore",
+            "ReplicaRuntimeInstruction",
             "TransitionKind",
         ] {
             if body.contains(forbidden) {

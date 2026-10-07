@@ -53,7 +53,7 @@ struct RuntimeState {
     write_status: AccessStatus,
     authority: Option<ManagedReplicaConfiguration>,
     configuration_generation: u64,
-    pending_configuration: Option<crate::replicator::ManagedConfigurationPreparation>,
+    pending_configuration: Option<PendingManagedConfiguration>,
     prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
     removal_in_progress: Option<crate::protocol::types::SecondaryScaleDownIntent>,
     retired_authority: Option<RetiredAuthority>,
@@ -71,43 +71,12 @@ struct RuntimeState {
     peer_repair_targets: BTreeMap<ReplicaIdentity, i64>,
 }
 
-enum ReplicaRuntimeInstruction {
-    AuthorizeFailoverPrefix(Lsn),
-    AdmitBuildAuthority(Box<BuildAuthority>),
-    PrepareSwitchover {
-        preparation_generation: u64,
-        request_id: crate::protocol::types::SwitchoverRequestId,
-        source: ReplicaIdentity,
-        target: ReplicaIdentity,
-        starting_configuration_id: crate::protocol::types::ConfigurationId,
-        starting_epoch: Epoch,
-    },
-    RefreshApplicationProgress,
-    RetireBuild(OperationId),
-    PrepareSecondaryRemoval {
-        intent: Box<crate::protocol::types::SecondaryScaleDownIntent>,
-        process_session_id: ProcessSessionId,
-        report_sequence: u64,
-    },
-    RegisterPeerSession {
-        identity: ReplicaIdentity,
-        session: ProcessSessionId,
-    },
-    ObserveSecondaryRemovalWitness(Box<SecondaryRemovalWitness>),
-    ObserveSecondaryRemovalProgress {
-        witness: Box<SecondaryRemovalWitness>,
-        committed: Box<SecondaryScaleDownCleanup>,
-    },
-    ObserveReplicationAck {
-        acknowledgement: Box<ReplicationAck>,
-        session: ProcessSessionId,
-    },
-    AcceptHistoricalSecondaryRemovalCommit(
-        Box<crate::protocol::command::AcceptSecondaryRemovalCommit>,
-    ),
-    AcceptSecondaryRemovalCommit(Box<SecondaryScaleDownCleanup>),
-    FenceRetirement(Box<RetiredAuthority>),
-    CompleteRetirement(Box<RetiredAuthority>),
+#[derive(Debug)]
+struct PendingManagedConfiguration {
+    configuration: ManagedReplicaConfiguration,
+    engine_generation: u64,
+    host_generation: u64,
+    active: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +277,14 @@ impl DefaultReplicatorInner {
     fn check_aborted(&self) -> Result<()> {
         if self.aborted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
             Err(RuntimeError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn check_no_pending_configuration(&self) -> Result<()> {
+        if self.state.read().await.pending_configuration.is_some() {
+            Err(RuntimeError::ReconfigurationPending)
         } else {
             Ok(())
         }
@@ -981,6 +958,7 @@ impl DefaultReplicatorInner {
 
     pub(crate) async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
         let _guard = self.effect_lock.lock().await;
+        self.check_no_pending_configuration().await?;
         self.begin_write_locked(write, false).await
     }
 
@@ -1245,6 +1223,7 @@ impl DefaultReplicatorInner {
                 "acknowledgement authority differs from durable admission".into(),
             ));
         }
+        self.check_no_pending_configuration().await?;
         self.replicator.lock().await.acknowledge(&acknowledgement)?;
         self.finalize_ready_commit().await?;
         self.changed.notify_waiters();
@@ -2147,6 +2126,7 @@ impl DefaultReplicatorInner {
         let delivery = self.delivery_lock.clone().lock_owned().await;
         let delivery_generation = self.fence_generation.load(Ordering::Acquire);
         self.check_aborted()?;
+        self.check_no_pending_configuration().await?;
         let state = self.state.read().await;
         if !state.open {
             return Err(RuntimeError::NotOpen);
@@ -2370,561 +2350,599 @@ impl DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn execute_instruction(&self, action: ReplicaRuntimeInstruction) -> Result<()> {
-        match action {
-            ReplicaRuntimeInstruction::AuthorizeFailoverPrefix(safe_lsn) => {
-                if self.state.read().await.removal_in_progress.is_some()
-                    || self
-                        .state
-                        .read()
-                        .await
-                        .authority
-                        .as_ref()
-                        .is_some_and(|a| a.secondary_removal.is_some())
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "failover prefix cannot certify a secondary removal".into(),
-                    ));
-                }
-                if safe_lsn < 0 {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "failover-safe LSN must not be negative".into(),
-                    ));
-                }
-                let (authority, mut progress) = {
-                    let state = self.state.read().await;
-                    (
-                        state
-                            .authority
-                            .clone()
-                            .ok_or(RuntimeError::AuthorityNotAdmitted)?,
-                        state
-                            .replication_progress
-                            .clone()
-                            .ok_or(RuntimeError::AuthorityNotAdmitted)?,
-                    )
-                };
-                let durable = self.storage().await?.durable_progress().await?;
-                progress.verified_lsn =
-                    progress.verified_lsn.max(durable.applied_lsn.min(safe_lsn));
-                if progress.fence != authority.fence() {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "failover-safe prefix belongs to another authority fence".into(),
-                    ));
-                }
-                self.replication_progress_store
-                    .record_replication_progress(&progress)
-                    .await?;
-                self.state.write().await.replication_progress = Some(progress);
-            }
-            ReplicaRuntimeInstruction::AdmitBuildAuthority(authority) => {
-                let authority = *authority;
-                authority.validate()?;
-                if authority.target != self.identity && authority.source != self.identity {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "build authority does not address this runtime".to_string(),
-                    ));
-                }
-                if let Some(existing) = self
-                    .build_authority_store
-                    .load_build(&authority.build_id)
-                    .await?
-                {
-                    if existing != authority {
-                        return Err(RuntimeError::AuthorityMismatch(
-                            "build ID is already bound to different authority".to_string(),
-                        ));
-                    }
-                } else {
-                    self.build_authority_store.admit_build(&authority).await?;
-                }
-                let progress = self
-                    .build_progress_store
-                    .load_build_progress(&authority.build_id)
-                    .await?
-                    .unwrap_or(DurableBuildProgress {
-                        authority: authority.clone(),
-                        last_sequence: 0,
-                        durable_lsn: 0,
-                        completed: false,
-                        catch_up_boundary_lsn: None,
-                    });
-                if progress.authority != authority {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "build progress belongs to different authority".to_string(),
-                    ));
-                }
-                if authority.target == self.identity {
-                    if authority.kind == BuildAuthorityKind::Provisioning {
-                        self.control()
-                            .await?
-                            .update_epoch(authority.current_configuration.epoch)
-                            .await?;
-                    }
-                    let mut state = self.state.write().await;
-                    state.builds.insert(authority.build_id.clone(), progress);
-                    state.inbound_build_generations.insert(
-                        authority.build_id.clone(),
-                        self.fence_generation.load(Ordering::Acquire),
-                    );
-                }
-            }
-            ReplicaRuntimeInstruction::PrepareSwitchover {
-                preparation_generation,
-                request_id,
-                source,
-                target,
-                starting_configuration_id,
-                starting_epoch,
-            } => {
-                let state = self.state.read().await;
-                if state
-                    .prepared_secondary_removal
-                    .as_ref()
-                    .is_some_and(|preparation| {
-                        state
-                            .accepted_secondary_removal
-                            .as_ref()
-                            .is_none_or(|committed| committed.evidence.preparation != *preparation)
-                    })
-                {
-                    return Err(RuntimeError::ReconfigurationPending);
-                }
-                drop(state);
-                if preparation_generation == 0 || request_id.is_empty() {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "planned switchover requires a request ID and positive generation"
-                            .to_string(),
-                    ));
-                }
-                let state = self.state.read().await;
-                if !state.open {
-                    return Err(RuntimeError::NotOpen);
-                }
-                if state.role != ReplicaRole::Primary
-                    || !matches!(
-                        state.write_status,
-                        AccessStatus::Granted | AccessStatus::ReconfigurationPending
-                    )
-                {
-                    return Err(RuntimeError::NotPrimary);
-                }
-                let authority = state
+    async fn authorize_failover_prefix_instruction(&self, safe_lsn: Lsn) -> Result<()> {
+        if self.state.read().await.removal_in_progress.is_some()
+            || self
+                .state
+                .read()
+                .await
+                .authority
+                .as_ref()
+                .is_some_and(|a| a.secondary_removal.is_some())
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "failover prefix cannot certify a secondary removal".into(),
+            ));
+        }
+        if safe_lsn < 0 {
+            return Err(RuntimeError::AuthorityMismatch(
+                "failover-safe LSN must not be negative".into(),
+            ));
+        }
+        let (authority, mut progress) = {
+            let state = self.state.read().await;
+            (
+                state
                     .authority
-                    .as_ref()
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                let current = &authority.current_configuration;
-                let primary = current
-                    .members
-                    .iter()
-                    .find(|member| member.identity.replica_id == current.primary_id)
-                    .expect("validated authority has one primary");
-                if current.configuration_id != starting_configuration_id
-                    || current.epoch != starting_epoch
-                    || source != self.identity
-                    || primary.identity != source
-                    || target.replica_id == current.primary_id
-                    || !current.members.iter().any(|member| {
-                        member.identity == target && member.role != ReplicaRole::Primary
-                    })
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "planned switchover preparation differs from admitted authority"
-                            .to_string(),
-                    ));
-                }
-                drop(state);
-                self.replicator.lock().await.fence_client_writes();
-                self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
-                // A reserved write must be part of the certified prefix even if its
-                // original application call failed before preparation.
-                let writes = self
-                    .state
-                    .read()
-                    .await
-                    .local_writes
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for durable in writes {
-                    let pending = self
-                        .begin_write_locked(
-                            ClientWrite {
-                                operation_id: durable.operation_id,
-                                data: durable.data,
-                            },
-                            true,
-                        )
-                        .await?;
-                    self.publish_replication(&pending).await?;
-                }
-                self.replicator.lock().await.fence_client_writes();
-            }
-            ReplicaRuntimeInstruction::RefreshApplicationProgress => {
-                let progress = if let Some(storage) = self.storage.read().await.clone() {
-                    storage.durable_progress().await?
-                } else {
-                    DurableApplicationProgress {
-                        applied_lsn: self.control().await?.current_progress().await?,
-                        committed_lsn: self.provider().await?.last_committed_lsn().await?,
-                    }
-                };
-                {
-                    let mut state = self.state.write().await;
-                    state.current_progress = state.current_progress.max(progress.applied_lsn);
-                    state.committed_lsn = state.committed_lsn.max(progress.committed_lsn);
-                }
-                if self.state.read().await.authority.is_some() {
-                    self.replicator
-                        .lock()
-                        .await
-                        .record_local_progress(progress.applied_lsn)?;
-                    self.finalize_ready_commit().await?;
-                }
-            }
-            ReplicaRuntimeInstruction::RetireBuild(build_id) => {
-                let mut state = self.state.write().await;
-                state.builds.remove(&build_id);
-                state.outbound_builds.remove(&build_id);
-                state.cancelled_outbound_builds.remove(&build_id);
-            }
-            ReplicaRuntimeInstruction::PrepareSecondaryRemoval {
-                intent,
-                process_session_id,
-                report_sequence,
-            } => {
-                let mut preparation = SecondaryRemovalPreparation {
-                    operation_id: intent
-                        .command_operation_id(SecondaryRemovalStage::Prepare, &intent.primary),
-                    intent: *intent,
-                    process_session_id,
-                    report_sequence,
-                    boundary_lsn: 0,
-                };
-                validate_secondary_removal_preparation(&preparation)
-                    .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
-                if preparation.intent.primary != self.identity {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "preparation belongs to another primary".into(),
-                    ));
-                }
-                {
-                    let state = self.state.read().await;
-                    let authority = state
-                        .authority
-                        .as_ref()
-                        .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                    if !state.open
-                        || state.role != ReplicaRole::Primary
-                        || (authority.current_configuration
-                            != preparation.intent.previous_configuration
-                            && authority
-                                .secondary_removal
-                                .as_ref()
-                                .is_none_or(|e| e.preparation.intent != preparation.intent))
-                    {
-                        return Err(RuntimeError::AuthorityMismatch(
-                            "preparation no longer matches installed primary authority".into(),
-                        ));
-                    }
-                }
-                if let Some(durable) = self
-                    .replica_authority_store
-                    .load_secondary_removal()
-                    .await?
-                {
-                    preparation.boundary_lsn = durable.boundary_lsn;
-                    if preparation != durable {
-                        let state = self.state.read().await;
-                        let advancing = preparation.intent.previous_configuration.epoch
-                            >= durable.intent.current_configuration.epoch
-                            && preparation.intent != durable.intent
-                            && state.authority.as_ref().is_some_and(|a| {
-                                a.previous_configuration.is_none()
-                                    && a.current_configuration
-                                        == preparation.intent.previous_configuration
-                            })
-                            && (state
-                                .accepted_secondary_removal
-                                .as_ref()
-                                .is_some_and(|c| c.evidence.preparation == durable)
-                                || preparation.intent.previous_configuration.epoch
-                                    > durable.intent.current_configuration.epoch
-                                || state.removal_in_progress.as_ref() == Some(&preparation.intent));
-                        if !advancing {
-                            return Err(RuntimeError::AuthorityMismatch(
-                                "conflicting persisted preparation".into(),
-                            ));
-                        }
-                        drop(state);
-                        let mut state = self.state.write().await;
-                        state.prepared_secondary_removal = None;
-                        state.removal_in_progress = None;
-                        preparation.boundary_lsn = 0;
-                    } else {
-                        self.state.write().await.prepared_secondary_removal = Some(durable);
-                    }
-                }
-                let state = self.state.read().await;
-                if let Some(existing) = &state.prepared_secondary_removal {
-                    preparation.boundary_lsn = existing.boundary_lsn;
-                    if existing == &preparation {
-                        return Ok(());
-                    }
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "conflicting removal preparation replay".into(),
-                    ));
-                }
-                if state
-                    .removal_in_progress
-                    .as_ref()
-                    .is_some_and(|intent| intent != &preparation.intent)
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "conflicting in-flight preparation".into(),
-                    ));
-                }
-                let authority = state
-                    .authority
-                    .as_ref()
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                if !state.open
-                    || state.role != ReplicaRole::Primary
-                    || preparation.intent.primary != self.identity
-                    || authority.previous_configuration.is_some()
-                    || authority.current_configuration != preparation.intent.previous_configuration
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "preparation requires the unchanged current-only primary".into(),
-                    ));
-                }
-                drop(state);
-                self.state.write().await.removal_in_progress = Some(preparation.intent.clone());
-                self.state.write().await.read_status = AccessStatus::ReconfigurationPending;
-                self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
-                self.replicator.lock().await.fence_client_writes();
-                // Both ACK completion and write registration hold effect_lock. Resolve
-                // journaled identities without waiting for the old write quorum.
-                let writes = self.local_write_journal.load_local_writes().await?;
-                for write in writes {
-                    self.begin_write_locked(
-                        ClientWrite {
-                            operation_id: write.operation_id,
-                            data: write.data,
-                        },
-                        true,
-                    )
-                    .await?;
-                }
-                self.replicator.lock().await.fence_client_writes();
-                let durable = self.storage().await?.durable_progress().await?;
-                let verified = self
-                    .state
-                    .read()
-                    .await
+                    .clone()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                state
                     .replication_progress
-                    .as_ref()
-                    .map_or(0, |p| p.verified_lsn);
-                if verified < durable.applied_lsn || durable.committed_lsn > durable.applied_lsn {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "primary prefix is not authority-verified".into(),
-                    ));
-                }
-                preparation.boundary_lsn = durable.applied_lsn;
-                self.replica_authority_store
-                    .record_secondary_removal(&preparation)
-                    .await?;
-                self.state.write().await.prepared_secondary_removal = Some(preparation);
+                    .clone()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+            )
+        };
+        let durable = self.storage().await?.durable_progress().await?;
+        progress.verified_lsn = progress.verified_lsn.max(durable.applied_lsn.min(safe_lsn));
+        if progress.fence != authority.fence() {
+            return Err(RuntimeError::AuthorityMismatch(
+                "failover-safe prefix belongs to another authority fence".into(),
+            ));
+        }
+        self.replication_progress_store
+            .record_replication_progress(&progress)
+            .await?;
+        self.state.write().await.replication_progress = Some(progress);
+        Ok(())
+    }
+
+    async fn admit_build_authority_instruction(&self, authority: BuildAuthority) -> Result<()> {
+        authority.validate()?;
+        if authority.target != self.identity && authority.source != self.identity {
+            return Err(RuntimeError::AuthorityMismatch(
+                "build authority does not address this runtime".to_string(),
+            ));
+        }
+        if let Some(existing) = self
+            .build_authority_store
+            .load_build(&authority.build_id)
+            .await?
+        {
+            if existing != authority {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "build ID is already bound to different authority".to_string(),
+                ));
             }
-            ReplicaRuntimeInstruction::RegisterPeerSession { identity, session } => {
-                self.replicator
-                    .lock()
-                    .await
-                    .register_peer_session(identity, session)?;
-            }
-            ReplicaRuntimeInstruction::ObserveSecondaryRemovalWitness(witness) => {
-                self.replicator
-                    .lock()
-                    .await
-                    .observe_secondary_removal(&witness)?;
-            }
-            ReplicaRuntimeInstruction::ObserveSecondaryRemovalProgress { witness, committed } => {
-                self.replicator
-                    .lock()
-                    .await
-                    .observe_secondary_removal_progress(&witness, &committed)?;
-            }
-            ReplicaRuntimeInstruction::ObserveReplicationAck {
-                acknowledgement,
-                session,
-            } => {
-                if self.replica_authority_store.load_configuration().await?
-                    != self.state.read().await.authority
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "ACK differs from durable authority".into(),
-                    ));
-                }
-                self.replicator
-                    .lock()
-                    .await
-                    .acknowledge_in_session(&acknowledgement, &session)?;
-                self.finalize_ready_commit().await?;
-            }
-            ReplicaRuntimeInstruction::AcceptHistoricalSecondaryRemovalCommit(command) => {
-                crate::protocol::validation::validate_accept_secondary_removal_commit(&command)
-                    .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
-                let committed = &command.committed;
-                let state = self.state.read().await;
-                let authority = state
-                    .authority
-                    .as_ref()
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                if !command.local_recovery
-                    || command.target != self.identity
-                    || state.role != ReplicaRole::ActiveSecondary
-                    || state.write_status == AccessStatus::Granted
-                    || state.prepared_secondary_removal.is_some()
-                    || authority.previous_configuration.is_some()
-                    || authority.current_configuration
-                        != committed.evidence.preparation.intent.current_configuration
-                    || authority.secondary_removal.as_ref() != Some(&committed.evidence)
-                    || state.current_progress < committed.evidence.preparation.boundary_lsn
-                    || state.replication_progress.as_ref().is_none_or(|p| {
-                        p.fence != authority.fence()
-                            || p.verified_lsn < committed.evidence.preparation.boundary_lsn
-                    })
-                    || state
-                        .accepted_secondary_removal
-                        .as_ref()
-                        .is_some_and(|c| c != committed)
-                    || self
-                        .replica_authority_store
-                        .load_configuration()
-                        .await?
-                        .as_ref()
-                        != Some(authority)
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "historical acceptance requires exact verified write-closed secondary authority".into(),
-                    ));
-                }
-                drop(state);
-                // Durability belongs to the agent's exact pending/completed effect.
-                // Do not persist a live runtime commit or resurrect peer-session credit.
-                self.state.write().await.accepted_secondary_removal = Some(committed.clone());
-            }
-            ReplicaRuntimeInstruction::AcceptSecondaryRemovalCommit(committed) => {
-                validate_secondary_scale_down_cleanup(&committed)
-                    .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
-                let state = self.state.read().await;
-                let authority = state
-                    .authority
-                    .as_ref()
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                if authority.previous_configuration.is_some()
-                    || authority.secondary_removal.as_ref() != Some(&committed.evidence)
-                    || authority.current_configuration
-                        != committed.evidence.preparation.intent.current_configuration
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "commit does not match installed reduction".into(),
-                    ));
-                }
-                if let Some(existing) = &state.accepted_secondary_removal {
-                    if existing == committed.as_ref() {
-                        return Ok(());
-                    }
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "conflicting reduction commit replay".into(),
-                    ));
-                }
-                drop(state);
-                self.replicator
-                    .lock()
-                    .await
-                    .validate_secondary_removal_commit(&committed)?;
-                for witness in &committed.current_only_write_quorum {
-                    if witness.identity != self.identity {
-                        self.replicator
-                            .lock()
-                            .await
-                            .observe_committed_secondary_removal(witness)?;
-                    }
-                }
-                if !self.replicator.lock().await.catch_up_complete() {
-                    return Err(RuntimeError::ReconfigurationPending);
-                }
-                self.replica_authority_store
-                    .record_secondary_removal_commit(&committed)
-                    .await?;
-                self.state.write().await.accepted_secondary_removal = Some(*committed);
-            }
-            ReplicaRuntimeInstruction::FenceRetirement(retired) => {
-                retired.validate(&self.identity)?;
-                let mut state = self.state.write().await;
-                if state
-                    .retiring_authority
-                    .as_ref()
-                    .is_some_and(|old| old != retired.as_ref())
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "conflicting retirement replay".into(),
-                    ));
-                }
-                if let Some(authority) = &state.authority
-                    && (authority.current_configuration
-                        != retired.report.intent.previous_configuration
-                        || authority.previous_configuration.is_some())
-                {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "retirement differs from installed target authority".into(),
-                    ));
-                }
-                self.replica_authority_store
-                    .record_retirement_started(&retired)
-                    .await?;
-                state.read_status = AccessStatus::NotPrimary;
-                state.write_status = AccessStatus::NotPrimary;
-                state.authority = None;
-                state.replication_progress = None;
-                state.outbound_builds.clear();
-                state.builds.clear();
-                state.peer_repair_targets.clear();
-                state.retiring_authority = Some(*retired);
-                drop(state);
-                if let Some(streams) = self.streams.read().await.as_ref() {
-                    streams.shutdown();
-                }
-                self.fence_generation.fetch_add(1, Ordering::AcqRel);
-                self.replicator.lock().await.fence_client_writes();
-            }
-            ReplicaRuntimeInstruction::CompleteRetirement(retired) => {
-                retired.validate(&self.identity)?;
-                let state = self.state.read().await;
-                if state.open
-                    || state.role != ReplicaRole::None
-                    || state.retiring_authority.as_ref() != Some(retired.as_ref())
-                {
-                    return Err(RuntimeError::ReconfigurationPending);
-                }
-                drop(state);
-                if let Some(existing) = self
-                    .replica_authority_store
-                    .load_retired_authority()
+        } else {
+            self.build_authority_store.admit_build(&authority).await?;
+        }
+        let progress = self
+            .build_progress_store
+            .load_build_progress(&authority.build_id)
+            .await?
+            .unwrap_or(DurableBuildProgress {
+                authority: authority.clone(),
+                last_sequence: 0,
+                durable_lsn: 0,
+                completed: false,
+                catch_up_boundary_lsn: None,
+            });
+        if progress.authority != authority {
+            return Err(RuntimeError::AuthorityMismatch(
+                "build progress belongs to different authority".to_string(),
+            ));
+        }
+        if authority.target == self.identity {
+            if authority.kind == BuildAuthorityKind::Provisioning {
+                self.control()
                     .await?
-                {
-                    if existing != *retired {
-                        return Err(RuntimeError::AuthorityMismatch(
-                            "conflicting durable retirement".into(),
-                        ));
-                    }
-                } else {
-                    self.replica_authority_store.retire(&retired).await?;
-                }
-                self.state.write().await.retired_authority = Some(*retired);
+                    .update_epoch(authority.current_configuration.epoch)
+                    .await?;
+            }
+            let mut state = self.state.write().await;
+            state.builds.insert(authority.build_id.clone(), progress);
+            state.inbound_build_generations.insert(
+                authority.build_id.clone(),
+                self.fence_generation.load(Ordering::Acquire),
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_switchover_instruction(
+        &self,
+        preparation_generation: u64,
+        request_id: crate::protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: crate::protocol::types::ConfigurationId,
+        starting_epoch: Epoch,
+    ) -> Result<()> {
+        let state = self.state.read().await;
+        if state
+            .prepared_secondary_removal
+            .as_ref()
+            .is_some_and(|preparation| {
+                state
+                    .accepted_secondary_removal
+                    .as_ref()
+                    .is_none_or(|committed| committed.evidence.preparation != *preparation)
+            })
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        drop(state);
+        if preparation_generation == 0 || request_id.is_empty() {
+            return Err(RuntimeError::AuthorityMismatch(
+                "planned switchover requires a request ID and positive generation".to_string(),
+            ));
+        }
+        let state = self.state.read().await;
+        if !state.open {
+            return Err(RuntimeError::NotOpen);
+        }
+        if state.role != ReplicaRole::Primary
+            || !matches!(
+                state.write_status,
+                AccessStatus::Granted | AccessStatus::ReconfigurationPending
+            )
+        {
+            return Err(RuntimeError::NotPrimary);
+        }
+        let authority = state
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let current = &authority.current_configuration;
+        let primary = current
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == current.primary_id)
+            .expect("validated authority has one primary");
+        if current.configuration_id != starting_configuration_id
+            || current.epoch != starting_epoch
+            || source != self.identity
+            || primary.identity != source
+            || target.replica_id == current.primary_id
+            || !current
+                .members
+                .iter()
+                .any(|member| member.identity == target && member.role != ReplicaRole::Primary)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "planned switchover preparation differs from admitted authority".to_string(),
+            ));
+        }
+        drop(state);
+        self.replicator.lock().await.fence_client_writes();
+        self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
+        // A reserved write must be part of the certified prefix even if its
+        // original application call failed before preparation.
+        let writes = self
+            .state
+            .read()
+            .await
+            .local_writes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for durable in writes {
+            let pending = self
+                .begin_write_locked(
+                    ClientWrite {
+                        operation_id: durable.operation_id,
+                        data: durable.data,
+                    },
+                    true,
+                )
+                .await?;
+            self.publish_replication(&pending).await?;
+        }
+        self.replicator.lock().await.fence_client_writes();
+        Ok(())
+    }
+
+    async fn refresh_application_progress_instruction(&self) -> Result<()> {
+        let progress = if let Some(storage) = self.storage.read().await.clone() {
+            storage.durable_progress().await?
+        } else {
+            DurableApplicationProgress {
+                applied_lsn: self.control().await?.current_progress().await?,
+                committed_lsn: self.provider().await?.last_committed_lsn().await?,
+            }
+        };
+        {
+            let mut state = self.state.write().await;
+            state.current_progress = state.current_progress.max(progress.applied_lsn);
+            state.committed_lsn = state.committed_lsn.max(progress.committed_lsn);
+        }
+        if self.state.read().await.authority.is_some() {
+            self.replicator
+                .lock()
+                .await
+                .record_local_progress(progress.applied_lsn)?;
+            self.finalize_ready_commit().await?;
+        }
+        Ok(())
+    }
+
+    async fn retire_build_instruction(&self, build_id: OperationId) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.builds.remove(&build_id);
+        state.outbound_builds.remove(&build_id);
+        state.cancelled_outbound_builds.remove(&build_id);
+        Ok(())
+    }
+
+    async fn prepare_secondary_removal_instruction(
+        &self,
+        intent: crate::protocol::types::SecondaryScaleDownIntent,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<()> {
+        let mut preparation = SecondaryRemovalPreparation {
+            operation_id: intent
+                .command_operation_id(SecondaryRemovalStage::Prepare, &intent.primary),
+            intent,
+            process_session_id,
+            report_sequence,
+            boundary_lsn: 0,
+        };
+        validate_secondary_removal_preparation(&preparation)
+            .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
+        if preparation.intent.primary != self.identity {
+            return Err(RuntimeError::AuthorityMismatch(
+                "preparation belongs to another primary".into(),
+            ));
+        }
+        {
+            let state = self.state.read().await;
+            let authority = state
+                .authority
+                .as_ref()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if !state.open
+                || state.role != ReplicaRole::Primary
+                || (authority.current_configuration != preparation.intent.previous_configuration
+                    && authority
+                        .secondary_removal
+                        .as_ref()
+                        .is_none_or(|e| e.preparation.intent != preparation.intent))
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "preparation no longer matches installed primary authority".into(),
+                ));
             }
         }
+        if let Some(durable) = self
+            .replica_authority_store
+            .load_secondary_removal()
+            .await?
+        {
+            preparation.boundary_lsn = durable.boundary_lsn;
+            if preparation != durable {
+                let state = self.state.read().await;
+                let advancing = preparation.intent.previous_configuration.epoch
+                    >= durable.intent.current_configuration.epoch
+                    && preparation.intent != durable.intent
+                    && state.authority.as_ref().is_some_and(|a| {
+                        a.previous_configuration.is_none()
+                            && a.current_configuration == preparation.intent.previous_configuration
+                    })
+                    && (state
+                        .accepted_secondary_removal
+                        .as_ref()
+                        .is_some_and(|c| c.evidence.preparation == durable)
+                        || preparation.intent.previous_configuration.epoch
+                            > durable.intent.current_configuration.epoch
+                        || state.removal_in_progress.as_ref() == Some(&preparation.intent));
+                if !advancing {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "conflicting persisted preparation".into(),
+                    ));
+                }
+                drop(state);
+                let mut state = self.state.write().await;
+                state.prepared_secondary_removal = None;
+                state.removal_in_progress = None;
+                preparation.boundary_lsn = 0;
+            } else {
+                self.state.write().await.prepared_secondary_removal = Some(durable);
+            }
+        }
+        let state = self.state.read().await;
+        if let Some(existing) = &state.prepared_secondary_removal {
+            preparation.boundary_lsn = existing.boundary_lsn;
+            if existing == &preparation {
+                return Ok(());
+            }
+            return Err(RuntimeError::AuthorityMismatch(
+                "conflicting removal preparation replay".into(),
+            ));
+        }
+        if state
+            .removal_in_progress
+            .as_ref()
+            .is_some_and(|intent| intent != &preparation.intent)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "conflicting in-flight preparation".into(),
+            ));
+        }
+        let authority = state
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if !state.open
+            || state.role != ReplicaRole::Primary
+            || preparation.intent.primary != self.identity
+            || authority.previous_configuration.is_some()
+            || authority.current_configuration != preparation.intent.previous_configuration
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "preparation requires the unchanged current-only primary".into(),
+            ));
+        }
+        drop(state);
+        self.state.write().await.removal_in_progress = Some(preparation.intent.clone());
+        self.state.write().await.read_status = AccessStatus::ReconfigurationPending;
+        self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
+        self.replicator.lock().await.fence_client_writes();
+        // Both ACK completion and write registration hold effect_lock. Resolve
+        // journaled identities without waiting for the old write quorum.
+        let writes = self.local_write_journal.load_local_writes().await?;
+        for write in writes {
+            self.begin_write_locked(
+                ClientWrite {
+                    operation_id: write.operation_id,
+                    data: write.data,
+                },
+                true,
+            )
+            .await?;
+        }
+        self.replicator.lock().await.fence_client_writes();
+        let durable = self.storage().await?.durable_progress().await?;
+        let verified = self
+            .state
+            .read()
+            .await
+            .replication_progress
+            .as_ref()
+            .map_or(0, |p| p.verified_lsn);
+        if verified < durable.applied_lsn || durable.committed_lsn > durable.applied_lsn {
+            return Err(RuntimeError::AuthorityMismatch(
+                "primary prefix is not authority-verified".into(),
+            ));
+        }
+        preparation.boundary_lsn = durable.applied_lsn;
+        self.replica_authority_store
+            .record_secondary_removal(&preparation)
+            .await?;
+        self.state.write().await.prepared_secondary_removal = Some(preparation);
+        Ok(())
+    }
+
+    async fn register_peer_session_instruction(
+        &self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        self.replicator
+            .lock()
+            .await
+            .register_peer_session(identity, session)?;
+        Ok(())
+    }
+
+    async fn observe_secondary_removal_witness_instruction(
+        &self,
+        witness: SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.replicator
+            .lock()
+            .await
+            .observe_secondary_removal(&witness)?;
+        Ok(())
+    }
+
+    async fn observe_secondary_removal_progress_instruction(
+        &self,
+        witness: SecondaryRemovalWitness,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.replicator
+            .lock()
+            .await
+            .observe_secondary_removal_progress(&witness, &committed)?;
+        Ok(())
+    }
+
+    async fn observe_replication_ack_instruction(
+        &self,
+        acknowledgement: ReplicationAck,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        if self.replica_authority_store.load_configuration().await?
+            != self.state.read().await.authority
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "ACK differs from durable authority".into(),
+            ));
+        }
+        self.replicator
+            .lock()
+            .await
+            .acknowledge_in_session(&acknowledgement, &session)?;
+        self.finalize_ready_commit().await?;
+        Ok(())
+    }
+
+    async fn accept_historical_secondary_removal_commit_instruction(
+        &self,
+        command: crate::protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        crate::protocol::validation::validate_accept_secondary_removal_commit(&command)
+            .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
+        let committed = &command.committed;
+        let state = self.state.read().await;
+        let authority = state
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if !command.local_recovery
+            || command.target != self.identity
+            || state.role != ReplicaRole::ActiveSecondary
+            || state.write_status == AccessStatus::Granted
+            || state.prepared_secondary_removal.is_some()
+            || authority.previous_configuration.is_some()
+            || authority.current_configuration
+                != committed.evidence.preparation.intent.current_configuration
+            || authority.secondary_removal.as_ref() != Some(&committed.evidence)
+            || state.current_progress < committed.evidence.preparation.boundary_lsn
+            || state.replication_progress.as_ref().is_none_or(|p| {
+                p.fence != authority.fence()
+                    || p.verified_lsn < committed.evidence.preparation.boundary_lsn
+            })
+            || state
+                .accepted_secondary_removal
+                .as_ref()
+                .is_some_and(|c| c != committed)
+            || self
+                .replica_authority_store
+                .load_configuration()
+                .await?
+                .as_ref()
+                != Some(authority)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "historical acceptance requires exact verified write-closed secondary authority"
+                    .into(),
+            ));
+        }
+        drop(state);
+        // Durability belongs to the agent's exact pending/completed effect.
+        // Do not persist a live runtime commit or resurrect peer-session credit.
+        self.state.write().await.accepted_secondary_removal = Some(committed.clone());
+        Ok(())
+    }
+
+    async fn accept_secondary_removal_commit_instruction(
+        &self,
+        committed: SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        validate_secondary_scale_down_cleanup(&committed)
+            .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
+        let state = self.state.read().await;
+        let authority = state
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if authority.previous_configuration.is_some()
+            || authority.secondary_removal.as_ref() != Some(&committed.evidence)
+            || authority.current_configuration
+                != committed.evidence.preparation.intent.current_configuration
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "commit does not match installed reduction".into(),
+            ));
+        }
+        if let Some(existing) = &state.accepted_secondary_removal {
+            if existing == &committed {
+                return Ok(());
+            }
+            return Err(RuntimeError::AuthorityMismatch(
+                "conflicting reduction commit replay".into(),
+            ));
+        }
+        drop(state);
+        self.replicator
+            .lock()
+            .await
+            .validate_secondary_removal_commit(&committed)?;
+        for witness in &committed.current_only_write_quorum {
+            if witness.identity != self.identity {
+                self.replicator
+                    .lock()
+                    .await
+                    .observe_committed_secondary_removal(witness)?;
+            }
+        }
+        if !self.replicator.lock().await.catch_up_complete() {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        self.replica_authority_store
+            .record_secondary_removal_commit(&committed)
+            .await?;
+        self.state.write().await.accepted_secondary_removal = Some(committed);
+        Ok(())
+    }
+
+    async fn fence_retirement_instruction(&self, retired: RetiredAuthority) -> Result<()> {
+        retired.validate(&self.identity)?;
+        let mut state = self.state.write().await;
+        if state
+            .retiring_authority
+            .as_ref()
+            .is_some_and(|old| old != &retired)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "conflicting retirement replay".into(),
+            ));
+        }
+        if let Some(authority) = &state.authority
+            && (authority.current_configuration != retired.report.intent.previous_configuration
+                || authority.previous_configuration.is_some())
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "retirement differs from installed target authority".into(),
+            ));
+        }
+        self.replica_authority_store
+            .record_retirement_started(&retired)
+            .await?;
+        state.read_status = AccessStatus::NotPrimary;
+        state.write_status = AccessStatus::NotPrimary;
+        state.authority = None;
+        state.replication_progress = None;
+        state.outbound_builds.clear();
+        state.builds.clear();
+        state.peer_repair_targets.clear();
+        state.retiring_authority = Some(retired);
+        drop(state);
+        if let Some(streams) = self.streams.read().await.as_ref() {
+            streams.shutdown();
+        }
+        self.fence_generation.fetch_add(1, Ordering::AcqRel);
+        self.replicator.lock().await.fence_client_writes();
+        Ok(())
+    }
+
+    async fn complete_retirement_instruction(&self, retired: RetiredAuthority) -> Result<()> {
+        retired.validate(&self.identity)?;
+        let state = self.state.read().await;
+        if state.open
+            || state.role != ReplicaRole::None
+            || state.retiring_authority.as_ref() != Some(&retired)
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        drop(state);
+        if let Some(existing) = self
+            .replica_authority_store
+            .load_retired_authority()
+            .await?
+        {
+            if existing != retired {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "conflicting durable retirement".into(),
+                ));
+            }
+        } else {
+            self.replica_authority_store.retire(&retired).await?;
+        }
+        self.state.write().await.retired_authority = Some(retired);
         Ok(())
     }
 
@@ -3298,6 +3316,17 @@ impl DefaultReplicatorInner {
                 ));
             }
         }
+        if let Some(preparation) = &state.prepared_secondary_removal
+            && authority.secondary_removal.as_ref().map(|e| &e.preparation) != Some(preparation)
+            && state
+                .accepted_secondary_removal
+                .as_ref()
+                .is_none_or(|committed| committed.evidence.preparation != *preparation)
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "prepared removal may only roll forward".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -3470,21 +3499,23 @@ impl DefaultReplicatorInner {
         Ok(())
     }
 
-    async fn execute_managed_instruction(&self, action: ReplicaRuntimeInstruction) -> Result<()> {
-        {
-            let _guard = self.effect_lock.lock().await;
-            if !matches!(action, ReplicaRuntimeInstruction::CompleteRetirement(_)) {
-                self.check_aborted()?;
-                if self.state.read().await.retiring_authority.is_some()
-                    && !matches!(action, ReplicaRuntimeInstruction::FenceRetirement(_))
-                {
-                    return Err(RuntimeError::Closed);
-                }
-            }
-            self.execute_instruction(action).await?;
+    async fn execute_managed_operation<T>(
+        &self,
+        allow_closed: bool,
+        allow_retiring: bool,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        self.check_no_pending_configuration().await?;
+        let _guard = self.effect_lock.lock().await;
+        if !allow_closed {
+            self.check_aborted()?;
         }
+        if !allow_retiring && self.state.read().await.retiring_authority.is_some() {
+            return Err(RuntimeError::Closed);
+        }
+        let result = operation.await?;
         self.changed.notify_waiters();
-        Ok(())
+        Ok(result)
     }
 
     async fn certified_prefix_outcome(
@@ -3541,7 +3572,12 @@ impl DefaultReplicatorInner {
 
     async fn prepare_switchover_with_token(
         &self,
-        action: ReplicaRuntimeInstruction,
+        preparation_generation: u64,
+        request_id: crate::protocol::types::SwitchoverRequestId,
+        source: ReplicaIdentity,
+        target: ReplicaIdentity,
+        starting_configuration_id: crate::protocol::types::ConfigurationId,
+        starting_epoch: Epoch,
     ) -> Result<ManagedOperationFence> {
         let _effect = self.effect_lock.lock().await;
         self.check_aborted()?;
@@ -3555,7 +3591,15 @@ impl DefaultReplicatorInner {
             engine_generation: self.fence_generation.load(Ordering::Acquire),
         };
         drop(state);
-        self.execute_instruction(action).await?;
+        self.prepare_switchover_instruction(
+            preparation_generation,
+            request_id,
+            source,
+            target,
+            starting_configuration_id,
+            starting_epoch,
+        )
+        .await?;
         self.changed.notify_waiters();
         Ok(token)
     }
@@ -3697,6 +3741,9 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         let _effect = self.effect_lock.lock().await;
         let _delivery = self.delivery_lock.lock().await;
         self.fence_generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(pending) = self.state.write().await.pending_configuration.take() {
+            pending.active.store(false, Ordering::Release);
+        }
         self.replicator.lock().await.fence_client_writes();
         self.changed.notify_waiters();
         Ok(())
@@ -3708,6 +3755,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         write: AccessStatus,
     ) -> Result<ManagedAccessPreparation> {
         self.check_aborted()?;
+        self.check_no_pending_configuration().await?;
         let generation = self.fence_generation.load(Ordering::Acquire);
         if write == AccessStatus::Granted {
             self.validate_removal_write_grant().await?;
@@ -3803,6 +3851,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         let _effect = self.effect_lock.lock().await;
         let delivery = self.delivery_lock.clone().lock_owned().await;
         self.check_aborted()?;
+        self.check_no_pending_configuration().await?;
         if expected.engine_session_id != self.session_id
             || expected.engine_generation != self.fence_generation.load(Ordering::Acquire)
             || {
@@ -3820,6 +3869,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         let _effect = self.effect_lock.lock().await;
         let _delivery = self.delivery_lock.lock().await;
         self.check_aborted()?;
+        self.check_no_pending_configuration().await?;
         let state = self.state.read().await;
         Ok(ManagedOperationFence {
             configuration: state.authority.clone(),
@@ -3855,6 +3905,16 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         }
         self.validate_managed_configuration_candidate(&configuration)
             .await?;
+        if self
+            .state
+            .read()
+            .await
+            .pending_configuration
+            .as_ref()
+            .is_some_and(|pending| pending.active.load(Ordering::Acquire))
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
         let existing = self.state.read().await.authority.clone();
         let preserve_access = existing.as_ref().is_some_and(|current| {
             current == &configuration
@@ -3872,17 +3932,23 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
                 self.replicator.lock().await.fence_client_writes();
             }
         }
+        let active = Arc::new(AtomicBool::new(true));
         let preparation = ManagedConfigurationPreparation {
             fence: ManagedOperationFence {
                 configuration: Some(configuration.clone()),
                 engine_session_id: self.session_id.clone(),
                 engine_generation: self.fence_generation.load(Ordering::Acquire),
             },
-            configuration,
-            preserve_access,
+            configuration: configuration.clone(),
             host_generation,
+            active: active.clone(),
         };
-        self.state.write().await.pending_configuration = Some(preparation.clone());
+        self.state.write().await.pending_configuration = Some(PendingManagedConfiguration {
+            configuration,
+            engine_generation: preparation.fence.engine_generation,
+            host_generation,
+            active,
+        });
         self.changed.notify_waiters();
         Ok(preparation)
     }
@@ -3897,10 +3963,23 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         );
         let _effect = self.effect_lock.lock().await;
         self.check_aborted()?;
-        if preparation.fence.engine_session_id != self.session_id
+        let pending_matches = self
+            .state
+            .read()
+            .await
+            .pending_configuration
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.active.load(Ordering::Acquire)
+                    && pending.configuration == preparation.configuration
+                    && pending.engine_generation == preparation.fence.engine_generation
+                    && pending.host_generation == preparation.host_generation
+            });
+        if !preparation.active.load(Ordering::Acquire)
+            || preparation.fence.engine_session_id != self.session_id
             || preparation.fence.engine_generation != self.fence_generation.load(Ordering::Acquire)
             || preparation.fence.configuration.as_ref() != Some(&preparation.configuration)
-            || self.state.read().await.pending_configuration.as_ref() != Some(&preparation)
+            || !pending_matches
         {
             return Err(RuntimeError::OperationCancelled);
         }
@@ -3911,6 +3990,7 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
             state.configuration_generation = preparation.host_generation;
             state.pending_configuration = None;
         }
+        preparation.active.store(false, Ordering::Release);
         drop(_effect);
         if recover_scale_up_writes && !self.state.read().await.local_writes.is_empty() {
             self.recover_pending_local_writes().await?;
@@ -3939,9 +4019,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         &self,
         boundary: Lsn,
     ) -> Result<crate::replicator::ManagedCertifiedPrefixOutcome> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::AuthorizeFailoverPrefix(
-            boundary,
-        ))
+        self.execute_managed_operation(
+            false,
+            false,
+            self.authorize_failover_prefix_instruction(boundary),
+        )
         .await?;
         self.certified_prefix_outcome(boundary).await
     }
@@ -3956,14 +4038,14 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         starting_epoch: Epoch,
     ) -> Result<crate::replicator::ManagedSwitchoverOutcome> {
         let fence = self
-            .prepare_switchover_with_token(ReplicaRuntimeInstruction::PrepareSwitchover {
+            .prepare_switchover_with_token(
                 preparation_generation,
-                request_id: request_id.clone(),
-                source: source.clone(),
-                target: target.clone(),
-                starting_configuration_id: starting_configuration_id.clone(),
+                request_id.clone(),
+                source.clone(),
+                target.clone(),
+                starting_configuration_id.clone(),
                 starting_epoch,
-            })
+            )
             .await?;
         let state = self.state.read().await;
         let handoff_lsn = state
@@ -3991,11 +4073,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         process_session_id: ProcessSessionId,
         report_sequence: u64,
     ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::PrepareSecondaryRemoval {
-            intent: Box::new(intent),
-            process_session_id,
-            report_sequence,
-        })
+        self.execute_managed_operation(
+            false,
+            false,
+            self.prepare_secondary_removal_instruction(intent, process_session_id, report_sequence),
+        )
         .await?;
         self.secondary_removal_outcome(None).await
     }
@@ -4004,8 +4086,10 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         &self,
         witness: SecondaryRemovalWitness,
     ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
-        self.execute_managed_instruction(
-            ReplicaRuntimeInstruction::ObserveSecondaryRemovalWitness(Box::new(witness.clone())),
+        self.execute_managed_operation(
+            false,
+            false,
+            self.observe_secondary_removal_witness_instruction(witness.clone()),
         )
         .await?;
         self.secondary_removal_outcome(Some(witness)).await
@@ -4016,11 +4100,10 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         witness: SecondaryRemovalWitness,
         committed: SecondaryScaleDownCleanup,
     ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
-        self.execute_managed_instruction(
-            ReplicaRuntimeInstruction::ObserveSecondaryRemovalProgress {
-                witness: Box::new(witness.clone()),
-                committed: Box::new(committed),
-            },
+        self.execute_managed_operation(
+            false,
+            false,
+            self.observe_secondary_removal_progress_instruction(witness.clone(), committed),
         )
         .await?;
         self.secondary_removal_outcome(Some(witness)).await
@@ -4030,9 +4113,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         &self,
         committed: SecondaryScaleDownCleanup,
     ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::AcceptSecondaryRemovalCommit(
-            Box::new(committed),
-        ))
+        self.execute_managed_operation(
+            false,
+            false,
+            self.accept_secondary_removal_commit_instruction(committed),
+        )
         .await?;
         self.secondary_removal_outcome(None).await
     }
@@ -4041,8 +4126,10 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         &self,
         command: crate::protocol::command::AcceptSecondaryRemovalCommit,
     ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
-        self.execute_managed_instruction(
-            ReplicaRuntimeInstruction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command)),
+        self.execute_managed_operation(
+            false,
+            false,
+            self.accept_historical_secondary_removal_commit_instruction(command),
         )
         .await?;
         self.secondary_removal_outcome(None).await
@@ -4052,9 +4139,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         &self,
         retired: RetiredAuthority,
     ) -> Result<crate::replicator::ManagedRetirementOutcome> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::FenceRetirement(Box::new(
-            retired.clone(),
-        )))
+        self.execute_managed_operation(
+            false,
+            true,
+            self.fence_retirement_instruction(retired.clone()),
+        )
         .await?;
         Ok(crate::replicator::ManagedRetirementOutcome {
             engine_session_id: self.session_id.clone(),
@@ -4068,9 +4157,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         &self,
         retired: RetiredAuthority,
     ) -> Result<crate::replicator::ManagedRetirementOutcome> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::CompleteRetirement(Box::new(
-            retired.clone(),
-        )))
+        self.execute_managed_operation(
+            true,
+            true,
+            self.complete_retirement_instruction(retired.clone()),
+        )
         .await?;
         Ok(crate::replicator::ManagedRetirementOutcome {
             engine_session_id: self.session_id.clone(),
@@ -4085,28 +4176,35 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::RegisterPeerSession {
-            identity,
-            session,
-        })
+        self.execute_managed_operation(
+            false,
+            false,
+            self.register_peer_session_instruction(identity, session),
+        )
         .await
     }
 
     async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::AdmitBuildAuthority(Box::new(
-            authority,
-        )))
+        self.execute_managed_operation(
+            false,
+            false,
+            self.admit_build_authority_instruction(authority),
+        )
         .await
     }
 
     async fn retire_build_proof(&self, build_id: OperationId) -> Result<()> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::RetireBuild(build_id))
+        self.execute_managed_operation(false, false, self.retire_build_instruction(build_id))
             .await
     }
 
     async fn refresh_progress_proof(&self) -> Result<()> {
-        self.execute_managed_instruction(ReplicaRuntimeInstruction::RefreshApplicationProgress)
-            .await
+        self.execute_managed_operation(
+            false,
+            false,
+            self.refresh_application_progress_instruction(),
+        )
+        .await
     }
 
     async fn restore_engine_proof(&self) -> Result<()> {
@@ -4184,10 +4282,11 @@ impl ManagedReplicatorDataPlane for DefaultReplicatorInner {
         acknowledgement: ReplicationAck,
         session: ProcessSessionId,
     ) -> Result<()> {
-        self.execute_instruction(ReplicaRuntimeInstruction::ObserveReplicationAck {
-            acknowledgement: Box::new(acknowledgement),
-            session,
-        })
+        self.execute_managed_operation(
+            false,
+            false,
+            self.observe_replication_ack_instruction(acknowledgement, session),
+        )
         .await
     }
 

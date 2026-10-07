@@ -12813,6 +12813,55 @@ async fn ambiguous_primary_authority_admission_fences_pending_writes_and_old_ack
 }
 
 #[tokio::test]
+async fn failed_managed_authority_persistence_invalidates_preparation_and_allows_exact_retry() {
+    let local = identity(1, "managed-persist-retry-primary");
+    let secondary = identity(2, "managed-persist-retry-secondary");
+    let admitted = authority(local.clone(), vec![local.clone(), secondary]);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = PodRuntime::new(local, Arc::new(TestApplication::default()), store.clone());
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let next = AdmittedAuthority {
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            admitted.current_configuration.primary_id,
+            admitted.current_configuration.members.clone(),
+            admitted.current_configuration.write_quorum,
+        ),
+        ..admitted.clone()
+    };
+    let admission = effect(
+        5,
+        RuntimeEffectAction::AdmitAuthority(Box::new(next.clone())),
+    );
+    store.fail_before_admit.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        runtime.apply_effect(admission.clone()).await,
+        Err(RuntimeError::Application(_))
+    ));
+    assert_eq!(store.load().await.unwrap(), Some(admitted));
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+
+    runtime.apply_effect(admission).await.unwrap();
+    assert_eq!(store.load().await.unwrap(), Some(next));
+}
+
+#[tokio::test]
 async fn removing_a_replica_terminates_its_pending_build_wait() {
     let runtime = open_primary_with_session(
         Arc::new(TestApplication::default()),
