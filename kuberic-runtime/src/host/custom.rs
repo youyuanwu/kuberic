@@ -1280,12 +1280,20 @@ impl ManagedLifecycleBackend {
         decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()> {
         let projection = self.common.reserve_access_projection(read, write).await?;
+        let deadline = super::access_publication_deadline();
         let publication = {
             let publication = self.publish_managed_access(projection.clone());
             tokio::pin!(publication);
             tokio::select! {
-                result = &mut publication => Some(result),
+                biased;
                 _ = ready.closed() => None,
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => None,
+                result = &mut publication => Some(result),
             }
         };
         let Some(publication) = publication else {

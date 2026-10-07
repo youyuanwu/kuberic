@@ -11,7 +11,8 @@ use crate::application::{ClientWrite, WriteReceipt};
 use crate::application::{OpenContext, OpenMode, StateProvider, StatefulServiceReplica};
 use crate::authority::{
     AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
-    BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore, ReplicationProgressStore,
+    BuildProgressStore, LocalWriteJournal, LocalWritePhase, ReplicaAuthorityStore,
+    ReplicationProgressStore,
 };
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::control::proto;
@@ -38,10 +39,24 @@ use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 tokio::task_local! {
     static ACCESS_PROOF_VIEW: (AccessStatus, AccessStatus);
+    static ACCESS_PUBLICATION_DEADLINE: tokio::time::Instant;
+}
+
+fn access_publication_deadline() -> Option<tokio::time::Instant> {
+    ACCESS_PUBLICATION_DEADLINE
+        .try_with(|deadline| *deadline)
+        .ok()
+}
+
+async fn with_access_publication_deadline<F: Future>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> F::Output {
+    ACCESS_PUBLICATION_DEADLINE.scope(deadline, future).await
 }
 
 pub(super) async fn with_access_proof_view<F>(
@@ -773,6 +788,8 @@ impl PodRuntime {
                 authority_publication_gate: StdMutex::new(None),
                 #[cfg(all(test, feature = "testing"))]
                 custom_restoration_gate: StdMutex::new(None),
+                #[cfg(all(test, feature = "testing"))]
+                peer_discovery_ready_gate: StdMutex::new(None),
             }),
         }
     }
@@ -804,6 +821,16 @@ impl PodRuntime {
             release: Arc::new(tokio::sync::Notify::new()),
         };
         *self.host.custom_restoration_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_pause_peer_discovery_ready(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.peer_discovery_ready_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
@@ -1418,6 +1445,8 @@ struct RuntimeHost {
     authority_publication_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
     #[cfg(all(test, feature = "testing"))]
     custom_restoration_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(all(test, feature = "testing"))]
+    peer_discovery_ready_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
 }
 
 impl OpenAttempt<'_> {
@@ -1546,6 +1575,119 @@ impl ReportHost for RuntimeHost {
 }
 
 impl RuntimeHost {
+    async fn describe_peer_with_owned_access_recovery(
+        &self,
+        replica: crate::replicator::ReplicaInformation,
+        discovery_ready: oneshot::Sender<()>,
+    ) -> Result<()> {
+        let effect = self.effect_lock.try_lock().ok();
+        let owned_access = if effect.is_some() {
+            let state = self.state.read().await;
+            let snapshot = &state.fallback_snapshot;
+            state
+                .effects
+                .values()
+                .rev()
+                .find(|applied| {
+                    matches!(
+                        applied.effect.action,
+                        RuntimeEffectAction::SetAccessStatus { .. }
+                            | RuntimeEffectAction::SetReadStatus(_)
+                            | RuntimeEffectAction::SetWriteStatus(_)
+                    )
+                })
+                .map(|applied| applied.result.postcondition.clone())
+                .filter(|owned| {
+                    snapshot.open
+                        && snapshot.role_transition.is_none()
+                        && state.reported_fault.is_none()
+                        && owned.authority.is_some()
+                        && owned.authority == snapshot.authority
+                        && owned.role == snapshot.role
+                        && owned.read_status == snapshot.read_status
+                        && owned.write_status == snapshot.write_status
+                        && (owned.read_status == AccessStatus::Granted
+                            || owned.write_status == AccessStatus::Granted)
+                })
+        } else {
+            None
+        };
+        self.peer_lifecycle()?.describe_peer(replica).await?;
+        let Some(owned) = owned_access else {
+            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        #[cfg(all(test, feature = "testing"))]
+        {
+            let gate = self.peer_discovery_ready_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        let mut discovery_ready = Some(discovery_ready);
+        for attempt in 0..3 {
+            let current = self.snapshot().await;
+            if !current.open
+                || current.role_transition.is_some()
+                || current.authority != owned.authority
+                || current.role != owned.role
+                || (current.read_status == owned.read_status
+                    && current.write_status == owned.write_status)
+            {
+                return Ok(());
+            }
+            let store = &self.default_dependencies.replica_authority_store;
+            if store.load().await? != owned.authority
+                || store.load_retired_authority().await?.is_some()
+                || store.load_retirement_started().await?.is_some()
+            {
+                return Ok(());
+            }
+            if owned.write_status == AccessStatus::Granted
+                && self
+                    .default_dependencies
+                    .local_write_journal
+                    .load_local_writes()
+                    .await?
+                    .iter()
+                    .any(|write| write.phase != LocalWritePhase::Committed)
+                && let Some(ready) = discovery_ready.take()
+            {
+                let _ = ready.send(());
+            }
+            let access = self
+                .registered
+                .get()
+                .and_then(RegisteredReplicator::access_lifecycle)
+                .ok_or(RuntimeError::NotOpen)?;
+            let result = async {
+                let ready = with_access_publication_deadline(
+                    deadline,
+                    access.begin_effect(owned.read_status, owned.write_status),
+                )
+                .await?;
+                let (_, accepted) = ready.accept().await?;
+                accepted.commit().await
+            }
+            .await;
+            match result {
+                Err(RuntimeError::OperationCancelled) if attempt < 2 => {
+                    tokio::task::yield_now().await
+                }
+                result => {
+                    if discovery_ready.is_none()
+                        && let Err(error) = &result
+                    {
+                        tracing::warn!(%error, "owned peer access recovery remains closed");
+                    }
+                    return result;
+                }
+            }
+        }
+        unreachable!()
+    }
+
     async fn observe_report_progress(&self) -> Result<()> {
         let _restoration = if !BuildHost::is_managed(self) {
             Some(self.custom_restoration.lock().await)
@@ -1626,6 +1768,21 @@ impl BuildHost for RuntimeHost {
     }
 
     async fn describe_peer(&self, replica: crate::replicator::ReplicaInformation) -> Result<()> {
+        if BuildHost::is_managed(self) {
+            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+            let (ready, discovered) = oneshot::channel();
+            let mut recovery = tokio::spawn(async move {
+                host.describe_peer_with_owned_access_recovery(replica, ready)
+                    .await
+            });
+            return tokio::select! {
+                result = &mut recovery => result.map_err(|error| RuntimeError::Application(error.to_string()))?,
+                result = discovered => match result {
+                    Ok(()) => Ok(()),
+                    Err(_) => recovery.await.map_err(|error| RuntimeError::Application(error.to_string()))?,
+                },
+            };
+        }
         self.peer_lifecycle()?.describe_peer(replica).await
     }
 

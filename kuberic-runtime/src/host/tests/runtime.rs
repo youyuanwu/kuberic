@@ -6714,6 +6714,481 @@ async fn managed_restart_recovery_never_restores_access_before_proof() {
 }
 
 #[tokio::test]
+async fn managed_replacement_peer_restart_restores_owned_access_before_new_write() {
+    for proof_registered_first in [false, true] {
+        let (runtime, admitted, replacement, other) = replacement_restart_primary().await;
+        for (index, session) in ["before-replacement-restart", "after-replacement-restart"]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 1 && proof_registered_first {
+                runtime
+                    .register_peer_session(replacement.clone(), ProcessSessionId::new(session))
+                    .await
+                    .unwrap();
+                assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+            }
+            let mut description = ReplicaInformation::new(
+                OperationId::default(),
+                replacement.clone(),
+                "in-process://replacement-restart".into(),
+            );
+            description.process_session_id = ProcessSessionId::new(session);
+            runtime
+                .build_runtime()
+                .describe_peer(description)
+                .await
+                .unwrap();
+        }
+        // No status-report request or fresh controller command between discovery
+        // and the write. The owned prior grant still needs new native proof.
+        assert_eq!(runtime.snapshot().await.authority, Some(admitted.clone()));
+        assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        let write = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("after-replacement-restart"),
+                data: Bytes::from_static(b"after-replacement-restart"),
+            })
+            .await
+            .unwrap();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(acknowledgement(&admitted, other, write.lsn))
+            .await
+            .unwrap();
+        assert_eq!(write.committed().await.unwrap().committed_lsn, 1);
+    }
+}
+
+async fn replacement_restart_primary() -> (
+    Arc<PodRuntime>,
+    AdmittedAuthority,
+    ReplicaIdentity,
+    ReplicaIdentity,
+) {
+    replacement_restart_primary_with_quorum_peer(true).await
+}
+
+async fn replacement_restart_primary_with_quorum_peer(
+    include_other: bool,
+) -> (
+    Arc<PodRuntime>,
+    AdmittedAuthority,
+    ReplicaIdentity,
+    ReplicaIdentity,
+) {
+    let local = identity(1, "replacement-restart-primary");
+    let replacement = identity(2, "accepted-replacement-instance");
+    let other = identity(3, "replacement-restart-quorum-peer");
+    let mut members = vec![local.clone(), replacement.clone()];
+    if include_other {
+        members.push(other.clone());
+    }
+    let mut admitted = authority(local.clone(), members);
+    admitted.current_configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        local.replica_id,
+        admitted.current_configuration.members.clone(),
+        admitted.current_configuration.write_quorum,
+    );
+    let runtime = Arc::new(PodRuntime::new(
+        local,
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("replacement-restart"),
+            ProcessSessionId::new("primary-session"),
+        )
+        .unwrap();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    (runtime, admitted, replacement, other)
+}
+
+#[tokio::test]
+async fn managed_peer_restart_recovery_does_not_wait_on_its_own_delivery_queue() {
+    let (source, admitted, replacement, _) =
+        replacement_restart_primary_with_quorum_peer(false).await;
+    let target = Arc::new(PodRuntime::new(
+        replacement.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    target
+        .bind_replica_session(
+            ResourceUid::new("replacement-restart"),
+            ProcessSessionId::new("new-session"),
+        )
+        .unwrap();
+    let mut target_authority = admitted.clone();
+    target_authority.local_identity = replacement.clone();
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(target_authority)),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        target
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    target
+        .register_peer_session(
+            admitted.local_identity.clone(),
+            ProcessSessionId::new("primary-session"),
+        )
+        .await
+        .unwrap();
+    let mut old = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    old.process_session_id = ProcessSessionId::new("old-session");
+    source.build_runtime().describe_peer(old).await.unwrap();
+    let pending = source
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("queued-before-restart"),
+            data: Bytes::from_static(b"queued-before-restart"),
+        })
+        .await
+        .unwrap();
+    let (sender, mut queue) = tokio::sync::mpsc::channel(4);
+    sender
+        .send(pending.replication_items[0].clone())
+        .await
+        .unwrap();
+    let delivery = {
+        let source = source.clone();
+        let target = target.clone();
+        tokio::spawn(async move {
+            let mut item = queue.recv().await.unwrap();
+            let mut fresh = ReplicaInformation::new(
+                OperationId::default(),
+                replacement.clone(),
+                "in-process://replacement-restart".into(),
+            );
+            fresh.process_session_id = ProcessSessionId::new("new-session");
+            source.build_runtime().describe_peer(fresh).await?;
+            source
+                .build_runtime()
+                .register_peer_session(replacement, ProcessSessionId::new("new-session"))
+                .await?;
+            item.sender_session_id = "primary-session".into();
+            item.receiver_session_id = "new-session".into();
+            let received = target.data_plane().receive_replication(item).await?;
+            let mut applied = received.applied().await?;
+            applied.receiver_session_id = "new-session".into();
+            source.data_plane().accept_acknowledgement(applied).await
+        })
+    };
+    timeout(Duration::from_secs(2), delivery)
+        .await
+        .expect("description blocked the only delivery worker needed for replay")
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while source.snapshot().await.write_status != AccessStatus::Granted {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let _ = pending.committed().await;
+    assert_eq!(target.snapshot().await.current_progress, 1);
+    assert_eq!(source.snapshot().await.committed_lsn, 1);
+}
+
+#[tokio::test]
+async fn managed_peer_recovery_without_quorum_releases_effect_owner_before_revocation() {
+    let (source, admitted, replacement, _) =
+        replacement_restart_primary_with_quorum_peer(false).await;
+    let mut old = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    old.process_session_id = ProcessSessionId::new("old-session");
+    source.build_runtime().describe_peer(old).await.unwrap();
+    let pending = source
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("never-acknowledged-peer-recovery"),
+            data: Bytes::from_static(b"never-acknowledged-peer-recovery"),
+        })
+        .await
+        .unwrap();
+    let mut fresh = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    fresh.process_session_id = ProcessSessionId::new("new-session");
+    timeout(
+        Duration::from_secs(1),
+        source.build_runtime().describe_peer(fresh),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(source.snapshot().await.write_status, AccessStatus::Granted);
+    timeout(
+        Duration::from_secs(8),
+        source.apply_effect(effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::ReconfigurationPending,
+                write: AccessStatus::ReconfigurationPending,
+            },
+        )),
+    )
+    .await
+    .expect("unacknowledged background recovery monopolized the effect owner")
+    .unwrap();
+    assert!(source.snapshot().await.open);
+    assert_ne!(source.snapshot().await.write_status, AccessStatus::Granted);
+    source
+        .register_peer_session(replacement.clone(), ProcessSessionId::new("new-session"))
+        .await
+        .unwrap();
+    let mut late_ack = acknowledgement(&admitted, replacement.clone(), pending.lsn);
+    late_ack.receiver_session_id = "new-session".into();
+    source
+        .data_plane()
+        .accept_acknowledgement(late_ack)
+        .await
+        .unwrap();
+    let mut again = ReplicaInformation::new(
+        OperationId::default(),
+        replacement,
+        "in-process://replacement-restart".into(),
+    );
+    again.process_session_id = ProcessSessionId::new("new-session");
+    source.build_runtime().describe_peer(again).await.unwrap();
+    assert_ne!(source.snapshot().await.write_status, AccessStatus::Granted);
+    let _ = pending.committed().await;
+}
+
+#[tokio::test]
+async fn managed_peer_restart_does_not_restore_revoked_or_other_authority_access() {
+    for change_authority in [false, true] {
+        let (runtime, admitted, replacement, _) = replacement_restart_primary().await;
+        let mut old = ReplicaInformation::new(
+            OperationId::default(),
+            replacement.clone(),
+            "in-process://replacement-restart".into(),
+        );
+        old.process_session_id = ProcessSessionId::new("old-session");
+        runtime.build_runtime().describe_peer(old).await.unwrap();
+        let action = if change_authority {
+            let mut newer = admitted;
+            newer.current_configuration = ConfigurationDescriptor::new(
+                Epoch::new(0, 3),
+                newer.local_identity.replica_id,
+                newer.current_configuration.members.clone(),
+                newer.current_configuration.write_quorum,
+            );
+            RuntimeEffectAction::AdmitAuthority(Box::new(newer))
+        } else {
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::ReconfigurationPending,
+                write: AccessStatus::ReconfigurationPending,
+            }
+        };
+        runtime.apply_effect(effect(5, action)).await.unwrap();
+        let mut fresh = ReplicaInformation::new(
+            OperationId::default(),
+            replacement,
+            "in-process://replacement-restart".into(),
+        );
+        fresh.process_session_id = ProcessSessionId::new("new-session");
+        runtime.build_runtime().describe_peer(fresh).await.unwrap();
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        assert!(matches!(
+            runtime
+                .data_plane()
+                .begin_write(ClientWrite {
+                    operation_id: OperationId::new("must-stay-closed"),
+                    data: Bytes::from_static(b"must-stay-closed"),
+                })
+                .await,
+            Err(RuntimeError::WriteClosed(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn managed_peer_discovery_does_not_regrant_during_owned_access_revocation() {
+    let (runtime, _, replacement, _) = replacement_restart_primary().await;
+    let mut old = ReplicaInformation::new(
+        OperationId::default(),
+        replacement.clone(),
+        "in-process://replacement-restart".into(),
+    );
+    old.process_session_id = ProcessSessionId::new("old-session");
+    runtime.build_runtime().describe_peer(old).await.unwrap();
+    let gate = runtime.testing_pause_access_effect_acceptance();
+    let revocation = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::SetAccessStatus {
+                        read: AccessStatus::ReconfigurationPending,
+                        write: AccessStatus::ReconfigurationPending,
+                    },
+                ))
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+    let mut fresh = ReplicaInformation::new(
+        OperationId::default(),
+        replacement,
+        "in-process://replacement-restart".into(),
+    );
+    fresh.process_session_id = ProcessSessionId::new("new-session");
+    runtime.build_runtime().describe_peer(fresh).await.unwrap();
+    assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    gate.release.notify_one();
+    let _ = revocation.await.unwrap();
+    assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn managed_peer_restart_waits_for_owned_write_recovery_after_observer_cancellation() {
+    for cancel_observer in [false, true] {
+        let (runtime, admitted, replacement, other) = replacement_restart_primary().await;
+        let mut old = ReplicaInformation::new(
+            OperationId::default(),
+            replacement.clone(),
+            "in-process://replacement-restart".into(),
+        );
+        old.process_session_id = ProcessSessionId::new("old-session");
+        runtime.build_runtime().describe_peer(old).await.unwrap();
+        let pending = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("interrupted-by-peer-restart"),
+                data: Bytes::from_static(b"interrupted-by-peer-restart"),
+            })
+            .await
+            .unwrap();
+        let gate = cancel_observer.then(|| runtime.testing_pause_peer_discovery_ready());
+        let discovery = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                let mut fresh = ReplicaInformation::new(
+                    OperationId::default(),
+                    replacement,
+                    "in-process://replacement-restart".into(),
+                );
+                fresh.process_session_id = ProcessSessionId::new("new-session");
+                runtime.build_runtime().describe_peer(fresh).await
+            })
+        };
+        if let Some(gate) = &gate {
+            timeout(Duration::from_secs(1), gate.entered.notified())
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.snapshot().await.write_status == AccessStatus::ReconfigurationPending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel_observer {
+            discovery.abort();
+            assert!(discovery.await.unwrap_err().is_cancelled());
+            gate.unwrap().release.notify_one();
+        } else {
+            timeout(Duration::from_secs(1), discovery)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        runtime
+            .register_peer_session(other.clone(), ProcessSessionId::new("quorum-session"))
+            .await
+            .unwrap();
+        let mut quorum_description = ReplicaInformation::new(
+            OperationId::default(),
+            other.clone(),
+            "in-process://quorum-peer".into(),
+        );
+        quorum_description.process_session_id = ProcessSessionId::new("quorum-session");
+        runtime
+            .build_runtime()
+            .describe_peer(quorum_description)
+            .await
+            .unwrap();
+        let mut replay_ack = acknowledgement(&admitted, other.clone(), pending.lsn);
+        replay_ack.receiver_session_id = "quorum-session".into();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(replay_ack)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while runtime.snapshot().await.write_status != AccessStatus::Granted {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = pending.committed().await;
+        let next = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("after-owned-recovery"),
+                data: Bytes::from_static(b"after-owned-recovery"),
+            })
+            .await
+            .unwrap();
+        let mut next_ack = acknowledgement(&admitted, other, next.lsn);
+        next_ack.receiver_session_id = "quorum-session".into();
+        runtime
+            .data_plane()
+            .accept_acknowledgement(next_ack)
+            .await
+            .unwrap();
+        assert_eq!(next.committed().await.unwrap().committed_lsn, 2);
+    }
+}
+
+#[tokio::test]
 async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it() {
     for (error, supersede) in [(1, 0), (1, 1), (1, 2), (2, 0), (3, 0)] {
         let directory = crate::host::tests::tempdir().unwrap();
