@@ -4372,6 +4372,7 @@ struct CustomRoleGate {
     revoke_error: AtomicBool,
     abort_count: AtomicUsize,
     block_configuration: AtomicBool,
+    fail_configuration: AtomicBool,
     configuration_entered: Notify,
     configuration_released: Notify,
     block_catchup: AtomicBool,
@@ -4474,9 +4475,15 @@ impl PrimaryReplicator for CustomRoleGate {
             self.configuration_entered.notify_one();
             self.configuration_released.notified().await;
         }
+        if self.fail_configuration.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::AuthorityMismatch(
+                "injected configuration rejection".into(),
+            ));
+        }
         self.configurations.lock().unwrap().push(configuration);
         Ok(())
     }
+
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
         if self.block_catchup.swap(false, Ordering::SeqCst) {
             self.catchup_entered.notify_one();
@@ -4500,6 +4507,42 @@ impl PrimaryReplicator for CustomRoleGate {
         }
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn rejected_custom_configuration_does_not_publish_authority() {
+    let local = identity(1, "rejected-custom-configuration");
+    let peer = identity(2, "rejected-custom-configuration-peer");
+    let control = Arc::new(CustomRoleGate::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(CustomRoleService(control.clone())),
+        store.clone(),
+    ));
+    runtime
+        .bind_replica_session(
+            ResourceUid::new("rejected-custom-configuration"),
+            ProcessSessionId::new("local-session"),
+        )
+        .unwrap();
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    control.fail_configuration.store(true, Ordering::SeqCst);
+    let result = runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority(
+                local.clone(),
+                vec![local, peer],
+            ))),
+        ))
+        .await;
+    assert!(matches!(result, Err(RuntimeError::AuthorityMismatch(_))));
+    assert!(store.authority.lock().unwrap().is_none());
+    assert_eq!(store.admit_count.load(Ordering::SeqCst), 0);
 }
 
 #[async_trait]

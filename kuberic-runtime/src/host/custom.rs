@@ -422,8 +422,12 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
 
     async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
         self.common.prepare_authority_admission(&authority).await?;
+        let (configuration_generation, configuration) =
+            Box::pin(self.common.prepare_configuration_for_authority(&authority)).await?;
         self.legacy.admit_authority_proof(authority.clone()).await?;
-        self.common.install_managed_authority(&authority).await?;
+        self.common
+            .install_prepared_managed_authority(&authority, configuration_generation, configuration)
+            .await?;
         self.sync_topology_status().await
     }
 
@@ -1640,14 +1644,16 @@ impl CustomReplicatorHost {
         })
     }
 
-    async fn descriptions(&self) -> Result<Option<ReplicaSetConfiguration>> {
+    async fn descriptions_for_authority(
+        &self,
+        authority: Option<AdmittedAuthority>,
+    ) -> Result<Option<ReplicaSetConfiguration>> {
         let host = self.host()?;
         let builds = host
             .default_dependencies
             .build_authority_store
             .load_builds()
             .await?;
-        let authority = self.state.read().await.authority.clone();
         let previous = authority
             .as_ref()
             .and_then(|a| a.previous_configuration.clone());
@@ -1758,6 +1764,11 @@ impl CustomReplicatorHost {
         }))
     }
 
+    async fn descriptions(&self) -> Result<Option<ReplicaSetConfiguration>> {
+        self.descriptions_for_authority(self.state.read().await.authority.clone())
+            .await
+    }
+
     async fn published_configuration(&self) -> Option<ReplicaSetConfiguration> {
         let _commit = self.configuration_commit.lock().await;
         self.configuration.read().await.clone()
@@ -1777,6 +1788,40 @@ impl CustomReplicatorHost {
             .as_ref()
             .and_then(|a| a.previous_configuration.clone());
         Ok(Some((current, previous)))
+    }
+
+    async fn prepare_configuration_for_authority(
+        &self,
+        authority: &AdmittedAuthority,
+    ) -> Result<(u64, ReplicaSetConfiguration)> {
+        let current = self
+            .descriptions_for_authority(Some(authority.clone()))
+            .await?
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let generation = self.configuration_generation.load(Ordering::Acquire);
+        let current = Self::apply_configuration_update(
+            self.primary.clone(),
+            current,
+            authority.previous_configuration.clone(),
+        )
+        .await?;
+        self.ensure_configuration_generation(generation)?;
+        Ok((generation, current))
+    }
+
+    async fn publish_prepared_configuration(
+        &self,
+        generation: u64,
+        current: ReplicaSetConfiguration,
+    ) -> Result<()> {
+        let _commit = self.configuration_commit.lock().await;
+        self.ensure_configuration_generation(generation)?;
+        *self.configuration.write().await = Some(current);
+        if let Err(error) = self.ensure_configuration_generation(generation) {
+            *self.configuration.write().await = None;
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn apply_configuration_update(
@@ -2978,7 +3023,12 @@ impl CustomReplicatorHost {
         Ok(())
     }
 
-    async fn install_managed_authority(&self, authority: &AdmittedAuthority) -> Result<()> {
+    async fn install_prepared_managed_authority(
+        &self,
+        authority: &AdmittedAuthority,
+        configuration_generation: u64,
+        configuration: ReplicaSetConfiguration,
+    ) -> Result<()> {
         let _gate = self.gate.lock().await;
         authority.validate()?;
         let previous = self.state.read().await.authority.clone();
@@ -3012,7 +3062,8 @@ impl CustomReplicatorHost {
                 self.enqueue_outbound(OutboundOperation::Evict(identity))?;
             }
         }
-        self.configure().await
+        self.publish_prepared_configuration(configuration_generation, configuration)
+            .await
     }
 
     async fn retire_managed_build(&self, build_id: OperationId) -> Result<()> {
@@ -3581,12 +3632,15 @@ impl CustomReplicatorHost {
                     }
                 }
                 self.prepare_authority_admission(&authority).await?;
+                let (configuration_generation, configuration) =
+                    Box::pin(self.prepare_configuration_for_authority(&authority)).await?;
                 host.default_dependencies
                     .replica_authority_store
                     .admit(&authority)
                     .await?;
                 self.state.write().await.authority = Some(*authority);
-                self.configure().await?;
+                self.publish_prepared_configuration(configuration_generation, configuration)
+                    .await?;
             }
             RuntimeEffectAction::AdmitBuildAuthority(_) => unreachable!(),
             RuntimeEffectAction::RegisterPeerSession { .. } => unreachable!(),
