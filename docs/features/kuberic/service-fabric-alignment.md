@@ -230,8 +230,10 @@ binds transient outcomes back to durable receipts.
 
 This now follows the Service Fabric ownership pattern: the replicator handles
 replication configuration, fencing, copy, replication and progress, while
-application role, replicator role, epoch and the RA's complete transition
-vocabulary remain outside the engine.
+application role remains outside the engine. Replicator role and epoch remain
+separate public `Replicator` operations outside the private managed lifecycle
+contract; their public handlers update engine/log state without exposing the
+RA's complete transition vocabulary.
 
 ### Broad Snapshots Act as Completion Contracts
 
