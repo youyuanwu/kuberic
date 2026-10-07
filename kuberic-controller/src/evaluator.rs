@@ -3982,7 +3982,9 @@ fn evaluate_failover_repair(
                     .iter()
                     .copied()
                     .find(|report| report.identity == member.identity)
-                    .filter(|report| report.current_progress.saturating_add(1) < retained_from)
+                    .filter(|report| {
+                        member_requires_full_copy(report.current_progress, retained_from)
+                    })
                     .map(|_| ReplicaRepairIntent {
                         operation_id: derive_failover_repair_operation_id(
                             &snapshot.resource_uid,
@@ -4086,6 +4088,10 @@ fn evaluate_failover_repair(
             )),
         }],
     })
+}
+
+fn member_requires_full_copy(member_progress: i64, retained_from: i64) -> bool {
+    member_progress.saturating_add(1) < retained_from
 }
 
 fn replica_failed(snapshot: &ObservationSnapshot, identity: &ReplicaIdentity) -> bool {
@@ -4719,4 +4725,17 @@ fn clear_runtime_conditions(status: AcceptedStatus) -> AcceptedStatus {
         .without_condition("Ready")
         .without_condition("Unsafe")
         .without_condition("Progressing")
+}
+
+#[cfg(test)]
+mod capability_boundary_tests {
+    use super::member_requires_full_copy;
+
+    #[test]
+    fn catch_up_capability_boundary_only_repairs_members_further_than_one_behind() {
+        let retained_from = 42;
+        assert!(!member_requires_full_copy(retained_from, retained_from));
+        assert!(!member_requires_full_copy(retained_from - 1, retained_from));
+        assert!(member_requires_full_copy(retained_from - 2, retained_from));
+    }
 }
