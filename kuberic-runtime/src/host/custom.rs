@@ -33,9 +33,6 @@ use super::{AppliedEffect, OpenAttempt, RuntimeHost, empty_snapshot};
 #[path = "custom_removal.rs"]
 mod removal;
 
-#[cfg(feature = "testing")]
-const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-#[cfg(not(feature = "testing"))]
 const ACCESS_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, PartialEq, Eq)]
