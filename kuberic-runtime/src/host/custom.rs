@@ -422,12 +422,8 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
 
     async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
         self.common.prepare_authority_admission(&authority).await?;
-        let (configuration_generation, configuration) =
-            Box::pin(self.common.prepare_configuration_for_authority(&authority)).await?;
         self.legacy.admit_authority_proof(authority.clone()).await?;
-        self.common
-            .install_prepared_managed_authority(&authority, configuration_generation, configuration)
-            .await?;
+        self.common.install_managed_authority(&authority).await?;
         self.sync_topology_status().await
     }
 
@@ -1765,8 +1761,8 @@ impl CustomReplicatorHost {
     }
 
     async fn descriptions(&self) -> Result<Option<ReplicaSetConfiguration>> {
-        self.descriptions_for_authority(self.state.read().await.authority.clone())
-            .await
+        let authority = self.state.read().await.authority.clone();
+        self.descriptions_for_authority(authority).await
     }
 
     async fn published_configuration(&self) -> Option<ReplicaSetConfiguration> {
@@ -3023,12 +3019,7 @@ impl CustomReplicatorHost {
         Ok(())
     }
 
-    async fn install_prepared_managed_authority(
-        &self,
-        authority: &AdmittedAuthority,
-        configuration_generation: u64,
-        configuration: ReplicaSetConfiguration,
-    ) -> Result<()> {
+    async fn install_managed_authority(&self, authority: &AdmittedAuthority) -> Result<()> {
         let _gate = self.gate.lock().await;
         authority.validate()?;
         let previous = self.state.read().await.authority.clone();
@@ -3062,8 +3053,7 @@ impl CustomReplicatorHost {
                 self.enqueue_outbound(OutboundOperation::Evict(identity))?;
             }
         }
-        self.publish_prepared_configuration(configuration_generation, configuration)
-            .await
+        self.configure().await
     }
 
     async fn retire_managed_build(&self, build_id: OperationId) -> Result<()> {
