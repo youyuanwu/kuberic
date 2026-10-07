@@ -166,9 +166,11 @@ The remaining complexity appears below that boundary:
 - `CustomReplicatorHost` owns sessions, addresses, retirements, build state,
   receipts, configurations, access generations and another runtime snapshot
   (`kuberic-runtime/src/host/custom.rs:1448-1481`);
-- the default replication engine also stores role, access, admitted authority,
-  removal, retirement, copy and replication progress
-  (`kuberic-runtime/src/runtime.rs:49-82,168-200`);
+- the default replication engine stores role, access, executable replication
+  configuration, removal, retirement, copy and replication progress; durable
+  admitted authority remains host-owned
+  (`kuberic-runtime/src/runtime.rs:49-86,174-206`,
+  `kuberic-runtime/src/replicator/configuration.rs:9-23`);
 - reporting composes durable and runtime observations and applies precedence
   and reconciliation rules (`kuberic-runtime/src/host/report.rs:31-95,102-284`).
 
@@ -216,16 +218,20 @@ operation-ownership seam needed before the private managed boundary changes,
 without absorbing managed peer recovery, reporting or general partition
 execution.
 
-### RA Vocabulary Crosses the Replicator Boundary
+### RA Vocabulary Is Contained by a Typed Replicator Boundary
 
-`ManagedReplicatorLifecycle` includes authority admission, access publication,
-peer registration, topology effects, builds, recovery and full observations
-(`kuberic-runtime/src/replicator/mod.rs:83-119`).
-The native boundary can receive the general `RuntimeEffectAction` vocabulary.
+`ManagedReplicatorLifecycle` includes explicit executable-configuration,
+access, peer, topology, build, recovery and narrow-observation operations
+(`kuberic-runtime/src/replicator/mod.rs:83-166`). General
+`RuntimeEffectAction`, durable `AdmittedAuthority`, transition kind and broad
+runtime snapshots do not cross into the engine. The host proxy translates
+controller-owned transitions into operation-specific engine instructions and
+binds transient outcomes back to durable receipts.
 
-Service Fabric sends typed runtime instructions through its proxy. The
-replicator handles configuration, role, epoch, catch-up, copy, replication and
-progress; it does not execute the RA's complete transition vocabulary.
+This now follows the Service Fabric ownership pattern: the replicator handles
+replication configuration, fencing, copy, replication and progress, while
+application role, replicator role, epoch and the RA's complete transition
+vocabulary remain outside the engine.
 
 ### Broad Snapshots Act as Completion Contracts
 
