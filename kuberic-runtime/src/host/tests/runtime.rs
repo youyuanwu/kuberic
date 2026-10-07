@@ -3518,7 +3518,9 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn settle_primary_prefix(&self) -> Result<crate::receipts::CertifiedPrefixReceipt> {
+    async fn settle_primary_prefix(
+        &self,
+    ) -> Result<crate::replicator::ManagedCertifiedPrefixOutcome> {
         panic!("registration tests do not settle certified prefixes")
     }
 
@@ -3530,22 +3532,25 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         &self,
         _read: AccessStatus,
         _write: AccessStatus,
-    ) -> Result<crate::receipts::AccessPreparation> {
+    ) -> Result<crate::replicator::ManagedAccessPreparation> {
         panic!("registration tests do not prepare access")
     }
 
-    async fn publish_access(&self, _preparation: crate::receipts::AccessPreparation) -> Result<()> {
+    async fn publish_access(
+        &self,
+        _preparation: crate::replicator::ManagedAccessPreparation,
+    ) -> Result<()> {
         panic!("registration tests do not publish access")
     }
 
     async fn lock_native_fence(
         &self,
-        _expected: &crate::receipts::NativeOperationToken,
+        _expected: &crate::replicator::ManagedOperationFence,
     ) -> Result<crate::replicator::ManagedFenceGuard> {
         panic!("registration tests do not lock native fencing")
     }
 
-    async fn native_fence(&self) -> Result<crate::receipts::NativeOperationToken> {
+    async fn native_fence(&self) -> Result<crate::replicator::ManagedOperationFence> {
         panic!("registration tests do not request native fencing")
     }
 
@@ -3557,14 +3562,81 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         panic!("registration tests do not request native topology status")
     }
 
-    async fn admit_authority_proof(&self, _authority: AdmittedAuthority) -> Result<()> {
+    async fn admit_replica_configuration(
+        &self,
+        _configuration: crate::replicator::configuration::ManagedReplicaConfiguration,
+    ) -> Result<()> {
         Ok(())
     }
 
-    async fn apply_topology(
+    async fn authorize_failover_prefix(
         &self,
-        _action: RuntimeEffectAction,
-    ) -> Result<crate::receipts::TopologyReceipt> {
+        _boundary: i64,
+    ) -> Result<crate::replicator::ManagedCertifiedPrefixOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn prepare_switchover(
+        &self,
+        _preparation_generation: u64,
+        _request_id: crate::protocol::types::SwitchoverRequestId,
+        _source: ReplicaIdentity,
+        _target: ReplicaIdentity,
+        _starting_configuration_id: crate::protocol::types::ConfigurationId,
+        _starting_epoch: Epoch,
+    ) -> Result<crate::replicator::ManagedSwitchoverOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn prepare_secondary_removal(
+        &self,
+        _intent: crate::protocol::types::SecondaryScaleDownIntent,
+        _process_session_id: ProcessSessionId,
+        _report_sequence: u64,
+    ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn observe_secondary_removal_witness(
+        &self,
+        _witness: crate::protocol::types::SecondaryRemovalWitness,
+    ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn observe_secondary_removal_progress(
+        &self,
+        _witness: crate::protocol::types::SecondaryRemovalWitness,
+        _committed: crate::protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn accept_secondary_removal_commit(
+        &self,
+        _committed: crate::protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn accept_historical_secondary_removal_commit(
+        &self,
+        _command: crate::protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<crate::replicator::ManagedSecondaryRemovalOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn fence_retirement(
+        &self,
+        _retired: crate::authority::RetiredAuthority,
+    ) -> Result<crate::replicator::ManagedRetirementOutcome> {
+        panic!("registration tests do not apply native topology")
+    }
+
+    async fn complete_retirement(
+        &self,
+        _retired: crate::authority::RetiredAuthority,
+    ) -> Result<crate::replicator::ManagedRetirementOutcome> {
         panic!("registration tests do not apply native topology")
     }
 
@@ -3592,7 +3664,7 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         Ok(())
     }
 
-    async fn snapshot(&self) -> crate::effects::RuntimeSnapshot {
+    async fn observe_engine(&self) -> crate::replicator::ManagedReplicaObservation {
         panic!("registration tests do not request snapshots")
     }
 

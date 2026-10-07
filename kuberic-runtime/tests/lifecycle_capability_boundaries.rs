@@ -1001,9 +1001,102 @@ fn reject_cancellation(source: &str, expected: &str) {
     );
 }
 
+fn production_prefix(source: &str) -> &str {
+    source.split("#[cfg(test)]").next().unwrap_or(source)
+}
+
+fn validate_managed_replica_runtime_boundary(
+    replicator: &str,
+    runtime: &str,
+    log: &str,
+    quorum: &str,
+) -> Result<(), String> {
+    let trait_body = replicator
+        .split("pub(crate) trait ManagedReplicatorLifecycle")
+        .nth(1)
+        .and_then(|body| body.split("pub(crate) struct ManagedFenceGuard").next())
+        .ok_or_else(|| "ManagedReplicatorLifecycle body was not found".to_string())?;
+    for forbidden in [
+        "RuntimeEffectAction",
+        "AdmittedAuthority",
+        "RuntimeSnapshot",
+        "RuntimePostcondition",
+        "apply_topology",
+    ] {
+        if trait_body.contains(forbidden) {
+            return Err(format!(
+                "managed replica-runtime boundary contains forbidden {forbidden}"
+            ));
+        }
+    }
+    for required in [
+        "admit_replica_configuration",
+        "authorize_failover_prefix",
+        "prepare_switchover",
+        "prepare_secondary_removal",
+        "observe_secondary_removal_witness",
+        "observe_secondary_removal_progress",
+        "accept_secondary_removal_commit",
+        "accept_historical_secondary_removal_commit",
+        "fence_retirement",
+        "complete_retirement",
+        "prepare_access",
+        "publish_access",
+        "observe_engine",
+    ] {
+        if !trait_body.contains(required) {
+            return Err(format!(
+                "managed replica-runtime boundary is missing explicit {required}"
+            ));
+        }
+    }
+    for (name, body) in [
+        ("runtime.rs", production_prefix(runtime)),
+        ("replicator/log.rs", production_prefix(log)),
+        ("replicator/quorum.rs", production_prefix(quorum)),
+    ] {
+        for forbidden in [
+            "RuntimeEffectAction",
+            "AdmittedAuthority",
+            "RuntimeSnapshot",
+            "RuntimePostcondition",
+            "ReplicaAuthorityStore",
+        ] {
+            if body.contains(forbidden) {
+                return Err(format!("{name} contains forbidden {forbidden}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn lifecycle_capability_boundaries_are_narrow() {
     validate_project().unwrap();
+}
+
+#[test]
+fn managed_replica_runtime_boundary_is_typed() {
+    let replicator = source("src/replicator/mod.rs");
+    let runtime = source("src/runtime.rs");
+    let log = source("src/replicator/log.rs");
+    let quorum = source("src/replicator/quorum.rs");
+    validate_managed_replica_runtime_boundary(&replicator, &runtime, &log, &quorum).unwrap();
+
+    let leaked_trait = replicator.replace(
+        "configuration: ManagedReplicaConfiguration",
+        "configuration: AdmittedAuthority",
+    );
+    assert_rejected(
+        validate_managed_replica_runtime_boundary(&leaked_trait, &runtime, &log, &quorum),
+        "AdmittedAuthority",
+    );
+
+    let leaked_runtime = format!("{runtime}\nuse crate::effects::RuntimeEffectAction;\n");
+    assert_rejected(
+        validate_managed_replica_runtime_boundary(&replicator, &leaked_runtime, &log, &quorum),
+        "RuntimeEffectAction",
+    );
 }
 
 #[test]

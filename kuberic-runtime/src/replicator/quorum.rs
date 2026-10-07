@@ -8,12 +8,12 @@ use crate::transport::ReplicationAck;
 use tokio::sync::oneshot;
 
 use crate::application::Lsn;
-use crate::authority::AdmittedAuthority;
+use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::{Result, RuntimeError};
 
 #[derive(Debug, Default)]
 pub(crate) struct QuorumTracker {
-    authority: Option<AdmittedAuthority>,
+    authority: Option<ManagedReplicaConfiguration>,
     progress: BTreeMap<ReplicaIdentity, Lsn>,
     pending: BTreeMap<Lsn, Vec<oneshot::Sender<Result<Lsn>>>>,
     highest_lsn: Lsn,
@@ -30,7 +30,7 @@ pub(crate) struct QuorumTracker {
 impl QuorumTracker {
     pub(crate) fn configure(
         &mut self,
-        authority: AdmittedAuthority,
+        authority: ManagedReplicaConfiguration,
         local_progress: Lsn,
     ) -> Result<()> {
         authority.validate()?;
@@ -581,7 +581,7 @@ impl QuorumTracker {
     }
 }
 
-fn authority_members(authority: &AdmittedAuthority) -> BTreeSet<ReplicaIdentity> {
+fn authority_members(authority: &ManagedReplicaConfiguration) -> BTreeSet<ReplicaIdentity> {
     authority
         .current_configuration
         .members
@@ -596,7 +596,7 @@ fn authority_members(authority: &AdmittedAuthority) -> BTreeSet<ReplicaIdentity>
         .collect()
 }
 
-fn derive_must_catch_up(authority: &AdmittedAuthority) -> BTreeSet<ReplicaIdentity> {
+fn derive_must_catch_up(authority: &ManagedReplicaConfiguration) -> BTreeSet<ReplicaIdentity> {
     let mut required = authority
         .scale_up
         .as_deref()
@@ -642,7 +642,7 @@ fn quorum_progress(
 }
 
 fn client_commit_ready(
-    authority: &AdmittedAuthority,
+    authority: &ManagedReplicaConfiguration,
     progress: &BTreeMap<ReplicaIdentity, Lsn>,
     lsn: Lsn,
 ) -> bool {
@@ -673,12 +673,26 @@ mod scenario_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::AdmittedAuthority;
     use crate::protocol::types::{
         EffectivePolicy, Epoch, ReplicaId, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence,
         ScaleUpIntent, ScaleUpStage, ScaleUpWitness, TransitionKind,
     };
     #[cfg(kuberic_workspace_tests)]
     use crate::removal_fixture;
+
+    fn managed(authority: AdmittedAuthority) -> ManagedReplicaConfiguration {
+        ManagedReplicaConfiguration {
+            local_identity: authority.local_identity,
+            previous_configuration: authority.previous_configuration,
+            current_configuration: authority.current_configuration,
+            switchover_handoff: authority.switchover_handoff,
+            secondary_removal: authority.secondary_removal,
+            scale_up: authority.scale_up,
+            failover_build: authority.transition_kind == Some(TransitionKind::Failover),
+            bootstrap: authority.transition_kind == Some(TransitionKind::Bootstrap),
+        }
+    }
 
     fn scale_up_authority() -> (AdmittedAuthority, ReplicaIdentity) {
         let primary = ReplicaIdentity {
@@ -751,7 +765,7 @@ mod tests {
     fn scale_up_requires_the_exact_candidate_through_the_frozen_boundary() {
         let (authority, target) = scale_up_authority();
         let mut tracker = QuorumTracker::default();
-        tracker.configure(authority, 2).unwrap();
+        tracker.configure(managed(authority), 2).unwrap();
         assert!(!tracker.catch_up_complete());
         tracker.record_build_handoff_progress(target, 2).unwrap();
         assert!(tracker.catch_up_complete());
@@ -768,7 +782,7 @@ mod tests {
         intent.catch_up_boundary_lsn = 0;
         intent.operation_id = intent.expected_operation_id();
         let mut tracker = QuorumTracker::default();
-        tracker.configure(authority, 0).unwrap();
+        tracker.configure(managed(authority), 0).unwrap();
         assert!(!tracker.catch_up_complete());
         tracker.record_build_handoff_progress(target, 0).unwrap();
         assert!(tracker.catch_up_complete());
@@ -907,7 +921,7 @@ mod tests {
             })),
         };
         let mut tracker = QuorumTracker::default();
-        tracker.configure(authority, 5).unwrap();
+        tracker.configure(managed(authority), 5).unwrap();
         tracker
             .record_build_handoff_progress(identities[4].clone(), 10)
             .unwrap();
@@ -947,7 +961,7 @@ mod tests {
             intent.current_configuration.configuration_id
         )));
         let mut tracker = QuorumTracker::default();
-        tracker.configure(authority.clone(), 10).unwrap();
+        tracker.configure(managed(authority.clone()), 10).unwrap();
         tracker.record_verified_local_progress(10);
         tracker
             .register_peer_session(
@@ -995,7 +1009,7 @@ mod tests {
         joint.previous_configuration = Some(intent.previous_configuration.clone());
         joint.transition_kind = Some(crate::protocol::types::TransitionKind::SecondaryScaleDown);
         let mut precommit = QuorumTracker::default();
-        precommit.configure(joint, 10).unwrap();
+        precommit.configure(managed(joint), 10).unwrap();
         precommit
             .register_peer_session(fresh.identity.clone(), fresh.process_session_id.clone())
             .unwrap();
@@ -1052,7 +1066,7 @@ mod tests {
             scale_up: None,
         };
         let mut tracker = QuorumTracker::default();
-        tracker.configure(authority, 10).unwrap();
+        tracker.configure(managed(authority), 10).unwrap();
         tracker.record_verified_local_progress(10);
         let mut frozen =
             removal_fixture::witnesses(&intent, SecondaryRemovalStage::CurrentOnly)[1].clone();

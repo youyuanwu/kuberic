@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::application::{ClientWrite, Lsn, Operation};
-use crate::authority::AdmittedAuthority;
+use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::queue::ReplicationQueue;
 use crate::{Result, RuntimeError};
 
@@ -22,7 +22,7 @@ pub(crate) struct PreparedWrite {
 #[derive(Debug)]
 pub(crate) struct ReplicationLog {
     local_identity: ReplicaIdentity,
-    authority: Option<AdmittedAuthority>,
+    authority: Option<ManagedReplicaConfiguration>,
     open: bool,
     role: ReplicaRole,
     epoch: Epoch,
@@ -54,7 +54,11 @@ impl ReplicationLog {
         }
     }
 
-    fn configure(&mut self, authority: AdmittedAuthority, local_progress: Lsn) -> Result<()> {
+    fn configure(
+        &mut self,
+        authority: ManagedReplicaConfiguration,
+        local_progress: Lsn,
+    ) -> Result<()> {
         if authority.local_identity != self.local_identity {
             return Err(RuntimeError::AuthorityMismatch(
                 "admitted local identity differs from runtime identity".to_string(),
@@ -307,7 +311,7 @@ impl ReplicationLog {
 
     pub(crate) fn admit_authority(
         &mut self,
-        authority: AdmittedAuthority,
+        authority: ManagedReplicaConfiguration,
         local_progress: Lsn,
         preserve_write_access: bool,
     ) -> Result<()> {
