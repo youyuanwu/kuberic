@@ -363,8 +363,9 @@ Each operation should return only the proof needed to complete that operation:
 - certified-prefix receipt;
 - secondary-removal or retirement receipt.
 
-Full runtime snapshots remain useful for diagnostics, testing and reporting,
-but should not be the normal effect-completion type.
+Full runtime snapshots remain useful as host-composed diagnostics, testing and
+reporting values, but are not a managed-engine boundary or the normal
+effect-completion type.
 
 ### One Local Commit Protocol
 
@@ -460,6 +461,19 @@ Exit criteria:
 - the engine does not consume controller transition evidence;
 - current ordinary, crash-boundary and live test identities remain intact;
 - stale session, generation and receipt rejection remains covered.
+
+Implementation status: complete. `ManagedReplicatorLifecycle` now exposes
+explicit configuration, access, peer, build, progress, acknowledgement,
+certified-prefix, switchover, secondary-removal and retirement operations.
+Application role, replicator role and epoch remain separate application/public
+paths. The host projects durable `AdmittedAuthority` into engine-owned
+`ManagedReplicaConfiguration`; runtime, log and quorum code consume neither
+`RuntimeEffectAction`, transition kind nor full authority. Managed authority
+admission uses prepare/fence, host persistence, exact prepared commit, common
+publication and generation synchronization. Transient engine outcomes are
+bound by the host to the unchanged durable receipt formats. Broad engine
+snapshots were replaced by a narrow observation, temporary action adapters were
+removed, and source guards reject their reintroduction.
 
 ### Phase 2: Separate State Ownership and Observations
 
