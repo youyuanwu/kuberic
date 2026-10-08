@@ -20,7 +20,8 @@ fencing.
 
 Those facts are exposed internally through explicit owner types. Durable
 `AgentState` is wrapped as `DurableAgentObservation`; process-local
-`HostProxyState` produces `HostProxyObservation`; and managed/native progress
+adapter-local `ReplicaRuntimeState` produces `HostProxyObservation`; and
+managed/native progress
 is exposed as `ReplicationEngineObservation`. `ReportObservation` composes the
 host and engine owners without becoming durable state
 (`kuberic-runtime/src/host/observation.rs:1-244`).
@@ -233,13 +234,14 @@ The reporter applies one composition rule per field:
 |---|---|
 | Protocol version, storage constants and reporter sequence | Protocol constants plus `AgentReporter::ProcessSession`; they are not host or engine lifecycle facts |
 | Identity, epoch, previous/current configuration, durable topology and retained work | Durable `AgentState` only |
+| Exact admitted authority | Durable `ReplicaAuthorityStore`; the host projection must match the complete stored authority, including transition, switchover, removal and scale-up evidence |
 | Address, actual application role/access, open state and authority projection | `HostProxyObservation` only |
 | Replication, verified, committed, quorum and catch-up progress | `ReplicationEngineObservation` only |
 | Builds | Live engine progress wins by build ID; durable fallback is admitted only for a still-live authority-free command or retained scale-up completion when the host is not in live-build-only mode; host receipt-currentness and retirement filtering decide whether live completion is reportable |
 | Peer sessions and addresses | Host/session registries own them; they fence report/recovery capture but are not copied into the local status except the reporter's own process session |
 | `healthy` | Live host fault, fail-closed immediately |
 | `reported_fault` and load | Durable state after background persistence |
-| Catch-up capability | Recovery-owner cache, emitted only while its observation fence remains current |
+| Catch-up capability | Managed engines supply it directly with each engine observation; independent custom runtimes use the recovery-owner cache only while its observation fence remains current |
 
 Report capture links the host and managed engine through executable
 configuration, engine session/generation and the host generation acknowledged
@@ -254,22 +256,29 @@ remain exact
 `kuberic-runtime/src/host/report.rs:199-303`).
 
 Lifecycle advancement belongs to service-owned background owners.
-`RecoveryOwner` refreshes progress, samples catch-up capability, reloads durable
-eligibility and reconciles exact access only when no effect or
-reconfiguration is pending. It reloads selection around publication and
-compensates fail-closed after supersession. Managed peer discovery contributes
-a deferred exact restoration witness rather than publishing access from its
-observer task. `PartitionReportOwner` independently persists changed load/fault
-revisions so a stalled callback cannot starve observation durability
+`RecoveryOwner` reconciles exact access first when no effect or
+reconfiguration is pending, then maintains one separately cancellable
+diagnostic task for progress and catch-up capability. Retryable access and
+open independent-custom observation use a bounded 100 ms timer; idle managed
+replicas wait for explicit lifecycle revisions. It reloads selection around
+publication and compensates fail-closed after supersession. Managed peer
+discovery contributes a deferred exact restoration witness rather than
+publishing access from its observer task. `PartitionReportOwner` independently
+persists changed load/fault revisions so a stalled callback cannot starve
+observation durability
 (`kuberic-runtime/src/host/recovery.rs:14-192`;
 `kuberic-runtime/src/host/hosting.rs:1694-1927`).
 
-`RecoveryTaskOwner` retains access transactions, custom configuration work and
-peer recovery producers after their observing caller disappears. Shutdown
-signals and joins the background owners, cancels and joins registered
-descendants, quiesces partition-report producers, persists the final stable
-load/fault revision, and only then aborts the runtime. Startup failure follows
-the same descendant-cancellation and persistence ordering
+`RecoveryTaskOwner` retains access transactions, diagnostic work and peer
+recovery producers after their observing caller disappears. Deferred custom
+configuration separately retains an abort handle and join handle before its
+callback may start. Shutdown signals the background owners, closes descendant
+ingress, aborts diagnostic/peer helpers, cooperatively rolls back and joins
+access transactions, joins the owners, cancels and joins deferred
+configuration, quiesces partition-report producers,
+persists the final stable load/fault revision, and only then aborts the
+runtime. Startup failure drops reconstruction ownership before following the
+same descendant-cancellation and persistence ordering
 (`kuberic-runtime/src/host/hosting.rs:57-87,259-300,1600-1665`;
 `kuberic-runtime/src/host/service.rs:511-621`).
 

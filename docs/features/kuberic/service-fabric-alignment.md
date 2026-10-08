@@ -156,7 +156,7 @@ The coordinator persists and advances explicit transition stages
 
 The Phase 2 ownership boundary is now explicit below that layer:
 
-- hosting stores process-local `HostProxyState`, emits
+- hosting stores process-local adapter state as `ReplicaRuntimeState`, emits
   `HostProxyObservation`, and holds one host-lifetime custom-authority
   containment owner plus service-owned recovery task ownership
   (`kuberic-runtime/src/host/observation.rs:50-169`,
@@ -178,7 +178,10 @@ The Phase 2 ownership boundary is now explicit below that layer:
   `ReplicationEngineObservation` under an explicit linked fence. It does not
   refresh, reconcile, restore, retry or persist lifecycle state
   (`kuberic-runtime/src/host/observation.rs:24-244`,
-  `kuberic-runtime/src/host/report.rs:14-303`).
+  `kuberic-runtime/src/host/report.rs:14-303`);
+- reporting validates the host authority projection against the complete
+  durable `ReplicaAuthorityStore` value instead of reconstructing transition
+  evidence from the broader agent aggregate.
 
 Some repetition is intentional: durable truth, execution fencing and public
 projection are different concepts. The distinctions are now represented by
@@ -525,8 +528,9 @@ Exit criteria:
   serialization;
 - durable-format changes follow the explicit fail-closed schema-change policy.
 
-Implementation status: complete. `DurableAgentObservation`, `HostProxyState` /
-`HostProxyObservation`, `ReplicationEngineObservation` and consumer-specific
+Implementation status: complete. `DurableAgentObservation`,
+`ReplicaRuntimeState` / `HostProxyObservation`,
+`ReplicationEngineObservation` and consumer-specific
 projections define the owner boundary. Reporting is read-only.
 `RecoveryOwner`, `PartitionReportOwner` and `RecoveryTaskOwner` own
 caller-independent recovery, observation persistence and descendant shutdown.
@@ -535,7 +539,7 @@ No durable schema or protected public replicator interface changed
 `kuberic-runtime/src/host/recovery.rs:14-192`;
 `kuberic-runtime/src/host/report.rs:14-303`;
 `kuberic-runtime/tests/lifecycle_capability_boundaries.rs:1266-1460`).
-Evidence includes the complete 912-test ordinary tier, the six-test PostgreSQL
+Evidence includes the complete 924-test ordinary tier, the six-test PostgreSQL
 smoke tier, focused runtime/store/coordinator/recovery/crash coverage, strict
 workspace Clippy and API/privacy/source guards, plus owned fresh-cluster
 `replacement`, `quorum-loss` and `adversarial` KinD identities.

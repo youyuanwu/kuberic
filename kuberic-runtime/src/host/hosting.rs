@@ -42,11 +42,11 @@ use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 
 use super::observation::{
-    BuildObservation, HostProxyObservation, HostProxyState, OutboundObservation, PeerObservation,
-    RecoveryObservation, ReplicationEngineObservation, ReportObservation,
+    BuildObservation, HostProxyObservation, OutboundObservation, PeerObservation,
+    RecoveryObservation, ReplicaRuntimeState, ReplicationEngineObservation, ReportObservation,
 };
 
 tokio::task_local! {
@@ -57,6 +57,40 @@ tokio::task_local! {
 pub(super) struct RecoveryTaskOwner {
     closed: AtomicBool,
     tasks: Mutex<JoinSet<()>>,
+    graceful_tasks: Mutex<JoinSet<()>>,
+}
+
+pub(super) struct OwnedRecoveryTask<T> {
+    abort: Option<AbortHandle>,
+    result: oneshot::Receiver<Result<T>>,
+}
+
+struct RecoveryWake<'a>(&'a RuntimeHost);
+
+impl Drop for RecoveryWake<'_> {
+    fn drop(&mut self) {
+        self.0.notify_recovery();
+    }
+}
+
+impl<T> OwnedRecoveryTask<T> {
+    pub(super) fn abort(&self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+
+    pub(super) fn try_recv(
+        &mut self,
+    ) -> std::result::Result<Result<T>, oneshot::error::TryRecvError> {
+        self.result.try_recv()
+    }
+
+    pub(super) async fn wait(&mut self) -> Result<T> {
+        (&mut self.result)
+            .await
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
+    }
 }
 
 impl RecoveryTaskOwner {
@@ -64,10 +98,19 @@ impl RecoveryTaskOwner {
         Arc::new(Self {
             closed: AtomicBool::new(false),
             tasks: Mutex::new(JoinSet::new()),
+            graceful_tasks: Mutex::new(JoinSet::new()),
         })
     }
 
     pub(super) async fn spawn<T, F>(&self, task: F) -> oneshot::Receiver<Result<T>>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        self.spawn_abortable(task).await.result
+    }
+
+    pub(super) async fn spawn_graceful<T, F>(&self, task: F) -> oneshot::Receiver<Result<T>>
     where
         T: Send + 'static,
         F: Future<Output = Result<T>> + Send + 'static,
@@ -77,7 +120,7 @@ impl RecoveryTaskOwner {
             let _ = result_tx.send(Err(RuntimeError::Closed));
             return result_rx;
         }
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.graceful_tasks.lock().await;
         if self.closed.load(Ordering::Acquire) {
             let _ = result_tx.send(Err(RuntimeError::Closed));
             return result_rx;
@@ -89,11 +132,45 @@ impl RecoveryTaskOwner {
         result_rx
     }
 
+    async fn spawn_abortable<T, F>(&self, task: F) -> OwnedRecoveryTask<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = oneshot::channel();
+        if self.closed.load(Ordering::Acquire) {
+            let _ = result_tx.send(Err(RuntimeError::Closed));
+            return OwnedRecoveryTask {
+                abort: None,
+                result: result_rx,
+            };
+        }
+        let mut tasks = self.tasks.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            let _ = result_tx.send(Err(RuntimeError::Closed));
+            return OwnedRecoveryTask {
+                abort: None,
+                result: result_rx,
+            };
+        }
+        while tasks.try_join_next().is_some() {}
+        let abort = tasks.spawn(async move {
+            let _ = result_tx.send(task.await);
+        });
+        OwnedRecoveryTask {
+            abort: Some(abort),
+            result: result_rx,
+        }
+    }
+
     async fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        drop(tasks);
+        let mut graceful = self.graceful_tasks.lock().await;
+        while graceful.join_next().await.is_some() {}
     }
 }
 
@@ -291,7 +368,7 @@ struct AppliedEffect {
 #[derive(Debug)]
 struct HostState {
     effects: BTreeMap<u64, AppliedEffect>,
-    fallback_snapshot: HostProxyState,
+    fallback_snapshot: ReplicaRuntimeState,
     partition_information: PartitionInformation,
     load_metrics: BTreeMap<String, i64>,
     reported_fault: Option<FaultType>,
@@ -548,6 +625,7 @@ impl RecoveryOwnerRuntime {
         self.inner.wait_for_recovery_change(observed).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn observe_progress(&self) -> Result<()> {
         self.inner.observe_progress().await
     }
@@ -556,6 +634,7 @@ impl RecoveryOwnerRuntime {
         self.inner.observation().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn reconcile_durable_access(
         &self,
         read: AccessStatus,
@@ -568,14 +647,24 @@ impl RecoveryOwnerRuntime {
         self.inner.partition_report().await
     }
 
-    pub(crate) async fn refresh_catch_up_capability(&self) -> Result<()> {
-        self.inner.refresh_catch_up_capability().await
+    pub(super) async fn start_diagnostics(&self) -> OwnedRecoveryTask<()> {
+        self.inner.start_diagnostics().await
+    }
+
+    pub(super) async fn start_access_reconciliation(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> OwnedRecoveryTask<()> {
+        self.inner.start_access_reconciliation(read, write).await
     }
 }
 
 #[async_trait]
 trait ReportHostMutations: Send + Sync {
+    #[cfg(test)]
     async fn observe_progress(&self) -> Result<()>;
+    #[cfg(test)]
     async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
     async fn refresh_catch_up_capability(&self) -> Result<()>;
 }
@@ -584,6 +673,12 @@ trait ReportHostMutations: Send + Sync {
 trait RecoveryOwnerHost: ReportHost + ReportHostMutations {
     fn recovery_revision(&self) -> u64;
     async fn wait_for_recovery_change(&self, observed: u64);
+    async fn start_diagnostics(&self) -> OwnedRecoveryTask<()>;
+    async fn start_access_reconciliation(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> OwnedRecoveryTask<()>;
 }
 
 #[async_trait]
@@ -935,7 +1030,7 @@ impl PodRuntime {
         let local_write_journal: Arc<dyn LocalWriteJournal> = authority_store.clone();
         let build_authority_store: Arc<dyn BuildAuthorityStore> = authority_store.clone();
         let build_progress_store: Arc<dyn BuildProgressStore> = authority_store;
-        let fallback_snapshot = HostProxyState::empty(identity.clone());
+        let fallback_snapshot = ReplicaRuntimeState::empty(identity.clone());
         Self {
             host: Arc::new_cyclic(|weak_self| RuntimeHost {
                 identity,
@@ -1171,7 +1266,7 @@ impl PodRuntime {
         if let Some(retired) = retired {
             retired.validate(&self.host.identity)?;
             let mut state = self.host.state.write().await;
-            state.fallback_snapshot = HostProxyState::empty(self.host.identity.clone());
+            state.fallback_snapshot = ReplicaRuntimeState::empty(self.host.identity.clone());
             state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.retired_authority = Some(retired);
@@ -1748,26 +1843,15 @@ impl ReportHost for RuntimeHost {
             Some(lifecycle) => lifecycle.report_observation().await,
             None => self.fallback_report_observation().await,
         };
+        observation.host = self.host_proxy_observation().await;
         let state = self.state.read().await;
-        let fallback = state.fallback_snapshot.clone();
         let catch_up_capability = state.catch_up_capability.clone();
         drop(state);
-        observation.host.identity = fallback.identity;
-        observation.host.open = fallback.open;
-        observation.host.replication_address = fallback.replication_address;
-        observation.host.role = fallback.role;
-        observation.host.role_transition = fallback.role_transition;
-        observation.host.read_status = fallback.read_status;
-        observation.host.write_status = fallback.write_status;
-        if fallback.authority.is_some() {
-            observation.host.authority = fallback.authority;
+        if observation.engine.catch_up_capability.is_none() {
+            observation.engine.catch_up_capability = catch_up_capability
+                .filter(|(fence, _)| fence.same_fence(&observation))
+                .map(|(_, capability)| capability);
         }
-        if self.aborted.load(Ordering::Acquire) {
-            observation.host.open = false;
-        }
-        observation.engine.catch_up_capability = catch_up_capability
-            .filter(|(fence, _)| fence.same_fence(&observation))
-            .map(|(_, capability)| capability);
         observation
     }
 
@@ -1776,8 +1860,37 @@ impl ReportHost for RuntimeHost {
     }
 }
 
+impl RuntimeHost {
+    async fn host_proxy_observation(&self) -> HostProxyObservation {
+        let lifecycle = self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle);
+        let mut observation = match lifecycle {
+            Some(lifecycle) => lifecycle.host_observation().await,
+            None => self.fallback_report_observation().await.host,
+        };
+        let fallback = self.state.read().await.fallback_snapshot.clone();
+        observation.identity = fallback.identity;
+        observation.open = fallback.open;
+        observation.replication_address = fallback.replication_address;
+        observation.role = fallback.role;
+        observation.role_transition = fallback.role_transition;
+        observation.read_status = fallback.read_status;
+        observation.write_status = fallback.write_status;
+        if fallback.authority.is_some() {
+            observation.authority = fallback.authority;
+        }
+        if self.aborted.load(Ordering::Acquire) {
+            observation.open = false;
+        }
+        observation
+    }
+}
+
 #[async_trait]
 impl ReportHostMutations for RuntimeHost {
+    #[cfg(test)]
     async fn observe_progress(&self) -> Result<()> {
         if !BuildHost::is_managed(self) {
             let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
@@ -1788,6 +1901,7 @@ impl ReportHostMutations for RuntimeHost {
         self.observe_report_progress().await
     }
 
+    #[cfg(test)]
     async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         if !BuildHost::is_managed(self) {
             let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
@@ -1835,6 +1949,54 @@ impl RecoveryOwnerHost for RuntimeHost {
             }
             changed.await;
         }
+    }
+
+    async fn start_diagnostics(&self) -> OwnedRecoveryTask<()> {
+        let host = self.weak_self.upgrade();
+        self.recovery_tasks
+            .spawn_abortable(async move {
+                let host = host.ok_or(RuntimeError::Closed)?;
+                match host.observe_report_progress().await {
+                    Ok(())
+                    | Err(
+                        RuntimeError::ReconfigurationPending
+                        | RuntimeError::OperationCancelled
+                        | RuntimeError::NotOpen
+                        | RuntimeError::Closed,
+                    ) => {}
+                    Err(error) => return Err(error),
+                }
+                match ReportHostMutations::refresh_catch_up_capability(host.as_ref()).await {
+                    Ok(()) | Err(RuntimeError::NotOpen | RuntimeError::Closed) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "catch-up capability observation remains unavailable"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn start_access_reconciliation(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> OwnedRecoveryTask<()> {
+        let host = self.weak_self.upgrade();
+        self.recovery_tasks
+            .spawn_abortable(async move {
+                let host = host.ok_or(RuntimeError::Closed)?;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+                with_access_publication_deadline(
+                    deadline,
+                    host.reconcile_report_access(read, write),
+                )
+                .await
+            })
+            .await
     }
 }
 
@@ -1888,7 +2050,7 @@ impl RuntimeHost {
                 gate.release.notified().await;
             }
         }
-        let current = self.snapshot().await;
+        let current = self.host_proxy_observation().await;
         if !current.open
             || current.role_transition.is_some()
             || current.authority != owned.authority
@@ -2026,7 +2188,22 @@ impl BuildHost for RuntimeHost {
     }
 
     async fn observation(&self) -> BuildObservation {
-        ReportHost::observation(self).await.build()
+        match self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle)
+        {
+            Some(lifecycle) => lifecycle.build_observation().await,
+            None => {
+                let state = self.state.read().await;
+                BuildObservation {
+                    authority: state.fallback_snapshot.authority.clone(),
+                    builds: state.fallback_snapshot.builds.clone(),
+                    current_progress: state.fallback_snapshot.current_progress,
+                    committed_lsn: state.fallback_snapshot.committed_lsn,
+                }
+            }
+        }
     }
 
     async fn register_peer_session(
@@ -2034,9 +2211,12 @@ impl BuildHost for RuntimeHost {
         identity: ReplicaIdentity,
         session: crate::protocol::types::ProcessSessionId,
     ) -> Result<()> {
-        self.peer_lifecycle()?
+        let result = self
+            .peer_lifecycle()?
             .register_peer_session(identity, session)
-            .await
+            .await;
+        self.notify_recovery();
+        result
     }
 
     async fn authorize_build(
@@ -2100,7 +2280,20 @@ impl BuildAttemptHost for RuntimeHost {
 #[async_trait]
 impl PeerDiscoveryHost for RuntimeHost {
     async fn observation(&self) -> PeerObservation {
-        ReportHost::observation(self).await.peer()
+        match self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle)
+        {
+            Some(lifecycle) => lifecycle.peer_observation().await,
+            None => {
+                let state = self.state.read().await;
+                PeerObservation {
+                    authority: state.fallback_snapshot.authority.clone(),
+                    retired_authority: state.fallback_snapshot.retired_authority.clone(),
+                }
+            }
+        }
     }
 
     async fn register_peer_session(
@@ -2108,9 +2301,12 @@ impl PeerDiscoveryHost for RuntimeHost {
         identity: ReplicaIdentity,
         session: crate::protocol::types::ProcessSessionId,
     ) -> Result<()> {
-        self.peer_lifecycle()?
+        let result = self
+            .peer_lifecycle()?
             .register_peer_session(identity, session)
-            .await
+            .await;
+        self.notify_recovery();
+        result
     }
 
     async fn observe_secondary_removal_witness(
@@ -2164,7 +2360,20 @@ impl OutboundHost for RuntimeHost {
     }
 
     async fn observation(&self) -> OutboundObservation {
-        ReportHost::observation(self).await.outbound()
+        match self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::report_lifecycle)
+        {
+            Some(lifecycle) => lifecycle.outbound_observation().await,
+            None => {
+                let state = self.state.read().await;
+                OutboundObservation {
+                    open: state.fallback_snapshot.open,
+                    authority: state.fallback_snapshot.authority.clone(),
+                }
+            }
+        }
     }
 }
 
@@ -2564,6 +2773,7 @@ impl RuntimeHost {
         if self.closed.load(Ordering::Acquire) || self.aborted.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.notify_recovery();
         if let Some(registered) = self.registered.get() {
             if let Some(lifecycle) = registered.process_lifecycle() {
                 lifecycle.notify_abort();
@@ -2580,10 +2790,10 @@ impl RuntimeHost {
         configuration: BuildConfiguration,
     ) -> Result<BuildAuthority> {
         let build = self.build_lifecycle()?;
-        let snapshot = self.snapshot().await;
+        let observation = BuildHost::observation(self).await;
         let (kind, current_configuration) = match configuration {
             BuildConfiguration::Current => {
-                let authority = snapshot
+                let authority = observation
                     .authority
                     .ok_or(RuntimeError::AuthorityNotAdmitted)?;
                 let kind = if authority
@@ -2629,7 +2839,7 @@ impl RuntimeHost {
             source: self.identity.clone(),
             target,
             current_configuration,
-            replication_boundary_lsn: snapshot.committed_lsn,
+            replication_boundary_lsn: observation.committed_lsn,
         };
         authority.validate()?;
         self.default_dependencies
@@ -2641,6 +2851,8 @@ impl RuntimeHost {
     }
 
     async fn prepare_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectExecution> {
+        self.notify_recovery();
+        let _wake = RecoveryWake(self);
         let _guard = self.effect_lock.lock().await;
         if !matches!(
             effect.action,
@@ -3636,7 +3848,7 @@ fn recovery_observation(snapshot: RuntimeSnapshot) -> RecoveryObservation {
 
 #[cfg(test)]
 pub(crate) fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
-    HostProxyState::empty(identity).into()
+    ReplicaRuntimeState::empty(identity).into()
 }
 
 fn snapshot_postcondition(snapshot: RuntimeSnapshot) -> RuntimePostcondition {

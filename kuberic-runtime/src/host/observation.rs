@@ -49,13 +49,15 @@ impl DurableAgentObservation {
     }
 }
 
-/// Process-local host/proxy state.
+/// Adapter-local state used to construct host and engine owner observations.
 ///
-/// Unlike [`RuntimeSnapshot`], this type is never serialized or transported
-/// through capability views. A complete snapshot is produced from it only for
-/// effect evidence and the opt-in testing facade.
+/// Physical co-location here does not transfer field ownership: lifecycle
+/// fields are projected through [`HostProxyObservation`], while progress and
+/// topology fields are projected through [`ReplicationEngineObservation`].
+/// This type is never serialized or transported through capability views. A
+/// complete snapshot is produced only for effect evidence and testing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostProxyState {
+pub(crate) struct ReplicaRuntimeState {
     pub(crate) identity: ReplicaIdentity,
     pub(crate) open: bool,
     pub(crate) replication_address: Option<String>,
@@ -77,7 +79,7 @@ pub(crate) struct HostProxyState {
     pub(crate) builds: Vec<BuildPostcondition>,
 }
 
-impl HostProxyState {
+impl ReplicaRuntimeState {
     pub(crate) fn empty(identity: ReplicaIdentity) -> Self {
         Self {
             identity,
@@ -103,8 +105,8 @@ impl HostProxyState {
     }
 }
 
-impl From<HostProxyState> for RuntimeSnapshot {
-    fn from(state: HostProxyState) -> Self {
+impl From<ReplicaRuntimeState> for RuntimeSnapshot {
+    fn from(state: ReplicaRuntimeState) -> Self {
         Self {
             identity: state.identity,
             open: state.open,
@@ -241,6 +243,7 @@ pub(crate) struct BuildObservation {
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) builds: Vec<BuildPostcondition>,
     pub(crate) current_progress: i64,
+    pub(crate) committed_lsn: i64,
 }
 
 /// Peer discovery reads only live authority and retirement.
@@ -300,21 +303,7 @@ impl ReportObservation {
             && self.engine.accepted_secondary_removal == other.engine.accepted_secondary_removal
     }
 
-    pub(crate) fn build(&self) -> BuildObservation {
-        BuildObservation {
-            authority: self.host.authority.clone(),
-            builds: self.engine.builds.clone(),
-            current_progress: self.engine.current_progress,
-        }
-    }
-
-    pub(crate) fn peer(&self) -> PeerObservation {
-        PeerObservation {
-            authority: self.host.authority.clone(),
-            retired_authority: self.engine.retired_authority.clone(),
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn outbound(&self) -> OutboundObservation {
         OutboundObservation {
             open: self.host.open,
@@ -352,7 +341,7 @@ mod tests {
             effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
         });
         let durable_before = serde_json::to_vec(&state).unwrap();
-        let effect_snapshot: RuntimeSnapshot = HostProxyState::empty(identity()).into();
+        let effect_snapshot: RuntimeSnapshot = ReplicaRuntimeState::empty(identity()).into();
         let retained = crate::effects::RuntimeEffectResult {
             operation_id: OperationId::new("effect"),
             sequence: 1,

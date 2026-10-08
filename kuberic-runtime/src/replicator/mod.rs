@@ -293,6 +293,7 @@ pub(crate) struct ManagedReplicaObservation {
     #[allow(dead_code)]
     pub(crate) diagnostic_revision: u64,
     pub(crate) progress: NativeProgressStatus,
+    pub(crate) catch_up_capability: Lsn,
     pub(crate) builds: Vec<BuildPostcondition>,
     pub(crate) prepared_secondary_removal:
         Option<crate::protocol::types::SecondaryRemovalPreparation>,

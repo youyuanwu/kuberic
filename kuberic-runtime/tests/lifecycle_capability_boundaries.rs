@@ -250,6 +250,7 @@ fn allowed_aggregates(relative: &Path) -> &'static [&'static str] {
             "PodRuntime",
             "RuntimeDataPlane",
             "RuntimeHost",
+            "RecoveryWake",
             "HostAccessView",
             "OpenAttempt",
         ],
@@ -1264,9 +1265,9 @@ fn lifecycle_capability_boundaries_are_narrow() {
 #[test]
 fn projection_capabilities_reject_complete_runtime_snapshots() {
     let hosting = source("src/host/hosting.rs");
-    assert!(hosting.contains("fallback_snapshot: HostProxyState"));
+    assert!(hosting.contains("fallback_snapshot: ReplicaRuntimeState"));
     let custom = source("src/host/custom.rs");
-    assert!(custom.contains("state: Arc<RwLock<HostProxyState>>"));
+    assert!(custom.contains("state: Arc<RwLock<ReplicaRuntimeState>>"));
     for (start, end, projection) in [
         (
             "trait ReportHost",
@@ -1384,6 +1385,16 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
             "RecoveryOwnerRuntime must own {owned}"
         );
     }
+    for broad_projection in [
+        "ReportHost::observation(self).await.build()",
+        "ReportHost::observation(self).await.peer()",
+        "ReportHost::observation(self).await.outbound()",
+    ] {
+        assert!(
+            !hosting.contains(broad_projection),
+            "narrow providers must not assemble the complete report observation through {broad_projection}"
+        );
+    }
 
     let report = source("src/host/report.rs");
     let production_report = production_items(&report);
@@ -1432,6 +1443,22 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         2,
         "status RPC and post-command status must share the read-only reporter"
     );
+    assert!(
+        service.contains("self.command_tasks.shutdown().await")
+            && service
+                .contains(".run(async move { coordinator.ensure_configuration(*command).await })")
+            && service.contains(".run(async move { coordinator.ensure_build(*command).await })"),
+        "configuration and build commands must remain service-owned through shutdown"
+    );
+    assert!(
+        service.find("self.command_tasks.shutdown().await")
+            < service.find("self.runtime.shutdown_configuration_work().await?"),
+        "configuration command tasks must stop before configuration cleanup"
+    );
+    assert!(
+        hosting.contains("if observation.engine.catch_up_capability.is_none()"),
+        "managed engine catch-up capability must not be overwritten by the custom cache"
+    );
     let observation = source("src/host/observation.rs");
     let production_observation = production_items(&observation);
     for serialization in [
@@ -1474,6 +1501,17 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         assert!(
             !production.contains("diagnostic_revision"),
             "{consumer} must not depend on unrelated engine diagnostics"
+        );
+    }
+    let recovery_owner = production_items(&source("src/host/recovery.rs"));
+    for scheduling_boundary in [
+        "RecoverySchedule",
+        "custom_tick",
+        "schedule . wait_for_timer",
+    ] {
+        assert!(
+            recovery_owner.contains(scheduling_boundary),
+            "recovery scheduling must retain the explicit {scheduling_boundary} boundary"
         );
     }
 }

@@ -419,6 +419,10 @@ impl AgentStore for ScaleUpProductionCutStore {
         self.inner.load_state().await
     }
 
+    async fn load_admitted_authority(&self) -> Result<Option<AdmittedAuthority>> {
+        Ok(self.inner.load().await?)
+    }
+
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         let begun = self.inner.begin_effect(effect).await?;
         if self.cut.as_deref().is_some_and(|cut| {

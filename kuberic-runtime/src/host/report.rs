@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::authority::AdmittedAuthority;
 use crate::control::proto;
 use crate::protocol::types::{AccessStatus, FaultType, ReplicaRole};
 
@@ -33,13 +34,19 @@ impl<S: AgentStore> AgentReporter<S> {
         for _ in 0..3 {
             let partition = runtime.partition_report().await;
             let state: DurableAgentObservation = self.store.load_state().await?.into();
+            let authority = self.store.load_admitted_authority().await?;
             let snapshot = runtime.observation().await;
             let confirmed_snapshot = runtime.observation().await;
             let confirmed_state: DurableAgentObservation = self.store.load_state().await?.into();
+            let confirmed_authority = self.store.load_admitted_authority().await?;
             let confirmed_partition = runtime.partition_report().await;
-            let durable_stable = state == confirmed_state;
+            let durable_stable = state == confirmed_state && authority == confirmed_authority;
             let fence_stable = same_report_fence(&snapshot, &confirmed_snapshot);
-            let ownership_matches = snapshot_matches_state(&confirmed_snapshot, &confirmed_state);
+            let ownership_matches = snapshot_matches_state(
+                &confirmed_snapshot,
+                &confirmed_state,
+                confirmed_authority.as_ref(),
+            );
             if !durable_stable
                 || !fence_stable
                 || !ownership_matches
@@ -210,14 +217,21 @@ fn build_report(
     }
 }
 
-fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObservation) -> bool {
+fn snapshot_matches_state(
+    snapshot: &ReportObservation,
+    state: &DurableAgentObservation,
+    authority: Option<&AdmittedAuthority>,
+) -> bool {
     let authority_matches = match snapshot.host.authority.as_ref() {
-        Some(authority) => {
-            authority.previous_configuration == state.previous_configuration
-                && Some(&authority.current_configuration) == state.current_configuration.as_ref()
-                && authority.scale_up == state.scale_up_evidence
+        Some(projected) => {
+            authority == Some(projected)
+                && projected.local_identity == state.identity.local_identity
+                && projected.previous_configuration == state.previous_configuration
+                && Some(&projected.current_configuration) == state.current_configuration.as_ref()
+                && projected.scale_up == state.scale_up_evidence
+                && projected.secondary_removal == state.secondary_removal_evidence
         }
-        None => state.previous_configuration.is_none() && state.current_configuration.is_none(),
+        None => authority.is_none(),
     };
     let access_matches = |projected, desired| {
         projected == desired
@@ -254,6 +268,7 @@ fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObse
                     && configuration.scale_up == authority.scale_up
             })
         }
+
         (Some(fence), None) => fence.configuration.is_none(),
         (None, _) => !snapshot.host.engine_required,
     };
@@ -467,7 +482,11 @@ mod tests {
         };
         observation.engine.fence = Some(engine_fence.clone());
         observation.engine.host_generation = Some(0);
-        assert!(!snapshot_matches_state(&observation, &state.clone().into()));
+        assert!(!snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            None
+        ));
         observation.host.pending_access =
             Some(crate::host::observation::PendingAccessObservation {
                 desired: (AccessStatus::Granted, AccessStatus::Granted),
@@ -478,8 +497,115 @@ mod tests {
                 peer_sessions: Vec::new(),
                 engine_fence: Some(engine_fence),
             });
-        assert!(snapshot_matches_state(&observation, &state.clone().into()));
+        assert!(snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            None
+        ));
         observation.host.access_generation = 1;
-        assert!(!snapshot_matches_state(&observation, &state.into()));
+        assert!(!snapshot_matches_state(&observation, &state.into(), None));
+    }
+
+    #[test]
+    fn report_authority_requires_exact_switchover_and_local_identity() {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("target"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let previous = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            identity.replica_id,
+            vec![ConfigurationMember {
+                identity: identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            target.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            2,
+        );
+        let handoff = SwitchoverHandoff {
+            preparation_generation: 1,
+            preparation_operation_id: OperationId::new("preparation"),
+            request_id: SwitchoverRequestId::new("request"),
+            source: identity.clone(),
+            target,
+            starting_configuration_id: previous.configuration_id.clone(),
+            starting_epoch: previous.epoch,
+            handoff_lsn: 7,
+        };
+        let mut state = crate::host::state::AgentState::new(crate::host::state::StorageIdentity {
+            schema_version: crate::host::state::SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource"),
+            local_identity: identity.clone(),
+            pod_uid: PodUid::new("source"),
+            pvc_uid: PvcUid::new("data"),
+            initialization_id: InitializationId::new("init"),
+            effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
+        });
+        state.previous_configuration = Some(previous);
+        state.current_configuration = Some(current);
+        state.prepared_switchover = Some(handoff.clone());
+        let authority = AdmittedAuthority {
+            local_identity: identity.clone(),
+            transition_kind: Some(crate::protocol::types::TransitionKind::PlannedSwitchover),
+            previous_configuration: state.previous_configuration.clone(),
+            current_configuration: state.current_configuration.clone().unwrap(),
+            switchover_handoff: Some(handoff.clone()),
+            secondary_removal: None,
+            scale_up: None,
+        };
+        let mut observation: ReportObservation =
+            crate::host::hosting::empty_snapshot(identity).into();
+        observation.host.authority = Some(authority.clone());
+        assert!(snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            Some(&authority)
+        ));
+
+        observation
+            .host
+            .authority
+            .as_mut()
+            .unwrap()
+            .switchover_handoff = None;
+        assert!(!snapshot_matches_state(
+            &observation,
+            &state.clone().into(),
+            Some(&authority)
+        ));
+        observation.host.authority = Some(authority);
+        observation
+            .host
+            .authority
+            .as_mut()
+            .unwrap()
+            .local_identity
+            .replica_id = ReplicaId::new(9);
+        let durable = observation.host.authority.as_ref().unwrap().clone();
+        assert!(!snapshot_matches_state(
+            &observation,
+            &state.into(),
+            Some(&durable)
+        ));
     }
 }
