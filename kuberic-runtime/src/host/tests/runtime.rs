@@ -14313,6 +14313,47 @@ async fn partition_report_owner_persists_without_status_polling() {
 }
 
 #[tokio::test]
+async fn recovery_task_owner_rejects_ingress_after_shutdown() {
+    let (runtime, _, _, _) = blocked_lifecycle_fixture("closed-recovery-ingress").await;
+    runtime.shutdown_recovery_tasks().await;
+    assert!(matches!(
+        runtime.recovery_owner_runtime().observe_progress().await,
+        Err(RuntimeError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn status_retries_when_live_fault_changes_during_capture() {
+    let directory = crate::host::tests::tempdir().unwrap();
+    let local = identity(1, "report-live-fault-fence");
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(PodRuntime::new(local, application.clone(), store.clone()));
+    RuntimeAdapter::new(store.clone(), runtime.clone())
+        .execute(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    let partition = application.partition.lock().unwrap().clone().unwrap();
+    let gate = runtime.testing_pause_partition_report();
+    let report = {
+        let runtime = runtime.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            crate::host::report::AgentReporter::new(store)
+                .report(&runtime.report_runtime())
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .unwrap();
+    partition.report_fault(FaultType::Permanent).await.unwrap();
+    gate.release.notify_waiters();
+    let report = report.await.unwrap().unwrap();
+    assert!(!report.healthy);
+}
+
+#[tokio::test]
 async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() {
     let local = identity(1, "single");
     let application = Arc::new(TestApplication::default());

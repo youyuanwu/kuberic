@@ -525,6 +525,7 @@ where
             replication.abort();
             let _ = tokio::join!(&mut control, &mut replication);
             self.runtime.shutdown_recovery_tasks().await;
+            let _ = self.runtime.shutdown_configuration_work().await;
             self.runtime.quiesce_partition_reports().await;
             let persisted = self.persist_partition_fault().await;
             self.runtime.abort();
@@ -536,8 +537,11 @@ where
             return Err(error);
         }
 
-        let recovery_owner =
-            RecoveryOwner::new(self.runtime.recovery_owner_runtime(), self.store.clone());
+        let recovery_owner = RecoveryOwner::with_admission_lock(
+            self.runtime.recovery_owner_runtime(),
+            self.store.clone(),
+            self.coordinator.recovery_admission_lock(),
+        );
         let (recovery_stop, recovery_shutdown) = watch::channel(false);
         let mut recovery_owner_task =
             tokio::spawn(async move { recovery_owner.run(recovery_shutdown).await });
@@ -598,6 +602,7 @@ where
             let _ = partition_owner_task.await;
         }
         self.runtime.shutdown_recovery_tasks().await;
+        self.runtime.shutdown_configuration_work().await?;
         self.runtime.quiesce_partition_reports().await;
         let persisted = self.persist_partition_fault().await;
         self.runtime.abort();

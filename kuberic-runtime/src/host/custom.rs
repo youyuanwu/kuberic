@@ -72,6 +72,12 @@ struct AcceptedBuild {
     admission: BuildAdmission,
 }
 
+#[derive(Clone)]
+struct DeferredAccess {
+    id: u64,
+    observation: PendingAccessObservation,
+}
+
 pub(super) struct ReadyAccessTransaction {
     pub(super) accept: oneshot::Sender<()>,
     pub(super) accepted: oneshot::Receiver<Option<NativeProgressStatus>>,
@@ -620,12 +626,15 @@ impl AccessLifecycle for ManagedLifecycleBackend {
     }
 
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
-        *self.common.restored_access.write().await = Some((read, write));
+        let fence = self.legacy.native_fence().await.ok();
+        self.common
+            .defer_access_obligation(read, write, fence)
+            .await;
     }
 
-    async fn complete_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+    async fn complete_restored_access(&self, obligation_id: Option<u64>) {
         let mut restored = self.common.restored_access.write().await;
-        if *restored == Some((read, write)) {
+        if restored.as_ref().map(|restored| restored.id) == obligation_id {
             *restored = None;
         }
     }
@@ -643,8 +652,19 @@ impl AccessLifecycle for ManagedLifecycleBackend {
             .await
     }
 
-    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
-        *self.common.restored_access.read().await
+    async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)> {
+        self.common
+            .restored_access
+            .read()
+            .await
+            .as_ref()
+            .map(|restored| {
+                (
+                    restored.id,
+                    restored.observation.desired.0,
+                    restored.observation.desired.1,
+                )
+            })
     }
 }
 
@@ -1280,9 +1300,6 @@ impl LifecycleObservation for ManagedLifecycleBackend {
         observation.host.engine_required = true;
         observation.host.engine_host_generation =
             Some(self.engine_host_generation.load(Ordering::Acquire));
-        if let Some(pending) = observation.host.pending_access.as_mut() {
-            pending.engine_fence = Some(engine.fence);
-        }
         observation.engine.current_progress = engine.progress.current_progress;
         observation.engine.committed_lsn = engine.progress.committed_lsn;
         observation.engine.verified_replication_lsn = engine.progress.verified_replication_lsn;
@@ -1644,7 +1661,8 @@ pub(super) struct CustomReplicatorHost {
     published_access_generation: Arc<AtomicU64>,
     access_commit: Arc<Mutex<()>>,
     session_registration: Mutex<()>,
-    restored_access: RwLock<Option<(AccessStatus, AccessStatus)>>,
+    restored_access: RwLock<Option<DeferredAccess>>,
+    restored_access_generation: AtomicU64,
     removal_witnesses:
         RwLock<BTreeMap<ReplicaIdentity, crate::protocol::types::SecondaryRemovalWitness>>,
     outbound: mpsc::Sender<OutboundOperation>,
@@ -1695,6 +1713,7 @@ impl CustomReplicatorHost {
             access_commit: Arc::new(Mutex::new(())),
             session_registration: Mutex::new(()),
             restored_access: RwLock::default(),
+            restored_access_generation: AtomicU64::new(0),
             removal_witnesses: RwLock::default(),
             outbound,
             receiver: Mutex::new(receiver),
@@ -1718,6 +1737,37 @@ impl CustomReplicatorHost {
             return Err(RuntimeError::Closed);
         }
         Ok(host)
+    }
+
+    async fn defer_access_obligation(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+        engine_fence: Option<ManagedOperationFence>,
+    ) {
+        let state = self.state.read().await;
+        let authority = state.authority.clone();
+        drop(state);
+        let peer_sessions: Vec<_> = self.sessions.read().await.clone().into_iter().collect();
+        let id = self
+            .restored_access_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        *self.restored_access.write().await = Some(DeferredAccess {
+            id,
+            observation: PendingAccessObservation {
+                desired: (read, write),
+                authority,
+                configuration_generation: self.configuration_generation.load(Ordering::Acquire),
+                access_generation: self.access_generation.load(Ordering::Acquire),
+                peer_sessions,
+                engine_fence,
+            },
+        });
+        if let Some(host) = self.host.upgrade() {
+            host.notify_recovery();
+        }
+        self.changed.notify_waiters();
     }
 
     fn active_host(&self) -> Result<Arc<RuntimeHost>> {
@@ -3986,17 +4036,18 @@ impl CustomReplicatorHost {
             state.builds.clone()
         };
         let peer_sessions: Vec<_> = self.sessions.read().await.clone().into_iter().collect();
-        let pending_access =
-            AccessLifecycle::restored_access(self)
+        let pending_access = if self
+            .host()
+            .is_ok_and(|host| host.custom_authority.authorization_required())
+        {
+            None
+        } else {
+            self.restored_access
+                .read()
                 .await
-                .map(|desired| PendingAccessObservation {
-                    desired,
-                    authority: state.authority.clone(),
-                    configuration_generation: self.configuration_generation.load(Ordering::Acquire),
-                    access_generation: self.access_generation.load(Ordering::Acquire),
-                    peer_sessions: peer_sessions.clone(),
-                    engine_fence: None,
-                });
+                .as_ref()
+                .map(|restored| restored.observation.clone())
+        };
         ReportObservation {
             host: HostProxyObservation {
                 identity: state.identity,
@@ -4193,19 +4244,18 @@ impl AccessLifecycle for CustomReplicatorHost {
     }
 
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
-        let mut restored = self.restored_access.write().await;
         if self.host().is_ok_and(|host| {
             host.custom_authority.authorization_required()
                 && (read == AccessStatus::Granted || write == AccessStatus::Granted)
         }) {
             return;
         }
-        *restored = Some((read, write));
+        self.defer_access_obligation(read, write, None).await;
     }
 
-    async fn complete_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+    async fn complete_restored_access(&self, obligation_id: Option<u64>) {
         let mut restored = self.restored_access.write().await;
-        if *restored == Some((read, write)) {
+        if restored.as_ref().map(|restored| restored.id) == obligation_id {
             *restored = None;
         }
     }
@@ -4223,7 +4273,7 @@ impl AccessLifecycle for CustomReplicatorHost {
             .await
     }
 
-    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
+    async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)> {
         let restored = self.restored_access.read().await;
         if self
             .host()
@@ -4231,7 +4281,13 @@ impl AccessLifecycle for CustomReplicatorHost {
         {
             None
         } else {
-            *restored
+            restored.as_ref().map(|restored| {
+                (
+                    restored.id,
+                    restored.observation.desired.0,
+                    restored.observation.desired.1,
+                )
+            })
         }
     }
 }

@@ -52,7 +52,7 @@ pub(super) trait AuthorityLifecycle: Send + Sync {
 pub(super) trait AccessLifecycle: Send + Sync {
     fn recovery_task_owner(&self) -> Option<Arc<super::RecoveryTaskOwner>>;
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus);
-    async fn complete_restored_access(&self, read: AccessStatus, write: AccessStatus);
+    async fn complete_restored_access(&self, obligation_id: Option<u64>);
     async fn run_access_transaction(
         &self,
         read: AccessStatus,
@@ -62,7 +62,7 @@ pub(super) trait AccessLifecycle: Send + Sync {
         accepted: oneshot::Sender<Option<NativeProgressStatus>>,
         decision: oneshot::Receiver<AccessDecision>,
     ) -> Result<()>;
-    async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)>;
+    async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)>;
 }
 
 #[async_trait]
@@ -693,10 +693,11 @@ async fn commit_access(
     read: AccessStatus,
     write: AccessStatus,
 ) -> Result<()> {
+    let obligation_id = access.restored_access().await.map(|restored| restored.0);
     let transaction = begin_access_effect(access.clone(), read, write).await?;
     let (_, transaction) = transaction.accept().await?;
     transaction.commit().await?;
-    access.complete_restored_access(read, write).await;
+    access.complete_restored_access(obligation_id).await;
     Ok(())
 }
 
@@ -792,7 +793,7 @@ mod tests {
         }
 
         async fn defer_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
-        async fn complete_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
+        async fn complete_restored_access(&self, _obligation_id: Option<u64>) {}
 
         async fn run_access_transaction(
             &self,
@@ -806,7 +807,7 @@ mod tests {
             Err(RuntimeError::Application("pre-ready failure".into()))
         }
 
-        async fn restored_access(&self) -> Option<(AccessStatus, AccessStatus)> {
+        async fn restored_access(&self) -> Option<(u64, AccessStatus, AccessStatus)> {
             None
         }
     }

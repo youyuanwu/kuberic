@@ -8,6 +8,8 @@ use crate::protocol::types::AccessStatus;
 
 use crate::RuntimeError;
 use crate::host::Result;
+#[cfg(all(test, feature = "testing"))]
+use crate::host::hosting::AccessEffectAcceptanceGate;
 use crate::host::hosting::RecoveryOwnerRuntime;
 #[cfg(test)]
 use crate::host::observation::RecoveryObservation;
@@ -16,20 +18,83 @@ use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 #[cfg(test)]
 use crate::host::state::RetainedResult;
 use crate::host::store::AgentStore;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryEligibility(serde_json::Value);
+
+fn recovery_eligibility(state: &crate::host::state::AgentState) -> RecoveryEligibility {
+    RecoveryEligibility(serde_json::json!({
+        "identity": &state.identity,
+        "highest_epoch": state.highest_epoch,
+        "previous_configuration": &state.previous_configuration,
+        "current_configuration": &state.current_configuration,
+        "role": state.role,
+        "read_status": state.read_status,
+        "write_status": state.write_status,
+        "pending_effect": &state.pending_effect,
+        "reconfiguration": &state.reconfiguration,
+        "scale_up_evidence": &state.scale_up_evidence,
+        "prepared_secondary_removal": &state.prepared_secondary_removal,
+        "accepted_secondary_removal": &state.accepted_secondary_removal,
+        "retired_authority": &state.retired_authority,
+        "prepared_switchover": &state.prepared_switchover,
+        "retired_switchover": &state.retired_switchover,
+        "preparation_retirement": &state.preparation_retirement,
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn same_recovery_eligibility(
+    left: &crate::host::state::AgentState,
+    right: &crate::host::state::AgentState,
+) -> bool {
+    recovery_eligibility(left) == recovery_eligibility(right)
+}
 
 pub(crate) struct RecoveryOwner<S> {
     runtime: RecoveryOwnerRuntime,
     store: Arc<S>,
+    admission_lock: Arc<Mutex<()>>,
+    #[cfg(all(test, feature = "testing"))]
+    selection_gate: Option<AccessEffectAcceptanceGate>,
 }
 
 impl<S: AgentStore> RecoveryOwner<S> {
+    #[cfg(test)]
     pub(crate) fn new(runtime: RecoveryOwnerRuntime, store: Arc<S>) -> Self {
-        Self { runtime, store }
+        Self {
+            runtime,
+            store,
+            admission_lock: Arc::new(Mutex::new(())),
+            #[cfg(all(test, feature = "testing"))]
+            selection_gate: None,
+        }
+    }
+
+    pub(crate) fn with_admission_lock(
+        runtime: RecoveryOwnerRuntime,
+        store: Arc<S>,
+        admission_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            runtime,
+            store,
+            admission_lock,
+            #[cfg(all(test, feature = "testing"))]
+            selection_gate: None,
+        }
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    #[allow(dead_code)]
+    pub(crate) fn pause_after_selection(&mut self, gate: AccessEffectAcceptanceGate) {
+        self.selection_gate = Some(gate);
     }
 
     pub(crate) async fn advance(&mut self) -> Result<()> {
         let durable = self.store.load_state().await?;
+        let durable_eligibility = recovery_eligibility(&durable);
         if durable.pending_effect.is_none() && durable.reconfiguration.is_none() {
             match self.runtime.observe_progress().await {
                 Ok(())
@@ -41,13 +106,9 @@ impl<S: AgentStore> RecoveryOwner<S> {
                 ) => {}
                 Err(error) => return Err(error.into()),
             }
-            match self.runtime.refresh_catch_up_capability().await {
-                Ok(()) | Err(RuntimeError::NotOpen | RuntimeError::Closed) => {}
-                Err(error) => return Err(error.into()),
-            }
-
+            let _admission = self.admission_lock.lock().await;
             let eligible = self.store.load_state().await?;
-            if eligible != durable
+            if recovery_eligibility(&eligible) != durable_eligibility
                 || eligible.pending_effect.is_some()
                 || eligible.reconfiguration.is_some()
             {
@@ -58,15 +119,28 @@ impl<S: AgentStore> RecoveryOwner<S> {
                 || observation.host.write_status != eligible.write_status
             {
                 let selected = self.store.load_state().await?;
-                if selected != eligible
+                let selected_eligibility = recovery_eligibility(&selected);
+                if selected_eligibility != recovery_eligibility(&eligible)
                     || selected.pending_effect.is_some()
                     || selected.reconfiguration.is_some()
                 {
                     return Ok(());
                 }
+                #[cfg(all(test, feature = "testing"))]
+                if let Some(gate) = self.selection_gate.take() {
+                    gate.entered.notify_waiters();
+                    gate.release.notified().await;
+                }
+                let confirmed = self.store.load_state().await?;
+                if recovery_eligibility(&confirmed) != selected_eligibility
+                    || confirmed.pending_effect.is_some()
+                    || confirmed.reconfiguration.is_some()
+                {
+                    return Ok(());
+                }
                 match self
                     .runtime
-                    .reconcile_durable_access(selected.read_status, selected.write_status)
+                    .reconcile_durable_access(confirmed.read_status, confirmed.write_status)
                     .await
                 {
                     Ok(())
@@ -79,7 +153,7 @@ impl<S: AgentStore> RecoveryOwner<S> {
                     Err(error) => return Err(error.into()),
                 }
                 let current = self.store.load_state().await?;
-                if current != selected {
+                if recovery_eligibility(&current) != selected_eligibility {
                     let (read, write) =
                         if current.pending_effect.is_some() || current.reconfiguration.is_some() {
                             (
@@ -92,6 +166,12 @@ impl<S: AgentStore> RecoveryOwner<S> {
                     let _ = self.runtime.reconcile_durable_access(read, write).await;
                 }
             }
+            match self.runtime.refresh_catch_up_capability().await {
+                Ok(()) | Err(RuntimeError::NotOpen | RuntimeError::Closed) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "catch-up capability observation remains unavailable");
+                }
+            }
         }
 
         Ok(())
@@ -102,24 +182,26 @@ impl<S: AgentStore> RecoveryOwner<S> {
             if *shutdown.borrow_and_update() {
                 return;
             }
+            let observed = self.runtime.revision();
             tokio::select! {
                 result = self.advance() => {
                     if let Err(error) = result {
                         tracing::warn!(%error, "background lifecycle recovery retrying");
                     }
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow_and_update() {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow_and_update() {
                         return;
                     }
                 }
             }
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow_and_update() {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow_and_update() {
                         return;
                     }
                 }
+                _ = self.runtime.wait_for_change(observed) => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
@@ -157,24 +239,26 @@ impl<S: AgentStore> PartitionReportOwner<S> {
             if *shutdown.borrow_and_update() {
                 return;
             }
+            let observed = self.runtime.revision();
             tokio::select! {
                 result = self.advance() => {
                     if let Err(error) = result {
                         tracing::warn!(%error, "partition observation persistence retrying");
                     }
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow_and_update() {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow_and_update() {
                         return;
                     }
                 }
             }
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow_and_update() {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow_and_update() {
                         return;
                     }
                 }
+                _ = self.runtime.wait_for_change(observed) => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }

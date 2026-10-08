@@ -76,6 +76,22 @@ fn result() -> RuntimeEffectResult {
     }
 }
 
+#[test]
+fn load_and_fault_observations_do_not_change_access_recovery_eligibility() {
+    let state = initial_state();
+    let mut observed = state.clone();
+    observed
+        .load_metrics
+        .push(crate::protocol::types::LoadMetric {
+            name: "queue-depth".into(),
+            value: 9,
+        });
+    observed.reported_fault = Some(crate::protocol::types::FaultType::Transient);
+    assert!(crate::host::recovery::same_recovery_eligibility(
+        &state, &observed
+    ));
+}
+
 #[derive(Default)]
 struct RecoveringRuntime {
     calls: AtomicUsize,

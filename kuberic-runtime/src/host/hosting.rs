@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -41,7 +41,7 @@ use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use tokio::task::JoinSet;
 
 use super::observation::{
@@ -55,12 +55,14 @@ tokio::task_local! {
 }
 
 pub(super) struct RecoveryTaskOwner {
+    closed: AtomicBool,
     tasks: Mutex<JoinSet<()>>,
 }
 
 impl RecoveryTaskOwner {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            closed: AtomicBool::new(false),
             tasks: Mutex::new(JoinSet::new()),
         })
     }
@@ -71,7 +73,15 @@ impl RecoveryTaskOwner {
         F: Future<Output = Result<T>> + Send + 'static,
     {
         let (result_tx, result_rx) = oneshot::channel();
+        if self.closed.load(Ordering::Acquire) {
+            let _ = result_tx.send(Err(RuntimeError::Closed));
+            return result_rx;
+        }
         let mut tasks = self.tasks.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            let _ = result_tx.send(Err(RuntimeError::Closed));
+            return result_rx;
+        }
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
             let _ = result_tx.send(task.await);
@@ -80,6 +90,7 @@ impl RecoveryTaskOwner {
     }
 
     async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
         let mut tasks = self.tasks.lock().await;
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
@@ -529,6 +540,14 @@ pub(crate) struct RecoveryOwnerRuntime {
 }
 
 impl RecoveryOwnerRuntime {
+    pub(crate) fn revision(&self) -> u64 {
+        self.inner.recovery_revision()
+    }
+
+    pub(crate) async fn wait_for_change(&self, observed: u64) {
+        self.inner.wait_for_recovery_change(observed).await;
+    }
+
     pub(crate) async fn observe_progress(&self) -> Result<()> {
         self.inner.observe_progress().await
     }
@@ -561,9 +580,11 @@ trait ReportHostMutations: Send + Sync {
     async fn refresh_catch_up_capability(&self) -> Result<()>;
 }
 
-trait RecoveryOwnerHost: ReportHost + ReportHostMutations {}
-
-impl<T> RecoveryOwnerHost for T where T: ReportHost + ReportHostMutations {}
+#[async_trait]
+trait RecoveryOwnerHost: ReportHost + ReportHostMutations {
+    fn recovery_revision(&self) -> u64;
+    async fn wait_for_recovery_change(&self, observed: u64);
+}
 
 #[async_trait]
 trait BuildHost: Send + Sync {
@@ -945,6 +966,8 @@ impl PodRuntime {
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 partition_reports_closed: AtomicBool::new(false),
+                recovery_revision: AtomicU64::new(0),
+                recovery_changed: Notify::new(),
                 recovery_tasks: RecoveryTaskOwner::new(),
                 custom_authority: custom::CustomAuthorityContainment::new(weak_self.clone()),
                 replica_session: OnceLock::new(),
@@ -954,6 +977,8 @@ impl PodRuntime {
                 peer_discovery_ready_gate: StdMutex::new(None),
                 #[cfg(all(test, feature = "testing"))]
                 managed_configuration_commit_gate: StdMutex::new(None),
+                #[cfg(all(test, feature = "testing"))]
+                partition_report_gate: StdMutex::new(None),
             }),
         }
     }
@@ -999,6 +1024,16 @@ impl PodRuntime {
             release: Arc::new(tokio::sync::Notify::new()),
         };
         *self.host.peer_discovery_ready_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_pause_partition_report(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self.host.partition_report_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
@@ -1361,6 +1396,21 @@ impl PodRuntime {
         self.host.shutdown_recovery_tasks().await;
     }
 
+    pub(crate) async fn shutdown_configuration_work(&self) -> Result<()> {
+        match self
+            .host
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::authority_lifecycle)
+        {
+            Some(authority) => match authority.cancel_configuration_work().await {
+                Ok(()) | Err(RuntimeError::NotOpen | RuntimeError::Closed) => Ok(()),
+                Err(error) => Err(error),
+            },
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn build_runtime(&self) -> BuildRuntime {
         BuildRuntime {
             inner: self.host.clone(),
@@ -1630,6 +1680,8 @@ struct RuntimeHost {
     aborted: AtomicBool,
     closed: AtomicBool,
     partition_reports_closed: AtomicBool,
+    recovery_revision: AtomicU64,
+    recovery_changed: Notify,
     recovery_tasks: Arc<RecoveryTaskOwner>,
     custom_authority: custom::CustomAuthorityContainment,
     #[cfg(all(test, feature = "testing"))]
@@ -1638,6 +1690,8 @@ struct RuntimeHost {
     peer_discovery_ready_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
     #[cfg(all(test, feature = "testing"))]
     managed_configuration_commit_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(all(test, feature = "testing"))]
+    partition_report_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
 }
 
 impl RuntimeHost {
@@ -1647,6 +1701,11 @@ impl RuntimeHost {
 
     fn custom_configuration_blocked(&self) -> bool {
         self.custom_recovery_pending() || self.custom_authority.attempt_entered()
+    }
+
+    fn notify_recovery(&self) {
+        self.recovery_revision.fetch_add(1, Ordering::AcqRel);
+        self.recovery_changed.notify_waiters();
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -1759,6 +1818,23 @@ impl ReportHostMutations for RuntimeHost {
         self.state.write().await.catch_up_capability =
             capability.map(|capability| (after, capability));
         Ok(())
+    }
+}
+
+#[async_trait]
+impl RecoveryOwnerHost for RuntimeHost {
+    fn recovery_revision(&self) -> u64 {
+        self.recovery_revision.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_recovery_change(&self, observed: u64) {
+        loop {
+            let changed = self.recovery_changed.notified();
+            if self.recovery_revision.load(Ordering::Acquire) != observed {
+                return;
+            }
+            changed.await;
+        }
     }
 }
 
@@ -2144,6 +2220,7 @@ impl PartitionAccessView for HostAccessView {
         if state.load_metrics != metrics {
             state.load_metrics = metrics;
             state.partition_report_revision = state.partition_report_revision.wrapping_add(1);
+            host.notify_recovery();
         }
         Ok(())
     }
@@ -2165,6 +2242,7 @@ impl PartitionAccessView for HostAccessView {
             if state.reported_fault != next {
                 state.reported_fault = next;
                 state.partition_report_revision = state.partition_report_revision.wrapping_add(1);
+                host.notify_recovery();
             }
         }
         Ok(())
@@ -3513,7 +3591,7 @@ impl RuntimeHost {
 
     async fn partition_report_snapshot(&self) -> PartitionReportSnapshot {
         let state = self.state.read().await;
-        PartitionReportSnapshot {
+        let snapshot = PartitionReportSnapshot {
             information: state.partition_information.clone(),
             read_status: state.fallback_snapshot.read_status,
             write_status: state.fallback_snapshot.write_status,
@@ -3527,7 +3605,16 @@ impl RuntimeHost {
                 .collect(),
             reported_fault: state.reported_fault,
             revision: state.partition_report_revision,
+        };
+        drop(state);
+        #[cfg(all(test, feature = "testing"))]
+        let gate = { self.partition_report_gate.lock().unwrap().take() };
+        #[cfg(all(test, feature = "testing"))]
+        if let Some(gate) = gate {
+            gate.entered.notify_waiters();
+            gate.release.notified().await;
         }
+        snapshot
     }
 
     async fn snapshot(&self) -> RuntimeSnapshot {

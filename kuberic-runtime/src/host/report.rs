@@ -30,23 +30,28 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub(crate) async fn report(&self, runtime: &ReportRuntime) -> Result<proto::AgentStatusReport> {
-        let partition = runtime.partition_report().await;
         for _ in 0..3 {
+            let partition = runtime.partition_report().await;
             let state: DurableAgentObservation = self.store.load_state().await?.into();
             let snapshot = runtime.observation().await;
             let confirmed_snapshot = runtime.observation().await;
             let confirmed_state: DurableAgentObservation = self.store.load_state().await?.into();
+            let confirmed_partition = runtime.partition_report().await;
             let durable_stable = state == confirmed_state;
             let fence_stable = same_report_fence(&snapshot, &confirmed_snapshot);
             let ownership_matches = snapshot_matches_state(&confirmed_snapshot, &confirmed_state);
-            if !durable_stable || !fence_stable || !ownership_matches {
+            if !durable_stable
+                || !fence_stable
+                || !ownership_matches
+                || partition.revision != confirmed_partition.revision
+            {
                 continue;
             }
             return Ok(build_report(
                 &self.session,
                 confirmed_state,
                 confirmed_snapshot,
-                partition.reported_fault,
+                confirmed_partition.reported_fault,
             ));
         }
         Err(crate::host::HostError::DurableEffectConflict(
