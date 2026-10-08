@@ -18,6 +18,13 @@ write journals, quorum commitment, copy progress, pending-write recovery,
 committed-prefix reconciliation, native topology evidence, and local write
 fencing.
 
+Those facts are exposed internally through explicit owner types. Durable
+`AgentState` is wrapped as `DurableAgentObservation`; process-local
+`HostProxyState` produces `HostProxyObservation`; and managed/native progress
+is exposed as `ReplicationEngineObservation`. `ReportObservation` composes the
+host and engine owners without becoming durable state
+(`kuberic-runtime/src/host/observation.rs:1-244`).
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its
@@ -211,25 +218,73 @@ validate. Existing
 JSON fields remain backward-readable through serde defaults; this refactor does
 not introduce a database schema migration.
 
-Reporting uses an opaque reconciliatory view rather than the complete hosting
-runtime. The engine returns `ManagedReplicaObservation`, containing only
-progress, build, removal and retirement facts; the host composes durable
-authority, role, access and the existing runtime snapshot/postcondition. It can
-retry deferred access restoration and preserves
-`live_builds_only`, so old-session build evidence is not resurrected. Catch-up
-composition retains an accepted boundary only while the native engine still
-reports catch-up complete.
-Independent custom authority staging supersedes old restoration authorization:
-report-driven grant restoration remains disabled for that host instance.
-An earlier durable/deferred grant cannot reopen the new configuration; initial
-and later regrants require fresh explicit access effects.
+Reporting is strictly read-only. `ReportRuntime` exposes only owner observation
+capture and live partition observation; it has no progress-refresh, access,
+retry, store-write or recovery capability. Both `GetAgentStatus` and the report
+appended to an accepted command use the same reporter
+(`kuberic-runtime/src/host/hosting.rs:466-527`;
+`kuberic-runtime/src/host/report.rs:14-246`;
+`kuberic-runtime/src/host/service.rs:816-946`).
 
-Recovery reconstructs authority and native stores, reissues or reobserves
-pending effects, and keeps access closed until public/native proof is accepted.
-A previously persisted granted snapshot is never sufficient to reopen writes.
-Managed recovery validates and loads the full durable authority in the host,
-derives executable configuration and reuses the same prepare/commit protocol
-before common restoration or access publication.
+The reporter applies one composition rule per field:
+
+| Field group | Owner and composition |
+|---|---|
+| Identity, epoch, previous/current configuration, durable topology and retained work | Durable `AgentState` only |
+| Address, actual application role/access, open state and authority projection | `HostProxyObservation` only |
+| Replication, verified, committed, quorum and catch-up progress | `ReplicationEngineObservation` only |
+| Builds | Live engine progress plus eligible durable fallback, selected through host receipt/retirement policy |
+| `healthy` | Live host fault, fail-closed immediately |
+| `reported_fault` and load | Durable state after background persistence |
+| Catch-up capability | Recovery-owner cache, emitted only while its observation fence remains current |
+
+Report capture links the host and managed engine through executable
+configuration, engine session/generation and the host generation acknowledged
+by the engine. Host lifecycle/generation/session fields and engine topology
+fences must remain stable across the capture; progress and builds may advance.
+An exact pending restoration may temporarily have durable desired access
+`Granted` while actual access remains `ReconfigurationPending`. Reporting emits
+the actual closed value and accepts that mismatch only while the desired pair,
+authority, configuration/access generations, peer sessions and engine fence
+remain exact
+(`kuberic-runtime/src/host/observation.rs:135-244`;
+`kuberic-runtime/src/host/report.rs:199-303`).
+
+Lifecycle advancement belongs to service-owned background owners.
+`RecoveryOwner` refreshes progress, samples catch-up capability, reloads durable
+eligibility and reconciles exact access only when no effect or
+reconfiguration is pending. It reloads selection around publication and
+compensates fail-closed after supersession. Managed peer discovery contributes
+a deferred exact restoration witness rather than publishing access from its
+observer task. `PartitionReportOwner` independently persists changed load/fault
+revisions so a stalled callback cannot starve observation durability
+(`kuberic-runtime/src/host/recovery.rs:14-192`;
+`kuberic-runtime/src/host/hosting.rs:1694-1927`).
+
+`RecoveryTaskOwner` retains access transactions, custom configuration work and
+peer recovery producers after their observing caller disappears. Shutdown
+signals and joins the background owners, cancels and joins registered
+descendants, quiesces partition-report producers, persists the final stable
+load/fault revision, and only then aborts the runtime. Startup failure follows
+the same descendant-cancellation and persistence ordering
+(`kuberic-runtime/src/host/hosting.rs:259-300,1600-1665`;
+`kuberic-runtime/src/host/service.rs:511-621`).
+
+Recovery still reconstructs authority and native stores, reissues or
+reobserves pending effects, and keeps access closed until public/native proof
+is accepted. A previously persisted granted value is never sufficient to
+reopen writes. Managed recovery validates the full durable authority in the
+host, derives executable configuration and reuses the same prepare/commit
+protocol before common restoration or access publication.
+
+`RuntimeSnapshot` remains only in the existing effect-evidence,
+`RuntimePostcondition` and opt-in testing paths. Report, build, peer-discovery,
+outbound and restart-inspection views carry owner observations or narrow
+projections. No durable schema change was required; engine-only fence and
+diagnostic fields do not implement durable serialization
+(`kuberic-runtime/src/effects.rs:104-181`;
+`kuberic-runtime/src/host/observation.rs:50-244`;
+`kuberic-runtime/tests/lifecycle_capability_boundaries.rs:1266-1460`).
 
 ## Compatibility
 
