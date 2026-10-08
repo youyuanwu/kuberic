@@ -1336,6 +1336,29 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "ReportObservationRuntime must not transport RuntimeSnapshot"
     );
     assert!(report_lifecycle.contains("ReportObservation"));
+    let report_callback_forbidden = [
+        "AccessLifecycle",
+        "observe_progress",
+        "refresh_progress",
+        "reconcile_access",
+        "run_access_transaction",
+        "restored_access",
+    ];
+    for callback in report_callback_forbidden {
+        assert!(
+            !report_lifecycle.contains(callback),
+            "ReportObservationRuntime must not expose callback {callback}"
+        );
+    }
+    let injected_report_lifecycle = format!(
+        "{report_lifecycle}\nfn injected() {{ self.observation.observe_progress().await; }}"
+    );
+    assert!(
+        report_callback_forbidden
+            .iter()
+            .any(|callback| injected_report_lifecycle.contains(callback)),
+        "report callback negative fixture must be rejected"
+    );
 
     let report_runtime = hosting
         .split_once("pub(crate) struct ReportRuntime")
@@ -1371,27 +1394,44 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
 
     let report = source("src/host/report.rs");
     let production_report = report.split("#[cfg(test)]").next().unwrap_or(&report);
-    for mutation in [
+    let report_mutations = [
         "record_partition_reports",
         "complete_application_initialization",
         "migrate_schema",
         "begin_effect",
+        "mark_effect_applied",
         "complete_effect",
+        "cancel_effect",
+        "begin_configuration",
+        "journal_build",
+        "abandon_build",
+        "advance_configuration",
+        "complete_configuration",
+        "set_reconfiguration",
         "clear_reconfiguration",
-        "record_build",
-        "record_fault",
         "observe_progress",
         "reconcile_durable_access",
         "catch_up_capability().await",
         "tokio::time::sleep",
         "RuntimeError::",
         "RuntimeSnapshot",
-    ] {
+    ];
+    for mutation in report_mutations {
         assert!(
             !production_report.contains(mutation),
             "status reporting must not perform {mutation}"
         );
     }
+    let injected_report = format!(
+        "{production_report}\nasync fn injected(store: &impl AgentStore) {{ store.cancel_effect(todo!()).await; let _: RuntimeSnapshot = todo!(); }}"
+    );
+    assert!(
+        report_mutations
+            .iter()
+            .filter(|mutation| { **mutation == "cancel_effect" || **mutation == "RuntimeSnapshot" })
+            .all(|mutation| injected_report.contains(mutation)),
+        "report mutation negative fixture must be rejected"
+    );
 
     let service = source("src/host/service.rs");
     assert_eq!(
@@ -1404,10 +1444,17 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         .split("#[cfg(test)]")
         .next()
         .unwrap_or(&observation);
-    assert!(
-        !production_observation.contains("Serialize, Deserialize"),
-        "process-local owner observations must not enter durable serialization"
-    );
+    for serialization in [
+        "Serialize",
+        "Deserialize",
+        "serde::Serialize",
+        "serde::Deserialize",
+    ] {
+        assert!(
+            !production_observation.contains(serialization),
+            "process-local owner observations must not enter durable serialization via {serialization}"
+        );
+    }
     let durable_state = source("src/host/state.rs");
     for transient in [
         "HostProxyObservation",
@@ -1415,6 +1462,10 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "ReportObservation",
         "PendingAccessObservation",
         "ManagedOperationFence",
+        "engine_session_id",
+        "engine_generation",
+        "host_generation",
+        "diagnostic_revision",
     ] {
         assert!(
             !durable_state.contains(transient),
