@@ -1258,7 +1258,6 @@ impl LifecycleObservation for ManagedLifecycleBackend {
     async fn report_observation(&self) -> ReportObservation {
         let mut observation = self.common.report_observation().await;
         let engine = self.engine_snapshot_for_host().await;
-        let _diagnostic_revision = engine.diagnostic_revision;
         observation.engine.host_generation = Some(engine.host_generation);
         observation.engine.fence = Some(engine.fence.clone());
         if let Some(pending) = observation.host.pending_access.as_mut() {

@@ -1337,6 +1337,7 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
     assert!(report_lifecycle.contains("ReportObservation"));
 
     for consumer in [
+        "src/host/custom.rs",
         "src/host/transport.rs",
         "src/host/recovery.rs",
         "src/host/report.rs",
