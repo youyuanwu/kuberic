@@ -34,6 +34,7 @@ use tonic::{Request, transport::Channel};
 
 const TOKEN: &str = "host-local-postgres-test";
 const PUBLIC_GROUP_TOKEN: &str = "host-local-native-build";
+const PROCESS_MONITOR_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn postgres_binary() -> PathBuf {
     std::env::var_os("NEXTEST_BIN_EXE_postgres_replicated")
@@ -1731,6 +1732,26 @@ struct BinaryHost {
     log: PathBuf,
 }
 
+async fn wait_for_binary_output(binary: &mut BinaryHost, expected: &str, context: &str) {
+    tokio::time::timeout(PROCESS_MONITOR_TIMEOUT, async {
+        while !binary.output().contains(expected) {
+            assert!(
+                binary.child.try_wait().unwrap().is_none(),
+                "{context}: binary exited before logging {expected:?}: {}",
+                binary.output()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{context} within {PROCESS_MONITOR_TIMEOUT:?}: {}",
+            binary.output()
+        )
+    });
+}
+
 async fn established_agent_and_postgres_lineage_mismatches_are_non_mutating() {
     let root = TestDataDir::new("host-lineage");
     let mut host = HostAttempt::start(root.path()).await;
@@ -2732,13 +2753,12 @@ async fn executable_supervisor_loss_is_cleanup_failure() {
     let descendants = Adopted(ProcessProbe::descendants(binary.child.id()));
     assert!(descendants.0.len() >= 7);
     supervisor.signal(rustix::process::Signal::KILL);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !binary.output().contains("PostgreSQL exited unexpectedly") {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("root loss must be observed even while the postmaster survives");
+    wait_for_binary_output(
+        &mut binary,
+        "PostgreSQL exited unexpectedly",
+        "root loss must be observed even while the postmaster survives",
+    )
+    .await;
     binary.terminate();
     let exit = binary.wait().await;
     assert!(!exit.success(), "{exit}: {}", binary.output());
@@ -2840,14 +2860,12 @@ async fn executable_shutdown_requires_durable_fault_acknowledgement() {
             .await
             .unwrap();
         assert!(stopped.status.success(), "{stopped:?}");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !binary.output().contains("PostgreSQL exited unexpectedly") {
-                assert!(binary.child.try_wait().unwrap().is_none());
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("process monitor must observe the unexpected child exit");
+        wait_for_binary_output(
+            &mut binary,
+            "PostgreSQL exited unexpectedly",
+            "process monitor must observe the unexpected child exit",
+        )
+        .await;
         // Let the monitor's queued fault reach the partition before SIGTERM.
         tokio::time::sleep(Duration::from_millis(100)).await;
         if release_lock {
