@@ -160,6 +160,7 @@ pub(crate) struct PendingAccessObservation {
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) configuration_generation: u64,
     pub(crate) access_generation: u64,
+    pub(crate) active_access_generation: Option<u64>,
     pub(crate) peer_sessions: Vec<(ReplicaIdentity, ProcessSessionId)>,
     pub(crate) engine_fence: Option<ManagedOperationFence>,
 }

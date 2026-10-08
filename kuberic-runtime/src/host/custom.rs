@@ -1749,21 +1749,32 @@ impl CustomReplicatorHost {
         let authority = state.authority.clone();
         drop(state);
         let peer_sessions: Vec<_> = self.sessions.read().await.clone().into_iter().collect();
+        let observation = PendingAccessObservation {
+            desired: (read, write),
+            authority,
+            configuration_generation: self.configuration_generation.load(Ordering::Acquire),
+            access_generation: self.access_generation.load(Ordering::Acquire),
+            active_access_generation: None,
+            peer_sessions,
+            engine_fence,
+        };
+        let mut restored = self.restored_access.write().await;
+        if let Some(existing) = restored.as_mut()
+            && existing.observation.desired == observation.desired
+            && existing.observation.authority == observation.authority
+            && existing.observation.configuration_generation == observation.configuration_generation
+            && existing.observation.peer_sessions == observation.peer_sessions
+            && existing.observation.engine_fence == observation.engine_fence
+        {
+            existing.observation.active_access_generation = None;
+            return;
+        }
         let id = self
             .restored_access_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        *self.restored_access.write().await = Some(DeferredAccess {
-            id,
-            observation: PendingAccessObservation {
-                desired: (read, write),
-                authority,
-                configuration_generation: self.configuration_generation.load(Ordering::Acquire),
-                access_generation: self.access_generation.load(Ordering::Acquire),
-                peer_sessions,
-                engine_fence,
-            },
-        });
+        *restored = Some(DeferredAccess { id, observation });
+        drop(restored);
         if let Some(host) = self.host.upgrade() {
             host.notify_recovery();
         }
@@ -2091,11 +2102,12 @@ impl CustomReplicatorHost {
     }
 
     async fn finish_deferred_configuration(&self) -> Result<()> {
-        let Some(mut handle) = self.deferred_configuration.lock().await.take() else {
+        let mut deferred = self.deferred_configuration.lock().await;
+        let Some(handle) = deferred.as_mut() else {
             return Ok(());
         };
         let (generation, _) =
-            match tokio::time::timeout(std::time::Duration::from_secs(75), &mut handle).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(75), &mut *handle).await {
                 Ok(result) => result.map_err(|error| {
                     if error.is_cancelled() {
                         RuntimeError::OperationCancelled
@@ -2105,9 +2117,13 @@ impl CustomReplicatorHost {
                 })??,
                 Err(_) => {
                     handle.abort();
+                    let _ = handle.await;
+                    *deferred = None;
                     return Err(RuntimeError::OperationCancelled);
                 }
             };
+        *deferred = None;
+        drop(deferred);
         self.deferred_configuration_abort.lock().unwrap().take();
         self.ensure_configuration_generation(generation)?;
         Ok(())
@@ -2344,6 +2360,7 @@ impl CustomReplicatorHost {
             }
         }
         let _commit = self.access_commit.lock().await;
+        let mut restored = self.restored_access.write().await;
         self.active_host()?;
         if authority_before != self.state.read().await.authority
             || configuration_before != self.published_configuration().await
@@ -2357,6 +2374,16 @@ impl CustomReplicatorHost {
         // reservation. The caller installs rollback ownership immediately,
         // without an intervening await.
         let access_generation = self.advance_access_generation()?;
+        if let Some(restored) = restored.as_mut()
+            && restored.observation.desired == (read, write)
+            && restored.observation.authority == authority_before
+            && restored.observation.configuration_generation == configuration_generation
+            && restored.observation.peer_sessions
+                == sessions_before.clone().into_iter().collect::<Vec<_>>()
+        {
+            restored.observation.active_access_generation = Some(access_generation);
+        }
+        drop(restored);
         Ok(AccessProjection {
             previous_read,
             previous_write,

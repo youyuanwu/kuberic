@@ -96,6 +96,69 @@ impl<S: AgentStore> RecoveryOwner<S> {
         let durable = self.store.load_state().await?;
         let durable_eligibility = recovery_eligibility(&durable);
         if durable.pending_effect.is_none() && durable.reconfiguration.is_none() {
+            {
+                let _admission = self.admission_lock.lock().await;
+                let eligible = self.store.load_state().await?;
+                if recovery_eligibility(&eligible) != durable_eligibility
+                    || eligible.pending_effect.is_some()
+                    || eligible.reconfiguration.is_some()
+                {
+                    return Ok(());
+                }
+                let observation = self.runtime.observation().await;
+                if observation.host.read_status != eligible.read_status
+                    || observation.host.write_status != eligible.write_status
+                {
+                    let selected = self.store.load_state().await?;
+                    let selected_eligibility = recovery_eligibility(&selected);
+                    if selected_eligibility != recovery_eligibility(&eligible)
+                        || selected.pending_effect.is_some()
+                        || selected.reconfiguration.is_some()
+                    {
+                        return Ok(());
+                    }
+                    #[cfg(all(test, feature = "testing"))]
+                    if let Some(gate) = self.selection_gate.take() {
+                        gate.entered.notify_waiters();
+                        gate.release.notified().await;
+                    }
+                    let confirmed = self.store.load_state().await?;
+                    if recovery_eligibility(&confirmed) != selected_eligibility
+                        || confirmed.pending_effect.is_some()
+                        || confirmed.reconfiguration.is_some()
+                    {
+                        return Ok(());
+                    }
+                    match self
+                        .runtime
+                        .reconcile_durable_access(confirmed.read_status, confirmed.write_status)
+                        .await
+                    {
+                        Ok(())
+                        | Err(
+                            RuntimeError::ReconfigurationPending
+                            | RuntimeError::OperationCancelled
+                            | RuntimeError::NotOpen
+                            | RuntimeError::Closed,
+                        ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    let current = self.store.load_state().await?;
+                    if recovery_eligibility(&current) != selected_eligibility {
+                        let (read, write) = if current.pending_effect.is_some()
+                            || current.reconfiguration.is_some()
+                        {
+                            (
+                                AccessStatus::ReconfigurationPending,
+                                AccessStatus::ReconfigurationPending,
+                            )
+                        } else {
+                            (current.read_status, current.write_status)
+                        };
+                        let _ = self.runtime.reconcile_durable_access(read, write).await;
+                    }
+                }
+            }
             match self.runtime.observe_progress().await {
                 Ok(())
                 | Err(
@@ -105,66 +168,6 @@ impl<S: AgentStore> RecoveryOwner<S> {
                     | RuntimeError::Closed,
                 ) => {}
                 Err(error) => return Err(error.into()),
-            }
-            let _admission = self.admission_lock.lock().await;
-            let eligible = self.store.load_state().await?;
-            if recovery_eligibility(&eligible) != durable_eligibility
-                || eligible.pending_effect.is_some()
-                || eligible.reconfiguration.is_some()
-            {
-                return Ok(());
-            }
-            let observation = self.runtime.observation().await;
-            if observation.host.read_status != eligible.read_status
-                || observation.host.write_status != eligible.write_status
-            {
-                let selected = self.store.load_state().await?;
-                let selected_eligibility = recovery_eligibility(&selected);
-                if selected_eligibility != recovery_eligibility(&eligible)
-                    || selected.pending_effect.is_some()
-                    || selected.reconfiguration.is_some()
-                {
-                    return Ok(());
-                }
-                #[cfg(all(test, feature = "testing"))]
-                if let Some(gate) = self.selection_gate.take() {
-                    gate.entered.notify_waiters();
-                    gate.release.notified().await;
-                }
-                let confirmed = self.store.load_state().await?;
-                if recovery_eligibility(&confirmed) != selected_eligibility
-                    || confirmed.pending_effect.is_some()
-                    || confirmed.reconfiguration.is_some()
-                {
-                    return Ok(());
-                }
-                match self
-                    .runtime
-                    .reconcile_durable_access(confirmed.read_status, confirmed.write_status)
-                    .await
-                {
-                    Ok(())
-                    | Err(
-                        RuntimeError::ReconfigurationPending
-                        | RuntimeError::OperationCancelled
-                        | RuntimeError::NotOpen
-                        | RuntimeError::Closed,
-                    ) => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let current = self.store.load_state().await?;
-                if recovery_eligibility(&current) != selected_eligibility {
-                    let (read, write) =
-                        if current.pending_effect.is_some() || current.reconfiguration.is_some() {
-                            (
-                                AccessStatus::ReconfigurationPending,
-                                AccessStatus::ReconfigurationPending,
-                            )
-                        } else {
-                            (current.read_status, current.write_status)
-                        };
-                    let _ = self.runtime.reconcile_durable_access(read, write).await;
-                }
             }
             match self.runtime.refresh_catch_up_capability().await {
                 Ok(()) | Err(RuntimeError::NotOpen | RuntimeError::Closed) => {}

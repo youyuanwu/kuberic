@@ -230,7 +230,10 @@ fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObse
                         && pending.authority == snapshot.host.authority
                         && pending.configuration_generation
                             == snapshot.host.configuration_generation
-                        && pending.access_generation == snapshot.host.access_generation
+                        && pending
+                            .active_access_generation
+                            .unwrap_or(pending.access_generation)
+                            == snapshot.host.access_generation
                         && pending.peer_sessions == snapshot.host.peer_sessions
                         && pending.engine_fence == snapshot.engine.fence
                 })
@@ -471,6 +474,7 @@ mod tests {
                 authority: None,
                 configuration_generation: 0,
                 access_generation: 0,
+                active_access_generation: None,
                 peer_sessions: Vec::new(),
                 engine_fence: Some(engine_fence),
             });

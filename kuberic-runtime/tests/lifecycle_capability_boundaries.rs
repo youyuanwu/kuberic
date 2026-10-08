@@ -1006,19 +1006,12 @@ fn production_items(source: &str) -> String {
     parsed(source)
         .items
         .iter()
-        .filter(|item| {
-            !matches!(
-                item,
-                Item::Mod(module)
-                    if module.attrs.iter().any(|attribute| {
-                        let attribute = compact(attribute);
-                        attribute.contains("cfg(test)")
-                            || attribute.contains("cfg(all(test,")
-                    })
-            )
-        })
         .map(ToTokens::to_token_stream)
         .map(|tokens| tokens.to_string())
+        .filter(|tokens| {
+            let compact = tokens.replace(' ', "");
+            !compact.starts_with("#[cfg(test)]") && !compact.starts_with("#[cfg(all(test,")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1393,7 +1386,7 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
     }
 
     let report = source("src/host/report.rs");
-    let production_report = report.split("#[cfg(test)]").next().unwrap_or(&report);
+    let production_report = production_items(&report);
     let report_mutations = [
         "record_partition_reports",
         "complete_application_initialization",
@@ -1440,10 +1433,7 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "status RPC and post-command status must share the read-only reporter"
     );
     let observation = source("src/host/observation.rs");
-    let production_observation = observation
-        .split("#[cfg(test)]")
-        .next()
-        .unwrap_or(&observation);
+    let production_observation = production_items(&observation);
     for serialization in [
         "Serialize",
         "Deserialize",
@@ -1480,7 +1470,7 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "src/host/report.rs",
     ] {
         let source = source(consumer);
-        let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+        let production = production_items(&source);
         assert!(
             !production.contains("diagnostic_revision"),
             "{consumer} must not depend on unrelated engine diagnostics"
