@@ -48,6 +48,7 @@ pub enum EffectStage {
 pub struct PendingEffect {
     pub effect: RuntimeEffect,
     pub stage: EffectStage,
+    pub applied_result: Option<Box<RuntimeEffectResult>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

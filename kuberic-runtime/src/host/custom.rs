@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use crate::authority::{AdmittedAuthority, BuildAuthority, BuildSelection, DurableBuildProgress};
 use crate::effects::{
-    BuildPostcondition, RuntimeEffectAction, RuntimePostcondition, RuntimeSnapshot,
+    BuildPostcondition, RuntimeEffectAction, RuntimeEffectOutcome, RuntimeSnapshot,
 };
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, OperationId, ProcessSessionId, ReplicaIdentity,
@@ -129,7 +129,7 @@ struct BuildQueueAdmission {
 }
 
 pub(super) struct BuildCompletionConfirmation {
-    pub(super) postcondition: RuntimePostcondition,
+    pub(super) build: BuildPostcondition,
     _native: Option<ManagedFenceGuard>,
 }
 
@@ -344,19 +344,6 @@ fn validate_retirement_receipt(
         return Err(RuntimeError::OperationCancelled);
     }
     Ok(())
-}
-
-fn apply_progress_status(
-    postcondition: &mut RuntimePostcondition,
-    progress: &NativeProgressStatus,
-) {
-    postcondition.current_progress = progress.current_progress;
-    postcondition.verified_replication_lsn = progress.verified_replication_lsn;
-    postcondition.committed_lsn = progress.committed_lsn;
-    postcondition.current_configuration_quorum_progress =
-        progress.current_configuration_quorum_progress;
-    postcondition.catch_up_boundary = progress.catch_up_boundary;
-    postcondition.catch_up_complete = progress.catch_up_complete;
 }
 
 fn cleanup_releases_claim(result: &Result<()>) -> bool {
@@ -869,10 +856,22 @@ impl BuildLifecycle for ManagedLifecycleBackend {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let mut postcondition = self.common.narrow_postcondition().await;
-        apply_progress_status(&mut postcondition, native_guard.progress());
+        let build = self
+            .common
+            .state
+            .read()
+            .await
+            .builds
+            .iter()
+            .find(|build| {
+                &build.authority.build_id == build_id
+                    && &build.authority.target == target
+                    && build.completed
+            })
+            .cloned()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
         Ok(BuildCompletionConfirmation {
-            postcondition,
+            build,
             _native: Some(native_guard),
         })
     }
@@ -1368,16 +1367,21 @@ impl LifecycleObservation for ManagedLifecycleBackend {
         self.common.outbound_observation().await
     }
 
-    async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition {
-        let mut postcondition = self.common.narrow_postcondition().await;
-        match progress {
-            Some(progress) => apply_progress_status(&mut postcondition, progress),
-            None => {
-                let progress = self.legacy.progress_status().await;
-                apply_progress_status(&mut postcondition, &progress);
-            }
-        }
-        postcondition
+    async fn effect_outcome(
+        &self,
+        action: &RuntimeEffectAction,
+        progress: Option<&NativeProgressStatus>,
+        receipt: Option<&TopologyReceipt>,
+    ) -> Result<RuntimeEffectOutcome> {
+        let owned_progress = match progress {
+            Some(_) => None,
+            None => Some(self.legacy.progress_status().await),
+        };
+        self.common.effect_state().await.effect_outcome(
+            action,
+            progress.or(owned_progress.as_ref()),
+            receipt,
+        )
     }
 }
 
@@ -4226,15 +4230,18 @@ impl CustomReplicatorHost {
         }
     }
 
-    async fn narrow_postcondition(&self) -> RuntimePostcondition {
-        let mut snapshot = self.snapshot().await;
+    async fn effect_state(&self) -> ReplicaRuntimeState {
+        let mut state = self.state.read().await.clone();
         if let Some(host) = self.host.upgrade() {
             let fallback = host.state.read().await.fallback_snapshot.clone();
-            snapshot.open = fallback.open;
-            snapshot.role = fallback.role;
-            snapshot.role_transition = fallback.role_transition;
+            state.open = fallback.open;
+            state.role = fallback.role;
+            state.role_transition = fallback.role_transition;
+            state.read_status = fallback.read_status;
+            state.write_status = fallback.write_status;
+            state.authority = fallback.authority.or(state.authority);
         }
-        snapshot.into()
+        state
     }
 
     pub(super) async fn cancel_outbound_build(
@@ -4565,8 +4572,21 @@ impl BuildLifecycle for CustomReplicatorHost {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
+        let build = self
+            .state
+            .read()
+            .await
+            .builds
+            .iter()
+            .find(|build| {
+                &build.authority.build_id == build_id
+                    && &build.authority.target == target
+                    && build.completed
+            })
+            .cloned()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
         Ok(BuildCompletionConfirmation {
-            postcondition: self.narrow_postcondition().await,
+            build,
             _native: None,
         })
     }
@@ -4794,11 +4814,15 @@ impl LifecycleObservation for CustomReplicatorHost {
         CustomReplicatorHost::outbound_observation(self).await
     }
 
-    async fn postcondition(
+    async fn effect_outcome(
         &self,
-        _progress: Option<&NativeProgressStatus>,
-    ) -> RuntimePostcondition {
-        self.narrow_postcondition().await
+        action: &RuntimeEffectAction,
+        progress: Option<&NativeProgressStatus>,
+        receipt: Option<&TopologyReceipt>,
+    ) -> Result<RuntimeEffectOutcome> {
+        self.effect_state()
+            .await
+            .effect_outcome(action, progress, receipt)
     }
 }
 

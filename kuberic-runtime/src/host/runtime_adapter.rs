@@ -205,6 +205,7 @@ where
     pub(crate) async fn execute(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         match self.store.begin_effect(&effect).await? {
             BeginEffect::Completed(result) => {
+                require_matching_result(&effect, &result)?;
                 if let crate::effects::RuntimeEffectAction::BuildReplica {
                     build_id,
                     target,
@@ -216,6 +217,30 @@ where
                         .await?;
                 }
                 Ok(*result)
+            }
+            BeginEffect::Applied { effect, result } => {
+                require_matching_result(&effect, &result)?;
+                if matches!(
+                    effect.action,
+                    crate::effects::RuntimeEffectAction::SetAccessStatus { .. }
+                        | crate::effects::RuntimeEffectAction::SetReadStatus(_)
+                        | crate::effects::RuntimeEffectAction::SetWriteStatus(_)
+                ) {
+                    let execution = self.executor.prepare_runtime_effect(effect.clone()).await?;
+                    let observed = execution.result().clone();
+                    require_matching_result(&effect, &observed)?;
+                    if observed != *result {
+                        execution.reject().await?;
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "recovered access produced a changed canonical result".into(),
+                        ));
+                    }
+                    self.store.complete_effect(&result).await?;
+                    execution.accept().await
+                } else {
+                    self.store.complete_effect(&result).await?;
+                    Ok(*result)
+                }
             }
             BeginEffect::Execute(effect) | BeginEffect::Pending(effect) => {
                 let execution = match self.executor.prepare_runtime_effect(effect.clone()).await {
@@ -254,20 +279,22 @@ where
                     return Err(error);
                 }
                 let pending_build_completion = match &effect.action {
-                    crate::effects::RuntimeEffectAction::BuildReplica {
-                        build_id, target, ..
-                    } => !result.postcondition.builds.iter().any(|build| {
-                        &build.authority.build_id == build_id
-                            && &build.authority.target == target
-                            && build.completed
-                    }),
+                    crate::effects::RuntimeEffectAction::BuildReplica { .. } => matches!(
+                        &result.outcome,
+                        crate::effects::RuntimeEffectOutcome::BuildReplica(
+                            crate::effects::BuildCompletion {
+                                state: crate::effects::BuildEffectState::Dispatched,
+                                ..
+                            }
+                        )
+                    ),
                     _ => false,
                 };
                 if pending_build_completion {
                     let result = execution.accept().await?;
                     return Box::pin(self.await_build_completion(effect, result)).await;
                 }
-                if let Err(error) = self.store.mark_effect_applied(&effect).await {
+                if let Err(error) = self.store.mark_effect_applied(&effect, &result).await {
                     execution.reject().await?;
                     return Err(error);
                 }
@@ -306,7 +333,7 @@ where
                     .observe_build_completion(effect.clone())
                     .await?;
                 require_matching_result(&effect, &completed)?;
-                self.store.mark_effect_applied(&effect).await?;
+                self.store.mark_effect_applied(&effect, &completed).await?;
                 self.store.complete_effect(&completed).await?;
                 Ok(completed)
             }
@@ -382,7 +409,7 @@ where
             .consume_cancelled_build_effect(effect.clone())
             .await?;
         require_matching_result(&effect, &result)?;
-        self.store.mark_effect_applied(&effect).await?;
+        self.store.mark_effect_applied(&effect, &result).await?;
         self.store.complete_effect(&result).await?;
         Ok(Some(result))
     }
@@ -400,10 +427,7 @@ pub(crate) fn require_matching_result(
     effect: &RuntimeEffect,
     result: &RuntimeEffectResult,
 ) -> Result<()> {
-    if effect.operation_id != result.operation_id || effect.sequence != result.sequence {
-        return Err(crate::host::HostError::DurableEffectConflict(
-            "runtime returned a result for a different durable effect".into(),
-        ));
-    }
-    Ok(())
+    result
+        .validate_for(effect)
+        .map_err(|message| crate::host::HostError::DurableEffectConflict(message.into()))
 }

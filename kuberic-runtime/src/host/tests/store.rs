@@ -7,7 +7,8 @@ use crate::authority::{
     LocalWritePhase, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use crate::effects::{
-    RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
+    HistoricalSecondaryRemovalCompletion, RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome,
+    RuntimeEffectResult,
 };
 use crate::host::provisioning::{
     InitializationAuthority, ObservedStorageIdentity, StorePresence, authorize_initialization,
@@ -79,37 +80,30 @@ fn pending_acceptance_fixture() -> (
     state.pending_effect = Some(PendingEffect {
         effect: ordinary.clone(),
         stage: EffectStage::IntentCommitted,
+        applied_result: None,
     });
     let result = RuntimeEffectResult {
         operation_id: ordinary.operation_id.clone(),
         sequence: ordinary.sequence,
-        topology_receipt: None,
-        postcondition: RuntimePostcondition {
-            open: true,
-            role: state.role,
-            role_transition: None,
-            read_status: state.read_status,
-            write_status: state.write_status,
-            authority: Some(AdmittedAuthority {
-                local_identity: local,
-                transition_kind: None,
-                previous_configuration: None,
-                current_configuration: intent.current_configuration.clone(),
-                switchover_handoff: None,
-                scale_up: None,
-                secondary_removal: Some(committed.evidence.clone()),
-            }),
-            prepared_secondary_removal: None,
-            retired_authority: None,
-            accepted_secondary_removal: Some(committed),
-            current_progress: 10,
-            verified_replication_lsn: Some(10),
-            committed_lsn: 10,
-            current_configuration_quorum_progress: 0,
-            catch_up_boundary: Some(10),
-            catch_up_complete: false,
-            builds: Vec::new(),
-        },
+        outcome: RuntimeEffectOutcome::HistoricalSecondaryRemovalAccepted(
+            HistoricalSecondaryRemovalCompletion {
+                accepted_secondary_removal: committed.clone(),
+                authority: Some(AdmittedAuthority {
+                    local_identity: local,
+                    transition_kind: None,
+                    previous_configuration: None,
+                    current_configuration: intent.current_configuration.clone(),
+                    switchover_handoff: None,
+                    scale_up: None,
+                    secondary_removal: Some(committed.evidence.clone()),
+                }),
+                role: state.role,
+                write_status: state.write_status,
+                role_transition_clear: true,
+                verified_replication_lsn: Some(10),
+                receipt: None,
+            },
+        ),
     };
     (state, ordinary, historical, result)
 }
@@ -128,9 +122,12 @@ async fn exhausted_effect_sequence_persists_and_rejects_new_intents_after_reopen
     };
     result.sequence = effect.sequence;
     result.operation_id = effect.operation_id.clone();
+    result.outcome = RuntimeEffectOutcome::ApplicationProgressRefreshed {
+        current_progress: 10,
+    };
     let store = SqliteStore::create_authorized(&path, state).unwrap();
     store.begin_effect(&effect).await.unwrap();
-    store.mark_effect_applied(&effect).await.unwrap();
+    store.mark_effect_applied(&effect, &result).await.unwrap();
     store.complete_effect(&result).await.unwrap();
     drop(store);
     let store = SqliteStore::open_existing(&path, None).unwrap();
@@ -157,12 +154,15 @@ async fn exhausted_effect_sequence_persists_and_rejects_new_intents_after_reopen
 }
 
 #[tokio::test]
-async fn pending_acceptance_conversion_is_atomic_one_way_and_preserves_stage_and_results() {
+async fn pending_acceptance_conversion_is_atomic_one_way_and_resets_canonical_baseline() {
     for stage in [EffectStage::IntentCommitted, EffectStage::EffectApplied] {
         let directory = tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let (mut state, ordinary, historical, result) = pending_acceptance_fixture();
         state.pending_effect.as_mut().unwrap().stage = stage;
+        if stage == EffectStage::EffectApplied {
+            state.pending_effect.as_mut().unwrap().applied_result = Some(Box::new(result.clone()));
+        }
         let mut retained = RetainedResult {
             operation_id: OperationId::new("previous-effect"),
             effect: ordinary.clone(),
@@ -172,7 +172,12 @@ async fn pending_acceptance_conversion_is_atomic_one_way_and_preserves_stage_and
         retained.result.operation_id = retained.operation_id.clone();
         state.retained_result = Some(retained.clone());
         let store = SqliteStore::create_authorized(&path, state.clone()).unwrap();
-        let authority = result.postcondition.authority.as_ref().unwrap();
+        let authority = match &result.outcome {
+            RuntimeEffectOutcome::HistoricalSecondaryRemovalAccepted(completion) => {
+                completion.authority.as_ref().unwrap()
+            }
+            _ => unreachable!(),
+        };
         store.admit(authority).await.unwrap();
         store
             .record_replication_progress(&ReplicationProgress {
@@ -203,6 +208,8 @@ async fn pending_acceptance_conversion_is_atomic_one_way_and_preserves_stage_and
             BeginEffect::Pending(historical.clone())
         );
         state.pending_effect.as_mut().unwrap().effect = historical.clone();
+        state.pending_effect.as_mut().unwrap().stage = EffectStage::IntentCommitted;
+        state.pending_effect.as_mut().unwrap().applied_result = None;
         assert_eq!(store.load_state().await.unwrap(), state);
         drop(store);
         let store = SqliteStore::open_existing(&path, Some(&state.identity)).unwrap();
@@ -215,10 +222,13 @@ async fn pending_acceptance_conversion_is_atomic_one_way_and_preserves_stage_and
             store.begin_effect(&ordinary).await.is_err(),
             "no widening back to live acceptance"
         );
-        assert!(store.mark_effect_applied(&ordinary).await.is_err());
+        assert!(store.mark_effect_applied(&ordinary, &result).await.is_err());
         assert!(store.cancel_effect(&ordinary).await.is_err());
         assert_eq!(store.load_state().await.unwrap(), state);
-        store.mark_effect_applied(&historical).await.unwrap();
+        store
+            .mark_effect_applied(&historical, &result)
+            .await
+            .unwrap();
         store.complete_effect(&result).await.unwrap();
         drop(store);
         let store = SqliteStore::open_existing(&path, Some(&state.identity)).unwrap();
@@ -255,7 +265,12 @@ async fn pending_acceptance_conversion_rejects_mutation_and_incompatible_durable
         let directory = tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let (mut state, ordinary, mut historical, result) = pending_acceptance_fixture();
-        let mut authority = result.postcondition.authority.clone().unwrap();
+        let mut authority = match &result.outcome {
+            RuntimeEffectOutcome::HistoricalSecondaryRemovalAccepted(completion) => {
+                completion.authority.clone().unwrap()
+            }
+            _ => unreachable!(),
+        };
         let mut progress = ReplicationProgress {
             fence: authority.fence(),
             verified_lsn: 10,
@@ -388,7 +403,7 @@ async fn schema_two_is_rejected_without_migration_or_provenance_changes() {
     assert!(matches!(
         SqliteStore::open_existing(&path, None),
         Err(crate::host::HostError::SchemaMismatch {
-            expected: 5,
+            expected: 6,
             observed: 2
         })
     ));
@@ -699,7 +714,7 @@ fn fresh_scale_up_store_requires_exact_frozen_authority() {
         InitializationAuthority::ScaleUp(&provisioning),
     )
     .unwrap();
-    assert_eq!(identity.schema_version, 5);
+    assert_eq!(identity.schema_version, 6);
 
     for mutation in 0..6 {
         let mut stale = command.clone();

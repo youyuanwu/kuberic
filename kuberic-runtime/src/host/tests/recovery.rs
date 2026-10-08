@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::application::OpenMode;
 use crate::effects::{
-    RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition, RuntimeSnapshot,
+    RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult, RuntimeSnapshot,
 };
 use crate::host::Result;
 use crate::host::hosting::empty_snapshot;
@@ -54,25 +54,7 @@ fn result() -> RuntimeEffectResult {
     RuntimeEffectResult {
         operation_id: effect().operation_id,
         sequence: 1,
-        topology_receipt: None,
-        postcondition: RuntimePostcondition {
-            prepared_secondary_removal: None,
-            retired_authority: None,
-            accepted_secondary_removal: None,
-            open: true,
-            role: snapshot().role,
-            role_transition: None,
-            read_status: AccessStatus::NotPrimary,
-            write_status: AccessStatus::NotPrimary,
-            authority: None,
-            current_progress: 0,
-            verified_replication_lsn: None,
-            committed_lsn: 0,
-            current_configuration_quorum_progress: 0,
-            catch_up_boundary: None,
-            catch_up_complete: false,
-            builds: Vec::new(),
-        },
+        outcome: RuntimeEffectOutcome::Opened,
     }
 }
 
@@ -116,7 +98,10 @@ async fn committed_and_applied_intents_recover_without_losing_retained_completio
             BeginEffect::Execute(effect())
         );
         if applied {
-            store.mark_effect_applied(&effect()).await.unwrap();
+            store
+                .mark_effect_applied(&effect(), &result())
+                .await
+                .unwrap();
         }
         drop(store);
 
@@ -133,7 +118,7 @@ async fn committed_and_applied_intents_recover_without_losing_retained_completio
             recover_pending(&adapter, &snapshot().into()).await.unwrap(),
             Some(result())
         );
-        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), usize::from(!applied));
         assert!(
             reopened
                 .load_state()

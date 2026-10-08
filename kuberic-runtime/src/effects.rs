@@ -1,5 +1,6 @@
 use crate::protocol::types::{
-    AccessStatus, ConfigurationId, OperationId, ReplicaIdentity, ReplicaRole, SwitchoverRequestId,
+    AccessStatus, ConfigurationId, Epoch, OperationId, ReplicaIdentity, ReplicaRole,
+    SwitchoverRequestId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +10,9 @@ use crate::protocol::types::{
     ProcessSessionId, SecondaryRemovalPreparation, SecondaryRemovalWitness,
     SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
 };
-use crate::receipts::TopologyReceipt;
+use crate::receipts::{
+    CertifiedPrefixReceipt, RetirementReceipt, SecondaryRemovalReceipt, SwitchoverReceipt,
+};
 
 use crate::application::OpenMode;
 
@@ -126,56 +129,342 @@ pub(crate) struct RuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RuntimePostcondition {
-    pub(crate) open: bool,
+pub(crate) struct RoleCompletion {
     pub(crate) role: ReplicaRole,
     pub(crate) role_transition: Option<RoleTransition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EpochCompletion {
+    pub(crate) epoch: Epoch,
+    pub(crate) role_transition: Option<RoleTransition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AccessCompletion {
     pub(crate) read_status: AccessStatus,
     pub(crate) write_status: AccessStatus,
     pub(crate) authority: Option<AdmittedAuthority>,
-    #[serde(default)]
-    pub(crate) prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
-    #[serde(default)]
-    pub(crate) retired_authority: Option<RetiredAuthority>,
-    #[serde(default)]
+    pub(crate) role: ReplicaRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CatchUpCompletion {
+    pub(crate) authority: Option<AdmittedAuthority>,
+    pub(crate) boundary_lsn: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum BuildEffectState {
+    Dispatched,
+    Completed(BuildPostcondition),
+    Abandoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BuildCompletion {
+    pub(crate) build_id: OperationId,
+    pub(crate) target: ReplicaIdentity,
+    pub(crate) state: BuildEffectState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AuthorityCompletion {
+    pub(crate) authority: AdmittedAuthority,
+    pub(crate) read_status: AccessStatus,
+    pub(crate) write_status: AccessStatus,
     pub(crate) accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SecondaryRemovalPreparationCompletion {
+    pub(crate) prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
+    pub(crate) authority: Option<AdmittedAuthority>,
+    pub(crate) role: ReplicaRole,
+    pub(crate) read_status: AccessStatus,
+    pub(crate) write_status: AccessStatus,
     pub(crate) current_progress: i64,
     pub(crate) verified_replication_lsn: Option<i64>,
     pub(crate) committed_lsn: i64,
-    pub(crate) current_configuration_quorum_progress: i64,
-    pub(crate) catch_up_boundary: Option<i64>,
-    pub(crate) catch_up_complete: bool,
-    pub(crate) builds: Vec<BuildPostcondition>,
+    pub(crate) receipt: Option<Box<SecondaryRemovalReceipt>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HistoricalSecondaryRemovalCompletion {
+    pub(crate) accepted_secondary_removal: SecondaryScaleDownCleanup,
+    pub(crate) authority: Option<AdmittedAuthority>,
+    pub(crate) role: ReplicaRole,
+    pub(crate) write_status: AccessStatus,
+    pub(crate) role_transition_clear: bool,
+    pub(crate) verified_replication_lsn: Option<i64>,
+    pub(crate) receipt: Option<Box<SecondaryRemovalReceipt>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SwitchoverCompletion {
+    pub(crate) authority: Option<AdmittedAuthority>,
+    pub(crate) role: ReplicaRole,
+    pub(crate) write_status: AccessStatus,
+    pub(crate) current_progress: i64,
+    pub(crate) committed_lsn: i64,
+    pub(crate) receipt: Option<Box<SwitchoverReceipt>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetirementCompletion {
+    pub(crate) retired: RetiredAuthority,
+    pub(crate) open: bool,
+    pub(crate) role: ReplicaRole,
+    pub(crate) read_status: AccessStatus,
+    pub(crate) write_status: AccessStatus,
+    pub(crate) authority: Option<AdmittedAuthority>,
+    pub(crate) role_transition_clear: bool,
+    pub(crate) active_builds: bool,
+    pub(crate) receipt: Option<Box<RetirementReceipt>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProcessCompletion {
+    pub(crate) open: bool,
+    pub(crate) role: ReplicaRole,
+    pub(crate) read_status: AccessStatus,
+    pub(crate) write_status: AccessStatus,
+    pub(crate) authority: Option<AdmittedAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RuntimeEffectOutcome {
+    Opened,
+    AuthorityAdmitted(AuthorityCompletion),
+    SecondaryRemovalPrepared(SecondaryRemovalPreparationCompletion),
+    PeerSessionRegistered {
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    },
+    SecondaryRemovalWitnessObserved {
+        witness: Box<SecondaryRemovalWitness>,
+        receipt: Option<Box<SecondaryRemovalReceipt>>,
+    },
+    SecondaryRemovalProgressObserved {
+        witness: Box<SecondaryRemovalWitness>,
+        committed: Box<SecondaryScaleDownCleanup>,
+        receipt: Option<Box<SecondaryRemovalReceipt>>,
+    },
+    ReplicationAckObserved {
+        acknowledgement: Box<crate::transport::ReplicationAck>,
+        session: ProcessSessionId,
+    },
+    SecondaryRemovalAccepted {
+        committed: Box<SecondaryScaleDownCleanup>,
+        receipt: Option<Box<SecondaryRemovalReceipt>>,
+    },
+    HistoricalSecondaryRemovalAccepted(HistoricalSecondaryRemovalCompletion),
+    ReplicaRetired(RetirementCompletion),
+    RetirementFenced(RetirementCompletion),
+    RetirementCompleted(RetirementCompletion),
+    FailoverPrefixAuthorized {
+        boundary_lsn: i64,
+        receipt: Option<Box<CertifiedPrefixReceipt>>,
+    },
+    BuildAuthorityAdmitted {
+        authority: Box<BuildAuthority>,
+    },
+    RoleChanged(RoleCompletion),
+    ReplicatorRoleChanged(RoleCompletion),
+    EpochUpdated(EpochCompletion),
+    ApplicationRoleChanged {
+        completion: RoleCompletion,
+        receipt: Option<Box<CertifiedPrefixReceipt>>,
+    },
+    CatchUpCompleted(CatchUpCompletion),
+    AccessChanged(AccessCompletion),
+    SwitchoverPrepared(SwitchoverCompletion),
+    ApplicationProgressRefreshed {
+        current_progress: i64,
+    },
+    BuildReplica(BuildCompletion),
+    BuildRetired {
+        build_id: OperationId,
+        active: bool,
+    },
+    Closed(ProcessCompletion),
+    Aborted(ProcessCompletion),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RuntimeEffectResult {
     pub(crate) operation_id: OperationId,
     pub(crate) sequence: u64,
-    #[serde(default)]
-    pub(crate) topology_receipt: Option<Box<TopologyReceipt>>,
-    pub(crate) postcondition: RuntimePostcondition,
+    pub(crate) outcome: RuntimeEffectOutcome,
 }
 
-impl From<RuntimeSnapshot> for RuntimePostcondition {
-    fn from(snapshot: RuntimeSnapshot) -> Self {
-        Self {
-            open: snapshot.open,
-            role: snapshot.role,
-            role_transition: snapshot.role_transition,
-            read_status: snapshot.read_status,
-            write_status: snapshot.write_status,
-            authority: snapshot.authority,
-            prepared_secondary_removal: snapshot.prepared_secondary_removal,
-            retired_authority: snapshot.retired_authority,
-            accepted_secondary_removal: snapshot.accepted_secondary_removal,
-            current_progress: snapshot.current_progress,
-            verified_replication_lsn: snapshot.verified_replication_lsn,
-            committed_lsn: snapshot.committed_lsn,
-            current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
-            catch_up_boundary: snapshot.catch_up_boundary,
-            catch_up_complete: snapshot.catch_up_complete,
-            builds: snapshot.builds,
+impl RuntimeEffectResult {
+    pub(crate) fn validate_for(&self, effect: &RuntimeEffect) -> Result<(), &'static str> {
+        if self.operation_id != effect.operation_id || self.sequence != effect.sequence {
+            return Err("runtime returned a result for a different durable effect");
+        }
+        let valid = match (&effect.action, &self.outcome) {
+            (RuntimeEffectAction::Open(_), RuntimeEffectOutcome::Opened) => true,
+            (
+                RuntimeEffectAction::AdmitAuthority(expected),
+                RuntimeEffectOutcome::AuthorityAdmitted(completion),
+            ) => completion.authority == **expected,
+            (
+                RuntimeEffectAction::PrepareSecondaryRemoval {
+                    intent,
+                    process_session_id,
+                    report_sequence,
+                },
+                RuntimeEffectOutcome::SecondaryRemovalPrepared(completion),
+            ) => completion
+                .prepared_secondary_removal
+                .as_ref()
+                .is_some_and(|prepared| {
+                    prepared.intent == **intent
+                        && prepared.process_session_id == *process_session_id
+                        && prepared.report_sequence == *report_sequence
+                        && prepared.operation_id == effect.operation_id
+                }),
+            (
+                RuntimeEffectAction::RegisterPeerSession { identity, session },
+                RuntimeEffectOutcome::PeerSessionRegistered {
+                    identity: completed_identity,
+                    session: completed_session,
+                },
+            ) => identity == completed_identity && session == completed_session,
+            (
+                RuntimeEffectAction::ObserveSecondaryRemovalWitness(expected),
+                RuntimeEffectOutcome::SecondaryRemovalWitnessObserved { witness, .. },
+            ) => expected == witness,
+            (
+                RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed },
+                RuntimeEffectOutcome::SecondaryRemovalProgressObserved {
+                    witness: completed_witness,
+                    committed: completed_cleanup,
+                    ..
+                },
+            ) => witness == completed_witness && committed == completed_cleanup,
+            (
+                RuntimeEffectAction::ObserveReplicationAck {
+                    acknowledgement,
+                    session,
+                },
+                RuntimeEffectOutcome::ReplicationAckObserved {
+                    acknowledgement: completed_acknowledgement,
+                    session: completed_session,
+                },
+            ) => acknowledgement == completed_acknowledgement && session == completed_session,
+            (
+                RuntimeEffectAction::AcceptSecondaryRemovalCommit(expected),
+                RuntimeEffectOutcome::SecondaryRemovalAccepted { committed, .. },
+            ) => expected == committed,
+            (
+                RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command),
+                RuntimeEffectOutcome::HistoricalSecondaryRemovalAccepted(completion),
+            ) => completion.accepted_secondary_removal == command.committed,
+            (
+                RuntimeEffectAction::RetireReplica(expected),
+                RuntimeEffectOutcome::ReplicaRetired(completion),
+            )
+            | (
+                RuntimeEffectAction::FenceRetirement(expected),
+                RuntimeEffectOutcome::RetirementFenced(completion),
+            )
+            | (
+                RuntimeEffectAction::CompleteRetirement(expected),
+                RuntimeEffectOutcome::RetirementCompleted(completion),
+            ) => completion.retired == **expected,
+            (
+                RuntimeEffectAction::AuthorizeFailoverPrefix(expected),
+                RuntimeEffectOutcome::FailoverPrefixAuthorized { boundary_lsn, .. },
+            ) => expected == boundary_lsn,
+            (
+                RuntimeEffectAction::AdmitBuildAuthority(expected),
+                RuntimeEffectOutcome::BuildAuthorityAdmitted { authority },
+            ) => expected == authority,
+            (
+                RuntimeEffectAction::ChangeRole(expected),
+                RuntimeEffectOutcome::RoleChanged(completion),
+            ) => completion.role == *expected,
+            (
+                RuntimeEffectAction::ChangeReplicatorRole(expected),
+                RuntimeEffectOutcome::ReplicatorRoleChanged(completion),
+            ) => completion
+                .role_transition
+                .as_ref()
+                .is_some_and(|transition| {
+                    transition.target_role == *expected && transition.replicator_completed
+                }),
+            (RuntimeEffectAction::UpdateEpoch, RuntimeEffectOutcome::EpochUpdated(completion)) => {
+                completion
+                    .role_transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.epoch_completed)
+            }
+            (
+                RuntimeEffectAction::ChangeApplicationRole(expected),
+                RuntimeEffectOutcome::ApplicationRoleChanged { completion, .. },
+            ) => completion.role == *expected && completion.role_transition.is_none(),
+            (RuntimeEffectAction::WaitForCatchup, RuntimeEffectOutcome::CatchUpCompleted(_)) => {
+                true
+            }
+            (
+                RuntimeEffectAction::SetAccessStatus { read, write },
+                RuntimeEffectOutcome::AccessChanged(completion),
+            ) => completion.read_status == *read && completion.write_status == *write,
+            (
+                RuntimeEffectAction::SetReadStatus(expected),
+                RuntimeEffectOutcome::AccessChanged(completion),
+            ) => completion.read_status == *expected,
+            (
+                RuntimeEffectAction::SetWriteStatus(expected),
+                RuntimeEffectOutcome::AccessChanged(completion),
+            ) => completion.write_status == *expected,
+            (
+                RuntimeEffectAction::PrepareSwitchover {
+                    preparation_generation,
+                    request_id,
+                    source,
+                    target,
+                    starting_configuration_id,
+                    starting_epoch,
+                },
+                RuntimeEffectOutcome::SwitchoverPrepared(completion),
+            ) => completion.receipt.as_ref().is_none_or(|receipt| {
+                receipt.preparation_generation == *preparation_generation
+                    && receipt.request_id == *request_id
+                    && receipt.source == *source
+                    && receipt.target == *target
+                    && receipt.starting_configuration_id == *starting_configuration_id
+                    && receipt.starting_epoch == *starting_epoch
+            }),
+            (
+                RuntimeEffectAction::RefreshApplicationProgress,
+                RuntimeEffectOutcome::ApplicationProgressRefreshed { .. },
+            ) => true,
+            (
+                RuntimeEffectAction::BuildReplica {
+                    build_id, target, ..
+                },
+                RuntimeEffectOutcome::BuildReplica(completion),
+            ) => completion.build_id == *build_id && completion.target == *target,
+            (
+                RuntimeEffectAction::RetireBuild(expected),
+                RuntimeEffectOutcome::BuildRetired { build_id, active },
+            ) => expected == build_id && !active,
+            (RuntimeEffectAction::Close, RuntimeEffectOutcome::Closed(completion))
+            | (RuntimeEffectAction::Abort, RuntimeEffectOutcome::Aborted(completion)) => {
+                !completion.open
+                    && completion.role == ReplicaRole::None
+                    && completion.read_status == AccessStatus::NotPrimary
+                    && completion.write_status == AccessStatus::NotPrimary
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err("runtime result does not match the durable effect action")
         }
     }
 }
