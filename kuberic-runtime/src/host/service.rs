@@ -524,6 +524,7 @@ where
             control.abort();
             replication.abort();
             let _ = tokio::join!(&mut control, &mut replication);
+            self.runtime.shutdown_recovery_tasks().await;
             self.runtime.quiesce_partition_reports().await;
             let persisted = self.persist_partition_fault().await;
             self.runtime.abort();

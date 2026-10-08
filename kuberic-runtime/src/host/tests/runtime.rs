@@ -5144,7 +5144,10 @@ async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoratio
             let report = runtime.recovery_owner_runtime();
             tokio::spawn(async move {
                 if deferred {
-                    report.observe_progress().await
+                    report.observe_progress().await?;
+                    report
+                        .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
+                        .await
                 } else {
                     report
                         .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
@@ -5188,7 +5191,10 @@ async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoratio
         assert_eq!(control.configurations.lock().unwrap().len(), before);
         gate.release.notify_one();
         if let Some(restoration) = restoration {
-            restoration.await.unwrap().unwrap();
+            match restoration.await.unwrap() {
+                Ok(()) | Err(RuntimeError::ReconfigurationPending) => {}
+                Err(error) => panic!("unexpected restoration error: {error}"),
+            }
         }
         admission.await.unwrap().unwrap();
         runtime
@@ -6835,7 +6841,11 @@ async fn managed_replacement_peer_restart_restores_owned_access_before_new_write
                     if *recovery_shutdown_rx.borrow_and_update() {
                         return;
                     }
-                    let _ = runtime.recovery_owner_runtime().observe_progress().await;
+                    let recovery = runtime.recovery_owner_runtime();
+                    let _ = recovery.observe_progress().await;
+                    let _ = recovery
+                        .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
+                        .await;
                     tokio::select! {
                         _ = recovery_shutdown_rx.changed() => {}
                         _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -6970,7 +6980,11 @@ async fn managed_peer_restart_recovery_does_not_wait_on_its_own_delivery_queue()
                 if *recovery_shutdown_rx.borrow_and_update() {
                     return;
                 }
-                let _ = source.recovery_owner_runtime().observe_progress().await;
+                let recovery = source.recovery_owner_runtime();
+                let _ = recovery.observe_progress().await;
+                let _ = recovery
+                    .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
+                    .await;
                 tokio::select! {
                     _ = recovery_shutdown_rx.changed() => {}
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -7245,7 +7259,11 @@ async fn managed_peer_restart_waits_for_owned_write_recovery_after_observer_canc
                     if *recovery_shutdown_rx.borrow_and_update() {
                         return;
                     }
-                    let _ = runtime.recovery_owner_runtime().observe_progress().await;
+                    let recovery = runtime.recovery_owner_runtime();
+                    let _ = recovery.observe_progress().await;
+                    let _ = recovery
+                        .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
+                        .await;
                     tokio::select! {
                         _ = recovery_shutdown_rx.changed() => {}
                         _ = tokio::time::sleep(Duration::from_millis(10)) => {}

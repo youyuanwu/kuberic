@@ -736,11 +736,7 @@ pub(super) struct ReportLifecycle {
 
 impl ReportLifecycle {
     pub(super) async fn observe_progress(&self) -> Result<()> {
-        self.observation.observe_progress().await?;
-        if let Some((read, write)) = self.access.restored_access().await {
-            commit_access(self.access.clone(), read, write).await?;
-        }
-        Ok(())
+        self.observation.observe_progress().await
     }
 
     pub(super) async fn reconcile_access(
