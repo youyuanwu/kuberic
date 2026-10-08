@@ -25,6 +25,7 @@ use crate::host::Result;
 use crate::host::coordinator::Coordinator;
 use crate::host::hosting::{PodRuntime, RuntimeDataPlane};
 use crate::host::provisioning::{InitializationAuthority, ObservedStorageIdentity};
+use crate::host::recovery::RecoveryOwner;
 use crate::host::report::AgentReporter;
 use crate::host::runtime_adapter::RuntimeEffectExecutor;
 use crate::host::session::ProcessSession;
@@ -523,6 +524,7 @@ where
             control.abort();
             replication.abort();
             let _ = tokio::join!(&mut control, &mut replication);
+            self.runtime.quiesce_partition_reports();
             let persisted = self.persist_partition_fault().await;
             self.runtime.abort();
             if let Err(persisted) = persisted {
@@ -533,10 +535,19 @@ where
             return Err(error);
         }
 
+        let mut recovery_owner =
+            RecoveryOwner::new(self.runtime.recovery_owner_runtime(), self.store.clone());
+        if let Err(error) = recovery_owner.advance().await {
+            tracing::warn!(%error, "initial lifecycle recovery pass will retry");
+        }
+        let recovery_shutdown = shutdown.clone();
+        let recovery_owner_task =
+            tokio::spawn(async move { recovery_owner.run(recovery_shutdown).await });
+
         self.ready_state.store(true, Ordering::Release);
         ready.send_replace(true);
         let recovery_coordinator = self.coordinator.clone();
-        let recovery_task = tokio::spawn(async move {
+        let configuration_recovery_task = tokio::spawn(async move {
             if let Err(error) = recovery_coordinator.resume_configuration().await {
                 tracing::warn!(%error, "background configuration recovery stopped");
             }
@@ -565,8 +576,11 @@ where
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
-        recovery_task.abort();
-        let _ = recovery_task.await;
+        self.runtime.quiesce_partition_reports();
+        configuration_recovery_task.abort();
+        let _ = configuration_recovery_task.await;
+        recovery_owner_task.abort();
+        let _ = recovery_owner_task.await;
         let persisted = self.persist_partition_fault().await;
         self.runtime.abort();
         persisted?;
@@ -576,11 +590,9 @@ where
     async fn persist_partition_fault(&self) -> Result<()> {
         tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
             let partition = self.runtime.partition_report().await;
-            if partition.reported_fault.is_some() {
-                self.store
-                    .record_partition_reports(partition.load_metrics, partition.reported_fault)
-                    .await?;
-            }
+            self.store
+                .record_partition_reports(partition.load_metrics, partition.reported_fault)
+                .await?;
             Ok(())
         })
         .await

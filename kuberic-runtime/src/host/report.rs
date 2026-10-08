@@ -30,68 +30,22 @@ impl<S: AgentStore> AgentReporter<S> {
     }
 
     pub(crate) async fn report(&self, runtime: &ReportRuntime) -> Result<proto::AgentStatusReport> {
-        for attempt in 0..100 {
-            match runtime.observe_progress().await {
-                Ok(()) | Err(crate::RuntimeError::ReconfigurationPending) => break,
-                Err(crate::RuntimeError::OperationCancelled) if attempt < 99 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let durable: DurableAgentObservation = self.store.load_state().await?.into();
-        let snapshot = runtime.observation().await;
-        if durable.pending_effect.is_none()
-            && durable.reconfiguration.is_none()
-            && (snapshot.host.read_status != durable.read_status
-                || snapshot.host.write_status != durable.write_status)
-        {
-            for attempt in 0..100 {
-                match runtime
-                    .reconcile_durable_access(durable.read_status, durable.write_status)
-                    .await
-                {
-                    Ok(())
-                    | Err(
-                        crate::RuntimeError::ReconfigurationPending
-                        | crate::RuntimeError::NotOpen
-                        | crate::RuntimeError::Closed,
-                    ) => break,
-                    Err(crate::RuntimeError::OperationCancelled) if attempt < 99 => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        continue;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
         let partition = runtime.partition_report().await;
-        self.store
-            .record_partition_reports(partition.load_metrics.clone(), partition.reported_fault)
-            .await?;
         for _ in 0..3 {
             let state: DurableAgentObservation = self.store.load_state().await?.into();
             let snapshot = runtime.observation().await;
-            let catch_up_capability =
-                if snapshot.host.open && snapshot.host.role != ReplicaRole::None {
-                    Some(runtime.catch_up_capability().await?)
-                } else {
-                    None
-                };
             let confirmed_snapshot = runtime.observation().await;
             let confirmed_state: DurableAgentObservation = self.store.load_state().await?.into();
-            if state != confirmed_state
-                || !same_report_fence(&snapshot, &confirmed_snapshot)
-                || !snapshot_matches_state(&confirmed_snapshot, &confirmed_state)
-            {
+            let durable_stable = state == confirmed_state;
+            let fence_stable = same_report_fence(&snapshot, &confirmed_snapshot);
+            let ownership_matches = snapshot_matches_state(&confirmed_snapshot, &confirmed_state);
+            if !durable_stable || !fence_stable || !ownership_matches {
                 continue;
             }
             return Ok(build_report(
                 &self.session,
                 confirmed_state,
                 confirmed_snapshot,
-                catch_up_capability,
                 partition.reported_fault,
             ));
         }
@@ -105,7 +59,6 @@ fn build_report(
     session: &ProcessSession,
     state: DurableAgentObservation,
     snapshot: ReportObservation,
-    catch_up_capability: Option<i64>,
     reported_fault: Option<FaultType>,
 ) -> proto::AgentStatusReport {
     let state = state.into_state();
@@ -182,7 +135,7 @@ fn build_report(
         current_progress: snapshot.engine.current_progress,
         verified_replication_lsn: snapshot.engine.verified_replication_lsn,
         committed_lsn: snapshot.engine.committed_lsn,
-        catch_up_capability,
+        catch_up_capability: snapshot.engine.catch_up_capability,
         storage_state: proto::AgentStorageState::Initialized as i32,
         pod_uid: state.identity.pod_uid.to_string(),
         pvc_uid: state.identity.pvc_uid.to_string(),
@@ -294,12 +247,13 @@ fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObse
             })
         }
         (Some(fence), None) => fence.configuration.is_none(),
-        (None, _) => snapshot.host.live_builds_only,
+        (None, _) => !snapshot.host.engine_required,
     };
-    let generation_linked = if snapshot.host.live_builds_only {
+    let generation_linked = if !snapshot.host.engine_required {
         snapshot.engine.host_generation.is_none()
     } else {
-        snapshot.engine.host_generation == Some(snapshot.host.configuration_generation)
+        snapshot.engine.host_generation == snapshot.host.engine_host_generation
+            && snapshot.host.engine_host_generation.is_some()
     };
     snapshot.host.role == state.role
         && access_matches(snapshot.host.read_status, state.read_status)
@@ -416,19 +370,13 @@ mod tests {
         snapshot.live_builds_only = true;
         let fresh = ProcessSession::new();
         assert!(
-            build_report(
-                &fresh,
-                state.clone().into(),
-                snapshot.clone().into(),
-                None,
-                None,
-            )
-            .builds
-            .is_empty()
+            build_report(&fresh, state.clone().into(), snapshot.clone().into(), None,)
+                .builds
+                .is_empty()
         );
         snapshot.live_builds_only = false;
         assert_eq!(
-            build_report(&fresh, state.into(), snapshot.into(), None, None)
+            build_report(&fresh, state.into(), snapshot.into(), None)
                 .builds
                 .len(),
             1
@@ -506,6 +454,8 @@ mod tests {
             crate::host::hosting::empty_snapshot(identity).into();
         observation.host.read_status = AccessStatus::ReconfigurationPending;
         observation.host.write_status = AccessStatus::ReconfigurationPending;
+        observation.host.engine_required = true;
+        observation.host.engine_host_generation = Some(0);
         let engine_fence = crate::replicator::ManagedOperationFence {
             configuration: None,
             engine_session_id: "engine-session".into(),

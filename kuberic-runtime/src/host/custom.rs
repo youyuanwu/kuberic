@@ -419,6 +419,7 @@ type DeferredConfiguration = tokio::task::JoinHandle<Result<(u64, ReplicaSetConf
 struct ManagedLifecycleBackend {
     legacy: Arc<dyn ManagedReplicatorLifecycle>,
     common: Arc<CustomReplicatorHost>,
+    engine_host_generation: AtomicU64,
     accepted_builds: RwLock<BTreeMap<OperationId, AcceptedBuild>>,
     topology_receipt: RwLock<Option<TopologyReceipt>>,
 }
@@ -498,20 +499,21 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
         if let Some(authority) = &authority {
             authority.validate()?;
         }
+        let host_generation = self.common.configuration_generation.load(Ordering::Acquire);
         self.legacy
             .restore_engine_proof(
                 authority.as_ref().map(managed_configuration),
-                self.common.configuration_generation.load(Ordering::Acquire),
+                host_generation,
             )
             .await?;
         self.common.restore_authority().await?;
         if authority.is_some() {
             self.legacy
-                .synchronize_replica_configuration(
-                    self.common.configuration_generation.load(Ordering::Acquire),
-                )
+                .synchronize_replica_configuration(host_generation)
                 .await?;
         }
+        self.engine_host_generation
+            .store(host_generation, Ordering::Release);
         self.sync_topology_status().await
     }
 
@@ -546,11 +548,12 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
             gate.release.notified().await;
         }
         self.common.install_managed_authority(&authority).await?;
+        let host_generation = self.common.configuration_generation.load(Ordering::Acquire);
         self.legacy
-            .synchronize_replica_configuration(
-                self.common.configuration_generation.load(Ordering::Acquire),
-            )
+            .synchronize_replica_configuration(host_generation)
             .await?;
+        self.engine_host_generation
+            .store(host_generation, Ordering::Release);
         self.sync_topology_status().await
     }
 
@@ -1260,6 +1263,9 @@ impl LifecycleObservation for ManagedLifecycleBackend {
         let engine = self.engine_snapshot_for_host().await;
         observation.engine.host_generation = Some(engine.host_generation);
         observation.engine.fence = Some(engine.fence.clone());
+        observation.host.engine_required = true;
+        observation.host.engine_host_generation =
+            Some(self.engine_host_generation.load(Ordering::Acquire));
         if let Some(pending) = observation.host.pending_access.as_mut() {
             pending.engine_fence = Some(engine.fence);
         }
@@ -1543,6 +1549,7 @@ impl ReplicatorLifecycleRegistration {
         let backend = Arc::new(ManagedLifecycleBackend {
             legacy: lifecycle,
             common: common.clone(),
+            engine_host_generation: AtomicU64::new(0),
             accepted_builds: RwLock::default(),
             topology_receipt: RwLock::default(),
         });
@@ -3988,7 +3995,9 @@ impl CustomReplicatorHost {
                 write_status: state.write_status,
                 authority: state.authority,
                 live_builds_only: state.live_builds_only,
+                engine_required: false,
                 configuration_generation: self.configuration_generation.load(Ordering::Acquire),
+                engine_host_generation: None,
                 access_generation: self.access_generation.load(Ordering::Acquire),
                 peer_sessions,
                 pending_access,
@@ -4005,6 +4014,7 @@ impl CustomReplicatorHost {
                 current_configuration_quorum_progress: state.current_configuration_quorum_progress,
                 catch_up_boundary: state.catch_up_boundary,
                 catch_up_complete: state.catch_up_complete,
+                catch_up_capability: None,
                 builds,
             },
         }

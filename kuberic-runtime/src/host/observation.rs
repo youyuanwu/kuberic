@@ -145,7 +145,9 @@ pub(crate) struct HostProxyObservation {
     pub(crate) write_status: AccessStatus,
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) live_builds_only: bool,
+    pub(crate) engine_required: bool,
     pub(crate) configuration_generation: u64,
+    pub(crate) engine_host_generation: Option<u64>,
     pub(crate) access_generation: u64,
     pub(crate) peer_sessions: Vec<(ReplicaIdentity, ProcessSessionId)>,
     pub(crate) pending_access: Option<PendingAccessObservation>,
@@ -179,6 +181,7 @@ pub(crate) struct ReplicationEngineObservation {
     pub(crate) current_configuration_quorum_progress: i64,
     pub(crate) catch_up_boundary: Option<i64>,
     pub(crate) catch_up_complete: bool,
+    pub(crate) catch_up_capability: Option<i64>,
     pub(crate) builds: Vec<BuildPostcondition>,
 }
 
@@ -204,7 +207,9 @@ impl From<RuntimeSnapshot> for ReportObservation {
                 write_status: snapshot.write_status,
                 authority: snapshot.authority,
                 live_builds_only: snapshot.live_builds_only,
+                engine_required: false,
                 configuration_generation: 0,
+                engine_host_generation: None,
                 access_generation: 0,
                 peer_sessions: Vec::new(),
                 pending_access: None,
@@ -222,6 +227,7 @@ impl From<RuntimeSnapshot> for ReportObservation {
                     .current_configuration_quorum_progress,
                 catch_up_boundary: snapshot.catch_up_boundary,
                 catch_up_complete: snapshot.catch_up_complete,
+                catch_up_capability: None,
                 builds: snapshot.builds,
             },
         }

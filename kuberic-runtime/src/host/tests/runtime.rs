@@ -4825,7 +4825,7 @@ async fn custom_authority_rejection_contains_partial_current_and_joint_applicati
             assert_custom_authority_closed(&runtime, &control).await;
             assert_eq!(control.abort_count.load(Ordering::SeqCst), 1);
             assert!(!runtime.snapshot().await.open);
-            let reporter = runtime.report_runtime();
+            let reporter = runtime.recovery_owner_runtime();
             reporter.observe_progress().await.unwrap_err();
             assert_custom_authority_closed(&runtime, &control).await;
         }
@@ -5048,9 +5048,9 @@ async fn custom_authority_success_cannot_restore_a_superseded_report_grant() {
     )
     .await
     .unwrap();
-    let reporter = runtime.report_runtime();
+    let reporter = runtime.recovery_owner_runtime();
     let stale_restoration = {
-        let reporter = runtime.report_runtime();
+        let reporter = runtime.recovery_owner_runtime();
         tokio::spawn(async move {
             reporter
                 .reconcile_durable_access(AccessStatus::Granted, AccessStatus::Granted)
@@ -5141,7 +5141,7 @@ async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoratio
         control.grant_error.store(0, Ordering::SeqCst);
         let gate = runtime.testing_pause_custom_restoration();
         let restoration = {
-            let report = runtime.report_runtime();
+            let report = runtime.recovery_owner_runtime();
             tokio::spawn(async move {
                 if deferred {
                     report.observe_progress().await
@@ -5183,7 +5183,11 @@ async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoratio
             restoration.await.unwrap().unwrap();
         }
         admission.await.unwrap().unwrap();
-        runtime.report_runtime().observe_progress().await.unwrap();
+        runtime
+            .recovery_owner_runtime()
+            .observe_progress()
+            .await
+            .unwrap();
         assert_custom_authority_closed(&runtime, &control).await;
         RuntimeAdapter::new(store, runtime.clone())
             .execute(effect(
@@ -7356,6 +7360,11 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
             AccessStatus::Granted
         );
         gate.grant_error.store(0, Ordering::SeqCst);
+        let observational = reporter.report(&runtime.report_runtime()).await.unwrap();
+        assert_eq!(
+            observational.write_status,
+            proto::AccessStatus::ReconfigurationPending as i32
+        );
         if supersede == 1 {
             RuntimeAdapter::new(store.clone(), runtime.clone())
                 .execute(effect(
@@ -7384,6 +7393,28 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
                 .await
                 .unwrap();
         }
+        let recovery = crate::host::recovery::RecoveryOwner::new(
+            runtime.recovery_owner_runtime(),
+            store.clone(),
+        );
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let recovery_task = tokio::spawn(recovery.run(shutdown_rx));
+        if supersede == 0 {
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if runtime.snapshot().await.write_status == AccessStatus::Granted {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        shutdown.send_replace(true);
+        recovery_task.await.unwrap();
         let report = reporter.report(&runtime.report_runtime()).await.unwrap();
         assert_eq!(
             report.write_status,
@@ -14133,6 +14164,41 @@ async fn partition_contract_reports_independent_access_load_and_fault() {
         .unwrap();
     assert!(partition.report_load(Vec::new()).await.is_err());
     assert!(partition.report_fault(FaultType::Permanent).await.is_err());
+}
+
+#[tokio::test]
+async fn recovery_owner_persists_partition_reports_without_status_polling() {
+    let directory = crate::host::tests::tempdir().unwrap();
+    let local = identity(1, "partition-report-owner");
+    let store = fresh_disk_store(directory.path(), local.clone());
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(PodRuntime::new(local, application.clone(), store.clone()));
+    RuntimeAdapter::new(store.clone(), runtime.clone())
+        .execute(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    let partition = application.partition.lock().unwrap().clone().unwrap();
+    partition
+        .report_load(vec![LoadMetric {
+            name: "queue-depth".into(),
+            value: 9,
+        }])
+        .await
+        .unwrap();
+    partition.report_fault(FaultType::Permanent).await.unwrap();
+
+    let mut recovery =
+        crate::host::recovery::RecoveryOwner::new(runtime.recovery_owner_runtime(), store.clone());
+    recovery.advance().await.unwrap();
+    let durable = store.load_state().await.unwrap();
+    assert_eq!(durable.load_metrics[0].value, 9);
+    assert_eq!(durable.reported_fault, Some(FaultType::Permanent));
+
+    let before = durable;
+    let reporter = crate::host::report::AgentReporter::new(store.clone());
+    let report = reporter.report(&runtime.report_runtime()).await.unwrap();
+    assert!(!report.healthy);
+    assert_eq!(store.load_state().await.unwrap(), before);
 }
 
 #[tokio::test]

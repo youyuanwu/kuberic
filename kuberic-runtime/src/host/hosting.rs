@@ -251,6 +251,8 @@ struct HostState {
     partition_information: PartitionInformation,
     load_metrics: BTreeMap<String, i64>,
     reported_fault: Option<FaultType>,
+    partition_report_revision: u64,
+    catch_up_capability: Option<i64>,
     role_transition_epoch: Option<Epoch>,
     role_transition_authority: Option<AdmittedAuthority>,
 }
@@ -464,15 +466,13 @@ pub(crate) struct PartitionReportSnapshot {
     pub(crate) write_status: AccessStatus,
     pub(crate) load_metrics: Vec<LoadMetric>,
     pub(crate) reported_fault: Option<FaultType>,
+    pub(crate) revision: u64,
 }
 
 #[async_trait]
 trait ReportHost: Send + Sync {
-    async fn observe_progress(&self) -> Result<()>;
     async fn observation(&self) -> ReportObservation;
-    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
     async fn partition_report(&self) -> PartitionReportSnapshot;
-    async fn catch_up_capability(&self) -> Result<i64>;
 }
 
 #[derive(Clone)]
@@ -481,6 +481,21 @@ pub(crate) struct ReportRuntime {
 }
 
 impl ReportRuntime {
+    pub(crate) async fn observation(&self) -> ReportObservation {
+        self.inner.observation().await
+    }
+
+    pub(crate) async fn partition_report(&self) -> PartitionReportSnapshot {
+        self.inner.partition_report().await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RecoveryOwnerRuntime {
+    inner: Arc<dyn RecoveryOwnerHost>,
+}
+
+impl RecoveryOwnerRuntime {
     pub(crate) async fn observe_progress(&self) -> Result<()> {
         self.inner.observe_progress().await
     }
@@ -501,10 +516,21 @@ impl ReportRuntime {
         self.inner.partition_report().await
     }
 
-    pub(crate) async fn catch_up_capability(&self) -> Result<i64> {
-        self.inner.catch_up_capability().await
+    pub(crate) async fn refresh_catch_up_capability(&self) -> Result<()> {
+        self.inner.refresh_catch_up_capability().await
     }
 }
+
+#[async_trait]
+trait ReportHostMutations: Send + Sync {
+    async fn observe_progress(&self) -> Result<()>;
+    async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
+    async fn refresh_catch_up_capability(&self) -> Result<()>;
+}
+
+trait RecoveryOwnerHost: ReportHost + ReportHostMutations {}
+
+impl<T> RecoveryOwnerHost for T where T: ReportHost + ReportHostMutations {}
 
 #[async_trait]
 trait BuildHost: Send + Sync {
@@ -874,6 +900,8 @@ impl PodRuntime {
                     partition_information,
                     load_metrics: BTreeMap::new(),
                     reported_fault: None,
+                    partition_report_revision: 0,
+                    catch_up_capability: None,
                     role_transition_epoch: None,
                     role_transition_authority: None,
                 }),
@@ -883,6 +911,7 @@ impl PodRuntime {
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
+                partition_reports_closed: AtomicBool::new(false),
                 custom_authority: custom::CustomAuthorityContainment::new(weak_self.clone()),
                 replica_session: OnceLock::new(),
                 #[cfg(all(test, feature = "testing"))]
@@ -1280,6 +1309,18 @@ impl PodRuntime {
         }
     }
 
+    pub(crate) fn recovery_owner_runtime(&self) -> RecoveryOwnerRuntime {
+        RecoveryOwnerRuntime {
+            inner: self.host.clone(),
+        }
+    }
+
+    pub(crate) fn quiesce_partition_reports(&self) {
+        self.host
+            .partition_reports_closed
+            .store(true, Ordering::Release);
+    }
+
     pub(crate) fn build_runtime(&self) -> BuildRuntime {
         BuildRuntime {
             inner: self.host.clone(),
@@ -1548,6 +1589,7 @@ struct RuntimeHost {
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
+    partition_reports_closed: AtomicBool,
     custom_authority: custom::CustomAuthorityContainment,
     #[cfg(all(test, feature = "testing"))]
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
@@ -1574,16 +1616,6 @@ impl RuntimeHost {
 
 #[async_trait]
 impl ReportHost for RuntimeHost {
-    async fn observe_progress(&self) -> Result<()> {
-        if !BuildHost::is_managed(self) {
-            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
-            return tokio::spawn(async move { host.observe_report_progress().await })
-                .await
-                .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        }
-        self.observe_report_progress().await
-    }
-
     async fn observation(&self) -> ReportObservation {
         let lifecycle = self
             .registered
@@ -1593,7 +1625,10 @@ impl ReportHost for RuntimeHost {
             Some(lifecycle) => lifecycle.report_observation().await,
             None => self.fallback_report_observation().await,
         };
-        let fallback = self.state.read().await.fallback_snapshot.clone();
+        let state = self.state.read().await;
+        let fallback = state.fallback_snapshot.clone();
+        let catch_up_capability = state.catch_up_capability;
+        drop(state);
         observation.host.identity = fallback.identity;
         observation.host.open = fallback.open;
         observation.host.replication_address = fallback.replication_address;
@@ -1607,7 +1642,25 @@ impl ReportHost for RuntimeHost {
         if self.aborted.load(Ordering::Acquire) {
             observation.host.open = false;
         }
+        observation.engine.catch_up_capability = catch_up_capability;
         observation
+    }
+
+    async fn partition_report(&self) -> PartitionReportSnapshot {
+        self.partition_report_snapshot().await
+    }
+}
+
+#[async_trait]
+impl ReportHostMutations for RuntimeHost {
+    async fn observe_progress(&self) -> Result<()> {
+        if !BuildHost::is_managed(self) {
+            let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+            return tokio::spawn(async move { host.observe_report_progress().await })
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        }
+        self.observe_report_progress().await
     }
 
     async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
@@ -1620,16 +1673,21 @@ impl ReportHost for RuntimeHost {
         self.reconcile_report_access(read, write).await
     }
 
-    async fn partition_report(&self) -> PartitionReportSnapshot {
-        self.partition_report_snapshot().await
-    }
-
-    async fn catch_up_capability(&self) -> Result<i64> {
-        self.registered
-            .get()
-            .ok_or(RuntimeError::NotOpen)?
-            .catch_up_capability()
-            .await
+    async fn refresh_catch_up_capability(&self) -> Result<()> {
+        let observation = ReportHost::observation(self).await;
+        let capability = if observation.host.open && observation.host.role != ReplicaRole::None {
+            Some(
+                self.registered
+                    .get()
+                    .ok_or(RuntimeError::NotOpen)?
+                    .catch_up_capability()
+                    .await?,
+            )
+        } else {
+            None
+        };
+        self.state.write().await.catch_up_capability = capability;
+        Ok(())
     }
 }
 
@@ -2016,7 +2074,10 @@ impl PartitionAccessView for HostAccessView {
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
         let _effect = host.effect_lock.lock().await;
-        if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
+        if host.closed.load(Ordering::Acquire)
+            || host.aborted.load(Ordering::Acquire)
+            || host.partition_reports_closed.load(Ordering::Acquire)
+        {
             return Err(RuntimeError::Closed);
         }
         let mut names = std::collections::BTreeSet::new();
@@ -2027,10 +2088,15 @@ impl PartitionAccessView for HostAccessView {
                 "load metrics require unique nonempty names and nonnegative values".into(),
             ));
         }
-        host.state.write().await.load_metrics = metrics
+        let metrics = metrics
             .into_iter()
             .map(|metric| (metric.name, metric.value))
             .collect();
+        let mut state = host.state.write().await;
+        if state.load_metrics != metrics {
+            state.load_metrics = metrics;
+            state.partition_report_revision = state.partition_report_revision.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -2040,11 +2106,18 @@ impl PartitionAccessView for HostAccessView {
         // already owns effect_lock. Reports change diagnostics, not authority;
         // the state lock serializes them without re-entering a lifecycle effect.
         let mut state = host.state.write().await;
-        if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
+        if host.closed.load(Ordering::Acquire)
+            || host.aborted.load(Ordering::Acquire)
+            || host.partition_reports_closed.load(Ordering::Acquire)
+        {
             return Err(RuntimeError::Closed);
         }
         if state.reported_fault != Some(FaultType::Permanent) {
-            state.reported_fault = Some(fault);
+            let next = Some(fault);
+            if state.reported_fault != next {
+                state.reported_fault = next;
+                state.partition_report_revision = state.partition_report_revision.wrapping_add(1);
+            }
         }
         Ok(())
     }
@@ -3364,7 +3437,9 @@ impl RuntimeHost {
                 write_status: snapshot.write_status,
                 authority: snapshot.authority,
                 live_builds_only: snapshot.live_builds_only,
+                engine_required: false,
                 configuration_generation: 0,
+                engine_host_generation: None,
                 access_generation: 0,
                 peer_sessions: Vec::new(),
                 pending_access: None,
@@ -3382,6 +3457,7 @@ impl RuntimeHost {
                     .current_configuration_quorum_progress,
                 catch_up_boundary: snapshot.catch_up_boundary,
                 catch_up_complete: snapshot.catch_up_complete,
+                catch_up_capability: None,
                 builds: snapshot.builds,
             },
         }
@@ -3402,6 +3478,7 @@ impl RuntimeHost {
                 })
                 .collect(),
             reported_fault: state.reported_fault,
+            revision: state.partition_report_revision,
         }
     }
 

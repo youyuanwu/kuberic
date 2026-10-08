@@ -11,7 +11,6 @@ mod observation;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;
-#[cfg(test)]
 mod recovery;
 mod removal;
 pub(crate) mod report;

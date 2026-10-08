@@ -20,7 +20,7 @@ const CAPABILITY_TYPES: &[&str] = &[
     "ProcessRuntime", "AuthorityRuntime", "PeerRuntime", "AccessClosure", "AccessRuntime",
     "ReportLifecycle", "EvidenceRuntime", "EffectEvidenceRuntime", "BuildLifecycleRuntime",
     "BuildCancellationRuntime", "OutboundLifecycleRuntime", "RemovalWitnessRuntime",
-    "TopologyRuntime", "RecoveryRuntime", "ReportRuntime", "BuildRuntime",
+    "TopologyRuntime", "RecoveryRuntime", "ReportRuntime", "RecoveryOwnerRuntime", "BuildRuntime",
     "BuildAttemptRuntime", "PeerDiscoveryRuntime", "OutboundRuntime",
 ];
 #[rustfmt::skip]
@@ -48,6 +48,7 @@ const LIFECYCLE_VIEW_RULES: &[(&str, &[&str])] = &[
 #[rustfmt::skip]
 const HOSTING_VIEW_RULES: &[(&str, &[&str])] = &[
     ("ReportRuntime", &["dynReportHost"]),
+    ("RecoveryOwnerRuntime", &["dynRecoveryOwnerHost"]),
     ("BuildRuntime", &["dynBuildHost", "BuildAttemptRuntime"]),
     ("BuildAttemptRuntime", &["dynBuildAttemptHost"]),
     ("PeerDiscoveryRuntime", &["dynPeerDiscoveryHost"]),
@@ -1335,6 +1336,52 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "ReportLifecycle must not transport RuntimeSnapshot"
     );
     assert!(report_lifecycle.contains("ReportObservation"));
+
+    let report_runtime = hosting
+        .split_once("pub(crate) struct ReportRuntime")
+        .and_then(|(_, rest)| {
+            rest.split_once("pub(crate) struct RecoveryOwnerRuntime")
+                .map(|(body, _)| body)
+        })
+        .expect("ReportRuntime capability");
+    for mutation in [
+        "observe_progress",
+        "reconcile_durable_access",
+        "refresh_catch_up_capability",
+    ] {
+        assert!(
+            !report_runtime.contains(mutation),
+            "ReportRuntime must not expose lifecycle mutation {mutation}"
+        );
+    }
+    let recovery_runtime = hosting
+        .split_once("pub(crate) struct RecoveryOwnerRuntime")
+        .and_then(|(_, rest)| rest.split_once("trait BuildHost").map(|(body, _)| body))
+        .expect("RecoveryOwnerRuntime capability");
+    for owned in [
+        "observe_progress",
+        "reconcile_durable_access",
+        "refresh_catch_up_capability",
+    ] {
+        assert!(
+            recovery_runtime.contains(owned),
+            "RecoveryOwnerRuntime must own {owned}"
+        );
+    }
+
+    let report = source("src/host/report.rs");
+    let production_report = report.split("#[cfg(test)]").next().unwrap_or(&report);
+    for mutation in [
+        "record_partition_reports",
+        "observe_progress",
+        "reconcile_durable_access",
+        "catch_up_capability().await",
+    ] {
+        assert!(
+            !production_report.contains(mutation),
+            "status reporting must not perform {mutation}"
+        );
+    }
 
     for consumer in [
         "src/host/custom.rs",
