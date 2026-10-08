@@ -3863,6 +3863,8 @@ impl CustomReplicatorHost {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
+        let host = self.host()?;
+        let _restoration = host.custom_authority.restoration().await;
         {
             let _registration = self.session_registration.lock().await;
             let replaced = {
