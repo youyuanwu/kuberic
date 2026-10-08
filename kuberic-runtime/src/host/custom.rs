@@ -18,8 +18,8 @@ use crate::receipts::{
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::{
     ManagedAccessPreparation, ManagedFenceGuard, ManagedOperationFence, ManagedReplicatorLifecycle,
-    ManagedSecondaryRemovalOutcome, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
-    ReplicaSetQuorumMode, Replicator,
+    PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
+    Replicator,
 };
 use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
@@ -357,6 +357,13 @@ fn managed_configuration(authority: &AdmittedAuthority) -> ManagedReplicaConfigu
         switchover_handoff: authority.switchover_handoff.clone(),
         secondary_removal: authority.secondary_removal.clone(),
         scale_up: authority.scale_up.clone(),
+        build_kind: if authority.transition_kind
+            == Some(crate::protocol::types::TransitionKind::Failover)
+        {
+            crate::authority::BuildAuthorityKind::Failover
+        } else {
+            crate::authority::BuildAuthorityKind::Provisioning
+        },
     }
 }
 
@@ -379,18 +386,27 @@ fn durable_native_token(
     })
 }
 
+struct ManagedRemovalReceiptParts {
+    preparation: Option<crate::protocol::types::SecondaryRemovalPreparation>,
+    witness: Option<crate::protocol::types::SecondaryRemovalWitness>,
+    accepted: Option<crate::protocol::types::SecondaryScaleDownCleanup>,
+    verified_lsn: Option<i64>,
+    committed_lsn: i64,
+}
+
 fn durable_secondary_removal_receipt(
-    outcome: ManagedSecondaryRemovalOutcome,
+    fence: ManagedOperationFence,
     expected: &ManagedOperationFence,
     authority: Option<AdmittedAuthority>,
+    parts: ManagedRemovalReceiptParts,
 ) -> Result<Box<SecondaryRemovalReceipt>> {
     Ok(Box::new(SecondaryRemovalReceipt {
-        token: durable_native_token(outcome.fence, expected, authority)?,
-        preparation: outcome.preparation,
-        witness: outcome.witness,
-        accepted: outcome.accepted,
-        verified_lsn: outcome.verified_lsn,
-        committed_lsn: outcome.committed_lsn,
+        token: durable_native_token(fence, expected, authority)?,
+        preparation: parts.preparation,
+        witness: parts.witness,
+        accepted: parts.accepted,
+        verified_lsn: parts.verified_lsn,
+        committed_lsn: parts.committed_lsn,
     }))
 }
 
@@ -468,12 +484,35 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
     }
 
     async fn restore_authority(&self) -> Result<()> {
-        self.legacy.restore_engine_proof().await?;
+        let authority = self
+            .common
+            .host()?
+            .default_dependencies
+            .replica_authority_store
+            .load()
+            .await?;
+        if let Some(authority) = &authority {
+            authority.validate()?;
+        }
+        self.legacy
+            .restore_engine_proof(
+                authority.as_ref().map(managed_configuration),
+                self.common.configuration_generation.load(Ordering::Acquire),
+            )
+            .await?;
         self.common.restore_authority().await?;
+        if authority.is_some() {
+            self.legacy
+                .synchronize_replica_configuration(
+                    self.common.configuration_generation.load(Ordering::Acquire),
+                )
+                .await?;
+        }
         self.sync_topology_status().await
     }
 
     async fn admit_authority(&self, authority: AdmittedAuthority) -> Result<()> {
+        authority.validate()?;
         self.common.prepare_authority_admission(&authority).await?;
         let generation = self.common.configuration_generation.load(Ordering::Acquire);
         let preparation = self
@@ -489,6 +528,19 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
         self.legacy
             .commit_replica_configuration(preparation)
             .await?;
+        #[cfg(all(test, feature = "testing"))]
+        let commit_gate = self
+            .common
+            .host()?
+            .managed_configuration_commit_gate
+            .lock()
+            .unwrap()
+            .take();
+        #[cfg(all(test, feature = "testing"))]
+        if let Some(gate) = commit_gate {
+            gate.entered.notify_waiters();
+            gate.release.notified().await;
+        }
         self.common.install_managed_authority(&authority).await?;
         self.legacy
             .synchronize_replica_configuration(
@@ -933,7 +985,18 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
             .legacy
             .prepare_secondary_removal(intent, process_session_id, report_sequence)
             .await?;
-        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        let receipt = durable_secondary_removal_receipt(
+            outcome.fence,
+            &token,
+            authority,
+            ManagedRemovalReceiptParts {
+                preparation: Some(outcome.preparation),
+                witness: None,
+                accepted: None,
+                verified_lsn: outcome.verified_lsn,
+                committed_lsn: outcome.committed_lsn,
+            },
+        )?;
         validate_secondary_removal_receipt(&receipt, &receipt.token)?;
         if receipt.preparation.as_ref().is_none_or(|preparation| {
             preparation.intent != expected_intent
@@ -960,7 +1023,18 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
             .legacy
             .observe_secondary_removal_witness(witness)
             .await?;
-        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        let receipt = durable_secondary_removal_receipt(
+            outcome.fence,
+            &token,
+            authority,
+            ManagedRemovalReceiptParts {
+                preparation: None,
+                witness: Some(outcome.witness),
+                accepted: None,
+                verified_lsn: outcome.verified_lsn,
+                committed_lsn: outcome.committed_lsn,
+            },
+        )?;
         validate_secondary_removal_receipt(&receipt, &receipt.token)?;
         if receipt.witness.as_ref() != Some(&expected) {
             return Err(RuntimeError::OperationCancelled);
@@ -985,7 +1059,18 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
             .legacy
             .observe_secondary_removal_progress(witness, committed)
             .await?;
-        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        let receipt = durable_secondary_removal_receipt(
+            outcome.fence,
+            &token,
+            authority,
+            ManagedRemovalReceiptParts {
+                preparation: None,
+                witness: Some(outcome.witness),
+                accepted: Some(outcome.accepted),
+                verified_lsn: outcome.verified_lsn,
+                committed_lsn: outcome.committed_lsn,
+            },
+        )?;
         validate_secondary_removal_receipt(&receipt, &receipt.token)?;
         if receipt.witness.as_ref() != Some(&expected_witness)
             || receipt.accepted.as_ref() != Some(&expected_committed)
@@ -1010,7 +1095,18 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
             .legacy
             .accept_secondary_removal_commit(committed)
             .await?;
-        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        let receipt = durable_secondary_removal_receipt(
+            outcome.fence,
+            &token,
+            authority,
+            ManagedRemovalReceiptParts {
+                preparation: None,
+                witness: None,
+                accepted: Some(outcome.accepted),
+                verified_lsn: outcome.verified_lsn,
+                committed_lsn: outcome.committed_lsn,
+            },
+        )?;
         validate_secondary_removal_receipt(&receipt, &receipt.token)?;
         if receipt.accepted.as_ref() != Some(&expected) {
             return Err(RuntimeError::OperationCancelled);
@@ -1032,7 +1128,18 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
             .legacy
             .accept_historical_secondary_removal_commit(command)
             .await?;
-        let receipt = durable_secondary_removal_receipt(outcome, &token, authority)?;
+        let receipt = durable_secondary_removal_receipt(
+            outcome.fence,
+            &token,
+            authority,
+            ManagedRemovalReceiptParts {
+                preparation: None,
+                witness: None,
+                accepted: Some(outcome.accepted),
+                verified_lsn: outcome.verified_lsn,
+                committed_lsn: outcome.committed_lsn,
+            },
+        )?;
         validate_secondary_removal_receipt(&receipt, &receipt.token)?;
         self.common
             .accept_secondary_removal_receipt(&receipt)
@@ -1047,7 +1154,7 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
             engine_session_id: outcome.engine_session_id,
             engine_generation: outcome.engine_generation,
             retired: outcome.retired,
-            completed: outcome.completed,
+            completed: false,
         });
         validate_retirement_receipt(&receipt, &retired, false)?;
         self.common.fence_retirement_state(&retired).await?;
@@ -1061,7 +1168,7 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
             engine_session_id: outcome.engine_session_id,
             engine_generation: outcome.engine_generation,
             retired: outcome.retired,
-            completed: outcome.completed,
+            completed: true,
         });
         validate_retirement_receipt(&receipt, &retired, true)?;
         self.common.complete_retirement_state(&retired).await?;

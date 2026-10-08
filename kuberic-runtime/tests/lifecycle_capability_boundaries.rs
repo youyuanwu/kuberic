@@ -1001,8 +1001,68 @@ fn reject_cancellation(source: &str, expected: &str) {
     );
 }
 
-fn production_prefix(source: &str) -> &str {
-    source.split("#[cfg(test)]").next().unwrap_or(source)
+fn production_items(source: &str) -> String {
+    parsed(source)
+        .items
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item,
+                Item::Mod(module)
+                    if module.attrs.iter().any(|attribute| {
+                        let attribute = compact(attribute);
+                        attribute.contains("cfg(test)")
+                            || attribute.contains("cfg(all(test,")
+                    })
+            )
+        })
+        .map(ToTokens::to_token_stream)
+        .map(|tokens| tokens.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_replicator_module(name: &str, source: &str) -> Result<(), String> {
+    let production = production_items(source);
+    for forbidden in [
+        "RuntimeEffectAction",
+        "AdmittedAuthority",
+        "RuntimeSnapshot",
+        "RuntimePostcondition",
+        "ReplicaAuthorityStore",
+        "ReplicaRuntimeInstruction",
+        "TransitionKind",
+    ] {
+        if production.contains(forbidden) {
+            return Err(format!("{name} contains forbidden {forbidden}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_replicator_tree(root: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            validate_replicator_tree(&path)?;
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let root_mod = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/replicator/mod.rs");
+        if path == root_mod || name.contains("test") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        validate_replicator_module(&path.display().to_string(), &source)?;
+    }
+    Ok(())
 }
 
 fn validate_managed_replica_runtime_boundary(
@@ -1054,15 +1114,106 @@ fn validate_managed_replica_runtime_boundary(
             ));
         }
     }
+    for outcome in [
+        "ManagedRemovalPreparationOutcome",
+        "ManagedRemovalWitnessOutcome",
+        "ManagedRemovalProgressOutcome",
+        "ManagedRemovalAcceptanceOutcome",
+        "ManagedHistoricalRemovalAcceptanceOutcome",
+        "ManagedRetirementFenceOutcome",
+        "ManagedRetirementCompletionOutcome",
+    ] {
+        if !trait_body.contains(outcome) {
+            return Err(format!(
+                "managed replica-runtime boundary is missing stage-specific {outcome}"
+            ));
+        }
+    }
+    let parsed_replicator = parsed(replicator);
+    let lifecycle_trait = parsed_replicator
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Trait(item) if item.ident == "ManagedReplicatorLifecycle" => Some(item),
+            _ => None,
+        })
+        .ok_or_else(|| "ManagedReplicatorLifecycle syntax was not found".to_string())?;
+    let method_outputs = lifecycle_trait
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            TraitItem::Fn(method) => {
+                Some((method.sig.ident.to_string(), compact(&method.sig.output)))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (method, outcome) in [
+        (
+            "prepare_secondary_removal",
+            "ManagedRemovalPreparationOutcome",
+        ),
+        (
+            "observe_secondary_removal_witness",
+            "ManagedRemovalWitnessOutcome",
+        ),
+        (
+            "observe_secondary_removal_progress",
+            "ManagedRemovalProgressOutcome",
+        ),
+        (
+            "accept_secondary_removal_commit",
+            "ManagedRemovalAcceptanceOutcome",
+        ),
+        (
+            "accept_historical_secondary_removal_commit",
+            "ManagedHistoricalRemovalAcceptanceOutcome",
+        ),
+        ("fence_retirement", "ManagedRetirementFenceOutcome"),
+        ("complete_retirement", "ManagedRetirementCompletionOutcome"),
+    ] {
+        let expected = format!("->Result<{outcome}>");
+        if method_outputs.get(method) != Some(&expected) {
+            return Err(format!(
+                "managed method {method} must return stage-specific {outcome}"
+            ));
+        }
+    }
+    let data_plane = replicator
+        .split("pub(crate) trait ManagedReplicatorDataPlane")
+        .nth(1)
+        .and_then(|body| body.split("pub enum ReplicaSetQuorumMode").next())
+        .ok_or_else(|| "ManagedReplicatorDataPlane body was not found".to_string())?;
+    let store = replicator
+        .split("pub(crate) trait ManagedReplicaStore")
+        .nth(1)
+        .and_then(|body| body.split("pub(crate) struct ManagedFenceGuard").next())
+        .ok_or_else(|| "ManagedReplicaStore body was not found".to_string())?;
     for (name, body) in [
-        ("runtime.rs", production_prefix(runtime)),
+        ("ManagedReplicatorDataPlane", data_plane),
+        ("ManagedReplicaStore", store),
+    ] {
+        for forbidden in [
+            "RuntimeEffectAction",
+            "AdmittedAuthority",
+            "RuntimeSnapshot",
+            "RuntimePostcondition",
+        ] {
+            if body.contains(forbidden) {
+                return Err(format!("{name} contains forbidden {forbidden}"));
+            }
+        }
+    }
+    let production = [
+        ("runtime.rs", production_items(runtime)),
         (
             "replicator/configuration.rs",
-            production_prefix(configuration),
+            production_items(configuration),
         ),
-        ("replicator/log.rs", production_prefix(log)),
-        ("replicator/quorum.rs", production_prefix(quorum)),
-    ] {
+        ("replicator/log.rs", production_items(log)),
+        ("replicator/quorum.rs", production_items(quorum)),
+    ];
+    for (name, body) in &production {
         for forbidden in [
             "RuntimeEffectAction",
             "AdmittedAuthority",
@@ -1133,6 +1284,8 @@ fn managed_replica_runtime_boundary_is_typed() {
         &host,
     )
     .unwrap();
+    validate_replicator_tree(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/replicator"))
+        .unwrap();
 
     let leaked_trait = replicator.replace(
         "configuration: ManagedReplicaConfiguration",
@@ -1163,6 +1316,45 @@ fn managed_replica_runtime_boundary_is_typed() {
         "RuntimeEffectAction",
     );
 
+    let leaked_data_plane = replicator.replace(
+        "async fn next_outbound_item(&self) -> Option<OutboundOperation>;",
+        "async fn next_outbound_item(&self) -> Option<OutboundOperation>;\n    async fn leak(&self, action: RuntimeEffectAction);",
+    );
+    assert_rejected(
+        validate_managed_replica_runtime_boundary(
+            &leaked_data_plane,
+            &configuration,
+            &runtime,
+            &log,
+            &quorum,
+            &host,
+        ),
+        "RuntimeEffectAction",
+    );
+
+    let leaked_after_test = format!(
+        "{quorum}\n#[cfg(not(test))]\nmod leaked_production {{ use crate::effects::RuntimeEffectAction; }}\n"
+    );
+    assert_rejected(
+        validate_managed_replica_runtime_boundary(
+            &replicator,
+            &configuration,
+            &runtime,
+            &log,
+            &leaked_after_test,
+            &host,
+        ),
+        "RuntimeEffectAction",
+    );
+
+    assert_rejected(
+        validate_replicator_module(
+            "replicator/sender.rs",
+            "use crate::effects::RuntimeEffectAction;",
+        ),
+        "RuntimeEffectAction",
+    );
+
     let leaked_configuration =
         format!("{configuration}\nuse crate::protocol::types::TransitionKind;\n");
     assert_rejected(
@@ -1175,6 +1367,22 @@ fn managed_replica_runtime_boundary_is_typed() {
             &host,
         ),
         "TransitionKind",
+    );
+
+    let broad_removal = replicator.replace(
+        "ManagedRemovalWitnessOutcome",
+        "ManagedRemovalPreparationOutcome",
+    );
+    assert_rejected(
+        validate_managed_replica_runtime_boundary(
+            &broad_removal,
+            &configuration,
+            &runtime,
+            &log,
+            &quorum,
+            &host,
+        ),
+        "ManagedRemovalWitnessOutcome",
     );
 }
 

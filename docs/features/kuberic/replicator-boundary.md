@@ -60,8 +60,9 @@ generations, cleanup claims and the outbound queue remain shared.
 The managed capability exposes explicit replication operations for executable
 configuration, peer sessions, build proof, progress refresh, acknowledgement,
 access, certified-prefix settlement, switchover, every secondary-removal stage
-and retirement. Each operation accepts its own input and returns its own
-outcome. There is no all-capability supertrait, generic lifecycle action hook,
+and retirement. Each removal and retirement stage has a distinct outcome type
+containing only that stage's evidence. There is no all-capability supertrait,
+generic lifecycle action hook,
 backend operation enum, compatibility dispatcher or getter that reconstructs
 the complete owner. Application role, replicator role and epoch remain separate
 application/public operations; access retains its private prepare/publish/
@@ -70,7 +71,8 @@ decision protocol.
 Durable `AdmittedAuthority` is host-owned. Before managed admission, the host
 derives `ManagedReplicaConfiguration`, which contains only executable current/
 previous configuration and replication-required handoff, removal and scale-up
-evidence. The engine, replication log and quorum tracker do not import
+evidence plus explicit executable build policy. The engine, replication log
+and quorum tracker do not import
 controller effects, transition kinds, durable authority or broad runtime
 snapshots. A narrow managed store view projects the already-durable
 configuration and exposes only replication-specific removal and retirement
@@ -189,9 +191,12 @@ Managed built-in admission uses an explicit prepared boundary. The engine first
 validates the executable candidate, replication progress, handoff/build proof
 and log epoch, then advances its native generation and returns one owned
 preparation. The host persists the exact durable authority, the engine consumes
-that exact preparation through a non-fallible candidate installation path, the
-host publishes common configuration and the engine synchronizes the final host
-generation. Dropping a preparation invalidates it synchronously. A before-write
+that exact preparation through prevalidated, non-fallible log/quorum mutation,
+then completes the remaining fallible public configuration callbacks under the
+existing exact-effect recovery contract. The host publishes common
+configuration and the engine synchronizes the final host generation. Dropping a
+preparation synchronously invalidates it and advances the native generation. A
+before-write
 store failure leaves the old durable authority and permits exact retry; an
 ambiguous post-write failure remains write-closed and leaves the durable
 candidate for recovery. Same-primary continuity preserves the access projection
@@ -222,6 +227,9 @@ and later regrants require fresh explicit access effects.
 Recovery reconstructs authority and native stores, reissues or reobserves
 pending effects, and keeps access closed until public/native proof is accepted.
 A previously persisted granted snapshot is never sufficient to reopen writes.
+Managed recovery validates and loads the full durable authority in the host,
+derives executable configuration and reuses the same prepare/commit protocol
+before common restoration or access publication.
 
 ## Compatibility
 

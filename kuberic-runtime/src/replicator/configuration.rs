@@ -1,4 +1,4 @@
-use crate::authority::AuthorityFence;
+use crate::authority::{AuthorityFence, BuildAuthorityKind};
 use crate::protocol::types::{
     ConfigurationDescriptor, ReplicaIdentity, ReplicaRole, ScaleUpConfigurationEvidence,
     SecondaryRemovalEvidence, SwitchoverHandoff,
@@ -9,8 +9,9 @@ use crate::{Result, RuntimeError};
 /// Engine-owned projection of the controller's durable authority.
 ///
 /// This deliberately omits transition stage, operation identity, effect
-/// sequence, and completion evidence. The host validates and persists the
-/// durable authority before constructing this executable configuration.
+/// sequence, and completion evidence. The host validates the durable candidate,
+/// constructs this projection for native preparation, then persists the exact
+/// authority before the prepared configuration can commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedReplicaConfiguration {
     pub(crate) local_identity: ReplicaIdentity,
@@ -19,6 +20,7 @@ pub(crate) struct ManagedReplicaConfiguration {
     pub(crate) switchover_handoff: Option<SwitchoverHandoff>,
     pub(crate) secondary_removal: Option<SecondaryRemovalEvidence>,
     pub(crate) scale_up: Option<Box<ScaleUpConfigurationEvidence>>,
+    pub(crate) build_kind: BuildAuthorityKind,
 }
 
 impl ManagedReplicaConfiguration {
@@ -112,15 +114,6 @@ impl ManagedReplicaConfiguration {
             })
             .expect("validated local identity belongs to configuration")
             .role
-    }
-
-    pub(crate) fn requires_failover_build(&self) -> bool {
-        self.previous_configuration
-            .as_ref()
-            .is_some_and(|previous| {
-                previous.primary_id != self.current_configuration.primary_id
-                    && self.switchover_handoff.is_none()
-            })
     }
 
     pub(crate) fn validate_envelope(&self, envelope: &ReplicationItem) -> Result<()> {

@@ -470,9 +470,10 @@ Exit criteria:
 - current ordinary, crash-boundary and live test identities remain intact;
 - stale session, generation and receipt rejection remains covered.
 
-Implementation status: complete. `ManagedReplicatorLifecycle` now exposes
-explicit configuration, access, peer, build, progress, acknowledgement,
-certified-prefix, switchover, secondary-removal and retirement operations.
+Implementation status: complete. The managed lifecycle and data-plane
+capabilities now expose explicit configuration, access, peer, build, progress,
+acknowledgement, certified-prefix, switchover, secondary-removal and retirement
+operations.
 Application role, replicator role and epoch remain separate application/public
 paths. The host projects durable `AdmittedAuthority` into engine-owned
 `ManagedReplicaConfiguration`; runtime, log and quorum code consume neither
@@ -481,7 +482,10 @@ admission uses prepare/fence, host persistence, exact prepared commit, common
 publication and generation synchronization. Transient engine outcomes are
 bound by the host to the unchanged durable receipt formats. Broad engine
 snapshots were replaced by a narrow observation, temporary action adapters were
-removed, and source guards reject their reintroduction.
+removed, secondary-removal and retirement stages have distinct private outcome
+types, and source guards reject broad lifecycle/data-plane/store leakage and
+wrong-stage outcome substitution. Managed restart validates full authority in
+the host and reuses the prepared admission path.
 
 ### Phase 2: Separate State Ownership and Observations
 

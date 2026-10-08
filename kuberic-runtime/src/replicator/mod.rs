@@ -126,30 +126,32 @@ pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
         intent: SecondaryScaleDownIntent,
         process_session_id: ProcessSessionId,
         report_sequence: u64,
-    ) -> Result<ManagedSecondaryRemovalOutcome>;
+    ) -> Result<ManagedRemovalPreparationOutcome>;
     async fn observe_secondary_removal_witness(
         &self,
         witness: SecondaryRemovalWitness,
-    ) -> Result<ManagedSecondaryRemovalOutcome>;
+    ) -> Result<ManagedRemovalWitnessOutcome>;
     async fn observe_secondary_removal_progress(
         &self,
         witness: SecondaryRemovalWitness,
         committed: SecondaryScaleDownCleanup,
-    ) -> Result<ManagedSecondaryRemovalOutcome>;
+    ) -> Result<ManagedRemovalProgressOutcome>;
     async fn accept_secondary_removal_commit(
         &self,
         committed: SecondaryScaleDownCleanup,
-    ) -> Result<ManagedSecondaryRemovalOutcome>;
+    ) -> Result<ManagedRemovalAcceptanceOutcome>;
     async fn accept_historical_secondary_removal_commit(
         &self,
         command: crate::protocol::command::AcceptSecondaryRemovalCommit,
-    ) -> Result<ManagedSecondaryRemovalOutcome>;
-    async fn fence_retirement(&self, retired: RetiredAuthority)
-    -> Result<ManagedRetirementOutcome>;
+    ) -> Result<ManagedHistoricalRemovalAcceptanceOutcome>;
+    async fn fence_retirement(
+        &self,
+        retired: RetiredAuthority,
+    ) -> Result<ManagedRetirementFenceOutcome>;
     async fn complete_retirement(
         &self,
         retired: RetiredAuthority,
-    ) -> Result<ManagedRetirementOutcome>;
+    ) -> Result<ManagedRetirementCompletionOutcome>;
     async fn register_peer_session_proof(
         &self,
         identity: ReplicaIdentity,
@@ -158,7 +160,11 @@ pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
     async fn admit_build_authority_proof(&self, authority: BuildAuthority) -> Result<()>;
     async fn retire_build_proof(&self, build_id: OperationId) -> Result<()>;
     async fn refresh_progress_proof(&self) -> Result<()>;
-    async fn restore_engine_proof(&self) -> Result<()>;
+    async fn restore_engine_proof(
+        &self,
+        configuration: Option<ManagedReplicaConfiguration>,
+        host_generation: u64,
+    ) -> Result<()>;
     async fn observe_engine(&self) -> ManagedReplicaObservation;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
     async fn detach_outbound_build_stream(&self, build_id: &OperationId) -> Result<()>;
@@ -184,11 +190,14 @@ pub(crate) struct ManagedConfigurationPreparation {
     pub(crate) configuration: ManagedReplicaConfiguration,
     pub(crate) host_generation: u64,
     pub(crate) active: Arc<AtomicBool>,
+    pub(crate) native_generation: Arc<AtomicU64>,
 }
 
 impl Drop for ManagedConfigurationPreparation {
     fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.native_generation.fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -223,21 +232,58 @@ pub(crate) struct ManagedSwitchoverOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ManagedSecondaryRemovalOutcome {
+pub(crate) struct ManagedRemovalPreparationOutcome {
     pub(crate) fence: ManagedOperationFence,
-    pub(crate) preparation: Option<crate::protocol::types::SecondaryRemovalPreparation>,
-    pub(crate) witness: Option<SecondaryRemovalWitness>,
-    pub(crate) accepted: Option<SecondaryScaleDownCleanup>,
+    pub(crate) preparation: crate::protocol::types::SecondaryRemovalPreparation,
     pub(crate) verified_lsn: Option<Lsn>,
     pub(crate) committed_lsn: Lsn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ManagedRetirementOutcome {
+pub(crate) struct ManagedRemovalWitnessOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) witness: SecondaryRemovalWitness,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRemovalProgressOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) witness: SecondaryRemovalWitness,
+    pub(crate) accepted: SecondaryScaleDownCleanup,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRemovalAcceptanceOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) accepted: SecondaryScaleDownCleanup,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedHistoricalRemovalAcceptanceOutcome {
+    pub(crate) fence: ManagedOperationFence,
+    pub(crate) accepted: SecondaryScaleDownCleanup,
+    pub(crate) verified_lsn: Option<Lsn>,
+    pub(crate) committed_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRetirementFenceOutcome {
     pub(crate) engine_session_id: String,
     pub(crate) engine_generation: u64,
     pub(crate) retired: RetiredAuthority,
-    pub(crate) completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedRetirementCompletionOutcome {
+    pub(crate) engine_session_id: String,
+    pub(crate) engine_generation: u64,
+    pub(crate) retired: RetiredAuthority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

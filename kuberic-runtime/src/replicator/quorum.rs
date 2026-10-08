@@ -695,7 +695,7 @@ mod scenario_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::AdmittedAuthority;
+    use crate::authority::{AdmittedAuthority, BuildAuthorityKind};
     use crate::protocol::types::{
         EffectivePolicy, Epoch, ReplicaId, ScaleUpConfigurationEvidence, ScaleUpFailoverEvidence,
         ScaleUpIntent, ScaleUpStage, ScaleUpWitness, TransitionKind,
@@ -711,6 +711,11 @@ mod tests {
             switchover_handoff: authority.switchover_handoff,
             secondary_removal: authority.secondary_removal,
             scale_up: authority.scale_up,
+            build_kind: if authority.transition_kind == Some(TransitionKind::Failover) {
+                BuildAuthorityKind::Failover
+            } else {
+                BuildAuthorityKind::Provisioning
+            },
         }
     }
 

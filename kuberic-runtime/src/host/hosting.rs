@@ -60,13 +60,24 @@ fn managed_configuration(authority: AdmittedAuthority) -> ManagedReplicaConfigur
         switchover_handoff: authority.switchover_handoff,
         secondary_removal: authority.secondary_removal,
         scale_up: authority.scale_up,
+        build_kind: if authority.transition_kind
+            == Some(crate::protocol::types::TransitionKind::Failover)
+        {
+            BuildAuthorityKind::Failover
+        } else {
+            BuildAuthorityKind::Provisioning
+        },
     }
 }
 
 #[async_trait]
 impl ManagedReplicaStore for ManagedReplicaStoreView {
     async fn load_configuration(&self) -> Result<Option<ManagedReplicaConfiguration>> {
-        Ok(self.inner.load().await?.map(managed_configuration))
+        let Some(authority) = self.inner.load().await? else {
+            return Ok(None);
+        };
+        authority.validate()?;
+        Ok(Some(managed_configuration(authority)))
     }
 
     async fn load_secondary_removal(
@@ -873,6 +884,8 @@ impl PodRuntime {
                 access_effect_acceptance_gate: StdMutex::new(None),
                 #[cfg(all(test, feature = "testing"))]
                 peer_discovery_ready_gate: StdMutex::new(None),
+                #[cfg(all(test, feature = "testing"))]
+                managed_configuration_commit_gate: StdMutex::new(None),
             }),
         }
     }
@@ -918,6 +931,16 @@ impl PodRuntime {
             release: Arc::new(tokio::sync::Notify::new()),
         };
         *self.host.peer_discovery_ready_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn testing_pause_managed_configuration_commit(&self) -> AccessEffectAcceptanceGate {
+        let gate = AccessEffectAcceptanceGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.host.managed_configuration_commit_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
@@ -1525,6 +1548,8 @@ struct RuntimeHost {
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
     #[cfg(all(test, feature = "testing"))]
     peer_discovery_ready_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(all(test, feature = "testing"))]
+    managed_configuration_commit_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
 }
 
 impl RuntimeHost {

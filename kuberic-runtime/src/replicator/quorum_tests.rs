@@ -1,5 +1,5 @@
 use super::QuorumTracker;
-use crate::authority::AdmittedAuthority;
+use crate::authority::{AdmittedAuthority, BuildAuthorityKind};
 use crate::protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, TransitionKind,
@@ -16,6 +16,11 @@ fn managed(authority: AdmittedAuthority) -> ManagedReplicaConfiguration {
         switchover_handoff: authority.switchover_handoff,
         secondary_removal: authority.secondary_removal,
         scale_up: authority.scale_up,
+        build_kind: if authority.transition_kind == Some(TransitionKind::Failover) {
+            BuildAuthorityKind::Failover
+        } else {
+            BuildAuthorityKind::Provisioning
+        },
     }
 }
 
