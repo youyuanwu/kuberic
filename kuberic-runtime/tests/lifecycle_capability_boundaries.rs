@@ -18,7 +18,7 @@ const HOST_CAPABILITY_TRAITS: &[&str] =
 #[rustfmt::skip]
 const CAPABILITY_TYPES: &[&str] = &[
     "ProcessRuntime", "AuthorityRuntime", "PeerRuntime", "AccessClosure", "AccessRuntime",
-    "ReportLifecycle", "EvidenceRuntime", "EffectEvidenceRuntime", "BuildLifecycleRuntime",
+    "ReportObservationRuntime", "EvidenceRuntime", "EffectEvidenceRuntime", "BuildLifecycleRuntime",
     "BuildCancellationRuntime", "OutboundLifecycleRuntime", "RemovalWitnessRuntime",
     "TopologyRuntime", "RecoveryRuntime", "ReportRuntime", "RecoveryOwnerRuntime", "BuildRuntime",
     "BuildAttemptRuntime", "PeerDiscoveryRuntime", "OutboundRuntime",
@@ -35,7 +35,7 @@ const LIFECYCLE_VIEW_RULES: &[(&str, &[&str])] = &[
     ("PeerRuntime", &["dynAuthorityLifecycle"]),
     ("AccessClosure", &["dynAccessLifecycle"]),
     ("AccessRuntime", &["dynAccessLifecycle"]),
-    ("ReportLifecycle", &["dynAccessLifecycle", "dynLifecycleObservation"]),
+    ("ReportObservationRuntime", &["dynLifecycleObservation"]),
     ("EvidenceRuntime", &["dynLifecycleObservation"]),
     ("EffectEvidenceRuntime", &["dynLifecycleObservation"]),
     ("BuildLifecycleRuntime", &["dynBuildLifecycle", "dynBuildCancellation", "BuildCancellationRuntime"]),
@@ -232,7 +232,7 @@ fn allowed_aggregates(relative: &Path) -> &'static [&'static str] {
     match relative.to_str() {
         Some("lifecycle.rs") => &[
             "LifecycleWiring",
-            "ReportLifecycle",
+            "ReportObservationRuntime",
             "BuildLifecycleRuntime",
             "RecoveryRuntime",
         ],
@@ -1325,7 +1325,7 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
     assert!(recovery.contains("RecoveryObservation"));
 
     let report_lifecycle = lifecycle
-        .split_once("pub(super) struct ReportLifecycle")
+        .split_once("pub(super) struct ReportObservationRuntime")
         .and_then(|(_, rest)| {
             rest.split_once("pub(super) struct EvidenceRuntime")
                 .map(|(body, _)| body)
@@ -1333,7 +1333,7 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         .expect("ReportLifecycle capability");
     assert!(
         !report_lifecycle.contains("RuntimeSnapshot"),
-        "ReportLifecycle must not transport RuntimeSnapshot"
+        "ReportObservationRuntime must not transport RuntimeSnapshot"
     );
     assert!(report_lifecycle.contains("ReportObservation"));
 
@@ -1373,11 +1373,19 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
     let production_report = report.split("#[cfg(test)]").next().unwrap_or(&report);
     for mutation in [
         "record_partition_reports",
+        "complete_application_initialization",
+        "migrate_schema",
+        "begin_effect",
+        "complete_effect",
+        "clear_reconfiguration",
+        "record_build",
+        "record_fault",
         "observe_progress",
         "reconcile_durable_access",
         "catch_up_capability().await",
         "tokio::time::sleep",
         "RuntimeError::",
+        "RuntimeSnapshot",
     ] {
         assert!(
             !production_report.contains(mutation),

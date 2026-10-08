@@ -299,7 +299,7 @@ struct RegisteredReplicator {
     peer_lifecycle: Option<lifecycle::PeerRuntime>,
     access_closure: Option<lifecycle::AccessClosure>,
     access_lifecycle: Option<lifecycle::AccessRuntime>,
-    report_lifecycle: Option<lifecycle::ReportLifecycle>,
+    report_lifecycle: Option<lifecycle::ReportObservationRuntime>,
     lifecycle_evidence: Option<lifecycle::EvidenceRuntime>,
     effect_evidence: Option<lifecycle::EffectEvidenceRuntime>,
     build_lifecycle: Option<lifecycle::BuildLifecycleRuntime>,
@@ -421,7 +421,7 @@ impl RegisteredReplicator {
     fn access_lifecycle(&self) -> Option<lifecycle::AccessRuntime> {
         self.access_lifecycle.clone()
     }
-    fn report_lifecycle(&self) -> Option<lifecycle::ReportLifecycle> {
+    fn report_lifecycle(&self) -> Option<lifecycle::ReportObservationRuntime> {
         self.report_lifecycle.clone()
     }
     fn lifecycle_evidence(&self) -> Option<lifecycle::EvidenceRuntime> {
@@ -1862,7 +1862,7 @@ impl RuntimeHost {
         if let Some(lifecycle) = self
             .registered
             .get()
-            .and_then(RegisteredReplicator::report_lifecycle)
+            .and_then(RegisteredReplicator::recovery_lifecycle)
         {
             lifecycle.observe_progress().await?;
         } else {
@@ -1906,7 +1906,7 @@ impl RuntimeHost {
         if let Some(lifecycle) = self
             .registered
             .get()
-            .and_then(RegisteredReplicator::report_lifecycle)
+            .and_then(RegisteredReplicator::recovery_lifecycle)
         {
             lifecycle.reconcile_access(read, write).await?;
         } else {

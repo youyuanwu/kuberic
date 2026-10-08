@@ -5160,11 +5160,15 @@ async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoratio
             .unwrap();
         if deferred {
             let observer = crate::host::report::AgentReporter::new(store.clone());
-            let in_flight = observer.report(&runtime.report_runtime()).await.unwrap();
-            assert_eq!(
-                in_flight.write_status,
-                proto::AccessStatus::ReconfigurationPending as i32
-            );
+            let durable_before = store.load_state().await.unwrap();
+            for _ in 0..2 {
+                let in_flight = observer.report(&runtime.report_runtime()).await.unwrap();
+                assert_eq!(
+                    in_flight.write_status,
+                    proto::AccessStatus::ReconfigurationPending as i32
+                );
+            }
+            assert_eq!(store.load_state().await.unwrap(), durable_before);
         }
         let restoration = if dropped {
             restoration.abort();

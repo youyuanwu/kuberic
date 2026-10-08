@@ -217,9 +217,8 @@ impl LifecycleWiring {
         }
     }
 
-    pub(super) fn report_lifecycle(&self) -> ReportLifecycle {
-        ReportLifecycle {
-            access: self.access.clone(),
+    pub(super) fn report_observation(&self) -> ReportObservationRuntime {
+        ReportObservationRuntime {
             observation: self.observation.clone(),
         }
     }
@@ -599,6 +598,18 @@ impl RecoveryRuntime {
         )
     }
 
+    pub(super) async fn observe_progress(&self) -> Result<()> {
+        self.observation.observe_progress().await
+    }
+
+    pub(super) async fn reconcile_access(
+        &self,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<()> {
+        restore_access(self.access.clone(), read, write).await
+    }
+
     pub(super) async fn restore_access(
         &self,
         read: AccessStatus,
@@ -729,24 +740,11 @@ impl AccessRuntime {
 }
 
 #[derive(Clone)]
-pub(super) struct ReportLifecycle {
-    access: Arc<dyn AccessLifecycle>,
+pub(super) struct ReportObservationRuntime {
     observation: Arc<dyn LifecycleObservation>,
 }
 
-impl ReportLifecycle {
-    pub(super) async fn observe_progress(&self) -> Result<()> {
-        self.observation.observe_progress().await
-    }
-
-    pub(super) async fn reconcile_access(
-        &self,
-        read: AccessStatus,
-        write: AccessStatus,
-    ) -> Result<()> {
-        restore_access(self.access.clone(), read, write).await
-    }
-
+impl ReportObservationRuntime {
     pub(super) async fn report_observation(&self) -> ReportObservation {
         self.observation.report_observation().await
     }

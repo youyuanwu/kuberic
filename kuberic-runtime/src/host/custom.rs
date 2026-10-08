@@ -1541,7 +1541,7 @@ pub(super) struct ReplicatorLifecycleRegistration {
     pub(super) peer: super::lifecycle::PeerRuntime,
     pub(super) access_closure: super::lifecycle::AccessClosure,
     pub(super) access: super::lifecycle::AccessRuntime,
-    pub(super) report: super::lifecycle::ReportLifecycle,
+    pub(super) report: super::lifecycle::ReportObservationRuntime,
     pub(super) evidence: super::lifecycle::EvidenceRuntime,
     pub(super) effect_evidence: super::lifecycle::EffectEvidenceRuntime,
     pub(super) build: super::lifecycle::BuildLifecycleRuntime,
@@ -1589,7 +1589,7 @@ impl ReplicatorLifecycleRegistration {
         let peer = wiring.peer_runtime();
         let access_closure = wiring.access_closure();
         let access = wiring.access_runtime();
-        let report = wiring.report_lifecycle();
+        let report = wiring.report_observation();
         let evidence = wiring.evidence_runtime();
         let effect_evidence = wiring.effect_evidence_runtime();
         let build = wiring.build_runtime(managed);
