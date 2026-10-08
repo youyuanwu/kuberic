@@ -1,9 +1,10 @@
 //! Restart recovery for durable agent effects.
 
-use crate::effects::{RuntimeEffect, RuntimeEffectResult, RuntimeSnapshot};
+use crate::effects::{RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::types::AccessStatus;
 
 use crate::host::Result;
+use crate::host::observation::RecoveryObservation;
 use crate::host::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use crate::host::state::RetainedResult;
 use crate::host::store::AgentStore;
@@ -17,7 +18,7 @@ pub(crate) enum RecoveryDecision {
 
 pub(crate) async fn inspect_recovery<S: AgentStore>(
     store: &S,
-    runtime: &RuntimeSnapshot,
+    runtime: &RecoveryObservation,
 ) -> Result<RecoveryDecision> {
     if runtime.write_status == AccessStatus::Granted {
         return Err(crate::host::HostError::DurableEffectConflict(
@@ -36,7 +37,7 @@ pub(crate) async fn inspect_recovery<S: AgentStore>(
 
 pub(crate) async fn recover_pending<S, E>(
     adapter: &RuntimeAdapter<S, E>,
-    runtime: &RuntimeSnapshot,
+    runtime: &RecoveryObservation,
 ) -> Result<Option<RuntimeEffectResult>>
 where
     S: AgentStore,

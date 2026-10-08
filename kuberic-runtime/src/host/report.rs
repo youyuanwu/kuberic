@@ -8,6 +8,7 @@ use crate::protocol::types::{AccessStatus, FaultType, ReplicaRole};
 
 use crate::host::Result;
 use crate::host::hosting::ReportRuntime;
+use crate::host::observation::{DurableAgentObservation, ReportObservation};
 use crate::host::session::ProcessSession;
 use crate::host::store::AgentStore;
 
@@ -39,12 +40,12 @@ impl<S: AgentStore> AgentReporter<S> {
                 Err(error) => return Err(error.into()),
             }
         }
-        let durable = self.store.load_state().await?;
-        let snapshot = runtime.snapshot().await;
+        let durable: DurableAgentObservation = self.store.load_state().await?.into();
+        let snapshot = runtime.observation().await;
         if durable.pending_effect.is_none()
             && durable.reconfiguration.is_none()
-            && (snapshot.read_status != durable.read_status
-                || snapshot.write_status != durable.write_status)
+            && (snapshot.host.read_status != durable.read_status
+                || snapshot.host.write_status != durable.write_status)
         {
             for attempt in 0..100 {
                 match runtime
@@ -70,15 +71,16 @@ impl<S: AgentStore> AgentReporter<S> {
             .record_partition_reports(partition.load_metrics.clone(), partition.reported_fault)
             .await?;
         for _ in 0..3 {
-            let state = self.store.load_state().await?;
-            let snapshot = runtime.snapshot().await;
-            let catch_up_capability = if snapshot.open && snapshot.role != ReplicaRole::None {
-                Some(runtime.catch_up_capability().await?)
-            } else {
-                None
-            };
-            let confirmed_snapshot = runtime.snapshot().await;
-            let confirmed_state = self.store.load_state().await?;
+            let state: DurableAgentObservation = self.store.load_state().await?.into();
+            let snapshot = runtime.observation().await;
+            let catch_up_capability =
+                if snapshot.host.open && snapshot.host.role != ReplicaRole::None {
+                    Some(runtime.catch_up_capability().await?)
+                } else {
+                    None
+                };
+            let confirmed_snapshot = runtime.observation().await;
+            let confirmed_state: DurableAgentObservation = self.store.load_state().await?.into();
             if state != confirmed_state
                 || !same_report_fence(&snapshot, &confirmed_snapshot)
                 || !snapshot_matches_state(&confirmed_snapshot, &confirmed_state)
@@ -101,14 +103,17 @@ impl<S: AgentStore> AgentReporter<S> {
 
 fn build_report(
     session: &ProcessSession,
-    state: crate::host::state::AgentState,
-    snapshot: crate::effects::RuntimeSnapshot,
+    state: DurableAgentObservation,
+    snapshot: ReportObservation,
     catch_up_capability: Option<i64>,
     reported_fault: Option<FaultType>,
 ) -> proto::AgentStatusReport {
+    let state = state.into_state();
     let mut builds = snapshot
+        .engine
         .builds
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|build| (build.authority.build_id.clone(), build))
         .collect::<BTreeMap<_, _>>();
     for (build_id, command) in &state.build_commands {
@@ -116,7 +121,7 @@ fn build_report(
             .scale_up_evidence
             .as_ref()
             .is_some_and(|evidence| &evidence.intent().build_id == build_id);
-        if !snapshot.live_builds_only
+        if !snapshot.host.live_builds_only
             && ((command.authority.is_none()
                 && !state.retired_builds.contains(build_id)
                 && !state.abandoned_builds.contains(build_id))
@@ -160,19 +165,23 @@ fn build_report(
         });
     proto::AgentStatusReport {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
-        replication_address: snapshot.replication_address.clone().unwrap_or_default(),
+        replication_address: snapshot
+            .host
+            .replication_address
+            .clone()
+            .unwrap_or_default(),
         resource_uid: state.identity.resource_uid.to_string(),
         identity: Some(state.identity.local_identity.clone().into()),
         process_session_id: session.id().to_string(),
         report_sequence: session.next_report_sequence(),
-        role: role_to_proto(snapshot.role) as i32,
-        write_status: access_to_proto(snapshot.write_status) as i32,
+        role: role_to_proto(snapshot.host.role) as i32,
+        write_status: access_to_proto(snapshot.host.write_status) as i32,
         epoch: Some(state.highest_epoch.into()),
         previous_configuration: state.previous_configuration.map(Into::into),
         current_configuration: state.current_configuration.map(Into::into),
-        current_progress: snapshot.current_progress,
-        verified_replication_lsn: snapshot.verified_replication_lsn,
-        committed_lsn: snapshot.committed_lsn,
+        current_progress: snapshot.engine.current_progress,
+        verified_replication_lsn: snapshot.engine.verified_replication_lsn,
+        committed_lsn: snapshot.engine.committed_lsn,
         catch_up_capability,
         storage_state: proto::AgentStorageState::Initialized as i32,
         pod_uid: state.identity.pod_uid.to_string(),
@@ -180,10 +189,12 @@ fn build_report(
         storage_error: String::new(),
         healthy: reported_fault != Some(FaultType::Permanent),
         replica_id: state.identity.local_identity.replica_id.value(),
-        read_status: access_to_proto(snapshot.read_status) as i32,
-        current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
-        catch_up_boundary: snapshot.catch_up_boundary,
-        catch_up_complete: snapshot.catch_up_complete,
+        read_status: access_to_proto(snapshot.host.read_status) as i32,
+        current_configuration_quorum_progress: snapshot
+            .engine
+            .current_configuration_quorum_progress,
+        catch_up_boundary: snapshot.engine.catch_up_boundary,
+        catch_up_complete: snapshot.engine.catch_up_complete,
         deactivated_lsn: state
             .deactivation
             .as_ref()
@@ -241,11 +252,8 @@ fn build_report(
     }
 }
 
-fn snapshot_matches_state(
-    snapshot: &crate::effects::RuntimeSnapshot,
-    state: &crate::host::state::AgentState,
-) -> bool {
-    let authority_matches = match snapshot.authority.as_ref() {
+fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObservation) -> bool {
+    let authority_matches = match snapshot.host.authority.as_ref() {
         Some(authority) => {
             authority.previous_configuration == state.previous_configuration
                 && Some(&authority.current_configuration) == state.current_configuration.as_ref()
@@ -255,33 +263,22 @@ fn snapshot_matches_state(
     };
     let access_matches = |projected, desired| {
         projected == desired
-            || (snapshot.live_builds_only
+            || (snapshot.host.live_builds_only
                 && projected == AccessStatus::ReconfigurationPending
                 && desired == AccessStatus::Granted)
     };
-    snapshot.role == state.role
-        && access_matches(snapshot.read_status, state.read_status)
-        && access_matches(snapshot.write_status, state.write_status)
+    snapshot.host.role == state.role
+        && access_matches(snapshot.host.read_status, state.read_status)
+        && access_matches(snapshot.host.write_status, state.write_status)
         && authority_matches
-        && snapshot.retired_authority == state.retired_authority
+        && snapshot.engine.retired_authority == state.retired_authority
 }
 
-fn same_report_fence(
-    before: &crate::effects::RuntimeSnapshot,
-    after: &crate::effects::RuntimeSnapshot,
-) -> bool {
-    before.identity == after.identity
-        && before.open == after.open
-        && before.replication_address == after.replication_address
-        && before.role == after.role
-        && before.role_transition == after.role_transition
-        && before.read_status == after.read_status
-        && before.write_status == after.write_status
-        && before.authority == after.authority
-        && before.prepared_secondary_removal == after.prepared_secondary_removal
-        && before.retired_authority == after.retired_authority
-        && before.accepted_secondary_removal == after.accepted_secondary_removal
-        && before.live_builds_only == after.live_builds_only
+fn same_report_fence(before: &ReportObservation, after: &ReportObservation) -> bool {
+    before.host == after.host
+        && before.engine.prepared_secondary_removal == after.engine.prepared_secondary_removal
+        && before.engine.retired_authority == after.engine.retired_authority
+        && before.engine.accepted_secondary_removal == after.engine.accepted_secondary_removal
 }
 
 fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
@@ -382,13 +379,19 @@ mod tests {
         snapshot.live_builds_only = true;
         let fresh = ProcessSession::new();
         assert!(
-            build_report(&fresh, state.clone(), snapshot.clone(), None, None)
-                .builds
-                .is_empty()
+            build_report(
+                &fresh,
+                state.clone().into(),
+                snapshot.clone().into(),
+                None,
+                None,
+            )
+            .builds
+            .is_empty()
         );
         snapshot.live_builds_only = false;
         assert_eq!(
-            build_report(&fresh, state, snapshot, None, None)
+            build_report(&fresh, state.into(), snapshot.into(), None, None)
                 .builds
                 .len(),
             1
@@ -417,9 +420,11 @@ mod tests {
         after.current_configuration_quorum_progress = 10;
         after.catch_up_boundary = Some(11);
         after.catch_up_complete = true;
-        assert!(same_report_fence(&before, &after));
-
+        assert!(same_report_fence(
+            &before.clone().into(),
+            &after.clone().into()
+        ));
         after.write_status = AccessStatus::Granted;
-        assert!(!same_report_fence(&before, &after));
+        assert!(!same_report_fence(&before.into(), &after.into()));
     }
 }

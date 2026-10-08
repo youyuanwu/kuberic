@@ -7,6 +7,7 @@ mod coordinator;
 mod error;
 #[allow(clippy::disallowed_types)]
 pub(crate) mod hosting;
+mod observation;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;

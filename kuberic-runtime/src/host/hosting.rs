@@ -43,6 +43,10 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use tokio::sync::{Mutex, RwLock, oneshot};
 
+use super::observation::{
+    BuildObservation, OutboundObservation, PeerObservation, RecoveryObservation, ReportObservation,
+};
+
 tokio::task_local! {
     static ACCESS_PROOF_VIEW: (AccessStatus, AccessStatus);
     static ACCESS_PUBLICATION_DEADLINE: tokio::time::Instant;
@@ -464,7 +468,7 @@ pub(crate) struct PartitionReportSnapshot {
 #[async_trait]
 trait ReportHost: Send + Sync {
     async fn observe_progress(&self) -> Result<()>;
-    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn observation(&self) -> ReportObservation;
     async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()>;
     async fn partition_report(&self) -> PartitionReportSnapshot;
     async fn catch_up_capability(&self) -> Result<i64>;
@@ -480,8 +484,8 @@ impl ReportRuntime {
         self.inner.observe_progress().await
     }
 
-    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.inner.snapshot().await
+    pub(crate) async fn observation(&self) -> ReportObservation {
+        self.inner.observation().await
     }
 
     pub(crate) async fn reconcile_durable_access(
@@ -505,7 +509,7 @@ impl ReportRuntime {
 trait BuildHost: Send + Sync {
     fn is_managed(&self) -> bool;
     async fn describe_peer(&self, replica: crate::replicator::ReplicaInformation) -> Result<()>;
-    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn observation(&self) -> BuildObservation;
     async fn register_peer_session(
         &self,
         identity: ReplicaIdentity,
@@ -582,8 +586,8 @@ impl BuildRuntime {
         self.cancellation.clone()
     }
 
-    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.inner.snapshot().await
+    pub(crate) async fn observation(&self) -> BuildObservation {
+        self.inner.observation().await
     }
 
     pub(crate) async fn register_peer_session(
@@ -722,7 +726,7 @@ impl BuildRuntimeCancellation {
 
 #[async_trait]
 trait PeerDiscoveryHost: Send + Sync {
-    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn observation(&self) -> PeerObservation;
     async fn register_peer_session(
         &self,
         identity: ReplicaIdentity,
@@ -743,8 +747,8 @@ pub(crate) struct PeerDiscoveryRuntime {
 }
 
 impl PeerDiscoveryRuntime {
-    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.inner.snapshot().await
+    pub(crate) async fn observation(&self) -> PeerObservation {
+        self.inner.observation().await
     }
 
     pub(crate) async fn register_peer_session(
@@ -780,7 +784,7 @@ impl PeerDiscoveryRuntime {
 #[async_trait]
 trait OutboundHost: Send + Sync {
     async fn next_outbound(&self) -> Option<OutboundOperation>;
-    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn observation(&self) -> OutboundObservation;
 }
 
 #[derive(Clone)]
@@ -793,8 +797,8 @@ impl OutboundRuntime {
         self.inner.next_outbound().await
     }
 
-    pub(crate) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.inner.snapshot().await
+    pub(crate) async fn observation(&self) -> OutboundObservation {
+        self.inner.observation().await
     }
 }
 
@@ -1082,7 +1086,7 @@ impl PodRuntime {
         if let Ok(recovery) = self.host.recovery_lifecycle() {
             recovery.restore_authority().await?;
             self.host
-                .sync_access_projection(recovery.snapshot().await)
+                .sync_access_projection(recovery.observation().await)
                 .await;
         }
         if let Some((target_role, epoch_completed, application_completed)) = transition {
@@ -1117,7 +1121,7 @@ impl PodRuntime {
                     .load_secondary_removal_commit()
                     .await?
                 && recovery
-                    .snapshot()
+                    .observation()
                     .await
                     .authority
                     .as_ref()
@@ -1135,7 +1139,7 @@ impl PodRuntime {
                 result => result?,
             }
             self.host
-                .sync_access_projection(recovery.snapshot().await)
+                .sync_access_projection(recovery.observation().await)
                 .await;
         } else {
             let mut state = self.host.state.write().await;
@@ -1579,7 +1583,7 @@ impl ReportHost for RuntimeHost {
         self.observe_report_progress().await
     }
 
-    async fn snapshot(&self) -> RuntimeSnapshot {
+    async fn observation(&self) -> ReportObservation {
         let lifecycle = self
             .registered
             .get()
@@ -1588,7 +1592,7 @@ impl ReportHost for RuntimeHost {
             Some(lifecycle) => Some(lifecycle.snapshot().await),
             None => None,
         };
-        self.compose_snapshot(snapshot).await
+        self.compose_snapshot(snapshot).await.into()
     }
 
     async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
@@ -1824,8 +1828,8 @@ impl BuildHost for RuntimeHost {
         self.peer_lifecycle()?.describe_peer(replica).await
     }
 
-    async fn snapshot(&self) -> RuntimeSnapshot {
-        RuntimeHost::snapshot(self).await
+    async fn observation(&self) -> BuildObservation {
+        ReportHost::observation(self).await.build()
     }
 
     async fn register_peer_session(
@@ -1898,8 +1902,8 @@ impl BuildAttemptHost for RuntimeHost {
 
 #[async_trait]
 impl PeerDiscoveryHost for RuntimeHost {
-    async fn snapshot(&self) -> RuntimeSnapshot {
-        RuntimeHost::snapshot(self).await
+    async fn observation(&self) -> PeerObservation {
+        ReportHost::observation(self).await.peer()
     }
 
     async fn register_peer_session(
@@ -1962,8 +1966,8 @@ impl OutboundHost for RuntimeHost {
         }
     }
 
-    async fn snapshot(&self) -> RuntimeSnapshot {
-        RuntimeHost::snapshot(self).await
+    async fn observation(&self) -> OutboundObservation {
+        ReportHost::observation(self).await.outbound()
     }
 }
 
@@ -2525,8 +2529,10 @@ impl RuntimeHost {
                     let topology = self.topology_lifecycle()?;
                     if !self.closed.load(Ordering::Acquire) {
                         topology.fence_retirement(*retired.clone()).await?;
-                        self.sync_access_projection(self.lifecycle_evidence()?.snapshot().await)
-                            .await;
+                        self.sync_access_projection(
+                            self.lifecycle_evidence()?.snapshot().await.into(),
+                        )
+                        .await;
                         self.change_replicator_role_at_epoch(
                             ReplicaRole::None,
                             Some(retired.report.epoch),
@@ -2564,7 +2570,7 @@ impl RuntimeHost {
                 self.authority_lifecycle()?
                     .admit_authority(*authority)
                     .await?;
-                self.sync_access_projection(self.lifecycle_evidence()?.snapshot().await)
+                self.sync_access_projection(self.lifecycle_evidence()?.snapshot().await.into())
                     .await;
             }
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
@@ -2952,7 +2958,8 @@ impl RuntimeHost {
         }
         let address = registered.open().await?;
         if let Some(evidence) = registered.lifecycle_evidence() {
-            self.sync_access_projection(evidence.snapshot().await).await;
+            self.sync_access_projection(evidence.snapshot().await.into())
+                .await;
         } else {
             let progress = registered.current_progress().await?;
             let committed = match registered.provider.as_ref() {
@@ -3229,11 +3236,11 @@ impl RuntimeHost {
         self.abort();
     }
 
-    async fn sync_access_projection(&self, managed_snapshot: RuntimeSnapshot) {
+    async fn sync_access_projection(&self, managed: RecoveryObservation) {
         let mut state = self.state.write().await;
-        state.fallback_snapshot.read_status = managed_snapshot.read_status;
-        state.fallback_snapshot.write_status = managed_snapshot.write_status;
-        state.fallback_snapshot.authority = managed_snapshot.authority;
+        state.fallback_snapshot.read_status = managed.read_status;
+        state.fallback_snapshot.write_status = managed.write_status;
+        state.fallback_snapshot.authority = managed.authority;
     }
 
     async fn execute_secondary_action(&self, action: RuntimeEffectAction) -> Result<()> {

@@ -1268,6 +1268,60 @@ fn lifecycle_capability_boundaries_are_narrow() {
 }
 
 #[test]
+fn projection_capabilities_reject_complete_runtime_snapshots() {
+    let hosting = source("src/host/hosting.rs");
+    for (start, end, projection) in [
+        (
+            "trait ReportHost",
+            "pub(crate) struct ReportRuntime",
+            "ReportObservation",
+        ),
+        (
+            "trait BuildHost",
+            "trait BuildAttemptHost",
+            "BuildObservation",
+        ),
+        (
+            "trait PeerDiscoveryHost",
+            "pub(crate) struct PeerDiscoveryRuntime",
+            "PeerObservation",
+        ),
+        (
+            "trait OutboundHost",
+            "pub(crate) struct OutboundRuntime",
+            "OutboundObservation",
+        ),
+    ] {
+        let body = hosting
+            .split_once(start)
+            .and_then(|(_, rest)| rest.split_once(end).map(|(body, _)| body))
+            .unwrap_or_else(|| panic!("missing {start} capability"));
+        assert!(
+            !body.contains("RuntimeSnapshot"),
+            "{start} must not transport RuntimeSnapshot"
+        );
+        assert!(
+            body.contains(projection),
+            "{start} must transport {projection}"
+        );
+    }
+
+    let lifecycle = source("src/host/lifecycle.rs");
+    let recovery = lifecycle
+        .split_once("pub(super) struct RecoveryRuntime")
+        .and_then(|(_, rest)| {
+            rest.split_once("pub(super) struct AccessClosure")
+                .map(|(body, _)| body)
+        })
+        .expect("RecoveryRuntime capability");
+    assert!(
+        !recovery.contains("RuntimeSnapshot"),
+        "RecoveryRuntime must not transport RuntimeSnapshot"
+    );
+    assert!(recovery.contains("RecoveryObservation"));
+}
+
+#[test]
 fn managed_replica_runtime_boundary_is_typed() {
     let replicator = source("src/replicator/mod.rs");
     let configuration = source("src/replicator/configuration.rs");

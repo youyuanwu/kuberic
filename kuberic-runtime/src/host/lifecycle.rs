@@ -16,6 +16,7 @@ use crate::replicator::ReplicaInformation;
 use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
 
+use super::super::observation::RecoveryObservation;
 use super::custom::{
     AccessDecision, BuildAdmission, BuildCompletionConfirmation, ReadyAccessTransaction,
 };
@@ -586,8 +587,8 @@ impl RecoveryRuntime {
         self.authority.restore_authority().await
     }
 
-    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.observation.snapshot().await
+    pub(super) async fn observation(&self) -> RecoveryObservation {
+        self.observation.snapshot().await.into()
     }
 
     pub(super) async fn restore_access(
