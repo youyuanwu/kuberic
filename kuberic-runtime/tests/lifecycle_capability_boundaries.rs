@@ -1376,10 +1376,41 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "observe_progress",
         "reconcile_durable_access",
         "catch_up_capability().await",
+        "tokio::time::sleep",
+        "RuntimeError::",
     ] {
         assert!(
             !production_report.contains(mutation),
             "status reporting must not perform {mutation}"
+        );
+    }
+
+    let service = source("src/host/service.rs");
+    assert_eq!(
+        service.matches(".report(&report_runtime)").count(),
+        2,
+        "status RPC and post-command status must share the read-only reporter"
+    );
+    let observation = source("src/host/observation.rs");
+    let production_observation = observation
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or(&observation);
+    assert!(
+        !production_observation.contains("Serialize, Deserialize"),
+        "process-local owner observations must not enter durable serialization"
+    );
+    let durable_state = source("src/host/state.rs");
+    for transient in [
+        "HostProxyObservation",
+        "ReplicationEngineObservation",
+        "ReportObservation",
+        "PendingAccessObservation",
+        "ManagedOperationFence",
+    ] {
+        assert!(
+            !durable_state.contains(transient),
+            "durable agent state must not contain transient observation {transient}"
         );
     }
 
