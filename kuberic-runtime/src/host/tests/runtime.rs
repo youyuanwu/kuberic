@@ -6880,10 +6880,10 @@ async fn exercise_blocked_lifecycle_invalidation(
             LifecycleInvalidation::Authority | LifecycleInvalidation::Session
         )
     {
+        let blocked = timeout(Duration::from_millis(25), &mut mutation).await;
         assert!(
-            timeout(Duration::from_millis(25), &mut mutation)
-                .await
-                .is_err()
+            blocked.is_err(),
+            "{callback:?} mutation {invalidation:?} completed early: {blocked:?}"
         );
         control.configuration_released.notify_one();
         let mutation_result = mutation.await;
@@ -6904,7 +6904,21 @@ async fn exercise_blocked_lifecycle_invalidation(
             );
         } else {
             mutation_result.unwrap();
-            assert!(result.is_err());
+            result.unwrap();
+            assert!(
+                control
+                    .configurations
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .replicas
+                    .iter()
+                    .any(|replica| {
+                        replica.process_session_id == ProcessSessionId::new("replacement-session")
+                    }),
+                "replacement session was not published after the owned callback"
+            );
         }
         assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
         return;
