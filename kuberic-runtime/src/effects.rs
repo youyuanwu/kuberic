@@ -141,7 +141,15 @@ pub(crate) struct EpochCompletion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AccessCompletionKind {
+    Combined,
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AccessCompletion {
+    pub(crate) kind: AccessCompletionKind,
     pub(crate) read_status: AccessStatus,
     pub(crate) write_status: AccessStatus,
     pub(crate) authority: Option<AdmittedAuthority>,
@@ -411,15 +419,24 @@ impl RuntimeEffectResult {
             (
                 RuntimeEffectAction::SetAccessStatus { read, write },
                 RuntimeEffectOutcome::AccessChanged(completion),
-            ) => completion.read_status == *read && completion.write_status == *write,
+            ) => {
+                completion.kind == AccessCompletionKind::Combined
+                    && completion.read_status == *read
+                    && completion.write_status == *write
+            }
             (
                 RuntimeEffectAction::SetReadStatus(expected),
                 RuntimeEffectOutcome::AccessChanged(completion),
-            ) => completion.read_status == *expected,
+            ) => {
+                completion.kind == AccessCompletionKind::Read && completion.read_status == *expected
+            }
             (
                 RuntimeEffectAction::SetWriteStatus(expected),
                 RuntimeEffectOutcome::AccessChanged(completion),
-            ) => completion.write_status == *expected,
+            ) => {
+                completion.kind == AccessCompletionKind::Write
+                    && completion.write_status == *expected
+            }
             (
                 RuntimeEffectAction::PrepareSwitchover {
                     preparation_generation,
@@ -466,5 +483,168 @@ impl RuntimeEffectResult {
         } else {
             Err("runtime result does not match the durable effect action")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authority::BuildAuthorityKind;
+    use crate::protocol::types::{
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, ReplicaId, ReplicaInstanceId,
+    };
+
+    fn identity(id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(format!("instance-{id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{id}")),
+        }
+    }
+
+    fn configuration() -> ConfigurationDescriptor {
+        let local = identity(1);
+        ConfigurationDescriptor::new(
+            Epoch::new(1, 2),
+            local.replica_id,
+            vec![ConfigurationMember {
+                identity: local,
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        )
+    }
+
+    fn authority() -> AdmittedAuthority {
+        AdmittedAuthority {
+            local_identity: identity(1),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: configuration(),
+            switchover_handoff: None,
+            scale_up: None,
+            secondary_removal: None,
+        }
+    }
+
+    fn required_family_cases() -> Vec<(RuntimeEffectAction, RuntimeEffectOutcome)> {
+        let transition = RoleTransition {
+            completed_role: ReplicaRole::IdleSecondary,
+            target_role: ReplicaRole::Primary,
+            replicator_completed: true,
+            epoch_completed: true,
+            application_completed: false,
+        };
+        let build_authority = BuildAuthority {
+            build_id: OperationId::new("build"),
+            kind: BuildAuthorityKind::Provisioning,
+            source: identity(1),
+            target: identity(2),
+            current_configuration: configuration(),
+            replication_boundary_lsn: 7,
+        };
+        vec![
+            (
+                RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::Primary),
+                RuntimeEffectOutcome::ApplicationRoleChanged {
+                    completion: RoleCompletion {
+                        role: ReplicaRole::Primary,
+                        role_transition: None,
+                    },
+                    receipt: None,
+                },
+            ),
+            (
+                RuntimeEffectAction::UpdateEpoch,
+                RuntimeEffectOutcome::EpochUpdated(EpochCompletion {
+                    epoch: Epoch::new(1, 2),
+                    role_transition: Some(transition),
+                }),
+            ),
+            (
+                RuntimeEffectAction::SetReadStatus(AccessStatus::Granted),
+                RuntimeEffectOutcome::AccessChanged(AccessCompletion {
+                    kind: AccessCompletionKind::Read,
+                    read_status: AccessStatus::Granted,
+                    write_status: AccessStatus::NotPrimary,
+                    authority: Some(authority()),
+                    role: ReplicaRole::Primary,
+                }),
+            ),
+            (
+                RuntimeEffectAction::WaitForCatchup,
+                RuntimeEffectOutcome::CatchUpCompleted(CatchUpCompletion {
+                    authority: Some(authority()),
+                    boundary_lsn: 9,
+                }),
+            ),
+            (
+                RuntimeEffectAction::BuildReplica {
+                    build_id: OperationId::new("build"),
+                    target: identity(2),
+                    replication_address: "in-process://target".into(),
+                },
+                RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                    build_id: OperationId::new("build"),
+                    target: identity(2),
+                    state: BuildEffectState::Completed(BuildPostcondition {
+                        authority: build_authority,
+                        last_sequence: 1,
+                        durable_lsn: 9,
+                        completed: true,
+                        catch_up_boundary_lsn: Some(7),
+                    }),
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn required_completion_families_round_trip_and_reject_substitution() {
+        let cases = required_family_cases();
+        for (index, (action, outcome)) in cases.iter().enumerate() {
+            let effect = RuntimeEffect {
+                operation_id: OperationId::new(format!("effect-{index}")),
+                sequence: index as u64 + 1,
+                action: action.clone(),
+            };
+            let result = RuntimeEffectResult {
+                operation_id: effect.operation_id.clone(),
+                sequence: effect.sequence,
+                outcome: outcome.clone(),
+            };
+            result.validate_for(&effect).unwrap();
+            let encoded = serde_json::to_vec(&result).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<RuntimeEffectResult>(&encoded).unwrap(),
+                result
+            );
+            let wrong = RuntimeEffectResult {
+                outcome: cases[(index + 1) % cases.len()].1.clone(),
+                ..result
+            };
+            assert!(wrong.validate_for(&effect).is_err());
+        }
+    }
+
+    #[test]
+    fn access_completion_rejects_wrong_suboperation_with_matching_status() {
+        let result = RuntimeEffectResult {
+            operation_id: OperationId::new("read"),
+            sequence: 1,
+            outcome: RuntimeEffectOutcome::AccessChanged(AccessCompletion {
+                kind: AccessCompletionKind::Write,
+                read_status: AccessStatus::Granted,
+                write_status: AccessStatus::NotPrimary,
+                authority: Some(authority()),
+                role: ReplicaRole::Primary,
+            }),
+        };
+        let effect = RuntimeEffect {
+            operation_id: result.operation_id.clone(),
+            sequence: result.sequence,
+            action: RuntimeEffectAction::SetReadStatus(AccessStatus::Granted),
+        };
+        assert!(result.validate_for(&effect).is_err());
     }
 }

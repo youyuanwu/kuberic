@@ -15,9 +15,9 @@
 
 use crate::authority::{AdmittedAuthority, RetiredAuthority};
 use crate::effects::{
-    AccessCompletion, AuthorityCompletion, BuildCompletion, BuildEffectState, BuildPostcondition,
-    CatchUpCompletion, EpochCompletion, HistoricalSecondaryRemovalCompletion, ProcessCompletion,
-    RetirementCompletion, RoleCompletion, RoleTransition, RuntimeEffectAction,
+    AccessCompletion, AccessCompletionKind, AuthorityCompletion, BuildCompletion, BuildEffectState,
+    BuildPostcondition, CatchUpCompletion, EpochCompletion, HistoricalSecondaryRemovalCompletion,
+    ProcessCompletion, RetirementCompletion, RoleCompletion, RoleTransition, RuntimeEffectAction,
     RuntimeEffectOutcome, RuntimeSnapshot, SecondaryRemovalPreparationCompletion,
     SwitchoverCompletion,
 };
@@ -325,7 +325,14 @@ impl ReplicaRuntimeState {
             RuntimeEffectAction::SetAccessStatus { .. }
             | RuntimeEffectAction::SetReadStatus(_)
             | RuntimeEffectAction::SetWriteStatus(_) => {
+                let kind = match action {
+                    RuntimeEffectAction::SetAccessStatus { .. } => AccessCompletionKind::Combined,
+                    RuntimeEffectAction::SetReadStatus(_) => AccessCompletionKind::Read,
+                    RuntimeEffectAction::SetWriteStatus(_) => AccessCompletionKind::Write,
+                    _ => unreachable!(),
+                };
                 RuntimeEffectOutcome::AccessChanged(AccessCompletion {
+                    kind,
                     read_status: self.read_status,
                     write_status: self.write_status,
                     authority: self.authority.clone(),
@@ -590,10 +597,13 @@ impl ReportObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::{BuildAuthority, BuildAuthorityKind};
+    use crate::effects::{BuildPostcondition, RoleTransition};
     use crate::host::state::{SCHEMA_VERSION, StorageIdentity};
     use crate::protocol::types::{
-        AgentGeneration, EffectivePolicy, InitializationId, OperationId, PodUid, PvcUid, ReplicaId,
-        ReplicaInstanceId, ResourceUid,
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
+        InitializationId, OperationId, PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ReplicaRole,
+        ResourceUid,
     };
 
     fn identity() -> ReplicaIdentity {
@@ -601,6 +611,27 @@ mod tests {
             replica_id: ReplicaId::new(1),
             instance_id: ReplicaInstanceId::new("instance"),
             agent_generation: AgentGeneration::new("generation"),
+        }
+    }
+
+    fn authority() -> AdmittedAuthority {
+        let local = identity();
+        AdmittedAuthority {
+            local_identity: local.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: ConfigurationDescriptor::new(
+                Epoch::new(1, 2),
+                local.replica_id,
+                vec![ConfigurationMember {
+                    identity: local,
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            switchover_handoff: None,
+            scale_up: None,
+            secondary_removal: None,
         }
     }
 
@@ -636,5 +667,120 @@ mod tests {
         assert_eq!(serde_json::to_vec(&retained).unwrap(), retained_before);
         assert_eq!(before.outbound(), outbound);
         assert_eq!(state.identity.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn required_effect_outcomes_ignore_unrelated_runtime_observations() {
+        let authority = authority();
+        let mut base = ReplicaRuntimeState::empty(identity());
+        base.open = true;
+        base.role = ReplicaRole::Primary;
+        base.read_status = AccessStatus::Granted;
+        base.write_status = AccessStatus::Granted;
+        base.authority = Some(authority.clone());
+        base.role_transition = Some(RoleTransition {
+            completed_role: ReplicaRole::IdleSecondary,
+            target_role: ReplicaRole::Primary,
+            replicator_completed: true,
+            epoch_completed: true,
+            application_completed: false,
+        });
+        base.catch_up_boundary = Some(9);
+        base.catch_up_complete = true;
+        let build = BuildPostcondition {
+            authority: BuildAuthority {
+                build_id: OperationId::new("build"),
+                kind: BuildAuthorityKind::Provisioning,
+                source: identity(),
+                target: ReplicaIdentity {
+                    replica_id: ReplicaId::new(2),
+                    instance_id: ReplicaInstanceId::new("target"),
+                    agent_generation: AgentGeneration::new("target-generation"),
+                },
+                current_configuration: authority.current_configuration.clone(),
+                replication_boundary_lsn: 7,
+            },
+            last_sequence: 1,
+            durable_lsn: 9,
+            completed: true,
+            catch_up_boundary_lsn: Some(7),
+        };
+        base.builds.push(build.clone());
+
+        let role_action = RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::Primary);
+        let role_before = base.effect_outcome(&role_action, None, None).unwrap();
+        let mut role_after_state = base.clone();
+        role_after_state.current_progress = 100;
+        role_after_state.committed_lsn = 90;
+        role_after_state.builds.clear();
+        assert_eq!(
+            role_after_state
+                .effect_outcome(&role_action, None, None)
+                .unwrap(),
+            role_before
+        );
+
+        let epoch_action = RuntimeEffectAction::UpdateEpoch;
+        let epoch_before = base.effect_outcome(&epoch_action, None, None).unwrap();
+        let mut epoch_after_state = base.clone();
+        epoch_after_state.read_status = AccessStatus::NotPrimary;
+        epoch_after_state.write_status = AccessStatus::NotPrimary;
+        epoch_after_state.current_progress = 101;
+        assert_eq!(
+            epoch_after_state
+                .effect_outcome(&epoch_action, None, None)
+                .unwrap(),
+            epoch_before
+        );
+
+        let access_action = RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        };
+        let access_before = base.effect_outcome(&access_action, None, None).unwrap();
+        let mut access_after_state = base.clone();
+        access_after_state.current_progress = 102;
+        access_after_state.committed_lsn = 91;
+        access_after_state.builds.clear();
+        assert_eq!(
+            access_after_state
+                .effect_outcome(&access_action, None, None)
+                .unwrap(),
+            access_before
+        );
+
+        let catch_up_action = RuntimeEffectAction::WaitForCatchup;
+        let catch_up_before = base.effect_outcome(&catch_up_action, None, None).unwrap();
+        let mut catch_up_after_state = base.clone();
+        catch_up_after_state.role = ReplicaRole::IdleSecondary;
+        catch_up_after_state.read_status = AccessStatus::NotPrimary;
+        catch_up_after_state.write_status = AccessStatus::NotPrimary;
+        catch_up_after_state.current_progress = 103;
+        catch_up_after_state.committed_lsn = 92;
+        catch_up_after_state.builds.clear();
+        assert_eq!(
+            catch_up_after_state
+                .effect_outcome(&catch_up_action, None, None)
+                .unwrap(),
+            catch_up_before
+        );
+
+        let build_action = RuntimeEffectAction::BuildReplica {
+            build_id: build.authority.build_id.clone(),
+            target: build.authority.target.clone(),
+            replication_address: "in-process://target".into(),
+        };
+        let build_before = base.effect_outcome(&build_action, None, None).unwrap();
+        let mut build_after_state = base.clone();
+        build_after_state.role = ReplicaRole::IdleSecondary;
+        build_after_state.read_status = AccessStatus::NotPrimary;
+        build_after_state.write_status = AccessStatus::NotPrimary;
+        build_after_state.current_progress = 104;
+        assert_eq!(
+            build_after_state
+                .effect_outcome(&build_action, None, None)
+                .unwrap(),
+            build_before
+        );
     }
 }

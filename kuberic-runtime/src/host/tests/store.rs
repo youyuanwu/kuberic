@@ -7,8 +7,9 @@ use crate::authority::{
     LocalWritePhase, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use crate::effects::{
-    HistoricalSecondaryRemovalCompletion, RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome,
-    RuntimeEffectResult,
+    AccessCompletion, AccessCompletionKind, BuildCompletion, BuildEffectState, BuildPostcondition,
+    CatchUpCompletion, EpochCompletion, HistoricalSecondaryRemovalCompletion, RoleCompletion,
+    RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult,
 };
 use crate::host::provisioning::{
     InitializationAuthority, ObservedStorageIdentity, StorePresence, authorize_initialization,
@@ -151,6 +152,220 @@ async fn exhausted_effect_sequence_persists_and_rejects_new_intents_after_reopen
     let state = store.load_state().await.unwrap();
     assert_eq!(state.next_effect_sequence, u64::MAX);
     assert!(state.pending_effect.is_none());
+}
+
+#[tokio::test]
+async fn narrow_effect_completion_updates_only_declared_durable_domains() {
+    #[derive(Clone, Copy)]
+    enum OwnedDomain {
+        Role,
+        Epoch,
+        ReadAccess,
+        None,
+    }
+
+    let (mut base, _, _, _) = pending_acceptance_fixture();
+    base.pending_effect = None;
+    base.retained_result = None;
+    base.removal_effects.clear();
+    base.prepared_secondary_removal = None;
+    base.accepted_secondary_removal = None;
+    base.secondary_removal_evidence = None;
+    base.scale_up_evidence = None;
+    base.role = ReplicaRole::IdleSecondary;
+    base.read_status = AccessStatus::NotPrimary;
+    base.write_status = AccessStatus::NotPrimary;
+    base.highest_epoch = Epoch::default();
+    base.next_effect_sequence = 20;
+
+    let configuration = base.current_configuration.clone().unwrap();
+    let authority = AdmittedAuthority {
+        local_identity: base.identity.local_identity.clone(),
+        transition_kind: None,
+        previous_configuration: base.previous_configuration.clone(),
+        current_configuration: configuration.clone(),
+        switchover_handoff: None,
+        scale_up: None,
+        secondary_removal: None,
+    };
+    let target = configuration
+        .members
+        .iter()
+        .find(|member| member.identity != base.identity.local_identity)
+        .unwrap()
+        .identity
+        .clone();
+    let build_authority = BuildAuthority {
+        build_id: OperationId::new("owned-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: base.identity.local_identity.clone(),
+        target: target.clone(),
+        current_configuration: configuration.clone(),
+        replication_boundary_lsn: 7,
+    };
+    let build_progress = DurableBuildProgress {
+        authority: build_authority.clone(),
+        last_sequence: 3,
+        durable_lsn: 9,
+        completed: true,
+        catch_up_boundary_lsn: Some(7),
+    };
+    base.build_progress
+        .insert(build_authority.build_id.clone(), build_progress.clone());
+
+    let cases = vec![
+        (
+            OwnedDomain::Role,
+            RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::Primary),
+            RuntimeEffectOutcome::ApplicationRoleChanged {
+                completion: RoleCompletion {
+                    role: ReplicaRole::Primary,
+                    role_transition: None,
+                },
+                receipt: None,
+            },
+        ),
+        (
+            OwnedDomain::Epoch,
+            RuntimeEffectAction::UpdateEpoch,
+            RuntimeEffectOutcome::EpochUpdated(EpochCompletion {
+                epoch: configuration.epoch,
+                role_transition: Some(RoleTransition {
+                    completed_role: ReplicaRole::IdleSecondary,
+                    target_role: ReplicaRole::Primary,
+                    replicator_completed: true,
+                    epoch_completed: true,
+                    application_completed: false,
+                }),
+            }),
+        ),
+        (
+            OwnedDomain::ReadAccess,
+            RuntimeEffectAction::SetReadStatus(AccessStatus::Granted),
+            RuntimeEffectOutcome::AccessChanged(AccessCompletion {
+                kind: AccessCompletionKind::Read,
+                read_status: AccessStatus::Granted,
+                write_status: AccessStatus::NotPrimary,
+                authority: Some(authority.clone()),
+                role: ReplicaRole::Primary,
+            }),
+        ),
+        (
+            OwnedDomain::None,
+            RuntimeEffectAction::WaitForCatchup,
+            RuntimeEffectOutcome::CatchUpCompleted(CatchUpCompletion {
+                authority: Some(authority.clone()),
+                boundary_lsn: 9,
+            }),
+        ),
+        (
+            OwnedDomain::None,
+            RuntimeEffectAction::BuildReplica {
+                build_id: build_authority.build_id.clone(),
+                target: target.clone(),
+                replication_address: "in-process://target".into(),
+            },
+            RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                build_id: build_authority.build_id.clone(),
+                target,
+                state: BuildEffectState::Completed(BuildPostcondition {
+                    authority: build_authority.clone(),
+                    last_sequence: build_progress.last_sequence,
+                    durable_lsn: build_progress.durable_lsn,
+                    completed: true,
+                    catch_up_boundary_lsn: build_progress.catch_up_boundary_lsn,
+                }),
+            }),
+        ),
+    ];
+
+    for (index, (owned, action, outcome)) in cases.into_iter().enumerate() {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let before = base.clone();
+        let store = SqliteStore::create_authorized(&path, before.clone()).unwrap();
+        let effect = RuntimeEffect {
+            operation_id: OperationId::new(format!("narrow-domain-{index}")),
+            sequence: before.next_effect_sequence,
+            action,
+        };
+        let result = RuntimeEffectResult {
+            operation_id: effect.operation_id.clone(),
+            sequence: effect.sequence,
+            outcome,
+        };
+        store.begin_effect(&effect).await.unwrap();
+        store.mark_effect_applied(&effect, &result).await.unwrap();
+        store.complete_effect(&result).await.unwrap();
+        let after = store.load_state().await.unwrap();
+
+        let mut normalized = after;
+        normalized.pending_effect = before.pending_effect.clone();
+        normalized.retained_result = before.retained_result.clone();
+        normalized.next_effect_sequence = before.next_effect_sequence;
+        normalized.removal_effects = before.removal_effects.clone();
+        match owned {
+            OwnedDomain::Role => normalized.role = before.role,
+            OwnedDomain::Epoch => normalized.highest_epoch = before.highest_epoch,
+            OwnedDomain::ReadAccess => normalized.read_status = before.read_status,
+            OwnedDomain::None => {}
+        }
+        assert_eq!(
+            normalized, before,
+            "completion {index} changed an undeclared durable domain"
+        );
+    }
+}
+
+#[tokio::test]
+async fn applied_effect_rejects_a_changed_canonical_result_without_mutation() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (mut state, _, _, _) = pending_acceptance_fixture();
+    state.pending_effect = None;
+    state.retained_result = None;
+    state.removal_effects.clear();
+    state.next_effect_sequence = 30;
+    state.highest_epoch = Epoch::default();
+    let expected_epoch = state.current_configuration.as_ref().unwrap().epoch;
+    let store = SqliteStore::create_authorized(&path, state).unwrap();
+    let effect = RuntimeEffect {
+        operation_id: OperationId::new("epoch-result-baseline"),
+        sequence: 30,
+        action: RuntimeEffectAction::UpdateEpoch,
+    };
+    let transition = RoleTransition {
+        completed_role: ReplicaRole::IdleSecondary,
+        target_role: ReplicaRole::Primary,
+        replicator_completed: true,
+        epoch_completed: true,
+        application_completed: false,
+    };
+    let result = RuntimeEffectResult {
+        operation_id: effect.operation_id.clone(),
+        sequence: effect.sequence,
+        outcome: RuntimeEffectOutcome::EpochUpdated(EpochCompletion {
+            epoch: expected_epoch,
+            role_transition: Some(transition.clone()),
+        }),
+    };
+    store.begin_effect(&effect).await.unwrap();
+    store.mark_effect_applied(&effect, &result).await.unwrap();
+    let applied = store.load_state().await.unwrap();
+
+    let changed = RuntimeEffectResult {
+        outcome: RuntimeEffectOutcome::EpochUpdated(EpochCompletion {
+            epoch: Epoch::new(
+                expected_epoch.data_loss_number,
+                expected_epoch.configuration_number + 1,
+            ),
+            role_transition: Some(transition),
+        }),
+        ..result.clone()
+    };
+    assert!(store.complete_effect(&changed).await.is_err());
+    assert_eq!(store.load_state().await.unwrap(), applied);
+    store.complete_effect(&result).await.unwrap();
 }
 
 #[tokio::test]

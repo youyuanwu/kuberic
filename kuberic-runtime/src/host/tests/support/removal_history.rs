@@ -98,10 +98,18 @@ where
     let (ready, mut ready_rx) = watch::channel(false);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(service.serve(address, replication, ready, shutdown_rx));
-    tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.wait_for(|r| *r))
-        .await
-        .unwrap()
-        .unwrap();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ready_rx.wait_for(|ready| *ready),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        readiness => panic!(
+            "history service readiness failed: {readiness:?}; server result: {:?}",
+            server.await
+        ),
+    }
     let client =
         proto::agent_control_client::AgentControlClient::connect(format!("http://{address}"))
             .await

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-// Fresh schema-5 stores bind application paths and initialization permission.
-pub const SCHEMA_VERSION: u32 = 5;
+// Schema 6 stores action-specific effect outcomes and rejects schema-5 metadata.
+pub const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

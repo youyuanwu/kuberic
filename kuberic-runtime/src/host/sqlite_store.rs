@@ -754,7 +754,28 @@ impl AgentStore for SqliteStore {
                 (
                     RuntimeEffectAction::UpdateEpoch,
                     RuntimeEffectOutcome::EpochUpdated(completion),
-                ) => state.highest_epoch = state.highest_epoch.max(completion.epoch),
+                ) => {
+                    let expected_epoch = durable_authority
+                        .as_ref()
+                        .map(|authority| authority.current_configuration.epoch)
+                        .or_else(|| {
+                            state
+                                .current_configuration
+                                .as_ref()
+                                .map(|configuration| configuration.epoch)
+                        })
+                        .ok_or_else(|| {
+                            crate::host::HostError::DurableEffectConflict(
+                                "epoch completion has no durable authority".into(),
+                            )
+                        })?;
+                    if completion.epoch != expected_epoch {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "epoch completion differs from durable authority".into(),
+                        ));
+                    }
+                    state.highest_epoch = state.highest_epoch.max(completion.epoch);
+                }
                 (
                     RuntimeEffectAction::ChangeApplicationRole(_),
                     RuntimeEffectOutcome::ApplicationRoleChanged {
@@ -2351,19 +2372,19 @@ mod tests {
     }
 
     #[test]
-    fn narrow_completion_schema_six_rejects_schema_four_without_migration() {
+    fn narrow_completion_schema_six_rejects_schema_five_without_migration() {
         let directory = crate::host::tests::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let expected = identity();
         drop(SqliteStore::create_authorized(&path, AgentState::new(expected.clone())).unwrap());
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
         drop(connection);
         assert!(matches!(
             SqliteStore::open_existing(&path, Some(&expected)),
             Err(crate::host::HostError::SchemaMismatch {
                 expected: 6,
-                observed: 4
+                observed: 5
             })
         ));
     }
