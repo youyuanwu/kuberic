@@ -290,6 +290,15 @@ impl From<RuntimeSnapshot> for RecoveryObservation {
 }
 
 impl ReportObservation {
+    pub(crate) fn same_fence(&self, other: &Self) -> bool {
+        self.host == other.host
+            && self.engine.fence == other.engine.fence
+            && self.engine.host_generation == other.engine.host_generation
+            && self.engine.prepared_secondary_removal == other.engine.prepared_secondary_removal
+            && self.engine.retired_authority == other.engine.retired_authority
+            && self.engine.accepted_secondary_removal == other.engine.accepted_secondary_removal
+    }
+
     pub(crate) fn build(&self) -> BuildObservation {
         BuildObservation {
             authority: self.host.authority.clone(),

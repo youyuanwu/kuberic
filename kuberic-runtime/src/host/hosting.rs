@@ -42,6 +42,7 @@ use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::task::JoinSet;
 
 use super::observation::{
     BuildObservation, HostProxyObservation, HostProxyState, OutboundObservation, PeerObservation,
@@ -252,7 +253,7 @@ struct HostState {
     load_metrics: BTreeMap<String, i64>,
     reported_fault: Option<FaultType>,
     partition_report_revision: u64,
-    catch_up_capability: Option<i64>,
+    catch_up_capability: Option<(ReportObservation, i64)>,
     role_transition_epoch: Option<Epoch>,
     role_transition_authority: Option<AdmittedAuthority>,
 }
@@ -912,6 +913,7 @@ impl PodRuntime {
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 partition_reports_closed: AtomicBool::new(false),
+                recovery_tasks: Mutex::new(JoinSet::new()),
                 custom_authority: custom::CustomAuthorityContainment::new(weak_self.clone()),
                 replica_session: OnceLock::new(),
                 #[cfg(all(test, feature = "testing"))]
@@ -1315,10 +1317,16 @@ impl PodRuntime {
         }
     }
 
-    pub(crate) fn quiesce_partition_reports(&self) {
+    pub(crate) async fn quiesce_partition_reports(&self) {
+        let _effect = self.host.effect_lock.lock().await;
+        let _state = self.host.state.write().await;
         self.host
             .partition_reports_closed
             .store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn shutdown_recovery_tasks(&self) {
+        self.host.shutdown_recovery_tasks().await;
     }
 
     pub(crate) fn build_runtime(&self) -> BuildRuntime {
@@ -1590,6 +1598,7 @@ struct RuntimeHost {
     aborted: AtomicBool,
     closed: AtomicBool,
     partition_reports_closed: AtomicBool,
+    recovery_tasks: Mutex<JoinSet<()>>,
     custom_authority: custom::CustomAuthorityContainment,
     #[cfg(all(test, feature = "testing"))]
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
@@ -1612,6 +1621,28 @@ impl RuntimeHost {
     async fn pause_custom_restoration(&self) {
         self.custom_authority.pause_restoration().await;
     }
+
+    async fn run_owned_recovery<F>(&self, recovery: F) -> Result<()>
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut tasks = self.recovery_tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _ = result_tx.send(recovery.await);
+        });
+        drop(tasks);
+        result_rx
+            .await
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
+    }
+
+    async fn shutdown_recovery_tasks(&self) {
+        let mut tasks = self.recovery_tasks.lock().await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
 }
 
 #[async_trait]
@@ -1627,7 +1658,7 @@ impl ReportHost for RuntimeHost {
         };
         let state = self.state.read().await;
         let fallback = state.fallback_snapshot.clone();
-        let catch_up_capability = state.catch_up_capability;
+        let catch_up_capability = state.catch_up_capability.clone();
         drop(state);
         observation.host.identity = fallback.identity;
         observation.host.open = fallback.open;
@@ -1642,7 +1673,9 @@ impl ReportHost for RuntimeHost {
         if self.aborted.load(Ordering::Acquire) {
             observation.host.open = false;
         }
-        observation.engine.catch_up_capability = catch_up_capability;
+        observation.engine.catch_up_capability = catch_up_capability
+            .filter(|(fence, _)| fence.same_fence(&observation))
+            .map(|(_, capability)| capability);
         observation
     }
 
@@ -1656,9 +1689,9 @@ impl ReportHostMutations for RuntimeHost {
     async fn observe_progress(&self) -> Result<()> {
         if !BuildHost::is_managed(self) {
             let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
-            return tokio::spawn(async move { host.observe_report_progress().await })
-                .await
-                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            return self
+                .run_owned_recovery(async move { host.observe_report_progress().await })
+                .await;
         }
         self.observe_report_progress().await
     }
@@ -1666,16 +1699,16 @@ impl ReportHostMutations for RuntimeHost {
     async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
         if !BuildHost::is_managed(self) {
             let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
-            return tokio::spawn(async move { host.reconcile_report_access(read, write).await })
-                .await
-                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            return self
+                .run_owned_recovery(async move { host.reconcile_report_access(read, write).await })
+                .await;
         }
         self.reconcile_report_access(read, write).await
     }
 
     async fn refresh_catch_up_capability(&self) -> Result<()> {
-        let observation = ReportHost::observation(self).await;
-        let capability = if observation.host.open && observation.host.role != ReplicaRole::None {
+        let before = ReportHost::observation(self).await;
+        let capability = if before.host.open && before.host.role != ReplicaRole::None {
             Some(
                 self.registered
                     .get()
@@ -1686,7 +1719,12 @@ impl ReportHostMutations for RuntimeHost {
         } else {
             None
         };
-        self.state.write().await.catch_up_capability = capability;
+        let after = ReportHost::observation(self).await;
+        if !before.same_fence(&after) {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.state.write().await.catch_up_capability =
+            capability.map(|capability| (after, capability));
         Ok(())
     }
 }
@@ -1733,7 +1771,6 @@ impl RuntimeHost {
         let Some(owned) = owned_access else {
             return Ok(());
         };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         #[cfg(all(test, feature = "testing"))]
         {
             let gate = self.peer_discovery_ready_gate.lock().unwrap().take();
@@ -1742,67 +1779,43 @@ impl RuntimeHost {
                 gate.release.notified().await;
             }
         }
-        let mut discovery_ready = Some(discovery_ready);
-        for attempt in 0..3 {
-            let current = self.snapshot().await;
-            if !current.open
-                || current.role_transition.is_some()
-                || current.authority != owned.authority
-                || current.role != owned.role
-                || (current.read_status == owned.read_status
-                    && current.write_status == owned.write_status)
-            {
-                return Ok(());
-            }
-            let store = &self.default_dependencies.replica_authority_store;
-            if store.load().await? != owned.authority
-                || store.load_retired_authority().await?.is_some()
-                || store.load_retirement_started().await?.is_some()
-            {
-                return Ok(());
-            }
-            if owned.write_status == AccessStatus::Granted
-                && self
-                    .default_dependencies
-                    .local_write_journal
-                    .load_local_writes()
-                    .await?
-                    .iter()
-                    .any(|write| write.phase != LocalWritePhase::Committed)
-                && let Some(ready) = discovery_ready.take()
-            {
-                let _ = ready.send(());
-            }
-            let access = self
-                .registered
-                .get()
-                .and_then(RegisteredReplicator::access_lifecycle)
-                .ok_or(RuntimeError::NotOpen)?;
-            let result = async {
-                let ready = with_access_publication_deadline(
-                    deadline,
-                    access.begin_effect(owned.read_status, owned.write_status),
-                )
-                .await?;
-                let (_, accepted) = ready.accept().await?;
-                accepted.commit().await
-            }
-            .await;
-            match result {
-                Err(RuntimeError::OperationCancelled) if attempt < 2 => {
-                    tokio::task::yield_now().await
-                }
-                result => {
-                    if discovery_ready.is_none()
-                        && let Err(error) = &result
-                    {
-                        tracing::warn!(%error, "owned peer access recovery remains closed");
-                    }
-                    return result;
-                }
-            }
+        let current = self.snapshot().await;
+        if !current.open
+            || current.role_transition.is_some()
+            || current.authority != owned.authority
+            || current.role != owned.role
+            || (current.read_status == owned.read_status
+                && current.write_status == owned.write_status)
+        {
+            return Ok(());
         }
-        unreachable!()
+        let store = &self.default_dependencies.replica_authority_store;
+        if store.load().await? != owned.authority
+            || store.load_retired_authority().await?.is_some()
+            || store.load_retirement_started().await?.is_some()
+        {
+            return Ok(());
+        }
+        if owned.write_status == AccessStatus::Granted
+            && self
+                .default_dependencies
+                .local_write_journal
+                .load_local_writes()
+                .await?
+                .iter()
+                .any(|write| write.phase != LocalWritePhase::Committed)
+        {
+            let _ = discovery_ready.send(());
+        }
+        let access = self
+            .registered
+            .get()
+            .and_then(RegisteredReplicator::access_lifecycle)
+            .ok_or(RuntimeError::NotOpen)?;
+        access
+            .defer_restored_access(owned.read_status, owned.write_status)
+            .await;
+        Ok(())
     }
 
     async fn observe_report_progress(&self) -> Result<()> {

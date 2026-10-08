@@ -265,11 +265,7 @@ fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObse
 }
 
 fn same_report_fence(before: &ReportObservation, after: &ReportObservation) -> bool {
-    before.host == after.host
-        && before.engine.fence == after.engine.fence
-        && before.engine.prepared_secondary_removal == after.engine.prepared_secondary_removal
-        && before.engine.retired_authority == after.engine.retired_authority
-        && before.engine.accepted_secondary_removal == after.engine.accepted_secondary_removal
+    before.same_fence(after)
 }
 
 fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {

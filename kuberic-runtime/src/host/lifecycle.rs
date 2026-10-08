@@ -51,6 +51,7 @@ pub(super) trait AuthorityLifecycle: Send + Sync {
 #[async_trait]
 pub(super) trait AccessLifecycle: Send + Sync {
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus);
+    async fn complete_restored_access(&self, read: AccessStatus, write: AccessStatus);
     async fn run_access_transaction(
         &self,
         read: AccessStatus,
@@ -670,9 +671,11 @@ async fn commit_access(
     read: AccessStatus,
     write: AccessStatus,
 ) -> Result<()> {
-    let transaction = begin_access_effect(access, read, write).await?;
+    let transaction = begin_access_effect(access.clone(), read, write).await?;
     let (_, transaction) = transaction.accept().await?;
-    transaction.commit().await
+    transaction.commit().await?;
+    access.complete_restored_access(read, write).await;
+    Ok(())
 }
 
 async fn restore_access(
@@ -701,6 +704,10 @@ pub(super) struct AccessRuntime {
 }
 
 impl AccessRuntime {
+    pub(super) async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+        self.inner.defer_restored_access(read, write).await;
+    }
+
     pub(super) async fn begin_effect(
         &self,
         read: AccessStatus,
@@ -776,6 +783,7 @@ mod tests {
     #[async_trait]
     impl AccessLifecycle for FailingAccess {
         async fn defer_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
+        async fn complete_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
 
         async fn run_access_transaction(
             &self,

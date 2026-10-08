@@ -5155,6 +5155,14 @@ async fn custom_authority_serializes_preaccepted_durable_and_deferred_restoratio
         timeout(Duration::from_secs(1), gate.entered.notified())
             .await
             .unwrap();
+        if deferred {
+            let observer = crate::host::report::AgentReporter::new(store.clone());
+            let in_flight = observer.report(&runtime.report_runtime()).await.unwrap();
+            assert_eq!(
+                in_flight.write_status,
+                proto::AccessStatus::ReconfigurationPending as i32
+            );
+        }
         let restoration = if dropped {
             restoration.abort();
             assert!(restoration.await.unwrap_err().is_cancelled());
@@ -6819,6 +6827,22 @@ async fn managed_restart_recovery_never_restores_access_before_proof() {
 async fn managed_replacement_peer_restart_restores_owned_access_before_new_write() {
     for proof_registered_first in [false, true] {
         let (runtime, admitted, replacement, other) = replacement_restart_primary().await;
+        let (recovery_shutdown, mut recovery_shutdown_rx) = tokio::sync::watch::channel(false);
+        let recovery_task = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                loop {
+                    if *recovery_shutdown_rx.borrow_and_update() {
+                        return;
+                    }
+                    let _ = runtime.recovery_owner_runtime().observe_progress().await;
+                    tokio::select! {
+                        _ = recovery_shutdown_rx.changed() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                }
+            })
+        };
         for (index, session) in ["before-replacement-restart", "after-replacement-restart"]
             .into_iter()
             .enumerate()
@@ -6845,6 +6869,13 @@ async fn managed_replacement_peer_restart_restores_owned_access_before_new_write
         // No status-report request or fresh controller command between discovery
         // and the write. The owned prior grant still needs new native proof.
         assert_eq!(runtime.snapshot().await.authority, Some(admitted.clone()));
+        timeout(Duration::from_secs(1), async {
+            while runtime.snapshot().await.write_status != AccessStatus::Granted {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
         let write = runtime
             .data_plane()
@@ -6860,6 +6891,8 @@ async fn managed_replacement_peer_restart_restores_owned_access_before_new_write
             .await
             .unwrap();
         assert_eq!(write.committed().await.unwrap().committed_lsn, 1);
+        recovery_shutdown.send_replace(true);
+        recovery_task.await.unwrap();
     }
 }
 
@@ -6929,6 +6962,22 @@ async fn replacement_restart_primary_with_quorum_peer(
 async fn managed_peer_restart_recovery_does_not_wait_on_its_own_delivery_queue() {
     let (source, admitted, replacement, _) =
         replacement_restart_primary_with_quorum_peer(false).await;
+    let (recovery_shutdown, mut recovery_shutdown_rx) = tokio::sync::watch::channel(false);
+    let recovery_task = {
+        let source = source.clone();
+        tokio::spawn(async move {
+            loop {
+                if *recovery_shutdown_rx.borrow_and_update() {
+                    return;
+                }
+                let _ = source.recovery_owner_runtime().observe_progress().await;
+                tokio::select! {
+                    _ = recovery_shutdown_rx.changed() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+    };
     let target = Arc::new(PodRuntime::new(
         replacement.clone(),
         Arc::new(TestApplication::default()),
@@ -7021,6 +7070,8 @@ async fn managed_peer_restart_recovery_does_not_wait_on_its_own_delivery_queue()
     let _ = pending.committed().await;
     assert_eq!(target.snapshot().await.current_progress, 1);
     assert_eq!(source.snapshot().await.committed_lsn, 1);
+    recovery_shutdown.send_replace(true);
+    recovery_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -7186,6 +7237,22 @@ async fn managed_peer_discovery_does_not_regrant_during_owned_access_revocation(
 async fn managed_peer_restart_waits_for_owned_write_recovery_after_observer_cancellation() {
     for cancel_observer in [false, true] {
         let (runtime, admitted, replacement, other) = replacement_restart_primary().await;
+        let (recovery_shutdown, mut recovery_shutdown_rx) = tokio::sync::watch::channel(false);
+        let recovery_task = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                loop {
+                    if *recovery_shutdown_rx.borrow_and_update() {
+                        return;
+                    }
+                    let _ = runtime.recovery_owner_runtime().observe_progress().await;
+                    tokio::select! {
+                        _ = recovery_shutdown_rx.changed() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                }
+            })
+        };
         let mut old = ReplicaInformation::new(
             OperationId::default(),
             replacement.clone(),
@@ -7287,6 +7354,8 @@ async fn managed_peer_restart_waits_for_owned_write_recovery_after_observer_canc
             .await
             .unwrap();
         assert_eq!(next.committed().await.unwrap().committed_lsn, 2);
+        recovery_shutdown.send_replace(true);
+        recovery_task.await.unwrap();
     }
 }
 
@@ -7393,28 +7462,32 @@ async fn custom_restored_access_defers_only_pending_and_new_intent_supersedes_it
                 .await
                 .unwrap();
         }
-        let recovery = crate::host::recovery::RecoveryOwner::new(
-            runtime.recovery_owner_runtime(),
-            store.clone(),
-        );
-        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-        let recovery_task = tokio::spawn(recovery.run(shutdown_rx));
         if supersede == 0 {
+            let recovery = crate::host::recovery::RecoveryOwner::new(
+                runtime.recovery_owner_runtime(),
+                store.clone(),
+            );
+            let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+            let recovery_task = tokio::spawn(recovery.run(shutdown_rx));
             timeout(Duration::from_secs(1), async {
                 loop {
                     if runtime.snapshot().await.write_status == AccessStatus::Granted {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::task::yield_now().await;
                 }
             })
             .await
             .unwrap();
+            shutdown.send_replace(true);
+            recovery_task.await.unwrap();
         } else {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            let mut recovery = crate::host::recovery::RecoveryOwner::new(
+                runtime.recovery_owner_runtime(),
+                store.clone(),
+            );
+            recovery.advance().await.unwrap();
         }
-        shutdown.send_replace(true);
-        recovery_task.await.unwrap();
         let report = reporter.report(&runtime.report_runtime()).await.unwrap();
         assert_eq!(
             report.write_status,
@@ -14167,7 +14240,7 @@ async fn partition_contract_reports_independent_access_load_and_fault() {
 }
 
 #[tokio::test]
-async fn recovery_owner_persists_partition_reports_without_status_polling() {
+async fn partition_report_owner_persists_without_status_polling() {
     let directory = crate::host::tests::tempdir().unwrap();
     let local = identity(1, "partition-report-owner");
     let store = fresh_disk_store(directory.path(), local.clone());
@@ -14187,8 +14260,10 @@ async fn recovery_owner_persists_partition_reports_without_status_polling() {
         .unwrap();
     partition.report_fault(FaultType::Permanent).await.unwrap();
 
-    let mut recovery =
-        crate::host::recovery::RecoveryOwner::new(runtime.recovery_owner_runtime(), store.clone());
+    let mut recovery = crate::host::recovery::PartitionReportOwner::new(
+        runtime.recovery_owner_runtime(),
+        store.clone(),
+    );
     recovery.advance().await.unwrap();
     let durable = store.load_state().await.unwrap();
     assert_eq!(durable.load_metrics[0].value, 9);

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::effects::{RuntimeEffect, RuntimeEffectResult};
-#[cfg(test)]
 use crate::protocol::types::AccessStatus;
 
 use crate::RuntimeError;
@@ -22,16 +21,11 @@ use tokio::sync::watch;
 pub(crate) struct RecoveryOwner<S> {
     runtime: RecoveryOwnerRuntime,
     store: Arc<S>,
-    persisted_partition_revision: Option<u64>,
 }
 
 impl<S: AgentStore> RecoveryOwner<S> {
     pub(crate) fn new(runtime: RecoveryOwnerRuntime, store: Arc<S>) -> Self {
-        Self {
-            runtime,
-            store,
-            persisted_partition_revision: None,
-        }
+        Self { runtime, store }
     }
 
     pub(crate) async fn advance(&mut self) -> Result<()> {
@@ -52,13 +46,27 @@ impl<S: AgentStore> RecoveryOwner<S> {
                 Err(error) => return Err(error.into()),
             }
 
-            let observation = self.runtime.observation().await;
-            if observation.host.read_status != durable.read_status
-                || observation.host.write_status != durable.write_status
+            let eligible = self.store.load_state().await?;
+            if eligible != durable
+                || eligible.pending_effect.is_some()
+                || eligible.reconfiguration.is_some()
             {
+                return Ok(());
+            }
+            let observation = self.runtime.observation().await;
+            if observation.host.read_status != eligible.read_status
+                || observation.host.write_status != eligible.write_status
+            {
+                let selected = self.store.load_state().await?;
+                if selected != eligible
+                    || selected.pending_effect.is_some()
+                    || selected.reconfiguration.is_some()
+                {
+                    return Ok(());
+                }
                 match self
                     .runtime
-                    .reconcile_durable_access(durable.read_status, durable.write_status)
+                    .reconcile_durable_access(selected.read_status, selected.write_status)
                     .await
                 {
                     Ok(())
@@ -70,15 +78,76 @@ impl<S: AgentStore> RecoveryOwner<S> {
                     ) => {}
                     Err(error) => return Err(error.into()),
                 }
+                let current = self.store.load_state().await?;
+                if current != selected {
+                    let (read, write) =
+                        if current.pending_effect.is_some() || current.reconfiguration.is_some() {
+                            (
+                                AccessStatus::ReconfigurationPending,
+                                AccessStatus::ReconfigurationPending,
+                            )
+                        } else {
+                            (current.read_status, current.write_status)
+                        };
+                    let _ = self.runtime.reconcile_durable_access(read, write).await;
+                }
             }
         }
 
+        Ok(())
+    }
+
+    pub(crate) async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
+        loop {
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+            tokio::select! {
+                result = self.advance() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "background lifecycle recovery retrying");
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow_and_update() {
+                        return;
+                    }
+                }
+            }
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow_and_update() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+    }
+}
+
+pub(crate) struct PartitionReportOwner<S> {
+    runtime: RecoveryOwnerRuntime,
+    store: Arc<S>,
+    persisted_revision: Option<u64>,
+}
+
+impl<S: AgentStore> PartitionReportOwner<S> {
+    pub(crate) fn new(runtime: RecoveryOwnerRuntime, store: Arc<S>) -> Self {
+        Self {
+            runtime,
+            store,
+            persisted_revision: None,
+        }
+    }
+
+    pub(crate) async fn advance(&mut self) -> Result<()> {
         let partition = self.runtime.partition_report().await;
-        if self.persisted_partition_revision != Some(partition.revision) {
+        if self.persisted_revision != Some(partition.revision) {
             self.store
                 .record_partition_reports(partition.load_metrics, partition.reported_fault)
                 .await?;
-            self.persisted_partition_revision = Some(partition.revision);
+            self.persisted_revision = Some(partition.revision);
         }
         Ok(())
     }
@@ -88,11 +157,24 @@ impl<S: AgentStore> RecoveryOwner<S> {
             if *shutdown.borrow_and_update() {
                 return;
             }
-            if let Err(error) = self.advance().await {
-                tracing::warn!(%error, "background lifecycle recovery retrying");
+            tokio::select! {
+                result = self.advance() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "partition observation persistence retrying");
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow_and_update() {
+                        return;
+                    }
+                }
             }
             tokio::select! {
-                _ = shutdown.changed() => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow_and_update() {
+                        return;
+                    }
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }

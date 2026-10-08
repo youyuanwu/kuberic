@@ -616,6 +616,13 @@ impl AccessLifecycle for ManagedLifecycleBackend {
         *self.common.restored_access.write().await = Some((read, write));
     }
 
+    async fn complete_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+        let mut restored = self.common.restored_access.write().await;
+        if *restored == Some((read, write)) {
+            *restored = None;
+        }
+    }
+
     async fn run_access_transaction(
         &self,
         read: AccessStatus,
@@ -2229,7 +2236,6 @@ impl CustomReplicatorHost {
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<AccessProjection> {
-        *self.restored_access.write().await = None;
         let host = self.host()?;
         if host.custom_configuration_blocked()
             && (read == AccessStatus::Granted || write == AccessStatus::Granted)
@@ -4184,6 +4190,13 @@ impl AccessLifecycle for CustomReplicatorHost {
             return;
         }
         *restored = Some((read, write));
+    }
+
+    async fn complete_restored_access(&self, read: AccessStatus, write: AccessStatus) {
+        let mut restored = self.restored_access.write().await;
+        if *restored == Some((read, write)) {
+            *restored = None;
+        }
     }
 
     async fn run_access_transaction(
