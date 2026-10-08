@@ -201,8 +201,9 @@ ownership and does not require another simplification phase.
 `LifecycleWiring` still projects process, authority, access, build, topology,
 observation and outbound capabilities from a shared backend, but report,
 recovery, build, peer and outbound consumers now receive owner-specific views.
-`ReportObservationRuntime` contains only lifecycle observation; access and
-progress mutation are reachable only through `RecoveryRuntime` and
+`ReportObservationRuntime` contains only lifecycle observation. Durable effect
+access publication remains in `AccessRuntime`; restoration/reconciliation and
+progress mutation are reachable through `RecoveryRuntime` and
 `RecoveryOwnerRuntime`
 (`kuberic-runtime/src/host/lifecycle.rs:137-225,574-763`;
 `kuberic-runtime/src/host/hosting.rs:466-555`).

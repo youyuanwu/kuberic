@@ -148,7 +148,7 @@ introduced.
 
 Each runtime host owns one `CustomAuthorityContainment`. It contains the
 independent authorization latch, exact pending recovery, and the shared
-configuration-callback and report-restoration serialization locks. Each
+configuration-callback and recovery-restoration serialization locks. Each
 admission creates a short-lived `CustomAuthorityAttempt`; nested staging and
 host effect completion share the same entered-attempt state so invalidation or
 caller loss cannot publish or record stale success
@@ -159,9 +159,10 @@ The containment owner first checks structural, durable-conflict and required
 build evidence. It then invalidates old work and saved grants, explicitly
 closes both read/write projections, and completes bounded native access
 revocation before calling the application. This also interrupts
-identical-authority replay and same-primary scale-up access. Report/deferred
+identical-authority replay and same-primary scale-up access. Deferred
 restoration accepted earlier is serialized before staging; its host-owned
-continuation retains ownership even if the requesting reporter is dropped.
+continuation retains ownership even if the requesting recovery observer is
+dropped.
 Already-entered incidental configuration callbacks likewise finish before
 candidate application. Independent direct and deferred configuration share the
 containment callback owner; dropping a peer-discovery observer does not release
@@ -230,10 +231,12 @@ The reporter applies one composition rule per field:
 
 | Field group | Owner and composition |
 |---|---|
+| Protocol version, storage constants and reporter sequence | Protocol constants plus `AgentReporter::ProcessSession`; they are not host or engine lifecycle facts |
 | Identity, epoch, previous/current configuration, durable topology and retained work | Durable `AgentState` only |
 | Address, actual application role/access, open state and authority projection | `HostProxyObservation` only |
 | Replication, verified, committed, quorum and catch-up progress | `ReplicationEngineObservation` only |
-| Builds | Live engine progress plus eligible durable fallback, selected through host receipt/retirement policy |
+| Builds | Live engine progress wins by build ID; durable fallback is admitted only for a still-live authority-free command or retained scale-up completion when the host is not in live-build-only mode; host receipt-currentness and retirement filtering decide whether live completion is reportable |
+| Peer sessions and addresses | Host/session registries own them; they fence report/recovery capture but are not copied into the local status except the reporter's own process session |
 | `healthy` | Live host fault, fail-closed immediately |
 | `reported_fault` and load | Durable state after background persistence |
 | Catch-up capability | Recovery-owner cache, emitted only while its observation fence remains current |
@@ -267,7 +270,7 @@ signals and joins the background owners, cancels and joins registered
 descendants, quiesces partition-report producers, persists the final stable
 load/fault revision, and only then aborts the runtime. Startup failure follows
 the same descendant-cancellation and persistence ordering
-(`kuberic-runtime/src/host/hosting.rs:259-300,1600-1665`;
+(`kuberic-runtime/src/host/hosting.rs:57-87,259-300,1600-1665`;
 `kuberic-runtime/src/host/service.rs:511-621`).
 
 Recovery still reconstructs authority and native stores, reissues or
