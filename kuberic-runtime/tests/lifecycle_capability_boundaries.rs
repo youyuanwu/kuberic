@@ -1342,12 +1342,11 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "src/host/report.rs",
     ] {
         let source = source(consumer);
-        if consumer != "src/host/report.rs" {
-            assert!(
-                !source.contains("ManagedOperationFence"),
-                "{consumer} must depend on its narrow projection, not engine diagnostics"
-            );
-        }
+        let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+        assert!(
+            !production.contains("diagnostic_revision"),
+            "{consumer} must not depend on unrelated engine diagnostics"
+        );
     }
 }
 

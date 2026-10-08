@@ -3371,6 +3371,7 @@ impl RuntimeHost {
             },
             engine: ReplicationEngineObservation {
                 fence: None,
+                host_generation: None,
                 prepared_secondary_removal: snapshot.prepared_secondary_removal,
                 retired_authority: snapshot.retired_authority,
                 accepted_secondary_removal: snapshot.accepted_secondary_removal,

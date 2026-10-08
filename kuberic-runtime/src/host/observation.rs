@@ -148,7 +148,18 @@ pub(crate) struct HostProxyObservation {
     pub(crate) configuration_generation: u64,
     pub(crate) access_generation: u64,
     pub(crate) peer_sessions: Vec<(ReplicaIdentity, ProcessSessionId)>,
-    pub(crate) pending_access: Option<(AccessStatus, AccessStatus)>,
+    pub(crate) pending_access: Option<PendingAccessObservation>,
+}
+
+/// Exact owner context for one deferred access restoration observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingAccessObservation {
+    pub(crate) desired: (AccessStatus, AccessStatus),
+    pub(crate) authority: Option<AdmittedAuthority>,
+    pub(crate) configuration_generation: u64,
+    pub(crate) access_generation: u64,
+    pub(crate) peer_sessions: Vec<(ReplicaIdentity, ProcessSessionId)>,
+    pub(crate) engine_fence: Option<ManagedOperationFence>,
 }
 
 /// Replication-engine facts used by reporting.
@@ -158,6 +169,7 @@ pub(crate) struct HostProxyObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplicationEngineObservation {
     pub(crate) fence: Option<ManagedOperationFence>,
+    pub(crate) host_generation: Option<u64>,
     pub(crate) prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
     pub(crate) retired_authority: Option<RetiredAuthority>,
     pub(crate) accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
@@ -199,6 +211,7 @@ impl From<RuntimeSnapshot> for ReportObservation {
             },
             engine: ReplicationEngineObservation {
                 fence: None,
+                host_generation: None,
                 prepared_secondary_removal: snapshot.prepared_secondary_removal,
                 retired_authority: snapshot.retired_authority,
                 accepted_secondary_removal: snapshot.accepted_secondary_removal,
@@ -299,7 +312,7 @@ mod tests {
     use super::*;
     use crate::host::state::{SCHEMA_VERSION, StorageIdentity};
     use crate::protocol::types::{
-        AgentGeneration, EffectivePolicy, InitializationId, PodUid, PvcUid, ReplicaId,
+        AgentGeneration, EffectivePolicy, InitializationId, OperationId, PodUid, PvcUid, ReplicaId,
         ReplicaInstanceId, ResourceUid,
     };
 
@@ -323,7 +336,15 @@ mod tests {
             effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
         });
         let durable_before = serde_json::to_vec(&state).unwrap();
-        let mut before: ReportObservation = crate::host::hosting::empty_snapshot(identity()).into();
+        let effect_snapshot: RuntimeSnapshot = HostProxyState::empty(identity()).into();
+        let retained = crate::effects::RuntimeEffectResult {
+            operation_id: OperationId::new("effect"),
+            sequence: 1,
+            topology_receipt: None,
+            postcondition: effect_snapshot.clone().into(),
+        };
+        let retained_before = serde_json::to_vec(&retained).unwrap();
+        let mut before: ReportObservation = effect_snapshot.into();
         let outbound = before.outbound();
         before.engine.fence = Some(ManagedOperationFence {
             configuration: None,
@@ -331,6 +352,7 @@ mod tests {
             engine_generation: 7,
         });
         assert_eq!(serde_json::to_vec(&state).unwrap(), durable_before);
+        assert_eq!(serde_json::to_vec(&retained).unwrap(), retained_before);
         assert_eq!(before.outbound(), outbound);
         assert_eq!(state.identity.schema_version, SCHEMA_VERSION);
     }

@@ -4216,6 +4216,8 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
                 engine_session_id: self.session_id.clone(),
                 engine_generation: self.fence_generation.load(Ordering::Acquire),
             },
+            host_generation: state.configuration_generation,
+            diagnostic_revision: self.fence_generation.load(Ordering::Acquire),
             progress,
             builds: build_postconditions(&state),
             prepared_secondary_removal: state.prepared_secondary_removal.clone(),

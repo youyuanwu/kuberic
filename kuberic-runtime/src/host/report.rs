@@ -263,7 +263,19 @@ fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObse
     };
     let access_matches = |projected, desired| {
         projected == desired
-            || (snapshot.host.pending_access == Some((state.read_status, state.write_status))
+            || (snapshot
+                .host
+                .pending_access
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.desired == (state.read_status, state.write_status)
+                        && pending.authority == snapshot.host.authority
+                        && pending.configuration_generation
+                            == snapshot.host.configuration_generation
+                        && pending.access_generation == snapshot.host.access_generation
+                        && pending.peer_sessions == snapshot.host.peer_sessions
+                        && pending.engine_fence == snapshot.engine.fence
+                })
                 && projected == AccessStatus::ReconfigurationPending
                 && desired == AccessStatus::Granted)
     };
@@ -282,13 +294,19 @@ fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObse
             })
         }
         (Some(fence), None) => fence.configuration.is_none(),
-        (None, _) => true,
+        (None, _) => snapshot.host.live_builds_only,
+    };
+    let generation_linked = if snapshot.host.live_builds_only {
+        snapshot.engine.host_generation.is_none()
+    } else {
+        snapshot.engine.host_generation == Some(snapshot.host.configuration_generation)
     };
     snapshot.host.role == state.role
         && access_matches(snapshot.host.read_status, state.read_status)
         && access_matches(snapshot.host.write_status, state.write_status)
         && authority_matches
         && engine_matches_host
+        && generation_linked
         && snapshot.engine.retired_authority == state.retired_authority
 }
 
@@ -488,8 +506,25 @@ mod tests {
             crate::host::hosting::empty_snapshot(identity).into();
         observation.host.read_status = AccessStatus::ReconfigurationPending;
         observation.host.write_status = AccessStatus::ReconfigurationPending;
+        let engine_fence = crate::replicator::ManagedOperationFence {
+            configuration: None,
+            engine_session_id: "engine-session".into(),
+            engine_generation: 1,
+        };
+        observation.engine.fence = Some(engine_fence.clone());
+        observation.engine.host_generation = Some(0);
         assert!(!snapshot_matches_state(&observation, &state.clone().into()));
-        observation.host.pending_access = Some((AccessStatus::Granted, AccessStatus::Granted));
-        assert!(snapshot_matches_state(&observation, &state.into()));
+        observation.host.pending_access =
+            Some(crate::host::observation::PendingAccessObservation {
+                desired: (AccessStatus::Granted, AccessStatus::Granted),
+                authority: None,
+                configuration_generation: 0,
+                access_generation: 0,
+                peer_sessions: Vec::new(),
+                engine_fence: Some(engine_fence),
+            });
+        assert!(snapshot_matches_state(&observation, &state.clone().into()));
+        observation.host.access_generation = 1;
+        assert!(!snapshot_matches_state(&observation, &state.into()));
     }
 }

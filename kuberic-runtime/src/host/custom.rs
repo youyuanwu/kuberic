@@ -27,7 +27,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 
 use super::super::observation::{
-    HostProxyObservation, HostProxyState, ReplicationEngineObservation, ReportObservation,
+    HostProxyObservation, HostProxyState, PendingAccessObservation, ReplicationEngineObservation,
+    ReportObservation,
 };
 use super::lifecycle::{
     AccessLifecycle, AuthorityLifecycle, BuildCancellation, BuildLifecycle, LifecycleObservation,
@@ -659,8 +660,8 @@ impl BuildLifecycle for ManagedLifecycleBackend {
             self.common
                 .ensure_build_generation(build_id, generation)
                 .await?;
-            let snapshot = self.snapshot().await;
-            if snapshot.builds.iter().any(|build| {
+            let observation = self.report_observation().await;
+            if observation.engine.builds.iter().any(|build| {
                 &build.authority.build_id == build_id
                     && &build.authority.target == target
                     && build.completed
@@ -685,11 +686,18 @@ impl BuildLifecycle for ManagedLifecycleBackend {
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
         let build_id = replica.build_id.clone();
         let target = replica.identity.clone();
-        if self.snapshot().await.builds.iter().any(|build| {
-            build.authority.build_id == build_id
-                && build.authority.target == target
-                && build.completed
-        }) {
+        if self
+            .report_observation()
+            .await
+            .engine
+            .builds
+            .iter()
+            .any(|build| {
+                build.authority.build_id == build_id
+                    && build.authority.target == target
+                    && build.completed
+            })
+        {
             return Ok(());
         }
         let endpoint = ReplicaEndpoint {
@@ -1250,7 +1258,12 @@ impl LifecycleObservation for ManagedLifecycleBackend {
     async fn report_observation(&self) -> ReportObservation {
         let mut observation = self.common.report_observation().await;
         let engine = self.engine_snapshot_for_host().await;
-        observation.engine.fence = Some(engine.fence);
+        let _diagnostic_revision = engine.diagnostic_revision;
+        observation.engine.host_generation = Some(engine.host_generation);
+        observation.engine.fence = Some(engine.fence.clone());
+        if let Some(pending) = observation.host.pending_access.as_mut() {
+            pending.engine_fence = Some(engine.fence);
+        }
         observation.engine.current_progress = engine.progress.current_progress;
         observation.engine.committed_lsn = engine.progress.committed_lsn;
         observation.engine.verified_replication_lsn = engine.progress.verified_replication_lsn;
@@ -3953,8 +3966,18 @@ impl CustomReplicatorHost {
         } else {
             state.builds.clone()
         };
-        let peer_sessions = self.sessions.read().await.clone().into_iter().collect();
-        let pending_access = AccessLifecycle::restored_access(self).await;
+        let peer_sessions: Vec<_> = self.sessions.read().await.clone().into_iter().collect();
+        let pending_access =
+            AccessLifecycle::restored_access(self)
+                .await
+                .map(|desired| PendingAccessObservation {
+                    desired,
+                    authority: state.authority.clone(),
+                    configuration_generation: self.configuration_generation.load(Ordering::Acquire),
+                    access_generation: self.access_generation.load(Ordering::Acquire),
+                    peer_sessions: peer_sessions.clone(),
+                    engine_fence: None,
+                });
         ReportObservation {
             host: HostProxyObservation {
                 identity: state.identity,
@@ -3973,6 +3996,7 @@ impl CustomReplicatorHost {
             },
             engine: ReplicationEngineObservation {
                 fence: None,
+                host_generation: None,
                 prepared_secondary_removal: state.prepared_secondary_removal,
                 retired_authority: state.retired_authority,
                 accepted_secondary_removal: state.accepted_secondary_removal,
@@ -4204,8 +4228,8 @@ impl BuildLifecycle for CustomReplicatorHost {
         loop {
             let changed = self.changed.notified();
             self.ensure_build_generation(build_id, generation).await?;
-            let snapshot = CustomReplicatorHost::snapshot(self).await;
-            if snapshot.builds.iter().any(|build| {
+            let observation = CustomReplicatorHost::report_observation(self).await;
+            if observation.engine.builds.iter().any(|build| {
                 &build.authority.build_id == build_id
                     && &build.authority.target == target
                     && build.completed
@@ -4228,11 +4252,18 @@ impl BuildLifecycle for CustomReplicatorHost {
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
         let build_id = replica.build_id.clone();
         let target = replica.identity.clone();
-        if self.snapshot().await.builds.iter().any(|build| {
-            build.authority.build_id == build_id
-                && build.authority.target == target
-                && build.completed
-        }) {
+        if self
+            .report_observation()
+            .await
+            .engine
+            .builds
+            .iter()
+            .any(|build| {
+                build.authority.build_id == build_id
+                    && build.authority.target == target
+                    && build.completed
+            })
+        {
             return Ok(());
         }
         self.enqueue_build_wait(ReplicaEndpoint {
@@ -4492,7 +4523,11 @@ impl LifecycleObservation for CustomReplicatorHost {
     }
 
     async fn observe_progress(&self) -> Result<()> {
-        if !CustomReplicatorHost::snapshot(self).await.open {
+        if !CustomReplicatorHost::report_observation(self)
+            .await
+            .host
+            .open
+        {
             return Ok(());
         }
         let result = CustomReplicatorHost::apply_common_action(
