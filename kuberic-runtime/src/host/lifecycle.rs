@@ -16,7 +16,7 @@ use crate::replicator::ReplicaInformation;
 use crate::transport::{OutboundOperation, ReplicaEndpoint};
 use crate::{Result, RuntimeError};
 
-use super::super::observation::RecoveryObservation;
+use super::super::observation::{RecoveryObservation, ReportObservation};
 use super::custom::{
     AccessDecision, BuildAdmission, BuildCompletionConfirmation, ReadyAccessTransaction,
 };
@@ -139,6 +139,7 @@ pub(super) trait LifecycleObservation: Send + Sync {
     async fn refresh_progress(&self) -> Result<()>;
     async fn observe_progress(&self) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn report_observation(&self) -> ReportObservation;
     async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition;
 }
 
@@ -588,7 +589,12 @@ impl RecoveryRuntime {
     }
 
     pub(super) async fn observation(&self) -> RecoveryObservation {
-        self.observation.snapshot().await.into()
+        let observation = self.observation.report_observation().await;
+        RecoveryObservation::new(
+            observation.host.read_status,
+            observation.host.write_status,
+            observation.host.authority,
+        )
     }
 
     pub(super) async fn restore_access(
@@ -727,8 +733,8 @@ impl ReportLifecycle {
         restore_access(self.access.clone(), read, write).await
     }
 
-    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        self.observation.snapshot().await
+    pub(super) async fn report_observation(&self) -> ReportObservation {
+        self.observation.report_observation().await
     }
 }
 

@@ -44,7 +44,8 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 use super::observation::{
-    BuildObservation, OutboundObservation, PeerObservation, RecoveryObservation, ReportObservation,
+    BuildObservation, HostProxyObservation, HostProxyState, OutboundObservation, PeerObservation,
+    RecoveryObservation, ReplicationEngineObservation, ReportObservation,
 };
 
 tokio::task_local! {
@@ -246,7 +247,7 @@ struct AppliedEffect {
 #[derive(Debug)]
 struct HostState {
     effects: BTreeMap<u64, AppliedEffect>,
-    fallback_snapshot: RuntimeSnapshot,
+    fallback_snapshot: HostProxyState,
     partition_information: PartitionInformation,
     load_metrics: BTreeMap<String, i64>,
     reported_fault: Option<FaultType>,
@@ -854,7 +855,7 @@ impl PodRuntime {
         let local_write_journal: Arc<dyn LocalWriteJournal> = authority_store.clone();
         let build_authority_store: Arc<dyn BuildAuthorityStore> = authority_store.clone();
         let build_progress_store: Arc<dyn BuildProgressStore> = authority_store;
-        let fallback_snapshot = empty_snapshot(identity.clone());
+        let fallback_snapshot = HostProxyState::empty(identity.clone());
         Self {
             host: Arc::new_cyclic(|weak_self| RuntimeHost {
                 identity,
@@ -1072,7 +1073,7 @@ impl PodRuntime {
         if let Some(retired) = retired {
             retired.validate(&self.host.identity)?;
             let mut state = self.host.state.write().await;
-            state.fallback_snapshot = empty_snapshot(self.host.identity.clone());
+            state.fallback_snapshot = HostProxyState::empty(self.host.identity.clone());
             state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.retired_authority = Some(retired);
@@ -1588,11 +1589,25 @@ impl ReportHost for RuntimeHost {
             .registered
             .get()
             .and_then(RegisteredReplicator::report_lifecycle);
-        let snapshot = match lifecycle {
-            Some(lifecycle) => Some(lifecycle.snapshot().await),
-            None => None,
+        let mut observation = match lifecycle {
+            Some(lifecycle) => lifecycle.report_observation().await,
+            None => self.fallback_report_observation().await,
         };
-        self.compose_snapshot(snapshot).await.into()
+        let fallback = self.state.read().await.fallback_snapshot.clone();
+        observation.host.identity = fallback.identity;
+        observation.host.open = fallback.open;
+        observation.host.replication_address = fallback.replication_address;
+        observation.host.role = fallback.role;
+        observation.host.role_transition = fallback.role_transition;
+        observation.host.read_status = fallback.read_status;
+        observation.host.write_status = fallback.write_status;
+        if fallback.authority.is_some() {
+            observation.host.authority = fallback.authority;
+        }
+        if self.aborted.load(Ordering::Acquire) {
+            observation.host.open = false;
+        }
+        observation
     }
 
     async fn reconcile_access(&self, read: AccessStatus, write: AccessStatus) -> Result<()> {
@@ -2529,9 +2544,9 @@ impl RuntimeHost {
                     let topology = self.topology_lifecycle()?;
                     if !self.closed.load(Ordering::Acquire) {
                         topology.fence_retirement(*retired.clone()).await?;
-                        self.sync_access_projection(
-                            self.lifecycle_evidence()?.snapshot().await.into(),
-                        )
+                        self.sync_access_projection(recovery_observation(
+                            self.lifecycle_evidence()?.snapshot().await,
+                        ))
                         .await;
                         self.change_replicator_role_at_epoch(
                             ReplicaRole::None,
@@ -2570,8 +2585,10 @@ impl RuntimeHost {
                 self.authority_lifecycle()?
                     .admit_authority(*authority)
                     .await?;
-                self.sync_access_projection(self.lifecycle_evidence()?.snapshot().await.into())
-                    .await;
+                self.sync_access_projection(recovery_observation(
+                    self.lifecycle_evidence()?.snapshot().await,
+                ))
+                .await;
             }
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
                 self.build_lifecycle()?.admit_authority(*authority).await?;
@@ -2958,7 +2975,7 @@ impl RuntimeHost {
         }
         let address = registered.open().await?;
         if let Some(evidence) = registered.lifecycle_evidence() {
-            self.sync_access_projection(evidence.snapshot().await.into())
+            self.sync_access_projection(recovery_observation(evidence.snapshot().await))
                 .await;
         } else {
             let progress = registered.current_progress().await?;
@@ -3325,11 +3342,47 @@ impl RuntimeHost {
             }
             snapshot
         } else {
-            let mut snapshot = self.state.read().await.fallback_snapshot.clone();
+            let mut snapshot: RuntimeSnapshot =
+                self.state.read().await.fallback_snapshot.clone().into();
             if self.aborted.load(Ordering::Acquire) {
                 snapshot.open = false;
             }
             snapshot
+        }
+    }
+
+    async fn fallback_report_observation(&self) -> ReportObservation {
+        let snapshot = self.state.read().await.fallback_snapshot.clone();
+        ReportObservation {
+            host: HostProxyObservation {
+                identity: snapshot.identity,
+                open: snapshot.open,
+                replication_address: snapshot.replication_address,
+                role: snapshot.role,
+                role_transition: snapshot.role_transition,
+                read_status: snapshot.read_status,
+                write_status: snapshot.write_status,
+                authority: snapshot.authority,
+                live_builds_only: snapshot.live_builds_only,
+                configuration_generation: 0,
+                access_generation: 0,
+                peer_sessions: Vec::new(),
+                pending_access: None,
+            },
+            engine: ReplicationEngineObservation {
+                fence: None,
+                prepared_secondary_removal: snapshot.prepared_secondary_removal,
+                retired_authority: snapshot.retired_authority,
+                accepted_secondary_removal: snapshot.accepted_secondary_removal,
+                current_progress: snapshot.current_progress,
+                verified_replication_lsn: snapshot.verified_replication_lsn,
+                committed_lsn: snapshot.committed_lsn,
+                current_configuration_quorum_progress: snapshot
+                    .current_configuration_quorum_progress,
+                catch_up_boundary: snapshot.catch_up_boundary,
+                catch_up_complete: snapshot.catch_up_complete,
+                builds: snapshot.builds,
+            },
         }
     }
 
@@ -3360,28 +3413,17 @@ impl RuntimeHost {
     }
 }
 
+fn recovery_observation(snapshot: RuntimeSnapshot) -> RecoveryObservation {
+    RecoveryObservation::new(
+        snapshot.read_status,
+        snapshot.write_status,
+        snapshot.authority,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
-    RuntimeSnapshot {
-        identity,
-        open: false,
-        replication_address: None,
-        role: ReplicaRole::None,
-        role_transition: None,
-        read_status: AccessStatus::NotPrimary,
-        write_status: AccessStatus::NotPrimary,
-        authority: None,
-        prepared_secondary_removal: None,
-        retired_authority: None,
-        accepted_secondary_removal: None,
-        current_progress: 0,
-        verified_replication_lsn: None,
-        live_builds_only: false,
-        committed_lsn: 0,
-        current_configuration_quorum_progress: 0,
-        catch_up_boundary: None,
-        catch_up_complete: false,
-        builds: Vec::new(),
-    }
+    HostProxyState::empty(identity).into()
 }
 
 fn snapshot_postcondition(snapshot: RuntimeSnapshot) -> RuntimePostcondition {

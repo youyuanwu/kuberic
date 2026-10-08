@@ -26,11 +26,14 @@ use crate::{Result, RuntimeError};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 
+use super::super::observation::{
+    HostProxyObservation, HostProxyState, ReplicationEngineObservation, ReportObservation,
+};
 use super::lifecycle::{
     AccessLifecycle, AuthorityLifecycle, BuildCancellation, BuildLifecycle, LifecycleObservation,
     LifecycleWiring, OutboundLifecycle, ProcessLifecycle, TopologyLifecycle,
 };
-use super::{AppliedEffect, RuntimeHost, empty_snapshot};
+use super::{AppliedEffect, RuntimeHost};
 #[path = "custom/authority.rs"]
 mod authority;
 #[path = "custom_removal.rs"]
@@ -1244,6 +1247,32 @@ impl LifecycleObservation for ManagedLifecycleBackend {
         snapshot
     }
 
+    async fn report_observation(&self) -> ReportObservation {
+        let mut observation = self.common.report_observation().await;
+        let engine = self.engine_snapshot_for_host().await;
+        observation.engine.fence = Some(engine.fence);
+        observation.engine.current_progress = engine.progress.current_progress;
+        observation.engine.committed_lsn = engine.progress.committed_lsn;
+        observation.engine.verified_replication_lsn = engine.progress.verified_replication_lsn;
+        observation.engine.current_configuration_quorum_progress =
+            engine.progress.current_configuration_quorum_progress;
+        observation.engine.catch_up_boundary = if engine.progress.catch_up_complete {
+            observation
+                .engine
+                .catch_up_boundary
+                .or(engine.progress.catch_up_boundary)
+        } else {
+            engine.progress.catch_up_boundary
+        };
+        observation.engine.catch_up_complete = engine.progress.catch_up_complete;
+        merge_builds(&mut observation.engine.builds, engine.builds);
+        observation.host.live_builds_only = false;
+        observation.engine.prepared_secondary_removal = engine.prepared_secondary_removal;
+        observation.engine.accepted_secondary_removal = engine.accepted_secondary_removal;
+        observation.engine.retired_authority = engine.retired_authority;
+        observation
+    }
+
     async fn postcondition(&self, progress: Option<&NativeProgressStatus>) -> RuntimePostcondition {
         let mut postcondition = self.common.narrow_postcondition().await;
         match progress {
@@ -1562,7 +1591,7 @@ pub(super) struct CustomReplicatorHost {
     native_receipts: bool,
     abort_notified: std::sync::atomic::AtomicBool,
     gate: Mutex<()>,
-    state: Arc<RwLock<RuntimeSnapshot>>,
+    state: Arc<RwLock<HostProxyState>>,
     sessions: RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>,
     addresses: RwLock<BTreeMap<ReplicaIdentity, (ProcessSessionId, String)>>,
     retired_sessions: RwLock<BTreeSet<(ReplicaIdentity, ProcessSessionId)>>,
@@ -1603,7 +1632,7 @@ impl CustomReplicatorHost {
             .identity
             .clone();
         let (outbound, receiver) = mpsc::channel(16);
-        let mut snapshot = empty_snapshot(identity);
+        let mut snapshot = HostProxyState::empty(identity);
         snapshot.live_builds_only = true;
         Self {
             host,
@@ -3882,13 +3911,13 @@ impl CustomReplicatorHost {
         Ok(())
     }
     pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
-        let mut snapshot = self.state.read().await.clone();
+        let mut state = self.state.read().await.clone();
         if !self.native_receipts {
-            return snapshot;
+            return state.into();
         }
         let receipts = self.receipts.read().await.clone();
         let mut current = Vec::new();
-        for build in snapshot.builds {
+        for build in state.builds {
             if let Some(receipt) = receipts.get(&build.authority.build_id)
                 && let Ok(current_receipt) = self.receipt(&build.authority).await
                 && receipt.matches_durable_selection(&current_receipt)
@@ -3901,8 +3930,61 @@ impl CustomReplicatorHost {
                 current.push(build);
             }
         }
-        snapshot.builds = current;
-        snapshot
+        state.builds = current;
+        state.into()
+    }
+
+    async fn report_observation(&self) -> ReportObservation {
+        let state = self.state.read().await.clone();
+        let builds = if self.native_receipts {
+            let receipts = self.receipts.read().await.clone();
+            let retired = self.retired_builds.read().await.clone();
+            let mut current = Vec::new();
+            for build in state.builds.clone() {
+                if let Some(receipt) = receipts.get(&build.authority.build_id)
+                    && let Ok(current_receipt) = self.receipt(&build.authority).await
+                    && receipt.matches_durable_selection(&current_receipt)
+                    && !retired.contains(&build.authority.build_id)
+                {
+                    current.push(build);
+                }
+            }
+            current
+        } else {
+            state.builds.clone()
+        };
+        let peer_sessions = self.sessions.read().await.clone().into_iter().collect();
+        let pending_access = AccessLifecycle::restored_access(self).await;
+        ReportObservation {
+            host: HostProxyObservation {
+                identity: state.identity,
+                open: state.open,
+                replication_address: state.replication_address,
+                role: state.role,
+                role_transition: state.role_transition,
+                read_status: state.read_status,
+                write_status: state.write_status,
+                authority: state.authority,
+                live_builds_only: state.live_builds_only,
+                configuration_generation: self.configuration_generation.load(Ordering::Acquire),
+                access_generation: self.access_generation.load(Ordering::Acquire),
+                peer_sessions,
+                pending_access,
+            },
+            engine: ReplicationEngineObservation {
+                fence: None,
+                prepared_secondary_removal: state.prepared_secondary_removal,
+                retired_authority: state.retired_authority,
+                accepted_secondary_removal: state.accepted_secondary_removal,
+                current_progress: state.current_progress,
+                verified_replication_lsn: state.verified_replication_lsn,
+                committed_lsn: state.committed_lsn,
+                current_configuration_quorum_progress: state.current_configuration_quorum_progress,
+                catch_up_boundary: state.catch_up_boundary,
+                catch_up_complete: state.catch_up_complete,
+                builds,
+            },
+        }
     }
 
     async fn narrow_postcondition(&self) -> RuntimePostcondition {
@@ -4428,6 +4510,10 @@ impl LifecycleObservation for CustomReplicatorHost {
 
     async fn snapshot(&self) -> RuntimeSnapshot {
         CustomReplicatorHost::snapshot(self).await
+    }
+
+    async fn report_observation(&self) -> ReportObservation {
+        CustomReplicatorHost::report_observation(self).await
     }
 
     async fn postcondition(

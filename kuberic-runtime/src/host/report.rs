@@ -263,19 +263,38 @@ fn snapshot_matches_state(snapshot: &ReportObservation, state: &DurableAgentObse
     };
     let access_matches = |projected, desired| {
         projected == desired
-            || (snapshot.host.live_builds_only
+            || (snapshot.host.pending_access == Some((state.read_status, state.write_status))
                 && projected == AccessStatus::ReconfigurationPending
                 && desired == AccessStatus::Granted)
+    };
+    let engine_matches_host = match (
+        snapshot.engine.fence.as_ref(),
+        snapshot.host.authority.as_ref(),
+    ) {
+        (Some(fence), Some(authority)) => {
+            fence.configuration.as_ref().is_some_and(|configuration| {
+                configuration.local_identity == authority.local_identity
+                    && configuration.previous_configuration == authority.previous_configuration
+                    && configuration.current_configuration == authority.current_configuration
+                    && configuration.switchover_handoff == authority.switchover_handoff
+                    && configuration.secondary_removal == authority.secondary_removal
+                    && configuration.scale_up == authority.scale_up
+            })
+        }
+        (Some(fence), None) => fence.configuration.is_none(),
+        (None, _) => true,
     };
     snapshot.host.role == state.role
         && access_matches(snapshot.host.read_status, state.read_status)
         && access_matches(snapshot.host.write_status, state.write_status)
         && authority_matches
+        && engine_matches_host
         && snapshot.engine.retired_authority == state.retired_authority
 }
 
 fn same_report_fence(before: &ReportObservation, after: &ReportObservation) -> bool {
     before.host == after.host
+        && before.engine.fence == after.engine.fence
         && before.engine.prepared_secondary_removal == after.engine.prepared_secondary_removal
         && before.engine.retired_authority == after.engine.retired_authority
         && before.engine.accepted_secondary_removal == after.engine.accepted_secondary_removal
@@ -420,11 +439,57 @@ mod tests {
         after.current_configuration_quorum_progress = 10;
         after.catch_up_boundary = Some(11);
         after.catch_up_complete = true;
-        assert!(same_report_fence(
-            &before.clone().into(),
-            &after.clone().into()
+        let before: ReportObservation = before.into();
+        let mut after: ReportObservation = after.into();
+        assert!(same_report_fence(&before, &after));
+        after.host.configuration_generation = 1;
+        assert!(!same_report_fence(&before, &after));
+        after.host.configuration_generation = 0;
+        after.host.access_generation = 1;
+        assert!(!same_report_fence(&before, &after));
+        after.host.access_generation = 0;
+        after.host.peer_sessions.push((
+            before.host.identity.clone(),
+            ProcessSessionId::new("peer-session"),
         ));
-        after.write_status = AccessStatus::Granted;
-        assert!(!same_report_fence(&before.into(), &after.into()));
+        assert!(!same_report_fence(&before, &after));
+        after.host.peer_sessions.clear();
+        after.engine.fence = Some(crate::replicator::ManagedOperationFence {
+            configuration: None,
+            engine_session_id: "engine-session".into(),
+            engine_generation: 1,
+        });
+        assert!(!same_report_fence(&before, &after));
+        after.engine.fence = None;
+        assert!(same_report_fence(&before, &after));
+        after.host.write_status = AccessStatus::Granted;
+        assert!(!same_report_fence(&before, &after));
+    }
+
+    #[test]
+    fn exact_pending_access_is_reportable_but_stale_mismatch_is_not() {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: AgentGeneration::new("generation"),
+        };
+        let mut state = crate::host::state::AgentState::new(crate::host::state::StorageIdentity {
+            schema_version: crate::host::state::SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource"),
+            local_identity: identity.clone(),
+            pod_uid: PodUid::new("source"),
+            pvc_uid: PvcUid::new("data"),
+            initialization_id: InitializationId::new("init"),
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        });
+        state.read_status = AccessStatus::Granted;
+        state.write_status = AccessStatus::Granted;
+        let mut observation: ReportObservation =
+            crate::host::hosting::empty_snapshot(identity).into();
+        observation.host.read_status = AccessStatus::ReconfigurationPending;
+        observation.host.write_status = AccessStatus::ReconfigurationPending;
+        assert!(!snapshot_matches_state(&observation, &state.clone().into()));
+        observation.host.pending_access = Some((AccessStatus::Granted, AccessStatus::Granted));
+        assert!(snapshot_matches_state(&observation, &state.into()));
     }
 }

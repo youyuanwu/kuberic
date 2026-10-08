@@ -1270,6 +1270,9 @@ fn lifecycle_capability_boundaries_are_narrow() {
 #[test]
 fn projection_capabilities_reject_complete_runtime_snapshots() {
     let hosting = source("src/host/hosting.rs");
+    assert!(hosting.contains("fallback_snapshot: HostProxyState"));
+    let custom = source("src/host/custom.rs");
+    assert!(custom.contains("state: Arc<RwLock<HostProxyState>>"));
     for (start, end, projection) in [
         (
             "trait ReportHost",
@@ -1319,6 +1322,33 @@ fn projection_capabilities_reject_complete_runtime_snapshots() {
         "RecoveryRuntime must not transport RuntimeSnapshot"
     );
     assert!(recovery.contains("RecoveryObservation"));
+
+    let report_lifecycle = lifecycle
+        .split_once("pub(super) struct ReportLifecycle")
+        .and_then(|(_, rest)| {
+            rest.split_once("pub(super) struct EvidenceRuntime")
+                .map(|(body, _)| body)
+        })
+        .expect("ReportLifecycle capability");
+    assert!(
+        !report_lifecycle.contains("RuntimeSnapshot"),
+        "ReportLifecycle must not transport RuntimeSnapshot"
+    );
+    assert!(report_lifecycle.contains("ReportObservation"));
+
+    for consumer in [
+        "src/host/transport.rs",
+        "src/host/recovery.rs",
+        "src/host/report.rs",
+    ] {
+        let source = source(consumer);
+        if consumer != "src/host/report.rs" {
+            assert!(
+                !source.contains("ManagedOperationFence"),
+                "{consumer} must depend on its narrow projection, not engine diagnostics"
+            );
+        }
+    }
 }
 
 #[test]

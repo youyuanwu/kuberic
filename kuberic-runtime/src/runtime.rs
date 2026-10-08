@@ -4211,6 +4211,11 @@ impl ManagedReplicatorLifecycle for DefaultReplicatorInner {
         let progress = self.progress_status().await;
         let state = self.state.read().await;
         crate::replicator::ManagedReplicaObservation {
+            fence: ManagedOperationFence {
+                configuration: state.authority.clone(),
+                engine_session_id: self.session_id.clone(),
+                engine_generation: self.fence_generation.load(Ordering::Acquire),
+            },
             progress,
             builds: build_postconditions(&state),
             prepared_secondary_removal: state.prepared_secondary_removal.clone(),
