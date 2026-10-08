@@ -7884,7 +7884,7 @@ async fn recovery_releases_admission_lock_when_access_proof_stalls() {
     timeout(Duration::from_secs(1), gate.progress_entered.notified())
         .await
         .expect("access proof did not stall");
-    let _admission = timeout(Duration::from_millis(500), admission.lock())
+    let _admission = timeout(Duration::from_secs(6), admission.lock())
         .await
         .expect("recovery retained command admission across a stalled proof");
     let (mut recovery, result) = attempt.await.unwrap();
@@ -7910,7 +7910,7 @@ async fn recovery_releases_admission_lock_when_access_proof_stalls() {
     timeout(Duration::from_secs(1), gate.progress_entered.notified())
         .await
         .expect("second access proof did not stall");
-    let _admission = timeout(Duration::from_millis(500), admission.lock())
+    let _admission = timeout(Duration::from_secs(6), admission.lock())
         .await
         .expect("second recovery attempt retained command admission");
     let (mut recovery, result) = retry.await.unwrap();

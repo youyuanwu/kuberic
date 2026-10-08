@@ -54,6 +54,8 @@ tokio::task_local! {
     static ACCESS_PUBLICATION_DEADLINE: tokio::time::Instant;
 }
 
+const RECOVERY_ACCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(super) struct RecoveryTaskOwner {
     closed: AtomicBool,
     tasks: Mutex<JoinSet<()>>,
@@ -1989,7 +1991,7 @@ impl RecoveryOwnerHost for RuntimeHost {
         self.recovery_tasks
             .spawn_abortable(async move {
                 let host = host.ok_or(RuntimeError::Closed)?;
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+                let deadline = tokio::time::Instant::now() + RECOVERY_ACCESS_TIMEOUT;
                 with_access_publication_deadline(
                     deadline,
                     host.reconcile_report_access(read, write),
