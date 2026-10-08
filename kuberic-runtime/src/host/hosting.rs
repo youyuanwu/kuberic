@@ -54,6 +54,38 @@ tokio::task_local! {
     static ACCESS_PUBLICATION_DEADLINE: tokio::time::Instant;
 }
 
+pub(super) struct RecoveryTaskOwner {
+    tasks: Mutex<JoinSet<()>>,
+}
+
+impl RecoveryTaskOwner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tasks: Mutex::new(JoinSet::new()),
+        })
+    }
+
+    pub(super) async fn spawn<T, F>(&self, task: F) -> oneshot::Receiver<Result<T>>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = oneshot::channel();
+        let mut tasks = self.tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _ = result_tx.send(task.await);
+        });
+        result_rx
+    }
+
+    async fn shutdown(&self) {
+        let mut tasks = self.tasks.lock().await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+}
+
 struct ManagedReplicaStoreView {
     inner: Arc<dyn ReplicaAuthorityStore>,
 }
@@ -913,7 +945,7 @@ impl PodRuntime {
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 partition_reports_closed: AtomicBool::new(false),
-                recovery_tasks: Mutex::new(JoinSet::new()),
+                recovery_tasks: RecoveryTaskOwner::new(),
                 custom_authority: custom::CustomAuthorityContainment::new(weak_self.clone()),
                 replica_session: OnceLock::new(),
                 #[cfg(all(test, feature = "testing"))]
@@ -1598,7 +1630,7 @@ struct RuntimeHost {
     aborted: AtomicBool,
     closed: AtomicBool,
     partition_reports_closed: AtomicBool,
-    recovery_tasks: Mutex<JoinSet<()>>,
+    recovery_tasks: Arc<RecoveryTaskOwner>,
     custom_authority: custom::CustomAuthorityContainment,
     #[cfg(all(test, feature = "testing"))]
     access_effect_acceptance_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
@@ -1622,26 +1654,27 @@ impl RuntimeHost {
         self.custom_authority.pause_restoration().await;
     }
 
-    async fn run_owned_recovery<F>(&self, recovery: F) -> Result<()>
+    async fn spawn_owned_recovery<T, F>(&self, recovery: F) -> oneshot::Receiver<Result<T>>
     where
-        F: Future<Output = Result<()>> + Send + 'static,
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
     {
-        let (result_tx, result_rx) = oneshot::channel();
-        let mut tasks = self.recovery_tasks.lock().await;
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(async move {
-            let _ = result_tx.send(recovery.await);
-        });
-        drop(tasks);
-        result_rx
+        self.recovery_tasks.spawn(recovery).await
+    }
+
+    async fn run_owned_recovery<T, F>(&self, recovery: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        self.spawn_owned_recovery(recovery)
+            .await
             .await
             .unwrap_or(Err(RuntimeError::OperationCancelled))
     }
 
     async fn shutdown_recovery_tasks(&self) {
-        let mut tasks = self.recovery_tasks.lock().await;
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        self.recovery_tasks.shutdown().await;
     }
 }
 
@@ -1899,15 +1932,17 @@ impl BuildHost for RuntimeHost {
         if BuildHost::is_managed(self) {
             let host = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
             let (ready, discovered) = oneshot::channel();
-            let mut recovery = tokio::spawn(async move {
-                host.describe_peer_with_owned_access_recovery(replica, ready)
-                    .await
-            });
+            let mut recovery = self
+                .spawn_owned_recovery(async move {
+                    host.describe_peer_with_owned_access_recovery(replica, ready)
+                        .await
+                })
+                .await;
             return tokio::select! {
-                result = &mut recovery => result.map_err(|error| RuntimeError::Application(error.to_string()))?,
+                result = &mut recovery => result.unwrap_or(Err(RuntimeError::OperationCancelled)),
                 result = discovered => match result {
                     Ok(()) => Ok(()),
-                    Err(_) => recovery.await.map_err(|error| RuntimeError::Application(error.to_string()))?,
+                    Err(_) => recovery.await.unwrap_or(Err(RuntimeError::OperationCancelled)),
                 },
             };
         }

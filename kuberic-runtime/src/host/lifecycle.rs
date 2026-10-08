@@ -50,6 +50,7 @@ pub(super) trait AuthorityLifecycle: Send + Sync {
 
 #[async_trait]
 pub(super) trait AccessLifecycle: Send + Sync {
+    fn recovery_task_owner(&self) -> Option<Arc<super::RecoveryTaskOwner>>;
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus);
     async fn complete_restored_access(&self, read: AccessStatus, write: AccessStatus);
     async fn run_access_transaction(
@@ -638,7 +639,8 @@ async fn begin_access_effect(
     let (accepted_tx, accepted_rx) = oneshot::channel();
     let (decision_tx, decision_rx) = oneshot::channel();
     let deadline = super::access_publication_deadline();
-    let completion = tokio::spawn(async move {
+    let owner = access.recovery_task_owner();
+    let transaction = async move {
         let transaction = access.run_access_transaction(
             read,
             write,
@@ -651,7 +653,16 @@ async fn begin_access_effect(
             Some(deadline) => super::with_access_publication_deadline(deadline, transaction).await,
             None => transaction.await,
         }
-    });
+    };
+    let completion = if let Some(owner) = owner {
+        owner.spawn(transaction).await
+    } else {
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = result_tx.send(transaction.await);
+        });
+        result_rx
+    };
     match ready_rx.await {
         Ok(()) => Ok(ReadyAccessTransaction {
             accept: accept_tx,
@@ -661,7 +672,7 @@ async fn begin_access_effect(
         }),
         Err(_) => completion
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
             .and(Err(RuntimeError::OperationCancelled)),
     }
 }
@@ -782,6 +793,10 @@ mod tests {
 
     #[async_trait]
     impl AccessLifecycle for FailingAccess {
+        fn recovery_task_owner(&self) -> Option<Arc<super::super::RecoveryTaskOwner>> {
+            None
+        }
+
         async fn defer_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
         async fn complete_restored_access(&self, _read: AccessStatus, _write: AccessStatus) {}
 

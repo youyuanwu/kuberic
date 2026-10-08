@@ -14274,6 +14274,20 @@ async fn partition_report_owner_persists_without_status_polling() {
     let report = reporter.report(&runtime.report_runtime()).await.unwrap();
     assert!(!report.healthy);
     assert_eq!(store.load_state().await.unwrap(), before);
+
+    partition
+        .report_load(vec![LoadMetric {
+            name: "queue-depth".into(),
+            value: 10,
+        }])
+        .await
+        .unwrap();
+    recovery.advance().await.unwrap();
+    assert_eq!(store.load_state().await.unwrap().load_metrics[0].value, 10);
+
+    runtime.quiesce_partition_reports().await;
+    assert!(partition.report_load(Vec::new()).await.is_err());
+    assert!(partition.report_fault(FaultType::Transient).await.is_err());
 }
 
 #[tokio::test]

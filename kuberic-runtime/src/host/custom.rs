@@ -76,12 +76,12 @@ pub(super) struct ReadyAccessTransaction {
     pub(super) accept: oneshot::Sender<()>,
     pub(super) accepted: oneshot::Receiver<Option<NativeProgressStatus>>,
     pub(super) decision: oneshot::Sender<AccessDecision>,
-    pub(super) completion: tokio::task::JoinHandle<Result<()>>,
+    pub(super) completion: oneshot::Receiver<Result<()>>,
 }
 
 pub(crate) struct AcceptedAccessTransaction {
     decision: oneshot::Sender<AccessDecision>,
-    completion: tokio::task::JoinHandle<Result<()>>,
+    completion: oneshot::Receiver<Result<()>>,
 }
 
 pub(crate) struct AcceptedAccessEffect {
@@ -190,7 +190,7 @@ impl AcceptedAccessTransaction {
         let _ = self.decision.send(decision);
         self.completion
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
     }
 
     pub(super) async fn commit(self) -> Result<()> {
@@ -235,7 +235,7 @@ impl AcceptedAccessEffect {
         transaction
             .completion
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .unwrap_or(Err(RuntimeError::OperationCancelled))
     }
 
     pub(crate) async fn reject(self) -> Result<()> {
@@ -612,6 +612,13 @@ impl AuthorityLifecycle for ManagedLifecycleBackend {
 
 #[async_trait]
 impl AccessLifecycle for ManagedLifecycleBackend {
+    fn recovery_task_owner(&self) -> Option<Arc<super::RecoveryTaskOwner>> {
+        self.common
+            .host
+            .upgrade()
+            .map(|host| host.recovery_tasks.clone())
+    }
+
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
         *self.common.restored_access.write().await = Some((read, write));
     }
@@ -2213,22 +2220,22 @@ impl CustomReplicatorHost {
         // The callback task, not its waiting caller, owns serialization through
         // application and publication. Dropping peer discovery cannot release
         // an already-entered stateful callback into a newer authority.
-        tokio::spawn(async move {
-            let _callback = callback;
-            let current = Self::apply_configuration_update(primary, current, previous).await?;
-            let _commit = commit.lock().await;
-            let mut configuration = configuration.write().await;
-            if host.aborted.load(Ordering::Acquire)
-                || host.closed.load(Ordering::Acquire)
-                || generations.load(Ordering::Acquire) != generation
-            {
-                return Err(RuntimeError::OperationCancelled);
-            }
-            *configuration = Some(current);
-            Ok(())
-        })
-        .await
-        .map_err(|error| RuntimeError::Application(error.to_string()))?
+        host.clone()
+            .run_owned_recovery(async move {
+                let _callback = callback;
+                let current = Self::apply_configuration_update(primary, current, previous).await?;
+                let _commit = commit.lock().await;
+                let mut configuration = configuration.write().await;
+                if host.aborted.load(Ordering::Acquire)
+                    || host.closed.load(Ordering::Acquire)
+                    || generations.load(Ordering::Acquire) != generation
+                {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                *configuration = Some(current);
+                Ok(())
+            })
+            .await
     }
 
     async fn reserve_access_projection(
@@ -4181,6 +4188,10 @@ impl AuthorityLifecycle for CustomReplicatorHost {
 
 #[async_trait]
 impl AccessLifecycle for CustomReplicatorHost {
+    fn recovery_task_owner(&self) -> Option<Arc<super::RecoveryTaskOwner>> {
+        self.host.upgrade().map(|host| host.recovery_tasks.clone())
+    }
+
     async fn defer_restored_access(&self, read: AccessStatus, write: AccessStatus) {
         let mut restored = self.restored_access.write().await;
         if self.host().is_ok_and(|host| {

@@ -578,7 +578,6 @@ where
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
-        self.runtime.quiesce_partition_reports().await;
         configuration_recovery_task.abort();
         let _ = configuration_recovery_task.await;
         recovery_stop.send_replace(true);
@@ -598,6 +597,7 @@ where
             let _ = partition_owner_task.await;
         }
         self.runtime.shutdown_recovery_tasks().await;
+        self.runtime.quiesce_partition_reports().await;
         let persisted = self.persist_partition_fault().await;
         self.runtime.abort();
         persisted?;
