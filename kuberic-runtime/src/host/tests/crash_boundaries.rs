@@ -5594,11 +5594,13 @@ fn switchover_recovery_boundaries_survive_process_termination() {
                 assert_eq!(state.prepared_switchover, command.switchover_handoff);
             }
             let runtime = Arc::new(SwitchoverRecoveryRuntime::new(&state, None));
+            runtime.state.lock().unwrap().authority =
+                store.load_admitted_authority().await.unwrap();
             let coordinator = Coordinator::new(store.clone(), runtime);
             let completed = coordinator
                 .ensure_configuration(command.clone())
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| panic!("{boundary}: {error:?}"));
             assert_eq!(completed.command, command);
             assert_eq!(
                 coordinator
@@ -7068,8 +7070,10 @@ fn switchover_recovery_writer_process() {
         _ => None,
     };
     let runtime = Arc::new(SwitchoverRecoveryRuntime::new(&state, crash_after));
+    let initial_authority = runtime.state.lock().unwrap().authority.clone().unwrap();
     let store = Arc::new(SqliteStore::create_authorized(path, state).unwrap());
     tokio::runtime::Runtime::new().unwrap().block_on(async {
+        store.admit(&initial_authority).await.unwrap();
         if boundary == "compensation-allocation" {
             store.begin_configuration(&command).await.unwrap();
         } else {

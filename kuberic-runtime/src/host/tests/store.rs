@@ -3,7 +3,7 @@ use std::fs;
 use super::tempdir;
 use crate::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
-    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
+    BuildProgressStore, BuildSelection, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
     LocalWritePhase, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use crate::effects::{
@@ -30,7 +30,7 @@ use crate::protocol::types::{
     derive_agent_generation, derive_initialization_id,
 };
 use bytes::Bytes;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::removal_fixture;
@@ -311,6 +311,7 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
         let path = SqliteStore::metadata_database_path(directory.path());
         let before = base.clone();
         let store = SqliteStore::create_authorized(&path, before.clone()).unwrap();
+        store.admit(&authority).await.unwrap();
         let connection = Connection::open(&path).unwrap();
         connection
             .execute(
@@ -327,6 +328,19 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
                 rusqlite::params![
                     build_authority.build_id.as_str(),
                     serde_json::to_string(&build_progress).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runtime_lifecycle(kind, value_json) VALUES(?1, ?2)",
+                rusqlite::params![
+                    format!("build-selection/{}", build_authority.target.replica_id),
+                    serde_json::to_string(&BuildSelection {
+                        authority: build_authority.clone(),
+                        generation: 1,
+                    })
+                    .unwrap()
                 ],
             )
             .unwrap();
@@ -481,16 +495,9 @@ async fn late_catch_up_and_build_completion_reject_authority_replacement() {
         .await
         .unwrap();
     let catch_up_applied = store.load_state().await.unwrap();
-    let mut replacement = authority.clone();
-    replacement.current_configuration.epoch.configuration_number += 1;
-    replacement.current_configuration.configuration_id =
-        replacement.current_configuration.expected_id();
     Connection::open(&path)
         .unwrap()
-        .execute(
-            "UPDATE replica_authority SET authority_json = ?1 WHERE singleton = 1",
-            [serde_json::to_string(&replacement).unwrap()],
-        )
+        .execute("DELETE FROM replica_authority WHERE singleton = 1", [])
         .unwrap();
     assert!(store.complete_effect(&catch_up_result).await.is_err());
     assert_eq!(store.load_state().await.unwrap(), catch_up_applied);
@@ -530,6 +537,39 @@ async fn late_catch_up_and_build_completion_reject_authority_replacement() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let store = SqliteStore::create_authorized(&path, build_state).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO build_authority(build_id, authority_json) VALUES(?1, ?2)",
+            rusqlite::params![
+                build_authority.build_id.as_str(),
+                serde_json::to_string(&build_authority).unwrap()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO build_progress(build_id, progress_json) VALUES(?1, ?2)",
+            rusqlite::params![
+                build_authority.build_id.as_str(),
+                serde_json::to_string(&progress).unwrap()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runtime_lifecycle(kind, value_json) VALUES(?1, ?2)",
+            rusqlite::params![
+                format!("build-selection/{}", build_authority.target.replica_id),
+                serde_json::to_string(&BuildSelection {
+                    authority: build_authority.clone(),
+                    generation: 1,
+                })
+                .unwrap()
+            ],
+        )
+        .unwrap();
+    drop(connection);
     let build_effect = RuntimeEffect {
         operation_id: OperationId::new("late-build-effect"),
         sequence: 50,
@@ -566,21 +606,103 @@ async fn late_catch_up_and_build_completion_reject_authority_replacement() {
         .unwrap();
     let mut replaced: AgentState = serde_json::from_str(&json).unwrap();
     replaced
-        .build_progress
-        .get_mut(&build_authority.build_id)
-        .unwrap()
-        .durable_lsn += 1;
+        .abandoned_builds
+        .insert(build_authority.build_id.clone());
     connection
         .execute(
             "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
             [serde_json::to_string(&replaced).unwrap()],
         )
         .unwrap();
+    let mut replacement_authority = build_authority.clone();
+    replacement_authority.build_id = OperationId::new("replacement-build");
+    connection
+        .execute(
+            "UPDATE runtime_lifecycle SET value_json = ?1 WHERE kind = ?2",
+            rusqlite::params![
+                serde_json::to_string(&BuildSelection {
+                    authority: replacement_authority,
+                    generation: 2,
+                })
+                .unwrap(),
+                format!("build-selection/{}", build_authority.target.replica_id)
+            ],
+        )
+        .unwrap();
+    let mut active_replacement = build_authority.clone();
+    active_replacement.target = build_authority.source.clone();
+    connection
+        .execute(
+            "UPDATE build_authority SET authority_json = ?1 WHERE build_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&active_replacement).unwrap(),
+                build_authority.build_id.as_str()
+            ],
+        )
+        .unwrap();
+    let rows_before: (Option<String>, Option<String>, String) = (
+        connection
+            .query_row(
+                "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                [build_authority.build_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT progress_json FROM build_progress WHERE build_id = ?1",
+                [build_authority.build_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT value_json FROM runtime_lifecycle WHERE kind = ?1",
+                [format!(
+                    "build-selection/{}",
+                    build_authority.target.replica_id
+                )],
+                |row| row.get(0),
+            )
+            .unwrap(),
+    );
     drop(connection);
     let store = SqliteStore::open_existing(&path, None).unwrap();
     let build_applied = store.load_state().await.unwrap();
     assert!(store.complete_effect(&build_result).await.is_err());
     assert_eq!(store.load_state().await.unwrap(), build_applied);
+    let connection = Connection::open(&path).unwrap();
+    let rows_after: (Option<String>, Option<String>, String) = (
+        connection
+            .query_row(
+                "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                [build_authority.build_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT progress_json FROM build_progress WHERE build_id = ?1",
+                [build_authority.build_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT value_json FROM runtime_lifecycle WHERE kind = ?1",
+                [format!(
+                    "build-selection/{}",
+                    build_authority.target.replica_id
+                )],
+                |row| row.get(0),
+            )
+            .unwrap(),
+    );
+    assert_eq!(rows_after, rows_before);
 }
 
 #[tokio::test]

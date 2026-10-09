@@ -135,23 +135,6 @@ fn apply_process_completion(
         .map(|authority| authority.current_configuration.clone());
 }
 
-fn authority_matches_durable_state(
-    state: &AgentState,
-    durable: Option<&AdmittedAuthority>,
-    observed: Option<&AdmittedAuthority>,
-) -> bool {
-    match (durable, observed) {
-        (Some(durable), Some(observed)) => durable == observed,
-        (None, Some(observed)) => {
-            observed.local_identity == state.identity.local_identity
-                && observed.previous_configuration == state.previous_configuration
-                && state.current_configuration.as_ref() == Some(&observed.current_configuration)
-        }
-        (None, None) => state.current_configuration.is_none(),
-        (Some(_), None) => false,
-    }
-}
-
 const DATABASE_FILE: &str = "agent.sqlite3";
 
 pub(crate) struct SqliteStore {
@@ -489,7 +472,19 @@ impl AgentStore for SqliteStore {
                 (
                     RuntimeEffectAction::AdmitAuthority(_),
                     RuntimeEffectOutcome::AuthorityAdmitted(completion),
-                ) => apply_admitted_authority(&mut state, completion),
+                ) => {
+                    apply_admitted_authority(&mut state, completion);
+                    let authority = serde_json::to_string(&completion.authority).map_err(|error| {
+                        crate::host::HostError::Corrupt(format!(
+                            "cannot serialize admitted authority: {error}"
+                        ))
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO replica_authority(singleton, authority_json) VALUES(1, ?1)
+                         ON CONFLICT(singleton) DO UPDATE SET authority_json = excluded.authority_json",
+                        [authority],
+                    )?;
+                }
                 (
                     RuntimeEffectAction::PrepareSecondaryRemoval {
                         intent,
@@ -810,11 +805,7 @@ impl AgentStore for SqliteStore {
                     RuntimeEffectAction::WaitForCatchup,
                     RuntimeEffectOutcome::CatchUpCompleted(completion),
                 ) => {
-                    if !authority_matches_durable_state(
-                        &state,
-                        durable_authority.as_ref(),
-                        completion.authority.as_ref(),
-                    ) {
+                    if completion.authority.as_ref() != durable_authority.as_ref() {
                         return Err(crate::host::HostError::DurableEffectConflict(
                             "catch-up completed under a different authority".into(),
                         ));
@@ -932,9 +923,29 @@ impl AgentStore for SqliteStore {
                         ));
                     }
                     BuildEffectState::Completed(build) => {
+                        let active_authority: Option<BuildAuthority> = load_json_optional(
+                            transaction,
+                            "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                            [build_id.as_str()],
+                        )?;
+                        let selection: Option<crate::authority::BuildSelection> = load_lifecycle(
+                            transaction,
+                            &build_selection_key(&build.authority.target).map_err(|error| {
+                                crate::host::HostError::DurableEffectConflict(error.to_string())
+                            })?,
+                        )
+                        .map_err(|error| {
+                            crate::host::HostError::DurableEffectConflict(error.to_string())
+                        })?;
                         if !build.completed
                             || build.authority.build_id != *build_id
                             || build.authority.target != completion.target
+                            || active_authority.as_ref() != Some(&build.authority)
+                            || selection
+                                .as_ref()
+                                .is_none_or(|selection| selection.authority != build.authority)
+                            || state.abandoned_builds.contains(build_id)
+                            || state.retired_builds.contains(build_id)
                         {
                             return Err(crate::host::HostError::DurableEffectConflict(
                                 "build completion carries contradictory identity or state".into(),
