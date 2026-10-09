@@ -117,7 +117,7 @@ impl ReplicaRuntimeState {
         progress: Option<&NativeProgressStatus>,
         receipt: Option<&TopologyReceipt>,
     ) -> crate::Result<RuntimeEffectOutcome> {
-        let progress = progress.cloned().unwrap_or_else(|| NativeProgressStatus {
+        let progress = progress.cloned().unwrap_or(NativeProgressStatus {
             current_progress: self.current_progress,
             verified_replication_lsn: self.verified_replication_lsn,
             committed_lsn: self.committed_lsn,
@@ -365,7 +365,7 @@ impl ReplicaRuntimeState {
                     })
                     .cloned();
                 let state = match build {
-                    Some(build) if build.completed => BuildEffectState::Completed(build),
+                    Some(build) if build.completed => BuildEffectState::Completed(Box::new(build)),
                     _ => BuildEffectState::Dispatched,
                 };
                 RuntimeEffectOutcome::BuildReplica(BuildCompletion {

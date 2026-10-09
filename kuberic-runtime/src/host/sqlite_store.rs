@@ -541,6 +541,8 @@ impl AgentStore for SqliteStore {
                             ));
                         }
                     }
+                    state.read_status = completion.read_status;
+                    state.write_status = completion.write_status;
                     state.prepared_secondary_removal = Some(prepared.clone());
                 }
                 (

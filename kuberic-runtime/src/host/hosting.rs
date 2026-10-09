@@ -3348,7 +3348,7 @@ impl RuntimeHost {
             outcome: RuntimeEffectOutcome::BuildReplica(BuildCompletion {
                 build_id: build_id.clone(),
                 target: target.clone(),
-                state: BuildEffectState::Completed(confirmation.build.clone()),
+                state: BuildEffectState::Completed(Box::new(confirmation.build.clone())),
             }),
         };
         self.state.write().await.effects.insert(

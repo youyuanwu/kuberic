@@ -279,15 +279,14 @@ where
                     return Err(error);
                 }
                 let pending_build_completion = match &effect.action {
-                    crate::effects::RuntimeEffectAction::BuildReplica { .. } => matches!(
-                        &result.outcome,
-                        crate::effects::RuntimeEffectOutcome::BuildReplica(
-                            crate::effects::BuildCompletion {
-                                state: crate::effects::BuildEffectState::Dispatched,
-                                ..
+                    crate::effects::RuntimeEffectAction::BuildReplica { .. } => {
+                        match &result.outcome {
+                            crate::effects::RuntimeEffectOutcome::BuildReplica(completion) => {
+                                completion.is_dispatched()
                             }
-                        )
-                    ),
+                            _ => false,
+                        }
+                    }
                     _ => false,
                 };
                 if pending_build_completion {

@@ -295,13 +295,13 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
             RuntimeEffectOutcome::BuildReplica(BuildCompletion {
                 build_id: build_authority.build_id.clone(),
                 target,
-                state: BuildEffectState::Completed(BuildPostcondition {
+                state: BuildEffectState::Completed(Box::new(BuildPostcondition {
                     authority: build_authority.clone(),
                     last_sequence: build_progress.last_sequence,
                     durable_lsn: build_progress.durable_lsn,
                     completed: true,
                     catch_up_boundary_lsn: build_progress.catch_up_boundary_lsn,
-                }),
+                })),
             }),
         ),
     ];
@@ -440,6 +440,147 @@ async fn applied_effect_rejects_a_changed_canonical_result_without_mutation() {
     let completed = store.load_state().await.unwrap();
     store.complete_effect(&result).await.unwrap();
     assert_eq!(store.load_state().await.unwrap(), completed);
+}
+
+#[tokio::test]
+async fn late_catch_up_and_build_completion_reject_authority_replacement() {
+    let (mut catch_up_state, _, _, _) = pending_acceptance_fixture();
+    catch_up_state.pending_effect = None;
+    catch_up_state.retained_result = None;
+    catch_up_state.removal_effects.clear();
+    catch_up_state.next_effect_sequence = 40;
+    let authority = AdmittedAuthority {
+        local_identity: catch_up_state.identity.local_identity.clone(),
+        transition_kind: None,
+        previous_configuration: catch_up_state.previous_configuration.clone(),
+        current_configuration: catch_up_state.current_configuration.clone().unwrap(),
+        switchover_handoff: None,
+        scale_up: None,
+        secondary_removal: None,
+    };
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = SqliteStore::create_authorized(&path, catch_up_state).unwrap();
+    store.admit(&authority).await.unwrap();
+    let catch_up_effect = RuntimeEffect {
+        operation_id: OperationId::new("late-catch-up"),
+        sequence: 40,
+        action: RuntimeEffectAction::WaitForCatchup,
+    };
+    let catch_up_result = RuntimeEffectResult {
+        operation_id: catch_up_effect.operation_id.clone(),
+        sequence: catch_up_effect.sequence,
+        outcome: RuntimeEffectOutcome::CatchUpCompleted(CatchUpCompletion {
+            authority: Some(authority.clone()),
+            boundary_lsn: 9,
+        }),
+    };
+    store.begin_effect(&catch_up_effect).await.unwrap();
+    store
+        .mark_effect_applied(&catch_up_effect, &catch_up_result)
+        .await
+        .unwrap();
+    let catch_up_applied = store.load_state().await.unwrap();
+    let mut replacement = authority.clone();
+    replacement.current_configuration.epoch.configuration_number += 1;
+    replacement.current_configuration.configuration_id =
+        replacement.current_configuration.expected_id();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE replica_authority SET authority_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&replacement).unwrap()],
+        )
+        .unwrap();
+    assert!(store.complete_effect(&catch_up_result).await.is_err());
+    assert_eq!(store.load_state().await.unwrap(), catch_up_applied);
+    drop(store);
+
+    let (mut build_state, _, _, _) = pending_acceptance_fixture();
+    build_state.pending_effect = None;
+    build_state.retained_result = None;
+    build_state.removal_effects.clear();
+    build_state.next_effect_sequence = 50;
+    let configuration = build_state.current_configuration.clone().unwrap();
+    let target = configuration
+        .members
+        .iter()
+        .find(|member| member.identity != build_state.identity.local_identity)
+        .unwrap()
+        .identity
+        .clone();
+    let build_authority = BuildAuthority {
+        build_id: OperationId::new("late-build"),
+        kind: BuildAuthorityKind::Provisioning,
+        source: build_state.identity.local_identity.clone(),
+        target: target.clone(),
+        current_configuration: configuration,
+        replication_boundary_lsn: 7,
+    };
+    let progress = DurableBuildProgress {
+        authority: build_authority.clone(),
+        last_sequence: 2,
+        durable_lsn: 9,
+        completed: true,
+        catch_up_boundary_lsn: Some(7),
+    };
+    build_state
+        .build_progress
+        .insert(build_authority.build_id.clone(), progress.clone());
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = SqliteStore::create_authorized(&path, build_state).unwrap();
+    let build_effect = RuntimeEffect {
+        operation_id: OperationId::new("late-build-effect"),
+        sequence: 50,
+        action: RuntimeEffectAction::BuildReplica {
+            build_id: build_authority.build_id.clone(),
+            target: target.clone(),
+            replication_address: "in-process://target".into(),
+        },
+    };
+    let build_result = RuntimeEffectResult {
+        operation_id: build_effect.operation_id.clone(),
+        sequence: build_effect.sequence,
+        outcome: RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+            build_id: build_authority.build_id.clone(),
+            target,
+            state: BuildEffectState::Completed(Box::new(BuildPostcondition {
+                authority: build_authority.clone(),
+                last_sequence: progress.last_sequence,
+                durable_lsn: progress.durable_lsn,
+                completed: true,
+                catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+            })),
+        }),
+    };
+    store.begin_effect(&build_effect).await.unwrap();
+    store
+        .mark_effect_applied(&build_effect, &build_result)
+        .await
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    let json: String = connection
+        .query_row("SELECT state_json FROM agent_state", [], |row| row.get(0))
+        .unwrap();
+    let mut replaced: AgentState = serde_json::from_str(&json).unwrap();
+    replaced
+        .build_progress
+        .get_mut(&build_authority.build_id)
+        .unwrap()
+        .durable_lsn += 1;
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&replaced).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    let store = SqliteStore::open_existing(&path, None).unwrap();
+    let build_applied = store.load_state().await.unwrap();
+    assert!(store.complete_effect(&build_result).await.is_err());
+    assert_eq!(store.load_state().await.unwrap(), build_applied);
 }
 
 #[tokio::test]

@@ -165,7 +165,7 @@ pub(crate) struct CatchUpCompletion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum BuildEffectState {
     Dispatched,
-    Completed(BuildPostcondition),
+    Completed(Box<BuildPostcondition>),
     Abandoned,
 }
 
@@ -174,6 +174,12 @@ pub(crate) struct BuildCompletion {
     pub(crate) build_id: OperationId,
     pub(crate) target: ReplicaIdentity,
     pub(crate) state: BuildEffectState,
+}
+
+impl BuildCompletion {
+    pub(crate) fn is_dispatched(&self) -> bool {
+        matches!(&self.state, BuildEffectState::Dispatched)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,13 +727,13 @@ mod tests {
                 RuntimeEffectOutcome::BuildReplica(BuildCompletion {
                     build_id: OperationId::new("build"),
                     target: identity(2),
-                    state: BuildEffectState::Completed(BuildPostcondition {
+                    state: BuildEffectState::Completed(Box::new(BuildPostcondition {
                         authority: build_authority,
                         last_sequence: 1,
                         durable_lsn: 9,
                         completed: true,
                         catch_up_boundary_lsn: Some(7),
-                    }),
+                    })),
                 }),
             ),
         ]

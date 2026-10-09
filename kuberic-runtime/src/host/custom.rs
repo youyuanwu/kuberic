@@ -856,20 +856,22 @@ impl BuildLifecycle for ManagedLifecycleBackend {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let build = self
+        let progress = self
             .common
-            .state
-            .read()
-            .await
-            .builds
-            .iter()
-            .find(|build| {
-                &build.authority.build_id == build_id
-                    && &build.authority.target == target
-                    && build.completed
-            })
-            .cloned()
+            .host()?
+            .default_dependencies
+            .build_progress_store
+            .load_build_progress(build_id)
+            .await?
+            .filter(|progress| &progress.authority.target == target && progress.completed)
             .ok_or(RuntimeError::ReconfigurationPending)?;
+        let build = BuildPostcondition {
+            authority: progress.authority,
+            last_sequence: progress.last_sequence,
+            durable_lsn: progress.durable_lsn,
+            completed: progress.completed,
+            catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+        };
         Ok(BuildCompletionConfirmation {
             build,
             _native: Some(native_guard),
@@ -3583,18 +3585,25 @@ impl CustomReplicatorHost {
                     && build.durable_lsn >= authority.replication_boundary_lsn
             });
             if authority.target == host.identity && !completed {
-                let read = self.state.read().await.read_status;
+                let (read, write) = {
+                    let state = self.state.read().await;
+                    (state.read_status, state.write_status)
+                };
+                let write = if write == AccessStatus::Granted {
+                    AccessStatus::ReconfigurationPending
+                } else {
+                    write
+                };
                 if self.native_receipts && superseding {
                     let mut state = self.state.write().await;
                     state.read_status = read;
-                    state.write_status = AccessStatus::ReconfigurationPending;
+                    state.write_status = write;
                     drop(state);
                     let mut state = host.state.write().await;
                     state.fallback_snapshot.read_status = read;
-                    state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+                    state.fallback_snapshot.write_status = write;
                 } else {
-                    self.set_access(read, AccessStatus::ReconfigurationPending)
-                        .await?;
+                    self.set_access(read, write).await?;
                 }
             }
             let configure = self.native_receipts || self.state.read().await.authority.is_some();
@@ -4572,19 +4581,21 @@ impl BuildLifecycle for CustomReplicatorHost {
         {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let build = self
-            .state
-            .read()
-            .await
-            .builds
-            .iter()
-            .find(|build| {
-                &build.authority.build_id == build_id
-                    && &build.authority.target == target
-                    && build.completed
-            })
-            .cloned()
+        let progress = self
+            .host()?
+            .default_dependencies
+            .build_progress_store
+            .load_build_progress(build_id)
+            .await?
+            .filter(|progress| &progress.authority.target == target && progress.completed)
             .ok_or(RuntimeError::ReconfigurationPending)?;
+        let build = BuildPostcondition {
+            authority: progress.authority,
+            last_sequence: progress.last_sequence,
+            durable_lsn: progress.durable_lsn,
+            completed: progress.completed,
+            catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+        };
         Ok(BuildCompletionConfirmation {
             build,
             _native: None,
