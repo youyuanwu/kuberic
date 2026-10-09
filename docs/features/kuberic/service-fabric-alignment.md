@@ -662,7 +662,7 @@ receipts retain their variant-specific authority and operation binding, and
 late catch-up/build completion revalidates current durable authority. Full
 runtime snapshots remain available for diagnostics and opt-in testing only.
 The public `Replicator` and `PrimaryReplicator` interfaces remain unchanged.
-Evidence includes 945 ordinary tests, seven PostgreSQL smoke tests, strict
+Evidence includes 946 ordinary tests, seven PostgreSQL smoke tests, strict
 workspace Clippy, doctests, public API/privacy checks and lifecycle source
 guards.
 

@@ -943,14 +943,17 @@ pub struct ScaleUpWitness {
     pub report_sequence: u64,
     pub epoch: Epoch,
     #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "Option<ConfigurationId>")]
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration_id: ConfigurationId,
     #[schemars(range(min = 0))]
     pub verified_replication_lsn: i64,
     pub write_status: AccessStatus,
     #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "Option<OperationId>")]
     pub pending_operation_id: Option<OperationId>,
     #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "Option<OperationId>")]
     pub retained_operation_id: Option<OperationId>,
 }
 
@@ -1310,14 +1313,17 @@ pub struct SecondaryRemovalWitness {
     pub report_sequence: u64,
     pub epoch: Epoch,
     #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "Option<ConfigurationId>")]
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration_id: ConfigurationId,
     #[schemars(range(min = 0))]
     pub verified_replication_lsn: i64,
     pub write_status: AccessStatus,
     #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "Option<OperationId>")]
     pub pending_operation_id: Option<OperationId>,
     #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "Option<OperationId>")]
     pub retained_operation_id: Option<OperationId>,
 }
 
@@ -1326,7 +1332,7 @@ pub struct SecondaryRemovalWitness {
 pub struct SecondaryRemovalEvidence {
     pub preparation: SecondaryRemovalPreparation,
     pub previous_read_quorum: Vec<SecondaryRemovalWitness>,
-    #[serde(default)]
+    #[schemars(default)]
     pub reduced_write_quorum: Vec<SecondaryRemovalWitness>,
 }
 
@@ -1352,7 +1358,7 @@ pub struct ReplicaRetirementReport {
 pub struct SecondaryScaleDownCleanup {
     pub evidence: SecondaryRemovalEvidence,
     pub current_only_write_quorum: Vec<SecondaryRemovalWitness>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub retirement: Option<ReplicaRetirementReport>,
 }
 
