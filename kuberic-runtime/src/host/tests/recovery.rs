@@ -275,6 +275,66 @@ async fn rejected_fresh_completion_discards_the_process_local_result() {
 }
 
 #[tokio::test]
+async fn rejected_applied_completion_discards_the_process_local_result() {
+    use crate::authority::{AdmittedAuthority, ReplicaAuthorityStore};
+
+    let intent = crate::removal_fixture::intent(&[1, 2, 3], 1);
+    let mut state = initial_state();
+    state.identity.local_identity = intent.primary.clone();
+    state.current_configuration = Some(intent.previous_configuration.clone());
+    state.highest_epoch = intent.previous_configuration.epoch;
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let durable = AdmittedAuthority {
+        local_identity: intent.primary.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: intent.previous_configuration.clone(),
+        switchover_handoff: None,
+        scale_up: None,
+        secondary_removal: None,
+    };
+    store.admit(&durable).await.unwrap();
+    let mut stale = durable.clone();
+    stale.current_configuration.epoch.configuration_number += 1;
+    stale.current_configuration.configuration_id = stale.current_configuration.expected_id();
+    let effect = RuntimeEffect {
+        operation_id: OperationId::new("applied-stale-catch-up"),
+        sequence: 1,
+        action: RuntimeEffectAction::WaitForCatchup,
+    };
+    let result = RuntimeEffectResult {
+        operation_id: effect.operation_id.clone(),
+        sequence: effect.sequence,
+        outcome: RuntimeEffectOutcome::CatchUpCompleted(crate::effects::CatchUpCompletion {
+            authority: Some(stale),
+            boundary_lsn: 9,
+        }),
+    };
+    store.begin_effect(&effect).await.unwrap();
+    store.mark_effect_applied(&effect, &result).await.unwrap();
+    let runtime = Arc::new(AppliedRecoveryRuntime {
+        calls: AtomicUsize::new(0),
+        discards: AtomicUsize::new(0),
+        result,
+    });
+    let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
+    assert!(adapter.execute(effect).await.is_err());
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.discards.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .pending_effect
+            .as_ref()
+            .is_some_and(|pending| pending.applied_result.is_some())
+    );
+}
+
+#[tokio::test]
 async fn recovery_starts_idle_and_requires_closed_writes() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());

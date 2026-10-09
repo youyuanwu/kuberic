@@ -138,12 +138,14 @@ pub(crate) struct RuntimeSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RoleCompletion {
     pub(crate) role: ReplicaRole,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) role_transition: Option<RoleTransition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EpochCompletion {
     pub(crate) epoch: Epoch,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) role_transition: Option<RoleTransition>,
 }
 
@@ -159,12 +161,14 @@ pub(crate) struct AccessCompletion {
     pub(crate) kind: AccessCompletionKind,
     pub(crate) read_status: AccessStatus,
     pub(crate) write_status: AccessStatus,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) role: ReplicaRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CatchUpCompletion {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) boundary_lsn: i64,
 }
@@ -194,40 +198,50 @@ pub(crate) struct AuthorityCompletion {
     pub(crate) authority: AdmittedAuthority,
     pub(crate) read_status: AccessStatus,
     pub(crate) write_status: AccessStatus,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SecondaryRemovalPreparationCompletion {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) role: ReplicaRole,
     pub(crate) read_status: AccessStatus,
     pub(crate) write_status: AccessStatus,
     pub(crate) current_progress: i64,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) verified_replication_lsn: Option<i64>,
     pub(crate) committed_lsn: i64,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) receipt: Option<Box<SecondaryRemovalReceipt>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HistoricalSecondaryRemovalCompletion {
     pub(crate) accepted_secondary_removal: SecondaryScaleDownCleanup,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) role: ReplicaRole,
     pub(crate) write_status: AccessStatus,
     pub(crate) role_transition_clear: bool,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) verified_replication_lsn: Option<i64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) receipt: Option<Box<SecondaryRemovalReceipt>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SwitchoverCompletion {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) role: ReplicaRole,
     pub(crate) write_status: AccessStatus,
     pub(crate) current_progress: i64,
     pub(crate) committed_lsn: i64,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) receipt: Option<Box<SwitchoverReceipt>>,
 }
 
@@ -238,9 +252,11 @@ pub(crate) struct RetirementCompletion {
     pub(crate) role: ReplicaRole,
     pub(crate) read_status: AccessStatus,
     pub(crate) write_status: AccessStatus,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
     pub(crate) role_transition_clear: bool,
     pub(crate) active_builds: bool,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) receipt: Option<Box<RetirementReceipt>>,
 }
 
@@ -250,6 +266,7 @@ pub(crate) struct ProcessCompletion {
     pub(crate) role: ReplicaRole,
     pub(crate) read_status: AccessStatus,
     pub(crate) write_status: AccessStatus,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) authority: Option<AdmittedAuthority>,
 }
 
@@ -264,11 +281,13 @@ pub(crate) enum RuntimeEffectOutcome {
     },
     SecondaryRemovalWitnessObserved {
         witness: Box<SecondaryRemovalWitness>,
+        #[serde(deserialize_with = "deserialize_required_option")]
         receipt: Option<Box<SecondaryRemovalReceipt>>,
     },
     SecondaryRemovalProgressObserved {
         witness: Box<SecondaryRemovalWitness>,
         committed: Box<SecondaryScaleDownCleanup>,
+        #[serde(deserialize_with = "deserialize_required_option")]
         receipt: Option<Box<SecondaryRemovalReceipt>>,
     },
     ReplicationAckObserved {
@@ -277,6 +296,7 @@ pub(crate) enum RuntimeEffectOutcome {
     },
     SecondaryRemovalAccepted {
         committed: Box<SecondaryScaleDownCleanup>,
+        #[serde(deserialize_with = "deserialize_required_option")]
         receipt: Option<Box<SecondaryRemovalReceipt>>,
     },
     HistoricalSecondaryRemovalAccepted(HistoricalSecondaryRemovalCompletion),
@@ -285,6 +305,7 @@ pub(crate) enum RuntimeEffectOutcome {
     RetirementCompleted(RetirementCompletion),
     FailoverPrefixAuthorized {
         boundary_lsn: i64,
+        #[serde(deserialize_with = "deserialize_required_option")]
         receipt: Option<Box<CertifiedPrefixReceipt>>,
     },
     BuildAuthorityAdmitted {
@@ -295,6 +316,7 @@ pub(crate) enum RuntimeEffectOutcome {
     EpochUpdated(EpochCompletion),
     ApplicationRoleChanged {
         completion: RoleCompletion,
+        #[serde(deserialize_with = "deserialize_required_option")]
         receipt: Option<Box<CertifiedPrefixReceipt>>,
     },
     CatchUpCompleted(CatchUpCompletion),

@@ -256,8 +256,15 @@ where
                     }
                     execution.accept().await
                 } else {
-                    self.store.complete_effect(&result).await?;
-                    Ok(*result)
+                    match self.store.complete_effect(&result).await {
+                        Ok(()) => Ok(*result),
+                        Err(error) => {
+                            if matches!(&error, crate::host::HostError::StaleEffectCompletion(_)) {
+                                self.executor.discard_runtime_effect(&effect).await?;
+                            }
+                            Err(error)
+                        }
+                    }
                 }
             }
             BeginEffect::Execute(effect) | BeginEffect::Pending(effect) => {

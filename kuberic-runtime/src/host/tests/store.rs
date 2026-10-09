@@ -945,6 +945,65 @@ async fn applied_completed_build_abandonment_clears_baseline_for_retirement() {
     );
 }
 
+#[test]
+fn schema_six_rejects_missing_nullable_canonical_fields_in_applied_results() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (mut state, _, _, _) = pending_acceptance_fixture();
+    state.pending_effect = Some(PendingEffect {
+        effect: RuntimeEffect {
+            operation_id: OperationId::new("strict-application-role"),
+            sequence: state.next_effect_sequence,
+            action: RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::ActiveSecondary),
+        },
+        stage: EffectStage::EffectApplied,
+        applied_result: Some(Box::new(RuntimeEffectResult {
+            operation_id: OperationId::new("strict-application-role"),
+            sequence: state.next_effect_sequence,
+            outcome: RuntimeEffectOutcome::ApplicationRoleChanged {
+                completion: RoleCompletion {
+                    role: ReplicaRole::ActiveSecondary,
+                    role_transition: None,
+                },
+                receipt: None,
+            },
+        })),
+    });
+    drop(SqliteStore::create_authorized(&path, state).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    let json: String = connection
+        .query_row("SELECT state_json FROM agent_state", [], |row| row.get(0))
+        .unwrap();
+    let mut value: Value = serde_json::from_str(&json).unwrap();
+    let outcome = value
+        .get_mut("pendingEffect")
+        .and_then(Value::as_object_mut)
+        .and_then(|pending| pending.get_mut("appliedResult"))
+        .and_then(Value::as_object_mut)
+        .and_then(|result| result.get_mut("outcome"))
+        .and_then(Value::as_object_mut)
+        .and_then(|outcome| outcome.get_mut("ApplicationRoleChanged"))
+        .and_then(Value::as_object_mut)
+        .expect("application-role outcome");
+    outcome.remove("receipt");
+    outcome
+        .get_mut("completion")
+        .and_then(Value::as_object_mut)
+        .unwrap()
+        .remove("role_transition");
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&value).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        SqliteStore::open_existing(&path, None),
+        Err(crate::host::HostError::Serialization(_))
+    ));
+}
+
 #[tokio::test]
 async fn pending_acceptance_conversion_is_atomic_one_way_and_resets_canonical_baseline() {
     for stage in [EffectStage::IntentCommitted, EffectStage::EffectApplied] {
