@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 use super::authority::RetiredAuthority;
 use super::authority::{AdmittedAuthority, BuildAuthority};
 use crate::application::OpenMode;
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
 use crate::protocol::types::{
     ProcessSessionId, SecondaryRemovalPreparation, SecondaryRemovalWitness,
     SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
@@ -16,7 +24,6 @@ pub struct RoleTransition {
     pub completed_role: ReplicaRole,
     pub target_role: ReplicaRole,
     pub replicator_completed: bool,
-    #[serde(default)]
     pub epoch_completed: bool,
     pub application_completed: bool,
 }
@@ -91,7 +98,7 @@ pub struct BuildPostcondition {
     pub last_sequence: u64,
     pub durable_lsn: i64,
     pub completed: bool,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub catch_up_boundary_lsn: Option<i64>,
 }
 

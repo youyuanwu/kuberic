@@ -52,7 +52,7 @@ fn validate_native_token(
     authority: Option<&AdmittedAuthority>,
 ) -> Result<()> {
     if token.engine_session_id.is_empty() || token.authority.as_ref() != authority {
-        return Err(crate::host::HostError::DurableEffectConflict(
+        return Err(crate::host::HostError::StaleEffectCompletion(
             "topology receipt authority or engine session is stale".into(),
         ));
     }
@@ -529,7 +529,13 @@ impl AgentStore for SqliteStore {
                         ));
                     }
                     if let Some(receipt) = completion.receipt.as_deref() {
-                        validate_native_token(&receipt.token, completion.authority.as_ref())?;
+                        if completion.authority.as_ref() != durable_authority.as_ref() {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "secondary-removal preparation completed under a different authority"
+                                    .into(),
+                            ));
+                        }
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
                         if receipt.preparation.as_ref() != Some(prepared) {
                             return Err(crate::host::HostError::DurableEffectConflict(
                                 "secondary-removal receipt does not match preparation".into(),
@@ -620,7 +626,13 @@ impl AgentStore for SqliteStore {
                         ));
                     }
                     if let Some(receipt) = completion.receipt.as_deref() {
-                        validate_native_token(&receipt.token, completion.authority.as_ref())?;
+                        if completion.authority.as_ref() != durable_authority.as_ref() {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "historical acceptance completed under a different authority"
+                                    .into(),
+                            ));
+                        }
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
                         if receipt.accepted.as_ref() != Some(&command.committed) {
                             return Err(crate::host::HostError::DurableEffectConflict(
                                 "historical acceptance receipt differs".into(),
@@ -806,7 +818,7 @@ impl AgentStore for SqliteStore {
                     RuntimeEffectOutcome::CatchUpCompleted(completion),
                 ) => {
                     if completion.authority.as_ref() != durable_authority.as_ref() {
-                        return Err(crate::host::HostError::DurableEffectConflict(
+                        return Err(crate::host::HostError::StaleEffectCompletion(
                             "catch-up completed under a different authority".into(),
                         ));
                     }
@@ -869,7 +881,12 @@ impl AgentStore for SqliteStore {
                         ));
                     }
                     if let Some(receipt) = completion.receipt.as_deref() {
-                        validate_native_token(&receipt.token, Some(authority))?;
+                        if Some(authority) != durable_authority.as_ref() {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "planned switchover completed under a different authority".into(),
+                            ));
+                        }
+                        validate_native_token(&receipt.token, durable_authority.as_ref())?;
                         if !switchover_receipt_matches(
                             receipt,
                             *preparation_generation,
@@ -940,15 +957,20 @@ impl AgentStore for SqliteStore {
                         if !build.completed
                             || build.authority.build_id != *build_id
                             || build.authority.target != completion.target
-                            || active_authority.as_ref() != Some(&build.authority)
+                        {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "build completion carries contradictory identity or state".into(),
+                            ));
+                        }
+                        if active_authority.as_ref() != Some(&build.authority)
                             || selection
                                 .as_ref()
                                 .is_none_or(|selection| selection.authority != build.authority)
                             || state.abandoned_builds.contains(build_id)
                             || state.retired_builds.contains(build_id)
                         {
-                            return Err(crate::host::HostError::DurableEffectConflict(
-                                "build completion carries contradictory identity or state".into(),
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "build completion lost its durable authority or selection".into(),
                             ));
                         }
                         let durable = state.build_progress.get(build_id).ok_or_else(|| {
@@ -962,7 +984,7 @@ impl AgentStore for SqliteStore {
                             || durable.completed != build.completed
                             || durable.catch_up_boundary_lsn != build.catch_up_boundary_lsn
                         {
-                            return Err(crate::host::HostError::DurableEffectConflict(
+                            return Err(crate::host::HostError::StaleEffectCompletion(
                                 "build completion differs from durable build progress".into(),
                             ));
                         }
@@ -1034,6 +1056,18 @@ impl AgentStore for SqliteStore {
                 return Err(crate::host::HostError::DurableEffectConflict(
                     "cancelled runtime effect does not match durable intent".into(),
                 ));
+            }
+            if pending.stage == EffectStage::EffectApplied {
+                let abandoned_build = matches!(
+                    &pending.effect.action,
+                    RuntimeEffectAction::BuildReplica { build_id, .. }
+                        if state.abandoned_builds.contains(build_id)
+                );
+                if !abandoned_build {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "applied effect cancellation requires durable build abandonment".into(),
+                    ));
+                }
             }
             write_agent_state(transaction, &state)
         })

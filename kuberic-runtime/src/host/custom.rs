@@ -336,10 +336,12 @@ fn validate_retirement_receipt(
     receipt: &RetirementReceipt,
     retired: &crate::authority::RetiredAuthority,
     completed: bool,
+    expected: &ManagedOperationFence,
 ) -> Result<()> {
     if &receipt.retired != retired
         || receipt.completed != completed
-        || receipt.engine_session_id.is_empty()
+        || receipt.engine_session_id != expected.engine_session_id
+        || receipt.engine_generation != expected.engine_generation
     {
         return Err(RuntimeError::OperationCancelled);
     }
@@ -1216,13 +1218,14 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
 
     async fn fence_retirement(&self, retired: crate::authority::RetiredAuthority) -> Result<()> {
         let outcome = self.legacy.fence_retirement(retired.clone()).await?;
+        let expected = self.legacy.current_engine_fence().await;
         let receipt = Box::new(RetirementReceipt {
-            engine_session_id: outcome.engine_session_id,
-            engine_generation: outcome.engine_generation,
+            engine_session_id: outcome.fence.engine_session_id,
+            engine_generation: outcome.fence.engine_generation,
             retired: outcome.retired,
             completed: false,
         });
-        validate_retirement_receipt(&receipt, &retired, false)?;
+        validate_retirement_receipt(&receipt, &retired, false, &expected)?;
         self.common.fence_retirement_state(&retired).await?;
         *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
         Ok(())
@@ -1230,13 +1233,14 @@ impl TopologyLifecycle for ManagedLifecycleBackend {
 
     async fn complete_retirement(&self, retired: crate::authority::RetiredAuthority) -> Result<()> {
         let outcome = self.legacy.complete_retirement(retired.clone()).await?;
+        let expected = self.legacy.current_engine_fence().await;
         let receipt = Box::new(RetirementReceipt {
-            engine_session_id: outcome.engine_session_id,
-            engine_generation: outcome.engine_generation,
+            engine_session_id: outcome.fence.engine_session_id,
+            engine_generation: outcome.fence.engine_generation,
             retired: outcome.retired,
             completed: true,
         });
-        validate_retirement_receipt(&receipt, &retired, true)?;
+        validate_retirement_receipt(&receipt, &retired, true, &expected)?;
         self.common.complete_retirement_state(&retired).await?;
         *self.topology_receipt.write().await = Some(TopologyReceipt::Retirement(receipt));
         Ok(())
@@ -4873,4 +4877,35 @@ fn unavailable<T>() -> Result<T> {
     Err(RuntimeError::Application(
         "the selected replicator does not support this managed operation".into(),
     ))
+}
+
+#[cfg(test)]
+mod retirement_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn retirement_receipt_requires_exact_engine_session_and_generation() {
+        let intent = crate::removal_fixture::intent(&[1, 2], 1);
+        let retired = crate::authority::RetiredAuthority {
+            committed: crate::removal_fixture::cleanup(&intent),
+            report: crate::removal_fixture::retirement(&intent),
+        };
+        let expected = ManagedOperationFence {
+            configuration: None,
+            engine_session_id: "engine-session".into(),
+            engine_generation: 7,
+        };
+        let mut receipt = RetirementReceipt {
+            engine_session_id: expected.engine_session_id.clone(),
+            engine_generation: expected.engine_generation,
+            retired: retired.clone(),
+            completed: true,
+        };
+        validate_retirement_receipt(&receipt, &retired, true, &expected).unwrap();
+        receipt.engine_generation += 1;
+        assert!(validate_retirement_receipt(&receipt, &retired, true, &expected).is_err());
+        receipt.engine_generation = expected.engine_generation;
+        receipt.engine_session_id = "stale-session".into();
+        assert!(validate_retirement_receipt(&receipt, &retired, true, &expected).is_err());
+    }
 }

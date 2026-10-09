@@ -3574,6 +3574,10 @@ impl ManagedReplicatorLifecycle for TrackingManagedCapability {
         panic!("registration tests do not request native fencing")
     }
 
+    async fn current_engine_fence(&self) -> crate::replicator::ManagedOperationFence {
+        panic!("registration tests do not request current engine fencing")
+    }
+
     async fn progress_status(&self) -> crate::receipts::NativeProgressStatus {
         panic!("registration tests do not request native progress")
     }

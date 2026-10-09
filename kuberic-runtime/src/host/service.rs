@@ -898,7 +898,8 @@ where
             .report(&report_runtime)
             .await
             .map_err(|error| match error {
-                crate::host::HostError::DurableEffectConflict(message) => {
+                crate::host::HostError::DurableEffectConflict(message)
+                | crate::host::HostError::StaleEffectCompletion(message) => {
                     Status::unavailable(message)
                 }
                 other => status_from_agent(other),
@@ -1316,6 +1317,7 @@ where
 fn status_from_agent(error: crate::host::HostError) -> Status {
     match error {
         crate::host::HostError::DurableEffectConflict(_)
+        | crate::host::HostError::StaleEffectCompletion(_)
         | crate::host::HostError::CommandRejected(_) => {
             Status::failed_precondition(error.to_string())
         }

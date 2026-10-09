@@ -98,7 +98,7 @@ fn effects_and_open_modes_preserve_durable_enum_representation() {
 }
 
 #[test]
-fn local_write_and_role_transition_preserve_missing_field_defaults() {
+fn local_write_defaults_remain_compatible_but_role_completion_is_strict() {
     let write: DurableLocalWrite = serde_json::from_value(json!({
         "operation_id": "write-op",
         "lsn": 12,
@@ -109,14 +109,15 @@ fn local_write_and_role_transition_preserve_missing_field_defaults() {
     assert_eq!(write.committed_lsn, 0);
     assert_eq!(write.phase, LocalWritePhase::Registered);
     assert_eq!(write.data, Bytes::from_static(&[1, 2]));
-    let role: RoleTransition = serde_json::from_value(json!({
-        "completed_role": "none",
-        "target_role": "primary",
-        "replicator_completed": true,
-        "application_completed": false,
-    }))
-    .unwrap();
-    assert!(!role.epoch_completed);
+    assert!(
+        serde_json::from_value::<RoleTransition>(json!({
+            "completed_role": "none",
+            "target_role": "primary",
+            "replicator_completed": true,
+            "application_completed": false,
+        }))
+        .is_err()
+    );
 }
 
 #[test]

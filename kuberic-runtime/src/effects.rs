@@ -16,12 +16,19 @@ use crate::receipts::{
 
 use crate::application::OpenMode;
 
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RoleTransition {
     pub(crate) completed_role: ReplicaRole,
     pub(crate) target_role: ReplicaRole,
     pub(crate) replicator_completed: bool,
-    #[serde(default)]
     pub(crate) epoch_completed: bool,
     pub(crate) application_completed: bool,
 }
@@ -100,7 +107,7 @@ pub(crate) struct BuildPostcondition {
     pub(crate) last_sequence: u64,
     pub(crate) durable_lsn: i64,
     pub(crate) completed: bool,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub(crate) catch_up_boundary_lsn: Option<i64>,
 }
 
@@ -825,5 +832,35 @@ mod tests {
             ..result
         };
         assert!(result.validate_for(&effect).is_err());
+    }
+
+    #[test]
+    fn canonical_outcomes_reject_missing_required_fields() {
+        let mut transition = serde_json::to_value(RoleTransition {
+            completed_role: ReplicaRole::IdleSecondary,
+            target_role: ReplicaRole::Primary,
+            replicator_completed: true,
+            epoch_completed: true,
+            application_completed: false,
+        })
+        .unwrap();
+        transition
+            .as_object_mut()
+            .unwrap()
+            .remove("epoch_completed");
+        assert!(serde_json::from_value::<RoleTransition>(transition).is_err());
+
+        let mut build = match required_family_cases().pop().unwrap().1 {
+            RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                state: BuildEffectState::Completed(build),
+                ..
+            }) => serde_json::to_value(build).unwrap(),
+            _ => unreachable!(),
+        };
+        build
+            .as_object_mut()
+            .unwrap()
+            .remove("catch_up_boundary_lsn");
+        assert!(serde_json::from_value::<BuildPostcondition>(build).is_err());
     }
 }

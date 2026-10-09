@@ -1582,6 +1582,10 @@ impl PodRuntime {
         self.host.discard_cancelled_build_effect(effect).await
     }
 
+    pub(crate) async fn discard_runtime_effect(&self, effect: &RuntimeEffect) -> Result<()> {
+        self.host.discard_runtime_effect(effect).await
+    }
+
     pub(crate) async fn reissue_outbound_build(
         &self,
         build_id: OperationId,
@@ -3299,6 +3303,10 @@ impl RuntimeHost {
                 "only a build effect can be discarded after cancellation".into(),
             ));
         }
+        self.discard_runtime_effect(effect).await
+    }
+
+    async fn discard_runtime_effect(&self, effect: &RuntimeEffect) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
         let mut state = self.state.write().await;
         match state.effects.get(&effect.sequence) {

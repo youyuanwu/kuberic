@@ -5,7 +5,8 @@ use async_trait::async_trait;
 
 use crate::application::OpenMode;
 use crate::effects::{
-    RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult, RuntimeSnapshot,
+    ProcessCompletion, RuntimeEffect, RuntimeEffectAction, RuntimeEffectOutcome,
+    RuntimeEffectResult, RuntimeSnapshot,
 };
 use crate::host::Result;
 use crate::host::hosting::empty_snapshot;
@@ -79,6 +80,25 @@ struct RecoveringRuntime {
     calls: AtomicUsize,
 }
 
+struct AppliedRecoveryRuntime {
+    calls: AtomicUsize,
+    discards: AtomicUsize,
+    result: RuntimeEffectResult,
+}
+
+#[async_trait]
+impl RuntimeEffectExecutor for AppliedRecoveryRuntime {
+    async fn apply_runtime_effect(&self, _: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.result.clone())
+    }
+
+    async fn discard_runtime_effect(&self, _: &RuntimeEffect) -> Result<()> {
+        self.discards.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl RuntimeEffectExecutor for RecoveringRuntime {
     async fn apply_runtime_effect(&self, _: RuntimeEffect) -> Result<RuntimeEffectResult> {
@@ -103,6 +123,7 @@ async fn committed_and_applied_intents_recover_without_losing_retained_completio
                 .await
                 .unwrap();
         }
+
         drop(store);
 
         let reopened = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
@@ -148,6 +169,109 @@ async fn committed_and_applied_intents_recover_without_losing_retained_completio
             result()
         );
     }
+}
+
+#[tokio::test]
+async fn applied_close_and_abort_reexecute_live_state_before_retention() {
+    for (index, action) in [RuntimeEffectAction::Close, RuntimeEffectAction::Abort]
+        .into_iter()
+        .enumerate()
+    {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = Arc::new(SqliteStore::create_authorized(&path, initial_state()).unwrap());
+        let effect = RuntimeEffect {
+            operation_id: OperationId::new(format!("terminal-{index}")),
+            sequence: 1,
+            action,
+        };
+        let completion = ProcessCompletion {
+            open: false,
+            role: crate::protocol::types::ReplicaRole::None,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            authority: None,
+        };
+        let outcome = if matches!(effect.action, RuntimeEffectAction::Close) {
+            RuntimeEffectOutcome::Closed(completion)
+        } else {
+            RuntimeEffectOutcome::Aborted(completion)
+        };
+        let result = RuntimeEffectResult {
+            operation_id: effect.operation_id.clone(),
+            sequence: effect.sequence,
+            outcome,
+        };
+        store.begin_effect(&effect).await.unwrap();
+        store.mark_effect_applied(&effect, &result).await.unwrap();
+        let runtime = Arc::new(AppliedRecoveryRuntime {
+            calls: AtomicUsize::new(0),
+            discards: AtomicUsize::new(0),
+            result: result.clone(),
+        });
+        let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
+        assert_eq!(adapter.execute(effect).await.unwrap(), result);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+        assert!(store.load_state().await.unwrap().pending_effect.is_none());
+    }
+}
+
+#[tokio::test]
+async fn rejected_fresh_completion_discards_the_process_local_result() {
+    use crate::authority::{AdmittedAuthority, ReplicaAuthorityStore};
+
+    let intent = crate::removal_fixture::intent(&[1, 2, 3], 1);
+    let mut state = initial_state();
+    state.identity.local_identity = intent.primary.clone();
+    state.current_configuration = Some(intent.previous_configuration.clone());
+    state.highest_epoch = intent.previous_configuration.epoch;
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let durable = AdmittedAuthority {
+        local_identity: intent.primary.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: intent.previous_configuration.clone(),
+        switchover_handoff: None,
+        scale_up: None,
+        secondary_removal: None,
+    };
+    store.admit(&durable).await.unwrap();
+    let mut stale = durable.clone();
+    stale.current_configuration.epoch.configuration_number += 1;
+    stale.current_configuration.configuration_id = stale.current_configuration.expected_id();
+    let effect = RuntimeEffect {
+        operation_id: OperationId::new("stale-catch-up"),
+        sequence: 1,
+        action: RuntimeEffectAction::WaitForCatchup,
+    };
+    let result = RuntimeEffectResult {
+        operation_id: effect.operation_id.clone(),
+        sequence: effect.sequence,
+        outcome: RuntimeEffectOutcome::CatchUpCompleted(crate::effects::CatchUpCompletion {
+            authority: Some(stale),
+            boundary_lsn: 9,
+        }),
+    };
+    let runtime = Arc::new(AppliedRecoveryRuntime {
+        calls: AtomicUsize::new(0),
+        discards: AtomicUsize::new(0),
+        result,
+    });
+    let adapter = RuntimeAdapter::new(store.clone(), runtime.clone());
+    assert!(adapter.execute(effect).await.is_err());
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.discards.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .pending_effect
+            .as_ref()
+            .is_some_and(|pending| pending.applied_result.is_some())
+    );
 }
 
 #[tokio::test]
