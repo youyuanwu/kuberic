@@ -217,11 +217,13 @@ policy does not weaken, replace or reorder this managed-only protocol.
 SQLite persists effect intent before execution. The applied marker then stores
 the exact action-specific canonical result, and completion commits only after
 that saved result, its exact action family and any variant-specific topology
-proof validate. Schema 6 replaces the broad schema-5 result directly; schema 5
-is rejected before agent-state deserialization and has no migration path
+proof validate
 (`kuberic-runtime/src/effects.rs:250-619`;
 `kuberic-runtime/src/host/state.rs:17-63`;
-`kuberic-runtime/src/host/sqlite_store.rs:417-991`).
+`kuberic-runtime/src/host/sqlite_store.rs:417-1003`). Schema 6 replaces the
+broad schema-5 result directly; schema 5 is rejected before agent-state
+deserialization and has no migration path
+(`kuberic-runtime/src/host/sqlite_store.rs:202-209,2413-2429`).
 
 Reporting is strictly read-only. `ReportRuntime` exposes only owner observation
 capture and live partition observation; it has no progress-refresh, access,

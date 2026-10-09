@@ -169,7 +169,7 @@ After process termination, a started record is finalized without Open: terminati
 already closed the prior host. The pending agent effect then completes its exact
 durable receipt normally. Failed finalization keeps reconstruction closed.
 Preparation, acceptance, and retirement postconditions are unpublished managed
-contracts, not additions to the SF-shaped application traits. Agent schema-5
+contracts, not additions to the SF-shaped application traits. Agent schema-6
 storage persists preparation, accepted-current-only, and retirement evidence.
 Recovery revalidates accepted evidence before restoring previously granted
 access; preparation and current-only coordination by themselves stay closed.
