@@ -24,26 +24,41 @@ fn authority() -> AdmittedAuthority {
 }
 
 #[test]
-fn authority_optional_evidence_preserves_legacy_defaults_and_field_names() {
+fn authority_nullable_evidence_requires_explicit_durable_fields() {
     let authority = authority();
-    let mut value = serde_json::to_value(&authority).unwrap();
-    let fields = value.as_object_mut().unwrap();
-    for key in ["switchover_handoff", "secondary_removal", "scale_up"] {
-        assert_eq!(fields.remove(key), Some(Value::Null));
-    }
+    let value = serde_json::to_value(&authority).unwrap();
     assert_eq!(
-        fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         [
             "current_configuration",
             "local_identity",
             "previous_configuration",
+            "scale_up",
+            "secondary_removal",
+            "switchover_handoff",
             "transition_kind",
         ],
     );
     assert_eq!(
-        serde_json::from_value::<AdmittedAuthority>(value).unwrap(),
+        serde_json::from_value::<AdmittedAuthority>(value.clone()).unwrap(),
         authority
     );
+    for key in [
+        "transition_kind",
+        "previous_configuration",
+        "switchover_handoff",
+        "secondary_removal",
+        "scale_up",
+    ] {
+        let mut missing = value.clone();
+        assert!(missing.as_object_mut().unwrap().remove(key).is_some());
+        assert!(serde_json::from_value::<AdmittedAuthority>(missing).is_err());
+    }
 }
 
 #[test]

@@ -707,6 +707,215 @@ async fn late_catch_up_and_build_completion_reject_authority_replacement() {
 }
 
 #[tokio::test]
+async fn build_completion_fences_reject_independent_authority_selection_and_abandonment_changes() {
+    for mutation in ["authority", "selection", "abandonment"] {
+        let (mut state, _, _, _) = pending_acceptance_fixture();
+        state.pending_effect = None;
+        state.retained_result = None;
+        state.removal_effects.clear();
+        state.next_effect_sequence = 55;
+        let configuration = state.current_configuration.clone().unwrap();
+        let target = configuration
+            .members
+            .iter()
+            .find(|member| member.identity != state.identity.local_identity)
+            .unwrap()
+            .identity
+            .clone();
+        let authority = BuildAuthority {
+            build_id: OperationId::new(format!("independent-{mutation}")),
+            kind: BuildAuthorityKind::Provisioning,
+            source: state.identity.local_identity.clone(),
+            target: target.clone(),
+            current_configuration: configuration,
+            replication_boundary_lsn: 7,
+        };
+        let progress = DurableBuildProgress {
+            authority: authority.clone(),
+            last_sequence: 2,
+            durable_lsn: 9,
+            completed: true,
+            catch_up_boundary_lsn: Some(7),
+        };
+        state
+            .build_progress
+            .insert(authority.build_id.clone(), progress.clone());
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = SqliteStore::create_authorized(&path, state).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO build_authority(build_id, authority_json) VALUES(?1, ?2)",
+                rusqlite::params![
+                    authority.build_id.as_str(),
+                    serde_json::to_string(&authority).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO build_progress(build_id, progress_json) VALUES(?1, ?2)",
+                rusqlite::params![
+                    authority.build_id.as_str(),
+                    serde_json::to_string(&progress).unwrap()
+                ],
+            )
+            .unwrap();
+        let selection_key = format!("build-selection/{}", authority.target.replica_id);
+        connection
+            .execute(
+                "INSERT INTO runtime_lifecycle(kind, value_json) VALUES(?1, ?2)",
+                rusqlite::params![
+                    &selection_key,
+                    serde_json::to_string(&BuildSelection {
+                        authority: authority.clone(),
+                        generation: 1,
+                    })
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let effect = RuntimeEffect {
+            operation_id: OperationId::new(format!("independent-{mutation}:effect")),
+            sequence: 55,
+            action: RuntimeEffectAction::BuildReplica {
+                build_id: authority.build_id.clone(),
+                target: target.clone(),
+                replication_address: "in-process://target".into(),
+            },
+        };
+        let result = RuntimeEffectResult {
+            operation_id: effect.operation_id.clone(),
+            sequence: effect.sequence,
+            outcome: RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                build_id: authority.build_id.clone(),
+                target,
+                state: BuildEffectState::Completed(Box::new(BuildPostcondition {
+                    authority: authority.clone(),
+                    last_sequence: progress.last_sequence,
+                    durable_lsn: progress.durable_lsn,
+                    completed: true,
+                    catch_up_boundary_lsn: progress.catch_up_boundary_lsn,
+                })),
+            }),
+        };
+        store.begin_effect(&effect).await.unwrap();
+        store.mark_effect_applied(&effect, &result).await.unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        match mutation {
+            "authority" => {
+                let mut replacement = authority.clone();
+                replacement.target = replacement.source.clone();
+                connection
+                    .execute(
+                        "UPDATE build_authority SET authority_json = ?1 WHERE build_id = ?2",
+                        rusqlite::params![
+                            serde_json::to_string(&replacement).unwrap(),
+                            authority.build_id.as_str()
+                        ],
+                    )
+                    .unwrap();
+            }
+            "selection" => {
+                let mut replacement = authority.clone();
+                replacement.build_id = OperationId::new("replacement-selection");
+                connection
+                    .execute(
+                        "UPDATE runtime_lifecycle SET value_json = ?1 WHERE kind = ?2",
+                        rusqlite::params![
+                            serde_json::to_string(&BuildSelection {
+                                authority: replacement,
+                                generation: 2,
+                            })
+                            .unwrap(),
+                            &selection_key
+                        ],
+                    )
+                    .unwrap();
+            }
+            "abandonment" => {
+                let json: String = connection
+                    .query_row("SELECT state_json FROM agent_state", [], |row| row.get(0))
+                    .unwrap();
+                let mut abandoned: AgentState = serde_json::from_str(&json).unwrap();
+                abandoned
+                    .abandoned_builds
+                    .insert(authority.build_id.clone());
+                connection
+                    .execute(
+                        "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                        [serde_json::to_string(&abandoned).unwrap()],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let rows_before: (Option<String>, Option<String>, String) = (
+            connection
+                .query_row(
+                    "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                    [authority.build_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT progress_json FROM build_progress WHERE build_id = ?1",
+                    [authority.build_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT value_json FROM runtime_lifecycle WHERE kind = ?1",
+                    [&selection_key],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        );
+        drop(connection);
+        let store = SqliteStore::open_existing(&path, None).unwrap();
+        let before = store.load_state().await.unwrap();
+        assert!(store.complete_effect(&result).await.is_err(), "{mutation}");
+        assert_eq!(store.load_state().await.unwrap(), before, "{mutation}");
+        let connection = Connection::open(&path).unwrap();
+        let rows_after: (Option<String>, Option<String>, String) = (
+            connection
+                .query_row(
+                    "SELECT authority_json FROM build_authority WHERE build_id = ?1",
+                    [authority.build_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT progress_json FROM build_progress WHERE build_id = ?1",
+                    [authority.build_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT value_json FROM runtime_lifecycle WHERE kind = ?1",
+                    [&selection_key],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(rows_after, rows_before, "{mutation}");
+    }
+}
+
+#[tokio::test]
 async fn token_bearing_topology_completion_rejects_replaced_durable_authority() {
     let (mut state, _, historical, mut result) = pending_acceptance_fixture();
     state.pending_effect = None;
@@ -1002,6 +1211,76 @@ fn schema_six_rejects_missing_nullable_canonical_fields_in_applied_results() {
         SqliteStore::open_existing(&path, None),
         Err(crate::host::HostError::Serialization(_))
     ));
+}
+
+#[test]
+fn schema_six_rejects_missing_nested_authority_fields() {
+    for field in [
+        "transition_kind",
+        "previous_configuration",
+        "switchover_handoff",
+        "secondary_removal",
+        "scale_up",
+    ] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let (mut state, _, _, result) = pending_acceptance_fixture();
+        let authority = match result.outcome {
+            RuntimeEffectOutcome::HistoricalSecondaryRemovalAccepted(completion) => {
+                completion.authority.unwrap()
+            }
+            _ => unreachable!(),
+        };
+        state.pending_effect = Some(PendingEffect {
+            effect: RuntimeEffect {
+                operation_id: OperationId::new(format!("strict-authority-{field}")),
+                sequence: state.next_effect_sequence,
+                action: RuntimeEffectAction::WaitForCatchup,
+            },
+            stage: EffectStage::EffectApplied,
+            applied_result: Some(Box::new(RuntimeEffectResult {
+                operation_id: OperationId::new(format!("strict-authority-{field}")),
+                sequence: state.next_effect_sequence,
+                outcome: RuntimeEffectOutcome::CatchUpCompleted(CatchUpCompletion {
+                    authority: Some(authority),
+                    boundary_lsn: 9,
+                }),
+            })),
+        });
+        drop(SqliteStore::create_authorized(&path, state).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let json: String = connection
+            .query_row("SELECT state_json FROM agent_state", [], |row| row.get(0))
+            .unwrap();
+        let mut value: Value = serde_json::from_str(&json).unwrap();
+        value
+            .get_mut("pendingEffect")
+            .and_then(Value::as_object_mut)
+            .and_then(|pending| pending.get_mut("appliedResult"))
+            .and_then(Value::as_object_mut)
+            .and_then(|result| result.get_mut("outcome"))
+            .and_then(Value::as_object_mut)
+            .and_then(|outcome| outcome.get_mut("CatchUpCompleted"))
+            .and_then(Value::as_object_mut)
+            .and_then(|completion| completion.get_mut("authority"))
+            .and_then(Value::as_object_mut)
+            .expect("catch-up authority")
+            .remove(field);
+        connection
+            .execute(
+                "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                [serde_json::to_string(&value).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            matches!(
+                SqliteStore::open_existing(&path, None),
+                Err(crate::host::HostError::Serialization(_))
+            ),
+            "missing {field} was accepted"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2278,7 +2557,7 @@ async fn sqlite_configuration_journal_replays_exact_installed_commands_and_rejec
 }
 
 #[tokio::test]
-async fn additive_handoff_fields_default_when_reopening_legacy_json() {
+async fn diagnostic_handoff_defaults_but_canonical_authority_is_strict() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let (initialize, observed, transition) = bootstrap_fixture();
@@ -2302,30 +2581,26 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
     drop(store);
 
     let connection = Connection::open(&path).unwrap();
-    for (table, column, removed_key) in [
-        ("agent_state", "state_json", "preparedSwitchover"),
-        ("replica_authority", "authority_json", "switchover_handoff"),
-    ] {
-        let mut json: Value = connection
-            .query_row(
-                &format!("SELECT {column} FROM {table} WHERE singleton = 1"),
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|json| serde_json::from_str(&json).unwrap())
-            .unwrap();
-        let object = json.as_object_mut().unwrap();
-        assert!(
-            object.remove(removed_key).is_some(),
-            "legacy fixture must remove {removed_key} from {table}"
-        );
-        connection
-            .execute(
-                &format!("UPDATE {table} SET {column} = ?1 WHERE singleton = 1"),
-                [serde_json::to_string(&json).unwrap()],
-            )
-            .unwrap();
-    }
+    let mut json: Value = connection
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).unwrap())
+        .unwrap();
+    assert!(
+        json.as_object_mut()
+            .unwrap()
+            .remove("preparedSwitchover")
+            .is_some()
+    );
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&json).unwrap()],
+        )
+        .unwrap();
     drop(connection);
 
     let reopened = SqliteStore::open_existing(&path, None).unwrap();
@@ -2338,4 +2613,30 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
             .is_none()
     );
     assert_eq!(reopened.load().await.unwrap(), Some(authority));
+    drop(reopened);
+
+    let connection = Connection::open(&path).unwrap();
+    let mut json: Value = connection
+        .query_row(
+            "SELECT authority_json FROM replica_authority WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).unwrap())
+        .unwrap();
+    assert!(
+        json.as_object_mut()
+            .unwrap()
+            .remove("switchover_handoff")
+            .is_some()
+    );
+    connection
+        .execute(
+            "UPDATE replica_authority SET authority_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&json).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    let reopened = SqliteStore::open_existing(&path, None).unwrap();
+    assert!(reopened.load().await.is_err());
 }
