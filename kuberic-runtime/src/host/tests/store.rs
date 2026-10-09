@@ -161,6 +161,8 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
         Role,
         Epoch,
         ReadAccess,
+        WriteAccess,
+        CombinedAccess,
         None,
     }
 
@@ -251,6 +253,31 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
             }),
         ),
         (
+            OwnedDomain::WriteAccess,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+            RuntimeEffectOutcome::AccessChanged(AccessCompletion {
+                kind: AccessCompletionKind::Write,
+                read_status: AccessStatus::NotPrimary,
+                write_status: AccessStatus::Granted,
+                authority: Some(authority.clone()),
+                role: ReplicaRole::Primary,
+            }),
+        ),
+        (
+            OwnedDomain::CombinedAccess,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+            RuntimeEffectOutcome::AccessChanged(AccessCompletion {
+                kind: AccessCompletionKind::Combined,
+                read_status: AccessStatus::Granted,
+                write_status: AccessStatus::Granted,
+                authority: Some(authority.clone()),
+                role: ReplicaRole::Primary,
+            }),
+        ),
+        (
             OwnedDomain::None,
             RuntimeEffectAction::WaitForCatchup,
             RuntimeEffectOutcome::CatchUpCompleted(CatchUpCompletion {
@@ -284,6 +311,33 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
         let path = SqliteStore::metadata_database_path(directory.path());
         let before = base.clone();
         let store = SqliteStore::create_authorized(&path, before.clone()).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO build_authority(build_id, authority_json) VALUES(?1, ?2)",
+                rusqlite::params![
+                    build_authority.build_id.as_str(),
+                    serde_json::to_string(&build_authority).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO build_progress(build_id, progress_json) VALUES(?1, ?2)",
+                rusqlite::params![
+                    build_authority.build_id.as_str(),
+                    serde_json::to_string(&build_progress).unwrap()
+                ],
+            )
+            .unwrap();
+        let build_row_before: String = connection
+            .query_row(
+                "SELECT progress_json FROM build_progress WHERE build_id = ?1",
+                [build_authority.build_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
         let effect = RuntimeEffect {
             operation_id: OperationId::new(format!("narrow-domain-{index}")),
             sequence: before.next_effect_sequence,
@@ -298,6 +352,18 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
         store.mark_effect_applied(&effect, &result).await.unwrap();
         store.complete_effect(&result).await.unwrap();
         let after = store.load_state().await.unwrap();
+        let build_row_after: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT progress_json FROM build_progress WHERE build_id = ?1",
+                [build_authority.build_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            build_row_after, build_row_before,
+            "completion {index} changed dedicated build progress"
+        );
 
         let mut normalized = after;
         normalized.pending_effect = before.pending_effect.clone();
@@ -308,6 +374,11 @@ async fn narrow_effect_completion_updates_only_declared_durable_domains() {
             OwnedDomain::Role => normalized.role = before.role,
             OwnedDomain::Epoch => normalized.highest_epoch = before.highest_epoch,
             OwnedDomain::ReadAccess => normalized.read_status = before.read_status,
+            OwnedDomain::WriteAccess => normalized.write_status = before.write_status,
+            OwnedDomain::CombinedAccess => {
+                normalized.read_status = before.read_status;
+                normalized.write_status = before.write_status;
+            }
             OwnedDomain::None => {}
         }
         assert_eq!(
@@ -366,6 +437,9 @@ async fn applied_effect_rejects_a_changed_canonical_result_without_mutation() {
     assert!(store.complete_effect(&changed).await.is_err());
     assert_eq!(store.load_state().await.unwrap(), applied);
     store.complete_effect(&result).await.unwrap();
+    let completed = store.load_state().await.unwrap();
+    store.complete_effect(&result).await.unwrap();
+    assert_eq!(store.load_state().await.unwrap(), completed);
 }
 
 #[tokio::test]
@@ -380,8 +454,10 @@ async fn pending_acceptance_conversion_is_atomic_one_way_and_resets_canonical_ba
         }
         let mut retained = RetainedResult {
             operation_id: OperationId::new("previous-effect"),
-            effect: ordinary.clone(),
-            result: result.clone(),
+            record: crate::effects::RecordedEffect {
+                effect: ordinary.clone(),
+                result: result.clone(),
+            },
         };
         retained.effect.operation_id = retained.operation_id.clone();
         retained.result.operation_id = retained.operation_id.clone();
@@ -537,8 +613,10 @@ async fn pending_acceptance_conversion_rejects_mutation_and_incompatible_durable
             17 => {
                 state.retained_result = Some(RetainedResult {
                     operation_id: ordinary.operation_id.clone(),
-                    effect: ordinary.clone(),
-                    result: result.clone(),
+                    record: crate::effects::RecordedEffect {
+                        effect: ordinary.clone(),
+                        result: result.clone(),
+                    },
                 });
             }
             18 => {
@@ -546,8 +624,10 @@ async fn pending_acceptance_conversion_rejects_mutation_and_incompatible_durable
                     ordinary.operation_id.clone(),
                     RetainedResult {
                         operation_id: ordinary.operation_id.clone(),
-                        effect: ordinary.clone(),
-                        result: result.clone(),
+                        record: crate::effects::RecordedEffect {
+                            effect: ordinary.clone(),
+                            result: result.clone(),
+                        },
                     },
                 );
             }

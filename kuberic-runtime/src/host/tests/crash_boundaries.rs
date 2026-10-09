@@ -3431,6 +3431,7 @@ async fn ensure_scale_up_store_cut(
             .unwrap()
             .retained_result
             .expect("durable candidate build-admission result")
+            .record
             .effect;
         assert_eq!(
             retained_build_effect.action,

@@ -287,7 +287,7 @@ where
                         "operation ID was reused with another switchover preparation".into(),
                     ));
                 }
-                retained.effect
+                retained.record.effect
             } else {
                 RuntimeEffect {
                     operation_id: command.operation_id,

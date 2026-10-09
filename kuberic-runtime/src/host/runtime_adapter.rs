@@ -360,7 +360,7 @@ where
     pub(crate) async fn resume_pending(&self) -> Result<Option<RuntimeEffectResult>> {
         let state = self.store.load_state().await?;
         let Some(pending) = state.pending_effect else {
-            return Ok(state.retained_result.map(|retained| retained.result));
+            return Ok(state.retained_result.map(|retained| retained.record.result));
         };
         self.execute(pending.effect).await.map(Some)
     }

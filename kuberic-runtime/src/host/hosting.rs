@@ -17,8 +17,8 @@ use crate::authority::{
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::control::proto;
 use crate::effects::{
-    BuildCompletion, BuildEffectState, RoleTransition, RuntimeEffect, RuntimeEffectAction,
-    RuntimeEffectOutcome, RuntimeEffectResult, RuntimeSnapshot,
+    BuildCompletion, BuildEffectState, RecordedEffect, RoleTransition, RuntimeEffect,
+    RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult, RuntimeSnapshot,
 };
 use crate::protocol::types::{
     AccessStatus, Epoch, FaultType, LoadMetric, OperationId, PartitionId, PartitionInformation,
@@ -361,11 +361,7 @@ pub(crate) enum OutboundReplication {
     Evict(ReplicaIdentity),
 }
 
-#[derive(Debug, Clone)]
-struct AppliedEffect {
-    effect: RuntimeEffect,
-    result: RuntimeEffectResult,
-}
+type AppliedEffect = RecordedEffect;
 
 #[derive(Debug)]
 struct HostState {

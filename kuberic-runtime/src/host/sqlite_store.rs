@@ -434,6 +434,22 @@ impl AgentStore for SqliteStore {
     async fn complete_effect(&self, result: &RuntimeEffectResult) -> Result<()> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
+            if state.pending_effect.is_none() {
+                let retained = state.removal_effects.get(&result.operation_id).or_else(|| {
+                    state
+                        .retained_result
+                        .as_ref()
+                        .filter(|retained| retained.operation_id == result.operation_id)
+                });
+                if let Some(retained) = retained {
+                    if retained.result == *result {
+                        return Ok(());
+                    }
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "retained effect completion changed its canonical result".into(),
+                    ));
+                }
+            }
             let pending = state.pending_effect.as_ref().ok_or_else(|| {
                 crate::host::HostError::DurableEffectConflict(
                     "effect completion has no durable intent".into(),
@@ -914,6 +930,14 @@ impl AgentStore for SqliteStore {
                         ));
                     }
                     BuildEffectState::Completed(build) => {
+                        if !build.completed
+                            || build.authority.build_id != *build_id
+                            || build.authority.target != completion.target
+                        {
+                            return Err(crate::host::HostError::DurableEffectConflict(
+                                "build completion carries contradictory identity or state".into(),
+                            ));
+                        }
                         let durable = state.build_progress.get(build_id).ok_or_else(|| {
                             crate::host::HostError::DurableEffectConflict(
                                 "build completion lacks durable progress".into(),
@@ -961,8 +985,10 @@ impl AgentStore for SqliteStore {
             }
             let retained = RetainedResult {
                 operation_id: result.operation_id.clone(),
-                effect: pending.effect,
-                result: result.clone(),
+                record: crate::effects::RecordedEffect {
+                    effect: pending.effect,
+                    result: result.clone(),
+                },
             };
             if matches!(
                 retained.effect.action,

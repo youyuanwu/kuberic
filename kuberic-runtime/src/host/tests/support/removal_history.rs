@@ -105,10 +105,13 @@ where
     .await
     {
         Ok(Ok(_)) => {}
-        readiness => panic!(
-            "history service readiness failed: {readiness:?}; server result: {:?}",
-            server.await
-        ),
+        readiness => {
+            server.abort();
+            panic!(
+                "history service readiness failed: {readiness:?}; server result: {:?}",
+                server.await
+            );
+        }
     }
     let client =
         proto::agent_control_client::AgentControlClient::connect(format!("http://{address}"))

@@ -299,6 +299,120 @@ pub(crate) enum RuntimeEffectOutcome {
     Aborted(ProcessCompletion),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEffectFamily {
+    Open,
+    Authority,
+    SecondaryRemovalPreparation,
+    PeerSession,
+    SecondaryRemovalWitness,
+    SecondaryRemovalProgress,
+    ReplicationAck,
+    SecondaryRemovalAcceptance,
+    HistoricalSecondaryRemovalAcceptance,
+    ReplicaRetirement,
+    RetirementFence,
+    RetirementCompletion,
+    FailoverPrefix,
+    BuildAuthority,
+    Role,
+    ReplicatorRole,
+    Epoch,
+    ApplicationRole,
+    CatchUp,
+    Access,
+    Switchover,
+    ApplicationProgress,
+    Build,
+    BuildRetirement,
+    Close,
+    Abort,
+}
+
+impl RuntimeEffectAction {
+    fn completion_family(&self) -> RuntimeEffectFamily {
+        match self {
+            Self::Open(_) => RuntimeEffectFamily::Open,
+            Self::AdmitAuthority(_) => RuntimeEffectFamily::Authority,
+            Self::PrepareSecondaryRemoval { .. } => {
+                RuntimeEffectFamily::SecondaryRemovalPreparation
+            }
+            Self::RegisterPeerSession { .. } => RuntimeEffectFamily::PeerSession,
+            Self::ObserveSecondaryRemovalWitness(_) => RuntimeEffectFamily::SecondaryRemovalWitness,
+            Self::ObserveSecondaryRemovalProgress { .. } => {
+                RuntimeEffectFamily::SecondaryRemovalProgress
+            }
+            Self::ObserveReplicationAck { .. } => RuntimeEffectFamily::ReplicationAck,
+            Self::AcceptSecondaryRemovalCommit(_) => {
+                RuntimeEffectFamily::SecondaryRemovalAcceptance
+            }
+            Self::AcceptHistoricalSecondaryRemovalCommit(_) => {
+                RuntimeEffectFamily::HistoricalSecondaryRemovalAcceptance
+            }
+            Self::RetireReplica(_) => RuntimeEffectFamily::ReplicaRetirement,
+            Self::FenceRetirement(_) => RuntimeEffectFamily::RetirementFence,
+            Self::CompleteRetirement(_) => RuntimeEffectFamily::RetirementCompletion,
+            Self::AuthorizeFailoverPrefix(_) => RuntimeEffectFamily::FailoverPrefix,
+            Self::AdmitBuildAuthority(_) => RuntimeEffectFamily::BuildAuthority,
+            Self::ChangeRole(_) => RuntimeEffectFamily::Role,
+            Self::ChangeReplicatorRole(_) => RuntimeEffectFamily::ReplicatorRole,
+            Self::UpdateEpoch => RuntimeEffectFamily::Epoch,
+            Self::ChangeApplicationRole(_) => RuntimeEffectFamily::ApplicationRole,
+            Self::WaitForCatchup => RuntimeEffectFamily::CatchUp,
+            Self::SetAccessStatus { .. } | Self::SetReadStatus(_) | Self::SetWriteStatus(_) => {
+                RuntimeEffectFamily::Access
+            }
+            Self::PrepareSwitchover { .. } => RuntimeEffectFamily::Switchover,
+            Self::RefreshApplicationProgress => RuntimeEffectFamily::ApplicationProgress,
+            Self::BuildReplica { .. } => RuntimeEffectFamily::Build,
+            Self::RetireBuild(_) => RuntimeEffectFamily::BuildRetirement,
+            Self::Close => RuntimeEffectFamily::Close,
+            Self::Abort => RuntimeEffectFamily::Abort,
+        }
+    }
+}
+
+impl RuntimeEffectOutcome {
+    fn completion_family(&self) -> RuntimeEffectFamily {
+        match self {
+            Self::Opened => RuntimeEffectFamily::Open,
+            Self::AuthorityAdmitted(_) => RuntimeEffectFamily::Authority,
+            Self::SecondaryRemovalPrepared(_) => RuntimeEffectFamily::SecondaryRemovalPreparation,
+            Self::PeerSessionRegistered { .. } => RuntimeEffectFamily::PeerSession,
+            Self::SecondaryRemovalWitnessObserved { .. } => {
+                RuntimeEffectFamily::SecondaryRemovalWitness
+            }
+            Self::SecondaryRemovalProgressObserved { .. } => {
+                RuntimeEffectFamily::SecondaryRemovalProgress
+            }
+            Self::ReplicationAckObserved { .. } => RuntimeEffectFamily::ReplicationAck,
+            Self::SecondaryRemovalAccepted { .. } => {
+                RuntimeEffectFamily::SecondaryRemovalAcceptance
+            }
+            Self::HistoricalSecondaryRemovalAccepted(_) => {
+                RuntimeEffectFamily::HistoricalSecondaryRemovalAcceptance
+            }
+            Self::ReplicaRetired(_) => RuntimeEffectFamily::ReplicaRetirement,
+            Self::RetirementFenced(_) => RuntimeEffectFamily::RetirementFence,
+            Self::RetirementCompleted(_) => RuntimeEffectFamily::RetirementCompletion,
+            Self::FailoverPrefixAuthorized { .. } => RuntimeEffectFamily::FailoverPrefix,
+            Self::BuildAuthorityAdmitted { .. } => RuntimeEffectFamily::BuildAuthority,
+            Self::RoleChanged(_) => RuntimeEffectFamily::Role,
+            Self::ReplicatorRoleChanged(_) => RuntimeEffectFamily::ReplicatorRole,
+            Self::EpochUpdated(_) => RuntimeEffectFamily::Epoch,
+            Self::ApplicationRoleChanged { .. } => RuntimeEffectFamily::ApplicationRole,
+            Self::CatchUpCompleted(_) => RuntimeEffectFamily::CatchUp,
+            Self::AccessChanged(_) => RuntimeEffectFamily::Access,
+            Self::SwitchoverPrepared(_) => RuntimeEffectFamily::Switchover,
+            Self::ApplicationProgressRefreshed { .. } => RuntimeEffectFamily::ApplicationProgress,
+            Self::BuildReplica(_) => RuntimeEffectFamily::Build,
+            Self::BuildRetired { .. } => RuntimeEffectFamily::BuildRetirement,
+            Self::Closed(_) => RuntimeEffectFamily::Close,
+            Self::Aborted(_) => RuntimeEffectFamily::Abort,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RuntimeEffectResult {
     pub(crate) operation_id: OperationId,
@@ -306,10 +420,19 @@ pub(crate) struct RuntimeEffectResult {
     pub(crate) outcome: RuntimeEffectOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecordedEffect {
+    pub(crate) effect: RuntimeEffect,
+    pub(crate) result: RuntimeEffectResult,
+}
+
 impl RuntimeEffectResult {
     pub(crate) fn validate_for(&self, effect: &RuntimeEffect) -> Result<(), &'static str> {
         if self.operation_id != effect.operation_id || self.sequence != effect.sequence {
             return Err("runtime returned a result for a different durable effect");
+        }
+        if effect.action.completion_family() != self.outcome.completion_family() {
+            return Err("runtime result belongs to a different effect family");
         }
         let valid = match (&effect.action, &self.outcome) {
             (RuntimeEffectAction::Open(_), RuntimeEffectOutcome::Opened) => true,
@@ -464,7 +587,18 @@ impl RuntimeEffectResult {
                     build_id, target, ..
                 },
                 RuntimeEffectOutcome::BuildReplica(completion),
-            ) => completion.build_id == *build_id && completion.target == *target,
+            ) => {
+                completion.build_id == *build_id
+                    && completion.target == *target
+                    && match &completion.state {
+                        BuildEffectState::Dispatched | BuildEffectState::Abandoned => true,
+                        BuildEffectState::Completed(build) => {
+                            build.completed
+                                && build.authority.build_id == *build_id
+                                && build.authority.target == *target
+                        }
+                    }
+            }
             (
                 RuntimeEffectAction::RetireBuild(expected),
                 RuntimeEffectOutcome::BuildRetired { build_id, active },
@@ -644,6 +778,45 @@ mod tests {
             operation_id: result.operation_id.clone(),
             sequence: result.sequence,
             action: RuntimeEffectAction::SetReadStatus(AccessStatus::Granted),
+        };
+        assert!(result.validate_for(&effect).is_err());
+    }
+
+    #[test]
+    fn build_completion_rejects_nonterminal_or_mismatched_nested_proof() {
+        let (action, outcome) = required_family_cases().pop().unwrap();
+        let effect = RuntimeEffect {
+            operation_id: OperationId::new("build-effect"),
+            sequence: 1,
+            action,
+        };
+        let RuntimeEffectOutcome::BuildReplica(completion) = outcome else {
+            unreachable!()
+        };
+        let build = match &completion.state {
+            BuildEffectState::Completed(build) => build.clone(),
+            _ => unreachable!(),
+        };
+        let mut nonterminal = build.clone();
+        nonterminal.completed = false;
+        let result = RuntimeEffectResult {
+            operation_id: effect.operation_id.clone(),
+            sequence: effect.sequence,
+            outcome: RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                state: BuildEffectState::Completed(nonterminal),
+                ..completion.clone()
+            }),
+        };
+        assert!(result.validate_for(&effect).is_err());
+
+        let mut mismatched = build;
+        mismatched.authority.target = identity(3);
+        let result = RuntimeEffectResult {
+            outcome: RuntimeEffectOutcome::BuildReplica(BuildCompletion {
+                state: BuildEffectState::Completed(mismatched),
+                ..completion
+            }),
+            ..result
         };
         assert!(result.validate_for(&effect).is_err());
     }

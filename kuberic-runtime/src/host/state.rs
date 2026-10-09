@@ -1,7 +1,7 @@
 //! Durable replica-agent state.
 
 use crate::authority::{DurableBuildProgress, RetiredAuthority};
-use crate::effects::{RuntimeEffect, RuntimeEffectResult};
+use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
 use crate::protocol::types::{
@@ -55,8 +55,22 @@ pub(crate) struct PendingEffect {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RetainedResult {
     pub(crate) operation_id: OperationId,
-    pub(crate) effect: RuntimeEffect,
-    pub(crate) result: RuntimeEffectResult,
+    #[serde(flatten)]
+    pub(crate) record: RecordedEffect,
+}
+
+impl std::ops::Deref for RetainedResult {
+    type Target = RecordedEffect;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
+impl std::ops::DerefMut for RetainedResult {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.record
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
