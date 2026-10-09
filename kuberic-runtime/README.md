@@ -190,7 +190,7 @@ authority into the runtime. It freezes a separate post-enumeration catch-up
 boundary, admits the candidate through independently validated previous and
 expanded policies, and may preserve same-primary writes only while both
 configurations remain writable. Candidate readiness/copy completion alone never
-grants membership or quorum credit. Protocol 9/schema 5 require a fresh
+grants membership or quorum credit. Protocol 9/agent schema 6 require a fresh
 coordinated v2 deployment; the removed classic v1 stack has no conversion path.
 The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
 include separating replication proof from Kubernetes cleanup obligations; neither
