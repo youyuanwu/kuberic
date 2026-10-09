@@ -1283,6 +1283,104 @@ fn schema_six_rejects_missing_nested_authority_fields() {
     }
 }
 
+#[test]
+fn schema_six_rejects_missing_topology_witness_fields_at_applied_and_retained_cutpoints() {
+    let intent = removal_fixture::intent(&[1, 2, 3], 1);
+    let witness = removal_fixture::cleanup(&intent)
+        .evidence
+        .previous_read_quorum[0]
+        .clone();
+    for cutpoint in ["applied", "retained"] {
+        for field in [
+            "previousConfigurationId",
+            "pendingOperationId",
+            "retainedOperationId",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = SqliteStore::metadata_database_path(directory.path());
+            let (mut state, _, _, _) = pending_acceptance_fixture();
+            state.pending_effect = None;
+            state.retained_result = None;
+            state.removal_effects.clear();
+            let effect = RuntimeEffect {
+                operation_id: OperationId::new(format!("strict-witness-{cutpoint}-{field}")),
+                sequence: state.next_effect_sequence,
+                action: RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(
+                    witness.clone(),
+                )),
+            };
+            let result = RuntimeEffectResult {
+                operation_id: effect.operation_id.clone(),
+                sequence: effect.sequence,
+                outcome: RuntimeEffectOutcome::SecondaryRemovalWitnessObserved {
+                    witness: Box::new(witness.clone()),
+                    receipt: None,
+                },
+            };
+            if cutpoint == "applied" {
+                state.pending_effect = Some(PendingEffect {
+                    effect: effect.clone(),
+                    stage: EffectStage::EffectApplied,
+                    applied_result: Some(Box::new(result.clone())),
+                });
+            } else {
+                state.retained_result = Some(RetainedResult {
+                    operation_id: effect.operation_id.clone(),
+                    record: crate::effects::RecordedEffect {
+                        effect: effect.clone(),
+                        result: result.clone(),
+                    },
+                });
+            }
+            drop(SqliteStore::create_authorized(&path, state).unwrap());
+            let connection = Connection::open(&path).unwrap();
+            let json: String = connection
+                .query_row("SELECT state_json FROM agent_state", [], |row| row.get(0))
+                .unwrap();
+            let mut value: Value = serde_json::from_str(&json).unwrap();
+            let result = if cutpoint == "applied" {
+                value
+                    .get_mut("pendingEffect")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|pending| pending.get_mut("appliedResult"))
+            } else {
+                value
+                    .get_mut("retainedResult")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|retained| retained.get_mut("result"))
+            };
+            let witness_object = result
+                .and_then(Value::as_object_mut)
+                .and_then(|result| result.get_mut("outcome"))
+                .and_then(Value::as_object_mut)
+                .and_then(|outcome| outcome.get_mut("SecondaryRemovalWitnessObserved"))
+                .and_then(Value::as_object_mut)
+                .and_then(|completion| completion.get_mut("witness"))
+                .and_then(Value::as_object_mut)
+                .expect("secondary-removal witness");
+            assert!(
+                witness_object.remove(field).is_some(),
+                "missing fixture key {field}; keys: {:?}",
+                witness_object.keys().collect::<Vec<_>>()
+            );
+            connection
+                .execute(
+                    "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                    [serde_json::to_string(&value).unwrap()],
+                )
+                .unwrap();
+            drop(connection);
+            assert!(
+                matches!(
+                    SqliteStore::open_existing(&path, None),
+                    Err(crate::host::HostError::Serialization(_))
+                ),
+                "{cutpoint} accepted missing {field}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn pending_acceptance_conversion_is_atomic_one_way_and_resets_canonical_baseline() {
     for stage in [EffectStage::IntentCommitted, EffectStage::EffectApplied] {

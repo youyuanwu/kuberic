@@ -8,6 +8,16 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+fn deserialize_required_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(
@@ -932,12 +942,15 @@ pub struct ScaleUpWitness {
     #[schemars(range(min = 1))]
     pub report_sequence: u64,
     pub epoch: Epoch,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration_id: ConfigurationId,
     #[schemars(range(min = 0))]
     pub verified_replication_lsn: i64,
     pub write_status: AccessStatus,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub pending_operation_id: Option<OperationId>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub retained_operation_id: Option<OperationId>,
 }
 
@@ -1296,12 +1309,15 @@ pub struct SecondaryRemovalWitness {
     #[schemars(range(min = 1))]
     pub report_sequence: u64,
     pub epoch: Epoch,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration_id: ConfigurationId,
     #[schemars(range(min = 0))]
     pub verified_replication_lsn: i64,
     pub write_status: AccessStatus,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub pending_operation_id: Option<OperationId>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub retained_operation_id: Option<OperationId>,
 }
 
