@@ -51,6 +51,7 @@ pub struct ServiceLocationProjection {
     pub process_session_id: ProcessSessionId,
     pub revision: u64,
     pub revoked: bool,
+    pub clear_required: bool,
     pub address_digest: String,
     pub deferred_address_digest: Option<String>,
     pub service_uid: String,
@@ -137,7 +138,7 @@ pub fn evaluate_service_location(
         .or_else(|| report.map(|report| report.replica.clone()))
         .ok_or("service-location projection requires primary identity")?;
     let revoked = projection_revoked(existing, authority, report, location.as_ref());
-    let (location, deferred_location, revoked) =
+    let (location, deferred_location, revoked, clear_required) =
         projection_locations(existing, status, service, authority, location, revoked)?;
     let desired = ServiceLocationProjection {
         authority: authority.clone(),
@@ -146,6 +147,7 @@ pub fn evaluate_service_location(
         process_session_id: authority.process_session_id.clone(),
         revision: authority.revision,
         revoked,
+        clear_required,
         address_digest: service_location_address_digest(location.as_ref()),
         deferred_address_digest: deferred_location
             .as_ref()
@@ -256,6 +258,7 @@ fn same_projection(
         && existing.process_session_id == desired.process_session_id
         && existing.revision == desired.revision
         && existing.revoked == desired.revoked
+        && existing.clear_required == desired.clear_required
         && existing.address_digest == desired.address_digest
         && existing.deferred_address_digest == desired.deferred_address_digest
         && existing.service_uid == desired.service_uid
@@ -270,28 +273,35 @@ fn projection_locations(
     authority: &PublicOperationIntent,
     location: Option<ServiceLocation>,
     revoked: bool,
-) -> Result<(Option<ServiceLocation>, Option<ServiceLocation>, bool), String> {
+) -> Result<(Option<ServiceLocation>, Option<ServiceLocation>, bool, bool), String> {
     let Some(existing) = existing else {
-        return Ok((location, None, revoked));
+        return Ok((location, None, revoked, false));
     };
     if existing.authority == *authority && existing.location.is_none() {
         return match (&existing.deferred_location, location) {
             (None, Some(_)) if existing.revoked => {
                 Err("cleared service-location authority cannot be republished".into())
             }
-            (None, Some(location)) => Ok((Some(location), None, false)),
+            (None, Some(location)) if existing.clear_required => {
+                if projection_is_published(status, service, existing) {
+                    Ok((Some(location), None, false, false))
+                } else {
+                    Ok((None, Some(location), false, true))
+                }
+            }
+            (None, Some(location)) => Ok((Some(location), None, false, false)),
             (Some(deferred), Some(location)) if deferred == &location => {
                 let clear_published = projection_is_published(status, service, existing);
                 if clear_published {
-                    Ok((Some(location), None, false))
+                    Ok((Some(location), None, false, false))
                 } else {
-                    Ok((None, Some(location), false))
+                    Ok((None, Some(location), false, true))
                 }
             }
             (Some(_), Some(_)) => {
                 Err("service-location address changed within one authority".into())
             }
-            (_, None) => Ok((None, None, revoked)),
+            (_, None) => Ok((None, None, revoked, existing.clear_required)),
         };
     }
     if existing.authority == *authority
@@ -302,12 +312,16 @@ fn projection_locations(
         return Err("service-location address changed within one authority".into());
     }
     if existing.authority != *authority
-        && location.is_some()
-        && (existing.location.is_some() || !projection_is_published(status, service, existing))
+        && (existing.location.is_some()
+            || existing.clear_required
+            || !projection_is_published(status, service, existing))
     {
-        return Ok((None, location, false));
+        return Ok((None, location, revoked, true));
     }
-    Ok((location, None, revoked))
+    if existing.authority == *authority && existing.location.is_some() && location.is_none() {
+        return Ok((None, None, revoked, true));
+    }
+    Ok((location, None, revoked, false))
 }
 
 fn projection_revoked(

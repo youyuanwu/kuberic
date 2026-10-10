@@ -431,6 +431,7 @@ async fn public_operation_role_address_newer_authority_preserves_inflight_clear(
     else {
         panic!("second authority did not retain a pending clear")
     };
+
     assert!(second_projection.location.is_none());
     assert_eq!(
         second_projection.deferred_location,
@@ -454,6 +455,44 @@ async fn public_operation_role_address_newer_authority_preserves_inflight_clear(
         third_projection.deferred_location,
         third_report.service_location
     );
+}
+
+#[tokio::test]
+async fn public_operation_role_address_completion_cannot_bypass_required_clear() {
+    let (config, first, first_report) = fixture(1, Some("first"));
+    let (_, second, second_pending) = fixture(2, None);
+    let (_, same_second, second_completed) = fixture(2, Some("second"));
+    assert_eq!(second, same_second);
+    let api = Api::new();
+    converge(&api, &config, &first, &first_report).await;
+
+    let pending_clear = plan(&api, &config, &second, &second_pending).await;
+    let PreviewServiceLocationPlan::PersistStatus { next, .. } = &pending_clear else {
+        panic!("pending authority did not persist a clear")
+    };
+    let PreviewServiceLocationStage::Pending(projection) = &next.service_location_projection else {
+        panic!("pending authority clear was not pending")
+    };
+    assert!(projection.location.is_none());
+    assert!(projection.deferred_location.is_none());
+    assert!(projection.clear_required);
+    execute_preview_service_location(&api, pending_clear)
+        .await
+        .unwrap();
+
+    let completed = plan(&api, &config, &second, &second_completed).await;
+    let PreviewServiceLocationPlan::PersistStatus { next, .. } = completed else {
+        panic!("role completion bypassed the durable clear stage")
+    };
+    let PreviewServiceLocationStage::Pending(projection) = next.service_location_projection else {
+        panic!("completed authority clear was not pending")
+    };
+    assert!(projection.location.is_none());
+    assert_eq!(
+        projection.deferred_location,
+        second_completed.service_location
+    );
+    assert!(projection.clear_required);
 }
 
 #[tokio::test]
