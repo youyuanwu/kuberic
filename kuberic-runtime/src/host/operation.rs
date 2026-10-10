@@ -527,6 +527,26 @@ impl PartitionOperation {
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
+    fn mark_superseded_by(&self, successor: &OperationId) -> Result<()> {
+        let mut record = self.snapshot();
+        if record
+            .superseded_by
+            .as_ref()
+            .is_some_and(|existing| existing != successor)
+        {
+            return Err(HostError::DurableEffectConflict(format!(
+                "public operation {} was superseded by multiple successors",
+                record.intent.operation_id
+            )));
+        }
+        if record.superseded_by.as_ref() != Some(successor) {
+            record.superseded_by = Some(successor.clone());
+            self.record.send_replace(record);
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
     fn bump_revision(&self) {
         let next = self.revision.borrow().wrapping_add(1);
         self.revision.send_replace(next);
@@ -711,6 +731,9 @@ impl PartitionOperationRegistry {
             | BeginPublicOperation::Pending(record)
             | BeginPublicOperation::Completed(record) => record,
         };
+        for displaced in &superseded {
+            displaced.mark_superseded_by(&intent.operation_id)?;
+        }
         let operation = Arc::new(PartitionOperation::new(
             self.store.clone(),
             record,

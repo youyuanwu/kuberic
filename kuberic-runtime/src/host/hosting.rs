@@ -1346,6 +1346,19 @@ impl PodRuntime {
         Ok(())
     }
 
+    pub(crate) async fn reconstruct_quarantined(&self, mode: OpenMode) -> Result<()> {
+        if !self.host.snapshot().await.open {
+            self.host.open(mode).await?;
+        }
+        let mut state = self.host.state.write().await;
+        state.fallback_snapshot.role = ReplicaRole::None;
+        state.fallback_snapshot.role_transition = None;
+        state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
+        state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+        state.fallback_snapshot.authority = None;
+        Ok(())
+    }
+
     pub(crate) async fn restore_accepted_removal(
         &self,
         committed: crate::protocol::types::SecondaryScaleDownCleanup,

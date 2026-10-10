@@ -1840,6 +1840,16 @@ impl AgentStore for SqliteStore {
                     "attached public-operation owner {owner} is unknown"
                 ))
             })?;
+            if owner_record.superseded_by.is_some()
+                || matches!(
+                    owner_record.disposition,
+                    Some(PublicOperationDisposition::Attached(_))
+                )
+            {
+                return Err(crate::host::HostError::StaleEffectCompletion(format!(
+                    "attached public-operation owner {owner} is not authoritative"
+                )));
+            }
             if let Some(existing) = preview.operations.get(&intent.operation_id) {
                 if &existing.intent != intent {
                     return Err(crate::host::HostError::DurableEffectConflict(

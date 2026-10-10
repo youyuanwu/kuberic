@@ -10,6 +10,7 @@ use tokio::sync::{Notify, watch};
 use crate::application::{
     OpenContext, OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
 };
+use crate::authority::{AdmittedAuthority, ReplicaAuthorityStore};
 use crate::host::hosting::PodRuntime;
 use crate::host::operation::{CallbackContainment, PartitionOperationRegistry};
 use crate::host::operation_recovery::PartitionOperationRuntime;
@@ -1157,6 +1158,73 @@ async fn active_terminal_attachment_waits_for_the_owner_result() {
 }
 
 #[tokio::test]
+async fn cancellation_failure_cannot_redirect_attachment_to_a_superseded_owner() {
+    let preview = PublicOperationPreviewIdentity::new(46);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry = PartitionOperationRegistry::new(
+        store.clone(),
+        preview.clone(),
+        ProcessSessionId::new("session-1"),
+    )
+    .unwrap();
+    let close = registry
+        .admit(intent(
+            &preview,
+            "a-close",
+            1,
+            PublicOperationClass::Close,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    close
+        .spawn_root(CallbackContainment::RootTask, async {
+            std::future::pending::<()>().await;
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    store.fail_next_public_operation_advance();
+    let abort = registry
+        .admit(intent(
+            &preview,
+            "b-abort",
+            2,
+            PublicOperationClass::Abort,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    let blocked = wait_for_stage(&abort, PublicOperationStage::ContainmentPending).await;
+    assert!(matches!(
+        blocked.disposition,
+        Some(PublicOperationDisposition::Ambiguous(_))
+    ));
+    assert_eq!(
+        close.snapshot().superseded_by,
+        Some(abort.intent().operation_id)
+    );
+
+    let attached = registry
+        .admit(intent(
+            &preview,
+            "c-permanent",
+            3,
+            PublicOperationClass::PermanentFault,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        attached.snapshot().disposition,
+        Some(PublicOperationDisposition::Attached(
+            abort.intent().operation_id
+        ))
+    );
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn fresh_session_recovers_unowned_work_as_ambiguous_containment() {
     let preview = PublicOperationPreviewIdentity::new(5);
     let (_directory, path, store) = durable_preview_store(&preview);
@@ -1213,7 +1281,7 @@ async fn fresh_preview_session_reconstructs_unassigned_and_access_closed() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let mut state = AgentState::new(storage_identity());
-    state.current_configuration = Some(ConfigurationDescriptor::new(
+    let current_configuration = ConfigurationDescriptor::new(
         Epoch::new(0, 1),
         ReplicaId::new(1),
         vec![ConfigurationMember {
@@ -1221,11 +1289,25 @@ async fn fresh_preview_session_reconstructs_unassigned_and_access_closed() {
             role: ReplicaRole::Primary,
         }],
         1,
-    ));
+    );
+    state.current_configuration = Some(current_configuration.clone());
     state.role = ReplicaRole::Primary;
     state.read_status = AccessStatus::Granted;
     state.write_status = AccessStatus::Granted;
-    drop(SqliteStore::create_preview_authorized(&path, state, preview.clone()).unwrap());
+    let seeded = SqliteStore::create_preview_authorized(&path, state, preview.clone()).unwrap();
+    seeded
+        .admit(&AdmittedAuthority {
+            local_identity: replica_identity(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration,
+            switchover_handoff: None,
+            scale_up: None,
+            secondary_removal: None,
+        })
+        .await
+        .unwrap();
+    drop(seeded);
 
     let store = Arc::new(
         SqliteStore::open_preview_existing(&path, Some(&storage_identity()), &preview).unwrap(),
@@ -1249,6 +1331,7 @@ async fn fresh_preview_session_reconstructs_unassigned_and_access_closed() {
     assert_eq!(durable.role, ReplicaRole::Primary);
     assert_eq!(durable.read_status, AccessStatus::Granted);
     assert_eq!(durable.write_status, AccessStatus::Granted);
+    assert!(store.load_admitted_authority().await.unwrap().is_some());
     runtime.abort();
 }
 
@@ -2014,6 +2097,30 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
             "missing {expected}"
         );
     }
+}
+
+#[tokio::test]
+async fn state_replicator_closes_on_abort_without_prior_close() {
+    let (trace, _application, replicator, state_replicator) = trace_fixture();
+    state_replicator
+        .replicate(bytes::Bytes::from_static(b"before-abort"))
+        .await
+        .unwrap();
+    replicator.abort();
+    assert!(matches!(
+        state_replicator
+            .replicate(bytes::Bytes::from_static(b"after-abort"))
+            .await,
+        Err(crate::RuntimeError::Closed)
+    ));
+    assert!(
+        trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "replicator.abort")
+    );
 }
 
 async fn assert_root_callback_cancelled<F, E>(

@@ -558,6 +558,12 @@ where
         ready: watch::Sender<bool>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
+        let preview_quarantine = self
+            .store
+            .load_state()
+            .await?
+            .public_operation_preview
+            .is_some();
         let control_service = self.clone();
         let peer_service = self.clone();
         let replication_service = self.clone();
@@ -611,7 +617,9 @@ where
             replication.abort();
             let _ = tokio::join!(&mut control, &mut replication);
             self.runtime.shutdown_recovery_tasks().await;
-            let _ = self.runtime.shutdown_configuration_work().await;
+            if !preview_quarantine {
+                let _ = self.runtime.shutdown_configuration_work().await;
+            }
             self.runtime.quiesce_partition_reports().await;
             let persisted = self.persist_partition_fault().await;
             self.runtime.abort();
@@ -623,14 +631,19 @@ where
             return Err(error);
         }
 
-        let recovery_owner = RecoveryOwner::with_admission_lock(
-            self.runtime.recovery_owner_runtime(),
-            self.store.clone(),
-            self.coordinator.recovery_admission_lock(),
-        );
         let (recovery_stop, recovery_shutdown) = watch::channel(false);
-        let mut recovery_owner_task =
-            tokio::spawn(async move { recovery_owner.run(recovery_shutdown).await });
+        let mut recovery_owner_task = if preview_quarantine {
+            None
+        } else {
+            let recovery_owner = RecoveryOwner::with_admission_lock(
+                self.runtime.recovery_owner_runtime(),
+                self.store.clone(),
+                self.coordinator.recovery_admission_lock(),
+            );
+            Some(tokio::spawn(async move {
+                recovery_owner.run(recovery_shutdown).await
+            }))
+        };
         let partition_owner =
             PartitionReportOwner::new(self.runtime.recovery_owner_runtime(), self.store.clone());
         let (partition_stop, partition_shutdown) = watch::channel(false);
@@ -639,12 +652,16 @@ where
 
         self.ready_state.store(true, Ordering::Release);
         ready.send_replace(true);
-        let recovery_coordinator = self.coordinator.clone();
-        let configuration_recovery_task = tokio::spawn(async move {
-            if let Err(error) = recovery_coordinator.resume_configuration().await {
-                tracing::warn!(%error, "background configuration recovery stopped");
-            }
-        });
+        let configuration_recovery_task = if preview_quarantine {
+            None
+        } else {
+            let recovery_coordinator = self.coordinator.clone();
+            Some(tokio::spawn(async move {
+                if let Err(error) = recovery_coordinator.resume_configuration().await {
+                    tracing::warn!(%error, "background configuration recovery stopped");
+                }
+            }))
+        };
         let result = tokio::select! {
             result = &mut control => {
                 replication.abort();
@@ -669,8 +686,10 @@ where
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
-        configuration_recovery_task.abort();
-        let _ = configuration_recovery_task.await;
+        if let Some(configuration_recovery_task) = configuration_recovery_task {
+            configuration_recovery_task.abort();
+            let _ = configuration_recovery_task.await;
+        }
         #[cfg(feature = "testing")]
         let public_operation_preview_result =
             if let Some(owner) = self.public_operation_preview.lock().await.take() {
@@ -682,9 +701,10 @@ where
         recovery_stop.send_replace(true);
         partition_stop.send_replace(true);
         self.runtime.shutdown_recovery_tasks().await;
-        if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut recovery_owner_task)
-            .await
-            .is_err()
+        if let Some(recovery_owner_task) = &mut recovery_owner_task
+            && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut *recovery_owner_task)
+                .await
+                .is_err()
         {
             recovery_owner_task.abort();
             let _ = recovery_owner_task.await;
@@ -696,7 +716,9 @@ where
             partition_owner_task.abort();
             let _ = partition_owner_task.await;
         }
-        self.runtime.shutdown_configuration_work().await?;
+        if !preview_quarantine {
+            self.runtime.shutdown_configuration_work().await?;
+        }
         self.runtime.quiesce_partition_reports().await;
         let persisted = self.persist_partition_fault().await;
         self.runtime.abort();
@@ -757,32 +779,27 @@ where
                 record.command.transition_kind
                     == crate::protocol::types::TransitionKind::PlannedSwitchover
             });
-        self.runtime
-            .reconstruct(
-                if state
-                    .application_storage
-                    .as_ref()
-                    .is_some_and(|b| b.initializing)
-                {
-                    OpenMode::New
-                } else {
-                    OpenMode::Existing
-                },
-                if preview_quarantine {
-                    crate::protocol::types::ReplicaRole::None
-                } else {
-                    state.role
-                },
-                if removal_pending {
-                    crate::protocol::types::AccessStatus::ReconfigurationPending
-                } else if preview_quarantine {
-                    crate::protocol::types::AccessStatus::NotPrimary
-                } else {
-                    state.read_status
-                },
-                if preview_quarantine {
-                    crate::protocol::types::AccessStatus::NotPrimary
-                } else {
+        let open_mode = if state
+            .application_storage
+            .as_ref()
+            .is_some_and(|b| b.initializing)
+        {
+            OpenMode::New
+        } else {
+            OpenMode::Existing
+        };
+        if preview_quarantine {
+            self.runtime.reconstruct_quarantined(open_mode).await?;
+        } else {
+            self.runtime
+                .reconstruct(
+                    open_mode,
+                    state.role,
+                    if removal_pending {
+                        crate::protocol::types::AccessStatus::ReconfigurationPending
+                    } else {
+                        state.read_status
+                    },
                     startup_write_status(
                         state.write_status,
                         state
@@ -790,11 +807,11 @@ where
                             .as_ref()
                             .map(|pending| &pending.effect.action),
                         removal_pending || planned_switchover_pending,
-                    )
-                },
-                transition,
-            )
-            .await?;
+                    ),
+                    transition,
+                )
+                .await?;
+        }
         // Consume creation permission before readiness permits any authority/access commands.
         if state
             .application_storage
