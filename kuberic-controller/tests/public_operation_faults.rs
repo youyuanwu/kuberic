@@ -585,6 +585,7 @@ async fn volatile_cleanup_never_deletes_a_recreated_endpoint() {
     for _ in 0..3 {
         reconciler.reconcile("tests", "fault-db").await.unwrap();
     }
+
     let mut observation = api.observation().await;
     let endpoint = observation
         .services
@@ -608,6 +609,44 @@ async fn volatile_cleanup_never_deletes_a_recreated_endpoint() {
             .services
             .iter()
             .any(|service| service.uid().as_deref() == Some("replacement-endpoint-uid"))
+    );
+}
+
+#[tokio::test]
+async fn volatile_cleanup_never_deletes_recreated_pod_or_pvc_names() {
+    let api = Arc::new(InMemoryClusterApi::new(raw_fault(
+        Some(StatePersistence::Volatile),
+        FaultType::Transient,
+        1,
+    )));
+    let reconciler = Reconciler::new(api.clone(), config());
+    for _ in 0..3 {
+        reconciler.reconcile("tests", "fault-db").await.unwrap();
+    }
+    let mut observation = api.observation().await;
+    observation.pods[0].metadata.uid = Some("replacement-pod-uid".into());
+    observation.pvcs[0].metadata.uid = Some("replacement-pvc-uid".into());
+    api.set_observation(observation).await;
+    assert_eq!(
+        reconciler
+            .reconcile("tests", "fault-db")
+            .await
+            .unwrap()
+            .kind,
+        ReconcileKind::ObservationStale
+    );
+    let observation = api.observation().await;
+    assert!(
+        observation
+            .pods
+            .iter()
+            .any(|pod| pod.uid().as_deref() == Some("replacement-pod-uid"))
+    );
+    assert!(
+        observation
+            .pvcs
+            .iter()
+            .any(|pvc| pvc.uid().as_deref() == Some("replacement-pvc-uid"))
     );
 }
 

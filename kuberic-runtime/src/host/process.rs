@@ -81,6 +81,13 @@ pub(crate) struct PreviewChildEvidence {
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 #[allow(dead_code)]
+pub(crate) struct PreviewChildProcess {
+    pub(crate) child: tokio::process::Child,
+    pub(crate) evidence: PreviewChildEvidence,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreviewRestartCut {
     Accepted,
@@ -104,6 +111,8 @@ pub(crate) struct ReplicaProcessSupervisor {
     data_root: PathBuf,
     child: PreviewChildCommand,
     active_child: Mutex<Option<tokio::process::Child>>,
+    launch: Mutex<()>,
+    container_restart_proven: bool,
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
@@ -113,19 +122,27 @@ impl ReplicaProcessSupervisor {
         store: Arc<SqliteStore>,
         data_root: PathBuf,
         child: PreviewChildCommand,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let marker = data_root.join(".kuberic").join("supervisor-session");
+        let container_restart_proven = marker.exists();
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&marker, uuid::Uuid::new_v4().to_string())?;
+        Ok(Self {
             store,
             data_root,
             child,
             active_child: Mutex::new(None),
-        }
+            launch: Mutex::new(()),
+            container_restart_proven,
+        })
     }
 
     pub(crate) async fn restart_with_child(
         &self,
         action: &PublicFaultAction,
-        predecessor: &mut tokio::process::Child,
+        predecessor: &mut PreviewChildProcess,
         cut: Option<PreviewRestartCut>,
     ) -> Result<PreviewRestartResult> {
         let record = self.store.begin_restart_action(action).await?;
@@ -135,7 +152,14 @@ impl ReplicaProcessSupervisor {
             ));
         }
         if record.stage == RestartActionStage::Accepted {
-            let status = predecessor.wait().await?;
+            if predecessor.evidence.process_session != action.predecessor_session
+                || predecessor.child.id() != Some(predecessor.evidence.child_pid)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "restart action does not name the supervised predecessor child".into(),
+                ));
+            }
+            let status = predecessor.child.wait().await?;
             if status.code() != Some(PREVIEW_RESTART_DISPOSITION) {
                 return Err(crate::host::HostError::CommandRejected(format!(
                     "predecessor did not exit with restart disposition {PREVIEW_RESTART_DISPOSITION}"
@@ -148,13 +172,12 @@ impl ReplicaProcessSupervisor {
     pub(crate) async fn resume_after_container_restart(
         &self,
         action: &PublicFaultAction,
-        parent_session: &ProcessSessionId,
         cut: Option<PreviewRestartCut>,
     ) -> Result<PreviewRestartResult> {
-        if parent_session.is_empty() || parent_session == &action.predecessor_session {
+        if !self.container_restart_proven {
             self.store.begin_restart_action(action).await?;
             return Err(crate::host::HostError::CommandRejected(
-                "container restart does not prove predecessor containment".into(),
+                "durable supervisor marker does not prove a parent/container restart".into(),
             ));
         }
         self.resume_contained(action, cut).await
@@ -165,6 +188,7 @@ impl ReplicaProcessSupervisor {
         action: &PublicFaultAction,
         cut: Option<PreviewRestartCut>,
     ) -> Result<PreviewRestartResult> {
+        let _launch = self.launch.lock().await;
         let mut record = self.store.begin_restart_action(action).await?;
         if cut == Some(PreviewRestartCut::Accepted) && record.stage == RestartActionStage::Accepted
         {
@@ -246,6 +270,9 @@ impl ReplicaProcessSupervisor {
             }
             std::fs::remove_file(&evidence_path)?;
         }
+        if self.active_child.lock().await.is_some() {
+            return self.await_successor_evidence(action).await;
+        }
         if let Some(parent) = evidence_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -266,6 +293,14 @@ impl ReplicaProcessSupervisor {
             .kill_on_drop(true);
         let child = command.spawn()?;
         *self.active_child.lock().await = Some(child);
+        self.await_successor_evidence(action).await
+    }
+
+    async fn await_successor_evidence(
+        &self,
+        action: &PublicFaultAction,
+    ) -> Result<PreviewChildEvidence> {
+        let evidence_path = self.evidence_path(action);
         for _ in 0..500 {
             if evidence_path.exists() {
                 return self.read_successor_evidence(action);
@@ -278,6 +313,7 @@ impl ReplicaProcessSupervisor {
                 .expect("successor child exists")
                 .try_wait()?
             {
+                self.active_child.lock().await.take();
                 return Err(crate::host::HostError::CommandRejected(format!(
                     "successor child exited before readiness with {status}"
                 )));

@@ -2499,6 +2499,10 @@ struct PreviewFaultBridge {
 
 #[cfg(feature = "testing")]
 impl PreviewFaultBridge {
+    fn fence_and_schedule_containment(&self) {
+        self.registry.fence_and_schedule_fault_containment();
+    }
+
     async fn report(&self, fault: FaultType) -> crate::host::Result<()> {
         let _admission = self.admission.lock().await;
         let state = self.store.load_state().await?;
@@ -2623,7 +2627,8 @@ impl PartitionAccessView for HostAccessView {
         #[cfg(feature = "testing")]
         let bridge = host.preview_fault_bridge.lock().await.clone();
         #[cfg(feature = "testing")]
-        if bridge.is_some() {
+        if let Some(bridge) = &bridge {
+            bridge.fence_and_schedule_containment();
             host.preview_fault_fenced.store(true, Ordering::Release);
         }
         let mut state = host.state.write().await;

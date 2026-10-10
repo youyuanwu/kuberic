@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use crate::Result as RuntimeResult;
 use crate::application::{OpenContext, RoleChange, StatefulServiceReplica};
 use crate::host::process::{
-    PREVIEW_RESTART_DISPOSITION, PreviewChildCommand, PreviewChildEvidence, PreviewRestartCut,
-    ReplicaProcessSupervisor,
+    PREVIEW_RESTART_DISPOSITION, PreviewChildCommand, PreviewChildEvidence, PreviewChildProcess,
+    PreviewRestartCut, ReplicaProcessSupervisor,
 };
 use crate::host::sqlite_store::SqliteStore;
 use crate::host::state::{AgentState, PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, StorageIdentity};
@@ -88,7 +88,8 @@ impl StatefulServiceReplica for PreviewChildApplication {
 
 struct ControllerSupervisorExecutor {
     supervisor: Arc<ReplicaProcessSupervisor>,
-    parent_session: ProcessSessionId,
+    predecessor: tokio::sync::Mutex<Option<PreviewChildProcess>>,
+    release: PathBuf,
 }
 
 #[async_trait]
@@ -100,9 +101,16 @@ impl kuberic_controller::cluster_api::PreviewFaultCommandExecutor for Controller
         kuberic_controller::protocol::public_operations::RestartActionRecord,
     > {
         let action: PublicFaultAction = wire(action);
+        std::fs::write(&self.release, b"restart")
+            .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
+        let mut predecessor = self.predecessor.lock().await.take().ok_or_else(|| {
+            kuberic_controller::ControllerError::Effect(
+                "predecessor child was already consumed".into(),
+            )
+        })?;
         let result = self
             .supervisor
-            .resume_after_container_restart(&action, &self.parent_session, None)
+            .restart_with_child(&action, &mut predecessor, None)
             .await
             .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
         Ok(wire(result.record))
@@ -151,6 +159,9 @@ fn preview_process_child_entrypoint() {
         application_instance_id: application.instance_id.clone(),
         replicator_instance_id: replicator.instance_id.clone(),
     };
+    if let Ok(delay) = std::env::var("KUBERIC_PREVIEW_READY_DELAY_MS") {
+        std::thread::sleep(std::time::Duration::from_millis(delay.parse().unwrap()));
+    }
     if let Some(parent) = Path::new(&output).parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -171,8 +182,8 @@ fn preview_process_child_entrypoint() {
 #[tokio::test]
 async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
     let fixture = Fixture::new();
-    let (mut predecessor, predecessor_evidence) = fixture.spawn_predecessor().await;
-    let action = fixture.action(predecessor_evidence.process_session.clone());
+    let mut predecessor = fixture.spawn_predecessor().await;
+    let action = fixture.action(predecessor.evidence.process_session.clone());
     std::fs::write(&fixture.release, b"restart").unwrap();
 
     let result = fixture
@@ -183,15 +194,15 @@ async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
     assert_eq!(result.record.stage, RestartActionStage::SuccessorStarted);
     assert_ne!(
         result.successor.process_session,
-        predecessor_evidence.process_session
+        predecessor.evidence.process_session
     );
     assert_eq!(result.successor.data_root, fixture.data_root);
     assert_eq!(
         result.successor.provider_sentinel,
-        predecessor_evidence.provider_sentinel
+        predecessor.evidence.provider_sentinel
     );
     assert!(Path::new(&format!("/proc/{}", result.successor.child_pid)).exists());
-    assert!(predecessor.try_wait().unwrap().is_some());
+    assert!(predecessor.child.try_wait().unwrap().is_some());
     assert_eq!(
         std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
         "2"
@@ -226,13 +237,15 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
     use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
 
     let fixture = Fixture::new();
-    let predecessor_session = ProcessSessionId::new("controller-predecessor");
+    let predecessor = fixture.spawn_predecessor().await;
+    let predecessor_session = predecessor.evidence.process_session.clone();
     let api = Arc::new(InMemoryClusterApi::new(
         fixture.controller_observation(&predecessor_session),
     ));
     api.set_preview_fault_executor(Arc::new(ControllerSupervisorExecutor {
         supervisor: fixture.supervisor.clone(),
-        parent_session: ProcessSessionId::new("controller-parent-restarted"),
+        predecessor: tokio::sync::Mutex::new(Some(predecessor)),
+        release: fixture.release.clone(),
     }))
     .await;
     let reconciler = Reconciler::new(
@@ -284,7 +297,7 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
     );
     assert_eq!(
         std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
-        "1"
+        "2"
     );
     fixture
         .supervisor
@@ -300,28 +313,20 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert!(
         fixture
             .supervisor
-            .resume_after_container_restart(
-                &action,
-                &ProcessSessionId::new("new-parent-session"),
-                Some(PreviewRestartCut::Accepted),
-            )
+            .resume_after_container_restart(&action, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not prove a parent/container restart")
+    );
+    let supervisor = fixture.restarted_supervisor();
+    assert!(
+        supervisor
+            .resume_after_container_restart(&action, Some(PreviewRestartCut::Accepted))
             .await
             .unwrap_err()
             .to_string()
             .contains("after durable restart acceptance")
-    );
-    assert!(
-        fixture
-            .supervisor
-            .resume_after_container_restart(
-                &action,
-                &ProcessSessionId::new("predecessor-session"),
-                None,
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("does not prove predecessor containment")
     );
     assert_eq!(
         fixture.store.restart_action().await.unwrap().unwrap().stage,
@@ -330,13 +335,8 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert!(!fixture.data_root.join("child-constructions").exists());
 
     assert!(
-        fixture
-            .supervisor
-            .resume_after_container_restart(
-                &action,
-                &ProcessSessionId::new("new-parent-session"),
-                Some(PreviewRestartCut::PredecessorContained),
-            )
+        supervisor
+            .resume_after_container_restart(&action, Some(PreviewRestartCut::PredecessorContained),)
             .await
             .unwrap_err()
             .to_string()
@@ -348,13 +348,8 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     );
 
     assert!(
-        fixture
-            .supervisor
-            .resume_after_container_restart(
-                &action,
-                &ProcessSessionId::new("new-parent-session"),
-                Some(PreviewRestartCut::SuccessorLaunched),
-            )
+        supervisor
+            .resume_after_container_restart(&action, Some(PreviewRestartCut::SuccessorLaunched))
             .await
             .unwrap_err()
             .to_string()
@@ -364,9 +359,8 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
         fixture.store.restart_action().await.unwrap().unwrap().stage,
         RestartActionStage::PredecessorContained
     );
-    let completed = fixture
-        .supervisor
-        .resume_after_container_restart(&action, &ProcessSessionId::new("new-parent-session"), None)
+    let completed = supervisor
+        .resume_after_container_restart(&action, None)
         .await
         .unwrap();
     let started = fixture.store.restart_action().await.unwrap().unwrap();
@@ -377,22 +371,14 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
         std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
         "1"
     );
-    fixture
-        .supervisor
-        .shutdown_successor(&action)
-        .await
-        .unwrap();
+    supervisor.shutdown_successor(&action).await.unwrap();
 
     let after_start = Fixture::new();
     let action = after_start.action(ProcessSessionId::new("old-parent"));
+    let supervisor = after_start.restarted_supervisor();
     assert!(
-        after_start
-            .supervisor
-            .resume_after_container_restart(
-                &action,
-                &ProcessSessionId::new("new-parent"),
-                Some(PreviewRestartCut::SuccessorStarted),
-            )
+        supervisor
+            .resume_after_container_restart(&action, Some(PreviewRestartCut::SuccessorStarted))
             .await
             .unwrap_err()
             .to_string()
@@ -400,20 +386,37 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     );
     let constructions =
         std::fs::read_to_string(after_start.data_root.join("child-constructions")).unwrap();
-    after_start
-        .supervisor
-        .resume_after_container_restart(&action, &ProcessSessionId::new("new-parent"), None)
+    supervisor
+        .resume_after_container_restart(&action, None)
         .await
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(after_start.data_root.join("child-constructions")).unwrap(),
         constructions
     );
-    after_start
-        .supervisor
-        .shutdown_successor(&action)
+    supervisor.shutdown_successor(&action).await.unwrap();
+
+    let cancelled = Fixture::new();
+    let action = cancelled.action(ProcessSessionId::new("cancelled-parent"));
+    let supervisor = cancelled.restarted_supervisor_with_delay(200);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            supervisor.resume_after_container_restart(&action, None),
+        )
+        .await
+        .is_err()
+    );
+    let completed = supervisor
+        .resume_after_container_restart(&action, None)
         .await
         .unwrap();
+    assert_eq!(completed.record.stage, RestartActionStage::SuccessorStarted);
+    assert_eq!(
+        std::fs::read_to_string(cancelled.data_root.join("child-constructions")).unwrap(),
+        "1"
+    );
+    supervisor.shutdown_successor(&action).await.unwrap();
 }
 
 struct Fixture {
@@ -466,19 +469,10 @@ impl Fixture {
             )
             .unwrap(),
         );
-        let child = PreviewChildCommand {
-            executable: std::env::current_exe().unwrap(),
-            arguments: vec![
-                "preview_process_child_entrypoint".into(),
-                "--nocapture".into(),
-            ],
-            environment: BTreeMap::new(),
-        };
-        let supervisor = Arc::new(ReplicaProcessSupervisor::new(
-            store.clone(),
-            data_root.clone(),
-            child,
-        ));
+        let supervisor = Arc::new(
+            ReplicaProcessSupervisor::new(store.clone(), data_root.clone(), Self::child_command())
+                .unwrap(),
+        );
         Self {
             _directory: directory,
             data_root,
@@ -488,6 +482,35 @@ impl Fixture {
             identity,
             supervisor,
         }
+    }
+
+    fn child_command() -> PreviewChildCommand {
+        PreviewChildCommand {
+            executable: std::env::current_exe().unwrap(),
+            arguments: vec![
+                "preview_process_child_entrypoint".into(),
+                "--nocapture".into(),
+            ],
+            environment: BTreeMap::new(),
+        }
+    }
+
+    fn restarted_supervisor(&self) -> Arc<ReplicaProcessSupervisor> {
+        self.restarted_supervisor_with_delay(0)
+    }
+
+    fn restarted_supervisor_with_delay(&self, delay_millis: u64) -> Arc<ReplicaProcessSupervisor> {
+        let mut child = Self::child_command();
+        if delay_millis > 0 {
+            child.environment.insert(
+                "KUBERIC_PREVIEW_READY_DELAY_MS".into(),
+                delay_millis.to_string(),
+            );
+        }
+        Arc::new(
+            ReplicaProcessSupervisor::new(self.store.clone(), self.data_root.clone(), child)
+                .unwrap(),
+        )
     }
 
     fn controller_observation(
@@ -661,7 +684,7 @@ impl Fixture {
         }
     }
 
-    async fn spawn_predecessor(&self) -> (tokio::process::Child, PreviewChildEvidence) {
+    async fn spawn_predecessor(&self) -> PreviewChildProcess {
         let output = self.data_root.join("predecessor.json");
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
         child
@@ -678,7 +701,7 @@ impl Fixture {
         for _ in 0..200 {
             if output.exists() {
                 let evidence = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
-                return (child, evidence);
+                return PreviewChildProcess { child, evidence };
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

@@ -720,6 +720,28 @@ impl PartitionOperationRegistry {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    pub(crate) fn fence_and_schedule_fault_containment(self: &Arc<Self>) {
+        self.fence();
+        let registry = Arc::clone(self);
+        self.own_control_task(async move {
+            let operations = registry
+                .state
+                .lock()
+                .await
+                .operations
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for operation in operations {
+                if !operation.intent().class.is_terminal()
+                    && let Err(error) = operation.cancel_root().await
+                {
+                    operation.record_failure(&error);
+                }
+            }
+        });
+    }
+
     pub(crate) fn abort_guard(&self) -> Arc<std::sync::Mutex<bool>> {
         self.abort_guard.clone()
     }

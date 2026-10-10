@@ -2952,10 +2952,38 @@ impl ClusterApi for InMemoryClusterApi {
                 candidate.name_any() != name || candidate.uid().as_deref() != Some(uid.as_str())
             });
         }
-        if let Some(name) = pod_name {
+        if let (Some(name), Some(uid)) = (pod_name, pod_uid) {
+            if state
+                .observation
+                .pods
+                .iter()
+                .find(|pod| pod.name_any() == name)
+                .is_some_and(|pod| pod.uid().as_deref() != Some(uid.as_str()))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            state
+                .observation
+                .pods
+                .retain(|pod| pod.name_any() != name || pod.uid().as_deref() != Some(uid.as_str()));
+        } else if let Some(name) = pod_name {
             state.observation.pods.retain(|pod| pod.name_any() != name);
         }
-        if let Some(name) = pvc_name {
+        if let (Some(name), Some(uid)) = (pvc_name, pvc_uid) {
+            if state
+                .observation
+                .pvcs
+                .iter()
+                .find(|pvc| pvc.name_any() == name)
+                .is_some_and(|pvc| pvc.uid().as_deref() != Some(uid.as_str()))
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            state
+                .observation
+                .pvcs
+                .retain(|pvc| pvc.name_any() != name || pvc.uid().as_deref() != Some(uid.as_str()));
+        } else if let Some(name) = pvc_name {
             state.observation.pvcs.retain(|pvc| pvc.name_any() != name);
         }
         state.effects.push(EffectRecord::DeleteScaffolding {
@@ -3201,7 +3229,7 @@ impl ClusterApi for InMemoryClusterApi {
         };
         #[cfg(feature = "runtime-test-bridge")]
         if let Some(action) = preview_command {
-            validate_preview_dispatch(observation, action)?;
+            validate_preview_dispatch(&state.observation, action)?;
             if action.target != target || action.predecessor_session.as_str() != session {
                 return Err(ControllerError::ObservationStale);
             }
