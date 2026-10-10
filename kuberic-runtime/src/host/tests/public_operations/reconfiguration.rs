@@ -567,29 +567,58 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
     );
     fixture.owner.shutdown().await.unwrap();
 
-    let fixture = Fixture::new().await;
-    let swap = Program::Swap {
-        starting: configuration(3),
-        refreshed: configuration_with_target(4),
-        epoch: Epoch::new(1, 4),
-        handoff: ReplicaRole::ActiveSecondary,
-        mode: PublicCatchUpMode::All,
-    };
-    fixture
-        .owner
-        .registry()
-        .admit(fixture.intent("expanded-swap", 3, swap))
-        .await
-        .unwrap();
-    let swap_build = fixture.intent("swap-build", 3, Program::Build(build("swap-build")));
-    assert!(
+    for (name, program) in [
+        (
+            "standalone-configuration",
+            Program::Configuration(configuration_with_target(3)),
+        ),
+        (
+            "standalone-catch-up",
+            Program::CatchUp {
+                configuration: configuration_with_target(3),
+                mode: PublicCatchUpMode::All,
+            },
+        ),
+        (
+            "swap-starting",
+            Program::Swap {
+                starting: configuration_with_target(3),
+                refreshed: configuration(4),
+                epoch: Epoch::new(1, 4),
+                handoff: ReplicaRole::ActiveSecondary,
+                mode: PublicCatchUpMode::All,
+            },
+        ),
+        (
+            "swap-refreshed",
+            Program::Swap {
+                starting: configuration(3),
+                refreshed: configuration_with_target(4),
+                epoch: Epoch::new(1, 4),
+                handoff: ReplicaRole::ActiveSecondary,
+                mode: PublicCatchUpMode::All,
+            },
+        ),
+    ] {
+        let fixture = Fixture::new().await;
         fixture
-            .store
-            .begin_public_operation(&swap_build, &[], &[])
+            .owner
+            .registry()
+            .admit(fixture.intent(name, 3, program))
             .await
-            .is_err()
-    );
-    fixture.owner.shutdown().await.unwrap();
+            .unwrap();
+        let attempt = format!("{name}-build");
+        let build_intent = fixture.intent(&attempt, 3, Program::Build(build(&attempt)));
+        assert!(
+            fixture
+                .store
+                .begin_public_operation(&build_intent, &[], &[])
+                .await
+                .is_err(),
+            "{name}"
+        );
+        fixture.owner.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -766,6 +795,21 @@ async fn synchronous_repeated_abort_fences_before_return_and_is_ordered_once() {
 #[tokio::test]
 async fn abort_admission_precedes_fencing_and_retained_duplicates_do_not_callback() {
     let fixture = Fixture::new().await;
+    let mut rejected_close = fixture.intent("rejected-close", 3, Program::Close);
+    rejected_close.process_session_id = ProcessSessionId::new("predecessor-session");
+    assert!(
+        public_lifecycle::launch(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            rejected_close,
+            fixture.callbacks.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!fixture.owner.registry().is_fenced());
+    assert!(fixture.trace.events.lock().unwrap().is_empty());
+
     let mut rejected = fixture.intent("rejected-abort", 3, Program::Abort);
     rejected.process_session_id = ProcessSessionId::new("predecessor-session");
     assert!(
