@@ -30,7 +30,7 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,258 tests: 1,020 ordinary, one build-only,
+The consolidated validator accounts for 1,260 tests: 1,022 ordinary, one build-only,
 205 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test
 and 19 mapped parent-driven subprocess helpers.
 Use its generated counts as the inventory evolves.

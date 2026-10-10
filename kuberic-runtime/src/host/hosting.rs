@@ -20,6 +20,10 @@ use crate::effects::{
     BuildCompletion, BuildEffectState, RecordedEffect, RoleTransition, RuntimeEffect,
     RuntimeEffectAction, RuntimeEffectOutcome, RuntimeEffectResult, RuntimeSnapshot,
 };
+#[cfg(feature = "testing")]
+use crate::protocol::public_operations::{
+    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
+};
 use crate::protocol::types::{
     AccessStatus, Epoch, FaultType, LoadMetric, OperationId, PartitionId, PartitionInformation,
     ReplicaIdentity, ReplicaRole,
@@ -1099,6 +1103,8 @@ impl PodRuntime {
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 partition_reports_closed: AtomicBool::new(false),
+                #[cfg(feature = "testing")]
+                preview_fault_fenced: AtomicBool::new(false),
                 recovery_revision: AtomicU64::new(0),
                 recovery_changed: Notify::new(),
                 recovery_tasks: RecoveryTaskOwner::new(),
@@ -1112,8 +1118,34 @@ impl PodRuntime {
                 managed_configuration_commit_gate: StdMutex::new(None),
                 #[cfg(all(test, feature = "testing"))]
                 partition_report_gate: StdMutex::new(None),
+                #[cfg(feature = "testing")]
+                preview_fault_bridge: Mutex::new(None),
             }),
         }
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn bind_public_fault_preview(
+        &self,
+        store: Arc<dyn crate::host::store::AgentStore>,
+        registry: Arc<crate::host::operation::PartitionOperationRegistry>,
+        preview: PublicOperationPreviewIdentity,
+        process_session: crate::protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        let mut bridge = self.host.preview_fault_bridge.lock().await;
+        if bridge.is_some() {
+            return Err(RuntimeError::Application(
+                "public fault preview is already bound".into(),
+            ));
+        }
+        *bridge = Some(Arc::new(PreviewFaultBridge {
+            store,
+            registry,
+            preview,
+            process_session,
+            admission: Mutex::new(()),
+        }));
+        Ok(())
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -1835,6 +1867,8 @@ struct RuntimeHost {
     aborted: AtomicBool,
     closed: AtomicBool,
     partition_reports_closed: AtomicBool,
+    #[cfg(feature = "testing")]
+    preview_fault_fenced: AtomicBool,
     recovery_revision: AtomicU64,
     recovery_changed: Notify,
     recovery_tasks: Arc<RecoveryTaskOwner>,
@@ -1847,6 +1881,8 @@ struct RuntimeHost {
     managed_configuration_commit_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
     #[cfg(all(test, feature = "testing"))]
     partition_report_gate: StdMutex<Option<AccessEffectAcceptanceGate>>,
+    #[cfg(feature = "testing")]
+    preview_fault_bridge: Mutex<Option<Arc<PreviewFaultBridge>>>,
 }
 
 impl RuntimeHost {
@@ -1940,6 +1976,13 @@ impl RuntimeHost {
         observation.write_status = fallback.write_status;
         if fallback.authority.is_some() {
             observation.authority = fallback.authority;
+        }
+        #[cfg(feature = "testing")]
+        if self.preview_fault_fenced.load(Ordering::Acquire) {
+            observation.role = ReplicaRole::None;
+            observation.read_status = AccessStatus::NotPrimary;
+            observation.write_status = AccessStatus::NotPrimary;
+            observation.authority = None;
         }
         if self.aborted.load(Ordering::Acquire) {
             observation.open = false;
@@ -2445,6 +2488,73 @@ struct HostAccessView {
     partition_information: PartitionInformation,
 }
 
+#[cfg(feature = "testing")]
+struct PreviewFaultBridge {
+    store: Arc<dyn crate::host::store::AgentStore>,
+    registry: Arc<crate::host::operation::PartitionOperationRegistry>,
+    preview: PublicOperationPreviewIdentity,
+    process_session: crate::protocol::types::ProcessSessionId,
+    admission: Mutex<()>,
+}
+
+#[cfg(feature = "testing")]
+impl PreviewFaultBridge {
+    async fn report(&self, fault: FaultType) -> crate::host::Result<()> {
+        let _admission = self.admission.lock().await;
+        let state = self.store.load_state().await?;
+        let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "public fault requires a bound preview store".into(),
+            )
+        })?;
+        if preview.identity != self.preview
+            || preview.binding.is_none()
+            || state.identity.resource_uid
+                != preview
+                    .binding
+                    .as_ref()
+                    .expect("binding checked")
+                    .resource_uid
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "public fault preview/store binding changed".into(),
+            ));
+        }
+        let revision = preview
+            .operations
+            .values()
+            .map(|record| record.intent.revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected("public fault revision overflow".into())
+            })?;
+        let operation_id = OperationId::new(format!(
+            "fault-{}-{revision}-{fault:?}",
+            self.process_session
+        ));
+        let intent = PublicOperationIntent {
+            preview: self.preview.clone(),
+            operation_id,
+            revision,
+            process_session_id: self.process_session.clone(),
+            class: match fault {
+                FaultType::Transient => PublicOperationClass::TransientFault,
+                FaultType::Permanent => PublicOperationClass::PermanentFault,
+            },
+            input_digest: format!("fault:{fault:?}:{revision}"),
+            lifecycle: None,
+            program: None,
+        };
+        self.store
+            .record_partition_reports(state.load_metrics, Some(fault))
+            .await?;
+        self.registry.report_fault(intent).await?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
     fn partition_information(&self) -> PartitionInformation {
@@ -2456,6 +2566,10 @@ impl PartitionAccessView for HostAccessView {
             return Ok(status);
         }
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        #[cfg(feature = "testing")]
+        if host.preview_fault_fenced.load(Ordering::Acquire) {
+            return Ok(AccessStatus::NotPrimary);
+        }
         Ok(host.state.read().await.fallback_snapshot.read_status)
     }
 
@@ -2464,6 +2578,10 @@ impl PartitionAccessView for HostAccessView {
             return Ok(status);
         }
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        #[cfg(feature = "testing")]
+        if host.preview_fault_fenced.load(Ordering::Acquire) {
+            return Ok(AccessStatus::NotPrimary);
+        }
         Ok(host.state.read().await.fallback_snapshot.write_status)
     }
 
@@ -2499,9 +2617,15 @@ impl PartitionAccessView for HostAccessView {
 
     async fn report_fault(&self, fault: FaultType) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        // Applications may report a fault from Open/change_role while the host
-        // already owns effect_lock. Reports change diagnostics, not authority;
-        // the state lock serializes them without re-entering a lifecycle effect.
+        // Open/change_role may report while the host owns effect_lock. The
+        // preview bridge uses its own admission lock and store transaction;
+        // the legacy path remains a partition-report update.
+        #[cfg(feature = "testing")]
+        let bridge = host.preview_fault_bridge.lock().await.clone();
+        #[cfg(feature = "testing")]
+        if bridge.is_some() {
+            host.preview_fault_fenced.store(true, Ordering::Release);
+        }
         let mut state = host.state.write().await;
         if host.closed.load(Ordering::Acquire)
             || host.aborted.load(Ordering::Acquire)
@@ -2516,6 +2640,23 @@ impl PartitionAccessView for HostAccessView {
                 state.partition_report_revision = state.partition_report_revision.wrapping_add(1);
                 host.notify_recovery();
             }
+        }
+        #[cfg(feature = "testing")]
+        let effective_fault = state.reported_fault.expect("fault was recorded");
+        #[cfg(feature = "testing")]
+        if bridge.is_some() {
+            state.fallback_snapshot.role = ReplicaRole::None;
+            state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
+            state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+            state.fallback_snapshot.authority = None;
+        }
+        drop(state);
+        #[cfg(feature = "testing")]
+        if let Some(bridge) = bridge {
+            bridge
+                .report(effective_fault)
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
         }
         Ok(())
     }

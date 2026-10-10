@@ -73,6 +73,9 @@ pub struct FrozenReplicaResources {
     pub pod_uid: PodUid,
     pub pvc_name: String,
     pub pvc_uid: PvcUid,
+    pub endpoint_name: String,
+    pub endpoint_uid: String,
+    pub endpoint_resource_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -104,7 +107,8 @@ impl PublicFaultAction {
                 "{kind:?}|{fault:?}|{persistence:?}|{resource_uid}|{protocol_version}|\
                  {preview_generation}|{spec_generation}|{replica_id}|{instance_id}|\
                  {agent_generation}|{predecessor_session}|{fault_revision}|{pod_name}|\
-                 {pod_uid}|{pvc_name}|{pvc_uid}",
+                 {pod_uid}|{pvc_name}|{pvc_uid}|{endpoint_name}|{endpoint_uid}|\
+                 {endpoint_resource_version}",
                 kind = self.kind,
                 fault = self.fault,
                 persistence = self.binding.state_persistence,
@@ -121,6 +125,9 @@ impl PublicFaultAction {
                 pod_uid = self.resources.pod_uid,
                 pvc_name = self.resources.pvc_name,
                 pvc_uid = self.resources.pvc_uid,
+                endpoint_name = self.resources.endpoint_name,
+                endpoint_uid = self.resources.endpoint_uid,
+                endpoint_resource_version = self.resources.endpoint_resource_version,
             )
             .as_bytes(),
         );
@@ -142,6 +149,9 @@ impl PublicFaultAction {
             || self.resources.pod_uid.is_empty()
             || self.resources.pvc_name.is_empty()
             || self.resources.pvc_uid.is_empty()
+            || self.resources.endpoint_name.is_empty()
+            || self.resources.endpoint_uid.is_empty()
+            || self.resources.endpoint_resource_version.is_empty()
         {
             return Err("incomplete exact fault action identity");
         }
@@ -519,6 +529,8 @@ pub struct ServiceLocation {
 #[serde(rename_all = "camelCase")]
 pub struct PublicLifecycleReport {
     pub preview: PublicOperationPreviewIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<PreviewLifecycleBinding>,
     pub resource_uid: ResourceUid,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,

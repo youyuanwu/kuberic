@@ -103,6 +103,9 @@ impl Model {
                             image: Some("example:v1".into()),
                             pod_ready: true,
                             peer_endpoint_ready: true,
+                            endpoint_name: None,
+                            endpoint_uid: None,
+                            endpoint_resource_version: None,
                         }),
                         agent: AgentObservation::Report(Box::new(AgentReport {
                             protocol_version: super::protocol::PROTOCOL_VERSION,
@@ -770,6 +773,9 @@ impl Model {
                     image: Some("example:v1".into()),
                     pod_ready: true,
                     peer_endpoint_ready: false,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                     protocol_version: super::protocol::PROTOCOL_VERSION,

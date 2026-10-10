@@ -20757,6 +20757,9 @@ async fn evaluator_scale_up_sqlite_trace() {
                         image: Some("example:v1".into()),
                         pod_ready: true,
                         peer_endpoint_ready: true,
+                        endpoint_name: None,
+                        endpoint_uid: None,
+                        endpoint_resource_version: None,
                     }),
                     agent: AgentObservation::Report(Box::new(AgentReport {
                         protocol_version: crate::protocol::PROTOCOL_VERSION,
@@ -20791,6 +20794,9 @@ async fn evaluator_scale_up_sqlite_trace() {
                         image: Some("example:v1".into()),
                         pod_ready: true,
                         peer_endpoint_ready: true,
+                        endpoint_name: None,
+                        endpoint_uid: None,
+                        endpoint_resource_version: None,
                     }),
                     agent: AgentObservation::Report(Box::new(AgentReport {
                         protocol_version: crate::protocol::PROTOCOL_VERSION,

@@ -228,6 +228,11 @@ pub enum KubernetesChange {
         pod_name: String,
         pod_uid: PodUid,
     },
+    DeleteExactService {
+        name: String,
+        uid: String,
+        resource_version: String,
+    },
     DeleteScaleDownResource {
         resource: ScaleDownResource,
         name: String,

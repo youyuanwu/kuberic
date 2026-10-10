@@ -62,6 +62,22 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
         }
         Some(_) => {}
     }
+    if let Some(action) = snapshot
+        .status
+        .public_fault_action
+        .as_ref()
+        .filter(|action| action.kind == PublicFaultActionKind::DropReplacement)
+    {
+        if action.binding != binding || action.validate().is_err() {
+            return Some(reject(
+                snapshot,
+                "FaultActionChanged",
+                "accepted drop action differs from the current preview binding",
+                config,
+            ));
+        }
+        return Some(evaluate_drop(snapshot, action, config));
+    }
 
     let mut reports = Vec::new();
     for replica in snapshot.replicas.values() {
@@ -85,6 +101,7 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             ));
         };
         if lifecycle.preview != *preview
+            || lifecycle.binding.as_ref() != Some(&binding)
             || lifecycle.resource_uid != snapshot.resource_uid
             || lifecycle.replica != report.identity
             || lifecycle.process_session_id != report.process_session_id
@@ -137,6 +154,20 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             config,
         ));
     }
+    let access_closed = report.read_status != AccessStatus::Granted
+        && report.write_status != AccessStatus::Granted
+        && report.role == ReplicaRole::None
+        && !lifecycle.write_access
+        && lifecycle.role == ReplicaRole::None
+        && lifecycle.service_location.is_none();
+    if !access_closed {
+        return Some(reject(
+            snapshot,
+            "FaultClosureIncomplete",
+            "fault or restart report still exposes access, role, or service location",
+            config,
+        ));
+    }
     let Some(fault) = report.reported_fault else {
         if let (Some(accepted), Some(record)) = (
             snapshot.status.public_fault_action.as_ref(),
@@ -145,6 +176,8 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             && record.stage == RestartActionStage::SuccessorStarted
             && record.successor_session.as_ref() == Some(&report.process_session_id)
             && report.process_session_id != accepted.predecessor_session
+            && kubernetes.pod_uid.as_ref() == Some(&accepted.resources.pod_uid)
+            && kubernetes.pvc_uid.as_ref() == Some(&accepted.resources.pvc_uid)
         {
             return Some(Plan::Stable {
                 status: unhealthy_status(snapshot.status.clone(), accepted.fault),
@@ -164,17 +197,11 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             requeue_after_seconds: config.stable_resync_seconds,
         });
     };
-    if report.healthy
-        || report.read_status == AccessStatus::Granted
-        || report.write_status == AccessStatus::Granted
-        || lifecycle.write_access
-        || lifecycle.role != ReplicaRole::None
-        || lifecycle.service_location.is_some()
-    {
+    if report.healthy {
         return Some(reject(
             snapshot,
             "FaultClosureIncomplete",
-            "faulted incarnation still exposes readiness, access, role, or service location",
+            "faulted incarnation still reports healthy",
             config,
         ));
     }
@@ -194,6 +221,30 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             config,
         ));
     };
+    let Some(endpoint_name) = &kubernetes.endpoint_name else {
+        return Some(reject(
+            snapshot,
+            "FaultEndpointIdentityMissing",
+            "fault action requires the exact endpoint name",
+            config,
+        ));
+    };
+    let Some(endpoint_uid) = &kubernetes.endpoint_uid else {
+        return Some(reject(
+            snapshot,
+            "FaultEndpointIdentityMissing",
+            "fault action requires the exact endpoint UID",
+            config,
+        ));
+    };
+    let Some(endpoint_resource_version) = &kubernetes.endpoint_resource_version else {
+        return Some(reject(
+            snapshot,
+            "FaultEndpointIdentityMissing",
+            "fault action requires the exact endpoint resource version",
+            config,
+        ));
+    };
     let kind = PublicFaultAction::expected_kind(persistence, fault);
     let mut action = PublicFaultAction {
         action_id: OperationId::new("pending"),
@@ -204,6 +255,9 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             pod_uid: pod_uid.clone(),
             pvc_name: kubernetes.pvc_name.clone(),
             pvc_uid: pvc_uid.clone(),
+            endpoint_name: endpoint_name.clone(),
+            endpoint_uid: endpoint_uid.clone(),
+            endpoint_resource_version: endpoint_resource_version.clone(),
         },
         predecessor_session: report.process_session_id.clone(),
         fault_revision: lifecycle.revision,
@@ -304,53 +358,61 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                 })),
             }
         }
-        PublicFaultActionKind::DropReplacement => {
-            let old_present = snapshot
-                .replicas
-                .values()
-                .any(|replica| match &replica.agent {
-                    AgentObservation::Report(candidate) => candidate.identity == action.target,
-                    _ => {
-                        replica
-                            .kubernetes
-                            .as_ref()
-                            .and_then(|kubernetes| kubernetes.pod_uid.as_ref())
-                            == Some(&action.resources.pod_uid)
-                    }
-                });
-            if !old_present
-                && snapshot.replicas.values().any(|replica| {
-                    replica.kubernetes.as_ref().is_some_and(|kubernetes| {
-                        kubernetes.replica_id == action.target.replica_id
-                            && kubernetes.pod_uid.as_ref() != Some(&action.resources.pod_uid)
-                    })
-                })
-            {
-                Plan::Stable {
-                    status: unhealthy_status(snapshot.status.clone(), fault),
-                    requeue_after_seconds: config.stable_resync_seconds,
-                }
-            } else {
-                Plan::Apply {
-                    changes: vec![
-                        KubernetesChange::DeleteReplicaEndpoint {
-                            identity: action.target.clone(),
-                        },
-                        KubernetesChange::DeleteReplicaScaffolding {
-                            pod_name: Some(action.resources.pod_name.clone()),
-                            pod_uid: Some(action.resources.pod_uid.clone()),
-                            pvc_name: Some(action.resources.pvc_name.clone()),
-                            pvc_uid: Some(action.resources.pvc_uid.clone()),
-                        },
-                        KubernetesChange::EnsureReplacementScaffolding {
-                            replica_id: action.target.replica_id,
-                            replacing: action.target,
-                        },
-                    ],
-                }
-            }
-        }
+        PublicFaultActionKind::DropReplacement => evaluate_drop(snapshot, &action, config),
     })
+}
+
+fn evaluate_drop(
+    snapshot: &ObservationSnapshot,
+    action: &PublicFaultAction,
+    config: &EvaluationConfig,
+) -> Plan {
+    if snapshot.routing.write_target.as_ref() == Some(&action.target)
+        || snapshot.routing.unresolved_write_target
+    {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::RemoveWriteRouting],
+        };
+    }
+    let replacement_ready = snapshot.replicas.values().any(|replica| {
+        replica.kubernetes.as_ref().is_some_and(|kubernetes| {
+            kubernetes.replica_id == action.target.replica_id
+                && kubernetes
+                    .pod_uid
+                    .as_ref()
+                    .is_some_and(|uid| uid != &action.resources.pod_uid)
+                && kubernetes
+                    .pvc_uid
+                    .as_ref()
+                    .is_some_and(|uid| uid != &action.resources.pvc_uid)
+                && kubernetes.endpoint_uid.is_some()
+        })
+    });
+    if replacement_ready {
+        return Plan::Stable {
+            status: unhealthy_status(snapshot.status.clone(), action.fault),
+            requeue_after_seconds: config.stable_resync_seconds,
+        };
+    }
+    Plan::Apply {
+        changes: vec![
+            KubernetesChange::DeleteExactService {
+                name: action.resources.endpoint_name.clone(),
+                uid: action.resources.endpoint_uid.clone(),
+                resource_version: action.resources.endpoint_resource_version.clone(),
+            },
+            KubernetesChange::DeleteReplicaScaffolding {
+                pod_name: Some(action.resources.pod_name.clone()),
+                pod_uid: Some(action.resources.pod_uid.clone()),
+                pvc_name: Some(action.resources.pvc_name.clone()),
+                pvc_uid: Some(action.resources.pvc_uid.clone()),
+            },
+            KubernetesChange::EnsureReplacementScaffolding {
+                replica_id: action.target.replica_id,
+                replacing: action.target.clone(),
+            },
+        ],
+    }
 }
 
 fn unhealthy_status(

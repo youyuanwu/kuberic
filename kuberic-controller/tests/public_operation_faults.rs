@@ -6,7 +6,8 @@ use std::sync::Arc;
 use k8s_openapi::api::core::v1::{
     PersistentVolumeClaim, Pod, PodCondition, PodStatus, Secret, Service, ServiceSpec,
 };
-use kuberic_controller::cluster_api::{EffectRecord, InMemoryClusterApi};
+use kube::ResourceExt;
+use kuberic_controller::cluster_api::{ClusterApi, EffectRecord, InMemoryClusterApi};
 use kuberic_controller::crd::{
     INSTANCE_LABEL, KubericSet, KubericSetSpec, KubericSetStatus, PreviewLifecycleSpec,
     REPLICA_ID_LABEL, SET_UID_LABEL,
@@ -17,12 +18,13 @@ use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
 use kuberic_runtime::protocol::command::{KubernetesChange, ProtocolCommand};
 use kuberic_runtime::protocol::observation::{AgentReport, ReplicaObservationKey};
 use kuberic_runtime::protocol::public_operations::{
-    PublicLifecycleReport, PublicOperationPreviewIdentity, RestartActionRecord, RestartActionStage,
-    StatePersistence,
+    PreviewLifecycleBinding, PublicLifecycleReport, PublicOperationPreviewIdentity,
+    RestartActionRecord, RestartActionStage, StatePersistence,
 };
 use kuberic_runtime::protocol::types::{
-    AccessStatus, AgentGeneration, Epoch, FaultType, PodUid, ProcessSessionId, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, derive_replica_endpoint_name,
+    AccessStatus, Epoch, FaultType, PodUid, ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
+    derive_replica_endpoint_name,
 };
 
 const RESOURCE_UID: &str = "set-fault-uid";
@@ -45,10 +47,17 @@ fn config() -> EvaluationConfig {
 }
 
 fn identity(replica_id: i64) -> ReplicaIdentity {
+    let replica_id = ReplicaId::new(replica_id);
+    let initialization = derive_initialization_id(
+        &ResourceUid::new(RESOURCE_UID),
+        replica_id,
+        &PodUid::new(POD_UID),
+        &PvcUid::new(PVC_UID),
+    );
     ReplicaIdentity {
-        replica_id: ReplicaId::new(replica_id),
+        replica_id,
         instance_id: ReplicaInstanceId::new(POD_UID),
-        agent_generation: AgentGeneration::new("fault-generation"),
+        agent_generation: derive_agent_generation(&initialization),
     }
 }
 
@@ -130,6 +139,12 @@ fn raw_fault(
         reported_fault: Some(fault),
         public_lifecycle_report: Some(Box::new(PublicLifecycleReport {
             preview: preview(),
+            binding: persistence.map(|state_persistence| PreviewLifecycleBinding {
+                preview: preview(),
+                resource_uid: ResourceUid::new(RESOURCE_UID),
+                spec_generation: 7,
+                state_persistence,
+            }),
             resource_uid: ResourceUid::new(RESOURCE_UID),
             replica: target.clone(),
             process_session_id: ProcessSessionId::new(PREDECESSOR_SESSION),
@@ -312,6 +327,25 @@ async fn persisted_primary_and_secondary_faults_use_one_restart_action_across_re
             .as_mut()
             .unwrap()
             .process_session_id = successor;
+        let mut invalid_successor = observation.clone();
+        invalid_successor.pvcs[0].metadata.uid = Some("changed-pvc".into());
+        let RawAgentObservation::PreviewReport(invalid_report) =
+            invalid_successor.agents.values_mut().next().unwrap()
+        else {
+            panic!("expected preview report");
+        };
+        invalid_report.role = ReplicaRole::Primary;
+        invalid_report.read_status = AccessStatus::Granted;
+        invalid_report.write_status = AccessStatus::Granted;
+        api.set_observation(invalid_successor).await;
+        assert_eq!(
+            restarted_controller
+                .reconcile("tests", "fault-db")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Unsafe
+        );
         api.set_observation(observation).await;
         assert_eq!(
             restarted_controller
@@ -336,9 +370,15 @@ async fn volatile_and_permanent_faults_freeze_exact_drop_and_replacement() {
             1,
         )));
         let reconciler = Reconciler::new(api.clone(), config());
-        for _ in 0..4 {
-            reconciler.reconcile("tests", "fault-db").await.unwrap();
+        let mut last = ReconcileKind::Waiting;
+        for _ in 0..7 {
+            last = reconciler
+                .reconcile("tests", "fault-db")
+                .await
+                .unwrap()
+                .kind;
         }
+        assert_eq!(last, ReconcileKind::Stable);
 
         let effects = api.effects().await;
         assert!(effects.iter().any(|effect| {
@@ -398,6 +438,15 @@ async fn permanent_fault_supersedes_transient_action_without_retargeting() {
     report.reported_fault = Some(FaultType::Permanent);
     report.report_sequence += 1;
     api.set_observation(observation).await;
+    let stale = ProtocolCommand::RestartReplicaProcess(Box::new(
+        kuberic_runtime::protocol::command::RestartReplicaProcess {
+            action: transient.clone(),
+        },
+    ));
+    assert!(matches!(
+        api.execute_command(&api.observation().await, &stale).await,
+        Err(kuberic_controller::ControllerError::ObservationStale)
+    ));
     assert_eq!(
         reconciler
             .reconcile("tests", "fault-db")
@@ -448,6 +497,33 @@ async fn missing_mutated_and_production_preview_selection_fail_closed() {
             | EffectRecord::EnsureReplacement(_)
     )));
 
+    let unbound = Arc::new(InMemoryClusterApi::new(raw_fault(
+        Some(StatePersistence::Persisted),
+        FaultType::Transient,
+        1,
+    )));
+    let mut unbound_observation = unbound.observation().await;
+    let RawAgentObservation::PreviewReport(report) =
+        unbound_observation.agents.values_mut().next().unwrap()
+    else {
+        panic!("expected preview report");
+    };
+    report.public_lifecycle_report.as_mut().unwrap().binding = None;
+    unbound.set_observation(unbound_observation).await;
+    let unbound_reconciler = Reconciler::new(unbound.clone(), config());
+    unbound_reconciler
+        .reconcile("tests", "fault-db")
+        .await
+        .unwrap();
+    assert_eq!(
+        unbound_reconciler
+            .reconcile("tests", "fault-db")
+            .await
+            .unwrap()
+            .kind,
+        ReconcileKind::Unsafe
+    );
+
     let api = Arc::new(InMemoryClusterApi::new(raw_fault(
         Some(StatePersistence::Persisted),
         FaultType::Transient,
@@ -496,6 +572,43 @@ async fn missing_mutated_and_production_preview_selection_fail_closed() {
             | EffectRecord::EnsureReplacement(_)
             | EffectRecord::DeleteExactPod { .. }
     )));
+}
+
+#[tokio::test]
+async fn volatile_cleanup_never_deletes_a_recreated_endpoint() {
+    let api = Arc::new(InMemoryClusterApi::new(raw_fault(
+        Some(StatePersistence::Volatile),
+        FaultType::Transient,
+        1,
+    )));
+    let reconciler = Reconciler::new(api.clone(), config());
+    for _ in 0..3 {
+        reconciler.reconcile("tests", "fault-db").await.unwrap();
+    }
+    let mut observation = api.observation().await;
+    let endpoint = observation
+        .services
+        .iter_mut()
+        .find(|service| !service.name_any().ends_with("-write"))
+        .unwrap();
+    endpoint.metadata.uid = Some("replacement-endpoint-uid".into());
+    endpoint.metadata.resource_version = Some("replacement-version".into());
+    api.set_observation(observation).await;
+    assert_eq!(
+        reconciler
+            .reconcile("tests", "fault-db")
+            .await
+            .unwrap()
+            .kind,
+        ReconcileKind::ObservationStale
+    );
+    assert!(
+        api.observation()
+            .await
+            .services
+            .iter()
+            .any(|service| service.uid().as_deref() == Some("replacement-endpoint-uid"))
+    );
 }
 
 #[test]

@@ -193,6 +193,14 @@ async fn execute_change(
         KubernetesChange::DeleteExactPod { pod_name, pod_uid } => {
             api.delete_exact_pod(observation, &pod_name, &pod_uid).await
         }
+        KubernetesChange::DeleteExactService {
+            name,
+            uid,
+            resource_version,
+        } => {
+            api.delete_exact_service(observation, &name, &uid, &resource_version)
+                .await
+        }
         KubernetesChange::EnsureWriteRoutingService => {
             api.ensure_write_routing_service(observation).await
         }

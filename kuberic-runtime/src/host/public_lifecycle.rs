@@ -291,6 +291,7 @@ pub(crate) async fn report(
         .and_then(|id| preview.operations.get(id));
     let mut report = PublicLifecycleReport {
         preview: identity.clone(),
+        binding: preview.binding.clone(),
         resource_uid: state.identity.resource_uid.clone(),
         replica: state.identity.local_identity,
         process_session_id: session.clone(),

@@ -530,10 +530,18 @@ where
         }
         let runtime = crate::host::testing::PublicOperationPreviewRuntime::start(
             self.store.clone(),
-            preview,
+            preview.clone(),
             self.sessions.local_session().clone(),
         )?;
         let registry = runtime.registry();
+        self.runtime
+            .bind_public_fault_preview(
+                self.store.clone(),
+                registry.clone(),
+                preview,
+                self.sessions.local_session().clone(),
+            )
+            .await?;
         *owner = Some(runtime.into_owner());
         Ok(registry)
     }

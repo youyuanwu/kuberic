@@ -832,8 +832,10 @@ renewal. The accepted, contained and successor-started crash cuts converge to
 one successor session, and unproven descendant containment prevents re-exec.
 
 Volatile transient faults and all permanent faults freeze the old endpoint,
-Pod and PVC identities, remove routing, delete only those resources and create
-distinct replacement scaffolding. This remains repository-only preview
+including its UID/resourceVersion, plus Pod and PVC identities, remove routing,
+delete only those resources and create distinct replacement scaffolding.
+Cleanup continues from accepted status after the predecessor disappears. This
+remains repository-only preview
 behavior. Production evaluation and gRPC dispatch reject the preview identity
 and restart/drop commands even in all-features builds.
 

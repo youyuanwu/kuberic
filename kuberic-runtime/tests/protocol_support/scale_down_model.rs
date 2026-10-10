@@ -86,6 +86,9 @@ impl Model {
                         image: Some(snapshot.desired.image.clone()),
                         pod_ready: true,
                         peer_endpoint_ready: true,
+                        endpoint_name: None,
+                        endpoint_uid: None,
+                        endpoint_resource_version: None,
                     }),
                     agent: AgentObservation::Report(Box::new(AgentReport {
                         protocol_version: super::protocol::PROTOCOL_VERSION,
@@ -312,6 +315,9 @@ impl Model {
                                         image: Some(self.snapshot.desired.image.clone()),
                                         pod_ready: true,
                                         peer_endpoint_ready: true,
+                                        endpoint_name: None,
+                                        endpoint_uid: None,
+                                        endpoint_resource_version: None,
                                     }),
                                     agent: AgentObservation::Uninitialized(
                                         UninitializedAgentObservation {

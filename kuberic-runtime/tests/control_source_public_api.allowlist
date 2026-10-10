@@ -190,6 +190,9 @@ public-path documented field crate::protocol::observation::DesiredState::image: 
 public-path documented field crate::protocol::observation::DesiredState::preview_lifecycle: Option < StatePersistence >
 public-path documented field crate::protocol::observation::DesiredState::replicas: u32
 public-path documented field crate::protocol::observation::DesiredState::switchover: Option < PlannedSwitchoverRequest >
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::endpoint_name: Option < String >
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::endpoint_resource_version: Option < String >
+public-path documented field crate::protocol::observation::KubernetesReplicaObservation::endpoint_uid: Option < String >
 public-path documented field crate::protocol::observation::KubernetesReplicaObservation::image: Option < String >
 public-path documented field crate::protocol::observation::KubernetesReplicaObservation::peer_endpoint_ready: bool
 public-path documented field crate::protocol::observation::KubernetesReplicaObservation::pod_name: String
@@ -627,6 +630,7 @@ public-path documented variant crate::protocol::command::EffectClass::Convergent
 public-path documented variant crate::protocol::command::EffectClass::ReconfigurationAction
 public-path documented variant crate::protocol::command::EffectClass::Unsupported
 public-path documented variant crate::protocol::command::KubernetesChange::DeleteExactPod { { pod_name : String , pod_uid : PodUid , } }
+public-path documented variant crate::protocol::command::KubernetesChange::DeleteExactService { { name : String , uid : String , resource_version : String , } }
 public-path documented variant crate::protocol::command::KubernetesChange::DeleteReplicaEndpoint { { identity : ReplicaIdentity , } }
 public-path documented variant crate::protocol::command::KubernetesChange::DeleteReplicaScaffolding { { pod_name : Option < String > , pod_uid : Option < PodUid > , pvc_name : Option < String > , pvc_uid : Option < PvcUid > , } }
 public-path documented variant crate::protocol::command::KubernetesChange::DeleteScaleDownResource { { resource : ScaleDownResource , name : String , uid : String , resource_version : String , } }
@@ -785,6 +789,9 @@ public-path hidden enum crate::protocol::public_operations::PublicOperationClass
 public-path hidden enum crate::protocol::public_operations::PublicOperationProgram
 public-path hidden enum crate::protocol::public_operations::RestartActionStage
 public-path hidden enum crate::protocol::public_operations::StatePersistence
+public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::endpoint_name: String
+public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::endpoint_resource_version: String
+public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::endpoint_uid: String
 public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::pod_name: String
 public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::pod_uid: PodUid
 public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::pvc_name: String
@@ -813,6 +820,7 @@ public-path hidden field crate::protocol::public_operations::PublicLifecycleInpu
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::previous: Option < ConfigurationDescriptor >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::recipe: PublicLifecycleRecipe
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::replica: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::binding: Option < PreviewLifecycleBinding >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::operation_id: Option < OperationId >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::preview: PublicOperationPreviewIdentity
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::process_session_id: ProcessSessionId

@@ -2683,6 +2683,15 @@
                       },
                       "resources": {
                         "properties": {
+                          "endpointName": {
+                            "type": "string"
+                          },
+                          "endpointResourceVersion": {
+                            "type": "string"
+                          },
+                          "endpointUid": {
+                            "type": "string"
+                          },
                           "podName": {
                             "type": "string"
                           },
@@ -2697,6 +2706,9 @@
                           }
                         },
                         "required": [
+                          "endpointName",
+                          "endpointResourceVersion",
+                          "endpointUid",
                           "podName",
                           "podUid",
                           "pvcName",

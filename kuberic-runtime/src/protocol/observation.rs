@@ -39,6 +39,12 @@ pub struct KubernetesReplicaObservation {
     pub pod_ready: bool,
     #[serde(default)]
     pub peer_endpoint_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_resource_version: Option<String>,
 }
 
 impl KubernetesReplicaObservation {

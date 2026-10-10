@@ -2,6 +2,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
+use crate::Result as RuntimeResult;
+use crate::application::{OpenContext, RoleChange, StatefulServiceReplica};
 use crate::host::process::{
     PREVIEW_RESTART_DISPOSITION, PreviewChildCommand, PreviewChildEvidence, PreviewRestartCut,
     ReplicaProcessSupervisor,
@@ -14,12 +18,96 @@ use crate::protocol::public_operations::{
     PublicOperationPreviewIdentity, RestartActionStage, StatePersistence,
 };
 use crate::protocol::types::{
-    AccessStatus, AgentGeneration, EffectivePolicy, FaultType, InitializationId, OperationId,
-    PodUid, ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ResourceUid,
+    AccessStatus, EffectivePolicy, Epoch, FaultType, OperationId, PodUid, ProcessSessionId, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
 };
+use crate::replicator::Replicator;
 
 const CHILD_OUTPUT: &str = "KUBERIC_PREVIEW_CHILD_OUTPUT";
+
+fn wire<T: serde::Serialize, U: serde::de::DeserializeOwned>(value: T) -> U {
+    serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap()
+}
+
+struct PreviewChildReplicator {
+    instance_id: String,
+}
+
+#[async_trait]
+impl Replicator for PreviewChildReplicator {
+    async fn open(&self) -> RuntimeResult<String> {
+        Ok("preview://child".into())
+    }
+
+    async fn change_role(&self, _epoch: Epoch, _role: ReplicaRole) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    async fn update_epoch(&self, _epoch: Epoch) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    async fn close(&self) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn abort(&self) {}
+
+    async fn current_progress(&self) -> RuntimeResult<i64> {
+        Ok(0)
+    }
+
+    async fn catch_up_capability(&self) -> RuntimeResult<i64> {
+        Ok(0)
+    }
+}
+
+struct PreviewChildApplication {
+    instance_id: String,
+    replicator: Arc<PreviewChildReplicator>,
+}
+
+#[async_trait]
+impl StatefulServiceReplica for PreviewChildApplication {
+    async fn open(self: Arc<Self>, _context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
+        Ok(self.replicator.clone())
+    }
+
+    async fn change_role(&self, _role: ReplicaRole) -> RuntimeResult<RoleChange> {
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
+
+    async fn close(&self) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn abort(&self) {}
+}
+
+struct ControllerSupervisorExecutor {
+    supervisor: Arc<ReplicaProcessSupervisor>,
+    parent_session: ProcessSessionId,
+}
+
+#[async_trait]
+impl kuberic_controller::cluster_api::PreviewFaultCommandExecutor for ControllerSupervisorExecutor {
+    async fn execute_restart(
+        &self,
+        action: &kuberic_controller::protocol::public_operations::PublicFaultAction,
+    ) -> kuberic_controller::Result<
+        kuberic_controller::protocol::public_operations::RestartActionRecord,
+    > {
+        let action: PublicFaultAction = wire(action);
+        let result = self
+            .supervisor
+            .resume_after_container_restart(&action, &self.parent_session, None)
+            .await
+            .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
+        Ok(wire(result.record))
+    }
+}
 
 #[test]
 fn preview_process_child_entrypoint() {
@@ -43,14 +131,25 @@ fn preview_process_child_entrypoint() {
         .unwrap_or(0)
         + 1;
     std::fs::write(&constructions, count.to_string()).unwrap();
+    let process_session = ProcessSessionId::new(uuid::Uuid::new_v4().to_string());
+    let replicator = Arc::new(PreviewChildReplicator {
+        instance_id: format!("replicator-{process_session}"),
+    });
+    let application = Arc::new(PreviewChildApplication {
+        instance_id: format!("application-{process_session}"),
+        replicator: replicator.clone(),
+    });
+    let _application: Arc<dyn StatefulServiceReplica> = application.clone();
+    let _replicator: Arc<dyn Replicator> = replicator.clone();
     let evidence = PreviewChildEvidence {
-        process_session: ProcessSessionId::new(uuid::Uuid::new_v4().to_string()),
+        process_session,
+        child_pid: std::process::id(),
         data_root: data_root.clone(),
         pod_uid: PodUid::new(std::env::var("KUBERIC_PREVIEW_POD_UID").unwrap()),
         pvc_uid: PvcUid::new(std::env::var("KUBERIC_PREVIEW_PVC_UID").unwrap()),
         provider_sentinel: sentinel,
-        application_constructed: true,
-        replicator_constructed: true,
+        application_instance_id: application.instance_id.clone(),
+        replicator_instance_id: replicator.instance_id.clone(),
     };
     if let Some(parent) = Path::new(&output).parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -62,6 +161,10 @@ fn preview_process_child_entrypoint() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         std::process::exit(PREVIEW_RESTART_DISPOSITION);
+    }
+    let shutdown = PathBuf::from(std::env::var("KUBERIC_PREVIEW_SHUTDOWN").unwrap());
+    while !shutdown.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -87,6 +190,7 @@ async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
         result.successor.provider_sentinel,
         predecessor_evidence.provider_sentinel
     );
+    assert!(Path::new(&format!("/proc/{}", result.successor.child_pid)).exists());
     assert!(predecessor.try_wait().unwrap().is_some());
     assert_eq!(
         std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
@@ -108,6 +212,85 @@ async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
         SqliteStore::open_preview_bound_existing(&database, None, &changed),
         Err(crate::host::HostError::IdentityMismatch(_))
     ));
+    fixture
+        .supervisor
+        .shutdown_successor(&action)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
+    use kuberic_controller::cluster_api::{EffectRecord, InMemoryClusterApi};
+    use kuberic_controller::evaluator::EvaluationConfig;
+    use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
+
+    let fixture = Fixture::new();
+    let predecessor_session = ProcessSessionId::new("controller-predecessor");
+    let api = Arc::new(InMemoryClusterApi::new(
+        fixture.controller_observation(&predecessor_session),
+    ));
+    api.set_preview_fault_executor(Arc::new(ControllerSupervisorExecutor {
+        supervisor: fixture.supervisor.clone(),
+        parent_session: ProcessSessionId::new("controller-parent-restarted"),
+    }))
+    .await;
+    let reconciler = Reconciler::new(
+        api.clone(),
+        EvaluationConfig {
+            public_operation_preview: Some(wire(fixture.binding.preview.clone())),
+            stable_resync_seconds: 10,
+            wait_requeue_seconds: 1,
+            unsafe_requeue_seconds: 1,
+            ..Default::default()
+        },
+    );
+    for expected in [
+        ReconcileKind::Applied,
+        ReconcileKind::Applied,
+        ReconcileKind::Applied,
+        ReconcileKind::Executed,
+        ReconcileKind::Stable,
+    ] {
+        assert_eq!(
+            reconciler
+                .reconcile("tests", "preview-db")
+                .await
+                .unwrap()
+                .kind,
+            expected
+        );
+    }
+    let executed = api
+        .effects()
+        .await
+        .into_iter()
+        .find_map(|effect| match effect {
+            EffectRecord::Execute(
+                kuberic_controller::protocol::command::ProtocolCommand::RestartReplicaProcess(
+                    command,
+                ),
+            ) => Some(command.action),
+            _ => None,
+        })
+        .expect("controller dispatched restart");
+    let action: PublicFaultAction = wire(&executed);
+    let record = fixture.store.restart_action().await.unwrap().unwrap();
+    assert_eq!(record.action, action);
+    assert_eq!(record.stage, RestartActionStage::SuccessorStarted);
+    assert_ne!(
+        record.successor_session.as_ref(),
+        Some(&predecessor_session)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
+        "1"
+    );
+    fixture
+        .supervisor
+        .shutdown_successor(&action)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -117,7 +300,11 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert!(
         fixture
             .supervisor
-            .resume(&action, true, Some(PreviewRestartCut::Accepted))
+            .resume_after_container_restart(
+                &action,
+                &ProcessSessionId::new("new-parent-session"),
+                Some(PreviewRestartCut::Accepted),
+            )
             .await
             .unwrap_err()
             .to_string()
@@ -126,11 +313,15 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert!(
         fixture
             .supervisor
-            .resume(&action, false, None)
+            .resume_after_container_restart(
+                &action,
+                &ProcessSessionId::new("predecessor-session"),
+                None,
+            )
             .await
             .unwrap_err()
             .to_string()
-            .contains("containment is unproven")
+            .contains("does not prove predecessor containment")
     );
     assert_eq!(
         fixture.store.restart_action().await.unwrap().unwrap().stage,
@@ -141,7 +332,11 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert!(
         fixture
             .supervisor
-            .resume(&action, true, Some(PreviewRestartCut::PredecessorContained),)
+            .resume_after_container_restart(
+                &action,
+                &ProcessSessionId::new("new-parent-session"),
+                Some(PreviewRestartCut::PredecessorContained),
+            )
             .await
             .unwrap_err()
             .to_string()
@@ -155,25 +350,70 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert!(
         fixture
             .supervisor
-            .resume(&action, true, Some(PreviewRestartCut::SuccessorStarted),)
+            .resume_after_container_restart(
+                &action,
+                &ProcessSessionId::new("new-parent-session"),
+                Some(PreviewRestartCut::SuccessorLaunched),
+            )
             .await
             .unwrap_err()
             .to_string()
-            .contains("after successor start")
+            .contains("after successor launch")
     );
+    assert_eq!(
+        fixture.store.restart_action().await.unwrap().unwrap().stage,
+        RestartActionStage::PredecessorContained
+    );
+    let completed = fixture
+        .supervisor
+        .resume_after_container_restart(&action, &ProcessSessionId::new("new-parent-session"), None)
+        .await
+        .unwrap();
     let started = fixture.store.restart_action().await.unwrap().unwrap();
     assert_eq!(started.stage, RestartActionStage::SuccessorStarted);
     let session = started.successor_session.clone().unwrap();
-    let completed = fixture
-        .supervisor
-        .resume(&action, false, None)
-        .await
-        .unwrap();
     assert_eq!(completed.record.successor_session, Some(session));
     assert_eq!(
         std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
         "1"
     );
+    fixture
+        .supervisor
+        .shutdown_successor(&action)
+        .await
+        .unwrap();
+
+    let after_start = Fixture::new();
+    let action = after_start.action(ProcessSessionId::new("old-parent"));
+    assert!(
+        after_start
+            .supervisor
+            .resume_after_container_restart(
+                &action,
+                &ProcessSessionId::new("new-parent"),
+                Some(PreviewRestartCut::SuccessorStarted),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("after successor start")
+    );
+    let constructions =
+        std::fs::read_to_string(after_start.data_root.join("child-constructions")).unwrap();
+    after_start
+        .supervisor
+        .resume_after_container_restart(&action, &ProcessSessionId::new("new-parent"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(after_start.data_root.join("child-constructions")).unwrap(),
+        constructions
+    );
+    after_start
+        .supervisor
+        .shutdown_successor(&action)
+        .await
+        .unwrap();
 }
 
 struct Fixture {
@@ -183,7 +423,7 @@ struct Fixture {
     store: Arc<SqliteStore>,
     binding: PreviewLifecycleBinding,
     identity: ReplicaIdentity,
-    supervisor: ReplicaProcessSupervisor,
+    supervisor: Arc<ReplicaProcessSupervisor>,
 }
 
 impl Fixture {
@@ -191,23 +431,29 @@ impl Fixture {
         let directory = super::tempdir().unwrap();
         let data_root = directory.path().join("data");
         let release = directory.path().join("release");
-        let identity = ReplicaIdentity {
-            replica_id: ReplicaId::new(1),
-            instance_id: ReplicaInstanceId::new("pod-1"),
-            agent_generation: AgentGeneration::new("agent-1"),
-        };
         let binding = PreviewLifecycleBinding {
             preview: PublicOperationPreviewIdentity::new(44),
             resource_uid: ResourceUid::new("resource-1"),
             spec_generation: 9,
             state_persistence: StatePersistence::Persisted,
         };
+        let initialization_id = crate::protocol::types::derive_initialization_id(
+            &binding.resource_uid,
+            ReplicaId::new(1),
+            &PodUid::new("pod-1"),
+            &PvcUid::new("pvc-1"),
+        );
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-1"),
+            agent_generation: crate::protocol::types::derive_agent_generation(&initialization_id),
+        };
         let storage = StorageIdentity {
             schema_version: PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
             resource_uid: binding.resource_uid.clone(),
             pod_uid: PodUid::new("pod-1"),
             pvc_uid: PvcUid::new("pvc-1"),
-            initialization_id: InitializationId::new("init-1"),
+            initialization_id,
             local_identity: identity.clone(),
             effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
         };
@@ -228,7 +474,11 @@ impl Fixture {
             ],
             environment: BTreeMap::new(),
         };
-        let supervisor = ReplicaProcessSupervisor::new(store.clone(), data_root.clone(), child);
+        let supervisor = Arc::new(ReplicaProcessSupervisor::new(
+            store.clone(),
+            data_root.clone(),
+            child,
+        ));
         Self {
             _directory: directory,
             data_root,
@@ -237,6 +487,177 @@ impl Fixture {
             binding,
             identity,
             supervisor,
+        }
+    }
+
+    fn controller_observation(
+        &self,
+        predecessor_session: &ProcessSessionId,
+    ) -> kuberic_controller::observation::RawObservation {
+        use k8s_openapi::api::core::v1::{
+            PersistentVolumeClaim, Pod, PodCondition, PodStatus, Service, ServicePort, ServiceSpec,
+        };
+        use kube::ResourceExt;
+        use kuberic_controller::crd::{
+            INSTANCE_LABEL, KubericSet, KubericSetSpec, KubericSetStatus, PreviewLifecycleSpec,
+            REPLICA_ID_LABEL, SET_UID_LABEL,
+        };
+        use kuberic_controller::observation::{RawAgentObservation, RawObservation};
+        use kuberic_controller::protocol::observation::{AgentReport, ReplicaObservationKey};
+
+        let mut set = KubericSet::new(
+            "preview-db",
+            KubericSetSpec {
+                replicas: 1,
+                image: "preview:test".into(),
+                failover_delay_seconds: 1,
+                switchover: None,
+                preview_lifecycle: Some(PreviewLifecycleSpec {
+                    state_persistence: wire(StatePersistence::Persisted),
+                }),
+            },
+        );
+        set.metadata.namespace = Some("tests".into());
+        set.metadata.uid = Some(self.binding.resource_uid.to_string());
+        set.metadata.resource_version = Some("1".into());
+        set.metadata.generation = Some(self.binding.spec_generation as i64);
+        set.status = Some(KubericSetStatus::default());
+        let labels = BTreeMap::from([
+            (
+                SET_UID_LABEL.to_string(),
+                self.binding.resource_uid.to_string(),
+            ),
+            (REPLICA_ID_LABEL.to_string(), "1".into()),
+            (INSTANCE_LABEL.to_string(), "pod-1".into()),
+        ]);
+        let pod = Pod {
+            metadata: kube::core::ObjectMeta {
+                name: Some("preview-db-1".into()),
+                namespace: Some("tests".into()),
+                uid: Some("pod-1".into()),
+                resource_version: Some("2".into()),
+                labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".into(),
+                    status: "True".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pvc = PersistentVolumeClaim {
+            metadata: kube::core::ObjectMeta {
+                name: Some("preview-db-1-data".into()),
+                namespace: Some("tests".into()),
+                uid: Some("pvc-1".into()),
+                resource_version: Some("3".into()),
+                labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let endpoint_name = crate::protocol::types::derive_replica_endpoint_name(
+            &self.binding.resource_uid,
+            &self.identity,
+        );
+        let endpoint = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some(endpoint_name),
+                namespace: Some("tests".into()),
+                uid: Some("endpoint-uid".into()),
+                resource_version: Some("4".into()),
+                labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                selector: Some(BTreeMap::from([(
+                    INSTANCE_LABEL.to_string(),
+                    "pod-1".into(),
+                )])),
+                ports: Some(vec![
+                    ServicePort {
+                        name: Some("control".into()),
+                        port: 50051,
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        name: Some("replication".into()),
+                        port: 50052,
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let write = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some("preview-db-write".into()),
+                namespace: Some("tests".into()),
+                uid: Some("write-uid".into()),
+                resource_version: Some("5".into()),
+                labels: Some(BTreeMap::from([(
+                    SET_UID_LABEL.to_string(),
+                    self.binding.resource_uid.to_string(),
+                )])),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                selector: Some(BTreeMap::from([(
+                    INSTANCE_LABEL.to_string(),
+                    "pod-1".into(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let report: AgentReport = wire(crate::protocol::observation::AgentReport {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            resource_uid: self.binding.resource_uid.clone(),
+            identity: self.identity.clone(),
+            process_session_id: predecessor_session.clone(),
+            report_sequence: 1,
+            role: ReplicaRole::None,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            healthy: false,
+            epoch: Epoch::default(),
+            reported_fault: Some(FaultType::Transient),
+            public_lifecycle_report: Some(Box::new(
+                crate::protocol::public_operations::PublicLifecycleReport {
+                    preview: self.binding.preview.clone(),
+                    binding: Some(self.binding.clone()),
+                    resource_uid: self.binding.resource_uid.clone(),
+                    replica: self.identity.clone(),
+                    process_session_id: predecessor_session.clone(),
+                    revision: 3,
+                    operation_id: None,
+                    role: ReplicaRole::None,
+                    write_access: false,
+                    service_location: None,
+                },
+            )),
+            ..Default::default()
+        });
+        let key = ReplicaObservationKey::new(
+            wire(self.identity.replica_id),
+            wire(self.identity.instance_id.clone()),
+        );
+        assert_eq!(pod.uid().as_deref(), Some("pod-1"));
+        RawObservation {
+            set,
+            pods: vec![pod],
+            pvcs: vec![pvc],
+            services: vec![endpoint, write],
+            secrets: Vec::new(),
+            agents: BTreeMap::from([(key, RawAgentObservation::PreviewReport(Box::new(report)))]),
+            exact_resources: Vec::new(),
+            failures: Vec::new(),
+            now_unix_seconds: 100,
         }
     }
 
@@ -274,6 +695,9 @@ impl Fixture {
                 pod_uid: PodUid::new("pod-1"),
                 pvc_name: "replica-1-data".into(),
                 pvc_uid: PvcUid::new("pvc-1"),
+                endpoint_name: "replica-1-endpoint".into(),
+                endpoint_uid: "endpoint-uid".into(),
+                endpoint_resource_version: "1".into(),
             },
             predecessor_session,
             fault_revision: 3,

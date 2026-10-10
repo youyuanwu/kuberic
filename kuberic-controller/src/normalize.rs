@@ -149,13 +149,12 @@ pub fn normalize(
                 .cloned()
                 .unwrap_or(RawAgentObservation::Absent);
             let pvc_uid = pvc.and_then(|pvc| pvc.uid()).map(PvcUid::new);
-            let peer_endpoint_ready =
-                pod_uid
-                    .as_ref()
-                    .zip(pvc_uid.as_ref())
-                    .is_some_and(|(pod_uid, pvc_uid)| {
-                        exact_peer_endpoint_ready(&raw, &resource_uid, replica_id, pod_uid, pvc_uid)
-                    });
+            let endpoint = pod_uid
+                .as_ref()
+                .zip(pvc_uid.as_ref())
+                .and_then(|(pod_uid, pvc_uid)| {
+                    exact_peer_endpoint(&raw, &resource_uid, replica_id, pod_uid, pvc_uid)
+                });
             insert_replica_observation(
                 &mut replicas,
                 &mut failures,
@@ -165,7 +164,7 @@ pub fn normalize(
                 Some(pod),
                 pvc,
                 raw_agent,
-                peer_endpoint_ready,
+                endpoint,
                 &resource_uid,
                 &previous_report_watermarks,
                 switchover_active,
@@ -190,7 +189,7 @@ pub fn normalize(
                 None,
                 Some(pvc),
                 RawAgentObservation::Absent,
-                false,
+                None,
                 &resource_uid,
                 &previous_report_watermarks,
                 switchover_active,
@@ -514,7 +513,7 @@ fn insert_replica_observation(
     pod: Option<&Pod>,
     pvc: Option<&PersistentVolumeClaim>,
     raw_agent: RawAgentObservation,
-    peer_endpoint_ready: bool,
+    endpoint: Option<EndpointObservation>,
     resource_uid: &ResourceUid,
     previous: &BTreeMap<ReplicaObservationKey, ReportWatermark>,
     switchover_active: bool,
@@ -537,7 +536,10 @@ fn insert_replica_observation(
             pvc_uid,
             image: pod.and_then(application_image),
             pod_ready: pod.is_some_and(pod_ready),
-            peer_endpoint_ready,
+            peer_endpoint_ready: endpoint.as_ref().is_some_and(|endpoint| endpoint.ready),
+            endpoint_name: endpoint.as_ref().map(|endpoint| endpoint.name.clone()),
+            endpoint_uid: endpoint.as_ref().and_then(|endpoint| endpoint.uid.clone()),
+            endpoint_resource_version: endpoint.and_then(|endpoint| endpoint.resource_version),
         }),
         agent,
     };
@@ -559,13 +561,20 @@ fn application_image(pod: &Pod) -> Option<String> {
         .clone()
 }
 
-fn exact_peer_endpoint_ready(
+struct EndpointObservation {
+    name: String,
+    uid: Option<String>,
+    resource_version: Option<String>,
+    ready: bool,
+}
+
+fn exact_peer_endpoint(
     raw: &RawObservation,
     resource_uid: &ResourceUid,
     replica_id: ReplicaId,
     pod_uid: &PodUid,
     pvc_uid: &PvcUid,
-) -> bool {
+) -> Option<EndpointObservation> {
     let initialization_id = derive_initialization_id(resource_uid, replica_id, pod_uid, pvc_uid);
     let identity = ReplicaIdentity {
         replica_id,
@@ -573,16 +582,20 @@ fn exact_peer_endpoint_ready(
         agent_generation: derive_agent_generation(&initialization_id),
     };
     let name = derive_replica_endpoint_name(resource_uid, &identity);
-    raw.services.iter().any(|service| {
-        service.name_any() == name
-            && owned_by_set(service, resource_uid)
-            && service.spec.as_ref().is_some_and(|spec| {
+    raw.services
+        .iter()
+        .find(|service| service.name_any() == name && owned_by_set(*service, resource_uid))
+        .map(|service| EndpointObservation {
+            name,
+            uid: service.uid(),
+            resource_version: service.resource_version(),
+            ready: service.spec.as_ref().is_some_and(|spec| {
                 spec.selector.as_ref().is_some_and(|selector| {
                     selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
                 }) && has_service_port(service, "control", 50051)
                     && has_service_port(service, "replication", 50052)
-            })
-    })
+            }),
+        })
 }
 
 fn pvc_for_pod<'a>(

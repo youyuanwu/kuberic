@@ -61,6 +61,11 @@ pub enum EffectRecord {
         pod_name: String,
         pod_uid: PodUid,
     },
+    DeleteExactService {
+        name: String,
+        uid: String,
+        resource_version: String,
+    },
     EnsureWriteRoutingService,
     ReplaceStatus,
     RemoveWriteRouting,
@@ -141,6 +146,14 @@ pub trait ClusterApi: Send + Sync {
         pod_uid: &PodUid,
     ) -> Result<()>;
 
+    async fn delete_exact_service(
+        &self,
+        observation: &RawObservation,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()>;
+
     async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()>;
 
     async fn replace_status(
@@ -162,6 +175,16 @@ pub trait ClusterApi: Send + Sync {
         observation: &RawObservation,
         command: &ProtocolCommand,
     ) -> Result<()>;
+}
+
+#[cfg(feature = "runtime-test-bridge")]
+#[async_trait]
+#[doc(hidden)]
+pub trait PreviewFaultCommandExecutor: Send + Sync {
+    async fn execute_restart(
+        &self,
+        action: &kuberic_runtime::protocol::public_operations::PublicFaultAction,
+    ) -> Result<kuberic_runtime::protocol::public_operations::RestartActionRecord>;
 }
 
 #[derive(Clone)]
@@ -749,6 +772,7 @@ where
         ) {
             return Err(ControllerError::ObservationStale);
         }
+
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
         let namespace = observation
             .set
@@ -756,6 +780,46 @@ where
             .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
         match pods.delete(pod_name, &params).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+            Err(error) => Err(map_kube_effect_error(error)),
+        }
+    }
+
+    async fn delete_exact_service(
+        &self,
+        observation: &RawObservation,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()> {
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or(ControllerError::ObservationStale)?;
+        let observed = observation
+            .services
+            .iter()
+            .find(|service| service.name_any() == name);
+        match observed {
+            None => return Ok(()),
+            Some(service)
+                if service.uid().as_deref() != Some(uid)
+                    || service.resource_version().as_deref() != Some(resource_version) =>
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            Some(_) => {}
+        }
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.into()),
+                resource_version: Some(resource_version.into()),
+            }),
+            ..Default::default()
+        };
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
+        match services.delete(name, &params).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
             Err(error) => Err(map_kube_effect_error(error)),
@@ -967,6 +1031,7 @@ fn observed_process_session(
         Some(RawAgentObservation::Report(report)) if !report.process_session_id.is_empty() => {
             Ok(report.process_session_id.clone())
         }
+
         #[cfg(feature = "runtime-test-bridge")]
         Some(RawAgentObservation::PreviewReport(report))
             if !report.process_session_id.is_empty() =>
@@ -975,6 +1040,74 @@ fn observed_process_session(
         }
         _ => Err(ControllerError::ObservationStale),
     }
+}
+
+#[cfg(feature = "runtime-test-bridge")]
+fn validate_preview_dispatch(
+    observation: &RawObservation,
+    action: &kuberic_runtime::protocol::public_operations::PublicFaultAction,
+) -> Result<()> {
+    action
+        .validate()
+        .map_err(|message| ControllerError::InvalidAgentEvidence(message.into()))?;
+    let uid = observation
+        .set
+        .uid()
+        .ok_or(ControllerError::ObservationStale)?;
+    let generation = observation
+        .set
+        .metadata
+        .generation
+        .and_then(|generation| u64::try_from(generation).ok())
+        .ok_or(ControllerError::ObservationStale)?;
+    let persistence = observation
+        .set
+        .spec
+        .preview_lifecycle
+        .as_ref()
+        .map(|preview| preview.state_persistence)
+        .ok_or(ControllerError::ObservationStale)?;
+    if action.binding.resource_uid.as_str() != uid
+        || action.binding.spec_generation != generation
+        || action.binding.state_persistence != persistence
+        || observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.preview_lifecycle.as_ref())
+            != Some(&action.binding)
+        || observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.public_fault_action.as_ref())
+            != Some(action)
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    let key =
+        ReplicaObservationKey::new(action.target.replica_id, action.target.instance_id.clone());
+    let Some(RawAgentObservation::PreviewReport(report)) = observation.agents.get(&key) else {
+        return Err(ControllerError::ObservationStale);
+    };
+    let lifecycle = report
+        .public_lifecycle_report
+        .as_deref()
+        .ok_or(ControllerError::ObservationStale)?;
+    if report.identity != action.target
+        || report.process_session_id != action.predecessor_session
+        || report.reported_fault != Some(action.fault)
+        || report.healthy
+        || report.read_status == kuberic_runtime::protocol::types::AccessStatus::Granted
+        || report.write_status == kuberic_runtime::protocol::types::AccessStatus::Granted
+        || lifecycle.binding.as_ref() != Some(&action.binding)
+        || lifecycle.role != ReplicaRole::None
+        || lifecycle.write_access
+        || lifecycle.service_location.is_some()
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    Ok(())
 }
 
 impl<A> KubeClusterApi<A>
@@ -2160,6 +2293,8 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
 #[derive(Clone)]
 pub struct InMemoryClusterApi {
     state: Arc<Mutex<InMemoryState>>,
+    #[cfg(feature = "runtime-test-bridge")]
+    preview_fault_executor: Arc<Mutex<Option<Arc<dyn PreviewFaultCommandExecutor>>>>,
 }
 
 struct InMemoryState {
@@ -2194,7 +2329,14 @@ impl InMemoryClusterApi {
                 exact_lookup_failures: BTreeMap::new(),
                 next_resource_uid: 1,
             })),
+            #[cfg(feature = "runtime-test-bridge")]
+            preview_fault_executor: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(feature = "runtime-test-bridge")]
+    pub async fn set_preview_fault_executor(&self, executor: Arc<dyn PreviewFaultCommandExecutor>) {
+        *self.preview_fault_executor.lock().await = Some(executor);
     }
 
     pub async fn set_observation(&self, observation: RawObservation) {
@@ -2812,7 +2954,8 @@ impl ClusterApi for InMemoryClusterApi {
         }
         if let Some(name) = pod_name {
             state.observation.pods.retain(|pod| pod.name_any() != name);
-        } else if let Some(name) = pvc_name {
+        }
+        if let Some(name) = pvc_name {
             state.observation.pvcs.retain(|pvc| pvc.name_any() != name);
         }
         state.effects.push(EffectRecord::DeleteScaffolding {
@@ -2835,6 +2978,7 @@ impl ClusterApi for InMemoryClusterApi {
         ) {
             return Err(ControllerError::ObservationStale);
         }
+
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
         let mut state = self.state.lock().await;
         if let Some(pod) = state
@@ -2857,6 +3001,40 @@ impl ClusterApi for InMemoryClusterApi {
         state.effects.push(EffectRecord::DeleteExactPod {
             pod_name: pod_name.to_string(),
             pod_uid: pod_uid.clone(),
+        });
+        Ok(())
+    }
+
+    async fn delete_exact_service(
+        &self,
+        observation: &RawObservation,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.observation.set.resource_version() != observation.set.resource_version() {
+            return Err(ControllerError::ObservationStale);
+        }
+        let current = state
+            .observation
+            .services
+            .iter()
+            .position(|service| service.name_any() == name);
+        let Some(index) = current else {
+            return Ok(());
+        };
+        let service = &state.observation.services[index];
+        if service.uid().as_deref() != Some(uid)
+            || service.resource_version().as_deref() != Some(resource_version)
+        {
+            return Err(ControllerError::ObservationStale);
+        }
+        state.observation.services.remove(index);
+        state.effects.push(EffectRecord::DeleteExactService {
+            name: name.into(),
+            uid: uid.into(),
+            resource_version: resource_version.into(),
         });
         Ok(())
     }
@@ -3023,9 +3201,7 @@ impl ClusterApi for InMemoryClusterApi {
         };
         #[cfg(feature = "runtime-test-bridge")]
         if let Some(action) = preview_command {
-            action
-                .validate()
-                .map_err(|message| ControllerError::InvalidAgentEvidence(message.into()))?;
+            validate_preview_dispatch(observation, action)?;
             if action.target != target || action.predecessor_session.as_str() != session {
                 return Err(ControllerError::ObservationStale);
             }
@@ -3053,8 +3229,55 @@ impl ClusterApi for InMemoryClusterApi {
         )?)
         .map_err(|e| ControllerError::InvalidAgentEvidence(e.to_string()))?;
         state.effects.push(EffectRecord::Execute(command.clone()));
-        if state.unavailable_next_execute {
+        let response_lost = state.unavailable_next_execute;
+        if response_lost {
             state.unavailable_next_execute = false;
+        }
+        #[cfg(feature = "runtime-test-bridge")]
+        let restart_action = preview_command.cloned();
+        drop(state);
+        #[cfg(feature = "runtime-test-bridge")]
+        if let Some(action) = restart_action
+            && let Some(executor) = self.preview_fault_executor.lock().await.clone()
+        {
+            let record = executor.execute_restart(&action).await?;
+            let mut state = self.state.lock().await;
+            let key = ReplicaObservationKey::new(
+                action.target.replica_id,
+                action.target.instance_id.clone(),
+            );
+            let Some(RawAgentObservation::PreviewReport(report)) =
+                state.observation.agents.get_mut(&key)
+            else {
+                return Err(ControllerError::ObservationStale);
+            };
+            report.restart_action = Some(Box::new(record.clone()));
+            if record.stage
+                == kuberic_runtime::protocol::public_operations::RestartActionStage::SuccessorStarted
+            {
+                let successor = record
+                    .successor_session
+                    .ok_or(ControllerError::ObservationStale)?;
+                report.process_session_id = successor.clone();
+                report.report_sequence = report.report_sequence.saturating_add(1);
+                report.reported_fault = None;
+                report.healthy = true;
+                report.role = ReplicaRole::None;
+                report.read_status =
+                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
+                report.write_status =
+                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
+                let lifecycle = report
+                    .public_lifecycle_report
+                    .as_mut()
+                    .ok_or(ControllerError::ObservationStale)?;
+                lifecycle.process_session_id = successor;
+                lifecycle.role = ReplicaRole::None;
+                lifecycle.write_access = false;
+                lifecycle.service_location = None;
+            }
+        }
+        if response_lost {
             return Err(ControllerError::AgentUnavailable(
                 "ambiguous command result after dispatch".to_string(),
             ));

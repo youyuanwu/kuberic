@@ -41,6 +41,14 @@ impl Fixture {
             ProcessSessionId::new("session-1"),
         )
         .unwrap();
+        host.bind_public_fault_preview(
+            store.clone(),
+            owner.registry(),
+            preview.clone(),
+            ProcessSessionId::new("session-1"),
+        )
+        .await
+        .unwrap();
         let opening = host.clone();
         owner
             .run_root(
@@ -304,24 +312,13 @@ async fn public_fault_reporting_closes_access_and_location_before_returning() {
     assert!(serving.write_access);
     assert!(serving.service_location.is_some());
 
-    fixture
-        .store
-        .record_partition_reports(
-            Vec::new(),
-            Some(crate::protocol::types::FaultType::Transient),
-        )
+    let partition = fixture
+        .host
+        .public_open_context(crate::application::OpenMode::Existing)
         .await
-        .unwrap();
-    let operation = fixture
-        .owner
-        .registry()
-        .report_fault(intent(
-            &fixture.preview,
-            "fault-transient",
-            3,
-            PublicOperationClass::TransientFault,
-            "session-1",
-        ))
+        .partition;
+    partition
+        .report_fault(crate::protocol::types::FaultType::Transient)
         .await
         .unwrap();
 
@@ -340,17 +337,35 @@ async fn public_fault_reporting_closes_access_and_location_before_returning() {
     assert!(preview.writes_revoked);
     assert!(preview.terminal);
 
-    operation.wait_for_terminal().await.unwrap();
+    assert_eq!(
+        partition.get_read_status().await.unwrap(),
+        AccessStatus::NotPrimary
+    );
+    assert_eq!(
+        partition.get_write_status().await.unwrap(),
+        AccessStatus::NotPrimary
+    );
+    let transient = preview.current_operation.clone().unwrap();
     fixture
         .owner
         .registry()
-        .report_fault(intent(
-            &fixture.preview,
-            "fault-permanent",
-            4,
-            PublicOperationClass::PermanentFault,
-            "session-1",
-        ))
+        .operation(&transient)
+        .await
+        .unwrap()
+        .wait_for_terminal()
+        .await
+        .unwrap();
+    partition
+        .report_fault(crate::protocol::types::FaultType::Permanent)
+        .await
+        .unwrap();
+    let state = fixture.store.load_state().await.unwrap();
+    let preview = state.public_operation_preview.unwrap();
+    let permanent = preview.current_operation.clone().unwrap();
+    fixture
+        .owner
+        .registry()
+        .operation(&permanent)
         .await
         .unwrap()
         .wait_for_terminal()
@@ -368,8 +383,6 @@ async fn public_fault_reporting_closes_access_and_location_before_returning() {
         ))
         .await;
     assert!(rejected.is_err());
-    let state = fixture.store.load_state().await.unwrap();
-    let preview = state.public_operation_preview.unwrap();
     let current = preview
         .operations
         .get(preview.current_operation.as_ref().unwrap())

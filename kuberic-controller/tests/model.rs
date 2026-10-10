@@ -1856,6 +1856,9 @@ impl SwitchoverModel {
                         image: Some("model:v2".into()),
                         pod_ready: true,
                         peer_endpoint_ready: true,
+                        endpoint_name: None,
+                        endpoint_uid: None,
+                        endpoint_resource_version: None,
                     }),
                     agent: AgentObservation::Report(Box::new(AgentReport {
                         protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,

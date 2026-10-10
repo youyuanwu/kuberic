@@ -1395,6 +1395,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "k8s-openapi",
+ "kube",
  "kuberic-controller",
  "prost",
  "quote",

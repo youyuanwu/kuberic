@@ -140,6 +140,7 @@ fn fixture(
     .unwrap();
     let report = PublicLifecycleReport {
         preview: preview.clone(),
+        binding: None,
         resource_uid: ResourceUid::new("resource-1"),
         replica: replica.clone(),
         process_session_id: intent.process_session_id.clone(),

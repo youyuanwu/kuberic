@@ -23,7 +23,8 @@ use crate::host::state::{
 use crate::host::store::AgentStore;
 use crate::host::testing::PublicOperationPreviewRuntime;
 use crate::protocol::public_operations::{
-    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
+    PreviewLifecycleBinding, PublicOperationClass, PublicOperationIntent,
+    PublicOperationPreviewIdentity, StatePersistence,
 };
 use crate::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -87,10 +88,15 @@ fn preview_store(
 ) -> (tempfile::TempDir, std::path::PathBuf, Arc<SqliteStore>) {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
-    let store = SqliteStore::create_preview_authorized(
+    let store = SqliteStore::create_preview_bound_authorized(
         &path,
         AgentState::new(storage_identity()),
-        preview.clone(),
+        PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: ResourceUid::new("resource-1"),
+            spec_generation: 7,
+            state_persistence: StatePersistence::Persisted,
+        },
     )
     .unwrap();
     store.relax_durability_for_tests();
@@ -102,10 +108,15 @@ fn durable_preview_store(
 ) -> (tempfile::TempDir, std::path::PathBuf, Arc<SqliteStore>) {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
-    let store = SqliteStore::create_preview_authorized(
+    let store = SqliteStore::create_preview_bound_authorized(
         &path,
         AgentState::new(storage_identity()),
-        preview.clone(),
+        PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: ResourceUid::new("resource-1"),
+            spec_generation: 7,
+            state_persistence: StatePersistence::Persisted,
+        },
     )
     .unwrap();
     (directory, path, Arc::new(store))
