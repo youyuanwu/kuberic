@@ -1604,6 +1604,7 @@ impl AgentStore for SqliteStore {
         &self,
         intent: &PublicOperationIntent,
         blockers: &[OperationId],
+        superseded: &[OperationId],
     ) -> Result<BeginPublicOperation> {
         intent
             .validate()
@@ -1660,10 +1661,10 @@ impl AgentStore for SqliteStore {
                     exact_blockers.insert(blocker.clone());
                 }
             }
-            for blocker in blockers {
-                let blocked = preview.operations.get_mut(blocker).ok_or_else(|| {
+            for operation_id in superseded {
+                let blocked = preview.operations.get_mut(operation_id).ok_or_else(|| {
                     crate::host::HostError::CommandRejected(format!(
-                        "public-operation blocker {blocker} disappeared"
+                        "superseded public operation {operation_id} disappeared"
                     ))
                 })?;
                 if blocked
@@ -1672,7 +1673,7 @@ impl AgentStore for SqliteStore {
                     .is_some_and(|existing| existing != &intent.operation_id)
                 {
                     return Err(crate::host::HostError::DurableEffectConflict(format!(
-                        "public-operation blocker {blocker} was already superseded"
+                        "public operation {operation_id} was already superseded"
                     )));
                 }
                 blocked.superseded_by = Some(intent.operation_id.clone());

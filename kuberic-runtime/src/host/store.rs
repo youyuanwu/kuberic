@@ -112,6 +112,7 @@ pub(crate) trait AgentStore: Send + Sync {
         &self,
         _intent: &PublicOperationIntent,
         _blockers: &[OperationId],
+        _superseded: &[OperationId],
     ) -> Result<BeginPublicOperation> {
         Err(crate::host::HostError::CommandRejected(
             "public-operation preview is not enabled for this store".into(),

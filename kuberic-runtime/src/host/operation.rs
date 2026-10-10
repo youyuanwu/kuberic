@@ -705,6 +705,7 @@ impl PartitionOperationRegistry {
                 }
                 AdmissionRelation::Supersede => {
                     blockers.insert(record.intent.operation_id.clone());
+                    blockers.extend(record.blockers.iter().cloned());
                     superseded.push(operation);
                 }
                 AdmissionRelation::Reject(reason) => {
@@ -721,9 +722,13 @@ impl PartitionOperationRegistry {
         }
 
         let blocker_ids = blockers.iter().cloned().collect::<Vec<_>>();
+        let superseded_ids = superseded
+            .iter()
+            .map(|operation| operation.intent().operation_id)
+            .collect::<Vec<_>>();
         let record = match self
             .store
-            .begin_public_operation(&intent, &blocker_ids)
+            .begin_public_operation(&intent, &blocker_ids, &superseded_ids)
             .await?
         {
             BeginPublicOperation::Ready(record)

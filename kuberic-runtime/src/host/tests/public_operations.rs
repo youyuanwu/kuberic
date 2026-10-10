@@ -243,6 +243,66 @@ async fn dropped_waiter_does_not_release_owned_callback_or_supersession() {
 }
 
 #[tokio::test]
+async fn transitive_containment_blockers_survive_multiple_supersessions() {
+    let preview = PublicOperationPreviewIdentity::new(47);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry =
+        PartitionOperationRegistry::new(store, preview.clone(), ProcessSessionId::new("session-1"))
+            .unwrap();
+    let first = registry
+        .admit(intent(
+            &preview,
+            "authority-1",
+            1,
+            PublicOperationClass::Authority,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    first
+        .spawn_root(CallbackContainment::ObjectOwnedOnInterruption, async {
+            std::future::pending::<()>().await;
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    let second = registry
+        .admit(intent(
+            &preview,
+            "authority-2",
+            2,
+            PublicOperationClass::Authority,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    wait_for_stage(&first, PublicOperationStage::ContainmentPending).await;
+    wait_for_stage(&second, PublicOperationStage::WaitingForContainment).await;
+
+    let third = registry
+        .admit(intent(
+            &preview,
+            "authority-3",
+            3,
+            PublicOperationClass::Authority,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    wait_for_stage(&second, PublicOperationStage::Completed).await;
+    let blocked = wait_for_stage(&third, PublicOperationStage::WaitingForContainment).await;
+    assert!(blocked.blockers.contains(&first.intent().operation_id));
+    assert!(blocked.blockers.contains(&second.intent().operation_id));
+
+    registry
+        .complete_containment(&first.intent().operation_id)
+        .await
+        .unwrap();
+    wait_for_stage(&third, PublicOperationStage::Ready).await;
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn changed_duplicate_and_stale_revision_are_rejected() {
     let preview = PublicOperationPreviewIdentity::new(3);
     let (_directory, _path, store) = preview_store(&preview);
@@ -294,7 +354,10 @@ async fn durable_supersession_fence_rejects_predecessor_callback_completion() {
         PublicOperationClass::Authority,
         "session-1",
     );
-    store.begin_public_operation(&first, &[]).await.unwrap();
+    store
+        .begin_public_operation(&first, &[], &[])
+        .await
+        .unwrap();
     store
         .advance_public_operation(
             &first.operation_id,
@@ -314,7 +377,11 @@ async fn durable_supersession_fence_rejects_predecessor_callback_completion() {
         "session-1",
     );
     store
-        .begin_public_operation(&second, std::slice::from_ref(&first.operation_id))
+        .begin_public_operation(
+            &second,
+            std::slice::from_ref(&first.operation_id),
+            std::slice::from_ref(&first.operation_id),
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -344,7 +411,10 @@ async fn recovery_retains_containment_for_callback_applied_before_supersession()
         PublicOperationClass::Authority,
         "session-1",
     );
-    store.begin_public_operation(&first, &[]).await.unwrap();
+    store
+        .begin_public_operation(&first, &[], &[])
+        .await
+        .unwrap();
     store
         .advance_public_operation(
             &first.operation_id,
@@ -375,7 +445,11 @@ async fn recovery_retains_containment_for_callback_applied_before_supersession()
         "session-1",
     );
     store
-        .begin_public_operation(&second, std::slice::from_ref(&first.operation_id))
+        .begin_public_operation(
+            &second,
+            std::slice::from_ref(&first.operation_id),
+            std::slice::from_ref(&first.operation_id),
+        )
         .await
         .unwrap();
 
@@ -1235,7 +1309,10 @@ async fn fresh_session_recovers_unowned_work_as_ambiguous_containment() {
         PublicOperationClass::Authority,
         "session-1",
     );
-    store.begin_public_operation(&pending, &[]).await.unwrap();
+    store
+        .begin_public_operation(&pending, &[], &[])
+        .await
+        .unwrap();
     store
         .advance_public_operation(
             &pending.operation_id,
