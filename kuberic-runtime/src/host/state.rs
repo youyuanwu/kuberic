@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 // Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
 pub(crate) const SCHEMA_VERSION: u32 = 6;
+pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +81,7 @@ pub(crate) enum PublicOperationStage {
     WaitingForContainment,
     Ready,
     Running,
+    CallbackApplied,
     ContainmentPending,
     Completed,
 }
@@ -91,7 +93,15 @@ pub(crate) enum PublicOperationDisposition {
     Failed(String),
     Ambiguous(String),
     Cancelled,
-    Contained,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PublicOperationContainment {
+    #[default]
+    NotRequired,
+    Pending,
+    Complete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +110,8 @@ pub(crate) struct PublicOperationRecord {
     pub(crate) intent: PublicOperationIntent,
     pub(crate) stage: PublicOperationStage,
     pub(crate) disposition: Option<PublicOperationDisposition>,
+    #[serde(default)]
+    pub(crate) containment: PublicOperationContainment,
     #[serde(default)]
     pub(crate) blockers: BTreeSet<OperationId>,
 }

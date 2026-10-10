@@ -28,6 +28,16 @@ impl PublicOperationPreviewEvaluationConfig {
             evaluation,
         }
     }
+
+    pub fn validate_identity(
+        &self,
+        observed: &PublicOperationPreviewIdentity,
+    ) -> Result<(), String> {
+        if observed != &self.identity {
+            return Err("public-operation preview identity mismatch".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -75,6 +85,20 @@ pub fn evaluate_json(snapshot: &[u8], config: &EvaluationConfig) -> serde_json::
     serde_json::to_vec(&super::evaluate(&snapshot.into(), config))
 }
 
+pub fn evaluate_preview_json(
+    preview: &PublicOperationPreviewIdentity,
+    snapshot: &[u8],
+    config: &PublicOperationPreviewEvaluationConfig,
+) -> serde_json::Result<Vec<u8>> {
+    config.validate_identity(preview).map_err(|message| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message,
+        ))
+    })?;
+    evaluate_json(snapshot, &config.evaluation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +115,14 @@ mod tests {
             config.evaluation.supported_protocol_version,
             kuberic_runtime::protocol::PROTOCOL_VERSION
         );
+        assert!(config.validate_identity(&identity).is_ok());
+        assert!(
+            config
+                .validate_identity(&PublicOperationPreviewIdentity::new(12))
+                .is_err()
+        );
+        let error = evaluate_preview_json(&PublicOperationPreviewIdentity::new(12), b"{}", &config)
+            .unwrap_err();
+        assert!(error.to_string().contains("preview identity mismatch"));
     }
 }

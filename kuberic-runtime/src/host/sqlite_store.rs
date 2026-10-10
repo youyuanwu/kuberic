@@ -27,12 +27,15 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use crate::host::Result;
 use crate::host::command::is_access_only_configuration;
 use crate::host::state::{
-    AgentState, CoordinatorStage, DeactivationState, EffectStage, PendingEffect,
-    PublicOperationPreviewState, ReconfigurationRecord, RetainedCommandResult, RetainedResult,
-    SCHEMA_VERSION, StorageIdentity,
+    AgentState, CoordinatorStage, DeactivationState, EffectStage,
+    PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, PendingEffect, PublicOperationPreviewState,
+    ReconfigurationRecord, RetainedCommandResult, RetainedResult, SCHEMA_VERSION, StorageIdentity,
 };
 #[cfg(any(test, feature = "testing"))]
-use crate::host::state::{PublicOperationDisposition, PublicOperationRecord, PublicOperationStage};
+use crate::host::state::{
+    PublicOperationContainment, PublicOperationDisposition, PublicOperationRecord,
+    PublicOperationStage,
+};
 #[cfg(any(test, feature = "testing"))]
 use crate::host::store::BeginPublicOperation;
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
@@ -151,6 +154,8 @@ pub(crate) struct SqliteStore {
     connection: Mutex<Connection>,
     #[cfg(all(test, feature = "testing"))]
     pub(super) authority_admission_failure: std::sync::atomic::AtomicUsize,
+    #[cfg(all(test, feature = "testing"))]
+    public_operation_advance_failure: std::sync::atomic::AtomicUsize,
 }
 
 impl SqliteStore {
@@ -183,15 +188,21 @@ impl SqliteStore {
                 "public-operation preview state is already initialized".into(),
             ));
         }
+        state.identity.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
         state.public_operation_preview = Some(PublicOperationPreviewState::new(preview));
         Self::create_store(path, state)
     }
 
     fn create_store(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if state.identity.schema_version != SCHEMA_VERSION {
+        let expected_version = if state.public_operation_preview.is_some() {
+            PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION
+        } else {
+            SCHEMA_VERSION
+        };
+        if state.identity.schema_version != expected_version {
             return Err(crate::host::HostError::SchemaMismatch {
-                expected: SCHEMA_VERSION,
+                expected: expected_version,
                 observed: state.identity.schema_version,
             });
         }
@@ -213,6 +224,8 @@ impl SqliteStore {
                 connection: Mutex::new(connection),
                 #[cfg(all(test, feature = "testing"))]
                 authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(all(test, feature = "testing"))]
+                public_operation_advance_failure: std::sync::atomic::AtomicUsize::new(0),
             })
         })();
         if result.is_err() {
@@ -269,6 +282,8 @@ impl SqliteStore {
             connection: Mutex::new(connection),
             #[cfg(all(test, feature = "testing"))]
             authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "testing"))]
+            public_operation_advance_failure: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -295,9 +310,9 @@ impl SqliteStore {
         validate_integrity(&connection)
             .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
+        if version != PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION {
             return Err(crate::host::HostError::SchemaMismatch {
-                expected: SCHEMA_VERSION,
+                expected: PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
                 observed: version,
             });
         }
@@ -308,13 +323,15 @@ impl SqliteStore {
                 observed: state.identity.schema_version,
             });
         }
-        if let Some(expected) = expected_identity
-            && &state.identity != expected
-        {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
-                    .into(),
-            ));
+        if let Some(expected) = expected_identity {
+            let mut expected = expected.clone();
+            expected.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+            if state.identity != expected {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
+                        .into(),
+                ));
+            }
         }
         let Some(preview) = &state.public_operation_preview else {
             return Err(crate::host::HostError::InitializationNotAuthorized(
@@ -332,12 +349,20 @@ impl SqliteStore {
             connection: Mutex::new(connection),
             #[cfg(all(test, feature = "testing"))]
             authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "testing"))]
+            public_operation_advance_failure: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn fail_next_public_operation_advance(&self) {
+        self.public_operation_advance_failure
+            .store(1, std::sync::atomic::Ordering::Release);
     }
 
     fn with_transaction<T>(&self, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
@@ -1582,7 +1607,9 @@ impl AgentStore for SqliteStore {
                     PublicOperationStage::WaitingForContainment => {
                         BeginPublicOperation::Waiting(existing.clone())
                     }
-                    PublicOperationStage::Ready | PublicOperationStage::Running => {
+                    PublicOperationStage::Ready
+                    | PublicOperationStage::Running
+                    | PublicOperationStage::CallbackApplied => {
                         BeginPublicOperation::Pending(existing.clone())
                     }
                     PublicOperationStage::ContainmentPending => {
@@ -1619,6 +1646,7 @@ impl AgentStore for SqliteStore {
                 intent: intent.clone(),
                 stage,
                 disposition: None,
+                containment: PublicOperationContainment::NotRequired,
                 blockers: exact_blockers,
             };
             preview
@@ -1637,20 +1665,31 @@ impl AgentStore for SqliteStore {
     async fn advance_public_operation(
         &self,
         operation_id: &OperationId,
+        expected_revision: u64,
+        expected_process_session: &crate::protocol::types::ProcessSessionId,
         expected: PublicOperationStage,
         next: PublicOperationStage,
         disposition: Option<PublicOperationDisposition>,
     ) -> Result<PublicOperationRecord> {
+        #[cfg(all(test, feature = "testing"))]
+        if self
+            .public_operation_advance_failure
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected public-operation advance failure".into(),
+            ));
+        }
         self.with_transaction(|transaction| {
             if !valid_public_operation_transition(expected, next) {
                 return Err(crate::host::HostError::CommandRejected(format!(
                     "invalid public-operation stage transition {expected:?} -> {next:?}"
                 )));
-            }
-            if next == PublicOperationStage::Completed && disposition.is_none() {
-                return Err(crate::host::HostError::CommandRejected(
-                    "completed public operation requires a disposition".into(),
-                ));
             }
             let mut state = load_state_from_connection(transaction)?;
             let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
@@ -1669,8 +1708,27 @@ impl AgentStore for SqliteStore {
                     record.stage
                 )));
             }
+            if record.intent.revision != expected_revision
+                || &record.intent.process_session_id != expected_process_session
+            {
+                return Err(crate::host::HostError::StaleEffectCompletion(format!(
+                    "public operation {operation_id} revision or process session is stale"
+                )));
+            }
             record.stage = next;
-            record.disposition = disposition;
+            if let Some(disposition) = disposition {
+                record.disposition = Some(disposition);
+            }
+            record.containment = match next {
+                PublicOperationStage::ContainmentPending => PublicOperationContainment::Pending,
+                PublicOperationStage::Completed => PublicOperationContainment::Complete,
+                _ => record.containment,
+            };
+            if next == PublicOperationStage::Completed && record.disposition.is_none() {
+                return Err(crate::host::HostError::CommandRejected(
+                    "completed public operation requires a disposition".into(),
+                ));
+            }
             if next == PublicOperationStage::Ready {
                 record.blockers.clear();
             }
@@ -1714,6 +1772,14 @@ fn valid_public_operation_transition(
                 PublicOperationStage::ContainmentPending
             )
             | (PublicOperationStage::Ready, PublicOperationStage::Completed)
+            | (
+                PublicOperationStage::Running,
+                PublicOperationStage::CallbackApplied
+            )
+            | (
+                PublicOperationStage::CallbackApplied,
+                PublicOperationStage::Completed
+            )
             | (
                 PublicOperationStage::Running,
                 PublicOperationStage::ContainmentPending
@@ -2614,10 +2680,10 @@ fn create_schema(connection: &mut Connection, state: &AgentState) -> Result<()> 
             progress_json TEXT NOT NULL
          );",
     )?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", state.identity.schema_version)?;
     transaction.execute(
         "INSERT INTO schema_migrations(version) VALUES(?1)",
-        [SCHEMA_VERSION],
+        [state.identity.schema_version],
     )?;
     write_agent_state(&transaction, state)?;
     transaction.commit()?;

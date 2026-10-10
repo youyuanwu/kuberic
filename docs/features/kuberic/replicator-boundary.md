@@ -64,19 +64,22 @@ Phase 4.1 adds a separate dormant public-operation preview boundary. A
 `PartitionOperationRegistry` admits exact preview intents and retains each
 `PartitionOperation` independently of the waiting caller. The live owner holds
 only callback tasks, cancellation and containment state; exact intent, stage,
-input digest, blockers and terminal disposition remain in the agent store.
+input digest, blockers, callback-applied evidence, containment state and
+terminal disposition remain in the agent store.
 `PartitionOperationRecoveryOwner` reconstructs unfinished durable obligations
 without replaying predecessor authority into a new process session
 (`kuberic-runtime/src/host/operation.rs`;
 `kuberic-runtime/src/host/operation_recovery.rs`;
 `kuberic-runtime/src/host/state.rs`).
 
-This preview uses a distinct immutable protocol identity and preview-marked
-store state. Legacy store openers reject preview state, preview openers reject
-legacy or mismatched preview state, and the operation modules are compiled only
-for tests or the repository `testing` feature. No legacy coordinator,
-production protocol command or current persisted effect selects the preview
-owner (`kuberic-runtime/src/protocol/public_operations.rs`;
+This preview uses a distinct immutable protocol identity and schema-7
+preview-marked store state. Schema-6 legacy readers reject it before state
+deserialization, preview openers reject legacy or mismatched preview state, and
+the operation modules are compiled only for tests or the repository `testing`
+feature. A preview runtime owner joins registry coordination/root tasks during
+shutdown; object-owned work remains pending until explicit containment. No
+legacy coordinator, production protocol command or current persisted effect
+selects the preview owner (`kuberic-runtime/src/protocol/public_operations.rs`;
 `kuberic-runtime/src/host/sqlite_store.rs`;
 `kuberic-runtime/src/host/mod.rs`).
 

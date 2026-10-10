@@ -122,6 +122,8 @@ pub(crate) trait AgentStore: Send + Sync {
     async fn advance_public_operation(
         &self,
         _operation_id: &OperationId,
+        _expected_revision: u64,
+        _expected_process_session: &crate::protocol::types::ProcessSessionId,
         _expected: PublicOperationStage,
         _next: PublicOperationStage,
         _disposition: Option<PublicOperationDisposition>,
