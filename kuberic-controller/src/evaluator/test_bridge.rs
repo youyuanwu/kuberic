@@ -7,7 +7,7 @@ use kuberic_runtime::protocol::observation::{
 };
 use kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity;
 use kuberic_runtime::protocol::types::{AcceptedStatus, ResourceUid};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::EvaluationConfig;
 
@@ -40,7 +40,7 @@ impl PublicOperationPreviewEvaluationConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotBridge {
     resource_uid: ResourceUid,
@@ -138,5 +138,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("preview identity mismatch"));
+
+        let snapshot = SnapshotBridge {
+            resource_uid: ResourceUid::new("resource-1"),
+            resource_version: "1".into(),
+            desired: DesiredState {
+                generation: 1,
+                replicas: 1,
+                image: "test".into(),
+                failover_delay_seconds: 30,
+                switchover: None,
+            },
+            status: AcceptedStatus::default(),
+            replicas: Vec::new(),
+            secondary_scale_down_resources: Vec::new(),
+            previous_report_watermarks: Vec::new(),
+            durable_storage_evidence: false,
+            supporting_resources_ready: false,
+            routing: RoutingObservation::default(),
+            observation_failures: Vec::new(),
+            now_unix_seconds: 0,
+        };
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("preview".into(), serde_json::to_value(&identity).unwrap());
+        let output = evaluate_preview_json(&serde_json::to_vec(&value).unwrap(), &config).unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(output["preview"], serde_json::to_value(&identity).unwrap());
+        assert!(output.get("plan").is_some());
     }
 }

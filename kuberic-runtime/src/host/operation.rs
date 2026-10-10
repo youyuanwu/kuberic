@@ -208,21 +208,24 @@ impl PartitionOperation {
             ) {
                 return Ok(current);
             }
-            self.task.lock().await.take()
+            let task = self.task.lock().await.take();
+            if let Some(task) = &task {
+                task.abort();
+            } else {
+                return self.persist_cancellation(current, None).await;
+            }
+            task
         };
+        let mut task_failure = None;
         if let Some(task) = task {
-            task.abort();
             match task.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    self.record_failure(&error);
-                    return Err(error);
+                    task_failure = Some(error.to_string());
                 }
                 Err(error) if error.is_cancelled() => {}
                 Err(error) => {
-                    return Err(HostError::CommandRejected(format!(
-                        "public-operation task join failed: {error}"
-                    )));
+                    task_failure = Some(format!("public-operation task join failed: {error}"));
                 }
             }
         }
@@ -236,25 +239,40 @@ impl PartitionOperation {
             return Ok(current);
         }
         if current.stage == PublicOperationStage::CallbackApplied {
-            let completed = match self
+            if current.superseded_by.is_some() {
+                let pending = self
+                    .advance(
+                        PublicOperationStage::CallbackApplied,
+                        PublicOperationStage::ContainmentPending,
+                        Some(PublicOperationDisposition::Ambiguous(
+                            "callback was applied before supersession".into(),
+                        )),
+                    )
+                    .await?;
+                self.record.send_replace(pending.clone());
+                self.bump_revision();
+                return Ok(pending);
+            }
+            let completed = self
                 .advance(
                     PublicOperationStage::CallbackApplied,
                     PublicOperationStage::Completed,
                     None,
                 )
-                .await
-            {
-                Ok(completed) => completed,
-                Err(error) => {
-                    self.record_failure(&error);
-                    return Err(error);
-                }
-            };
+                .await?;
             self.record.send_replace(completed.clone());
             self.bump_revision();
             return Ok(completed);
         }
 
+        self.persist_cancellation(current, task_failure).await
+    }
+
+    async fn persist_cancellation(
+        &self,
+        current: PublicOperationRecord,
+        task_failure: Option<String>,
+    ) -> Result<PublicOperationRecord> {
         let containment = *self.containment.lock().await;
         let next = match containment {
             CallbackContainment::RootTask => PublicOperationStage::Completed,
@@ -262,14 +280,10 @@ impl PartitionOperation {
                 PublicOperationStage::ContainmentPending
             }
         };
-        let updated = match self
-            .advance(
-                current.stage,
-                next,
-                Some(PublicOperationDisposition::Cancelled),
-            )
-            .await
-        {
+        let disposition = task_failure.map_or(PublicOperationDisposition::Cancelled, |error| {
+            PublicOperationDisposition::Ambiguous(error)
+        });
+        let updated = match self.advance(current.stage, next, Some(disposition)).await {
             Ok(updated) => updated,
             Err(error) => {
                 self.record_failure(&error);
@@ -426,12 +440,23 @@ impl PartitionOperation {
         }
 
         let recovered = if record.stage == PublicOperationStage::CallbackApplied {
-            self.advance(
-                PublicOperationStage::CallbackApplied,
-                PublicOperationStage::Completed,
-                None,
-            )
-            .await?
+            if record.superseded_by.is_some() {
+                self.advance(
+                    PublicOperationStage::CallbackApplied,
+                    PublicOperationStage::ContainmentPending,
+                    Some(PublicOperationDisposition::Ambiguous(
+                        "callback was applied before supersession".into(),
+                    )),
+                )
+                .await?
+            } else {
+                self.advance(
+                    PublicOperationStage::CallbackApplied,
+                    PublicOperationStage::Completed,
+                    None,
+                )
+                .await?
+            }
         } else {
             let detail = if &record.intent.process_session_id == current_session {
                 "public operation recovered without its owned task"
@@ -583,11 +608,33 @@ impl PartitionOperationRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let highest_retained_authority_revision = existing
+            .iter()
+            .filter_map(|operation| {
+                let record = operation.snapshot();
+                (record.stage == PublicOperationStage::Completed
+                    && matches!(
+                        record.intent.class,
+                        PublicOperationClass::Authority | PublicOperationClass::PlannedSwap
+                    ))
+                .then_some(record.intent.revision)
+            })
+            .max();
         let mut blockers = BTreeSet::new();
         let mut superseded = Vec::new();
         let mut attached_to = None;
         for operation in existing {
             let record = operation.snapshot();
+            if record.stage == PublicOperationStage::Completed
+                && matches!(
+                    record.intent.class,
+                    PublicOperationClass::Authority | PublicOperationClass::PlannedSwap
+                )
+                && highest_retained_authority_revision
+                    .is_some_and(|revision| record.intent.revision < revision)
+            {
+                continue;
+            }
             let relation = if record.stage == PublicOperationStage::Completed {
                 retained_relation(&record.intent, &intent)
             } else {
@@ -679,12 +726,7 @@ impl PartitionOperationRegistry {
         intent: PublicOperationIntent,
         owner: OperationId,
     ) -> Result<Arc<PartitionOperation>> {
-        let record = match self.store.begin_public_operation(&intent, &[]).await? {
-            BeginPublicOperation::Ready(record)
-            | BeginPublicOperation::Waiting(record)
-            | BeginPublicOperation::Pending(record)
-            | BeginPublicOperation::Completed(record) => record,
-        };
+        let record = self.store.attach_public_operation(&intent, &owner).await?;
         let operation = Arc::new(PartitionOperation::new(
             self.store.clone(),
             record,
@@ -697,16 +739,6 @@ impl PartitionOperationRegistry {
             .await
             .operations
             .insert(intent.operation_id.clone(), operation.clone());
-        if operation.snapshot().stage != PublicOperationStage::Completed {
-            let completed = operation
-                .advance(
-                    operation.snapshot().stage,
-                    PublicOperationStage::Completed,
-                    Some(PublicOperationDisposition::Attached(owner)),
-                )
-                .await?;
-            operation.record.send_replace(completed);
-        }
         self.bump_revision();
         Ok(operation)
     }
@@ -773,14 +805,17 @@ impl PartitionOperationRegistry {
     pub(crate) async fn shutdown(&self) -> Result<()> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
-        let _admission = self.admission.lock().await;
+        let admission = self.admission.lock().await;
+        let mut first_error = None;
         let coordination = std::mem::take(&mut *self.coordination.lock().await);
         for task in coordination {
-            task.await.map_err(|error| {
-                HostError::CommandRejected(format!(
-                    "public-operation coordination join failed: {error}"
-                ))
-            })?;
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!(
+                        "public-operation coordination join failed: {error}"
+                    ))
+                });
+            }
         }
         let operations = self
             .state
@@ -794,11 +829,19 @@ impl PartitionOperationRegistry {
             if !matches!(
                 operation.snapshot().stage,
                 PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-            ) {
-                operation.cancel_root().await?;
+            ) && let Err(error) = operation.cancel_root().await
+            {
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        drop(admission);
+        if let Err(error) = self.recover_unowned().await {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn operation(

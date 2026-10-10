@@ -156,6 +156,8 @@ pub(crate) struct SqliteStore {
     pub(super) authority_admission_failure: std::sync::atomic::AtomicUsize,
     #[cfg(all(test, feature = "testing"))]
     public_operation_advance_failure: std::sync::atomic::AtomicUsize,
+    #[cfg(all(test, feature = "testing"))]
+    public_operation_attachment_failure: std::sync::atomic::AtomicUsize,
 }
 
 impl SqliteStore {
@@ -226,6 +228,8 @@ impl SqliteStore {
                 authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(all(test, feature = "testing"))]
                 public_operation_advance_failure: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(all(test, feature = "testing"))]
+                public_operation_attachment_failure: std::sync::atomic::AtomicUsize::new(0),
             })
         })();
         if result.is_err() {
@@ -284,6 +288,8 @@ impl SqliteStore {
             authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, feature = "testing"))]
             public_operation_advance_failure: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "testing"))]
+            public_operation_attachment_failure: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -351,6 +357,8 @@ impl SqliteStore {
             authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, feature = "testing"))]
             public_operation_advance_failure: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, feature = "testing"))]
+            public_operation_attachment_failure: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -362,6 +370,12 @@ impl SqliteStore {
     #[cfg(all(test, feature = "testing"))]
     pub(crate) fn fail_next_public_operation_advance(&self) {
         self.public_operation_advance_failure
+            .store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn fail_next_public_operation_attachment(&self) {
+        self.public_operation_attachment_failure
             .store(1, std::sync::atomic::Ordering::Release);
     }
 
@@ -1651,11 +1665,29 @@ impl AgentStore for SqliteStore {
             } else {
                 PublicOperationStage::WaitingForContainment
             };
+            for blocker in &exact_blockers {
+                let blocked = preview.operations.get_mut(blocker).ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(format!(
+                        "public-operation blocker {blocker} disappeared"
+                    ))
+                })?;
+                if blocked
+                    .superseded_by
+                    .as_ref()
+                    .is_some_and(|existing| existing != &intent.operation_id)
+                {
+                    return Err(crate::host::HostError::DurableEffectConflict(format!(
+                        "public-operation blocker {blocker} was already superseded"
+                    )));
+                }
+                blocked.superseded_by = Some(intent.operation_id.clone());
+            }
             let record = PublicOperationRecord {
                 intent: intent.clone(),
                 stage,
                 disposition: None,
                 containment: PublicOperationContainment::NotRequired,
+                superseded_by: None,
                 blockers: exact_blockers,
             };
             preview
@@ -1724,6 +1756,27 @@ impl AgentStore for SqliteStore {
                     "public operation {operation_id} revision or process session is stale"
                 )));
             }
+            if record.superseded_by.is_some()
+                && matches!(
+                    next,
+                    PublicOperationStage::CallbackApplied
+                        | PublicOperationStage::Running
+                        | PublicOperationStage::Ready
+                )
+            {
+                return Err(crate::host::HostError::StaleEffectCompletion(format!(
+                    "public operation {operation_id} was superseded"
+                )));
+            }
+            if record.superseded_by.is_some()
+                && expected == PublicOperationStage::CallbackApplied
+                && next == PublicOperationStage::Completed
+                && disposition.is_none()
+            {
+                return Err(crate::host::HostError::StaleEffectCompletion(format!(
+                    "public operation {operation_id} was superseded after callback application"
+                )));
+            }
             record.stage = next;
             if let Some(disposition) = disposition {
                 record.disposition = Some(disposition);
@@ -1744,6 +1797,75 @@ impl AgentStore for SqliteStore {
             let result = record.clone();
             write_agent_state(transaction, &state)?;
             Ok(result)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn attach_public_operation(
+        &self,
+        intent: &PublicOperationIntent,
+        owner: &OperationId,
+    ) -> Result<PublicOperationRecord> {
+        #[cfg(all(test, feature = "testing"))]
+        if self
+            .public_operation_attachment_failure
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected public-operation attachment failure".into(),
+            ));
+        }
+        intent
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.to_string()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-operation preview is not enabled for this store".into(),
+                )
+            })?;
+            if preview.identity != intent.preview {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-operation preview identity changed".into(),
+                ));
+            }
+            let owner_record = preview.operations.get(owner).ok_or_else(|| {
+                crate::host::HostError::CommandRejected(format!(
+                    "attached public-operation owner {owner} is unknown"
+                ))
+            })?;
+            if owner_record.stage != PublicOperationStage::Completed {
+                return Err(crate::host::HostError::CommandRejected(format!(
+                    "attached public-operation owner {owner} is not terminal"
+                )));
+            }
+            if let Some(existing) = preview.operations.get(&intent.operation_id) {
+                if &existing.intent != intent {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "public-operation ID was reused with changed input".into(),
+                    ));
+                }
+                return Ok(existing.clone());
+            }
+            let record = PublicOperationRecord {
+                intent: intent.clone(),
+                stage: PublicOperationStage::Completed,
+                disposition: Some(PublicOperationDisposition::Attached(owner.clone())),
+                containment: PublicOperationContainment::Complete,
+                superseded_by: None,
+                blockers: std::collections::BTreeSet::new(),
+            };
+            preview
+                .operations
+                .insert(intent.operation_id.clone(), record.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(record)
         })
     }
 
@@ -1788,6 +1910,10 @@ fn valid_public_operation_transition(
             | (
                 PublicOperationStage::CallbackApplied,
                 PublicOperationStage::Completed
+            )
+            | (
+                PublicOperationStage::CallbackApplied,
+                PublicOperationStage::ContainmentPending
             )
             | (
                 PublicOperationStage::Running,

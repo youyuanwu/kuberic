@@ -44,6 +44,10 @@ impl PublicOperationPreviewRuntime {
         self.owner.registry()
     }
 
+    pub(crate) fn into_owner(self) -> PartitionOperationRuntime {
+        self.owner
+    }
+
     pub(crate) async fn run_root<F, E>(
         &self,
         intent: PublicOperationIntent,

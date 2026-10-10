@@ -114,6 +114,8 @@ pub(crate) struct PublicOperationRecord {
     #[serde(default)]
     pub(crate) containment: PublicOperationContainment,
     #[serde(default)]
+    pub(crate) superseded_by: Option<OperationId>,
+    #[serde(default)]
     pub(crate) blockers: BTreeSet<OperationId>,
 }
 

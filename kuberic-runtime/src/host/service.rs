@@ -405,6 +405,9 @@ pub(crate) struct AgentService<S, E> {
     bearer_token: Arc<str>,
     ready_state: Arc<AtomicBool>,
     command_tasks: Arc<CommandTaskOwner>,
+    #[cfg(feature = "testing")]
+    public_operation_preview:
+        Arc<Mutex<Option<crate::host::operation_recovery::PartitionOperationRuntime>>>,
 }
 
 struct CommandTaskOwner {
@@ -469,6 +472,8 @@ impl<S, E> Clone for AgentService<S, E> {
             bearer_token: self.bearer_token.clone(),
             ready_state: self.ready_state.clone(),
             command_tasks: self.command_tasks.clone(),
+            #[cfg(feature = "testing")]
+            public_operation_preview: self.public_operation_preview.clone(),
         }
     }
 }
@@ -502,6 +507,8 @@ where
             bearer_token,
             ready_state: Arc::new(AtomicBool::new(false)),
             command_tasks: CommandTaskOwner::new(),
+            #[cfg(feature = "testing")]
+            public_operation_preview: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -511,15 +518,24 @@ where
 
     #[cfg(feature = "testing")]
     #[allow(dead_code)]
-    pub(crate) fn public_operation_preview_runtime(
+    pub(crate) async fn public_operation_preview_runtime(
         &self,
         preview: crate::protocol::public_operations::PublicOperationPreviewIdentity,
-    ) -> Result<crate::host::testing::PublicOperationPreviewRuntime> {
-        crate::host::testing::PublicOperationPreviewRuntime::start(
+    ) -> Result<Arc<crate::host::operation::PartitionOperationRegistry>> {
+        let mut owner = self.public_operation_preview.lock().await;
+        if owner.is_some() {
+            return Err(crate::host::HostError::CommandRejected(
+                "public-operation preview runtime is already active".into(),
+            ));
+        }
+        let runtime = crate::host::testing::PublicOperationPreviewRuntime::start(
             self.store.clone(),
             preview,
             self.sessions.local_session().clone(),
-        )
+        )?;
+        let registry = runtime.registry();
+        *owner = Some(runtime.into_owner());
+        Ok(registry)
     }
 
     pub(crate) async fn serve(
@@ -655,6 +671,13 @@ where
         ready.send_replace(false);
         configuration_recovery_task.abort();
         let _ = configuration_recovery_task.await;
+        #[cfg(feature = "testing")]
+        let public_operation_preview_result =
+            if let Some(owner) = self.public_operation_preview.lock().await.take() {
+                owner.shutdown().await
+            } else {
+                Ok(())
+            };
         self.command_tasks.shutdown().await;
         recovery_stop.send_replace(true);
         partition_stop.send_replace(true);
@@ -677,6 +700,8 @@ where
         self.runtime.quiesce_partition_reports().await;
         let persisted = self.persist_partition_fault().await;
         self.runtime.abort();
+        #[cfg(feature = "testing")]
+        public_operation_preview_result?;
         persisted?;
         result
     }

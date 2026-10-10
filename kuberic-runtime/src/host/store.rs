@@ -134,6 +134,17 @@ pub(crate) trait AgentStore: Send + Sync {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    async fn attach_public_operation(
+        &self,
+        _intent: &PublicOperationIntent,
+        _owner: &OperationId,
+    ) -> Result<PublicOperationRecord> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-operation preview is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     async fn public_operation_records(&self) -> Result<Vec<PublicOperationRecord>> {
         Err(crate::host::HostError::CommandRejected(
             "public-operation preview is not enabled for this store".into(),
