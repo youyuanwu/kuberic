@@ -703,6 +703,66 @@ custom implementation and are not compatible with a strict SF V1 Replicator.
 
 ## Conformance Verdict
 
+### Dormant Phase 4.2 Implementation
+
+The repository-only public-operation preview now implements these sequences
+through the Phase 4.1 operation-owned root task and exact durable instruction
+journal (`kuberic-runtime/src/host/public_lifecycle.rs`):
+
+| Preview recipe | Ordered operations |
+|---|---|
+| Initial primary, ordinary | Replicator primary role -> application primary role -> current configuration -> preview access decision |
+| Failover, ordinary | Replicator primary role -> promoted epoch -> application primary role -> catch-up configuration -> write-quorum wait -> preview access decision |
+| Same-role active secondary | New-epoch update -> preview access decision; no repeated role callback |
+| Possible data loss | Required primary role/epoch sequence -> application primary role -> `on_data_loss` -> retained history-admission barrier; no configuration, catch-up or access |
+
+The selected controller preview planner is the source of
+`PossibleDataLossIntent::{NotPossible, Possible}`. Neither progress nor a
+data-loss-number change selects it. Its frozen input binds the preview
+identity, exact replica, operation ID, source session, epoch, revision and
+configuration. Store transactions reject changed duplicates, stale sessions,
+non-advancing epochs and out-of-order callbacks.
+
+The barrier is created at `Possible` admission, before callbacks can mutate
+application state. It distinguishes not-yet-invoked, `false`, `true`, callback
+error and ambiguous execution. An in-flight marker is committed before
+`on_data_loss`; loss of its completion journal remains ambiguous, not a
+successful history repair. Every outcome stays access-closed. A rejected newer
+authority request may cancel/drain the old root but does not acquire authority
+or remove the barrier. Close, Abort and faults retain it as retired historical
+evidence. Phase 5 still owns authorized history reconciliation/admission;
+neither boolean changes progress, configurations, builds or serving permission.
+
+Exact optional application addresses are retained in role outcomes, including
+`None` and the empty string. `PublicLifecycleReport.service_location` contains
+a distinct `ServiceLocation`, not `replication_address`, and is suppressed
+unless the current exact primary/session/revision has completed all required
+instructions with write permission. Pending, failed, superseded, terminal and
+fresh-session observations cannot publish historical addresses.
+
+The controller preview normalizes that report into
+`PreviewAcceptedStatus.service_location_projection`: `None` -> `Pending` ->
+one conditional Service write -> `Published`. Clearing follows the same
+protocol with desired absence and a disabled selector. The Service write
+atomically changes the selector and opaque
+`operator.kuberic.io/preview-service-location` annotation, preserving unrelated
+metadata. Status writes are conditional; Service writes use UID and
+resourceVersion preconditions. Publication reobserves the exact Service
+version and desired metadata. Response loss, controller restart and API
+unavailability converge by reobservation, not by assuming a cross-resource
+transaction. Already-running Pods remain locally fenced while Kubernetes is
+unavailable.
+
+These paths require the existing exact preview identity, preview store and
+repository test/preview constructors. They deliberately do **not** extend
+production CRD/status/effect variants or activate the legacy custom-authority
+and access recipes, even in all-features builds. Tests use the real preview
+planner, runtime journal, normalizer and executor with a conditional
+in-memory Kubernetes Service model. They do not claim live-cluster cutover,
+Phase 5 public-value conformance, or completed Phase 4.3/4.4 behavior.
+
+### Production Verdict
+
 **Overall: materially misaligned.**
 
 | Area | Current verdict |

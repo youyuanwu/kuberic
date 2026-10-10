@@ -151,4 +151,17 @@ pub(crate) trait AgentStore: Send + Sync {
             "public-operation preview is not enabled for this store".into(),
         ))
     }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_instruction(
+        &self,
+        _intent: &PublicOperationIntent,
+        _index: usize,
+        _instruction: crate::host::state::PublicInstruction,
+        _outcome: Option<crate::host::state::PublicInstructionOutcome>,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-operation preview is not enabled for this store".into(),
+        ))
+    }
 }

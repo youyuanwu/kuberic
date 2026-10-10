@@ -769,22 +769,56 @@ public-path documented variant crate::protocol::validation::ValidationError::Uni
 public-path documented variant crate::protocol::validation::ValidationError::UnrelatedReplicaClaimsAuthority((i64))
 public-path documented variant crate::protocol::validation::ValidationError::WriteQuorumMismatch { { actual : u32 , expected : u32 } }
 public-path hidden const crate::protocol::public_operations::PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32
+public-path hidden enum crate::protocol::public_operations::PossibleDataLossIntent
+public-path hidden enum crate::protocol::public_operations::PublicLifecycleRecipe
 public-path hidden enum crate::protocol::public_operations::PublicOperationClass
+public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::current: ConfigurationDescriptor
+public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::epoch: Epoch
+public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::possible_data_loss: PossibleDataLossIntent
+public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::previous: Option < ConfigurationDescriptor >
+public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::recipe: PublicLifecycleRecipe
+public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::replica: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::operation_id: Option < OperationId >
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::preview: PublicOperationPreviewIdentity
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::process_session_id: ProcessSessionId
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::replica: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::revision: u64
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::role: ReplicaRole
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::service_location: Option < ServiceLocation >
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::write_access: bool
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::class: PublicOperationClass
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::input_digest: String
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::lifecycle: Option < PublicLifecycleInput >
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::operation_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::preview: PublicOperationPreviewIdentity
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::revision: u64
 public-path hidden field crate::protocol::public_operations::PublicOperationPreviewIdentity::generation: u64
 public-path hidden field crate::protocol::public_operations::PublicOperationPreviewIdentity::protocol_version: u32
+public-path hidden field crate::protocol::public_operations::ServiceLocation::address: String
+public-path hidden field crate::protocol::public_operations::ServiceLocation::epoch: Epoch
+public-path hidden field crate::protocol::public_operations::ServiceLocation::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::ServiceLocation::preview: PublicOperationPreviewIdentity
+public-path hidden field crate::protocol::public_operations::ServiceLocation::process_session_id: ProcessSessionId
+public-path hidden field crate::protocol::public_operations::ServiceLocation::replica: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::ServiceLocation::revision: u64
+public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn digest (& self) -> String
+public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicOperationClass::fn is_terminal (& self) -> bool
 public-path hidden impl crate::protocol::public_operations::PublicOperationIntent::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicOperationPreviewIdentity::const fn is_valid (& self) -> bool
 public-path hidden impl crate::protocol::public_operations::PublicOperationPreviewIdentity::const fn new (generation : u64) -> Self
 public-path hidden module crate::protocol::public_operations
+public-path hidden struct crate::protocol::public_operations::PublicLifecycleInput
+public-path hidden struct crate::protocol::public_operations::PublicLifecycleReport
 public-path hidden struct crate::protocol::public_operations::PublicOperationIntent
 public-path hidden struct crate::protocol::public_operations::PublicOperationPreviewIdentity
+public-path hidden struct crate::protocol::public_operations::ServiceLocation
+public-path hidden variant crate::protocol::public_operations::PossibleDataLossIntent::NotPossible
+public-path hidden variant crate::protocol::public_operations::PossibleDataLossIntent::Possible
+public-path hidden variant crate::protocol::public_operations::PublicLifecycleRecipe::FailoverPromotion
+public-path hidden variant crate::protocol::public_operations::PublicLifecycleRecipe::InitialPrimary
+public-path hidden variant crate::protocol::public_operations::PublicLifecycleRecipe::SecondaryEpochAdvance
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Abort
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Authority
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Build { { target : ReplicaId } }

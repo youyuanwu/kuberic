@@ -117,6 +117,49 @@ pub(crate) struct PublicOperationRecord {
     pub(crate) superseded_by: Option<OperationId>,
     #[serde(default)]
     pub(crate) blockers: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub(crate) lifecycle: PublicLifecycleRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PublicInstruction {
+    ReplicatorPrimary,
+    Epoch,
+    ApplicationPrimary,
+    DataLoss,
+    CurrentConfiguration,
+    CatchUpConfiguration,
+    CatchUp,
+    Access,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PublicInstructionOutcome {
+    Done,
+    ApplicationRole(Option<String>),
+    DataLoss(DataLossOutcome),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DataLossOutcome {
+    NotInvoked,
+    False,
+    True,
+    Error(String),
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct PublicLifecycleRecord {
+    pub(crate) in_flight: Option<PublicInstruction>,
+    pub(crate) outcomes: Vec<PublicInstructionOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HistoryAdmissionBarrier {
+    pub(crate) intent: PublicOperationIntent,
+    pub(crate) outcome: DataLossOutcome,
+    pub(crate) retired_by: Option<OperationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +167,10 @@ pub(crate) struct PublicOperationRecord {
 pub(crate) struct PublicOperationPreviewState {
     pub(crate) identity: PublicOperationPreviewIdentity,
     pub(crate) operations: BTreeMap<OperationId, PublicOperationRecord>,
+    #[serde(default)]
+    pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
+    #[serde(default)]
+    pub(crate) current_operation: Option<OperationId>,
 }
 
 impl PublicOperationPreviewState {
@@ -132,6 +179,8 @@ impl PublicOperationPreviewState {
         Self {
             identity,
             operations: BTreeMap::new(),
+            history_barriers: BTreeMap::new(),
+            current_operation: None,
         }
     }
 }

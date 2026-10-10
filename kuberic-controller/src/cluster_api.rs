@@ -3228,6 +3228,11 @@ fn role_label(role: ReplicaRole) -> &'static str {
 #[path = "../tests/protocol_support/secondary_scale_down.rs"]
 mod scale_down_fixture;
 
+#[cfg(feature = "runtime-test-bridge")]
+mod public_lifecycle;
+#[cfg(feature = "runtime-test-bridge")]
+pub use public_lifecycle::{PreviewServiceApi, preview_service_matches, preview_service_update};
+
 #[cfg(test)]
 mod tests {
     use super::*;

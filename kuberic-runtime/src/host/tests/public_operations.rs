@@ -38,6 +38,9 @@ use crate::replicator::{
 
 use super::tempdir;
 
+#[path = "public_operations/lifecycle.rs"]
+mod lifecycle;
+
 fn replica_identity() -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(1),
@@ -72,6 +75,7 @@ fn intent(
         process_session_id: ProcessSessionId::new(session),
         class,
         input_digest: format!("digest-{operation_id}-{revision}"),
+        lifecycle: None,
     }
 }
 
@@ -1527,6 +1531,10 @@ async fn agent_service_retains_and_drains_the_preview_runtime() {
 struct Trace {
     events: Mutex<Vec<String>>,
     gates: Mutex<BTreeMap<&'static str, Arc<Notify>>>,
+    arguments: Mutex<Vec<String>>,
+    service_address: Mutex<Option<String>>,
+    data_loss: Mutex<Option<std::result::Result<bool, String>>>,
+    fail_role: AtomicBool,
 }
 
 struct TraceCallback {
@@ -1625,7 +1633,13 @@ impl StateProvider for TraceProvider {
 
     async fn on_data_loss(&self) -> crate::Result<bool> {
         self.trace.callback("provider.on_data_loss").await;
-        Ok(false)
+        self.trace
+            .data_loss
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(Ok(false))
+            .map_err(crate::RuntimeError::Application)
     }
 }
 
@@ -1727,10 +1741,18 @@ impl StatefulServiceReplica for TraceApplication {
         Ok(interfaces.replicator())
     }
 
-    async fn change_role(&self, _role: ReplicaRole) -> crate::Result<RoleChange> {
+    async fn change_role(&self, role: ReplicaRole) -> crate::Result<RoleChange> {
+        self.trace
+            .arguments
+            .lock()
+            .unwrap()
+            .push(format!("application.role:{role:?}"));
         self.trace.callback("application.change_role").await;
+        if self.trace.fail_role.load(Ordering::Acquire) {
+            return Err(crate::RuntimeError::Application("role failed".into()));
+        }
         Ok(RoleChange {
-            service_address: None,
+            service_address: self.trace.service_address.lock().unwrap().clone(),
         })
     }
 
@@ -1785,7 +1807,12 @@ impl Replicator for TraceReplicator {
         Ok("trace://replicator".into())
     }
 
-    async fn change_role(&self, _epoch: Epoch, role: ReplicaRole) -> crate::Result<()> {
+    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> crate::Result<()> {
+        self.trace
+            .arguments
+            .lock()
+            .unwrap()
+            .push(format!("replicator.role:{epoch:?}:{role:?}"));
         self.trace.callback("replicator.change_role").await;
         self.primary
             .store(role == ReplicaRole::Primary, Ordering::Release);
@@ -1793,6 +1820,11 @@ impl Replicator for TraceReplicator {
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> crate::Result<()> {
+        self.trace
+            .arguments
+            .lock()
+            .unwrap()
+            .push(format!("replicator.epoch:{epoch:?}"));
         self.trace.callback("replicator.update_epoch").await;
         self.provider.update_epoch(epoch, 0).await
     }

@@ -20,6 +20,8 @@ use kuberic_runtime::protocol::validation::{
     validate_report_internal, validate_snapshot, validate_transition_relationship,
 };
 
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) mod public_lifecycle;
 mod replacement_cleanup;
 mod scale_up;
 mod secondary_scale_down;

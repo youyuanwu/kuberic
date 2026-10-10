@@ -100,6 +100,7 @@ path = "private.rs"
         "module `hosting` is private",
         "module `operation` is private",
         "module `operation_recovery` is private",
+        "module `public_lifecycle` is private",
         "module `provisioning` is private",
         "module `recovery` is private",
         "module `report` is private",

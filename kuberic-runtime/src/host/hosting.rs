@@ -990,6 +990,18 @@ impl Drop for PodRuntime {
 }
 
 impl PodRuntime {
+    #[cfg(feature = "testing")]
+    pub(crate) fn public_lifecycle_callbacks(
+        &self,
+    ) -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks> {
+        let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
+        Ok(crate::host::public_lifecycle::PublicLifecycleCallbacks {
+            application: self.host.application.clone(),
+            replicator: registered.control.clone(),
+            primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
+        })
+    }
+
     pub(crate) fn new<A, S>(
         identity: ReplicaIdentity,
         application: Arc<A>,

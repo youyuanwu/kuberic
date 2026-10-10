@@ -83,6 +83,26 @@ selects the preview owner (`kuberic-runtime/src/protocol/public_operations.rs`;
 `kuberic-runtime/src/host/sqlite_store.rs`;
 `kuberic-runtime/src/host/mod.rs`).
 
+Phase 4.2 implements distinct initial-primary, failover-promotion and
+same-role-secondary epoch recipes inside that boundary. The controller preview
+planner freezes `PossibleDataLossIntent` with the exact operation/session,
+epoch, replica and revision. Ordinary planning always selects `NotPossible`;
+only the explicit preview transition selects `Possible`. Every possible-loss
+operation retains a durable history-admission barrier, including `false`,
+`true`, callback error and interrupted/unrecorded outcomes. A later ordinary
+request cannot remove it; Close/Abort/fault may retire, but never clear, it.
+
+Application role completion retains its exact optional address independently
+of the Replicator endpoint. A preview report exposes it only after the exact
+current primary operation completes with write permission. The controller
+preview uses a separate accepted-status projection, persists `Pending`, writes
+the write-Service selector and opaque `operator.kuberic.io/preview-service-location`
+annotation together, then records `Published` after exact reobservation.
+Supersession and terminal admission fence the local projection without waiting
+for Kubernetes. This is a repository-only Service model, not production
+`AcceptedStatus`, routing or CRD activation. The existing custom-authority
+and legacy access engines remain unchanged.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

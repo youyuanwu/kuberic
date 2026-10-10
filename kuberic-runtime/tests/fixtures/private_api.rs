@@ -6,7 +6,7 @@ use kuberic_runtime::authority::AdmittedAuthority;
 use kuberic_runtime::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use kuberic_runtime::effects::RuntimeEffect;
 use kuberic_runtime::host::{
-    command, coordinator, hosting, operation, operation_recovery, provisioning, recovery, report,
+    command, coordinator, hosting, operation, operation_recovery, provisioning, public_lifecycle, recovery, report,
     runtime_adapter, service, session, sqlite_store, state, store, testing as host_testing,
     transport as host_transport,
 };

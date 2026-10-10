@@ -17,6 +17,10 @@ mod operation_recovery;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;
+#[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
+#[allow(clippy::disallowed_types)]
+pub(crate) mod public_lifecycle;
 mod recovery;
 mod removal;
 pub(crate) mod report;

@@ -658,6 +658,31 @@ impl PartitionOperationRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        if !intent.class.is_terminal()
+            && self
+                .store
+                .load_state()
+                .await?
+                .public_operation_preview
+                .is_some_and(|preview| !preview.history_barriers.is_empty())
+        {
+            // A rejected successor may contain its predecessor, but never acquires
+            // authority or removes the logical history-admission barrier.
+            drop(admission);
+            for operation in existing {
+                if operation.intent().revision < intent.revision
+                    && operation.intent().lifecycle.as_ref().is_some_and(|input| {
+                        input.possible_data_loss
+                            == crate::protocol::public_operations::PossibleDataLossIntent::Possible
+                    })
+                {
+                    operation.cancel_root().await?;
+                }
+            }
+            return Err(HostError::CommandRejected(
+                "unresolved history-admission barrier".into(),
+            ));
+        }
         let highest_retained_authority_revision = existing
             .iter()
             .filter_map(|operation| {
@@ -1153,6 +1178,7 @@ mod tests {
             process_session_id: ProcessSessionId::new("session"),
             class,
             input_digest: format!("digest-{revision}"),
+            lifecycle: None,
         }
     }
 

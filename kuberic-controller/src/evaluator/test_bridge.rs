@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use super::EvaluationConfig;
 
+pub use super::public_lifecycle::{
+    PreviewAcceptedStatus, PreviewServiceLocationPlan, PreviewServiceLocationStage,
+    PreviewTransition, ServiceLocationProjection, evaluate_service_location, plan_public_lifecycle,
+};
+pub use crate::cluster_api::{PreviewServiceApi, preview_service_matches, preview_service_update};
+pub use crate::executor::execute_preview_service_location;
+pub use k8s_openapi::api::core::v1::Service as PreviewWriteService;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicOperationPreviewEvaluationConfig {
     pub identity: PublicOperationPreviewIdentity,

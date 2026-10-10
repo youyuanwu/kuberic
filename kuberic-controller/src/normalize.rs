@@ -17,6 +17,49 @@ use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL};
 use crate::observation::{RawAgentObservation, RawObservation};
 use crate::{ControllerError, Result};
 
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) fn normalize_public_service_location(
+    config: &crate::evaluator::test_bridge::PublicOperationPreviewEvaluationConfig,
+    authority: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
+    report: Option<&kuberic_runtime::protocol::public_operations::PublicLifecycleReport>,
+) -> std::result::Result<
+    Option<kuberic_runtime::protocol::public_operations::ServiceLocation>,
+    String,
+> {
+    let Some(report) = report else {
+        return Ok(None);
+    };
+    config.validate_identity(&report.preview)?;
+    let Some(input) = &authority.lifecycle else {
+        return Ok(None);
+    };
+    if authority.class.is_terminal()
+        || report.replica != input.replica
+        || report.process_session_id != authority.process_session_id
+        || report.revision != authority.revision
+        || report.operation_id.as_ref() != Some(&authority.operation_id)
+        || !report.write_access
+        || report.role != kuberic_runtime::protocol::types::ReplicaRole::Primary
+        || input.possible_data_loss
+            != kuberic_runtime::protocol::public_operations::PossibleDataLossIntent::NotPossible
+    {
+        return Ok(None);
+    }
+    let Some(location) = &report.service_location else {
+        return Ok(None);
+    };
+    if location.preview != authority.preview
+        || location.replica != input.replica
+        || location.process_session_id != authority.process_session_id
+        || location.revision != authority.revision
+        || location.epoch != input.epoch
+        || location.operation_id != authority.operation_id
+    {
+        return Ok(None);
+    }
+    Ok(Some(location.clone()))
+}
+
 pub fn normalize(
     raw: RawObservation,
     previous_report_watermarks: BTreeMap<ReplicaObservationKey, ReportWatermark>,

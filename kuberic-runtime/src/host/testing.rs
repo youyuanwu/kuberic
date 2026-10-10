@@ -25,6 +25,9 @@ use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationP
 #[allow(dead_code)]
 pub(crate) struct PublicOperationPreviewRuntime {
     owner: PartitionOperationRuntime,
+    store: Arc<dyn AgentStore>,
+    preview: PublicOperationPreviewIdentity,
+    session: ProcessSessionId,
 }
 
 #[allow(dead_code)]
@@ -34,9 +37,16 @@ impl PublicOperationPreviewRuntime {
         preview: PublicOperationPreviewIdentity,
         process_session_id: ProcessSessionId,
     ) -> crate::host::Result<Self> {
-        let registry = PartitionOperationRegistry::new(store, preview, process_session_id)?;
+        let registry = PartitionOperationRegistry::new(
+            store.clone(),
+            preview.clone(),
+            process_session_id.clone(),
+        )?;
         Ok(Self {
             owner: PartitionOperationRuntime::start(registry),
+            store,
+            preview,
+            session: process_session_id,
         })
     }
 
@@ -65,6 +75,44 @@ impl PublicOperationPreviewRuntime {
 
     pub(crate) async fn shutdown(self) -> crate::host::Result<()> {
         self.owner.shutdown().await
+    }
+
+    pub(crate) async fn launch_lifecycle(
+        &self,
+        intent: PublicOperationIntent,
+        runtime: &PodRuntime,
+    ) -> crate::host::Result<Arc<crate::host::operation::PartitionOperation>> {
+        let snapshot = runtime.snapshot().await;
+        let input = intent.lifecycle.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected("preview lifecycle input required".into())
+        })?;
+        if !snapshot.open || snapshot.identity != input.replica {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "preview lifecycle requires exact opened replica".into(),
+            ));
+        }
+        if input.recipe
+            == crate::protocol::public_operations::PublicLifecycleRecipe::SecondaryEpochAdvance
+            && snapshot.role != crate::protocol::types::ReplicaRole::ActiveSecondary
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "same-role epoch update requires an active secondary".into(),
+            ));
+        }
+        crate::host::public_lifecycle::launch(
+            &self.registry(),
+            self.store.clone(),
+            intent,
+            runtime.public_lifecycle_callbacks()?,
+        )
+        .await
+    }
+
+    pub(crate) async fn lifecycle_report(
+        &self,
+    ) -> crate::host::Result<crate::protocol::public_operations::PublicLifecycleReport> {
+        crate::host::public_lifecycle::report(self.store.as_ref(), &self.preview, &self.session)
+            .await
     }
 }
 

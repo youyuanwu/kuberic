@@ -119,6 +119,7 @@ fn host_capabilities_are_not_source_public_even_when_doc_hidden() {
             "crate::host::hosting",
             "crate::host::operation",
             "crate::host::operation_recovery",
+            "crate::host::public_lifecycle",
             "crate::host::provisioning",
             "crate::host::recovery",
             "crate::host::report",
