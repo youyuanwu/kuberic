@@ -50,6 +50,7 @@ pub struct ServiceLocationProjection {
     pub primary: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
     pub revision: u64,
+    pub revoked: bool,
     pub address_digest: String,
     pub deferred_address_digest: Option<String>,
     pub service_uid: String,
@@ -135,14 +136,16 @@ pub fn evaluate_service_location(
         .or_else(|| existing.map(|projection| projection.primary.clone()))
         .or_else(|| report.map(|report| report.replica.clone()))
         .ok_or("service-location projection requires primary identity")?;
-    let (location, deferred_location) =
-        projection_locations(existing, status, service, authority, location)?;
+    let revoked = projection_revoked(existing, authority, report, location.as_ref());
+    let (location, deferred_location, revoked) =
+        projection_locations(existing, status, service, authority, location, revoked)?;
     let desired = ServiceLocationProjection {
         authority: authority.clone(),
         resource_uid: resource_uid.clone(),
         primary,
         process_session_id: authority.process_session_id.clone(),
         revision: authority.revision,
+        revoked,
         address_digest: service_location_address_digest(location.as_ref()),
         deferred_address_digest: deferred_location
             .as_ref()
@@ -218,6 +221,9 @@ fn validate_projection(
         || (projection.authority.lifecycle.is_none() && !projection.authority.class.is_terminal())
         || projection.process_session_id != projection.authority.process_session_id
         || projection.revision != projection.authority.revision
+        || (projection.revoked
+            && (projection.location.is_some() || projection.deferred_location.is_some()))
+        || (!projection.revoked && projection.authority.class.is_terminal())
         || projection.address_digest
             != service_location_address_digest(projection.location.as_ref())
         || projection.deferred_address_digest
@@ -249,6 +255,7 @@ fn same_projection(
         && existing.primary == desired.primary
         && existing.process_session_id == desired.process_session_id
         && existing.revision == desired.revision
+        && existing.revoked == desired.revoked
         && existing.address_digest == desired.address_digest
         && existing.deferred_address_digest == desired.deferred_address_digest
         && existing.service_uid == desired.service_uid
@@ -262,34 +269,29 @@ fn projection_locations(
     service: &Service,
     authority: &PublicOperationIntent,
     location: Option<ServiceLocation>,
-) -> Result<(Option<ServiceLocation>, Option<ServiceLocation>), String> {
+    revoked: bool,
+) -> Result<(Option<ServiceLocation>, Option<ServiceLocation>, bool), String> {
     let Some(existing) = existing else {
-        return Ok((location, None));
+        return Ok((location, None, revoked));
     };
     if existing.authority == *authority && existing.location.is_none() {
         return match (&existing.deferred_location, location) {
-            (None, Some(_)) => {
+            (None, Some(_)) if existing.revoked => {
                 Err("cleared service-location authority cannot be republished".into())
             }
+            (None, Some(location)) => Ok((Some(location), None, false)),
             (Some(deferred), Some(location)) if deferred == &location => {
-                let clear_published =
-                    matches!(
-                        status.service_location_projection,
-                        PreviewServiceLocationStage::Published(_)
-                    ) && crate::cluster_api::preview_service_matches(service, existing)
-                        && service.metadata.uid.as_ref() == Some(&existing.service_uid)
-                        && service.metadata.resource_version.as_ref()
-                            == Some(&existing.service_resource_version);
+                let clear_published = projection_is_published(status, service, existing);
                 if clear_published {
-                    Ok((Some(location), None))
+                    Ok((Some(location), None, false))
                 } else {
-                    Ok((None, Some(location)))
+                    Ok((None, Some(location), false))
                 }
             }
             (Some(_), Some(_)) => {
                 Err("service-location address changed within one authority".into())
             }
-            (_, None) => Ok((None, None)),
+            (_, None) => Ok((None, None, revoked)),
         };
     }
     if existing.authority == *authority
@@ -299,10 +301,46 @@ fn projection_locations(
     {
         return Err("service-location address changed within one authority".into());
     }
-    if existing.authority != *authority && existing.location.is_some() && location.is_some() {
-        return Ok((None, location));
+    if existing.authority != *authority
+        && location.is_some()
+        && (existing.location.is_some() || !projection_is_published(status, service, existing))
+    {
+        return Ok((None, location, false));
     }
-    Ok((location, None))
+    Ok((location, None, revoked))
+}
+
+fn projection_revoked(
+    existing: Option<&ServiceLocationProjection>,
+    authority: &PublicOperationIntent,
+    report: Option<&PublicLifecycleReport>,
+    location: Option<&ServiceLocation>,
+) -> bool {
+    authority.class.is_terminal()
+        || existing.is_some_and(|projection| {
+            projection.authority == *authority
+                && (projection.revoked || (projection.location.is_some() && location.is_none()))
+        })
+        || report.is_some_and(|report| {
+            report.preview != authority.preview
+                || report.process_session_id != authority.process_session_id
+                || report.revision != authority.revision
+                || report.operation_id.as_ref() != Some(&authority.operation_id)
+                || (report.service_location.is_some() && location.is_none())
+        })
+}
+
+fn projection_is_published(
+    status: &PreviewAcceptedStatus,
+    service: &Service,
+    projection: &ServiceLocationProjection,
+) -> bool {
+    matches!(
+        status.service_location_projection,
+        PreviewServiceLocationStage::Published(_)
+    ) && crate::cluster_api::preview_service_matches(service, projection)
+        && service.metadata.uid.as_ref() == Some(&projection.service_uid)
+        && service.metadata.resource_version.as_ref() == Some(&projection.service_resource_version)
 }
 
 fn location_matches_projection(

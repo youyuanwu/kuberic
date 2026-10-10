@@ -280,6 +280,31 @@ async fn public_operation_role_address_pending_precedes_service_then_exact_reobs
 }
 
 #[tokio::test]
+async fn public_operation_role_address_pending_role_can_publish_exact_completion() {
+    let (config, authority, pending) = fixture(1, None);
+    let (_, same_authority, completed) = fixture(1, Some("ready"));
+    assert_eq!(authority, same_authority);
+    let api = Api::new();
+    converge(&api, &config, &authority, &pending).await;
+    let (status, _) = api.observe_preview().await.unwrap();
+    let PreviewServiceLocationStage::Published(projection) = status.service_location_projection
+    else {
+        panic!("pending role absence was not published")
+    };
+    assert!(!projection.revoked && projection.location.is_none());
+
+    converge(&api, &config, &authority, &completed).await;
+    let (status, service) = api.observe_preview().await.unwrap();
+    let PreviewServiceLocationStage::Published(projection) = status.service_location_projection
+    else {
+        panic!("exact role completion was not published")
+    };
+    assert_eq!(projection.location, completed.service_location);
+    assert!(!projection.revoked);
+    assert!(preview_service_matches(&service, &projection));
+}
+
+#[tokio::test]
 async fn public_operation_role_address_delayed_old_revision_and_resource_replacement_are_fenced() {
     for delayed_status in [false, true] {
         let (config, old, old_report) = fixture(1, Some("old"));
@@ -386,6 +411,49 @@ async fn public_operation_role_address_clears_old_location_before_new_publicatio
     };
     assert_eq!(projection.location, new_report.service_location);
     assert!(projection.deferred_location.is_none());
+}
+
+#[tokio::test]
+async fn public_operation_role_address_newer_authority_preserves_inflight_clear() {
+    let (config, first, first_report) = fixture(1, Some("first"));
+    let (_, second, second_report) = fixture(2, Some("second"));
+    let (_, third, third_report) = fixture(3, Some("third"));
+    let api = Api::new();
+    converge(&api, &config, &first, &first_report).await;
+
+    let second_clear = plan(&api, &config, &second, &second_report).await;
+    execute_preview_service_location(&api, second_clear)
+        .await
+        .unwrap();
+    let (status, service) = api.observe_preview().await.unwrap();
+    let PreviewServiceLocationStage::Pending(second_projection) =
+        status.service_location_projection
+    else {
+        panic!("second authority did not retain a pending clear")
+    };
+    assert!(second_projection.location.is_none());
+    assert_eq!(
+        second_projection.deferred_location,
+        second_report.service_location
+    );
+    assert_eq!(
+        service.metadata.annotations.unwrap()["operator.kuberic.io/preview-service-location"],
+        "first"
+    );
+
+    let third_clear = plan(&api, &config, &third, &third_report).await;
+    let PreviewServiceLocationPlan::PersistStatus { next, .. } = third_clear else {
+        panic!("third authority bypassed the persisted clear")
+    };
+    let PreviewServiceLocationStage::Pending(third_projection) = next.service_location_projection
+    else {
+        panic!("third authority clear was not pending")
+    };
+    assert!(third_projection.location.is_none());
+    assert_eq!(
+        third_projection.deferred_location,
+        third_report.service_location
+    );
 }
 
 #[tokio::test]
