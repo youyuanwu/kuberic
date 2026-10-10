@@ -1456,6 +1456,10 @@ pub struct AcceptedStatus {
     pub preview_lifecycle: Option<crate::protocol::public_operations::PreviewLifecycleBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_fault_action: Option<crate::protocol::public_operations::PublicFaultAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_service_clear: Option<crate::protocol::public_operations::PublicServiceClear>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_public_fault_action: Option<crate::protocol::public_operations::PublicFaultAction>,
     pub conditions: Vec<StatusCondition>,
 }
 

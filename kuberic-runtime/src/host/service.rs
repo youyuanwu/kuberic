@@ -629,7 +629,11 @@ where
                 let _ = self.runtime.shutdown_configuration_work().await;
             }
             self.runtime.quiesce_partition_reports().await;
-            let persisted = self.persist_partition_fault().await;
+            let persisted = if preview_quarantine {
+                Ok(())
+            } else {
+                self.persist_partition_fault().await
+            };
             self.runtime.abort();
             if let Err(persisted) = persisted {
                 return Err(crate::host::HostError::CommandRejected(format!(
@@ -652,11 +656,18 @@ where
                 recovery_owner.run(recovery_shutdown).await
             }))
         };
-        let partition_owner =
-            PartitionReportOwner::new(self.runtime.recovery_owner_runtime(), self.store.clone());
         let (partition_stop, partition_shutdown) = watch::channel(false);
-        let mut partition_owner_task =
-            tokio::spawn(async move { partition_owner.run(partition_shutdown).await });
+        let mut partition_owner_task = if preview_quarantine {
+            None
+        } else {
+            let partition_owner = PartitionReportOwner::new(
+                self.runtime.recovery_owner_runtime(),
+                self.store.clone(),
+            );
+            Some(tokio::spawn(async move {
+                partition_owner.run(partition_shutdown).await
+            }))
+        };
 
         self.ready_state.store(true, Ordering::Release);
         ready.send_replace(true);
@@ -717,9 +728,10 @@ where
             recovery_owner_task.abort();
             let _ = recovery_owner_task.await;
         }
-        if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut partition_owner_task)
-            .await
-            .is_err()
+        if let Some(partition_owner_task) = &mut partition_owner_task
+            && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut *partition_owner_task)
+                .await
+                .is_err()
         {
             partition_owner_task.abort();
             let _ = partition_owner_task.await;
@@ -728,7 +740,11 @@ where
             self.runtime.shutdown_configuration_work().await?;
         }
         self.runtime.quiesce_partition_reports().await;
-        let persisted = self.persist_partition_fault().await;
+        let persisted = if preview_quarantine {
+            Ok(())
+        } else {
+            self.persist_partition_fault().await
+        };
         self.runtime.abort();
         #[cfg(feature = "testing")]
         public_operation_preview_result?;

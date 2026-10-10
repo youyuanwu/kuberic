@@ -78,6 +78,7 @@ pub(crate) struct PreviewChildEvidence {
     pub(crate) application_instance_id: String,
     pub(crate) replicator_instance_id: String,
     pub(crate) callbacks: Vec<String>,
+    pub(crate) launch_nonce: String,
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
@@ -85,6 +86,7 @@ pub(crate) struct PreviewChildEvidence {
 pub(crate) struct PreviewChildProcess {
     pub(crate) child: tokio::process::Child,
     pub(crate) evidence: PreviewChildEvidence,
+    pub(crate) restart_signal: PathBuf,
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
@@ -113,6 +115,15 @@ struct PreviewSupervisorIdentity {
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PreviewLaunchOwner {
+    nonce: String,
+    supervisor_id: String,
+    pid: u32,
+    start_time: String,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
 #[allow(dead_code)]
 pub(crate) struct ReplicaProcessSupervisor {
     store: Arc<SqliteStore>,
@@ -121,6 +132,7 @@ pub(crate) struct ReplicaProcessSupervisor {
     active_child: Mutex<Option<tokio::process::Child>>,
     launch: Mutex<()>,
     container_restart_proven: bool,
+    instance_id: String,
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
@@ -144,6 +156,7 @@ impl ReplicaProcessSupervisor {
             active_child: Mutex::new(None),
             launch: Mutex::new(()),
             container_restart_proven,
+            instance_id: uuid::Uuid::new_v4().to_string(),
         })
     }
 
@@ -190,6 +203,7 @@ impl ReplicaProcessSupervisor {
                     "restart action does not name the supervised predecessor child".into(),
                 ));
             }
+            std::fs::write(&predecessor.restart_signal, b"restart")?;
             let status = predecessor.child.wait().await?;
             if status.code() != Some(PREVIEW_RESTART_DISPOSITION) {
                 return Err(crate::host::HostError::CommandRejected(format!(
@@ -197,7 +211,7 @@ impl ReplicaProcessSupervisor {
                 )));
             }
         }
-        self.resume_contained(action, cut).await
+        self.resume_existing(action, cut).await
     }
 
     pub(crate) async fn resume_after_container_restart(
@@ -205,24 +219,41 @@ impl ReplicaProcessSupervisor {
         action: &PublicFaultAction,
         cut: Option<PreviewRestartCut>,
     ) -> Result<PreviewRestartResult> {
-        if !self.container_restart_proven
-            || Path::new(&format!("/proc/{}", action.predecessor_process_id)).exists()
+        let record = self.store.restart_action().await?.ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "container recovery cannot admit a new restart action".into(),
+            )
+        })?;
+        if record.action != *action {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "container recovery action differs from durable acceptance".into(),
+            ));
+        }
+        if record.stage == RestartActionStage::Accepted
+            && (!self.container_restart_proven
+                || Path::new(&format!("/proc/{}", action.predecessor_process_id)).exists())
         {
-            self.store.begin_restart_action(action).await?;
             return Err(crate::host::HostError::CommandRejected(
                 "durable supervisor marker does not prove a parent/container restart".into(),
             ));
         }
-        self.resume_contained(action, cut).await
+        self.resume_existing(action, cut).await
     }
 
-    async fn resume_contained(
+    async fn resume_existing(
         &self,
         action: &PublicFaultAction,
         cut: Option<PreviewRestartCut>,
     ) -> Result<PreviewRestartResult> {
         let _launch = self.launch.lock().await;
-        let mut record = self.store.begin_restart_action(action).await?;
+        let mut record = self.store.restart_action().await?.ok_or_else(|| {
+            crate::host::HostError::CommandRejected("restart action is not accepted".into())
+        })?;
+        if record.action != *action {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "restart action changed during recovery".into(),
+            ));
+        }
         if cut == Some(PreviewRestartCut::Accepted) && record.stage == RestartActionStage::Accepted
         {
             return Err(crate::host::HostError::CommandRejected(
@@ -238,6 +269,7 @@ impl ReplicaProcessSupervisor {
                     RestartActionStage::PredecessorContained,
                     None,
                     None,
+                    None,
                 )
                 .await?;
         }
@@ -248,11 +280,34 @@ impl ReplicaProcessSupervisor {
                 "injected crash after predecessor containment".into(),
             ));
         }
+        let (launch_nonce, may_spawn) = self.claim_successor_launch(action)?;
+        if record.stage == RestartActionStage::PredecessorContained {
+            record = self
+                .store
+                .advance_restart_action(
+                    action,
+                    RestartActionStage::PredecessorContained,
+                    RestartActionStage::SuccessorLaunching,
+                    None,
+                    None,
+                    Some(&launch_nonce),
+                )
+                .await?;
+        }
         if record.stage == RestartActionStage::SuccessorStarted {
             let successor = self.read_successor_evidence(action)?;
             return Ok(PreviewRestartResult { record, successor });
         }
-        let successor = self.launch_successor(action).await?;
+        if record.stage != RestartActionStage::SuccessorLaunching
+            || record.launch_nonce.as_deref() != Some(launch_nonce.as_str())
+        {
+            return Err(crate::host::HostError::DurableEffectConflict(
+                "successor launch claim differs from durable restart state".into(),
+            ));
+        }
+        let successor = self
+            .launch_successor(action, &launch_nonce, may_spawn)
+            .await?;
         if cut == Some(PreviewRestartCut::SuccessorLaunched) {
             return Err(crate::host::HostError::CommandRejected(
                 "injected crash after successor launch".into(),
@@ -262,10 +317,11 @@ impl ReplicaProcessSupervisor {
             .store
             .advance_restart_action(
                 action,
-                RestartActionStage::PredecessorContained,
+                RestartActionStage::SuccessorLaunching,
                 RestartActionStage::SuccessorStarted,
                 Some(&successor.process_session),
                 Some(successor.child_pid),
+                None,
             )
             .await?;
         if cut == Some(PreviewRestartCut::SuccessorStarted) {
@@ -288,6 +344,68 @@ impl ReplicaProcessSupervisor {
             .join(format!("{}.successor.shutdown", action.action_id))
     }
 
+    fn launch_owner_path(&self, action: &PublicFaultAction) -> PathBuf {
+        self.data_root
+            .join(".kuberic")
+            .join(format!("{}.launch-owner.json", action.action_id))
+    }
+
+    fn claim_successor_launch(&self, action: &PublicFaultAction) -> Result<(String, bool)> {
+        let path = self.launch_owner_path(action);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let nonce = format!("{}-successor", action.action_id);
+        let current = PreviewLaunchOwner {
+            nonce: nonce.clone(),
+            supervisor_id: self.instance_id.clone(),
+            pid: std::process::id(),
+            start_time: process_start_time(std::process::id()).ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "cannot read launch-owner process identity".into(),
+                )
+            })?,
+        };
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(
+                        &serde_json::to_vec(&current)
+                            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+                    )?;
+                    file.sync_all()?;
+                    return Ok((nonce, true));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(&path)?)
+                        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+                    if owner.nonce != nonce {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "successor launch nonce changed".into(),
+                        ));
+                    }
+                    let identity = PreviewSupervisorIdentity {
+                        pid: owner.pid,
+                        start_time: owner.start_time.clone(),
+                    };
+                    if process_identity_is_alive(&identity) {
+                        return Ok((nonce, owner.supervisor_id == current.supervisor_id));
+                    }
+                    std::fs::remove_file(&path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(crate::host::HostError::CommandRejected(
+            "cannot claim successor launch".into(),
+        ))
+    }
+
     fn read_successor_evidence(&self, action: &PublicFaultAction) -> Result<PreviewChildEvidence> {
         let bytes = std::fs::read(self.evidence_path(action))?;
         let evidence: PreviewChildEvidence = serde_json::from_slice(&bytes)
@@ -296,7 +414,12 @@ impl ReplicaProcessSupervisor {
         Ok(evidence)
     }
 
-    async fn launch_successor(&self, action: &PublicFaultAction) -> Result<PreviewChildEvidence> {
+    async fn launch_successor(
+        &self,
+        action: &PublicFaultAction,
+        launch_nonce: &str,
+        may_spawn: bool,
+    ) -> Result<PreviewChildEvidence> {
         let evidence_path = self.evidence_path(action);
         if evidence_path.exists() {
             let evidence = self.read_successor_evidence(action)?;
@@ -306,7 +429,10 @@ impl ReplicaProcessSupervisor {
             std::fs::remove_file(&evidence_path)?;
         }
         if self.active_child.lock().await.is_some() {
-            return self.await_successor_evidence(action).await;
+            return self.await_successor_evidence(action, launch_nonce).await;
+        }
+        if !may_spawn {
+            return self.await_successor_evidence(action, launch_nonce).await;
         }
         if let Some(parent) = evidence_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -325,29 +451,36 @@ impl ReplicaProcessSupervisor {
             .env("KUBERIC_PREVIEW_SHUTDOWN", &shutdown_path)
             .env("KUBERIC_PREVIEW_POD_UID", action.resources.pod_uid.as_str())
             .env("KUBERIC_PREVIEW_PVC_UID", action.resources.pvc_uid.as_str())
-            .kill_on_drop(true);
+            .env("KUBERIC_PREVIEW_LAUNCH_NONCE", launch_nonce);
         let child = command.spawn()?;
         *self.active_child.lock().await = Some(child);
-        self.await_successor_evidence(action).await
+        self.await_successor_evidence(action, launch_nonce).await
     }
 
     async fn await_successor_evidence(
         &self,
         action: &PublicFaultAction,
+        launch_nonce: &str,
     ) -> Result<PreviewChildEvidence> {
         let evidence_path = self.evidence_path(action);
         for _ in 0..500 {
             if evidence_path.exists() {
-                return self.read_successor_evidence(action);
+                let evidence = self.read_successor_evidence(action)?;
+                if evidence.launch_nonce != launch_nonce {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "successor evidence launch nonce changed".into(),
+                    ));
+                }
+                return Ok(evidence);
             }
-            if let Some(status) = self
-                .active_child
-                .lock()
-                .await
-                .as_mut()
-                .expect("successor child exists")
-                .try_wait()?
-            {
+            let status = {
+                let mut child = self.active_child.lock().await;
+                match child.as_mut() {
+                    Some(child) => child.try_wait()?,
+                    None => None,
+                }
+            };
+            if let Some(status) = status {
                 self.active_child.lock().await.take();
                 return Err(crate::host::HostError::CommandRejected(format!(
                     "successor child exited before readiness with {status}"
@@ -373,6 +506,21 @@ impl ReplicaProcessSupervisor {
                     "successor child shutdown failed with {status}"
                 )));
             }
+        } else if let Some(process_id) = self
+            .store
+            .restart_action()
+            .await?
+            .and_then(|record| record.successor_process_id)
+        {
+            for _ in 0..500 {
+                if !Path::new(&format!("/proc/{process_id}")).exists() {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return Err(crate::host::HostError::CommandRejected(
+                "adopted successor did not stop".into(),
+            ));
         }
         Ok(())
     }

@@ -333,6 +333,10 @@ async fn public_fault_reporting_closes_access_and_location_before_returning() {
     assert!(!closed.write_access);
     assert!(closed.service_location.is_none());
     let state = fixture.store.load_state().await.unwrap();
+    assert_eq!(
+        state.reported_fault,
+        Some(crate::protocol::types::FaultType::Transient)
+    );
     let preview = state.public_operation_preview.unwrap();
     assert!(preview.writes_revoked);
     assert!(preview.terminal);
@@ -355,6 +359,15 @@ async fn public_fault_reporting_closes_access_and_location_before_returning() {
         .wait_for_terminal()
         .await
         .unwrap();
+    let operation_count = preview.operations.len();
+    partition
+        .report_fault(crate::protocol::types::FaultType::Transient)
+        .await
+        .unwrap();
+    let repeated = fixture.store.load_state().await.unwrap();
+    let repeated = repeated.public_operation_preview.unwrap();
+    assert_eq!(repeated.current_operation.as_ref(), Some(&transient));
+    assert_eq!(repeated.operations.len(), operation_count);
     partition
         .report_fault(crate::protocol::types::FaultType::Permanent)
         .await

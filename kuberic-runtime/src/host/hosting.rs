@@ -2524,6 +2524,24 @@ impl PreviewFaultBridge {
                 "public fault preview/store binding changed".into(),
             ));
         }
+        let class = match fault {
+            FaultType::Transient => PublicOperationClass::TransientFault,
+            FaultType::Permanent => PublicOperationClass::PermanentFault,
+        };
+        if let Some(intent) = preview
+            .operations
+            .values()
+            .filter(|record| {
+                record.intent.process_session_id == self.process_session
+                    && record.intent.class == class
+                    && record.superseded_by.is_none()
+            })
+            .max_by_key(|record| record.intent.revision)
+            .map(|record| record.intent.clone())
+        {
+            self.registry.report_fault(intent).await?;
+            return Ok(());
+        }
         let revision = preview
             .operations
             .values()
@@ -2543,17 +2561,11 @@ impl PreviewFaultBridge {
             operation_id,
             revision,
             process_session_id: self.process_session.clone(),
-            class: match fault {
-                FaultType::Transient => PublicOperationClass::TransientFault,
-                FaultType::Permanent => PublicOperationClass::PermanentFault,
-            },
+            class,
             input_digest: format!("fault:{fault:?}:{revision}"),
             lifecycle: None,
             program: None,
         };
-        self.store
-            .record_partition_reports(state.load_metrics, Some(fault))
-            .await?;
         self.registry.report_fault(intent).await?;
         Ok(())
     }

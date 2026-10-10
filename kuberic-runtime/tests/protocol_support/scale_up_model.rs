@@ -190,6 +190,7 @@ impl Model {
                     service_present: true,
                     unresolved_write_target: false,
                     write_target: Some(members[0].identity.clone()),
+                    ..Default::default()
                 },
                 observation_failures: Vec::new(),
                 now_unix_seconds: 100,

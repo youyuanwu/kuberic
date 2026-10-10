@@ -82,6 +82,7 @@ pub struct FrozenReplicaResources {
 #[serde(rename_all = "camelCase")]
 pub struct PublicFaultAction {
     pub action_id: OperationId,
+    pub fault_operation_id: OperationId,
     pub binding: PreviewLifecycleBinding,
     pub target: ReplicaIdentity,
     pub resources: FrozenReplicaResources,
@@ -105,13 +106,14 @@ impl PublicFaultAction {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(
             format!(
-                "{kind:?}|{fault:?}|{persistence:?}|{resource_uid}|{protocol_version}|\
+                "{kind:?}|{fault:?}|{fault_operation_id}|{persistence:?}|{resource_uid}|{protocol_version}|\
                  {preview_generation}|{spec_generation}|{replica_id}|{instance_id}|\
                  {agent_generation}|{predecessor_session}|{fault_revision}|{pod_name}|\
                  {predecessor_process_id}|{pod_uid}|{pvc_name}|{pvc_uid}|{endpoint_name}|{endpoint_uid}|\
                  {endpoint_resource_version}",
                 kind = self.kind,
                 fault = self.fault,
+                fault_operation_id = self.fault_operation_id,
                 persistence = self.binding.state_persistence,
                 resource_uid = self.binding.resource_uid,
                 protocol_version = self.binding.preview.protocol_version,
@@ -145,6 +147,7 @@ impl PublicFaultAction {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.binding.validate()?;
         if self.action_id.is_empty()
+            || self.fault_operation_id.is_empty()
             || self.predecessor_session.is_empty()
             || self.predecessor_process_id == 0
             || self.fault_revision == 0
@@ -173,7 +176,26 @@ impl PublicFaultAction {
 pub enum RestartActionStage {
     Accepted,
     PredecessorContained,
+    SuccessorLaunching,
     SuccessorStarted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicServiceClearStage {
+    Pending,
+    PublishedAbsent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicServiceClear {
+    pub action_id: OperationId,
+    pub stage: PublicServiceClearStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_resource_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -185,6 +207,8 @@ pub struct RestartActionRecord {
     pub successor_session: Option<ProcessSessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce: Option<String>,
 }
 
 impl PublicOperationPreviewIdentity {

@@ -286,6 +286,14 @@ pub struct RoutingObservation {
     #[serde(default)]
     pub unresolved_write_target: bool,
     pub write_target: Option<ReplicaIdentity>,
+    #[serde(default)]
+    pub preview_service_location_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_service_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_service_resource_version: Option<String>,
+    #[serde(default)]
+    pub service_identities: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -189,6 +189,7 @@ pub(crate) trait AgentStore: Send + Sync {
         _next: RestartActionStage,
         _successor_session: Option<&crate::protocol::types::ProcessSessionId>,
         _successor_process_id: Option<u32>,
+        _launch_nonce: Option<&str>,
     ) -> Result<RestartActionRecord> {
         Err(crate::host::HostError::CommandRejected(
             "public-operation preview is not enabled for this store".into(),

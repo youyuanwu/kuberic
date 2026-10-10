@@ -636,6 +636,11 @@ fn normalize_routing(
     resource_uid: &ResourceUid,
     failures: &mut Vec<ObservationFailure>,
 ) -> RoutingObservation {
+    let service_identities = raw
+        .services
+        .iter()
+        .filter_map(|service| Some((service.name_any(), service.uid()?)))
+        .collect::<Vec<_>>();
     let write_services = raw
         .services
         .iter()
@@ -653,11 +658,23 @@ fn normalize_routing(
             service_present: true,
             unresolved_write_target: true,
             write_target: None,
+            preview_service_location_present: true,
+            write_service_uid: None,
+            write_service_resource_version: None,
+            service_identities,
         };
     }
-    let Some(_service) = write_services.first() else {
-        return RoutingObservation::default();
+    let Some(service) = write_services.first() else {
+        return RoutingObservation {
+            service_identities,
+            ..Default::default()
+        };
     };
+    let preview_service_location_present = service
+        .annotations()
+        .contains_key(crate::cluster_api::PREVIEW_SERVICE_LOCATION_ANNOTATION);
+    let write_service_uid = service.uid();
+    let write_service_resource_version = service.resource_version();
     let Some(instance) = write_services
         .first()
         .and_then(|service| service.spec.as_ref())
@@ -669,6 +686,10 @@ fn normalize_routing(
             service_present: true,
             unresolved_write_target: false,
             write_target: None,
+            preview_service_location_present,
+            write_service_uid,
+            write_service_resource_version,
+            service_identities,
         };
     };
     let matches = replicas
@@ -697,12 +718,20 @@ fn normalize_routing(
             service_present: true,
             unresolved_write_target: false,
             write_target: matches.into_iter().next(),
+            preview_service_location_present,
+            write_service_uid,
+            write_service_resource_version,
+            service_identities,
         }
     } else {
         RoutingObservation {
             service_present: true,
             unresolved_write_target: true,
             write_target: None,
+            preview_service_location_present,
+            write_service_uid,
+            write_service_resource_version,
+            service_identities,
         }
     }
 }

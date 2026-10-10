@@ -815,11 +815,14 @@ and production construction fail closed.
 
 A public transient or permanent fault is durably admitted before returning and
 immediately makes the exact incarnation unhealthy, role-none, access-closed
-and location-free. The selected preview evaluator cannot run ordinary stable,
+and location-free. Fault kind and terminal operation/fence are committed in
+one transaction; identical reports reuse the same episode. The selected preview evaluator cannot run ordinary stable,
 election, quorum or routing logic while fault evidence is active. It persists
 one deterministic action over exact replica, Pod/PVC, process-session, fault
 revision, predecessor OS PID and persistence evidence, removes routing, revalidates the same
-observation and dispatches the action. Permanent fault supersedes a transient
+observation and clears the application location through pending,
+conditional-Service-write and exact published-absence stages before dispatch.
+Permanent fault supersedes a transient
 action only for the same predecessor identity/session.
 
 Persisted state uses a real parent/child process fixture and one durable
@@ -829,7 +832,8 @@ whose exact OS process has terminated is required before re-exec, and the
 action-bound predecessor child PID must also be gone before the same data
 root/PVC is reused. Outstanding
 successor launch is serialized and recovered rather than replaced on
-redelivery. Quarantine clears predecessor role, PC/CC
+redelivery. An action-specific durable launch nonce plus owner PID/start-time
+precedes child construction. Quarantine clears predecessor role, PC/CC
 configuration, access and peer/build authority; the fresh application and
 Replicator session remains unassigned and access-closed because Phase 5 owns
 renewal. The accepted, contained and successor-started crash cuts converge to

@@ -22,9 +22,9 @@ use kuberic_runtime::protocol::public_operations::{
     RestartActionRecord, RestartActionStage, StatePersistence,
 };
 use kuberic_runtime::protocol::types::{
-    AccessStatus, Epoch, FaultType, PodUid, ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
-    derive_replica_endpoint_name,
+    AccessStatus, Epoch, FaultType, OperationId, PodUid, ProcessSessionId, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation,
+    derive_initialization_id, derive_replica_endpoint_name,
 };
 
 const RESOURCE_UID: &str = "set-fault-uid";
@@ -150,7 +150,7 @@ fn raw_fault(
             process_session_id: ProcessSessionId::new(PREDECESSOR_SESSION),
             process_id: std::process::id(),
             revision: 3,
-            operation_id: None,
+            operation_id: Some(OperationId::new("fault-operation")),
             role: ReplicaRole::None,
             write_access: false,
             service_location: None,
@@ -166,6 +166,10 @@ fn raw_fault(
             labels: Some(BTreeMap::from([(
                 SET_UID_LABEL.into(),
                 RESOURCE_UID.into(),
+            )])),
+            annotations: Some(BTreeMap::from([(
+                "operator.kuberic.io/preview-service-location".into(),
+                "opaque://published-before-fault".into(),
             )])),
             ..Default::default()
         },
@@ -269,6 +273,27 @@ async fn persisted_primary_and_secondary_faults_use_one_restart_action_across_re
                 .kind,
             ReconcileKind::Applied
         );
+        for _ in 0..2 {
+            assert_eq!(
+                reconciler
+                    .reconcile("tests", "fault-db")
+                    .await
+                    .unwrap()
+                    .kind,
+                ReconcileKind::Applied
+            );
+        }
+        assert!(
+            api.observation()
+                .await
+                .services
+                .iter()
+                .find(|service| service.name_any().ends_with("-write"))
+                .unwrap()
+                .annotations()
+                .get("operator.kuberic.io/preview-service-location")
+                .is_none()
+        );
 
         api.unavailable_next_execute().await;
         assert_eq!(
@@ -323,6 +348,7 @@ async fn persisted_primary_and_secondary_faults_use_one_restart_action_across_re
             stage: RestartActionStage::SuccessorStarted,
             successor_session: Some(successor.clone()),
             successor_process_id: Some(std::process::id()),
+            launch_nonce: Some("controller-test-launch".into()),
         }));
         report
             .public_lifecycle_report
@@ -356,8 +382,57 @@ async fn persisted_primary_and_secondary_faults_use_one_restart_action_across_re
                 .await
                 .unwrap()
                 .kind,
+            ReconcileKind::Applied
+        );
+        assert_eq!(
+            restarted_controller
+                .reconcile("tests", "fault-db")
+                .await
+                .unwrap()
+                .kind,
             ReconcileKind::Stable
         );
+        let historical = api
+            .observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .last_public_fault_action
+            .unwrap();
+        let mut next_fault = api.observation().await;
+        let RawAgentObservation::PreviewReport(report) =
+            next_fault.agents.values_mut().next().unwrap()
+        else {
+            panic!("expected preview report");
+        };
+        report.reported_fault = Some(FaultType::Transient);
+        report.healthy = false;
+        report.report_sequence += 1;
+        report.restart_action = None;
+        let lifecycle = report.public_lifecycle_report.as_mut().unwrap();
+        lifecycle.revision += 1;
+        lifecycle.operation_id = Some(OperationId::new(format!("fault-next-{replica_id}")));
+        api.set_observation(next_fault).await;
+        assert_eq!(
+            restarted_controller
+                .reconcile("tests", "fault-db")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+        let next = api
+            .observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .public_fault_action
+            .unwrap();
+        assert_ne!(next.action_id, historical.action_id);
     }
 }
 
@@ -374,7 +449,7 @@ async fn volatile_and_permanent_faults_freeze_exact_drop_and_replacement() {
         )));
         let reconciler = Reconciler::new(api.clone(), config());
         let mut last = ReconcileKind::Waiting;
-        for _ in 0..7 {
+        for _ in 0..15 {
             last = reconciler
                 .reconcile("tests", "fault-db")
                 .await
@@ -394,6 +469,15 @@ async fn volatile_and_permanent_faults_freeze_exact_drop_and_replacement() {
             matches!(effect, EffectRecord::EnsureReplacement(replacing)
                 if replacing == &identity(1))
         }));
+        let deleted = effects
+            .iter()
+            .position(|effect| matches!(effect, EffectRecord::DeleteScaffolding { .. }))
+            .unwrap();
+        let replaced = effects
+            .iter()
+            .position(|effect| matches!(effect, EffectRecord::EnsureReplacement(_)))
+            .unwrap();
+        assert!(deleted < replaced);
         let action = api
             .observation()
             .await
@@ -401,7 +485,7 @@ async fn volatile_and_permanent_faults_freeze_exact_drop_and_replacement() {
             .status
             .unwrap()
             .authority
-            .public_fault_action
+            .last_public_fault_action
             .unwrap();
         assert_eq!(
             action.kind,
@@ -607,7 +691,7 @@ async fn volatile_cleanup_never_deletes_a_recreated_endpoint() {
         1,
     )));
     let reconciler = Reconciler::new(api.clone(), config());
-    for _ in 0..3 {
+    for _ in 0..5 {
         reconciler.reconcile("tests", "fault-db").await.unwrap();
     }
 
@@ -645,7 +729,7 @@ async fn volatile_cleanup_never_deletes_recreated_pod_or_pvc_names() {
         1,
     )));
     let reconciler = Reconciler::new(api.clone(), config());
-    for _ in 0..3 {
+    for _ in 0..5 {
         reconciler.reconcile("tests", "fault-db").await.unwrap();
     }
     let mut observation = api.observation().await;
@@ -708,6 +792,50 @@ async fn accepted_drop_rejects_invalid_normalized_predecessor_evidence() {
             effect,
             EffectRecord::Execute(_)
                 | EffectRecord::DeleteExactService { .. }
+                | EffectRecord::DeleteScaffolding { .. }
+                | EffectRecord::EnsureReplacement(_)
+        )
+    }));
+}
+
+#[tokio::test]
+async fn accepted_drop_never_targets_a_successor_on_the_same_storage() {
+    let api = Arc::new(InMemoryClusterApi::new(raw_fault(
+        Some(StatePersistence::Persisted),
+        FaultType::Permanent,
+        1,
+    )));
+    let reconciler = Reconciler::new(api.clone(), config());
+    for _ in 0..5 {
+        reconciler.reconcile("tests", "fault-db").await.unwrap();
+    }
+    let effects_before = api.effects().await.len();
+    let mut observation = api.observation().await;
+    let RawAgentObservation::PreviewReport(report) =
+        observation.agents.values_mut().next().unwrap()
+    else {
+        panic!("expected preview report");
+    };
+    report.process_session_id = ProcessSessionId::new("successor-session");
+    report.report_sequence += 1;
+    report.reported_fault = None;
+    report.healthy = true;
+    let lifecycle = report.public_lifecycle_report.as_mut().unwrap();
+    lifecycle.process_session_id = ProcessSessionId::new("successor-session");
+    lifecycle.process_id = std::process::id().saturating_add(1);
+    api.set_observation(observation).await;
+    assert_eq!(
+        reconciler
+            .reconcile("tests", "fault-db")
+            .await
+            .unwrap()
+            .kind,
+        ReconcileKind::Unsafe
+    );
+    assert!(!api.effects().await[effects_before..].iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::DeleteExactService { .. }
                 | EffectRecord::DeleteScaffolding { .. }
                 | EffectRecord::EnsureReplacement(_)
         )

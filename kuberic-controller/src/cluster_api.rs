@@ -41,6 +41,8 @@ const CONTROL_PORT: i32 = 50051;
 const REPLICATION_PORT: i32 = 50052;
 const LIVE_TEST_COPY_GATE_ANNOTATION: &str = "testing.kuberic.io/live-copy-gate";
 const LIVE_TEST_COPY_GATE_ADDRESS: &str = "0.0.0.0:18080";
+pub(crate) const PREVIEW_SERVICE_LOCATION_ANNOTATION: &str =
+    "operator.kuberic.io/preview-service-location";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
@@ -937,7 +939,7 @@ where
         {
             return Ok(());
         }
-        patch_write_service(self.client.clone(), observation, "disabled").await
+        patch_write_service(self.client.clone(), observation, "disabled", true).await
     }
 
     async fn publish_write_routing(
@@ -965,6 +967,7 @@ where
             self.client.clone(),
             observation,
             primary.instance_id.as_str(),
+            false,
         )
         .await
     }
@@ -1947,6 +1950,7 @@ async fn patch_write_service(
     client: Client,
     observation: &RawObservation,
     instance: &str,
+    clear_preview_location: bool,
 ) -> Result<()> {
     let namespace = observation
         .set
@@ -1962,18 +1966,28 @@ async fn patch_write_service(
     let resource_version = service
         .resource_version()
         .ok_or(ControllerError::ObservationStale)?;
-    let patch = serde_json::json!([
-        {"op": "test", "path": "/metadata/uid", "value": uid},
-        {"op": "test", "path": "/metadata/resourceVersion", "value": resource_version},
-        {"op": "add", "path": "/spec/selector", "value": {INSTANCE_LABEL: instance}}
-    ]);
+    let mut patch = vec![
+        serde_json::json!({"op": "test", "path": "/metadata/uid", "value": uid}),
+        serde_json::json!({"op": "test", "path": "/metadata/resourceVersion", "value": resource_version}),
+        serde_json::json!({"op": "add", "path": "/spec/selector", "value": {INSTANCE_LABEL: instance}}),
+    ];
+    if clear_preview_location
+        && service
+            .annotations()
+            .contains_key(PREVIEW_SERVICE_LOCATION_ANNOTATION)
+    {
+        patch.push(serde_json::json!({
+            "op": "remove",
+            "path": "/metadata/annotations/operator.kuberic.io~1preview-service-location"
+        }));
+    }
     let services: Api<Service> = Api::namespaced(client, &namespace);
     services
         .patch(
             &service_name,
             &PatchParams::default(),
             &Patch::<serde_json::Value>::Json(
-                serde_json::from_value(patch)
+                serde_json::from_value(serde_json::Value::Array(patch))
                     .map_err(|error| ControllerError::Effect(error.to_string()))?,
             ),
         )
@@ -3213,6 +3227,11 @@ impl ClusterApi for InMemoryClusterApi {
                 INSTANCE_LABEL.to_string(),
                 "disabled".to_string(),
             )]));
+            service
+                .metadata
+                .annotations
+                .get_or_insert_default()
+                .remove(PREVIEW_SERVICE_LOCATION_ANNOTATION);
         }
         state.effects.push(EffectRecord::RemoveWriteRouting);
         Ok(())

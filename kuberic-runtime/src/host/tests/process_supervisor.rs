@@ -90,7 +90,6 @@ impl StatefulServiceReplica for PreviewChildApplication {
 struct ControllerSupervisorExecutor {
     supervisor: Arc<ReplicaProcessSupervisor>,
     predecessor: tokio::sync::Mutex<Option<PreviewChildProcess>>,
-    release: PathBuf,
     store: Arc<SqliteStore>,
     binding: PreviewLifecycleBinding,
     identity: ReplicaIdentity,
@@ -103,8 +102,6 @@ impl kuberic_controller::cluster_api::PreviewFaultCommandExecutor for Controller
         action: &kuberic_controller::protocol::public_operations::PublicFaultAction,
     ) -> kuberic_controller::Result<kuberic_controller::cluster_api::PreviewRestartExecution> {
         let action: PublicFaultAction = wire(action);
-        std::fs::write(&self.release, b"restart")
-            .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
         let mut predecessor = self.predecessor.lock().await.take().ok_or_else(|| {
             kuberic_controller::ControllerError::Effect(
                 "predecessor child was already consumed".into(),
@@ -214,9 +211,14 @@ fn preview_process_child_entrypoint() {
             "replicator.change_role.none".into(),
             "application.change_role.none".into(),
         ],
+        launch_nonce: std::env::var("KUBERIC_PREVIEW_LAUNCH_NONCE")
+            .unwrap_or_else(|_| "predecessor".into()),
     };
     if let Ok(delay) = std::env::var("KUBERIC_PREVIEW_READY_DELAY_MS") {
         std::thread::sleep(std::time::Duration::from_millis(delay.parse().unwrap()));
+    }
+    if std::env::var_os("KUBERIC_PREVIEW_EXIT_BEFORE_READY").is_some() {
+        std::process::exit(42);
     }
 
     if let Some(parent) = Path::new(&output).parent() {
@@ -255,11 +257,12 @@ fn preview_supervisor_parent_entrypoint() {
 async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
     let fixture = Fixture::new();
     let mut predecessor = fixture.spawn_predecessor().await;
-    let action = fixture.action(
-        predecessor.evidence.process_session.clone(),
-        predecessor.evidence.child_pid,
-    );
-    std::fs::write(&fixture.release, b"restart").unwrap();
+    let action = fixture
+        .action(
+            predecessor.evidence.process_session.clone(),
+            predecessor.evidence.child_pid,
+        )
+        .await;
 
     let result = fixture
         .supervisor
@@ -315,13 +318,13 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
     let predecessor = fixture.spawn_predecessor().await;
     let predecessor_session = predecessor.evidence.process_session.clone();
     let predecessor_process_id = predecessor.evidence.child_pid;
+    fixture.seed_fault(&predecessor_session).await;
     let api = Arc::new(InMemoryClusterApi::new(
         fixture.controller_observation(&predecessor_session, predecessor_process_id),
     ));
     api.set_preview_fault_executor(Arc::new(ControllerSupervisorExecutor {
         supervisor: fixture.supervisor.clone(),
         predecessor: tokio::sync::Mutex::new(Some(predecessor)),
-        release: fixture.release.clone(),
         store: fixture.store.clone(),
         binding: fixture.binding.clone(),
         identity: fixture.identity.clone(),
@@ -337,22 +340,20 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
             ..Default::default()
         },
     );
-    for expected in [
-        ReconcileKind::Applied,
-        ReconcileKind::Applied,
-        ReconcileKind::Applied,
-        ReconcileKind::Executed,
-        ReconcileKind::Stable,
-    ] {
-        assert_eq!(
-            reconciler
-                .reconcile("tests", "preview-db")
-                .await
-                .unwrap()
-                .kind,
-            expected
-        );
+    let mut kinds = Vec::new();
+    for _ in 0..10 {
+        let kind = reconciler
+            .reconcile("tests", "preview-db")
+            .await
+            .unwrap()
+            .kind;
+        kinds.push(kind);
+        if kind == ReconcileKind::Stable {
+            break;
+        }
     }
+    assert!(kinds.contains(&ReconcileKind::Executed), "{kinds:?}");
+    assert_eq!(kinds.last(), Some(&ReconcileKind::Stable));
     let executed = api
         .effects()
         .await
@@ -388,8 +389,7 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
 #[tokio::test]
 async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_closed() {
     let fixture = Fixture::new();
-    let predecessor = fixture.stopped_predecessor().await;
-    let action = fixture.action(predecessor.process_session, predecessor.child_pid);
+    let action = fixture.accepted_stopped_action().await;
     assert!(
         fixture
             .supervisor
@@ -440,8 +440,10 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     );
     assert_eq!(
         fixture.store.restart_action().await.unwrap().unwrap().stage,
-        RestartActionStage::PredecessorContained
+        RestartActionStage::SuccessorLaunching
     );
+    drop(supervisor);
+    let supervisor = fixture.recovery_supervisor(0);
     let completed = supervisor
         .resume_after_container_restart(&action, None)
         .await
@@ -457,8 +459,7 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     supervisor.shutdown_successor(&action).await.unwrap();
 
     let after_start = Fixture::new();
-    let predecessor = after_start.stopped_predecessor().await;
-    let action = after_start.action(predecessor.process_session, predecessor.child_pid);
+    let action = after_start.accepted_stopped_action().await;
     let supervisor = after_start.restarted_supervisor().await;
     assert!(
         supervisor
@@ -481,8 +482,7 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     supervisor.shutdown_successor(&action).await.unwrap();
 
     let cancelled = Fixture::new();
-    let predecessor = cancelled.stopped_predecessor().await;
-    let action = cancelled.action(predecessor.process_session, predecessor.child_pid);
+    let action = cancelled.accepted_stopped_action().await;
     let supervisor = cancelled.restarted_supervisor_with_delay(200).await;
     assert!(
         tokio::time::timeout(
@@ -492,6 +492,8 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
         .await
         .is_err()
     );
+    drop(supervisor);
+    let supervisor = cancelled.recovery_supervisor(200);
     let completed = supervisor
         .resume_after_container_restart(&action, None)
         .await
@@ -502,6 +504,31 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
         "2"
     );
     supervisor.shutdown_successor(&action).await.unwrap();
+
+    let failed = Fixture::new();
+    let action = failed.accepted_stopped_action().await;
+    let supervisor = failed.restarted_supervisor_with_exit().await;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        supervisor.resume_after_container_restart(&action, None),
+    )
+    .await
+    .expect("failed child must not deadlock")
+    .unwrap_err();
+    assert!(error.to_string().contains("exited before readiness"));
+
+    let unaccepted = Fixture::new();
+    let action = unaccepted.stopped_unaccepted_action().await;
+    let supervisor = unaccepted.restarted_supervisor().await;
+    assert!(
+        supervisor
+            .resume_after_container_restart(&action, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot admit a new restart action")
+    );
+    assert!(unaccepted.store.restart_action().await.unwrap().is_none());
 }
 
 struct Fixture {
@@ -588,8 +615,37 @@ impl Fixture {
         &self,
         delay_millis: u64,
     ) -> Arc<ReplicaProcessSupervisor> {
+        self.record_dead_parent_marker().await;
+        let mut child = Self::child_command();
+        if delay_millis > 0 {
+            child.environment.insert(
+                "KUBERIC_PREVIEW_READY_DELAY_MS".into(),
+                delay_millis.to_string(),
+            );
+        }
+        Arc::new(
+            ReplicaProcessSupervisor::new(self.store.clone(), self.data_root.clone(), child)
+                .unwrap(),
+        )
+    }
+
+    async fn restarted_supervisor_with_exit(&self) -> Arc<ReplicaProcessSupervisor> {
+        self.record_dead_parent_marker().await;
+        let mut child = Self::child_command();
+        child
+            .environment
+            .insert("KUBERIC_PREVIEW_EXIT_BEFORE_READY".into(), "1".into());
+        Arc::new(
+            ReplicaProcessSupervisor::new(self.store.clone(), self.data_root.clone(), child)
+                .unwrap(),
+        )
+    }
+
+    async fn record_dead_parent_marker(&self) {
         let ready = self.data_root.join("parent-marker-ready");
         let release = self.data_root.join("parent-marker-release");
+        let _ = std::fs::remove_file(&ready);
+        let _ = std::fs::remove_file(&release);
         let mut parent = tokio::process::Command::new(std::env::current_exe().unwrap());
         parent
             .arg("preview_supervisor_parent_entrypoint")
@@ -608,6 +664,9 @@ impl Fixture {
         assert!(ready.exists(), "parent marker helper did not start");
         std::fs::write(&release, b"exit").unwrap();
         assert!(parent.wait().await.unwrap().success());
+    }
+
+    fn recovery_supervisor(&self, delay_millis: u64) -> Arc<ReplicaProcessSupervisor> {
         let mut child = Self::child_command();
         if delay_millis > 0 {
             child.environment.insert(
@@ -768,7 +827,7 @@ impl Fixture {
                     process_session_id: predecessor_session.clone(),
                     process_id: predecessor_process_id,
                     revision: 3,
-                    operation_id: None,
+                    operation_id: Some(OperationId::new("fault-operation")),
                     role: ReplicaRole::None,
                     write_access: false,
                     service_location: None,
@@ -811,28 +870,75 @@ impl Fixture {
         for _ in 0..200 {
             if output.exists() {
                 let evidence = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
-                return PreviewChildProcess { child, evidence };
+                return PreviewChildProcess {
+                    child,
+                    evidence,
+                    restart_signal: self.release.clone(),
+                };
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("predecessor child did not report");
     }
 
-    async fn stopped_predecessor(&self) -> PreviewChildEvidence {
+    async fn accepted_stopped_action(&self) -> PublicFaultAction {
         let mut predecessor = self.spawn_predecessor().await;
+        let action = self
+            .action(
+                predecessor.evidence.process_session.clone(),
+                predecessor.evidence.child_pid,
+            )
+            .await;
+        self.store.begin_restart_action(&action).await.unwrap();
         std::fs::write(&self.release, b"restart").unwrap();
         let status = predecessor.child.wait().await.unwrap();
         assert_eq!(status.code(), Some(PREVIEW_RESTART_DISPOSITION));
-        predecessor.evidence
+        action
     }
 
-    fn action(
+    async fn stopped_unaccepted_action(&self) -> PublicFaultAction {
+        let mut predecessor = self.spawn_predecessor().await;
+        let action = self
+            .action(
+                predecessor.evidence.process_session.clone(),
+                predecessor.evidence.child_pid,
+            )
+            .await;
+        std::fs::write(&self.release, b"restart").unwrap();
+        let status = predecessor.child.wait().await.unwrap();
+        assert_eq!(status.code(), Some(PREVIEW_RESTART_DISPOSITION));
+        action
+    }
+
+    async fn seed_fault(&self, predecessor_session: &ProcessSessionId) {
+        self.store
+            .begin_public_operation(
+                &crate::protocol::public_operations::PublicOperationIntent {
+                    preview: self.binding.preview.clone(),
+                    operation_id: OperationId::new("fault-operation"),
+                    revision: 3,
+                    process_session_id: predecessor_session.clone(),
+                    class: crate::protocol::public_operations::PublicOperationClass::TransientFault,
+                    input_digest: "fault-operation-digest".into(),
+                    lifecycle: None,
+                    program: None,
+                },
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn action(
         &self,
         predecessor_session: ProcessSessionId,
         predecessor_process_id: u32,
     ) -> PublicFaultAction {
+        self.seed_fault(&predecessor_session).await;
         let mut action = PublicFaultAction {
             action_id: OperationId::new("pending"),
+            fault_operation_id: OperationId::new("fault-operation"),
             binding: self.binding.clone(),
             target: self.identity.clone(),
             resources: FrozenReplicaResources {

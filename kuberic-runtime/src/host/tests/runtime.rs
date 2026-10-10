@@ -20826,6 +20826,7 @@ async fn evaluator_scale_up_sqlite_trace() {
             service_present: true,
             unresolved_write_target: false,
             write_target: Some(source.clone()),
+            ..Default::default()
         },
         observation_failures: Vec::new(),
         now_unix_seconds: 100,

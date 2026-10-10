@@ -534,6 +534,17 @@ impl PartitionOperation {
         if !self.needs_recovery() || self.has_live_work().await {
             return Ok(None);
         }
+        let finished = {
+            let mut task = self.task.lock().await;
+            if task.as_ref().is_some_and(JoinHandle::is_finished) {
+                task.take()
+            } else {
+                None
+            }
+        };
+        if let Some(task) = finished {
+            let _ = task.await;
+        }
         let operation_id = self.intent().operation_id;
         let record = self
             .store
@@ -608,6 +619,9 @@ impl PartitionOperation {
             .await?
         };
         self.record.send_replace(recovered.clone());
+        if recovered.stage == PublicOperationStage::Ready {
+            self.failure.send_replace(None);
+        }
         self.recovery_complete();
         Ok(Some(recovered))
     }
@@ -1168,6 +1182,15 @@ impl PartitionOperationRegistry {
 
     async fn load_durable_records(&self) -> Result<()> {
         let records = self.store.public_operation_records().await?;
+        if self
+            .store
+            .load_state()
+            .await?
+            .public_operation_preview
+            .is_some_and(|preview| preview.terminal)
+        {
+            self.fence();
+        }
         let mut state = self.state.lock().await;
         for record in records {
             state

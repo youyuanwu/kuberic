@@ -1,5 +1,6 @@
 use k8s_openapi::api::core::v1::Service;
 
+use super::PREVIEW_SERVICE_LOCATION_ANNOTATION;
 use crate::evaluator::test_bridge::{PreviewAcceptedStatus, ServiceLocationProjection};
 
 #[async_trait::async_trait]
@@ -13,8 +14,6 @@ pub trait PreviewServiceApi: Send + Sync {
     /// One conditional Service write, including both selector and annotation.
     async fn replace_preview_service(&self, service: Service) -> Result<(), String>;
 }
-
-const SERVICE_LOCATION_ANNOTATION: &str = "operator.kuberic.io/preview-service-location";
 
 pub fn preview_service_update(
     observed: &Service,
@@ -32,10 +31,13 @@ pub fn preview_service_update(
     let annotations = service.metadata.annotations.get_or_insert_default();
     match &projection.location {
         Some(location) => {
-            annotations.insert(SERVICE_LOCATION_ANNOTATION.into(), location.address.clone());
+            annotations.insert(
+                PREVIEW_SERVICE_LOCATION_ANNOTATION.into(),
+                location.address.clone(),
+            );
         }
         None => {
-            annotations.remove(SERVICE_LOCATION_ANNOTATION);
+            annotations.remove(PREVIEW_SERVICE_LOCATION_ANNOTATION);
         }
     }
     service
@@ -55,10 +57,10 @@ pub fn preview_service_matches(service: &Service, projection: &ServiceLocationPr
             .metadata
             .annotations
             .as_ref()
-            .and_then(|map| map.get(SERVICE_LOCATION_ANNOTATION))
+            .and_then(|map| map.get(PREVIEW_SERVICE_LOCATION_ANNOTATION))
             == desired
                 .metadata
                 .annotations
                 .as_ref()
-                .and_then(|map| map.get(SERVICE_LOCATION_ANNOTATION))
+                .and_then(|map| map.get(PREVIEW_SERVICE_LOCATION_ANNOTATION))
 }

@@ -70,6 +70,8 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     if snapshot.desired.preview_lifecycle.is_some()
         || snapshot.status.preview_lifecycle.is_some()
         || snapshot.status.public_fault_action.is_some()
+        || snapshot.status.last_public_fault_action.is_some()
+        || snapshot.status.public_service_clear.is_some()
     {
         return unsafe_plan(
             snapshot.status.clone(),

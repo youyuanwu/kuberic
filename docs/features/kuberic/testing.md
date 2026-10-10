@@ -96,7 +96,7 @@ KUBERIC_WORKSPACE_TESTS=1 cargo nextest run -j 1 --profile ordinary \
   -E 'test(public_operations) or test(public_operation_replay) or test(process_supervisor)'
 cargo nextest run -j 1 --profile ordinary \
   -p kuberic-controller --all-features \
-  -E 'test(public_operation_fault) or test(public_operation_role_address)'
+  -E 'binary(public_operation_faults) or binary(public_operation_role_address)'
 ```
 
 The supervisor cases use a true child executable and same data root. They cut

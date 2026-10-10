@@ -675,6 +675,87 @@ async fn completion_persistence_failure_is_reported_and_recovered_as_ambiguous()
 }
 
 #[tokio::test]
+async fn repeatable_redelivery_reaps_a_finished_root_after_completion_persistence_failure() {
+    let preview = PublicOperationPreviewIdentity::new(31);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry = PartitionOperationRegistry::new(
+        store.clone(),
+        preview.clone(),
+        ProcessSessionId::new("session-1"),
+    )
+    .unwrap();
+    let program =
+        crate::protocol::public_operations::PublicOperationProgram::Progress { capability: false };
+    let intent = PublicOperationIntent {
+        preview,
+        operation_id: OperationId::new("repeatable-persistence-cut"),
+        revision: 1,
+        process_session_id: ProcessSessionId::new("session-1"),
+        class: PublicOperationClass::Authority,
+        input_digest: program.digest(),
+        lifecycle: None,
+        program: Some(program),
+    };
+    let operation = registry.admit(intent.clone()).await.unwrap();
+    let release = Arc::new(Notify::new());
+    let applied = Arc::new(Notify::new());
+    let callback_release = release.clone();
+    let callback_applied = applied.clone();
+    let callback_store = store.clone();
+    let callback_intent = intent.clone();
+    operation
+        .spawn_root(CallbackContainment::RootTask, async move {
+            callback_store
+                .public_instruction(
+                    &callback_intent,
+                    0,
+                    crate::host::state::PublicInstruction::Progress,
+                    None,
+                )
+                .await
+                .unwrap();
+            callback_store
+                .public_instruction(
+                    &callback_intent,
+                    0,
+                    crate::host::state::PublicInstruction::Progress,
+                    Some(crate::host::state::PublicInstructionOutcome::Progress(0)),
+                )
+                .await
+                .unwrap();
+            callback_applied.notify_one();
+            callback_release.notified().await;
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    applied.notified().await;
+    store.fail_next_public_operation_advance();
+    release.notify_one();
+    assert!(
+        operation
+            .wait_for_terminal()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected public-operation")
+    );
+
+    let duplicate = registry.admit(intent).await.unwrap();
+    assert_eq!(duplicate.snapshot().stage, PublicOperationStage::Ready);
+    duplicate
+        .spawn_root(CallbackContainment::RootTask, async {
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate.wait_for_terminal().await.unwrap().stage,
+        PublicOperationStage::Completed
+    );
+}
+
+#[tokio::test]
 async fn cancellation_persistence_failure_is_recovered_without_releasing_successor() {
     let preview = PublicOperationPreviewIdentity::new(32);
     let (_directory, _path, store) = preview_store(&preview);

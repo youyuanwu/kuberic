@@ -64,6 +64,7 @@ impl Model {
                 service_present: true,
                 write_target: Some(intent.primary),
                 unresolved_write_target: false,
+                ..Default::default()
             },
             observation_failures: Vec::new(),
             now_unix_seconds: 100,

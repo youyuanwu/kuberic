@@ -3890,6 +3890,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                 service_present: true,
                 unresolved_write_target: false,
                 write_target: Some(fixture.primary.clone()),
+                ..Default::default()
             },
             observation_failures: Vec::new(),
             now_unix_seconds: 100,

@@ -619,6 +619,36 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
         );
         fixture.owner.shutdown().await.unwrap();
     }
+
+    let fixture = Fixture::new().await;
+    fixture
+        .run(
+            "historical-configuration",
+            3,
+            Program::Configuration(configuration_with_target(3)),
+        )
+        .await;
+    fixture
+        .run(
+            "current-configuration",
+            4,
+            Program::Configuration(configuration(4)),
+        )
+        .await;
+    let build = fixture.intent(
+        "historical-target-build",
+        5,
+        Program::Build(build("historical-target-build")),
+    );
+    assert!(
+        fixture
+            .store
+            .begin_public_operation(&build, &[], &[])
+            .await
+            .is_ok(),
+        "superseded historical topology must not poison a future build"
+    );
+    fixture.owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]

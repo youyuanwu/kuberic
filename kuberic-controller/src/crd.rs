@@ -312,12 +312,12 @@ mod tests {
 
         let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
         assert!(
-            generated.len() < 360_000,
+            generated.len() < 370_000,
             "generated CRD unexpectedly grew to {} bytes",
             generated.len()
         );
         assert!(
-            generated.len() <= 355_000,
+            generated.len() <= 365_000,
             "compact final-election schema lost its reviewed headroom at {} bytes",
             generated.len()
         );

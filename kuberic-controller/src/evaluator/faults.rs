@@ -4,7 +4,7 @@ use kuberic_runtime::protocol::command::{
 use kuberic_runtime::protocol::observation::{AgentObservation, ObservationSnapshot};
 use kuberic_runtime::protocol::public_operations::{
     FrozenReplicaResources, PreviewLifecycleBinding, PublicFaultAction, PublicFaultActionKind,
-    RestartActionStage,
+    PublicServiceClear, PublicServiceClearStage, RestartActionStage,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, ConditionStatus, FaultType, OperationId, ReplicaRole, StatusCondition,
@@ -84,7 +84,31 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                 config,
             ));
         }
-        return Some(evaluate_drop(snapshot, action, config));
+        if let Some(plan) = service_clear_plan(snapshot, action) {
+            return Some(plan);
+        }
+        if snapshot.replicas.values().any(|replica| {
+            matches!(
+                &replica.agent,
+                AgentObservation::Report(report)
+                    if report.identity == action.target
+                        && (report.process_session_id != action.predecessor_session
+                            || report
+                                .public_lifecycle_report
+                                .as_deref()
+                                .is_some_and(|lifecycle| {
+                                    lifecycle.process_id != action.predecessor_process_id
+                                }))
+            )
+        }) {
+            return Some(reject(
+                snapshot,
+                "FaultCleanupSuccessorPresent",
+                "predecessor-bound cleanup cannot target a successor process",
+                config,
+            ));
+        }
+        return Some(evaluate_drop(snapshot, action));
     }
 
     let mut reports = Vec::new();
@@ -124,6 +148,14 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
         reports.push((kubernetes, report.as_ref(), lifecycle));
     }
     if reports.is_empty() {
+        if snapshot.status.public_fault_action.is_none()
+            && snapshot.status.last_public_fault_action.is_some()
+        {
+            return Some(Plan::Stable {
+                status: snapshot.status.clone(),
+                requeue_after_seconds: config.stable_resync_seconds,
+            });
+        }
         return Some(reject(
             snapshot,
             "PreviewReportRequired",
@@ -188,10 +220,7 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             && kubernetes.pod_uid.as_ref() == Some(&accepted.resources.pod_uid)
             && kubernetes.pvc_uid.as_ref() == Some(&accepted.resources.pvc_uid)
         {
-            return Some(Plan::Stable {
-                status: unhealthy_status(snapshot.status.clone(), accepted.fault),
-                requeue_after_seconds: config.stable_resync_seconds,
-            });
+            return Some(complete_fault_plan(snapshot, accepted));
         }
         if snapshot.status.public_fault_action.is_some() {
             return Some(reject(
@@ -254,9 +283,18 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             config,
         ));
     };
+    let Some(fault_operation_id) = &lifecycle.operation_id else {
+        return Some(reject(
+            snapshot,
+            "FaultOperationIdentityMissing",
+            "fault report requires the exact durable operation ID",
+            config,
+        ));
+    };
     let kind = PublicFaultAction::expected_kind(persistence, fault);
     let mut action = PublicFaultAction {
         action_id: OperationId::new("pending"),
+        fault_operation_id: fault_operation_id.clone(),
         binding,
         target: report.identity.clone(),
         resources: FrozenReplicaResources {
@@ -326,12 +364,8 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
         Some(_) => {}
     }
 
-    if snapshot.routing.write_target.as_ref() == Some(&action.target)
-        || snapshot.routing.unresolved_write_target
-    {
-        return Some(Plan::Apply {
-            changes: vec![KubernetesChange::RemoveWriteRouting],
-        });
+    if let Some(plan) = service_clear_plan(snapshot, &action) {
+        return Some(plan);
     }
 
     Some(match action.kind {
@@ -356,10 +390,7 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                             config,
                         ));
                     }
-                    return Some(Plan::Stable {
-                        status: unhealthy_status(snapshot.status.clone(), fault),
-                        requeue_after_seconds: config.stable_resync_seconds,
-                    });
+                    return Some(complete_fault_plan(snapshot, &action));
                 }
             }
             Plan::Execute {
@@ -368,7 +399,7 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                 })),
             }
         }
-        PublicFaultActionKind::DropReplacement => evaluate_drop(snapshot, &action, config),
+        PublicFaultActionKind::DropReplacement => evaluate_drop(snapshot, &action),
     })
 }
 
@@ -405,16 +436,101 @@ fn validate_present_preview_reports(
     Ok(())
 }
 
-fn evaluate_drop(
-    snapshot: &ObservationSnapshot,
-    action: &PublicFaultAction,
-    config: &EvaluationConfig,
-) -> Plan {
+fn service_clear_plan(snapshot: &ObservationSnapshot, action: &PublicFaultAction) -> Option<Plan> {
+    let clear = match &snapshot.status.public_service_clear {
+        Some(clear) if clear.action_id == action.action_id => clear,
+        _ => {
+            let mut status = snapshot.status.clone();
+            status.public_service_clear = Some(PublicServiceClear {
+                action_id: action.action_id.clone(),
+                stage: PublicServiceClearStage::Pending,
+                service_uid: None,
+                service_resource_version: None,
+            });
+            return Some(Plan::Apply {
+                changes: vec![KubernetesChange::PersistStatus {
+                    status: Box::new(status),
+                }],
+            });
+        }
+    };
+    if snapshot.routing.write_target.as_ref() == Some(&action.target)
+        || snapshot.routing.unresolved_write_target
+        || snapshot.routing.preview_service_location_present
+    {
+        return Some(Plan::Apply {
+            changes: vec![KubernetesChange::RemoveWriteRouting],
+        });
+    }
+    if clear.stage == PublicServiceClearStage::Pending {
+        let mut status = snapshot.status.clone();
+        status.public_service_clear = Some(PublicServiceClear {
+            action_id: action.action_id.clone(),
+            stage: PublicServiceClearStage::PublishedAbsent,
+            service_uid: snapshot.routing.write_service_uid.clone(),
+            service_resource_version: snapshot.routing.write_service_resource_version.clone(),
+        });
+        return Some(Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(status),
+            }],
+        });
+    }
+    if clear.service_uid != snapshot.routing.write_service_uid
+        || clear.service_resource_version != snapshot.routing.write_service_resource_version
+    {
+        let mut status = snapshot.status.clone();
+        status.public_service_clear = Some(PublicServiceClear {
+            action_id: action.action_id.clone(),
+            stage: PublicServiceClearStage::Pending,
+            service_uid: None,
+            service_resource_version: None,
+        });
+        return Some(Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(status),
+            }],
+        });
+    }
+    None
+}
+
+fn evaluate_drop(snapshot: &ObservationSnapshot, action: &PublicFaultAction) -> Plan {
     if snapshot.routing.write_target.as_ref() == Some(&action.target)
         || snapshot.routing.unresolved_write_target
     {
         return Plan::Apply {
             changes: vec![KubernetesChange::RemoveWriteRouting],
+        };
+    }
+    let old_pod_or_pvc_present = snapshot.replicas.values().any(|replica| {
+        replica.kubernetes.as_ref().is_some_and(|kubernetes| {
+            kubernetes.pod_uid.as_ref() == Some(&action.resources.pod_uid)
+                || kubernetes.pvc_uid.as_ref() == Some(&action.resources.pvc_uid)
+        })
+    });
+    let old_endpoint_present = snapshot
+        .routing
+        .service_identities
+        .iter()
+        .any(|(name, uid)| {
+            name == &action.resources.endpoint_name && uid == &action.resources.endpoint_uid
+        });
+    if old_pod_or_pvc_present || old_endpoint_present {
+        return Plan::Apply {
+            changes: vec![
+                KubernetesChange::DeleteExactService {
+                    name: action.resources.endpoint_name.clone(),
+                    uid: action.resources.endpoint_uid.clone(),
+                    resource_version: action.resources.endpoint_resource_version.clone(),
+                },
+                KubernetesChange::DeleteReplicaScaffolding {
+                    pod_name: Some(action.resources.pod_name.clone()),
+                    pod_uid: Some(action.resources.pod_uid.clone()),
+                    pvc_name: Some(action.resources.pvc_name.clone()),
+                    pvc_uid: Some(action.resources.pvc_uid.clone()),
+                },
+            ],
         };
     }
     let replacement_ready = snapshot.replicas.values().any(|replica| {
@@ -432,29 +548,25 @@ fn evaluate_drop(
         })
     });
     if replacement_ready {
-        return Plan::Stable {
-            status: unhealthy_status(snapshot.status.clone(), action.fault),
-            requeue_after_seconds: config.stable_resync_seconds,
-        };
+        return complete_fault_plan(snapshot, action);
     }
     Plan::Apply {
-        changes: vec![
-            KubernetesChange::DeleteExactService {
-                name: action.resources.endpoint_name.clone(),
-                uid: action.resources.endpoint_uid.clone(),
-                resource_version: action.resources.endpoint_resource_version.clone(),
-            },
-            KubernetesChange::DeleteReplicaScaffolding {
-                pod_name: Some(action.resources.pod_name.clone()),
-                pod_uid: Some(action.resources.pod_uid.clone()),
-                pvc_name: Some(action.resources.pvc_name.clone()),
-                pvc_uid: Some(action.resources.pvc_uid.clone()),
-            },
-            KubernetesChange::EnsureReplacementScaffolding {
-                replica_id: action.target.replica_id,
-                replacing: action.target.clone(),
-            },
-        ],
+        changes: vec![KubernetesChange::EnsureReplacementScaffolding {
+            replica_id: action.target.replica_id,
+            replacing: action.target.clone(),
+        }],
+    }
+}
+
+fn complete_fault_plan(snapshot: &ObservationSnapshot, action: &PublicFaultAction) -> Plan {
+    let mut status = unhealthy_status(snapshot.status.clone(), action.fault);
+    status.last_public_fault_action = Some(action.clone());
+    status.public_fault_action = None;
+    status.public_service_clear = None;
+    Plan::Apply {
+        changes: vec![KubernetesChange::PersistStatus {
+            status: Box::new(status),
+        }],
     }
 }
 

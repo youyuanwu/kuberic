@@ -1717,7 +1717,15 @@ impl AgentStore for SqliteStore {
             match &intent.program {
                 Some(PublicOperationProgram::Build(build)) => {
                     if preview.active_builds.contains_key(&build.replica.replica_id)
-                        || preview.operations.values().any(|record| {
+                        || preview.operations.values().filter(|record| {
+                            preview.current_operation.as_ref()
+                                == Some(&record.intent.operation_id)
+                                || (matches!(
+                                    record.intent.program,
+                                    Some(PublicOperationProgram::Swap { .. })
+                                ) && record.stage != PublicOperationStage::Completed
+                                    && record.superseded_by.is_none())
+                        }).any(|record| {
                             let contains = |configuration: &crate::protocol::types::ConfigurationDescriptor| {
                                 configuration
                                     .members
@@ -1842,6 +1850,17 @@ impl AgentStore for SqliteStore {
             if intent.class.is_terminal() {
                 preview.writes_revoked = true;
                 preview.terminal = true;
+            }
+            match intent.class {
+                crate::protocol::public_operations::PublicOperationClass::TransientFault
+                    if state.reported_fault != Some(FaultType::Permanent) =>
+                {
+                    state.reported_fault = Some(FaultType::Transient);
+                }
+                crate::protocol::public_operations::PublicOperationClass::PermanentFault => {
+                    state.reported_fault = Some(FaultType::Permanent);
+                }
+                _ => {}
             }
             for blocker in blockers {
                 if blocker == &intent.operation_id {
@@ -2337,6 +2356,31 @@ impl AgentStore for SqliteStore {
                     "persisted restart store rejected drop/replacement action".into(),
                 ));
             }
+            let expected_class = match action.fault {
+                FaultType::Transient => {
+                    crate::protocol::public_operations::PublicOperationClass::TransientFault
+                }
+                FaultType::Permanent => {
+                    crate::protocol::public_operations::PublicOperationClass::PermanentFault
+                }
+            };
+            let fault_record = preview
+                .operations
+                .get(&action.fault_operation_id)
+                .ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "restart action has no exact durable fault operation".into(),
+                    )
+                })?;
+            if fault_record.intent.class != expected_class
+                || fault_record.intent.revision != action.fault_revision
+                || fault_record.intent.process_session_id != action.predecessor_session
+                || state.reported_fault != Some(action.fault)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "restart action differs from durable fault evidence".into(),
+                ));
+            }
             if let Some(existing) = &preview.restart_action {
                 if existing.action == *action {
                     return Ok(existing.clone());
@@ -2361,6 +2405,7 @@ impl AgentStore for SqliteStore {
                 stage: RestartActionStage::Accepted,
                 successor_session: None,
                 successor_process_id: None,
+                launch_nonce: None,
             };
             preview.restart_action = Some(record.clone());
             write_agent_state(transaction, &state)?;
@@ -2376,6 +2421,7 @@ impl AgentStore for SqliteStore {
         next: RestartActionStage,
         successor_session: Option<&crate::protocol::types::ProcessSessionId>,
         successor_process_id: Option<u32>,
+        launch_nonce: Option<&str>,
     ) -> Result<RestartActionRecord> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
@@ -2405,6 +2451,9 @@ impl AgentStore for SqliteStore {
                         RestartActionStage::PredecessorContained
                     ) | (
                         RestartActionStage::PredecessorContained,
+                        RestartActionStage::SuccessorLaunching
+                    ) | (
+                        RestartActionStage::SuccessorLaunching,
                         RestartActionStage::SuccessorStarted
                     )
                 )
@@ -2436,6 +2485,25 @@ impl AgentStore for SqliteStore {
                 state.prepared_switchover = None;
                 preview.current_operation = None;
                 preview.active_builds.clear();
+            }
+            if next == RestartActionStage::SuccessorLaunching {
+                if successor_session.is_some() || successor_process_id.is_some() {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "successor launch claim cannot contain completion evidence".into(),
+                    ));
+                }
+                let nonce = launch_nonce
+                    .filter(|nonce| !nonce.is_empty())
+                    .ok_or_else(|| {
+                        crate::host::HostError::CommandRejected(
+                            "successor launch requires an exact nonce".into(),
+                        )
+                    })?;
+                preview
+                    .restart_action
+                    .as_mut()
+                    .expect("restart action checked")
+                    .launch_nonce = Some(nonce.into());
             }
             let (successor_session, successor_process_id) =
                 if next == RestartActionStage::SuccessorStarted {
