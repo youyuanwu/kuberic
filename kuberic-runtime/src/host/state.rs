@@ -123,6 +123,24 @@ pub(crate) struct PublicOperationRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PublicInstruction {
+    ApplicationOpen,
+    ReplicatorOpen,
+    ReplicatorRole,
+    ApplicationRole,
+    ProgramEpoch,
+    Configuration,
+    StartingConfiguration,
+    RefreshedConfiguration,
+    FirstCatchUp,
+    SecondCatchUp,
+    Revoke,
+    Progress,
+    Build,
+    Remove,
+    ReplicatorClose,
+    ApplicationClose,
+    Abort,
+    Cleanup,
     ReplicatorPrimary,
     Epoch,
     ApplicationPrimary,
@@ -138,6 +156,18 @@ pub(crate) enum PublicInstructionOutcome {
     Done,
     ApplicationRole(Option<String>),
     DataLoss(DataLossOutcome),
+    Endpoint(String),
+    Progress(i64),
+    CloseFailure {
+        child: PublicCloseChild,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PublicCloseChild {
+    Replicator,
+    Application,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +201,17 @@ pub(crate) struct PublicOperationPreviewState {
     pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
     #[serde(default)]
     pub(crate) current_operation: Option<OperationId>,
+    #[serde(default)]
+    pub(crate) active_builds: BTreeMap<
+        crate::protocol::types::ReplicaId,
+        crate::protocol::public_operations::PublicBuildInput,
+    >,
+    #[serde(default)]
+    pub(crate) absent_builds: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub(crate) writes_revoked: bool,
+    #[serde(default)]
+    pub(crate) terminal: bool,
 }
 
 impl PublicOperationPreviewState {
@@ -181,6 +222,10 @@ impl PublicOperationPreviewState {
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
             current_operation: None,
+            active_builds: BTreeMap::new(),
+            absent_builds: BTreeSet::new(),
+            writes_revoked: false,
+            terminal: false,
         }
     }
 }

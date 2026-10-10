@@ -991,6 +991,29 @@ impl Drop for PodRuntime {
 
 impl PodRuntime {
     #[cfg(feature = "testing")]
+    #[allow(dead_code)]
+    pub(crate) async fn public_open_context(&self, mode: OpenMode) -> OpenContext {
+        let context = ReplicatorFactoryContext::new(
+            RuntimeHostToken::new(),
+            self.host.identity.clone(),
+            Arc::new(HostAccessView {
+                host: Arc::downgrade(&self.host),
+                partition_information: self.host.state.read().await.partition_information.clone(),
+            }),
+            self.host.default_dependencies.clone(),
+        );
+        OpenContext {
+            identity: self.host.identity.clone(),
+            mode,
+            partition: StatefulServicePartition::new(
+                RuntimeHostToken::new(),
+                self.host.clone(),
+                context,
+            ),
+        }
+    }
+
+    #[cfg(feature = "testing")]
     pub(crate) fn public_lifecycle_callbacks(
         &self,
     ) -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks> {
@@ -999,6 +1022,11 @@ impl PodRuntime {
             application: self.host.application.clone(),
             replicator: registered.control.clone(),
             primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
+            open_context: None,
+            containment: None,
+            aborted: Arc::new(std::sync::Mutex::new(false)),
+            #[cfg(all(test, feature = "testing"))]
+            cut: None,
         })
     }
 

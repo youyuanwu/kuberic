@@ -1646,10 +1646,85 @@ impl AgentStore for SqliteStore {
             }
 
             let mut exact_blockers = std::collections::BTreeSet::new();
+            if !intent.class.is_terminal()
+                && preview.operations.values().any(|record| record.intent.process_session_id != intent.process_session_id)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "fresh session cannot resume predecessor public operations".into(),
+                ));
+            }
             if !intent.class.is_terminal() && !preview.history_barriers.is_empty() {
                 return Err(crate::host::HostError::CommandRejected(
                     "unresolved history-admission barrier".into(),
                 ));
+            }
+            use crate::protocol::public_operations::PublicOperationProgram;
+            match &intent.program {
+                Some(PublicOperationProgram::Build(build)) => {
+                    if preview.active_builds.contains_key(&build.replica.replica_id)
+                        || preview.operations.values().any(|record| {
+                            record.intent.program.as_ref().is_some_and(|program| match program {
+                                PublicOperationProgram::Configuration(configuration)
+                                | PublicOperationProgram::CatchUp { configuration, .. } => {
+                                    std::iter::once(&configuration.current)
+                                        .chain(configuration.previous.iter())
+                                        .any(|configuration| {
+                                            configuration
+                                                .members
+                                                .iter()
+                                                .any(|member| member.identity == build.replica)
+                                        })
+                                }
+                                _ => false,
+                            })
+                        })
+                    {
+                        return Err(crate::host::HostError::CommandRejected(
+                            "build target is active or has an unretired attempt".into(),
+                        ));
+                    }
+                    preview
+                        .active_builds
+                        .insert(build.replica.replica_id, build.clone());
+                }
+                Some(PublicOperationProgram::Remove(build)) => {
+                    if preview.active_builds.get(&build.replica.replica_id) != Some(build) {
+                        return Err(crate::host::HostError::CommandRejected(
+                            "removal does not name the exact active attempt".into(),
+                        ));
+                    }
+                }
+                Some(PublicOperationProgram::Swap { starting, .. }) => {
+                    let primary_completed = preview.operations.values().any(|record| {
+                        record.stage == PublicOperationStage::Completed
+                            && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                            && (record.intent.lifecycle.as_ref().is_some_and(|input| {
+                                input.recipe
+                                    != crate::protocol::public_operations::PublicLifecycleRecipe::SecondaryEpochAdvance
+                            }) || matches!(
+                                record.intent.program,
+                                Some(PublicOperationProgram::Role {
+                                    role: ReplicaRole::Primary,
+                                    ..
+                                })
+                            ))
+                    });
+                    if !primary_completed
+                        || starting.current.primary_id != state.identity.local_identity.replica_id
+                    {
+                        return Err(crate::host::HostError::CommandRejected(
+                            "swap requires completed local primary authority".into(),
+                        ));
+                    }
+                }
+                Some(PublicOperationProgram::Open { replica, .. })
+                    if replica != &state.identity.local_identity =>
+                {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "open target is not the local replica".into(),
+                    ));
+                }
+                _ => {}
             }
             if let Some(input) = &intent.lifecycle {
                 if input.replica != state.identity.local_identity {
@@ -1697,6 +1772,10 @@ impl AgentStore for SqliteStore {
                 preview.current_operation = Some(intent.operation_id.clone());
             }
             retire_history_barriers(preview, intent);
+            if intent.class.is_terminal() {
+                preview.writes_revoked = true;
+                preview.terminal = true;
+            }
             for blocker in blockers {
                 if blocker == &intent.operation_id {
                     return Err(crate::host::HostError::CommandRejected(
@@ -1854,6 +1933,7 @@ impl AgentStore for SqliteStore {
             }
             if next == PublicOperationStage::Ready {
                 record.blockers.clear();
+                record.lifecycle.in_flight = None;
             }
             let result = record.clone();
             write_agent_state(transaction, &state)?;
@@ -2001,12 +2081,14 @@ impl AgentStore for SqliteStore {
                 || preview.identity != intent.preview
                 || record.stage != PublicOperationStage::Running
                 || record.superseded_by.is_some()
-                || preview.current_operation.as_ref() != Some(&intent.operation_id)
+                || (matches!(
+                    intent.class,
+                    crate::protocol::public_operations::PublicOperationClass::Authority
+                        | crate::protocol::public_operations::PublicOperationClass::PlannedSwap
+                ) && preview.current_operation.as_ref() != Some(&intent.operation_id))
                 || record.lifecycle.outcomes.len() != index
-                || intent.lifecycle.as_ref().is_none_or(|input| {
-                    crate::host::public_lifecycle::instructions(input).get(index)
-                        != Some(&instruction)
-                })
+                || crate::host::public_lifecycle::operation_instructions(intent).get(index)
+                    != Some(&instruction)
             {
                 return Err(crate::host::HostError::StaleEffectCompletion(
                     "stale or out-of-order public lifecycle instruction".into(),
@@ -2018,6 +2100,12 @@ impl AgentStore for SqliteStore {
                     | PublicInstruction::CatchUpConfiguration
                     | PublicInstruction::CatchUp
                     | PublicInstruction::Access
+                    | PublicInstruction::Configuration
+                    | PublicInstruction::StartingConfiguration
+                    | PublicInstruction::RefreshedConfiguration
+                    | PublicInstruction::FirstCatchUp
+                    | PublicInstruction::SecondCatchUp
+                    | PublicInstruction::Build
             ) && !preview.history_barriers.is_empty()
             {
                 return Err(crate::host::HostError::CommandRejected(
@@ -2025,7 +2113,10 @@ impl AgentStore for SqliteStore {
                 ));
             }
             match outcome {
-                None if record.lifecycle.in_flight.is_none() => {
+                None if record.lifecycle.in_flight.is_none()
+                    || (record.lifecycle.in_flight == Some(instruction)
+                        && crate::host::public_lifecycle::repeatable(instruction)) =>
+                {
                     record.lifecycle.in_flight = Some(instruction);
                     if instruction == PublicInstruction::DataLoss {
                         preview
@@ -2036,12 +2127,42 @@ impl AgentStore for SqliteStore {
                             })?
                             .outcome = DataLossOutcome::Ambiguous;
                     }
+                    if matches!(
+                        instruction,
+                        PublicInstruction::Revoke
+                            | PublicInstruction::Abort
+                            | PublicInstruction::ReplicatorClose
+                    ) {
+                        preview.writes_revoked = true;
+                    }
                 }
                 Some(outcome) if record.lifecycle.in_flight == Some(instruction) => {
                     let valid = match (&instruction, &outcome) {
                         (
-                            PublicInstruction::ApplicationPrimary,
+                            PublicInstruction::ApplicationPrimary
+                            | PublicInstruction::ApplicationRole,
                             PublicInstructionOutcome::ApplicationRole(_),
+                        ) => true,
+                        (
+                            PublicInstruction::ReplicatorOpen,
+                            PublicInstructionOutcome::Endpoint(_),
+                        )
+                        | (PublicInstruction::Progress, PublicInstructionOutcome::Progress(_)) => {
+                            true
+                        }
+                        (
+                            PublicInstruction::ReplicatorClose,
+                            PublicInstructionOutcome::CloseFailure {
+                                child: crate::host::state::PublicCloseChild::Replicator,
+                                ..
+                            },
+                        )
+                        | (
+                            PublicInstruction::ApplicationClose,
+                            PublicInstructionOutcome::CloseFailure {
+                                child: crate::host::state::PublicCloseChild::Application,
+                                ..
+                            },
                         ) => true,
                         (
                             PublicInstruction::DataLoss,
@@ -2052,7 +2173,11 @@ impl AgentStore for SqliteStore {
                             ),
                         ) => true,
                         (
-                            PublicInstruction::ApplicationPrimary | PublicInstruction::DataLoss,
+                            PublicInstruction::ApplicationPrimary
+                            | PublicInstruction::ApplicationRole
+                            | PublicInstruction::DataLoss
+                            | PublicInstruction::ReplicatorOpen
+                            | PublicInstruction::Progress,
                             _,
                         ) => false,
                         (_, PublicInstructionOutcome::Done) => true,
@@ -2071,6 +2196,24 @@ impl AgentStore for SqliteStore {
                                 crate::host::HostError::Corrupt("missing history barrier".into())
                             })?
                             .outcome = result.clone();
+                    }
+                    if instruction == PublicInstruction::Access && !preview.terminal {
+                        preview.writes_revoked = false;
+                    }
+                    if instruction == PublicInstruction::Remove
+                        && let Some(
+                            crate::protocol::public_operations::PublicOperationProgram::Remove(
+                                build,
+                            ),
+                        ) = &intent.program
+                    {
+                        if preview.active_builds.get(&build.replica.replica_id) != Some(build) {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "removal attempt changed".into(),
+                            ));
+                        }
+                        preview.active_builds.remove(&build.replica.replica_id);
+                        preview.absent_builds.insert(build.attempt.clone());
                     }
                     record.lifecycle.outcomes.push(outcome);
                     record.lifecycle.in_flight = None;
@@ -2124,6 +2267,7 @@ fn valid_public_operation_transition(
             PublicOperationStage::WaitingForContainment,
             PublicOperationStage::Completed
         ) | (PublicOperationStage::Ready, PublicOperationStage::Running)
+            | (PublicOperationStage::Running, PublicOperationStage::Ready)
             | (
                 PublicOperationStage::Ready,
                 PublicOperationStage::ContainmentPending

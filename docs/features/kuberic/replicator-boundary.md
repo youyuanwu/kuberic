@@ -103,6 +103,31 @@ for Kubernetes. This is a repository-only Service model, not production
 `AcceptedStatus`, routing or CRD activation. The existing custom-authority
 and legacy access engines remain unchanged.
 
+Phase 4.3 extends the same dormant owner with exact public-operation programs.
+A planned swap durably installs the captured starting PC/CC configuration
+before its first wait, revokes preview writes/location, applies the swap epoch,
+installs the refreshed configuration, repeats the same caller-selected
+catch-up mode, and hands off Replicator role before application role. Recovery
+reinstalls the exact captured configuration before reevaluating an interrupted
+wait, so an incidental previously installed topology cannot satisfy the
+operation.
+
+Build state is keyed by exact attempt identity. Same-target removal supersedes
+and drains the owned build root and provider descendants before
+`remove_replica`, then durably records that exact attempt absent. Ambiguous
+build execution remains fenced until the attempt is contained and retired;
+late completion cannot remove or publish a successor attempt.
+
+Preview Close and Abort are also operation programs. Close revokes publication,
+drains blockers, closes Replicator before application, and waits for descendant
+containment. A child close error invokes Replicator-before-application abort,
+continues cleanup, retains typed child diagnostics, and normalizes the outer
+result only after containment. Abort fences synchronously and invokes those
+abort callbacks once while durable cleanup remains registry-owned. The replay
+table distinguishes repeatable convergent callbacks, read-only progress,
+non-repeatable ambiguous build/data-loss work, exact removal, and terminal
+containment; a fresh process session never executes predecessor program state.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

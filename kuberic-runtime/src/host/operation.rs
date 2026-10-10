@@ -35,6 +35,9 @@ pub(crate) struct PartitionOperation {
     needs_recovery: std::sync::atomic::AtomicBool,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     revision: watch::Sender<u64>,
+    descendants: Mutex<Option<watch::Receiver<bool>>>,
+    #[cfg(all(test, feature = "testing"))]
+    cut: Mutex<Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>>,
 }
 
 impl PartitionOperation {
@@ -58,6 +61,9 @@ impl PartitionOperation {
             needs_recovery: std::sync::atomic::AtomicBool::new(needs_recovery),
             shutting_down,
             revision,
+            descendants: Mutex::new(None),
+            #[cfg(all(test, feature = "testing"))]
+            cut: Mutex::new(None),
         }
     }
 
@@ -67,6 +73,68 @@ impl PartitionOperation {
 
     pub(crate) fn snapshot(&self) -> PublicOperationRecord {
         self.record.borrow().clone()
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) async fn track_cut(
+        &self,
+        cut: Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>,
+    ) {
+        *self.cut.lock().await = cut;
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) async fn crash_root(&self) {
+        if let Some(task) = self.task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.needs_recovery
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn track_containment(&self, witness: watch::Receiver<bool>) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.snapshot().stage != PublicOperationStage::Ready {
+            return Err(HostError::CommandRejected(
+                "containment must be bound before dispatch".into(),
+            ));
+        }
+        *self.descendants.lock().await = Some(witness);
+        Ok(())
+    }
+
+    async fn descendants_contained(&self) -> bool {
+        self.descendants
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|witness| *witness.borrow())
+    }
+
+    async fn settle_witness(&self) -> Result<()> {
+        let witness = self.descendants.lock().await.clone();
+        if witness.is_some_and(|witness| *witness.borrow())
+            && self.snapshot().stage == PublicOperationStage::ContainmentPending
+        {
+            self.complete_containment().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn wait_until_ready(&self) -> Result<bool> {
+        let mut record = self.record.subscribe();
+        loop {
+            match record.borrow().stage {
+                PublicOperationStage::Ready => return Ok(true),
+                PublicOperationStage::WaitingForContainment => {}
+                _ => return Ok(false),
+            }
+            record
+                .changed()
+                .await
+                .map_err(|_| HostError::CommandRejected("operation owner lost".into()))?;
+        }
     }
 
     pub(crate) async fn spawn_root<F, E>(
@@ -162,8 +230,9 @@ impl PartitionOperation {
             Err(error) => PublicOperationDisposition::Failed(error),
         };
 
-        if matches!(disposition, PublicOperationDisposition::Failed(_))
-            && containment == CallbackContainment::ObjectOwnedOnInterruption
+        if (matches!(disposition, PublicOperationDisposition::Failed(_))
+            && containment == CallbackContainment::ObjectOwnedOnInterruption)
+            || !self.descendants_contained().await
         {
             let pending = self
                 .advance(
@@ -186,6 +255,14 @@ impl PartitionOperation {
             .await?;
         self.record.send_replace(applied);
         self.bump_revision();
+        #[cfg(all(test, feature = "testing"))]
+        if let Some(cut) = self.cut.lock().await.clone() {
+            cut.pause(
+                crate::host::public_lifecycle::PublicCutPosition::CallbackApplied,
+                0,
+            )
+            .await;
+        }
         let completed = self
             .advance(
                 PublicOperationStage::CallbackApplied,
@@ -195,6 +272,14 @@ impl PartitionOperation {
             .await?;
         self.record.send_replace(completed);
         self.bump_revision();
+        #[cfg(all(test, feature = "testing"))]
+        if let Some(cut) = self.cut.lock().await.clone() {
+            cut.pause(
+                crate::host::public_lifecycle::PublicCutPosition::Completed,
+                0,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -275,7 +360,10 @@ impl PartitionOperation {
     ) -> Result<PublicOperationRecord> {
         let containment = *self.containment.lock().await;
         let next = match containment {
-            CallbackContainment::RootTask => PublicOperationStage::Completed,
+            CallbackContainment::RootTask if self.descendants_contained().await => {
+                PublicOperationStage::Completed
+            }
+            CallbackContainment::RootTask => PublicOperationStage::ContainmentPending,
             CallbackContainment::ObjectOwnedOnInterruption => {
                 PublicOperationStage::ContainmentPending
             }
@@ -306,6 +394,11 @@ impl PartitionOperation {
                 "public operation {} has no pending containment",
                 current.intent.operation_id
             )));
+        }
+        if !self.descendants_contained().await {
+            return Err(HostError::CommandRejected(
+                "root termination is not descendant containment".into(),
+            ));
         }
         let completed = match self
             .advance(
@@ -469,7 +562,21 @@ impl PartitionOperation {
             return Ok(None);
         }
 
-        let recovered = if record.stage == PublicOperationStage::CallbackApplied {
+        let same_session = &record.intent.process_session_id == current_session;
+        let recovered = if same_session
+            && record.superseded_by.is_none()
+            && crate::host::public_lifecycle::replayable(&record)
+            && matches!(
+                record.stage,
+                PublicOperationStage::Ready | PublicOperationStage::Running
+            ) {
+            if record.stage == PublicOperationStage::Ready {
+                record
+            } else {
+                self.advance(record.stage, PublicOperationStage::Ready, None)
+                    .await?
+            }
+        } else if record.stage == PublicOperationStage::CallbackApplied && same_session {
             if record.superseded_by.is_some() {
                 self.advance(
                     PublicOperationStage::CallbackApplied,
@@ -567,6 +674,9 @@ pub(crate) struct PartitionOperationRegistry {
     coordination: Mutex<Vec<JoinHandle<()>>>,
     revision: watch::Sender<u64>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    terminal_fence: std::sync::atomic::AtomicBool,
+    control_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    abort_guard: Arc<std::sync::Mutex<bool>>,
 }
 
 impl PartitionOperationRegistry {
@@ -595,11 +705,35 @@ impl PartitionOperationRegistry {
             coordination: Mutex::new(Vec::new()),
             revision,
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            terminal_fence: std::sync::atomic::AtomicBool::new(false),
+            control_tasks: std::sync::Mutex::new(Vec::new()),
+            abort_guard: Arc::new(std::sync::Mutex::new(false)),
         }))
     }
 
     pub(crate) fn revision_receiver(&self) -> watch::Receiver<u64> {
         self.revision.subscribe()
+    }
+
+    pub(crate) fn fence(&self) {
+        self.terminal_fence
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn abort_guard(&self) -> Arc<std::sync::Mutex<bool>> {
+        self.abort_guard.clone()
+    }
+
+    pub(crate) fn is_fenced(&self) -> bool {
+        self.terminal_fence
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn own_control_task(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.control_tasks
+            .lock()
+            .expect("control task lock")
+            .push(tokio::spawn(future));
     }
 
     pub(crate) async fn admit(
@@ -617,6 +751,11 @@ impl PartitionOperationRegistry {
         intent
             .validate()
             .map_err(|message| HostError::CommandRejected(message.to_string()))?;
+        if self.is_fenced() && !intent.class.is_terminal() {
+            return Err(HostError::CommandRejected(
+                "preview is synchronously fenced".into(),
+            ));
+        }
         if intent.preview != self.preview || intent.process_session_id != self.process_session_id {
             return Err(HostError::IdentityMismatch(
                 "public-operation preview or process session changed".into(),
@@ -643,6 +782,7 @@ impl PartitionOperationRegistry {
             .cloned()
         {
             if existing.intent() == intent {
+                existing.recover_if_needed(&self.process_session_id).await?;
                 return Ok(existing);
             }
             return Err(HostError::DurableEffectConflict(
@@ -842,6 +982,8 @@ impl PartitionOperationRegistry {
         for displaced in superseded {
             if let Err(error) = displaced.cancel_root().await {
                 first_error.get_or_insert(error);
+            } else if let Err(error) = displaced.settle_witness().await {
+                first_error.get_or_insert(error);
             }
         }
         if let Err(error) = self.refresh_waiters().await {
@@ -887,6 +1029,7 @@ impl PartitionOperationRegistry {
             .collect::<Vec<_>>();
         let mut recovered = Vec::new();
         for operation in operations {
+            operation.settle_witness().await?;
             if let Some(record) = operation
                 .recover_if_needed(&self.process_session_id)
                 .await?
@@ -904,6 +1047,11 @@ impl PartitionOperationRegistry {
     pub(crate) async fn shutdown(&self) -> Result<()> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        let controls = std::mem::take(&mut *self.control_tasks.lock().expect("control task lock"));
+        for task in controls {
+            task.abort();
+            let _ = task.await;
+        }
         let admission = self.admission.lock().await;
         let mut first_error = None;
         let coordination = std::mem::take(&mut *self.coordination.lock().await);
@@ -1179,6 +1327,7 @@ mod tests {
             class,
             input_digest: format!("digest-{revision}"),
             lifecycle: None,
+            program: None,
         }
     }
 

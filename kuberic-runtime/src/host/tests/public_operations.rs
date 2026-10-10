@@ -40,6 +40,8 @@ use super::tempdir;
 
 #[path = "public_operations/lifecycle.rs"]
 mod lifecycle;
+#[path = "public_operations/reconfiguration.rs"]
+mod reconfiguration;
 
 fn replica_identity() -> ReplicaIdentity {
     ReplicaIdentity {
@@ -76,6 +78,7 @@ fn intent(
         class,
         input_digest: format!("digest-{operation_id}-{revision}"),
         lifecycle: None,
+        program: None,
     }
 }
 
@@ -1535,6 +1538,15 @@ struct Trace {
     service_address: Mutex<Option<String>>,
     data_loss: Mutex<Option<std::result::Result<bool, String>>>,
     fail_role: AtomicBool,
+    fail_close: Mutex<Vec<&'static str>>,
+    configurations: Mutex<Vec<crate::protocol::public_operations::PublicConfiguration>>,
+    installed: Mutex<Option<crate::protocol::public_operations::PublicConfiguration>>,
+    waits: Mutex<
+        Vec<(
+            crate::protocol::public_operations::PublicConfiguration,
+            ReplicaSetQuorumMode,
+        )>,
+    >,
 }
 
 struct TraceCallback {
@@ -1697,6 +1709,7 @@ struct TraceApplication {
     trace: Arc<Trace>,
     replicator: Arc<TraceReplicator>,
     state_replicator: Arc<TraceStateReplicator>,
+    convergent_open: AtomicBool,
 }
 
 struct TraceReplicatorFactory {
@@ -1729,6 +1742,9 @@ impl TraceApplication {
 #[async_trait]
 impl StatefulServiceReplica for TraceApplication {
     async fn open(self: Arc<Self>, context: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
+        if self.convergent_open.load(Ordering::Acquire) {
+            return self.trace_open().await;
+        }
         self.trace.callback("application.open").await;
         let interfaces = context
             .partition
@@ -1758,6 +1774,17 @@ impl StatefulServiceReplica for TraceApplication {
 
     async fn close(&self) -> crate::Result<()> {
         self.trace.callback("application.close").await;
+        if self
+            .trace
+            .fail_close
+            .lock()
+            .unwrap()
+            .contains(&"application")
+        {
+            return Err(crate::RuntimeError::Application(
+                "application close failed".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1774,6 +1801,8 @@ struct TraceReplicator {
     descendant_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     descendant_stopped: Arc<AtomicBool>,
     lifecycle_closed: Arc<AtomicBool>,
+    containment: watch::Sender<bool>,
+    cancel_descendant_with_root: AtomicBool,
 }
 
 impl TraceReplicator {
@@ -1786,15 +1815,18 @@ impl TraceReplicator {
     }
 
     fn start_descendant(&self) {
+        self.containment.send_replace(false);
         let (stop, mut receiver) = tokio::sync::watch::channel(false);
         *self.descendant_stop.lock().unwrap() = Some(stop);
         let stopped = self.descendant_stopped.clone();
         let trace = self.trace.clone();
+        let containment = self.containment.clone();
         let task = tokio::spawn(async move {
             trace.record("provider.descendant.begin");
             let _ = receiver.wait_for(|stop| *stop).await;
             stopped.store(true, Ordering::Release);
             trace.record("provider.descendant.end");
+            containment.send_replace(true);
         });
         *self.descendant_task.lock().unwrap() = Some(task);
     }
@@ -1831,6 +1863,17 @@ impl Replicator for TraceReplicator {
 
     async fn close(&self) -> crate::Result<()> {
         self.trace.callback("replicator.close").await;
+        if self
+            .trace
+            .fail_close
+            .lock()
+            .unwrap()
+            .contains(&"replicator")
+        {
+            return Err(crate::RuntimeError::Application(
+                "replicator close failed".into(),
+            ));
+        }
         self.lifecycle_closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -1864,36 +1907,74 @@ impl PrimaryReplicator for TraceReplicator {
 
     async fn update_catch_up_replica_set_configuration(
         &self,
-        _current: ReplicaSetConfiguration,
-        _previous: ReplicaSetConfiguration,
+        current: ReplicaSetConfiguration,
+        previous: ReplicaSetConfiguration,
     ) -> crate::Result<()> {
         self.require_primary()?;
         self.trace
             .callback("primary.update_catch_up_configuration")
             .await;
+        let configuration = crate::protocol::public_operations::PublicConfiguration {
+            current: current.configuration,
+            previous: Some(previous.configuration),
+        };
+        self.trace
+            .configurations
+            .lock()
+            .unwrap()
+            .push(configuration.clone());
+        *self.trace.installed.lock().unwrap() = Some(configuration);
         Ok(())
     }
 
-    async fn wait_for_catch_up_quorum(&self, _mode: ReplicaSetQuorumMode) -> crate::Result<()> {
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> crate::Result<()> {
         self.require_primary()?;
+        if let Some(configuration) = self.trace.installed.lock().unwrap().clone() {
+            self.trace.waits.lock().unwrap().push((configuration, mode));
+        }
         self.trace.callback("primary.wait_for_catch_up").await;
         Ok(())
     }
 
     async fn update_current_replica_set_configuration(
         &self,
-        _current: ReplicaSetConfiguration,
+        current: ReplicaSetConfiguration,
     ) -> crate::Result<()> {
         self.require_primary()?;
         self.trace
             .callback("primary.update_current_configuration")
             .await;
+        let configuration = crate::protocol::public_operations::PublicConfiguration {
+            current: current.configuration,
+            previous: None,
+        };
+        self.trace
+            .configurations
+            .lock()
+            .unwrap()
+            .push(configuration.clone());
+        *self.trace.installed.lock().unwrap() = Some(configuration);
         Ok(())
     }
 
     async fn build_replica(&self, _replica: ReplicaInformation) -> crate::Result<()> {
         self.require_primary()?;
         self.start_descendant();
+        struct CancelDescendant(Option<watch::Sender<bool>>);
+        impl Drop for CancelDescendant {
+            fn drop(&mut self) {
+                if let Some(stop) = &self.0 {
+                    stop.send_replace(true);
+                }
+            }
+        }
+        let _cancel = CancelDescendant(
+            if self.cancel_descendant_with_root.load(Ordering::Acquire) {
+                self.descendant_stop.lock().unwrap().clone()
+            } else {
+                None
+            },
+        );
         self.trace.callback("primary.build_replica").await;
         if let Some(stop) = self.descendant_stop.lock().unwrap().take() {
             stop.send_replace(true);
@@ -1935,6 +2016,8 @@ fn trace_fixture() -> (
         descendant_task: Mutex::new(None),
         descendant_stopped: Arc::new(AtomicBool::new(false)),
         lifecycle_closed: lifecycle_closed.clone(),
+        containment: watch::channel(true).0,
+        cancel_descendant_with_root: AtomicBool::new(false),
     });
     let state_replicator = Arc::new(TraceStateReplicator {
         trace: trace.clone(),
@@ -1944,6 +2027,7 @@ fn trace_fixture() -> (
         trace: trace.clone(),
         replicator: replicator.clone(),
         state_replicator: state_replicator.clone(),
+        convergent_open: AtomicBool::new(false),
     });
     (trace, application, replicator, state_replicator)
 }

@@ -38,6 +38,7 @@ pub fn plan_public_lifecycle(
         class: PublicOperationClass::Authority,
         input_digest: input.digest(),
         lifecycle: Some(input),
+        program: None,
     };
     intent.validate()?;
     Ok(intent)

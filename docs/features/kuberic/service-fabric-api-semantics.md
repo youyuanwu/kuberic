@@ -759,7 +759,50 @@ production CRD/status/effect variants or activate the legacy custom-authority
 and access recipes, even in all-features builds. Tests use the real preview
 planner, runtime journal, normalizer and executor with a conditional
 in-memory Kubernetes Service model. They do not claim live-cluster cutover,
-Phase 5 public-value conformance, or completed Phase 4.3/4.4 behavior.
+Phase 5 public-value conformance, or completed Phase 4.4 behavior.
+
+### Dormant Phase 4.3 Implementation
+
+The preview operation journal now also accepts exact frozen programs for Open,
+role, epoch, configuration, catch-up, progress, planned swap, build, removal,
+Close, and Abort. Planned swap follows:
+
+1. install the exact captured starting current/previous configuration;
+2. wait using one captured opaque catch-up mode;
+3. revoke preview write/location publication;
+4. apply the swap epoch;
+5. install the exact refreshed configuration;
+6. repeat the same captured mode;
+7. change Replicator role and then application role.
+
+Interrupted waits reinstall the corresponding frozen configuration before
+reevaluation. Tests deliberately seed a different installed configuration and
+cut before/after the first install, proving stale topology cannot satisfy the
+first wait. The mode is retained as caller input only; Phase 5 still owns the
+capability-dependent value policy.
+
+Build admission retains one exact attempt per target. Removal names that exact
+attempt, cancels and joins its build callback and provider descendant, then
+invokes `remove_replica` and records exact absence. An ambiguous build is not
+reinvoked; it must be contained and removed before a fresh attempt can be
+admitted. Stale completion and stale removal cannot affect a newer attempt.
+
+Close revokes preview serving before teardown, drains conflicting operations,
+calls Replicator close before application close, and waits for tracked
+descendants. A child close error triggers ordered abort containment and is
+retained as a typed diagnostic while remaining teardown continues; outer
+success means containment completed. Synchronous Abort fences admission and
+invokes Replicator abort before application abort exactly once, while its
+durable cleanup is still host-owned.
+
+Replay is operation-specific rather than universally exactly-once. Exact
+terminal completion returns without callbacks; same-session convergent
+Open/role/epoch/configuration work and exact catch-up may resume; progress is a
+repeatable read; swap reinstalls captured topology/mode; durable build success
+is not reinvoked; ambiguous build/data loss remains closed; removal converges
+to exact absence; Close/Abort converges to terminal containment. Reopening any
+durable cut in a fresh process session yields only historical evidence and
+remains unassigned, access-closed, and location-free.
 
 ### Production Verdict
 

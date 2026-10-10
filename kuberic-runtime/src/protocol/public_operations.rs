@@ -72,6 +72,8 @@ pub struct PublicOperationIntent {
     pub input_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<PublicLifecycleInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<PublicOperationProgram>,
 }
 
 impl PublicOperationIntent {
@@ -92,6 +94,9 @@ impl PublicOperationIntent {
             return Err("public-operation input digest is empty");
         }
         if let Some(input) = &self.lifecycle {
+            if self.program.is_some() {
+                return Err("operation cannot carry two programs");
+            }
             if self.class != PublicOperationClass::Authority {
                 return Err("lifecycle input requires authority operation");
             }
@@ -99,6 +104,161 @@ impl PublicOperationIntent {
             if self.input_digest != input.digest() {
                 return Err("lifecycle digest does not match frozen input");
             }
+        }
+        if let Some(program) = &self.program {
+            program.validate(&self.class, &self.operation_id)?;
+            if self.input_digest != program.digest() {
+                return Err("program digest does not match frozen input");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Captures the caller's selection, not the predicate or value policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum PublicCatchUpMode {
+    WriteQuorum,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PublicConfiguration {
+    pub current: ConfigurationDescriptor,
+    pub previous: Option<ConfigurationDescriptor>,
+}
+
+impl PublicConfiguration {
+    fn validate(&self) -> Result<(), &'static str> {
+        for configuration in std::iter::once(&self.current).chain(self.previous.iter()) {
+            if configuration.configuration_id != configuration.expected_id()
+                || configuration.write_quorum == 0
+                || configuration.write_quorum as usize > configuration.members.len()
+                || configuration
+                    .members
+                    .iter()
+                    .filter(|m| m.role == ReplicaRole::Primary)
+                    .count()
+                    != 1
+                || !configuration.members.iter().any(|m| {
+                    m.identity.replica_id == configuration.primary_id
+                        && m.role == ReplicaRole::Primary
+                })
+                || configuration
+                    .members
+                    .iter()
+                    .map(|m| &m.identity)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != configuration.members.len()
+            {
+                return Err("invalid exact public configuration");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PublicBuildInput {
+    pub attempt: OperationId,
+    pub replica: ReplicaIdentity,
+    pub process_session_id: ProcessSessionId,
+    pub replication_address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum PublicOperationProgram {
+    Open {
+        replica: ReplicaIdentity,
+        existing: bool,
+    },
+    Role {
+        epoch: Epoch,
+        role: ReplicaRole,
+    },
+    Epoch {
+        epoch: Epoch,
+    },
+    Configuration(PublicConfiguration),
+    CatchUp {
+        configuration: PublicConfiguration,
+        mode: PublicCatchUpMode,
+    },
+    Progress {
+        capability: bool,
+    },
+    Swap {
+        starting: PublicConfiguration,
+        refreshed: PublicConfiguration,
+        epoch: Epoch,
+        handoff: ReplicaRole,
+        mode: PublicCatchUpMode,
+    },
+    Build(PublicBuildInput),
+    Remove(PublicBuildInput),
+    Close,
+    Abort,
+}
+
+impl PublicOperationProgram {
+    pub fn digest(&self) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(format!("{self:?}").as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn validate(&self, class: &PublicOperationClass, id: &OperationId) -> Result<(), &'static str> {
+        let expected = match self {
+            Self::Swap {
+                starting,
+                refreshed,
+                epoch,
+                handoff,
+                ..
+            } => {
+                starting.validate()?;
+                refreshed.validate()?;
+                if starting.current.epoch >= *epoch
+                    || refreshed.current.epoch != *epoch
+                    || !matches!(handoff, ReplicaRole::ActiveSecondary | ReplicaRole::None)
+                {
+                    return Err("invalid swap epoch or handoff");
+                }
+                PublicOperationClass::PlannedSwap
+            }
+            Self::Configuration(configuration) | Self::CatchUp { configuration, .. } => {
+                configuration.validate()?;
+                PublicOperationClass::Authority
+            }
+            Self::Build(build) | Self::Remove(build) => {
+                if build.attempt.is_empty()
+                    || build.process_session_id.is_empty()
+                    || build.replication_address.is_empty()
+                {
+                    return Err("incomplete exact build identity");
+                }
+                if matches!(self, Self::Build(_)) {
+                    if &build.attempt != id {
+                        return Err("build operation is not its exact attempt");
+                    }
+                    PublicOperationClass::Build {
+                        target: build.replica.replica_id,
+                    }
+                } else {
+                    PublicOperationClass::Remove {
+                        target: build.replica.replica_id,
+                    }
+                }
+            }
+            Self::Close => PublicOperationClass::Close,
+            Self::Abort => PublicOperationClass::Abort,
+            _ => PublicOperationClass::Authority,
+        };
+        if *class != expected {
+            return Err("program does not match operation class");
         }
         Ok(())
     }

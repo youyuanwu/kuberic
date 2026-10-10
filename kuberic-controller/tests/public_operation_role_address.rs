@@ -609,6 +609,7 @@ async fn public_operation_role_address_rejects_inconsistent_persisted_location_f
                     class: PublicOperationClass::Abort,
                     input_digest: "terminal".into(),
                     lifecycle: None,
+                    program: None,
                 };
                 projection.process_session_id = projection.authority.process_session_id.clone();
                 projection.revision = projection.authority.revision;

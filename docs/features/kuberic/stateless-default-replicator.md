@@ -871,6 +871,18 @@ public/custom test implementations and the future built-in preview.
 - keep the entire next-protocol path preview/test-only until the atomic
   cutover.
 
+The dormant alignment implementation now supplies the Phase 4.3 ordering and
+replay prerequisite used by this roadmap. Planned swap freezes both exact
+configurations plus one opaque mode, reinstalls the relevant configuration
+before each recovered wait, revokes serving between waits, and preserves
+Replicator-before-application handoff. Exact build attempts are drained before
+removal; ambiguous attempts require containment and retirement before a new
+attempt. Close/Abort preserve ordered containment and typed child diagnostics.
+The agent journal implements the operation-specific replay table above, while
+fresh process sessions remain unassigned and cannot execute predecessor
+program records. These are preview semantics only and do not select the
+replacement default Replicator.
+
 Exit criteria:
 
 - every public callback has one exact task owner, bounded cancellation and

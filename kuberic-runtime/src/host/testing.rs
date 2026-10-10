@@ -111,8 +111,18 @@ impl PublicOperationPreviewRuntime {
     pub(crate) async fn lifecycle_report(
         &self,
     ) -> crate::host::Result<crate::protocol::public_operations::PublicLifecycleReport> {
-        crate::host::public_lifecycle::report(self.store.as_ref(), &self.preview, &self.session)
-            .await
+        let mut report = crate::host::public_lifecycle::report(
+            self.store.as_ref(),
+            &self.preview,
+            &self.session,
+        )
+        .await?;
+        if self.registry().is_fenced() {
+            report.write_access = false;
+            report.service_location = None;
+            report.role = crate::protocol::types::ReplicaRole::None;
+        }
+        Ok(report)
     }
 }
 
