@@ -335,6 +335,60 @@ async fn public_operation_role_address_delayed_old_revision_and_resource_replace
 }
 
 #[tokio::test]
+async fn public_operation_role_address_clears_old_location_before_new_publication() {
+    let (config, old, old_report) = fixture(1, Some("old"));
+    let (_, new, new_report) = fixture(2, Some("new"));
+    let api = Api::new();
+    converge(&api, &config, &old, &old_report).await;
+
+    let pending_clear = plan(&api, &config, &new, &new_report).await;
+    let PreviewServiceLocationPlan::PersistStatus { next, .. } = &pending_clear else {
+        panic!("new authority did not begin with a persisted clear")
+    };
+    let PreviewServiceLocationStage::Pending(projection) = &next.service_location_projection else {
+        panic!("clear was not pending")
+    };
+    assert!(projection.location.is_none());
+    assert_eq!(projection.deferred_location, new_report.service_location);
+    execute_preview_service_location(&api, pending_clear)
+        .await
+        .unwrap();
+
+    let service_clear = plan(&api, &config, &new, &new_report).await;
+    let PreviewServiceLocationPlan::WriteService { projection, .. } = &service_clear else {
+        panic!("pending clear did not mutate the Service")
+    };
+    assert!(projection.location.is_none());
+    execute_preview_service_location(&api, service_clear)
+        .await
+        .unwrap();
+
+    let publish_clear = plan(&api, &config, &new, &new_report).await;
+    let PreviewServiceLocationPlan::PersistStatus { next, .. } = &publish_clear else {
+        panic!("cleared Service was not published absent")
+    };
+    let PreviewServiceLocationStage::Published(projection) = &next.service_location_projection
+    else {
+        panic!("clear was not published")
+    };
+    assert!(projection.location.is_none());
+    assert_eq!(projection.deferred_location, new_report.service_location);
+    execute_preview_service_location(&api, publish_clear)
+        .await
+        .unwrap();
+
+    let pending_publish = plan(&api, &config, &new, &new_report).await;
+    let PreviewServiceLocationPlan::PersistStatus { next, .. } = pending_publish else {
+        panic!("new location did not begin after published absence")
+    };
+    let PreviewServiceLocationStage::Pending(projection) = next.service_location_projection else {
+        panic!("new location was not pending")
+    };
+    assert_eq!(projection.location, new_report.service_location);
+    assert!(projection.deferred_location.is_none());
+}
+
+#[tokio::test]
 async fn public_operation_role_address_closed_mixed_stale_fresh_session_reports_clear() {
     for case in 0..8 {
         let (config, authority, mut report) = fixture(1, Some("old"));
@@ -419,6 +473,54 @@ async fn public_operation_role_address_fresh_session_clear_fences_predecessor_re
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn public_operation_role_address_rejects_inconsistent_persisted_location_fences() {
+    let (config, authority, report) = fixture(1, Some("old"));
+    let api = Api::new();
+    converge(&api, &config, &authority, &report).await;
+    let (status, service) = api.observe_preview().await.unwrap();
+
+    for case in 0..4 {
+        let mut changed = status.clone();
+        let PreviewServiceLocationStage::Published(projection) =
+            &mut changed.service_location_projection
+        else {
+            panic!("fixture was not published")
+        };
+        match case {
+            0 => projection.location.as_mut().unwrap().preview.generation += 1,
+            1 => projection.location.as_mut().unwrap().operation_id = OperationId::new("different"),
+            2 => projection.location.as_mut().unwrap().epoch = Epoch::new(999, 1),
+            3 => {
+                projection.authority = PublicOperationIntent {
+                    preview: authority.preview.clone(),
+                    operation_id: OperationId::new("terminal"),
+                    revision: 2,
+                    process_session_id: authority.process_session_id.clone(),
+                    class: PublicOperationClass::Abort,
+                    input_digest: "terminal".into(),
+                    lifecycle: None,
+                };
+                projection.process_session_id = projection.authority.process_session_id.clone();
+                projection.revision = projection.authority.revision;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            evaluate_service_location(
+                &config,
+                &ResourceUid::new("resource-1"),
+                &authority,
+                Some(&report),
+                &changed,
+                &service,
+            )
+            .is_err(),
+            "persisted fence case {case} was accepted"
+        );
+    }
 }
 
 #[tokio::test]

@@ -749,7 +749,7 @@ fn converge(
     status: &mut PreviewAcceptedStatus,
     service: &mut PreviewWriteService,
 ) {
-    for _ in 0..5 {
+    for _ in 0..8 {
         match evaluate_service_location(
             &fixture.config(),
             &wire(ResourceUid::new("resource-1")),
