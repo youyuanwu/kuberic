@@ -829,7 +829,9 @@ preview protocol/store identity, one exact `PartitionOperationRegistry`
 admission boundary, caller-independent root-task ownership, explicit
 containment-pending state, canonical callback-applied stage, durable operation
 records and a `PartitionOperationRecoveryOwner`. A preview runtime owner joins
-registry coordination/root tasks during shutdown. The strict blockable public
+registry coordination/root tasks during shutdown and is constructed from the
+real agent store/process session by the repository testing service path. The
+strict blockable public
 application/Replicator/provider/data-plane fixture and API/privacy/source
 guards prove ownership without changing the protected public method sets.
 Schema-7 preview state is incompatible with the schema-6 legacy reader; legacy

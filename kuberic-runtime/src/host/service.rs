@@ -509,6 +509,19 @@ where
         &self.sessions
     }
 
+    #[cfg(feature = "testing")]
+    #[allow(dead_code)]
+    pub(crate) fn public_operation_preview_runtime(
+        &self,
+        preview: crate::protocol::public_operations::PublicOperationPreviewIdentity,
+    ) -> Result<crate::host::testing::PublicOperationPreviewRuntime> {
+        crate::host::testing::PublicOperationPreviewRuntime::start(
+            self.store.clone(),
+            preview,
+            self.sessions.local_session().clone(),
+        )
+    }
+
     pub(crate) async fn serve(
         self,
         control_address: SocketAddr,

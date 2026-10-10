@@ -86,17 +86,28 @@ pub fn evaluate_json(snapshot: &[u8], config: &EvaluationConfig) -> serde_json::
 }
 
 pub fn evaluate_preview_json(
-    preview: &PublicOperationPreviewIdentity,
     snapshot: &[u8],
     config: &PublicOperationPreviewEvaluationConfig,
 ) -> serde_json::Result<Vec<u8>> {
-    config.validate_identity(preview).map_err(|message| {
+    let value: serde_json::Value = serde_json::from_slice(snapshot)?;
+    let preview: PublicOperationPreviewIdentity =
+        serde_json::from_value(value.get("preview").cloned().ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "public-operation preview observation is missing its identity",
+            ))
+        })?)?;
+    config.validate_identity(&preview).map_err(|message| {
         serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             message,
         ))
     })?;
-    evaluate_json(snapshot, &config.evaluation)
+    let snapshot: SnapshotBridge = serde_json::from_value(value)?;
+    serde_json::to_vec(&serde_json::json!({
+        "preview": preview,
+        "plan": super::evaluate(&snapshot.into(), &config.evaluation),
+    }))
 }
 
 #[cfg(test)]
@@ -121,8 +132,11 @@ mod tests {
                 .validate_identity(&PublicOperationPreviewIdentity::new(12))
                 .is_err()
         );
-        let error = evaluate_preview_json(&PublicOperationPreviewIdentity::new(12), b"{}", &config)
-            .unwrap_err();
+        let error = evaluate_preview_json(
+            br#"{"preview":{"protocolVersion":10,"generation":12}}"#,
+            &config,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("preview identity mismatch"));
     }
 }

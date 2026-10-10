@@ -93,6 +93,7 @@ pub(crate) enum PublicOperationDisposition {
     Failed(String),
     Ambiguous(String),
     Cancelled,
+    Attached(OperationId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

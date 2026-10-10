@@ -365,6 +365,15 @@ impl SqliteStore {
             .store(1, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn relax_durability_for_tests(&self) {
+        self.connection
+            .lock()
+            .expect("test SQLite connection lock")
+            .execute_batch("PRAGMA synchronous = OFF;")
+            .expect("relax test SQLite durability");
+    }
+
     fn with_transaction<T>(&self, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut connection = self.connection.lock().map_err(|_| {
             crate::host::HostError::Corrupt("agent database connection mutex was poisoned".into())

@@ -40,13 +40,20 @@ pub enum PublicOperationClass {
     Abort,
     TransientFault,
     PermanentFault,
+    Restart,
+    DropReplacement,
 }
 
 impl PublicOperationClass {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Close | Self::Abort | Self::TransientFault | Self::PermanentFault
+            Self::Close
+                | Self::Abort
+                | Self::TransientFault
+                | Self::PermanentFault
+                | Self::Restart
+                | Self::DropReplacement
         )
     }
 }

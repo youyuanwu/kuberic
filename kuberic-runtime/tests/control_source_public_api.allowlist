@@ -789,7 +789,9 @@ public-path hidden variant crate::protocol::public_operations::PublicOperationCl
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Authority
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Build { { target : ReplicaId } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Close
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::DropReplacement
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::PermanentFault
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::PlannedSwap
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Remove { { target : ReplicaId } }
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Restart
 public-path hidden variant crate::protocol::public_operations::PublicOperationClass::TransientFault

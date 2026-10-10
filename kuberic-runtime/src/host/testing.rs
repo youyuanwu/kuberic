@@ -3,6 +3,7 @@
 //! This owns data-plane polling, not authority or application lifetime. Callers
 //! admit configurations/builds themselves and supply a fresh session on restart.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -14,7 +15,54 @@ use futures::future::{BoxFuture, poll_fn};
 use futures::task::noop_waker_ref;
 
 use crate::host::hosting::{OutboundReplication, PendingReplication, PodRuntime};
+use crate::host::operation::{CallbackContainment, PartitionOperationRegistry};
+use crate::host::operation_recovery::PartitionOperationRuntime;
+use crate::host::state::PublicOperationRecord;
+use crate::host::store::AgentStore;
 use crate::host::transport::{copy_from_proto, replication_from_proto};
+use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationPreviewIdentity};
+
+#[allow(dead_code)]
+pub(crate) struct PublicOperationPreviewRuntime {
+    owner: PartitionOperationRuntime,
+}
+
+#[allow(dead_code)]
+impl PublicOperationPreviewRuntime {
+    pub(crate) fn start(
+        store: Arc<dyn AgentStore>,
+        preview: PublicOperationPreviewIdentity,
+        process_session_id: ProcessSessionId,
+    ) -> crate::host::Result<Self> {
+        let registry = PartitionOperationRegistry::new(store, preview, process_session_id)?;
+        Ok(Self {
+            owner: PartitionOperationRuntime::start(registry),
+        })
+    }
+
+    pub(crate) fn registry(&self) -> Arc<PartitionOperationRegistry> {
+        self.owner.registry()
+    }
+
+    pub(crate) async fn run_root<F, E>(
+        &self,
+        intent: PublicOperationIntent,
+        containment: CallbackContainment,
+        future: F,
+    ) -> crate::host::Result<PublicOperationRecord>
+    where
+        F: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        let operation = self.registry().admit(intent).await?;
+        operation.spawn_root(containment, future).await?;
+        operation.wait_for_terminal().await
+    }
+
+    pub(crate) async fn shutdown(self) -> crate::host::Result<()> {
+        self.owner.shutdown().await
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {

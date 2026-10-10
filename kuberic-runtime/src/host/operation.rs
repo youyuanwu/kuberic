@@ -17,8 +17,11 @@ use crate::protocol::types::{OperationId, ProcessSessionId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallbackContainment {
+    /// Joining the root future proves all operation-owned work terminated.
     RootTask,
-    ObjectOwned,
+    /// Successful callback completion is the public contract boundary; failure or
+    /// cancellation still requires object/process containment.
+    ObjectOwnedOnInterruption,
 }
 
 pub(crate) struct PartitionOperation {
@@ -30,6 +33,7 @@ pub(crate) struct PartitionOperation {
     containment: Mutex<CallbackContainment>,
     coordination_active: std::sync::atomic::AtomicBool,
     needs_recovery: std::sync::atomic::AtomicBool,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
     revision: watch::Sender<u64>,
 }
 
@@ -39,6 +43,7 @@ impl PartitionOperation {
         record: PublicOperationRecord,
         revision: watch::Sender<u64>,
         needs_recovery: bool,
+        shutting_down: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let (record, _) = watch::channel(record);
         let (failure, _) = watch::channel(None);
@@ -51,6 +56,7 @@ impl PartitionOperation {
             containment: Mutex::new(CallbackContainment::RootTask),
             coordination_active: std::sync::atomic::AtomicBool::new(false),
             needs_recovery: std::sync::atomic::AtomicBool::new(needs_recovery),
+            shutting_down,
             revision,
         }
     }
@@ -73,6 +79,14 @@ impl PartitionOperation {
         E: std::fmt::Display + Send + 'static,
     {
         let _lifecycle = self.lifecycle.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(HostError::CommandRejected(
+                "public-operation registry is shutting down".into(),
+            ));
+        }
         let current = self.snapshot();
         if current.stage != PublicOperationStage::Ready {
             return Err(HostError::CommandRejected(format!(
@@ -135,6 +149,7 @@ impl PartitionOperation {
         result: std::result::Result<(), String>,
         containment: CallbackContainment,
     ) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         let current = self.snapshot();
         if current.stage != PublicOperationStage::Running {
             return Err(HostError::StaleEffectCompletion(format!(
@@ -148,7 +163,7 @@ impl PartitionOperation {
         };
 
         if matches!(disposition, PublicOperationDisposition::Failed(_))
-            && containment == CallbackContainment::ObjectOwned
+            && containment == CallbackContainment::ObjectOwnedOnInterruption
         {
             let pending = self
                 .advance(
@@ -184,16 +199,18 @@ impl PartitionOperation {
     }
 
     pub(crate) async fn cancel_root(&self) -> Result<PublicOperationRecord> {
-        let _lifecycle = self.lifecycle.lock().await;
-        let current = self.snapshot();
-        if matches!(
-            current.stage,
-            PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-        ) {
-            return Ok(current);
-        }
-
-        if let Some(task) = self.task.lock().await.take() {
+        let task = {
+            let _lifecycle = self.lifecycle.lock().await;
+            let current = self.snapshot();
+            if matches!(
+                current.stage,
+                PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+            ) {
+                return Ok(current);
+            }
+            self.task.lock().await.take()
+        };
+        if let Some(task) = task {
             task.abort();
             match task.await {
                 Ok(Ok(())) => {}
@@ -210,6 +227,7 @@ impl PartitionOperation {
             }
         }
 
+        let _lifecycle = self.lifecycle.lock().await;
         let current = self.snapshot();
         if matches!(
             current.stage,
@@ -218,13 +236,20 @@ impl PartitionOperation {
             return Ok(current);
         }
         if current.stage == PublicOperationStage::CallbackApplied {
-            let completed = self
+            let completed = match self
                 .advance(
                     PublicOperationStage::CallbackApplied,
                     PublicOperationStage::Completed,
                     None,
                 )
-                .await?;
+                .await
+            {
+                Ok(completed) => completed,
+                Err(error) => {
+                    self.record_failure(&error);
+                    return Err(error);
+                }
+            };
             self.record.send_replace(completed.clone());
             self.bump_revision();
             return Ok(completed);
@@ -233,15 +258,24 @@ impl PartitionOperation {
         let containment = *self.containment.lock().await;
         let next = match containment {
             CallbackContainment::RootTask => PublicOperationStage::Completed,
-            CallbackContainment::ObjectOwned => PublicOperationStage::ContainmentPending,
+            CallbackContainment::ObjectOwnedOnInterruption => {
+                PublicOperationStage::ContainmentPending
+            }
         };
-        let updated = self
+        let updated = match self
             .advance(
                 current.stage,
                 next,
                 Some(PublicOperationDisposition::Cancelled),
             )
-            .await?;
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                self.record_failure(&error);
+                return Err(error);
+            }
+        };
         self.record.send_replace(updated.clone());
         self.bump_revision();
         Ok(updated)
@@ -259,13 +293,20 @@ impl PartitionOperation {
                 current.intent.operation_id
             )));
         }
-        let completed = self
+        let completed = match self
             .advance(
                 PublicOperationStage::ContainmentPending,
                 PublicOperationStage::Completed,
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                self.record_failure(&error);
+                return Err(error);
+            }
+        };
         self.record.send_replace(completed.clone());
         self.bump_revision();
         Ok(completed)
@@ -306,13 +347,20 @@ impl PartitionOperation {
         if current.stage != PublicOperationStage::WaitingForContainment {
             return Ok(());
         }
-        let ready = self
+        let ready = match self
             .advance(
                 PublicOperationStage::WaitingForContainment,
                 PublicOperationStage::Ready,
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.record_failure(&error);
+                return Err(error);
+            }
+        };
         self.record.send_replace(ready);
         self.bump_revision();
         Ok(())
@@ -346,6 +394,60 @@ impl PartitionOperation {
                 .await
                 .as_ref()
                 .is_some_and(|task| !task.is_finished())
+    }
+
+    async fn recover_if_needed(
+        &self,
+        current_session: &ProcessSessionId,
+    ) -> Result<Option<PublicOperationRecord>> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if !self.needs_recovery() || self.has_live_work().await {
+            return Ok(None);
+        }
+        let operation_id = self.intent().operation_id;
+        let record = self
+            .store
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| record.intent.operation_id == operation_id)
+            .ok_or_else(|| {
+                HostError::CommandRejected(format!(
+                    "public operation {operation_id} disappeared during recovery"
+                ))
+            })?;
+        self.record.send_replace(record.clone());
+        if matches!(
+            record.stage,
+            PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+        ) {
+            self.recovery_complete();
+            return Ok(None);
+        }
+
+        let recovered = if record.stage == PublicOperationStage::CallbackApplied {
+            self.advance(
+                PublicOperationStage::CallbackApplied,
+                PublicOperationStage::Completed,
+                None,
+            )
+            .await?
+        } else {
+            let detail = if &record.intent.process_session_id == current_session {
+                "public operation recovered without its owned task"
+            } else {
+                "public operation belongs to a predecessor process session"
+            };
+            self.advance(
+                record.stage,
+                PublicOperationStage::ContainmentPending,
+                Some(PublicOperationDisposition::Ambiguous(detail.into())),
+            )
+            .await?
+        };
+        self.record.send_replace(recovered.clone());
+        self.recovery_complete();
+        Ok(Some(recovered))
     }
 
     fn set_coordination_active(&self, active: bool) {
@@ -389,7 +491,7 @@ pub(crate) struct PartitionOperationRegistry {
     state: Mutex<RegistryState>,
     coordination: Mutex<Vec<JoinHandle<()>>>,
     revision: watch::Sender<u64>,
-    shutting_down: std::sync::atomic::AtomicBool,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PartitionOperationRegistry {
@@ -417,7 +519,7 @@ impl PartitionOperationRegistry {
             state: Mutex::new(RegistryState::default()),
             coordination: Mutex::new(Vec::new()),
             revision,
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))
     }
 
@@ -448,6 +550,14 @@ impl PartitionOperationRegistry {
 
         self.reap_coordination().await;
         let admission = self.admission.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(HostError::CommandRejected(
+                "public-operation registry is shutting down".into(),
+            ));
+        }
         self.load_durable_records().await?;
         if let Some(existing) = self
             .state
@@ -475,6 +585,7 @@ impl PartitionOperationRegistry {
             .collect::<Vec<_>>();
         let mut blockers = BTreeSet::new();
         let mut superseded = Vec::new();
+        let mut attached_to = None;
         for operation in existing {
             let record = operation.snapshot();
             let relation = if record.stage == PublicOperationStage::Completed {
@@ -484,7 +595,10 @@ impl PartitionOperationRegistry {
             };
             match relation {
                 AdmissionRelation::Coexist => {}
-                AdmissionRelation::Attach => return Ok(operation),
+                AdmissionRelation::Attach => {
+                    attached_to = Some(operation);
+                    break;
+                }
                 AdmissionRelation::Supersede => {
                     blockers.insert(record.intent.operation_id.clone());
                     superseded.push(operation);
@@ -493,6 +607,13 @@ impl PartitionOperationRegistry {
                     return Err(HostError::CommandRejected(reason.into()));
                 }
             }
+        }
+        if let Some(owner) = attached_to {
+            let attached = self
+                .record_attachment(intent, owner.intent().operation_id)
+                .await?;
+            drop(admission);
+            return Ok(attached);
         }
 
         let blocker_ids = blockers.iter().cloned().collect::<Vec<_>>();
@@ -511,6 +632,7 @@ impl PartitionOperationRegistry {
             record,
             self.revision.clone(),
             false,
+            self.shutting_down.clone(),
         ));
         self.state
             .lock()
@@ -552,6 +674,43 @@ impl PartitionOperationRegistry {
         Ok(operation)
     }
 
+    async fn record_attachment(
+        &self,
+        intent: PublicOperationIntent,
+        owner: OperationId,
+    ) -> Result<Arc<PartitionOperation>> {
+        let record = match self.store.begin_public_operation(&intent, &[]).await? {
+            BeginPublicOperation::Ready(record)
+            | BeginPublicOperation::Waiting(record)
+            | BeginPublicOperation::Pending(record)
+            | BeginPublicOperation::Completed(record) => record,
+        };
+        let operation = Arc::new(PartitionOperation::new(
+            self.store.clone(),
+            record,
+            self.revision.clone(),
+            false,
+            self.shutting_down.clone(),
+        ));
+        self.state
+            .lock()
+            .await
+            .operations
+            .insert(intent.operation_id.clone(), operation.clone());
+        if operation.snapshot().stage != PublicOperationStage::Completed {
+            let completed = operation
+                .advance(
+                    operation.snapshot().stage,
+                    PublicOperationStage::Completed,
+                    Some(PublicOperationDisposition::Attached(owner)),
+                )
+                .await?;
+            operation.record.send_replace(completed);
+        }
+        self.bump_revision();
+        Ok(operation)
+    }
+
     async fn finish_supersession(
         &self,
         _admitted: Arc<PartitionOperation>,
@@ -587,54 +746,22 @@ impl PartitionOperationRegistry {
     pub(crate) async fn recover_unowned(&self) -> Result<Vec<PublicOperationRecord>> {
         let _admission = self.admission.lock().await;
         self.load_durable_records().await?;
-        let records = self.store.public_operation_records().await?;
+        let operations = self
+            .state
+            .lock()
+            .await
+            .operations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut recovered = Vec::new();
-        for record in records {
-            let operation = self
-                .state
-                .lock()
-                .await
-                .operations
-                .get(&record.intent.operation_id)
-                .cloned()
-                .expect("durable public operation loaded into registry");
-            operation.record.send_replace(record.clone());
-            if matches!(
-                record.stage,
-                PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-            ) {
-                operation.recovery_complete();
-                continue;
+        for operation in operations {
+            if let Some(record) = operation
+                .recover_if_needed(&self.process_session_id)
+                .await?
+            {
+                recovered.push(record);
             }
-            if !operation.needs_recovery() || operation.has_live_work().await {
-                continue;
-            }
-
-            let recovered_record = if record.stage == PublicOperationStage::CallbackApplied {
-                operation
-                    .advance(
-                        PublicOperationStage::CallbackApplied,
-                        PublicOperationStage::Completed,
-                        None,
-                    )
-                    .await?
-            } else {
-                let detail = if record.intent.process_session_id == self.process_session_id {
-                    "public operation recovered without its owned task"
-                } else {
-                    "public operation belongs to a predecessor process session"
-                };
-                operation
-                    .advance(
-                        record.stage,
-                        PublicOperationStage::ContainmentPending,
-                        Some(PublicOperationDisposition::Ambiguous(detail.into())),
-                    )
-                    .await?
-            };
-            operation.record.send_replace(recovered_record.clone());
-            operation.recovery_complete();
-            recovered.push(recovered_record);
         }
         if !recovered.is_empty() {
             self.bump_revision();
@@ -646,6 +773,7 @@ impl PartitionOperationRegistry {
     pub(crate) async fn shutdown(&self) -> Result<()> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        let _admission = self.admission.lock().await;
         let coordination = std::mem::take(&mut *self.coordination.lock().await);
         for task in coordination {
             task.await.map_err(|error| {
@@ -698,6 +826,7 @@ impl PartitionOperationRegistry {
                         record,
                         self.revision.clone(),
                         true,
+                        self.shutting_down.clone(),
                     ))
                 });
         }
@@ -759,13 +888,17 @@ fn active_relation(
 ) -> AdmissionRelation {
     use AdmissionRelation::{Attach, Coexist, Reject, Supersede};
     use PublicOperationClass::{
-        Abort, Authority, Build, Close, PermanentFault, PlannedSwap, Remove, TransientFault,
+        Abort, Authority, Build, Close, DropReplacement, PermanentFault, PlannedSwap, Remove,
+        Restart, TransientFault,
     };
 
     match (&existing.class, &incoming.class) {
         (PermanentFault, class) if class.is_terminal() => Attach,
         (PermanentFault, _) => Reject("permanent fault is already terminal"),
         (_, PermanentFault) => Supersede,
+        (Restart | DropReplacement, class) if class.is_terminal() => Attach,
+        (Restart | DropReplacement, _) => Reject("restart or drop action is already active"),
+        (_, Restart | DropReplacement) => Supersede,
         (Abort, class) if class.is_terminal() => Attach,
         (Abort, _) => Reject("abort containment is already terminal"),
         (TransientFault, Close | Abort | TransientFault) => Attach,
@@ -784,13 +917,39 @@ fn active_relation(
         (Build { target: left }, Build { target: right }) if left != right => {
             Reject("build revisions do not match")
         }
-        (Build { target: left }, Remove { target: right }) if left == right => Supersede,
+        (Build { target: left }, Remove { target: right })
+            if left == right && existing.revision == incoming.revision =>
+        {
+            Supersede
+        }
+        (Build { target: left }, Remove { target: right }) if left == right => {
+            Reject("same-target removal revision does not match build")
+        }
         (Remove { target: left }, Build { target: right }) if left == right => {
             Reject("same-target removal is already active")
         }
-        (Build { .. }, Remove { .. }) | (Remove { .. }, Build { .. }) => Coexist,
-        (Remove { target: left }, Remove { target: right }) if left != right => Coexist,
-        (Build { .. }, Authority | PlannedSwap) => Supersede,
+        (Build { .. }, Remove { .. }) | (Remove { .. }, Build { .. })
+            if existing.revision == incoming.revision =>
+        {
+            Coexist
+        }
+        (Build { .. }, Remove { .. }) | (Remove { .. }, Build { .. }) => {
+            Reject("build and removal revisions do not match")
+        }
+        (Remove { target: left }, Remove { target: right })
+            if left != right && existing.revision == incoming.revision =>
+        {
+            Coexist
+        }
+        (Remove { target: left }, Remove { target: right }) if left != right => {
+            Reject("removal revisions do not match")
+        }
+        (Build { .. }, Authority | PlannedSwap) if incoming.revision > existing.revision => {
+            Supersede
+        }
+        (Build { .. }, Authority | PlannedSwap) => {
+            Reject("authority revision does not exceed active build")
+        }
         (Authority, Build { .. }) if existing.revision == incoming.revision => Coexist,
         (Authority, Build { .. }) => {
             Reject("build authority revision does not match current authority")
@@ -803,8 +962,18 @@ fn active_relation(
                 Reject("authority revision is not newer")
             }
         }
-        (Remove { .. }, Authority | PlannedSwap) => Supersede,
-        (Authority | PlannedSwap, Remove { .. }) => Coexist,
+        (Remove { .. }, Authority | PlannedSwap) if incoming.revision > existing.revision => {
+            Supersede
+        }
+        (Remove { .. }, Authority | PlannedSwap) => {
+            Reject("authority revision does not exceed active removal")
+        }
+        (Authority | PlannedSwap, Remove { .. }) if existing.revision == incoming.revision => {
+            Coexist
+        }
+        (Authority | PlannedSwap, Remove { .. }) => {
+            Reject("removal authority revision does not match current authority")
+        }
         (Build { .. }, Build { .. }) | (Remove { .. }, Remove { .. }) => {
             Reject("same-target operation is already active")
         }
@@ -817,12 +986,19 @@ fn retained_relation(
 ) -> AdmissionRelation {
     use AdmissionRelation::{Attach, Coexist, Reject};
     use PublicOperationClass::{
-        Abort, Authority, Close, PermanentFault, PlannedSwap, TransientFault,
+        Abort, Authority, Build, Close, DropReplacement, PermanentFault, PlannedSwap, Remove,
+        Restart, TransientFault,
     };
 
     match (&existing.class, &incoming.class) {
-        (Close | Abort | PermanentFault, class) if class.is_terminal() => Attach,
-        (Close | Abort | PermanentFault, _) => Reject("replica is durably terminal"),
+        (Close | Abort | PermanentFault | Restart | DropReplacement, class)
+            if class.is_terminal() =>
+        {
+            Attach
+        }
+        (Close | Abort | PermanentFault | Restart | DropReplacement, _) => {
+            Reject("replica is durably terminal")
+        }
         (TransientFault, PermanentFault) => Coexist,
         (TransientFault, class) if class.is_terminal() => Attach,
         (TransientFault, _) => Reject("transient fault requires lifecycle control"),
@@ -830,6 +1006,11 @@ fn retained_relation(
             if incoming.revision <= existing.revision =>
         {
             Reject("authority revision does not exceed retained authority")
+        }
+        (Authority | PlannedSwap, Build { .. } | Remove { .. })
+            if existing.revision != incoming.revision =>
+        {
+            Reject("operation revision does not match retained authority")
         }
         _ => Coexist,
     }
@@ -855,7 +1036,8 @@ mod tests {
     fn admission_relation_covers_the_reviewed_compatibility_edges() {
         use AdmissionRelation::{Attach, Coexist, Reject, Supersede};
         use PublicOperationClass::{
-            Abort, Authority, Build, Close, PermanentFault, PlannedSwap, Remove, TransientFault,
+            Abort, Authority, Build, Close, DropReplacement, PermanentFault, PlannedSwap, Remove,
+            Restart, TransientFault,
         };
 
         let cases = [
@@ -899,6 +1081,17 @@ mod tests {
                 },
                 1,
                 Supersede,
+            ),
+            (
+                Build {
+                    target: ReplicaId::new(2),
+                },
+                1,
+                Remove {
+                    target: ReplicaId::new(2),
+                },
+                2,
+                Reject("same-target removal revision does not match build"),
             ),
             (
                 Remove {
@@ -946,6 +1139,10 @@ mod tests {
             (TransientFault, 1, Close, 1, Attach),
             (TransientFault, 1, PermanentFault, 1, Supersede),
             (PermanentFault, 1, Abort, 1, Attach),
+            (Authority, 1, Restart, 1, Supersede),
+            (Restart, 1, Close, 1, Attach),
+            (Authority, 1, DropReplacement, 1, Supersede),
+            (DropReplacement, 1, Abort, 1, Attach),
         ];
 
         for (existing, existing_revision, incoming, incoming_revision, expected) in cases {
@@ -962,7 +1159,7 @@ mod tests {
     #[test]
     fn retained_terminal_and_authority_records_fence_new_admission() {
         use AdmissionRelation::{Attach, Coexist, Reject};
-        use PublicOperationClass::{Abort, Authority, Close, PermanentFault};
+        use PublicOperationClass::{Abort, Authority, Build, Close, PermanentFault};
 
         assert_eq!(
             retained_relation(&intent(Authority, 4), &intent(Authority, 4)),
@@ -971,6 +1168,18 @@ mod tests {
         assert_eq!(
             retained_relation(&intent(Authority, 4), &intent(Authority, 5)),
             Coexist
+        );
+        assert_eq!(
+            retained_relation(
+                &intent(Authority, 4),
+                &intent(
+                    Build {
+                        target: ReplicaId::new(2),
+                    },
+                    5,
+                ),
+            ),
+            Reject("operation revision does not match retained authority")
         );
         assert_eq!(
             retained_relation(&intent(Abort, 1), &intent(Close, 2)),
