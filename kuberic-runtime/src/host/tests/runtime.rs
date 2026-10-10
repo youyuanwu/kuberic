@@ -20732,6 +20732,7 @@ async fn evaluator_scale_up_sqlite_trace() {
             image: "example:v1".into(),
             failover_delay_seconds: 30,
             switchover: None,
+            preview_lifecycle: None,
         },
         status: AcceptedStatus {
             initialized: true,

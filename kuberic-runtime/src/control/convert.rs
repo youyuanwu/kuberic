@@ -468,6 +468,8 @@ pub fn normalize_agent_status_report(
                     .map(TryInto::try_into)
                     .transpose()?,
                 retired_replica: report.retired_replica.map(TryInto::try_into).transpose()?,
+                public_lifecycle_report: None,
+                restart_action: None,
             };
             crate::protocol::validation::validate_report_internal(&report)
                 .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;

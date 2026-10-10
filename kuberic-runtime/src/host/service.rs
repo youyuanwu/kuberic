@@ -1083,6 +1083,13 @@ where
                     .await
                     .map_err(status_from_agent)?;
             }
+            #[cfg(feature = "testing")]
+            ProtocolCommand::RestartReplicaProcess(_)
+            | ProtocolCommand::DropReplicaIncarnation(_) => {
+                return Err(Status::failed_precondition(
+                    "preview fault commands require the repository-only supervisor path",
+                ));
+            }
         }
         let report_runtime = self.runtime.report_runtime();
         let observation = self

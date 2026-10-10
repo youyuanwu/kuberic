@@ -17,6 +17,8 @@ use crate::protocol::types::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
+    #[error("invalid public fault action: {0}")]
+    InvalidPublicFault(&'static str),
     #[error("invalid scale-up authority: {0}")]
     InvalidScaleUp(&'static str),
     #[error("invalid secondary scale-down authority: {0}")]
@@ -177,6 +179,41 @@ pub enum ValidationError {
     InvalidSwitchoverHandoff,
     #[error("planned switchover receipt is malformed")]
     InvalidSwitchoverReceipt,
+}
+
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn validate_public_fault_action(
+    action: &crate::protocol::public_operations::PublicFaultAction,
+    binding: &crate::protocol::public_operations::PreviewLifecycleBinding,
+    target: &ReplicaIdentity,
+    process_session: &crate::protocol::types::ProcessSessionId,
+    fault: crate::protocol::types::FaultType,
+) -> Result<(), ValidationError> {
+    action
+        .validate()
+        .map_err(ValidationError::InvalidPublicFault)?;
+    if &action.binding != binding {
+        return Err(ValidationError::InvalidPublicFault(
+            "preview identity, resource UID, generation, or persistence changed",
+        ));
+    }
+    if &action.target != target {
+        return Err(ValidationError::InvalidPublicFault(
+            "fault action targets another replica incarnation",
+        ));
+    }
+    if &action.predecessor_session != process_session {
+        return Err(ValidationError::InvalidPublicFault(
+            "fault action targets a stale process session",
+        ));
+    }
+    if action.fault != fault {
+        return Err(ValidationError::InvalidPublicFault(
+            "fault action conflicts with observed fault",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates accepted status and every observed exact replica incarnation.

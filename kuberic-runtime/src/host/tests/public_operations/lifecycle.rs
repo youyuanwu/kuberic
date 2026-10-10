@@ -226,6 +226,7 @@ async fn exact_initial_failover_and_secondary_recipes() {
                 vec![PublicInstructionOutcome::Done]
             );
         }
+
         fixture.run(command.clone()).await;
         assert_eq!(
             fixture.begins(),
@@ -279,6 +280,102 @@ async fn exact_initial_failover_and_secondary_recipes() {
         );
         fixture.owner.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn public_fault_reporting_closes_access_and_location_before_returning() {
+    let fixture = Fixture::new(ReplicaRole::None).await;
+    *fixture.trace.service_address.lock().unwrap() = Some("opaque://fault-serving".into());
+    fixture
+        .run(fixture.command(
+            PublicLifecycleRecipe::InitialPrimary,
+            2,
+            PreviewTransition::Ordinary,
+        ))
+        .await;
+    let serving = crate::host::public_lifecycle::report(
+        fixture.store.as_ref(),
+        &fixture.preview,
+        &ProcessSessionId::new("session-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(serving.role, ReplicaRole::Primary);
+    assert!(serving.write_access);
+    assert!(serving.service_location.is_some());
+
+    fixture
+        .store
+        .record_partition_reports(
+            Vec::new(),
+            Some(crate::protocol::types::FaultType::Transient),
+        )
+        .await
+        .unwrap();
+    let operation = fixture
+        .owner
+        .registry()
+        .report_fault(intent(
+            &fixture.preview,
+            "fault-transient",
+            3,
+            PublicOperationClass::TransientFault,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+
+    let closed = crate::host::public_lifecycle::report(
+        fixture.store.as_ref(),
+        &fixture.preview,
+        &ProcessSessionId::new("session-1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed.role, ReplicaRole::None);
+    assert!(!closed.write_access);
+    assert!(closed.service_location.is_none());
+    let state = fixture.store.load_state().await.unwrap();
+    let preview = state.public_operation_preview.unwrap();
+    assert!(preview.writes_revoked);
+    assert!(preview.terminal);
+
+    operation.wait_for_terminal().await.unwrap();
+    fixture
+        .owner
+        .registry()
+        .report_fault(intent(
+            &fixture.preview,
+            "fault-permanent",
+            4,
+            PublicOperationClass::PermanentFault,
+            "session-1",
+        ))
+        .await
+        .unwrap()
+        .wait_for_terminal()
+        .await
+        .unwrap();
+    let rejected = fixture
+        .owner
+        .registry()
+        .admit(intent(
+            &fixture.preview,
+            "authority-after-fault",
+            5,
+            PublicOperationClass::Authority,
+            "session-1",
+        ))
+        .await;
+    assert!(rejected.is_err());
+    let state = fixture.store.load_state().await.unwrap();
+    let preview = state.public_operation_preview.unwrap();
+    let current = preview
+        .operations
+        .get(preview.current_operation.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(current.intent.class, PublicOperationClass::PermanentFault);
+    fixture.owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]

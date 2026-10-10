@@ -1963,6 +1963,7 @@ fn desired(replicas: u32) -> DesiredState {
         image: "example:v1".to_string(),
         failover_delay_seconds: 10,
         switchover: None,
+        preview_lifecycle: None,
     }
 }
 

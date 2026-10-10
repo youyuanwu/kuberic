@@ -128,6 +128,23 @@ table distinguishes repeatable convergent callbacks, read-only progress,
 non-repeatable ambiguous build/data-loss work, exact removal, and terminal
 containment; a fresh process session never executes predecessor program state.
 
+Phase 4.4 binds reported faults to explicit persisted/volatile preview
+classification and one frozen controller action identity. Fault admission
+commits the terminal preview/write fence before reporting returns. The
+repository-only controller path excludes the exact incarnation from
+readiness, routing, election and stable completion, persists the action,
+removes routing and then dispatches.
+
+Persisted restart records `Accepted`, `PredecessorContained` and
+`SuccessorStarted` in the agent aggregate. The process supervisor requires
+exact predecessor termination before same-PVC child re-exec, and quarantine
+clears executable role, PC/CC, access and peer/build authority before storage
+reuse. A new session constructs fresh application/Replicator objects but
+remains unassigned and access-closed. Volatile and permanent actions remain
+controller-owned: endpoint, Pod and PVC identities are frozen before deletion,
+and replacement scaffolding does not imply history/build/serving completion.
+Production construction and dispatch cannot select either preview action.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

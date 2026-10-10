@@ -31,6 +31,8 @@ impl PublicOperationPreviewEvaluationConfig {
             identity.is_valid(),
             "public-operation preview identity must be valid"
         );
+        let mut evaluation = evaluation;
+        evaluation.public_operation_preview = Some(identity.clone());
         Self {
             identity,
             evaluation,
@@ -156,6 +158,7 @@ mod tests {
                 image: "test".into(),
                 failover_delay_seconds: 30,
                 switchover: None,
+                preview_lifecycle: None,
             },
             status: AcceptedStatus::default(),
             replicas: Vec::new(),

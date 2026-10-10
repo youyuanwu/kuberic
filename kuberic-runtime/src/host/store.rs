@@ -4,6 +4,10 @@ use crate::effects::{RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::PublicOperationIntent;
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+use crate::protocol::public_operations::{
+    PublicFaultAction, RestartActionRecord, RestartActionStage,
+};
 use crate::protocol::types::{FaultType, LoadMetric, OperationId};
 use async_trait::async_trait;
 
@@ -163,5 +167,36 @@ pub(crate) trait AgentStore: Send + Sync {
         Err(crate::host::HostError::CommandRejected(
             "public-operation preview is not enabled for this store".into(),
         ))
+    }
+
+    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+    #[allow(dead_code)]
+    async fn begin_restart_action(
+        &self,
+        _action: &PublicFaultAction,
+    ) -> Result<RestartActionRecord> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-operation preview is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+    #[allow(dead_code)]
+    async fn advance_restart_action(
+        &self,
+        _action: &PublicFaultAction,
+        _expected: RestartActionStage,
+        _next: RestartActionStage,
+        _successor_session: Option<&crate::protocol::types::ProcessSessionId>,
+    ) -> Result<RestartActionRecord> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-operation preview is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+    #[allow(dead_code)]
+    async fn restart_action(&self) -> Result<Option<RestartActionRecord>> {
+        Ok(None)
     }
 }

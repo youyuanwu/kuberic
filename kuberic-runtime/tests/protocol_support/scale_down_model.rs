@@ -44,6 +44,7 @@ impl Model {
                 image: "example:v1".into(),
                 failover_delay_seconds: 30,
                 switchover: None,
+                preview_lifecycle: None,
             },
             status: AcceptedStatus {
                 initialized: true,

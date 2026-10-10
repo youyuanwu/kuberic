@@ -171,10 +171,12 @@ public-path documented field crate::protocol::observation::AgentReport::prepared
 public-path documented field crate::protocol::observation::AgentReport::previous_configuration: Option < ConfigurationDescriptor >
 public-path documented field crate::protocol::observation::AgentReport::process_session_id: ProcessSessionId
 public-path documented field crate::protocol::observation::AgentReport::protocol_version: u32
+public-path documented field crate::protocol::observation::AgentReport::public_lifecycle_report: Option < Box < PublicLifecycleReport > >
 public-path documented field crate::protocol::observation::AgentReport::read_status: AccessStatus
 public-path documented field crate::protocol::observation::AgentReport::report_sequence: u64
 public-path documented field crate::protocol::observation::AgentReport::reported_fault: Option < FaultType >
 public-path documented field crate::protocol::observation::AgentReport::resource_uid: ResourceUid
+public-path documented field crate::protocol::observation::AgentReport::restart_action: Option < Box < RestartActionRecord > >
 public-path documented field crate::protocol::observation::AgentReport::retained_operation_id: Option < OperationId >
 public-path documented field crate::protocol::observation::AgentReport::retired_replica: Option < crate :: protocol :: types :: ReplicaRetirementReport >
 public-path documented field crate::protocol::observation::AgentReport::role: ReplicaRole
@@ -185,6 +187,7 @@ public-path documented field crate::protocol::observation::AgentReport::write_st
 public-path documented field crate::protocol::observation::DesiredState::failover_delay_seconds: u64
 public-path documented field crate::protocol::observation::DesiredState::generation: u64
 public-path documented field crate::protocol::observation::DesiredState::image: String
+public-path documented field crate::protocol::observation::DesiredState::preview_lifecycle: Option < StatePersistence >
 public-path documented field crate::protocol::observation::DesiredState::replicas: u32
 public-path documented field crate::protocol::observation::DesiredState::switchover: Option < PlannedSwitchoverRequest >
 public-path documented field crate::protocol::observation::KubernetesReplicaObservation::image: Option < String >
@@ -243,8 +246,10 @@ public-path documented field crate::protocol::types::AcceptedStatus::last_second
 public-path documented field crate::protocol::types::AcceptedStatus::last_switchover: Option < PlannedSwitchoverReceipt >
 public-path documented field crate::protocol::types::AcceptedStatus::observed_generation: u64
 public-path documented field crate::protocol::types::AcceptedStatus::pending_replacement_cleanup: Option < ReplacementCleanup >
+public-path documented field crate::protocol::types::AcceptedStatus::preview_lifecycle: Option < crate :: protocol :: public_operations :: PreviewLifecycleBinding >
 public-path documented field crate::protocol::types::AcceptedStatus::primary_failure: Option < PrimaryFailureObservation >
 public-path documented field crate::protocol::types::AcceptedStatus::provisioning: Option < ProvisioningIntent >
+public-path documented field crate::protocol::types::AcceptedStatus::public_fault_action: Option < crate :: protocol :: public_operations :: PublicFaultAction >
 public-path documented field crate::protocol::types::AcceptedStatus::quorum_loss: Option < QuorumLossObservation >
 public-path documented field crate::protocol::types::AcceptedStatus::scale_up_admission_started: Option < OperationId >
 public-path documented field crate::protocol::types::AcceptedStatus::scale_up_allocation: Option < ScaleUpAllocation >
@@ -633,11 +638,13 @@ public-path documented variant crate::protocol::command::KubernetesChange::Persi
 public-path documented variant crate::protocol::command::KubernetesChange::PublishWriteRouting { { primary : crate :: protocol :: types :: ReplicaIdentity , } }
 public-path documented variant crate::protocol::command::KubernetesChange::RemoveWriteRouting
 public-path documented variant crate::protocol::command::ProtocolCommand::AcceptSecondaryRemovalCommit((Box < AcceptSecondaryRemovalCommit >))
+public-path documented variant crate::protocol::command::ProtocolCommand::DropReplicaIncarnation((Box < DropReplicaIncarnation >))
 public-path documented variant crate::protocol::command::ProtocolCommand::EnsureConfiguration((Box < EnsureConfiguration >))
 public-path documented variant crate::protocol::command::ProtocolCommand::EnsureReplicaBuild((Box < EnsureReplicaBuild >))
 public-path documented variant crate::protocol::command::ProtocolCommand::InitializeAgentStore((Box < InitializeAgentStore >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSecondaryRemoval((Box < PrepareSecondaryRemoval >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSwitchover((Box < PrepareSwitchover >))
+public-path documented variant crate::protocol::command::ProtocolCommand::RestartReplicaProcess((Box < RestartReplicaProcess >))
 public-path documented variant crate::protocol::command::ProtocolCommand::RetireReplica((Box < RetireReplica >))
 public-path documented variant crate::protocol::command::SafetyChange::RemoveWriteRouting
 public-path documented variant crate::protocol::command::ScaleDownResource::Endpoint
@@ -724,6 +731,7 @@ public-path documented variant crate::protocol::validation::ValidationError::Inv
 public-path documented variant crate::protocol::validation::ValidationError::InvalidFailoverRepairTarget
 public-path documented variant crate::protocol::validation::ValidationError::InvalidPrimaryCount((usize))
 public-path documented variant crate::protocol::validation::ValidationError::InvalidProvisioningReplacement
+public-path documented variant crate::protocol::validation::ValidationError::InvalidPublicFault((& 'static str))
 public-path documented variant crate::protocol::validation::ValidationError::InvalidReplacementCleanup
 public-path documented variant crate::protocol::validation::ValidationError::InvalidReplacementMembership
 public-path documented variant crate::protocol::validation::ValidationError::InvalidReplicaId((i64))
@@ -771,15 +779,34 @@ public-path documented variant crate::protocol::validation::ValidationError::Wri
 public-path hidden const crate::protocol::public_operations::PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32
 public-path hidden enum crate::protocol::public_operations::PossibleDataLossIntent
 public-path hidden enum crate::protocol::public_operations::PublicCatchUpMode
+public-path hidden enum crate::protocol::public_operations::PublicFaultActionKind
 public-path hidden enum crate::protocol::public_operations::PublicLifecycleRecipe
 public-path hidden enum crate::protocol::public_operations::PublicOperationClass
 public-path hidden enum crate::protocol::public_operations::PublicOperationProgram
+public-path hidden enum crate::protocol::public_operations::RestartActionStage
+public-path hidden enum crate::protocol::public_operations::StatePersistence
+public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::pod_name: String
+public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::pod_uid: PodUid
+public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::pvc_name: String
+public-path hidden field crate::protocol::public_operations::FrozenReplicaResources::pvc_uid: PvcUid
+public-path hidden field crate::protocol::public_operations::PreviewLifecycleBinding::preview: PublicOperationPreviewIdentity
+public-path hidden field crate::protocol::public_operations::PreviewLifecycleBinding::resource_uid: ResourceUid
+public-path hidden field crate::protocol::public_operations::PreviewLifecycleBinding::spec_generation: u64
+public-path hidden field crate::protocol::public_operations::PreviewLifecycleBinding::state_persistence: StatePersistence
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::attempt: OperationId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replication_address: String
 public-path hidden field crate::protocol::public_operations::PublicConfiguration::current: ConfigurationDescriptor
 public-path hidden field crate::protocol::public_operations::PublicConfiguration::previous: Option < ConfigurationDescriptor >
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::action_id: OperationId
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::binding: PreviewLifecycleBinding
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::fault: FaultType
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::fault_revision: u64
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::kind: PublicFaultActionKind
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::predecessor_session: ProcessSessionId
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::resources: FrozenReplicaResources
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::target: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::current: ConfigurationDescriptor
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::epoch: Epoch
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::possible_data_loss: PossibleDataLossIntent
@@ -805,6 +832,9 @@ public-path hidden field crate::protocol::public_operations::PublicOperationInte
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::revision: u64
 public-path hidden field crate::protocol::public_operations::PublicOperationPreviewIdentity::generation: u64
 public-path hidden field crate::protocol::public_operations::PublicOperationPreviewIdentity::protocol_version: u32
+public-path hidden field crate::protocol::public_operations::RestartActionRecord::action: PublicFaultAction
+public-path hidden field crate::protocol::public_operations::RestartActionRecord::stage: RestartActionStage
+public-path hidden field crate::protocol::public_operations::RestartActionRecord::successor_session: Option < ProcessSessionId >
 public-path hidden field crate::protocol::public_operations::ServiceLocation::address: String
 public-path hidden field crate::protocol::public_operations::ServiceLocation::epoch: Epoch
 public-path hidden field crate::protocol::public_operations::ServiceLocation::operation_id: OperationId
@@ -814,6 +844,10 @@ public-path hidden field crate::protocol::public_operations::ServiceLocation::re
 public-path hidden field crate::protocol::public_operations::ServiceLocation::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::ServiceLocation::revision: u64
 public-path hidden fn crate::protocol::public_operations::fn service_location_address_digest (location : Option < & ServiceLocation >) -> String
+public-path hidden impl crate::protocol::public_operations::PreviewLifecycleBinding::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_id (& self) -> OperationId
+public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_kind (persistence : StatePersistence , fault : FaultType) -> PublicFaultActionKind
+public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn digest (& self) -> String
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicOperationClass::fn is_terminal (& self) -> bool
@@ -822,17 +856,23 @@ public-path hidden impl crate::protocol::public_operations::PublicOperationPrevi
 public-path hidden impl crate::protocol::public_operations::PublicOperationPreviewIdentity::const fn new (generation : u64) -> Self
 public-path hidden impl crate::protocol::public_operations::PublicOperationProgram::fn digest (& self) -> String
 public-path hidden module crate::protocol::public_operations
+public-path hidden struct crate::protocol::public_operations::FrozenReplicaResources
+public-path hidden struct crate::protocol::public_operations::PreviewLifecycleBinding
 public-path hidden struct crate::protocol::public_operations::PublicBuildInput
 public-path hidden struct crate::protocol::public_operations::PublicConfiguration
+public-path hidden struct crate::protocol::public_operations::PublicFaultAction
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleInput
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleReport
 public-path hidden struct crate::protocol::public_operations::PublicOperationIntent
 public-path hidden struct crate::protocol::public_operations::PublicOperationPreviewIdentity
+public-path hidden struct crate::protocol::public_operations::RestartActionRecord
 public-path hidden struct crate::protocol::public_operations::ServiceLocation
 public-path hidden variant crate::protocol::public_operations::PossibleDataLossIntent::NotPossible
 public-path hidden variant crate::protocol::public_operations::PossibleDataLossIntent::Possible
 public-path hidden variant crate::protocol::public_operations::PublicCatchUpMode::All
 public-path hidden variant crate::protocol::public_operations::PublicCatchUpMode::WriteQuorum
+public-path hidden variant crate::protocol::public_operations::PublicFaultActionKind::DropReplacement
+public-path hidden variant crate::protocol::public_operations::PublicFaultActionKind::Restart
 public-path hidden variant crate::protocol::public_operations::PublicLifecycleRecipe::FailoverPromotion
 public-path hidden variant crate::protocol::public_operations::PublicLifecycleRecipe::InitialPrimary
 public-path hidden variant crate::protocol::public_operations::PublicLifecycleRecipe::SecondaryEpochAdvance
@@ -857,3 +897,8 @@ public-path hidden variant crate::protocol::public_operations::PublicOperationPr
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Remove((PublicBuildInput))
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Role { { epoch : Epoch , role : ReplicaRole , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Swap { { starting : PublicConfiguration , refreshed : PublicConfiguration , epoch : Epoch , handoff : ReplicaRole , mode : PublicCatchUpMode , } }
+public-path hidden variant crate::protocol::public_operations::RestartActionStage::Accepted
+public-path hidden variant crate::protocol::public_operations::RestartActionStage::PredecessorContained
+public-path hidden variant crate::protocol::public_operations::RestartActionStage::SuccessorStarted
+public-path hidden variant crate::protocol::public_operations::StatePersistence::Persisted
+public-path hidden variant crate::protocol::public_operations::StatePersistence::Volatile

@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::{
-    ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaId, ReplicaIdentity,
-    ReplicaRole, ResourceUid,
+    ConfigurationDescriptor, Epoch, FaultType, OperationId, PodUid, ProcessSessionId, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaRole, ResourceUid,
 };
 
 pub const PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32 = 10;
@@ -26,7 +26,153 @@ impl PublicOperationPreviewIdentity {
             generation,
         }
     }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum StatePersistence {
+    Persisted,
+    Volatile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewLifecycleBinding {
+    pub preview: PublicOperationPreviewIdentity,
+    pub resource_uid: ResourceUid,
+    pub spec_generation: u64,
+    pub state_persistence: StatePersistence,
+}
+
+impl PreviewLifecycleBinding {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.preview.is_valid() {
+            return Err("invalid public-operation preview identity");
+        }
+        if self.resource_uid.is_empty() {
+            return Err("preview lifecycle resource UID is empty");
+        }
+        if self.spec_generation == 0 {
+            return Err("preview lifecycle spec generation must be positive");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicFaultActionKind {
+    Restart,
+    DropReplacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FrozenReplicaResources {
+    pub pod_name: String,
+    pub pod_uid: PodUid,
+    pub pvc_name: String,
+    pub pvc_uid: PvcUid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicFaultAction {
+    pub action_id: OperationId,
+    pub binding: PreviewLifecycleBinding,
+    pub target: ReplicaIdentity,
+    pub resources: FrozenReplicaResources,
+    pub predecessor_session: ProcessSessionId,
+    pub fault_revision: u64,
+    pub fault: FaultType,
+    pub kind: PublicFaultActionKind,
+}
+
+impl PublicFaultAction {
+    pub fn expected_kind(persistence: StatePersistence, fault: FaultType) -> PublicFaultActionKind {
+        if fault == FaultType::Transient && persistence == StatePersistence::Persisted {
+            PublicFaultActionKind::Restart
+        } else {
+            PublicFaultActionKind::DropReplacement
+        }
+    }
+
+    pub fn expected_id(&self) -> OperationId {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(
+            format!(
+                "{kind:?}|{fault:?}|{persistence:?}|{resource_uid}|{protocol_version}|\
+                 {preview_generation}|{spec_generation}|{replica_id}|{instance_id}|\
+                 {agent_generation}|{predecessor_session}|{fault_revision}|{pod_name}|\
+                 {pod_uid}|{pvc_name}|{pvc_uid}",
+                kind = self.kind,
+                fault = self.fault,
+                persistence = self.binding.state_persistence,
+                resource_uid = self.binding.resource_uid,
+                protocol_version = self.binding.preview.protocol_version,
+                preview_generation = self.binding.preview.generation,
+                spec_generation = self.binding.spec_generation,
+                replica_id = self.target.replica_id,
+                instance_id = self.target.instance_id,
+                agent_generation = self.target.agent_generation,
+                predecessor_session = self.predecessor_session,
+                fault_revision = self.fault_revision,
+                pod_name = self.resources.pod_name,
+                pod_uid = self.resources.pod_uid,
+                pvc_name = self.resources.pvc_name,
+                pvc_uid = self.resources.pvc_uid,
+            )
+            .as_bytes(),
+        );
+        OperationId::new(format!(
+            "fault-{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ))
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.binding.validate()?;
+        if self.action_id.is_empty()
+            || self.predecessor_session.is_empty()
+            || self.fault_revision == 0
+            || self.resources.pod_name.is_empty()
+            || self.resources.pod_uid.is_empty()
+            || self.resources.pvc_name.is_empty()
+            || self.resources.pvc_uid.is_empty()
+        {
+            return Err("incomplete exact fault action identity");
+        }
+        if self.kind != Self::expected_kind(self.binding.state_persistence, self.fault) {
+            return Err("fault action conflicts with persistence classification");
+        }
+        if self.action_id != self.expected_id() {
+            return Err("fault action ID does not match frozen identity");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RestartActionStage {
+    Accepted,
+    PredecessorContained,
+    SuccessorStarted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartActionRecord {
+    pub action: PublicFaultAction,
+    pub stage: RestartActionStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_session: Option<ProcessSessionId>,
+}
+
+impl PublicOperationPreviewIdentity {
     pub const fn is_valid(&self) -> bool {
         self.protocol_version == PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION && self.generation > 0
     }

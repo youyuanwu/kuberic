@@ -11,6 +11,8 @@ mod coordinator;
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 mod crash_boundaries;
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+mod process_supervisor;
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
 mod public_operations;
 mod recovery;
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]

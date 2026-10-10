@@ -24,6 +24,13 @@ use crate::host::transport::{
     run_peer_discovery,
 };
 
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+use crate::protocol::public_operations::{
+    PublicFaultAction, RestartActionRecord, RestartActionStage,
+};
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+use crate::protocol::types::ProcessSessionId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationStorageState {
     FreshEmpty,
@@ -42,6 +49,218 @@ pub struct ReplicaProcessConfig {
     pub bearer_token: String,
     pub rpc_deadline: Duration,
     pub transport_window_capacity: usize,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+pub(crate) const PREVIEW_RESTART_DISPOSITION: i32 = 75;
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewChildCommand {
+    pub(crate) executable: PathBuf,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) environment: BTreeMap<String, String>,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreviewChildEvidence {
+    pub(crate) process_session: ProcessSessionId,
+    pub(crate) data_root: PathBuf,
+    pub(crate) pod_uid: PodUid,
+    pub(crate) pvc_uid: PvcUid,
+    pub(crate) provider_sentinel: String,
+    pub(crate) application_constructed: bool,
+    pub(crate) replicator_constructed: bool,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewRestartCut {
+    Accepted,
+    PredecessorContained,
+    SuccessorStarted,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreviewRestartResult {
+    pub(crate) record: RestartActionRecord,
+    pub(crate) successor: PreviewChildEvidence,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+pub(crate) struct ReplicaProcessSupervisor {
+    store: Arc<SqliteStore>,
+    data_root: PathBuf,
+    child: PreviewChildCommand,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+impl ReplicaProcessSupervisor {
+    pub(crate) fn new(
+        store: Arc<SqliteStore>,
+        data_root: PathBuf,
+        child: PreviewChildCommand,
+    ) -> Self {
+        Self {
+            store,
+            data_root,
+            child,
+        }
+    }
+
+    pub(crate) async fn restart_with_child(
+        &self,
+        action: &PublicFaultAction,
+        predecessor: &mut tokio::process::Child,
+        cut: Option<PreviewRestartCut>,
+    ) -> Result<PreviewRestartResult> {
+        let record = self.store.begin_restart_action(action).await?;
+        if cut == Some(PreviewRestartCut::Accepted) {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after durable restart acceptance".into(),
+            ));
+        }
+        if record.stage == RestartActionStage::Accepted {
+            let status = predecessor.wait().await?;
+            if status.code() != Some(PREVIEW_RESTART_DISPOSITION) {
+                return Err(crate::host::HostError::CommandRejected(format!(
+                    "predecessor did not exit with restart disposition {PREVIEW_RESTART_DISPOSITION}"
+                )));
+            }
+        }
+        self.resume(action, true, cut).await
+    }
+
+    pub(crate) async fn resume(
+        &self,
+        action: &PublicFaultAction,
+        predecessor_contained: bool,
+        cut: Option<PreviewRestartCut>,
+    ) -> Result<PreviewRestartResult> {
+        let mut record = self.store.begin_restart_action(action).await?;
+        if cut == Some(PreviewRestartCut::Accepted) && record.stage == RestartActionStage::Accepted
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after durable restart acceptance".into(),
+            ));
+        }
+        if record.stage == RestartActionStage::Accepted {
+            if !predecessor_contained {
+                return Err(crate::host::HostError::CommandRejected(
+                    "predecessor containment is unproven".into(),
+                ));
+            }
+            record = self
+                .store
+                .advance_restart_action(
+                    action,
+                    RestartActionStage::Accepted,
+                    RestartActionStage::PredecessorContained,
+                    None,
+                )
+                .await?;
+        }
+        if cut == Some(PreviewRestartCut::PredecessorContained)
+            && record.stage == RestartActionStage::PredecessorContained
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after predecessor containment".into(),
+            ));
+        }
+        if record.stage == RestartActionStage::SuccessorStarted {
+            let successor = self.read_successor_evidence(action)?;
+            return Ok(PreviewRestartResult { record, successor });
+        }
+        let successor = self.launch_successor(action).await?;
+        record = self
+            .store
+            .advance_restart_action(
+                action,
+                RestartActionStage::PredecessorContained,
+                RestartActionStage::SuccessorStarted,
+                Some(&successor.process_session),
+            )
+            .await?;
+        if cut == Some(PreviewRestartCut::SuccessorStarted) {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after successor start".into(),
+            ));
+        }
+        Ok(PreviewRestartResult { record, successor })
+    }
+
+    fn evidence_path(&self, action: &PublicFaultAction) -> PathBuf {
+        self.data_root
+            .join(".kuberic")
+            .join(format!("{}.successor.json", action.action_id))
+    }
+
+    fn read_successor_evidence(&self, action: &PublicFaultAction) -> Result<PreviewChildEvidence> {
+        let bytes = std::fs::read(self.evidence_path(action))?;
+        let evidence: PreviewChildEvidence = serde_json::from_slice(&bytes)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        self.validate_successor(action, &evidence)?;
+        Ok(evidence)
+    }
+
+    async fn launch_successor(&self, action: &PublicFaultAction) -> Result<PreviewChildEvidence> {
+        let evidence_path = self.evidence_path(action);
+        if evidence_path.exists() {
+            std::fs::remove_file(&evidence_path)?;
+        }
+        if let Some(parent) = evidence_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut command = tokio::process::Command::new(&self.child.executable);
+        command
+            .args(&self.child.arguments)
+            .envs(&self.child.environment)
+            .env("KUBERIC_PREVIEW_CHILD_OUTPUT", &evidence_path)
+            .env("KUBERIC_PREVIEW_DATA_ROOT", &self.data_root)
+            .env("KUBERIC_PREVIEW_CHILD_MODE", "successor")
+            .env("KUBERIC_PREVIEW_POD_UID", action.resources.pod_uid.as_str())
+            .env("KUBERIC_PREVIEW_PVC_UID", action.resources.pvc_uid.as_str())
+            .kill_on_drop(true);
+        let status = command.spawn()?.wait().await?;
+        if !status.success() {
+            return Err(crate::host::HostError::CommandRejected(format!(
+                "successor child exited with {status}"
+            )));
+        }
+        self.read_successor_evidence(action)
+    }
+
+    fn validate_successor(
+        &self,
+        action: &PublicFaultAction,
+        evidence: &PreviewChildEvidence,
+    ) -> Result<()> {
+        if evidence.process_session.is_empty()
+            || evidence.process_session == action.predecessor_session
+            || evidence.data_root != self.data_root
+            || evidence.pod_uid != action.resources.pod_uid
+            || evidence.pvc_uid != action.resources.pvc_uid
+            || evidence.provider_sentinel.is_empty()
+            || !evidence.application_constructed
+            || !evidence.replicator_constructed
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "successor child evidence changed storage, process, or construction identity"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

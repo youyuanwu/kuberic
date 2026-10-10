@@ -4,6 +4,7 @@ use crate::authority::{DurableBuildProgress, RetiredAuthority};
 use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
+use crate::protocol::public_operations::{PreviewLifecycleBinding, RestartActionRecord};
 use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationPreviewIdentity};
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
@@ -196,6 +197,10 @@ pub(crate) struct HistoryAdmissionBarrier {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicOperationPreviewState {
     pub(crate) identity: PublicOperationPreviewIdentity,
+    #[serde(default)]
+    pub(crate) binding: Option<PreviewLifecycleBinding>,
+    #[serde(default)]
+    pub(crate) restart_action: Option<RestartActionRecord>,
     pub(crate) operations: BTreeMap<OperationId, PublicOperationRecord>,
     #[serde(default)]
     pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
@@ -219,6 +224,23 @@ impl PublicOperationPreviewState {
     pub(crate) fn new(identity: PublicOperationPreviewIdentity) -> Self {
         Self {
             identity,
+            binding: None,
+            restart_action: None,
+            operations: BTreeMap::new(),
+            history_barriers: BTreeMap::new(),
+            current_operation: None,
+            active_builds: BTreeMap::new(),
+            absent_builds: BTreeSet::new(),
+            writes_revoked: false,
+            terminal: false,
+        }
+    }
+
+    pub(crate) fn new_bound(binding: PreviewLifecycleBinding) -> Self {
+        Self {
+            identity: binding.preview.clone(),
+            binding: Some(binding),
+            restart_action: None,
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
             current_operation: None,

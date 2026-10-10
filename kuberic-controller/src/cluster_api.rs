@@ -967,6 +967,12 @@ fn observed_process_session(
         Some(RawAgentObservation::Report(report)) if !report.process_session_id.is_empty() => {
             Ok(report.process_session_id.clone())
         }
+        #[cfg(feature = "runtime-test-bridge")]
+        Some(RawAgentObservation::PreviewReport(report))
+            if !report.process_session_id.is_empty() =>
+        {
+            Ok(report.process_session_id.to_string())
+        }
         _ => Err(ControllerError::ObservationStale),
     }
 }
@@ -1942,6 +1948,16 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
             };
             (identity, command.local_replica_id)
         }
+        #[cfg(feature = "runtime-test-bridge")]
+        ProtocolCommand::RestartReplicaProcess(command) => (
+            command.action.target.clone(),
+            command.action.target.replica_id,
+        ),
+        #[cfg(feature = "runtime-test-bridge")]
+        ProtocolCommand::DropReplicaIncarnation(command) => (
+            command.action.target.clone(),
+            command.action.target.replica_id,
+        ),
     }
 }
 
@@ -1984,6 +2000,12 @@ fn command_request(
             proto::execute_command_request::Command::EnsureReplicaBuild(ensure_build_command(
                 *command,
             ))
+        }
+        #[cfg(feature = "runtime-test-bridge")]
+        ProtocolCommand::RestartReplicaProcess(_) | ProtocolCommand::DropReplicaIncarnation(_) => {
+            return Err(ControllerError::Effect(
+                "preview fault commands cannot use the production gRPC dispatcher".into(),
+            ));
         }
     };
     Ok(proto::ExecuteCommandRequest {
@@ -2993,6 +3015,33 @@ impl ClusterApi for InMemoryClusterApi {
         if observed_process_session(&state.observation, replica_id, &target)? != session {
             return Err(ControllerError::ObservationStale);
         }
+        #[cfg(feature = "runtime-test-bridge")]
+        let preview_command = match command {
+            ProtocolCommand::RestartReplicaProcess(command) => Some(&command.action),
+            ProtocolCommand::DropReplicaIncarnation(command) => Some(&command.action),
+            _ => None,
+        };
+        #[cfg(feature = "runtime-test-bridge")]
+        if let Some(action) = preview_command {
+            action
+                .validate()
+                .map_err(|message| ControllerError::InvalidAgentEvidence(message.into()))?;
+            if action.target != target || action.predecessor_session.as_str() != session {
+                return Err(ControllerError::ObservationStale);
+            }
+        } else {
+            kuberic_runtime::control::validate_execute_request(&command_request(
+                observation
+                    .set
+                    .uid()
+                    .ok_or(ControllerError::ObservationStale)?,
+                target,
+                session,
+                command.clone(),
+            )?)
+            .map_err(|e| ControllerError::InvalidAgentEvidence(e.to_string()))?;
+        }
+        #[cfg(not(feature = "runtime-test-bridge"))]
         kuberic_runtime::control::validate_execute_request(&command_request(
             observation
                 .set
@@ -3492,6 +3541,7 @@ mod tests {
                     image: "example/db:latest".to_string(),
                     failover_delay_seconds: 30,
                     switchover: None,
+                    preview_lifecycle: None,
                 },
             ),
             pods: Vec::new(),
@@ -3659,6 +3709,7 @@ mod tests {
                 image: "kvstore2:test".to_string(),
                 failover_delay_seconds: 10,
                 switchover: None,
+                preview_lifecycle: None,
             },
         );
         assert!(
@@ -3677,6 +3728,7 @@ mod tests {
                 image: "kvstore2:test".to_string(),
                 failover_delay_seconds: 10,
                 switchover: None,
+                preview_lifecycle: None,
             },
         );
         set.metadata.annotations = Some(BTreeMap::from([(

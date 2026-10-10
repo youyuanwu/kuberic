@@ -951,6 +951,47 @@ impl PartitionOperationRegistry {
         Ok(operation)
     }
 
+    pub(crate) async fn report_fault(
+        self: &Arc<Self>,
+        intent: PublicOperationIntent,
+    ) -> Result<Arc<PartitionOperation>> {
+        if !matches!(
+            intent.class,
+            PublicOperationClass::TransientFault | PublicOperationClass::PermanentFault
+        ) || intent.lifecycle.is_some()
+            || intent.program.is_some()
+        {
+            return Err(HostError::CommandRejected(
+                "fault reporting requires an exact fault-only public operation".into(),
+            ));
+        }
+        let operation = self.admit(intent).await?;
+        self.fence();
+        let dispatch = {
+            let operation = operation.clone();
+            async move {
+                if operation.wait_until_ready().await? {
+                    operation
+                        .spawn_root(CallbackContainment::RootTask, async {
+                            Ok::<(), HostError>(())
+                        })
+                        .await?;
+                }
+                Ok::<(), HostError>(())
+            }
+        };
+        if operation.snapshot().stage == PublicOperationStage::Ready {
+            dispatch.await?;
+        } else if operation.snapshot().stage == PublicOperationStage::WaitingForContainment {
+            self.own_control_task(async move {
+                if let Err(error) = dispatch.await {
+                    tracing::warn!(%error, "preview fault containment remains fenced");
+                }
+            });
+        }
+        Ok(operation)
+    }
+
     async fn record_attachment(
         &self,
         intent: PublicOperationIntent,

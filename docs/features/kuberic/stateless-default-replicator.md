@@ -871,8 +871,9 @@ public/custom test implementations and the future built-in preview.
 - keep the entire next-protocol path preview/test-only until the atomic
   cutover.
 
-The dormant alignment implementation now supplies the Phase 4.3 ordering and
-replay prerequisite used by this roadmap. Planned swap freezes both exact
+The dormant alignment implementation now supplies the complete Phase 4
+ordering, replay and fault-control prerequisite used by this roadmap. Planned
+swap freezes both exact
 configurations plus one opaque mode, reinstalls the relevant configuration
 before each recovered wait, revokes serving between waits, and preserves
 Replicator-before-application handoff. Exact build attempts are drained before
@@ -882,6 +883,16 @@ The agent journal implements the operation-specific replay table above, while
 fresh process sessions remain unassigned and cannot execute predecessor
 program records. These are preview semantics only and do not select the
 replacement default Replicator.
+
+Explicit persisted/volatile classification is frozen with preview/resource
+identity. Fault reporting closes local access/location before controller
+availability; the repository preview controller persists one exact action and
+removes routing before dispatch. Persisted restart uses a durable
+accepted/contained/successor handshake and a real same-storage child process;
+volatile and permanent faults freeze/delete the old resources and create
+distinct scaffolding. The fresh persisted child is intentionally
+unassigned/access-closed. Phase 2 still owns higher-epoch session renewal,
+history admission and serving authority.
 
 Exit criteria:
 

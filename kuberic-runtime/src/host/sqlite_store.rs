@@ -14,9 +14,14 @@ use crate::effects::{
 };
 use crate::error::{ContractError, ContractResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
+use crate::protocol::public_operations::PreviewLifecycleBinding;
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::PublicOperationIntent;
 use crate::protocol::public_operations::PublicOperationPreviewIdentity;
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+use crate::protocol::public_operations::{
+    PublicFaultAction, RestartActionRecord, RestartActionStage,
+};
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaIdentity,
     ReplicaRole, SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
@@ -195,6 +200,30 @@ impl SqliteStore {
         Self::create_store(path, state)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn create_preview_bound_authorized(
+        path: impl AsRef<Path>,
+        mut state: AgentState,
+        binding: PreviewLifecycleBinding,
+    ) -> Result<Self> {
+        binding.validate().map_err(|message| {
+            crate::host::HostError::InitializationNotAuthorized(message.into())
+        })?;
+        if state.identity.resource_uid != binding.resource_uid {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "preview binding resource UID differs from store identity".into(),
+            ));
+        }
+        if state.public_operation_preview.is_some() {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "public-operation preview state is already initialized".into(),
+            ));
+        }
+        state.identity.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+        state.public_operation_preview = Some(PublicOperationPreviewState::new_bound(binding));
+        Self::create_store(path, state)
+    }
+
     fn create_store(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let expected_version = if state.public_operation_preview.is_some() {
@@ -360,6 +389,32 @@ impl SqliteStore {
             #[cfg(all(test, feature = "testing"))]
             public_operation_attachment_failure: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_preview_bound_existing(
+        path: impl AsRef<Path>,
+        expected_identity: Option<&StorageIdentity>,
+        expected_binding: &PreviewLifecycleBinding,
+    ) -> Result<Self> {
+        expected_binding.validate().map_err(|message| {
+            crate::host::HostError::InitializationNotAuthorized(message.into())
+        })?;
+        let store =
+            Self::open_preview_existing(path, expected_identity, &expected_binding.preview)?;
+        let state =
+            load_state_from_connection(&store.connection.lock().expect("SQLite connection lock"))?;
+        if state
+            .public_operation_preview
+            .as_ref()
+            .and_then(|preview| preview.binding.as_ref())
+            != Some(expected_binding)
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "preview lifecycle binding or persistence classification changed".into(),
+            ));
+        }
+        Ok(store)
     }
 
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -2249,6 +2304,166 @@ impl AgentStore for SqliteStore {
             }
             write_agent_state(transaction, &state)
         })
+    }
+
+    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+    async fn begin_restart_action(
+        &self,
+        action: &PublicFaultAction,
+    ) -> Result<RestartActionRecord> {
+        action
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "restart requires a public-operation preview store".into(),
+                )
+            })?;
+            if preview.binding.as_ref() != Some(&action.binding)
+                || preview.identity != action.binding.preview
+                || state.identity.resource_uid != action.binding.resource_uid
+                || state.identity.local_identity != action.target
+                || state.identity.pod_uid != action.resources.pod_uid
+                || state.identity.pvc_uid != action.resources.pvc_uid
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "restart action does not match frozen preview/store identity".into(),
+                ));
+            }
+            if action.kind != crate::protocol::public_operations::PublicFaultActionKind::Restart {
+                return Err(crate::host::HostError::CommandRejected(
+                    "persisted restart store rejected drop/replacement action".into(),
+                ));
+            }
+            if let Some(existing) = &preview.restart_action {
+                if existing.action == *action {
+                    return Ok(existing.clone());
+                }
+                if existing.action.target == action.target
+                    && existing.action.predecessor_session == action.predecessor_session
+                    && existing.action.fault == FaultType::Transient
+                    && action.fault == FaultType::Permanent
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "permanent fault requires controller drop/replacement".into(),
+                    ));
+                }
+                return Err(crate::host::HostError::DurableEffectConflict(
+                    "restart action changed after durable acceptance".into(),
+                ));
+            }
+            preview.writes_revoked = true;
+            preview.terminal = true;
+            let record = RestartActionRecord {
+                action: action.clone(),
+                stage: RestartActionStage::Accepted,
+                successor_session: None,
+            };
+            preview.restart_action = Some(record.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(record)
+        })
+    }
+
+    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+    async fn advance_restart_action(
+        &self,
+        action: &PublicFaultAction,
+        expected: RestartActionStage,
+        next: RestartActionStage,
+        successor_session: Option<&crate::protocol::types::ProcessSessionId>,
+    ) -> Result<RestartActionRecord> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "restart requires a public-operation preview store".into(),
+                )
+            })?;
+            let current = preview.restart_action.as_ref().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "restart action was not durably accepted".into(),
+                )
+            })?;
+            if current.action != *action {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "restart action identity changed".into(),
+                ));
+            }
+            if current.stage == next {
+                return Ok(current.clone());
+            }
+            if current.stage != expected
+                || !matches!(
+                    (expected, next),
+                    (
+                        RestartActionStage::Accepted,
+                        RestartActionStage::PredecessorContained
+                    ) | (
+                        RestartActionStage::PredecessorContained,
+                        RestartActionStage::SuccessorStarted
+                    )
+                )
+            {
+                return Err(crate::host::HostError::DurableEffectConflict(
+                    "invalid durable restart stage transition".into(),
+                ));
+            }
+            if next == RestartActionStage::PredecessorContained {
+                if successor_session.is_some() {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "predecessor containment cannot name a successor session".into(),
+                    ));
+                }
+                state.role = ReplicaRole::None;
+                state.read_status = AccessStatus::NotPrimary;
+                state.write_status = AccessStatus::NotPrimary;
+                state.previous_configuration = None;
+                state.current_configuration = None;
+                state.reconfiguration = None;
+                state.pending_effect = None;
+                state.prepared_secondary_removal = None;
+                state.secondary_removal_evidence = None;
+                state.prepared_switchover = None;
+                preview.current_operation = None;
+                preview.active_builds.clear();
+            }
+            let successor_session = if next == RestartActionStage::SuccessorStarted {
+                let session = successor_session.ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "successor-started stage requires a process session".into(),
+                    )
+                })?;
+                if session.is_empty() || session == &action.predecessor_session {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "successor process session must be fresh".into(),
+                    ));
+                }
+                Some(session.clone())
+            } else {
+                None
+            };
+            let record = preview
+                .restart_action
+                .as_mut()
+                .expect("restart action checked");
+            record.stage = next;
+            record.successor_session = successor_session;
+            let record = record.clone();
+            write_agent_state(transaction, &state)?;
+            Ok(record)
+        })
+    }
+
+    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+    async fn restart_action(&self) -> Result<Option<RestartActionRecord>> {
+        Ok(self
+            .load_state()
+            .await?
+            .public_operation_preview
+            .and_then(|preview| preview.restart_action))
     }
 }
 

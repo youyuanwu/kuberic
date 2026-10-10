@@ -759,7 +759,7 @@ production CRD/status/effect variants or activate the legacy custom-authority
 and access recipes, even in all-features builds. Tests use the real preview
 planner, runtime journal, normalizer and executor with a conditional
 in-memory Kubernetes Service model. They do not claim live-cluster cutover,
-Phase 5 public-value conformance, or completed Phase 4.4 behavior.
+Phase 5 public-value conformance, or production activation.
 
 ### Dormant Phase 4.3 Implementation
 
@@ -803,6 +803,39 @@ is not reinvoked; ambiguous build/data loss remains closed; removal converges
 to exact absence; Close/Abort converges to terminal containment. Reopening any
 durable cut in a fresh process session yields only historical evidence and
 remains unassigned, access-closed, and location-free.
+
+### Dormant Phase 4.4 Implementation
+
+The CRD now has optional `previewLifecycle.statePersistence` with explicit
+`Persisted` and `Volatile` values. Omission keeps legacy objects on the
+production path; the repository preview constructor freezes classification
+with resource UID, preview identity and spec generation in accepted status and
+schema-7 preview state. Mutation, stale status, mixed preview/legacy reports
+and production construction fail closed.
+
+A public transient or permanent fault is durably admitted before returning and
+immediately makes the exact incarnation unhealthy, role-none, access-closed
+and location-free. The selected preview evaluator cannot run ordinary stable,
+election, quorum or routing logic while fault evidence is active. It persists
+one deterministic action over exact replica, Pod/PVC, process-session, fault
+revision and persistence evidence, removes routing, revalidates the same
+observation and dispatches the action. Permanent fault supersedes a transient
+action only for the same predecessor identity/session.
+
+Persisted state uses a real parent/child process fixture and one durable
+`Accepted` -> `PredecessorContained` -> `SuccessorStarted` handshake. Exact
+child exit or container-restart containment is required before re-exec over
+the same data root/PVC. Quarantine clears predecessor role, PC/CC
+configuration, access and peer/build authority; the fresh application and
+Replicator session remains unassigned and access-closed because Phase 5 owns
+renewal. The accepted, contained and successor-started crash cuts converge to
+one successor session, and unproven descendant containment prevents re-exec.
+
+Volatile transient faults and all permanent faults freeze the old endpoint,
+Pod and PVC identities, remove routing, delete only those resources and create
+distinct replacement scaffolding. This remains repository-only preview
+behavior. Production evaluation and gRPC dispatch reject the preview identity
+and restart/drop commands even in all-features builds.
 
 ### Production Verdict
 

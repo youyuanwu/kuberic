@@ -83,7 +83,6 @@ private-path documented variant crate::host::error::HostError::CommandRejected((
 private-path documented variant crate::host::error::HostError::Contract((String))
 private-path documented variant crate::host::error::HostError::Corrupt((String))
 private-path documented variant crate::host::error::HostError::DurableEffectConflict((String))
-private-path documented variant crate::host::error::HostError::StaleEffectCompletion((String))
 private-path documented variant crate::host::error::HostError::IdentityMismatch((String))
 private-path documented variant crate::host::error::HostError::InitializationNotAuthorized((String))
 private-path documented variant crate::host::error::HostError::Io((# [from] std :: io :: Error))
@@ -93,6 +92,7 @@ private-path documented variant crate::host::error::HostError::SchemaMismatch { 
 private-path documented variant crate::host::error::HostError::Serialization((# [from] serde_json :: Error))
 private-path documented variant crate::host::error::HostError::SessionRejected((String))
 private-path documented variant crate::host::error::HostError::Sqlite((# [from] rusqlite :: Error))
+private-path documented variant crate::host::error::HostError::StaleEffectCompletion((String))
 private-path documented variant crate::host::error::HostError::Uninitialized
 private-path documented variant crate::host::process::ApplicationStorageState::Established
 private-path documented variant crate::host::process::ApplicationStorageState::FreshEmpty

@@ -36,6 +36,7 @@ fn controller_exports_observation_and_evaluation_contracts() {
             image: "example/db:latest".into(),
             failover_delay_seconds: 30,
             switchover: None,
+            preview_lifecycle: None,
         },
     );
     set.metadata.uid = Some("set-uid".into());

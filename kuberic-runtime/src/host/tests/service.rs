@@ -3780,6 +3780,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                 image: "example:v1".into(),
                 failover_delay_seconds: 30,
                 switchover: None,
+                preview_lifecycle: None,
             },
             status: AcceptedStatus {
                 initialized: true,

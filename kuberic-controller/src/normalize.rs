@@ -229,6 +229,11 @@ pub fn normalize(
                     request_id: SwitchoverRequestId::new(request.request_id),
                     target_replica_id: ReplicaId::new(i64::from(request.target_replica_id)),
                 }),
+            preview_lifecycle: raw
+                .set
+                .spec
+                .preview_lifecycle
+                .map(|preview| preview.state_persistence),
         },
         status,
         replicas,
@@ -407,6 +412,16 @@ fn normalize_agent(
                     };
                 }
             }
+        }
+        #[cfg(feature = "runtime-test-bridge")]
+        RawAgentObservation::PreviewReport(report) => {
+            if report.resource_uid != *resource_uid {
+                return AgentObservation::Invalid {
+                    message: "preview report resource UID differs from the observed set".into(),
+                    uninitialized_report: None,
+                };
+            }
+            AgentObservation::Report(report)
         }
     };
     let mismatch = match &observation {
