@@ -722,30 +722,41 @@ where
 
     pub(crate) async fn reconstruct_runtime(&self) -> Result<()> {
         let state = self.store.load_state().await?;
+        let preview_quarantine = state.public_operation_preview.is_some();
         self.runtime.bind_replica_session(
             state.identity.resource_uid.clone(),
             self.sessions.local_session().clone(),
         )?;
-        self.runtime.stage_authority_recovery(
-            state
-                .pending_effect
-                .as_ref()
-                .map(|pending| pending.effect.clone()),
-        );
-        let transition = startup_transition(&state);
-        let removal_pending = state.pending_effect.as_ref().is_some_and(|p| {
-            matches!(
-                p.effect.action,
-                crate::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                    | crate::effects::RuntimeEffectAction::RetireReplica(_)
-            )
-        }) || state.reconfiguration.as_ref().is_some_and(|r| {
-            r.command.transition_kind == crate::protocol::types::TransitionKind::SecondaryScaleDown
-        });
-        let planned_switchover_pending = state.reconfiguration.as_ref().is_some_and(|record| {
-            record.command.transition_kind
-                == crate::protocol::types::TransitionKind::PlannedSwitchover
-        });
+        self.runtime
+            .stage_authority_recovery(if preview_quarantine {
+                None
+            } else {
+                state
+                    .pending_effect
+                    .as_ref()
+                    .map(|pending| pending.effect.clone())
+            });
+        let transition = if preview_quarantine {
+            None
+        } else {
+            startup_transition(&state)
+        };
+        let removal_pending = !preview_quarantine
+            && (state.pending_effect.as_ref().is_some_and(|p| {
+                matches!(
+                    p.effect.action,
+                    crate::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                        | crate::effects::RuntimeEffectAction::RetireReplica(_)
+                )
+            }) || state.reconfiguration.as_ref().is_some_and(|r| {
+                r.command.transition_kind
+                    == crate::protocol::types::TransitionKind::SecondaryScaleDown
+            }));
+        let planned_switchover_pending = !preview_quarantine
+            && state.reconfiguration.as_ref().is_some_and(|record| {
+                record.command.transition_kind
+                    == crate::protocol::types::TransitionKind::PlannedSwitchover
+            });
         self.runtime
             .reconstruct(
                 if state
@@ -757,20 +768,30 @@ where
                 } else {
                     OpenMode::Existing
                 },
-                state.role,
+                if preview_quarantine {
+                    crate::protocol::types::ReplicaRole::None
+                } else {
+                    state.role
+                },
                 if removal_pending {
                     crate::protocol::types::AccessStatus::ReconfigurationPending
+                } else if preview_quarantine {
+                    crate::protocol::types::AccessStatus::NotPrimary
                 } else {
                     state.read_status
                 },
-                startup_write_status(
-                    state.write_status,
-                    state
-                        .pending_effect
-                        .as_ref()
-                        .map(|pending| &pending.effect.action),
-                    removal_pending || planned_switchover_pending,
-                ),
+                if preview_quarantine {
+                    crate::protocol::types::AccessStatus::NotPrimary
+                } else {
+                    startup_write_status(
+                        state.write_status,
+                        state
+                            .pending_effect
+                            .as_ref()
+                            .map(|pending| &pending.effect.action),
+                        removal_pending || planned_switchover_pending,
+                    )
+                },
                 transition,
             )
             .await?;
@@ -781,6 +802,9 @@ where
             .is_some_and(|b| b.initializing)
         {
             self.store.complete_application_initialization().await?;
+        }
+        if preview_quarantine {
+            return Ok(());
         }
         if let Some(committed) = state.accepted_secondary_removal
             && self

@@ -1660,12 +1660,7 @@ impl AgentStore for SqliteStore {
                     exact_blockers.insert(blocker.clone());
                 }
             }
-            let stage = if exact_blockers.is_empty() {
-                PublicOperationStage::Ready
-            } else {
-                PublicOperationStage::WaitingForContainment
-            };
-            for blocker in &exact_blockers {
+            for blocker in blockers {
                 let blocked = preview.operations.get_mut(blocker).ok_or_else(|| {
                     crate::host::HostError::CommandRejected(format!(
                         "public-operation blocker {blocker} disappeared"
@@ -1682,6 +1677,11 @@ impl AgentStore for SqliteStore {
                 }
                 blocked.superseded_by = Some(intent.operation_id.clone());
             }
+            let stage = if exact_blockers.is_empty() {
+                PublicOperationStage::Ready
+            } else {
+                PublicOperationStage::WaitingForContainment
+            };
             let record = PublicOperationRecord {
                 intent: intent.clone(),
                 stage,
@@ -1840,11 +1840,6 @@ impl AgentStore for SqliteStore {
                     "attached public-operation owner {owner} is unknown"
                 ))
             })?;
-            if owner_record.stage != PublicOperationStage::Completed {
-                return Err(crate::host::HostError::CommandRejected(format!(
-                    "attached public-operation owner {owner} is not terminal"
-                )));
-            }
             if let Some(existing) = preview.operations.get(&intent.operation_id) {
                 if &existing.intent != intent {
                     return Err(crate::host::HostError::DurableEffectConflict(
@@ -1853,13 +1848,26 @@ impl AgentStore for SqliteStore {
                 }
                 return Ok(existing.clone());
             }
+            let owner_completed = owner_record.stage == PublicOperationStage::Completed;
             let record = PublicOperationRecord {
                 intent: intent.clone(),
-                stage: PublicOperationStage::Completed,
+                stage: if owner_completed {
+                    PublicOperationStage::Completed
+                } else {
+                    PublicOperationStage::WaitingForContainment
+                },
                 disposition: Some(PublicOperationDisposition::Attached(owner.clone())),
-                containment: PublicOperationContainment::Complete,
+                containment: if owner_completed {
+                    PublicOperationContainment::Complete
+                } else {
+                    PublicOperationContainment::NotRequired
+                },
                 superseded_by: None,
-                blockers: std::collections::BTreeSet::new(),
+                blockers: if owner_completed {
+                    std::collections::BTreeSet::new()
+                } else {
+                    std::collections::BTreeSet::from([owner.clone()])
+                },
             };
             preview
                 .operations

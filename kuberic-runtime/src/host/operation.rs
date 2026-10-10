@@ -380,6 +380,29 @@ impl PartitionOperation {
         Ok(())
     }
 
+    async fn complete_attachment(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let current = self.snapshot();
+        if current.stage != PublicOperationStage::WaitingForContainment
+            || !matches!(
+                current.disposition,
+                Some(PublicOperationDisposition::Attached(_))
+            )
+        {
+            return Ok(());
+        }
+        let completed = self
+            .advance(
+                PublicOperationStage::WaitingForContainment,
+                PublicOperationStage::Completed,
+                None,
+            )
+            .await?;
+        self.record.send_replace(completed);
+        self.bump_revision();
+        Ok(())
+    }
+
     async fn advance(
         &self,
         expected: PublicOperationStage,
@@ -434,6 +457,13 @@ impl PartitionOperation {
         if matches!(
             record.stage,
             PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+        ) {
+            self.recovery_complete();
+            return Ok(None);
+        }
+        if matches!(
+            record.disposition,
+            Some(PublicOperationDisposition::Attached(_))
         ) {
             self.recovery_complete();
             return Ok(None);
@@ -625,6 +655,14 @@ impl PartitionOperationRegistry {
         let mut attached_to = None;
         for operation in existing {
             let record = operation.snapshot();
+            if record.superseded_by.is_some()
+                || matches!(
+                    record.disposition,
+                    Some(PublicOperationDisposition::Attached(_))
+                )
+            {
+                continue;
+            }
             if record.stage == PublicOperationStage::Completed
                 && matches!(
                     record.intent.class,
@@ -643,8 +681,7 @@ impl PartitionOperationRegistry {
             match relation {
                 AdmissionRelation::Coexist => {}
                 AdmissionRelation::Attach => {
-                    attached_to = Some(operation);
-                    break;
+                    attached_to.get_or_insert(operation);
                 }
                 AdmissionRelation::Supersede => {
                     blockers.insert(record.intent.operation_id.clone());
@@ -748,10 +785,19 @@ impl PartitionOperationRegistry {
         _admitted: Arc<PartitionOperation>,
         superseded: Vec<Arc<PartitionOperation>>,
     ) -> Result<()> {
+        let mut first_error = None;
         for displaced in superseded {
-            displaced.cancel_root().await?;
+            if let Err(error) = displaced.cancel_root().await {
+                first_error.get_or_insert(error);
+            }
         }
-        self.refresh_waiters().await
+        if let Err(error) = self.refresh_waiters().await {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn complete_containment(
@@ -797,8 +843,8 @@ impl PartitionOperationRegistry {
         }
         if !recovered.is_empty() {
             self.bump_revision();
-            self.refresh_waiters().await?;
         }
+        self.refresh_waiters().await?;
         Ok(recovered)
     }
 
@@ -898,7 +944,14 @@ impl PartitionOperationRegistry {
                     .iter()
                     .all(|blocker| completed.contains(blocker))
             {
-                operation.activate().await?;
+                if matches!(
+                    record.disposition,
+                    Some(PublicOperationDisposition::Attached(_))
+                ) {
+                    operation.complete_attachment().await?;
+                } else {
+                    operation.activate().await?;
+                }
             }
         }
         Ok(())
@@ -938,12 +991,12 @@ fn active_relation(
     match (&existing.class, &incoming.class) {
         (PermanentFault, class) if class.is_terminal() => Attach,
         (PermanentFault, _) => Reject("permanent fault is already terminal"),
-        (_, PermanentFault) => Supersede,
         (Restart | DropReplacement, class) if class.is_terminal() => Attach,
         (Restart | DropReplacement, _) => Reject("restart or drop action is already active"),
-        (_, Restart | DropReplacement) => Supersede,
         (Abort, class) if class.is_terminal() => Attach,
         (Abort, _) => Reject("abort containment is already terminal"),
+        (_, PermanentFault) => Supersede,
+        (_, Restart | DropReplacement) => Supersede,
         (TransientFault, Close | Abort | TransientFault) => Attach,
         (_, Abort) => Supersede,
         (Close, Close) => Attach,
@@ -1027,7 +1080,7 @@ fn retained_relation(
     existing: &PublicOperationIntent,
     incoming: &PublicOperationIntent,
 ) -> AdmissionRelation {
-    use AdmissionRelation::{Attach, Coexist, Reject};
+    use AdmissionRelation::{Attach, Coexist, Reject, Supersede};
     use PublicOperationClass::{
         Abort, Authority, Build, Close, DropReplacement, PermanentFault, PlannedSwap, Remove,
         Restart, TransientFault,
@@ -1042,7 +1095,7 @@ fn retained_relation(
         (Close | Abort | PermanentFault | Restart | DropReplacement, _) => {
             Reject("replica is durably terminal")
         }
-        (TransientFault, PermanentFault) => Coexist,
+        (TransientFault, PermanentFault) => Supersede,
         (TransientFault, class) if class.is_terminal() => Attach,
         (TransientFault, _) => Reject("transient fault requires lifecycle control"),
         (Authority | PlannedSwap, Authority | PlannedSwap)
@@ -1232,5 +1285,55 @@ mod tests {
             retained_relation(&intent(PermanentFault, 1), &intent(Authority, 2)),
             Reject("replica is durably terminal")
         );
+    }
+
+    #[test]
+    fn terminal_pair_matrices_are_exhaustive() {
+        use AdmissionRelation::{Attach, Supersede};
+        use PublicOperationClass::{
+            Abort, Close, DropReplacement, PermanentFault, Restart, TransientFault,
+        };
+
+        let classes = [
+            Close,
+            Abort,
+            TransientFault,
+            PermanentFault,
+            Restart,
+            DropReplacement,
+        ];
+        let active = [
+            [
+                Attach, Supersede, Supersede, Supersede, Supersede, Supersede,
+            ],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+            [Attach, Attach, Attach, Supersede, Supersede, Supersede],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+        ];
+        let retained = [
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+            [Attach, Attach, Attach, Supersede, Attach, Attach],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+            [Attach, Attach, Attach, Attach, Attach, Attach],
+        ];
+
+        for (existing_index, existing) in classes.iter().cloned().enumerate() {
+            for (incoming_index, incoming) in classes.iter().cloned().enumerate() {
+                assert_eq!(
+                    active_relation(&intent(existing.clone(), 1), &intent(incoming.clone(), 2)),
+                    active[existing_index][incoming_index],
+                    "active terminal pair {existing:?} -> {incoming:?}"
+                );
+                assert_eq!(
+                    retained_relation(&intent(existing.clone(), 1), &intent(incoming.clone(), 2)),
+                    retained[existing_index][incoming_index],
+                    "retained terminal pair {existing:?} -> {incoming:?}"
+                );
+            }
+        }
     }
 }

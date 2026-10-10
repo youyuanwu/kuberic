@@ -25,13 +25,14 @@ use crate::protocol::public_operations::{
     PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
 };
 use crate::protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, EffectivePolicy, Epoch, InitializationId,
-    OperationId, PodUid, ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRole, ResourceUid,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+    Epoch, InitializationId, OperationId, PodUid, ProcessSessionId, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
 };
 use crate::replicator::{
-    DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
-    ReplicaSetQuorumMode, Replicator, ReplicatorSettings, StateReplicator,
+    PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
+    Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
+    ReplicatorSettings, StateReplicator,
 };
 
 use super::tempdir;
@@ -743,6 +744,67 @@ async fn shutdown_drains_other_roots_after_one_cancellation_persistence_failure(
 }
 
 #[tokio::test]
+async fn terminal_supersession_drains_all_roots_after_one_persistence_failure() {
+    let preview = PublicOperationPreviewIdentity::new(38);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry = PartitionOperationRegistry::new(
+        store.clone(),
+        preview.clone(),
+        ProcessSessionId::new("session-1"),
+    )
+    .unwrap();
+    let runtime = PartitionOperationRuntime::start(registry.clone());
+    let mut builds = Vec::new();
+    for target in [2, 3] {
+        let build = registry
+            .admit(intent(
+                &preview,
+                &format!("build-{target}"),
+                1,
+                PublicOperationClass::Build {
+                    target: ReplicaId::new(target),
+                },
+                "session-1",
+            ))
+            .await
+            .unwrap();
+        build
+            .spawn_root(CallbackContainment::RootTask, async {
+                std::future::pending::<()>().await;
+                Ok::<(), Infallible>(())
+            })
+            .await
+            .unwrap();
+        builds.push(build);
+    }
+
+    store.fail_next_public_operation_advance();
+    let abort = registry
+        .admit(intent(
+            &preview,
+            "abort",
+            2,
+            PublicOperationClass::Abort,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+
+    wait_for_stage(&builds[0], PublicOperationStage::ContainmentPending).await;
+    let drained = wait_for_stage(&builds[1], PublicOperationStage::Completed).await;
+    assert_eq!(
+        drained.disposition,
+        Some(PublicOperationDisposition::Cancelled)
+    );
+    let blocked = wait_for_stage(&abort, PublicOperationStage::ContainmentPending).await;
+    assert!(matches!(
+        blocked.disposition,
+        Some(PublicOperationDisposition::Ambiguous(_))
+    ));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn retained_authority_and_abort_records_fence_later_admission() {
     let preview = PublicOperationPreviewIdentity::new(40);
     let (_directory, _path, store) = preview_store(&preview);
@@ -910,6 +972,191 @@ async fn retained_authority_and_abort_records_fence_later_admission() {
 }
 
 #[tokio::test]
+async fn terminal_attachments_follow_the_authoritative_escalation_owner() {
+    let preview = PublicOperationPreviewIdentity::new(42);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry =
+        PartitionOperationRegistry::new(store, preview.clone(), ProcessSessionId::new("session-1"))
+            .unwrap();
+    let runtime = PartitionOperationRuntime::start(registry.clone());
+    let close = registry
+        .admit(intent(
+            &preview,
+            "a-close",
+            1,
+            PublicOperationClass::Close,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    close
+        .spawn_root(CallbackContainment::RootTask, async {
+            std::future::pending::<()>().await;
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    let abort = registry
+        .admit(intent(
+            &preview,
+            "b-abort",
+            2,
+            PublicOperationClass::Abort,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    wait_for_stage(&close, PublicOperationStage::Completed).await;
+    wait_for_stage(&abort, PublicOperationStage::Ready).await;
+    abort
+        .spawn_root(CallbackContainment::RootTask, async {
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    abort.wait_for_terminal().await.unwrap();
+
+    let attached = registry
+        .admit(intent(
+            &preview,
+            "c-later-close",
+            3,
+            PublicOperationClass::Close,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        attached.snapshot().disposition,
+        Some(PublicOperationDisposition::Attached(
+            abort.intent().operation_id
+        ))
+    );
+    runtime.shutdown().await.unwrap();
+
+    let preview = PublicOperationPreviewIdentity::new(43);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry =
+        PartitionOperationRegistry::new(store, preview.clone(), ProcessSessionId::new("session-1"))
+            .unwrap();
+    let runtime = PartitionOperationRuntime::start(registry.clone());
+    let transient = registry
+        .admit(intent(
+            &preview,
+            "a-transient",
+            1,
+            PublicOperationClass::TransientFault,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    transient
+        .spawn_root(CallbackContainment::RootTask, async {
+            std::future::pending::<()>().await;
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    let permanent = registry
+        .admit(intent(
+            &preview,
+            "b-permanent",
+            2,
+            PublicOperationClass::PermanentFault,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    wait_for_stage(&transient, PublicOperationStage::Completed).await;
+    wait_for_stage(&permanent, PublicOperationStage::Ready).await;
+    permanent
+        .spawn_root(CallbackContainment::RootTask, async {
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    permanent.wait_for_terminal().await.unwrap();
+
+    let attached = registry
+        .admit(intent(
+            &preview,
+            "c-later-abort",
+            3,
+            PublicOperationClass::Abort,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        attached.snapshot().disposition,
+        Some(PublicOperationDisposition::Attached(
+            permanent.intent().operation_id
+        ))
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn active_terminal_attachment_waits_for_the_owner_result() {
+    let preview = PublicOperationPreviewIdentity::new(44);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry =
+        PartitionOperationRegistry::new(store, preview.clone(), ProcessSessionId::new("session-1"))
+            .unwrap();
+    let runtime = PartitionOperationRuntime::start(registry.clone());
+    let release = Arc::new(Notify::new());
+    let callback_release = release.clone();
+    let abort = registry
+        .admit(intent(
+            &preview,
+            "abort",
+            1,
+            PublicOperationClass::Abort,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    abort
+        .spawn_root(CallbackContainment::RootTask, async move {
+            callback_release.notified().await;
+            Ok::<(), Infallible>(())
+        })
+        .await
+        .unwrap();
+    let close = registry
+        .admit(intent(
+            &preview,
+            "close",
+            2,
+            PublicOperationClass::Close,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        close.snapshot().stage,
+        PublicOperationStage::WaitingForContainment
+    );
+    assert_eq!(
+        close.snapshot().disposition,
+        Some(PublicOperationDisposition::Attached(
+            abort.intent().operation_id
+        ))
+    );
+
+    release.notify_one();
+    abort.wait_for_terminal().await.unwrap();
+    let attached = wait_for_stage(&close, PublicOperationStage::Completed).await;
+    assert_eq!(
+        attached.disposition,
+        Some(PublicOperationDisposition::Attached(
+            abort.intent().operation_id
+        ))
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn fresh_session_recovers_unowned_work_as_ambiguous_containment() {
     let preview = PublicOperationPreviewIdentity::new(5);
     let (_directory, path, store) = durable_preview_store(&preview);
@@ -961,6 +1208,51 @@ async fn fresh_session_recovers_unowned_work_as_ambiguous_containment() {
 }
 
 #[tokio::test]
+async fn fresh_preview_session_reconstructs_unassigned_and_access_closed() {
+    let preview = PublicOperationPreviewIdentity::new(45);
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let mut state = AgentState::new(storage_identity());
+    state.current_configuration = Some(ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        ReplicaId::new(1),
+        vec![ConfigurationMember {
+            identity: replica_identity(),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    ));
+    state.role = ReplicaRole::Primary;
+    state.read_status = AccessStatus::Granted;
+    state.write_status = AccessStatus::Granted;
+    drop(SqliteStore::create_preview_authorized(&path, state, preview.clone()).unwrap());
+
+    let store = Arc::new(
+        SqliteStore::open_preview_existing(&path, Some(&storage_identity()), &preview).unwrap(),
+    );
+    let (_trace, application, _replicator, _state_replicator) = trace_fixture();
+    let runtime = Arc::new(PodRuntime::new(
+        replica_identity(),
+        application,
+        store.clone(),
+    ));
+    let service =
+        AgentService::new(store.clone(), runtime.clone(), runtime.clone(), "token").unwrap();
+    service.reconstruct_runtime().await.unwrap();
+
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.role, ReplicaRole::None);
+    assert_eq!(snapshot.read_status, AccessStatus::NotPrimary);
+    assert_eq!(snapshot.write_status, AccessStatus::NotPrimary);
+    assert!(snapshot.authority.is_none());
+    let durable = store.load_state().await.unwrap();
+    assert_eq!(durable.role, ReplicaRole::Primary);
+    assert_eq!(durable.read_status, AccessStatus::Granted);
+    assert_eq!(durable.write_status, AccessStatus::Granted);
+    runtime.abort();
+}
+
+#[tokio::test]
 async fn preview_runtime_shutdown_owns_and_drains_root_tasks() {
     let preview = PublicOperationPreviewIdentity::new(31);
     let (_directory, _path, store) = preview_store(&preview);
@@ -998,9 +1290,10 @@ async fn preview_runtime_shutdown_owns_and_drains_root_tasks() {
 async fn agent_service_retains_and_drains_the_preview_runtime() {
     let preview = PublicOperationPreviewIdentity::new(37);
     let (_directory, _path, store) = preview_store(&preview);
+    let (trace, application, _replicator, _state_replicator) = trace_fixture();
     let runtime = Arc::new(PodRuntime::new(
         replica_identity(),
-        Arc::new(ServicePreviewApplication),
+        application,
         store.clone(),
     ));
     let service = AgentService::new(store, runtime.clone(), runtime, "token").unwrap();
@@ -1055,6 +1348,14 @@ async fn agent_service_retains_and_drains_the_preview_runtime() {
         .unwrap()
         .unwrap();
 
+    assert!(
+        trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "application.open.end")
+    );
     assert_eq!(operation.snapshot().stage, PublicOperationStage::Completed);
     assert_eq!(
         operation.snapshot().disposition,
@@ -1221,101 +1522,27 @@ impl StateReplicator for TraceStateReplicator {
 struct TraceApplication {
     trace: Arc<Trace>,
     replicator: Arc<TraceReplicator>,
+    state_replicator: Arc<TraceStateReplicator>,
 }
 
-struct ServicePreviewApplication;
-
-#[async_trait]
-impl crate::engine::DurableState for ServicePreviewApplication {
-    async fn get_replication_operations(
-        &self,
-        _from: i64,
-        _to: i64,
-    ) -> crate::Result<crate::engine::RetainedOperationStream> {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-
-    async fn apply_copy_chunk(
-        &self,
-        _copy_id: &OperationId,
-        _sequence: u64,
-        _chunk: crate::application::CopyChunk,
-    ) -> crate::Result<()> {
-        unreachable!("preview service ownership test does not copy state")
-    }
-
-    async fn verify_copy_chunk(
-        &self,
-        _copy_id: &OperationId,
-        _sequence: u64,
-        _chunk: &crate::application::CopyChunk,
-    ) -> crate::Result<bool> {
-        unreachable!("preview service ownership test does not copy state")
-    }
-
-    async fn finish_copy(
-        &self,
-        _copy_id: &OperationId,
-        _checkpoint_lsn: i64,
-        _up_to_lsn: i64,
-    ) -> crate::Result<crate::application::DurableApplicationProgress> {
-        unreachable!("preview service ownership test does not copy state")
-    }
-
-    async fn apply(
-        &self,
-        _operation: crate::application::Operation,
-    ) -> crate::Result<crate::application::DurableApplicationAck> {
-        unreachable!("preview service ownership test does not apply writes")
-    }
-
-    async fn durable_progress(
-        &self,
-    ) -> crate::Result<crate::application::DurableApplicationProgress> {
-        Ok(Default::default())
-    }
-
-    async fn verify_applied(
-        &self,
-        _operation: &crate::application::Operation,
-    ) -> crate::Result<bool> {
-        unreachable!("preview service ownership test does not verify writes")
-    }
-
-    async fn commit(
-        &self,
-        lsn: i64,
-    ) -> crate::Result<crate::application::DurableApplicationProgress> {
-        assert_eq!(lsn, 0);
-        Ok(Default::default())
-    }
+struct TraceReplicatorFactory {
+    replicator: Arc<TraceReplicator>,
+    state_replicator: Arc<TraceStateReplicator>,
 }
 
 #[async_trait]
-impl StatefulServiceReplica for ServicePreviewApplication {
-    async fn open(self: Arc<Self>, context: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
-        let provider = Arc::new(TraceProvider {
-            trace: Arc::new(Trace::default()),
-        });
-        let interfaces = context
-            .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new(self)))
-            .create_replicator(Some(provider), None)
-            .await?;
-        Ok(interfaces.replicator())
+impl ReplicatorFactory for TraceReplicatorFactory {
+    async fn create_replicator(
+        &self,
+        _context: ReplicatorFactoryContext,
+        _state_provider: Option<Arc<dyn StateProvider>>,
+        _settings: ReplicatorSettings,
+    ) -> crate::Result<ReplicatorInterfaces> {
+        Ok(ReplicatorInterfaces::primary(
+            self.replicator.clone(),
+            Some(self.state_replicator.clone()),
+        ))
     }
-
-    async fn change_role(&self, _role: ReplicaRole) -> crate::Result<RoleChange> {
-        Ok(RoleChange {
-            service_address: None,
-        })
-    }
-
-    async fn close(&self) -> crate::Result<()> {
-        Ok(())
-    }
-
-    fn abort(&self) {}
 }
 
 impl TraceApplication {
@@ -1327,8 +1554,17 @@ impl TraceApplication {
 
 #[async_trait]
 impl StatefulServiceReplica for TraceApplication {
-    async fn open(self: Arc<Self>, _context: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
-        self.trace_open().await
+    async fn open(self: Arc<Self>, context: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
+        self.trace.callback("application.open").await;
+        let interfaces = context
+            .partition
+            .with_factory(Arc::new(TraceReplicatorFactory {
+                replicator: self.replicator.clone(),
+                state_replicator: self.state_replicator.clone(),
+            }))
+            .create_replicator(Some(self.replicator.provider.clone()), None)
+            .await?;
+        Ok(interfaces.replicator())
     }
 
     async fn change_role(&self, _role: ReplicaRole) -> crate::Result<RoleChange> {
@@ -1508,13 +1744,14 @@ fn trace_fixture() -> (
         descendant_stopped: Arc::new(AtomicBool::new(false)),
         lifecycle_closed: lifecycle_closed.clone(),
     });
-    let application = Arc::new(TraceApplication {
-        trace: trace.clone(),
-        replicator: replicator.clone(),
-    });
     let state_replicator = Arc::new(TraceStateReplicator {
         trace: trace.clone(),
         lifecycle_closed,
+    });
+    let application = Arc::new(TraceApplication {
+        trace: trace.clone(),
+        replicator: replicator.clone(),
+        state_replicator: state_replicator.clone(),
     });
     (trace, application, replicator, state_replicator)
 }
@@ -1634,13 +1871,39 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
         callback.on_data_loss().await.map(|_| ())
     })
     .await;
+    let callback = replicator.provider.clone();
+    run_owned_trace(
+        &runtime,
+        &preview,
+        11,
+        "provider-last-committed",
+        async move { callback.last_committed_lsn().await.map(|_| ()) },
+    )
+    .await;
+    let callback = replicator.provider.clone();
+    run_owned_trace(
+        &runtime,
+        &preview,
+        12,
+        "provider-copy-context",
+        async move { callback.get_copy_context().await.map(|_| ()) },
+    )
+    .await;
+    let callback = replicator.provider.clone();
+    run_owned_trace(&runtime, &preview, 13, "provider-copy-state", async move {
+        callback
+            .get_copy_state(0, Box::pin(futures::stream::empty()))
+            .await
+            .map(|_| ())
+    })
+    .await;
     let callback = replicator.clone();
     let current = empty.clone();
     let previous = empty.clone();
     run_owned_trace(
         &runtime,
         &preview,
-        11,
+        14,
         "catch-up-configuration",
         async move {
             callback
@@ -1650,7 +1913,7 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
     )
     .await;
     let callback = replicator.clone();
-    run_owned_trace(&runtime, &preview, 12, "catch-up-wait", async move {
+    run_owned_trace(&runtime, &preview, 15, "catch-up-wait", async move {
         callback
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
             .await
@@ -1661,7 +1924,7 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
     run_owned_trace(
         &runtime,
         &preview,
-        13,
+        16,
         "current-configuration",
         async move {
             callback
@@ -1671,7 +1934,7 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
     )
     .await;
     let callback = replicator.clone();
-    run_owned_trace(&runtime, &preview, 14, "build", async move {
+    run_owned_trace(&runtime, &preview, 17, "build", async move {
         callback
             .build_replica(ReplicaInformation::new(
                 OperationId::new("build"),
@@ -1682,7 +1945,7 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
     })
     .await;
     let callback = replicator.clone();
-    run_owned_trace(&runtime, &preview, 15, "remove", async move {
+    run_owned_trace(&runtime, &preview, 18, "remove", async move {
         callback.remove_replica(ReplicaId::new(2)).await
     })
     .await;
@@ -1696,19 +1959,22 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
         .update_replicator_settings(ReplicatorSettings::default())
         .await
         .unwrap();
-    replicator.abort();
-    trace.wait_for("provider.descendant.end").await;
-    assert!(matches!(
-        state_replicator
-            .replicate(bytes::Bytes::from_static(b"after-abort"))
-            .await,
-        Err(crate::RuntimeError::Closed)
-    ));
     let callback = replicator.clone();
-    run_owned_trace(&runtime, &preview, 16, "replicator-close", async move {
+    run_owned_trace(&runtime, &preview, 19, "replicator-close", async move {
         callback.close().await
     })
     .await;
+    assert!(matches!(
+        state_replicator
+            .replicate(bytes::Bytes::from_static(b"after-close"))
+            .await,
+        Err(crate::RuntimeError::Closed)
+    ));
+    replicator.abort();
+    assert!(matches!(
+        state_replicator.get_copy_stream().await,
+        Err(crate::RuntimeError::Closed)
+    ));
     runtime.shutdown().await.unwrap();
 
     let events = trace.events.lock().unwrap().clone();
@@ -1726,6 +1992,9 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
         "replicator.catch_up_capability.end",
         "primary.on_data_loss.begin",
         "provider.on_data_loss.end",
+        "provider.last_committed_lsn.end",
+        "provider.get_copy_context.end",
+        "provider.get_copy_state.end",
         "primary.update_catch_up_configuration.end",
         "primary.wait_for_catch_up.end",
         "primary.update_current_configuration.end",
@@ -1745,6 +2014,206 @@ async fn strict_trace_fixture_covers_the_public_callback_inventory_and_primary_g
             "missing {expected}"
         );
     }
+}
+
+async fn assert_root_callback_cancelled<F, E>(
+    generation: u64,
+    trace: Arc<Trace>,
+    callback_name: &'static str,
+    future: F,
+) where
+    F: std::future::Future<Output = std::result::Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    trace.block(callback_name);
+    let preview = PublicOperationPreviewIdentity::new(generation);
+    let (_directory, _path, store) = preview_store(&preview);
+    let registry =
+        PartitionOperationRegistry::new(store, preview.clone(), ProcessSessionId::new("session-1"))
+            .unwrap();
+    let runtime = PartitionOperationRuntime::start(registry.clone());
+    let operation = registry
+        .admit(intent(
+            &preview,
+            "blocked-callback",
+            1,
+            PublicOperationClass::Authority,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    operation
+        .spawn_root(CallbackContainment::RootTask, future)
+        .await
+        .unwrap();
+    trace.wait_for(&format!("{callback_name}.begin")).await;
+
+    let successor = registry
+        .admit(intent(
+            &preview,
+            "successor",
+            2,
+            PublicOperationClass::Authority,
+            "session-1",
+        ))
+        .await
+        .unwrap();
+    let cancelled = wait_for_stage(&operation, PublicOperationStage::Completed).await;
+    assert_eq!(
+        cancelled.disposition,
+        Some(PublicOperationDisposition::Cancelled)
+    );
+    trace.wait_for(&format!("{callback_name}.cancel")).await;
+    wait_for_stage(&successor, PublicOperationStage::Ready).await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn every_non_build_public_callback_is_independently_cancellable() {
+    let (trace, application, _replicator, _state_replicator) = trace_fixture();
+    let callback = application.clone();
+    assert_root_callback_cancelled(70, trace, "application.open", async move {
+        callback.trace_open().await.map(|_| ())
+    })
+    .await;
+
+    let (trace, application, _replicator, _state_replicator) = trace_fixture();
+    let callback = application.clone();
+    assert_root_callback_cancelled(71, trace, "application.change_role", async move {
+        callback.change_role(ReplicaRole::Primary).await.map(|_| ())
+    })
+    .await;
+
+    let (trace, application, _replicator, _state_replicator) = trace_fixture();
+    let callback = application.clone();
+    assert_root_callback_cancelled(72, trace, "application.close", async move {
+        callback.close().await
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(73, trace, "replicator.open", async move {
+        callback.open().await.map(|_| ())
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(74, trace, "replicator.change_role", async move {
+        callback
+            .change_role(Epoch::default(), ReplicaRole::Primary)
+            .await
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(75, trace, "replicator.update_epoch", async move {
+        callback.update_epoch(Epoch::default()).await
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(76, trace, "replicator.current_progress", async move {
+        callback.current_progress().await.map(|_| ())
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(77, trace, "replicator.catch_up_capability", async move {
+        callback.catch_up_capability().await.map(|_| ())
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(78, trace, "replicator.close", async move {
+        callback.close().await
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    replicator
+        .change_role(Epoch::default(), ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(79, trace, "primary.on_data_loss", async move {
+        callback.on_data_loss().await.map(|_| ())
+    })
+    .await;
+
+    let configuration = ReplicaSetConfiguration::from(ConfigurationDescriptor::new(
+        Epoch::default(),
+        ReplicaId::new(1),
+        Vec::new(),
+        1,
+    ));
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    replicator
+        .change_role(Epoch::default(), ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let callback = replicator.clone();
+    let current = configuration.clone();
+    let previous = configuration.clone();
+    assert_root_callback_cancelled(
+        80,
+        trace,
+        "primary.update_catch_up_configuration",
+        async move {
+            callback
+                .update_catch_up_replica_set_configuration(current, previous)
+                .await
+        },
+    )
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    replicator
+        .change_role(Epoch::default(), ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(81, trace, "primary.wait_for_catch_up", async move {
+        callback
+            .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+            .await
+    })
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    replicator
+        .change_role(Epoch::default(), ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let callback = replicator.clone();
+    let current = configuration;
+    assert_root_callback_cancelled(
+        82,
+        trace,
+        "primary.update_current_configuration",
+        async move {
+            callback
+                .update_current_replica_set_configuration(current)
+                .await
+        },
+    )
+    .await;
+
+    let (trace, _application, replicator, _state_replicator) = trace_fixture();
+    replicator
+        .change_role(Epoch::default(), ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let callback = replicator.clone();
+    assert_root_callback_cancelled(83, trace, "primary.remove_replica", async move {
+        callback.remove_replica(ReplicaId::new(2)).await
+    })
+    .await;
 }
 
 #[tokio::test]
