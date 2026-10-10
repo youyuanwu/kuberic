@@ -3,8 +3,10 @@
 ## Status
 
 Required prerequisite architecture. PostgreSQL restart-stateless metadata work
-is blocked until every prerequisite in this document is implemented and
-verified.
+is blocked until every prerequisite in this document and every applicable
+public/custom conformance requirement in
+[Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md)
+is implemented and verified.
 
 These changes belong to Kuberic's generic Service Fabric-shaped
 reconfiguration behavior. They must not introduce PostgreSQL-specific runtime
@@ -64,6 +66,47 @@ The public `Replicator`, `PrimaryReplicator`, and `StateProvider` interfaces
 must not change. Generic implementation changes may refine when existing calls
 are issued, retried, and considered complete.
 
+## Upstream Service Fabric Conformance Gate
+
+This document supplements rather than replaces the generic conformance
+inventory in
+[Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md).
+The current public/custom path is materially misaligned with SF semantics, so
+the three PostgreSQL-discovered changes below are not the complete generic
+runtime prerequisite set.
+
+Before PostgreSQL metadata-removal implementation begins, the conformance
+catalog must classify every `KSF-*` finding as applicable or inapplicable to a
+restart-stateless custom replicator. All applicable findings must be resolved
+and covered by generic fixtures. At minimum, the PostgreSQL path depends on:
+
+- primary role before primary-only configuration (`KSF-01`);
+- ordered `on_data_loss` before catch-up and access when loss is possible
+  (`KSF-02`);
+- epoch delivery to same-role secondaries (`KSF-03`);
+- exact SF-shaped active membership, progress, and designated-successor
+  semantics (`KSF-04`);
+- truthful build target and source-boundary semantics (`KSF-05`);
+- cancellation and settlement of build before removal (`KSF-06`);
+- two write-quorum swap waits with the designated successor (`KSF-07`);
+- role-correct progress without promotion into unexposed proof (`KSF-08`);
+- one application-owned Replicator endpoint (`KSF-10`);
+- correct role-change address publication (`KSF-11`);
+- cancellation and draining of superseded callbacks (`KSF-12`);
+- transient-fault lifecycle behavior (`KSF-13`);
+- explicit graceful-close failure semantics (`KSF-14`);
+- callback-specific replay and idempotency semantics (`KSF-15`).
+
+Default-engine-only findings such as `KSF-09` and `KSF-16` remain governed by
+the default-replicator work unless the applicability review identifies a
+shared host dependency.
+
+The operation-bound catch-up receipt defined below depends specifically on the
+role-correct progress and catch-up semantics from `KSF-07` and `KSF-08`.
+`current_progress` must mean the public contract's committed boundary for the
+current role; it cannot be a local-WAL-end scalar promoted into stronger
+evidence.
+
 ## Required Generic Changes
 
 ### 1. Defer cold role restoration until peers can exist
@@ -72,9 +115,10 @@ are issued, retried, and considered complete.
 
 Cold startup restores admitted authority and invokes role callbacks while the
 custom-host restoration path is serialized. Fresh peer-session registration
-uses the same serialization domain, while the PostgreSQL listener and
-application coordination endpoint are created only after host startup
-completes.
+uses the same serialization domain, while the current PostgreSQL coordination
+listener is created outside `Replicator::open` and only after host startup
+completes. This also conflicts with SF endpoint ownership: the Replicator must
+open and return its own replication endpoint before role assignment.
 
 A truthful Primary or ActiveSecondary callback may need fresh peer sessions to
 apply native synchronous membership, establish a source, or validate catch-up.
@@ -99,17 +143,17 @@ Generic startup must have three distinguishable stages:
    - construct the application and replicator;
    - keep external read and write access denied;
    - install only postconditions that do not require live peers.
-2. **Connectivity availability**
-   - the generic `ReplicaHost` startup coordinator returns a closed host handle
-     after closed restoration rather than waiting for peer-dependent role
-     completion;
-   - start the application-owned listener and coordination endpoint;
-   - use a private, application-neutral host-ready signal to declare that
-     application connectivity can now be attempted;
+2. **Replicator open and connectivity availability**
+   - `Replicator::open` creates, binds, and owns the application-specific
+     replication/coordination endpoint;
+   - successful `open` returns the canonical endpoint address to the generic
+     host before any role-specific callback is required to complete;
+   - the generic host publishes that returned endpoint through its ordinary
+     application-neutral endpoint path;
    - permit exact current-session peer registration;
    - reject predecessor sessions and stale registrations.
 3. **Deferred role reconciliation**
-   - `RecoveryOwner` owns retries after the host-ready signal, peer-session
+   - `RecoveryOwner` owns retries after Replicator open, peer-session
      registration, or its bounded recovery cadence;
    - retry role/configuration/catch-up work that returned
      `ReconfigurationPending`;
@@ -119,19 +163,19 @@ Generic startup must have three distinguishable stages:
 `ReconfigurationPending` must mean "the admitted operation remains pending and
 access remains closed," not "host startup permanently fails."
 
-The host-ready signal is neither role evidence nor an access grant. It only
-releases deferred generic reconciliation after the process has made its
-application-owned connectivity surface available. The signal and retry path
-are private hosting mechanics; they do not change `StatefulServiceReplica`,
-`Replicator`, `PrimaryReplicator`, or `StateProvider`.
+Replicator-open completion is neither role evidence nor an access grant. It
+only proves that the Replicator-owned endpoint and open resources are
+available. Deferred reconciliation and retry are private hosting mechanics;
+they do not change `StatefulServiceReplica`, `Replicator`,
+`PrimaryReplicator`, or `StateProvider`.
 
 #### Required invariants
 
 - No peer-dependent callback is required to complete while peer registration
   is blocked by the same owner or lock.
 - A new listener or peer session cannot grant role or access by itself.
-- Host readiness is monotonic for one process session and is discarded on
-  close, abort, or session replacement.
+- Replicator-open readiness is monotonic for one process session and is
+  discarded on close, abort, or session replacement.
 - Retry does not mint a new epoch, configuration, operation, or build
   authorization.
 - Close, abort, session replacement, and authority replacement cancel or stale
@@ -169,8 +213,8 @@ generic catch-up floor:
 1. after entering the callback under the stable admitted configuration and
    process session, the replicator samples its own durable local progress;
 2. the invocation floor is the greater of that sample and any still-relevant
-   configuration, handoff, or build floor already installed by generic
-   authority;
+   configuration or handoff floor independently exposed by the generic public
+   contract;
 3. `WriteQuorum` succeeds only after the admitted write quorum reaches that
    invocation floor;
 4. `All` succeeds only after every required admitted member reaches that
@@ -283,17 +327,24 @@ Relevant integration points include:
 
 Planned switchover must use this generic order:
 
-1. close client writes on the source and drain/fence the old primary;
-2. capture and durably retain the generic handoff boundary;
-3. catch the target and required quorum up through that boundary;
-4. revoke remaining source service authority;
-5. advance epoch and promote the target;
-6. while all client access remains closed, command enough replicas into the
+1. mark the intended successor as the designated catch-up member and install
+   the admitted current/previous configuration;
+2. while source writes remain granted, perform the first designated-successor
+   write-quorum catch-up to reduce the final closed interval;
+3. revoke source write access and drain/fence the old primary;
+4. capture and durably retain the final generic handoff boundary;
+5. apply the swap epoch barrier to the required replicas;
+6. refresh the exact current/previous catch-up configuration under that epoch,
+   retaining the designated successor;
+7. perform the second designated-successor write-quorum catch-up through the
+   final boundary while writes remain closed;
+8. demote the old primary and promote the target;
+9. while all client access remains closed, command enough replicas into the
    admitted ActiveSecondary configuration to supply its write quorum;
-7. verify target primary readiness, the required live secondary membership,
+10. verify target primary readiness, the required live secondary membership,
    and current-configuration quorum catch-up;
-8. publish target write access;
-9. admit secondary read access individually only after each replica's
+11. publish target write access;
+12. admit secondary read access individually only after each replica's
    secondary callbacks complete.
 
 The former primary may remain closed and pending while the target is promoted.
@@ -311,6 +362,8 @@ methods do not become generic controller phases or instructions.
 #### Required invariants
 
 - The source cannot acknowledge new client writes after the handoff fence.
+- Writes may advance during the first catch-up, so only the second catch-up
+  can certify the final handoff boundary used for promotion.
 - The target cannot serve writes before epoch, role, configuration, catch-up,
   live write quorum, and access postconditions complete.
 - The former primary cannot serve reads while it is primary-looking,
@@ -386,10 +439,13 @@ An unacknowledged suffix may survive and become visible if it belongs to the
 selected compatible history. The guarantee is preservation of acknowledged
 writes, not forced rollback of every write whose client lost its response.
 
-The runtime may durably retain generic LSN boundaries produced by generic
-operations, such as a handoff or build boundary. It must not retain
-PostgreSQL-specific policy objects, native witness transcripts, timeline
-snapshots, or application workflow phases.
+The runtime may durably retain a generic handoff LSN when that boundary is an
+independently owned reconfiguration result. A build/copy boundary remains
+internal to the Replicator or state-provider build contract unless an existing
+public contract independently exposes it; generic hosting must not infer one
+from target progress. The runtime must not retain PostgreSQL-specific policy
+objects, native witness transcripts, timeline snapshots, or application
+workflow phases.
 
 ## Prohibited Implementations
 
@@ -450,12 +506,18 @@ The later PostgreSQL metadata-disposition design may begin only after all
 generic prerequisite behavior is covered by generic custom-replicator
 fixtures.
 
+The gate also requires an applicability matrix for every `KSF-*` finding from
+the upstream conformance document, with source-backed evidence for every
+"inapplicable" decision and focused tests for every applicable correction.
+
 ### Cold restoration
 
 - Restart a primary and secondary with their durable application copies
   intact but no process-local sessions.
+- Prove `Replicator::open` owns and returns the bound endpoint before
+  peer-dependent role restoration.
 - Prove startup remains externally closed while role restoration is pending.
-- Register fresh peer sessions after listener startup.
+- Register fresh peer sessions after Replicator open.
 - Prove deferred callbacks retry under the original authority and stale
   sessions cannot complete them.
 - Crash or replace the host during each stage and verify fail-closed replay.
@@ -481,7 +543,13 @@ fixtures.
 
 ### Target-first switchover
 
+- Verify the first designated-successor write-quorum catch-up occurs while
+  writes remain granted.
 - Verify source writes close before boundary capture.
+- Verify the swap epoch barrier and refreshed PC/CC catch-up configuration
+  complete before the final wait.
+- Verify the second designated-successor write-quorum catch-up covers the
+  final boundary while writes remain closed.
 - Verify target promotion does not wait for the former primary to become a
   secondary.
 - Verify a two-member configuration keeps target writes closed until the
@@ -528,16 +596,18 @@ prerequisite gate.
 
 ## Implementation Order
 
-1. Implement deferred cold restoration and its generic fixture coverage.
-2. Strengthen every generic catch-up invocation to establish a fresh floor,
+1. Classify and complete every applicable public/custom `KSF-*` conformance
+   requirement, preserving the protected public interfaces.
+2. Implement deferred cold restoration and its generic fixture coverage.
+3. Strengthen every generic catch-up invocation to establish a fresh floor,
    add the operation-bound lower-bound receipt, and replace exact handoff
    equality with operation-bound monotonic convergence.
-3. Implement target-first planned-switchover choreography.
-4. Run the complete generic prerequisite gate.
-5. Create and approve the complete PostgreSQL metadata-disposition matrix.
-6. Rewrite and re-review the PostgreSQL restart-stateless design against the
+4. Implement target-first planned-switchover choreography.
+5. Run the complete generic prerequisite gate.
+6. Create and approve the complete PostgreSQL metadata-disposition matrix.
+7. Rewrite and re-review the PostgreSQL restart-stateless design against the
    implemented generic behavior and approved matrix.
-7. Only then begin PostgreSQL PGDATA reconstruction and staged removal of
+8. Only then begin PostgreSQL PGDATA reconstruction and staged removal of
    `state-v2.json`.
 
 If any prerequisite requires an application-specific exception, the
@@ -550,6 +620,9 @@ prerequisite fails and PostgreSQL metadata removal remains blocked.
   implementation.
 - [Service Fabric Alignment and Runtime Simplification](../kuberic/service-fabric-alignment.md)
   defines the broader generic ownership direction.
+- [Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md)
+  is the authoritative public/custom conformance inventory that must be
+  completed or explicitly classified before this work proceeds.
 - [Stateless Default Replicator](../kuberic/stateless-default-replicator.md)
   applies the same V1 restart-reconstruction principle to the built-in
   replication engine.

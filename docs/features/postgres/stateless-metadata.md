@@ -12,8 +12,11 @@ the existing Service Fabric-shaped lifecycle callbacks as the complete
 application boundary, with PostgreSQL facts reconstructed from PGDATA and
 callback completion serving as the native acceptance boundary.
 
-Three application-neutral reconfiguration changes are required before this
-design can be rewritten or implemented:
+The applicable public/custom requirements in
+[Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md)
+must be completed before this design can be rewritten or implemented. The
+PostgreSQL audit additionally identified three application-neutral
+reconfiguration blockers:
 
 1. deferred cold role restoration after listeners and fresh peer sessions are
    available;
