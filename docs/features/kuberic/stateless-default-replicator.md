@@ -859,6 +859,9 @@ public/custom test implementations and the future built-in preview.
 - cancel and settle the exact build future before `remove_replica`;
 - retain/publish application role addresses and make transient fault trigger
   access revocation plus restart/drop;
+- update the real controller evaluator/executor so transient fault produces an
+  exact persisted-restart or volatile-drop/replacement action instead of a
+  healthy diagnostic report;
 - normalize child graceful-close failure after abort containment while retaining
   diagnostics;
 - implement the operation-specific public replay/ambiguity table rather than a
@@ -877,6 +880,8 @@ Exit criteria:
   progress/configuration values;
 - true or ambiguous data-loss outcomes remain access-closed and pending rather
   than fabricating history compatibility;
+- controller-driven fault tests prove immediate access closure and exact
+  persisted-restart/volatile-drop behavior for the faulted incarnation;
 - no Phase 1 lifecycle path is selected by the legacy production protocol.
 
 ### Phase 2: Migrate Public Values, Evidence and the Conformance Oracle
@@ -945,6 +950,26 @@ activated against the legacy production engine.
 - turn the Phase 1 trace implementation into one table-driven conformance
   oracle covering every KSF-01 through KSF-16 disposition.
 
+Controller work:
+
+- update `kuberic-runtime/src/protocol/types.rs`, `protocol/command.rs` and
+  `protocol/validation.rs` for protocol/history generations,
+  `DataLossRecovery`, session renewal and signed authorization;
+- update `kuberic-controller/src/evaluator.rs` and transition modules to compare
+  only compatible histories, select provisional rather than serving-ready
+  primaries, advance epoch for process replacement, decide data-loss recovery
+  versus rebuild and mint exact peer/build authorization;
+- update `kuberic-controller/src/executor.rs`, `reconciler.rs` and
+  `cluster_api.rs` to deliver fenced typed commands, manage signing/verification
+  material and reject stale protocol/resource/session identities;
+- update `kuberic-controller/src/crd.rs`, normalization and runtime reporting so
+  status contains public progress, history/incarnation identity and exact
+  public-operation completion but no private verified/quorum/committed/build
+  boundary;
+- extend controller protocol/model/integration tests to cover delayed reports,
+  incomparable histories, replacement session renewal, data-loss authorization,
+  signed build/peer values and corrective replacement.
+
 Exit criteria:
 
 - capability, history, data-loss and build-authorization values have one public
@@ -967,6 +992,8 @@ Exit criteria:
   path before any cutover work begins;
 - the KSF disposition matrix has a named test and production gate for every
   finding.
+- evaluator/executor tests consume only the new public protocol and produce the
+  same commands/outcomes expected by the strict conformance oracle.
 
 ### Phase 3: Build a Parallel Stateless Engine Core
 
@@ -1030,6 +1057,9 @@ Exit criteria:
   configuration and catch-up calls;
 - run the exact Phase 2 conformance oracle against both the strict
   public/custom implementation and the built-in preview;
+- drive preview failover, swap, process restart, data-loss recovery, build and
+  corrective replacement through the real controller evaluator, executor and
+  reconciler; direct runtime-command tests do not satisfy this gate;
 - pass every required KSF-01 through KSF-15 behavior and prove KSF-16 is
   confined to the unselected legacy engine;
 - pass ordinary, crash-boundary, all-survivor restart, divergence, transport,
@@ -1046,6 +1076,8 @@ Exit criteria:
   through the still-unselected legacy engine;
 - real PostgreSQL, SQLite and KVStore2 fresh-state suites pass under preview
   selection;
+- controller-driven preview scenarios match the direct public oracle while
+  reading no private progress/build evidence;
 - production manifests and the running production protocol remain legacy.
 
 ### Phase 5: Finalize the Replacement-Only Cutover Release
@@ -1073,6 +1105,8 @@ yet.
 - remove `LegacyManaged` selection and every fallback/crossed-selection path;
 - build the deployment artifact with only the stateless factory and
   Replicator-owned transport;
+- include the replacement controller, protocol/CRD schema, signing-key
+  provisioning, cutover Lease and namespace-scoped RBAC in the same release;
 - run all fresh-state conformance/live suites against the exact artifact and
   record its immutable image digest with the KSF gate results.
 

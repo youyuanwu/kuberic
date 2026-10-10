@@ -527,6 +527,7 @@ will delete:
 |---|---|---|
 | Public operation semantics | Give every public call exact task ownership, cancellation and SF lifecycle ordering | Phase 4 |
 | Public V1 values and evidence | Define SF-shaped configuration/build/progress values and remove private evidence dependencies | Phase 5 |
+| Controller protocol and policy | Own transient-fault restart/drop, history transitions, election comparability, signed authorization, rebuild decisions and cutover fencing | Phases 4-7 |
 | V1 replacement | Build the stateless engine beside the legacy engine, then cut over and delete the legacy path | Phases 6-7 |
 | Deferred maintainability | Decompose the remaining custom host only after the managed path is gone | After Phase 7 |
 | Optional V2 storage | Add a deliberate transactional log and provider protocol above V1 | Phase 8 |
@@ -564,6 +565,24 @@ post-cutover cleanup, not in the engine that will be removed.
 - Removing V1 engine persistence and introducing a V2 transactional log are
   separate changes. The latter requires new V2 transaction and provider
   contracts rather than extending the protected V1 `StateProvider`.
+
+### Controller Protocol and Policy Track
+
+The alignment is not runtime-only. The controller owns policy and durable
+authorization while the runtime/Replicator owns execution.
+
+| Phase | Controller responsibility | Primary components |
+|---|---|---|
+| Phase 4 | Consume a transient public fault as lifecycle control, close access and plan/execute restart for persisted state or drop/replacement for volatile state using the exact faulted incarnation | `kuberic-controller/src/evaluator.rs`, `executor.rs`, fault/report protocol and controller fault tests |
+| Phase 5 | Define the new protocol/status vocabulary, compare only compatible histories, authorize data-loss recovery, issue higher-epoch session renewal, mint signed peer/build authorization and decide fresh-incarnation rebuild | `kuberic-runtime/src/protocol/types.rs`, `protocol/command.rs`, `protocol/validation.rs`, `kuberic-controller/src/evaluator.rs` and its transition modules, `kuberic-controller/src/plan.rs` |
+| Phase 6 | Drive the real preview through evaluator, executor and reconciler; consume only public progress/completion; prove failover, swap, build, replacement and restart without direct test-only runtime commands | `kuberic-controller/src/evaluator.rs`, `executor.rs`, `reconciler.rs`, `cluster_api.rs`, controller protocol/model/integration tests |
+| Phase 7 | Build and validate the replacement-only controller artifact, own signing keys and cutover Lease, revoke legacy command/signing/RBAC authority and activate in a fresh namespace/resource UID | `kuberic-controller/src/crd.rs`, `cluster_api.rs`, deployment/RBAC manifests and cutover/live tests |
+
+The controller must not learn Replicator-private ACK sets, copy boundaries or
+queue positions. Its new state is limited to agent/controller policy:
+`HistoryContext`, data-loss authorization, process/incarnation identity,
+configuration/epoch lineage, signed authorization, durable public-operation
+completion and cutover generation.
 
 ### Phase 0: Extract Custom-Authority Operation Ownership
 
@@ -767,6 +786,9 @@ Planned work:
 - make transient fault revoke access and request restart/drop of the exact
   incarnation; normalize a child graceful-close failure after successful abort
   containment while retaining its diagnostic error;
+- update controller evaluator/executor fault handling so transient fault is not
+  healthy: persisted replicas plan an exact-incarnation restart, volatile
+  replicas plan drop/replacement, and both remain access-closed;
 - define operation-specific duplicate/replay behavior for a crash after public
   callback success but before durable applied/completed persistence;
 - build one strict trace Replicator/provider harness that rejects pre-primary
@@ -795,6 +817,8 @@ Exit criteria:
   callbacks within a bounded test deadline;
 - service-address publication, transient restart/drop and contained-close
   outcomes are observable and durable;
+- controller-driven transient-fault tests prove exact persisted restart and
+  volatile drop/replacement rather than diagnostic-only reporting;
 - no new-protocol lifecycle recipe is activated against the legacy production
   protocol or persisted state;
 - no broad legacy lock, generation or source-layout cleanup is required to
@@ -883,6 +907,22 @@ Planned work:
   disposition matrix, adding cases without deferring ownership or activation
   gates.
 
+Controller deliverables:
+
+- protocol and CRD/status schemas carry protocol generation,
+  `HistoryContext`, typed `DataLossRecovery`, process/incarnation identity,
+  signed-authorization digests and exact public-operation completion;
+- evaluator policy rejects incomparable histories, selects provisional
+  primaries without granting serving readiness, requires higher-epoch renewal
+  for every replacement process session, and chooses rebuild versus authorized
+  data-loss recovery explicitly;
+- executor/reconciler deliver exact fenced commands and signed values, never
+  infer success from Kubernetes object existence, and retain no dependency on
+  verified/quorum/committed/build-boundary report fields;
+- controller tests exercise evaluator-to-executor behavior for failover,
+  switchover, scale, build, data loss, replacement, delayed reports and
+  predecessor sessions using the new protocol types.
+
 Exit criteria:
 
 - the runtime and controller require no evidence unavailable through public
@@ -911,6 +951,10 @@ Exit criteria:
   before public role/epoch calls, validates signed build authorization instead
   of idle-target configuration membership, and declares a supported data-loss
   replay disposition before it is eligible for cutover;
+- controller evaluator/executor tests prove incompatible histories are never
+  ranked, private progress fields are neither read nor emitted, and every
+  rebuild/data-loss/session-renewal decision produces the exact typed command
+  required by the public oracle;
 - none of the Phase 5 protocol, report, durable-outcome or store formats is
   activated against the legacy production engine.
 
@@ -955,6 +999,9 @@ Planned work:
 - run exactly the same Phase 5 conformance oracle against the public/custom
   trace implementation and the built-in preview; no built-in-only receipt or
   observation may satisfy an oracle assertion.
+- run preview failover, switchover, process replacement, data loss, build and
+  corrective rebuild through the real controller evaluator, executor and
+  reconciler rather than direct test-only runtime commands.
 
 Exit criteria:
 
@@ -972,6 +1019,8 @@ Exit criteria:
   acceptance suite passes;
 - hosted preview tests prove endpoint ownership, failed-Open cleanup, immutable
   selection and unchanged production manifests.
+- controller-driven preview tests prove the same outcomes as the direct public
+  oracle and cannot observe or consume engine-private evidence.
 
 ### Phase 7: Finalize the Replacement-Only Release and Cut Over
 
@@ -998,6 +1047,9 @@ Planned work:
 - validate the exact replacement-only artifact from empty controller, agent
   and application state before deployment; record its immutable digest with
   every KSF gate result and pin that digest in the cutover manifest;
+- include the replacement controller, protocol/CRD schema, signing-key
+  provisioning, RBAC and Lease manifests in that same digest-pinned release
+  evidence;
 - require an explicit irreversible-cutover approval recording that required
   application-level exports completed or that no old data is retained;
 - disable every application, acquire an exclusive cutover Lease, terminate all
@@ -1028,6 +1080,8 @@ Exit criteria:
   capability;
 - every deployment activates only from fresh storage;
 - controller status contains only the fresh protocol/history generation;
+- the replacement controller's evaluator/executor/report schema contains no
+  legacy/private progress field or old protocol branch;
 - delayed legacy reconciliation or commands are rejected by lease, resource
   UID, protocol generation and credential fences;
 - delayed namespaced Kubernetes mutations remain confined to the quarantined
@@ -1144,24 +1198,24 @@ Exit criteria:
 This mapping is part of the plan, not a Phase 5 deliverable. Phase 5 may add
 more cases but cannot weaken or defer these gates.
 
-| Finding | Owning phase(s) | Named public-observable gate | Required result before activation |
-|---|---|---|---|
-| KSF-01 | 4 | `primary_configuration_follows_primary_role` | Strict Replicator never observes primary configuration before successful primary role |
-| KSF-02 | 4-6 | `authorized_data_loss_false_true_error_ambiguity` | Logical authorization drives callback before configuration/access; crash renewal is session-fenced and cannot weaken the captured replay disposition |
-| KSF-03 | 4 | `same_role_secondary_receives_new_epoch` | Secondary fences the predecessor epoch without requiring a role change |
-| KSF-04 | 5 | `configuration_contains_only_remote_active_members` | Local/idle targets absent, progress meanings exact, successor designated and active peer handshake carries signed configuration-derived proof |
-| KSF-05 | 5 | `build_uses_invalid_target_progress_and_signed_authorization` | Empty target receives unknown progress and validates the exact signed attempt |
-| KSF-06 | 4 | `build_is_cancelled_and_drained_before_remove` | Exact build future terminates before removal and cannot recreate resources |
-| KSF-07 | 4-6 | `swap_uses_captured_specific_quorum_capability` | Ordering is wait/revoke/epoch/config/wait; Write includes successor when supported, otherwise explicit All |
-| KSF-08 | 5-6 | `progress_is_role_correct_and_history_scoped` | Primary exposes committed progress; incomparable histories are never ranked; exact build admits a new PVC incarnation into the source lineage |
-| KSF-09 | 7 | `replacement_bundle_has_no_managed_capability` | Replacement-only artifact cannot attach/discover any private capability |
-| KSF-10 | 6-7 | `replicator_open_owns_endpoint_lifetime` | One listener exists only after successful Open and stops on Close/Abort; dispatcher absent at activation |
-| KSF-11 | 4 | `role_address_is_published_and_cleared` | Exact successful role completion controls the visible service address |
-| KSF-12 | 4 | `supersession_cancels_and_drains_public_callbacks` | New authority/Close/Abort progresses within a bound and stale work cannot mutate externally |
-| KSF-13 | 4 | `transient_fault_restarts_or_drops_exact_incarnation` | Access closes immediately and the exact persisted/volatile incarnation is restarted/dropped |
-| KSF-14 | 4 | `contained_close_failure_completes_outer_close` | Failed child is aborted, teardown completes, outer close succeeds and diagnostics retain the child error |
-| KSF-15 | 4-5 | `callback_replay_follows_declared_disposition` | Each crash cut converges by exact replay, reconciliation or declared replacement; no universal exactly-once claim |
-| KSF-16 | 7 | `cutover_artifact_contains_no_legacy_continuation_owner` | No legacy engine/store/selection/dispatcher is compiled or reachable before traffic |
+| Finding | Owning phase(s) | Component owner(s) | Named public-observable gate | Required result before activation |
+|---|---|---|---|---|
+| KSF-01 | 4 | Agent/Runtime | `primary_configuration_follows_primary_role` | Strict Replicator never observes primary configuration before successful primary role |
+| KSF-02 | 4-6 | Controller, Agent/Runtime, Replicator, Provider | `authorized_data_loss_false_true_error_ambiguity` | Logical authorization drives callback before configuration/access; crash renewal is session-fenced and cannot weaken the captured replay disposition |
+| KSF-03 | 4 | Controller, Agent/Runtime, Replicator | `same_role_secondary_receives_new_epoch` | Secondary fences the predecessor epoch without requiring a role change |
+| KSF-04 | 5 | Controller, Agent/Runtime, Replicator | `configuration_contains_only_remote_active_members` | Local/idle targets absent, progress meanings exact, successor designated and active peer handshake carries signed configuration-derived proof |
+| KSF-05 | 5 | Controller, Agent/Runtime, Replicator | `build_uses_invalid_target_progress_and_signed_authorization` | Empty target receives unknown progress and validates the exact signed attempt |
+| KSF-06 | 4 | Agent/Runtime, Replicator | `build_is_cancelled_and_drained_before_remove` | Exact build future terminates before removal and cannot recreate resources |
+| KSF-07 | 4-6 | Controller, Agent/Runtime, Replicator | `swap_uses_captured_specific_quorum_capability` | Ordering is wait/revoke/epoch/config/wait; Write includes successor when supported, otherwise explicit All |
+| KSF-08 | 5-6 | Controller, Agent/Runtime, Replicator, Provider | `progress_is_role_correct_and_history_scoped` | Primary exposes committed progress; incomparable histories are never ranked; exact build admits a new PVC incarnation into the source lineage |
+| KSF-09 | 7 | Agent/Runtime, Replicator | `replacement_bundle_has_no_managed_capability` | Replacement-only artifact cannot attach/discover any private capability |
+| KSF-10 | 6-7 | Agent/Runtime, Replicator | `replicator_open_owns_endpoint_lifetime` | One listener exists only after successful Open and stops on Close/Abort; dispatcher absent at activation |
+| KSF-11 | 4 | Agent/Runtime, Application | `role_address_is_published_and_cleared` | Exact successful role completion controls the visible service address |
+| KSF-12 | 4 | Agent/Runtime | `supersession_cancels_and_drains_public_callbacks` | New authority/Close/Abort progresses within a bound and stale work cannot mutate externally |
+| KSF-13 | 4 | Controller, Agent/Runtime | `transient_fault_restarts_or_drops_exact_incarnation` | Access closes immediately and the exact persisted/volatile incarnation is restarted/dropped |
+| KSF-14 | 4 | Agent/Runtime | `contained_close_failure_completes_outer_close` | Failed child is aborted, teardown completes, outer close succeeds and diagnostics retain the child error |
+| KSF-15 | 4-5 | Agent/Runtime, Replicator, Provider/Application | `callback_replay_follows_declared_disposition` | Each crash cut converges by exact replay, reconciliation or declared replacement; no universal exactly-once claim |
+| KSF-16 | 7 | Controller, Agent/Runtime, Replicator, Release | `cutover_artifact_contains_no_legacy_continuation_owner` | No legacy engine/store/selection/dispatcher is compiled or reachable before traffic |
 
 ## Guarantees to Preserve
 
