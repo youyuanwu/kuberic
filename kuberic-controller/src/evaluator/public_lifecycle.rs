@@ -3,9 +3,11 @@
 use k8s_openapi::api::core::v1::Service;
 use kuberic_runtime::protocol::public_operations::{
     PossibleDataLossIntent, PublicLifecycleInput, PublicLifecycleReport, PublicOperationClass,
-    PublicOperationIntent, ServiceLocation,
+    PublicOperationIntent, ServiceLocation, service_location_address_digest,
 };
-use kuberic_runtime::protocol::types::{OperationId, ProcessSessionId};
+use kuberic_runtime::protocol::types::{
+    OperationId, ProcessSessionId, ReplicaIdentity, ResourceUid,
+};
 use serde::{Deserialize, Serialize};
 
 use super::test_bridge::PublicOperationPreviewEvaluationConfig;
@@ -44,6 +46,13 @@ pub fn plan_public_lifecycle(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceLocationProjection {
     pub authority: PublicOperationIntent,
+    pub resource_uid: ResourceUid,
+    pub primary: ReplicaIdentity,
+    pub process_session_id: ProcessSessionId,
+    pub revision: u64,
+    pub address_digest: String,
+    pub service_uid: String,
+    pub service_resource_version: String,
     pub location: Option<ServiceLocation>,
 }
 
@@ -65,7 +74,6 @@ pub enum PreviewServiceLocationPlan {
     PersistStatus {
         expected: PreviewAcceptedStatus,
         next: PreviewAcceptedStatus,
-        service_evidence: Option<(String, String)>,
     },
     WriteService {
         expected_status: PreviewAcceptedStatus,
@@ -78,6 +86,7 @@ pub enum PreviewServiceLocationPlan {
 
 pub fn evaluate_service_location(
     config: &PublicOperationPreviewEvaluationConfig,
+    resource_uid: &ResourceUid,
     authority: &PublicOperationIntent,
     report: Option<&PublicLifecycleReport>,
     status: &PreviewAcceptedStatus,
@@ -85,13 +94,30 @@ pub fn evaluate_service_location(
 ) -> Result<PreviewServiceLocationPlan, String> {
     config.validate_identity(&authority.preview)?;
     authority.validate()?;
+    if let Some(report) = report
+        && &report.resource_uid != resource_uid
+    {
+        return Err("service-location report resource UID mismatch".into());
+    }
+    let service_uid = service
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.is_empty())
+        .ok_or("Service UID required")?;
+    let service_resource_version = service
+        .metadata
+        .resource_version
+        .clone()
+        .filter(|version| !version.is_empty())
+        .ok_or("Service resourceVersion required")?;
     let existing = match &status.service_location_projection {
         PreviewServiceLocationStage::None => None,
         PreviewServiceLocationStage::Pending(projection)
         | PreviewServiceLocationStage::Published(projection) => Some(projection),
     };
     if let Some(existing) = existing {
-        config.validate_identity(&existing.authority.preview)?;
+        validate_projection(config, existing)?;
         if existing.authority.revision > authority.revision
             || (existing.authority.revision == authority.revision
                 && existing.authority != *authority)
@@ -100,74 +126,123 @@ pub fn evaluate_service_location(
         }
     }
     let location = crate::normalize::normalize_public_service_location(config, authority, report)?;
+    if let Some(existing) = existing
+        && existing.authority == *authority
+        && existing.location.is_none()
+        && location.is_some()
+    {
+        return Err("cleared service-location authority cannot be republished".into());
+    }
+    let primary = authority
+        .lifecycle
+        .as_ref()
+        .map(|input| input.replica.clone())
+        .or_else(|| existing.map(|projection| projection.primary.clone()))
+        .or_else(|| report.map(|report| report.replica.clone()))
+        .ok_or("service-location projection requires primary identity")?;
     let desired = ServiceLocationProjection {
         authority: authority.clone(),
+        resource_uid: resource_uid.clone(),
+        primary,
+        process_session_id: authority.process_session_id.clone(),
+        revision: authority.revision,
+        address_digest: service_location_address_digest(location.as_ref()),
+        service_uid: service_uid.clone(),
+        service_resource_version: service_resource_version.clone(),
         location,
     };
-    if existing != Some(&desired) {
+    if existing.is_none_or(|existing| !same_projection(existing, &desired)) {
         return Ok(PreviewServiceLocationPlan::PersistStatus {
             expected: status.clone(),
             next: PreviewAcceptedStatus {
                 service_location_projection: PreviewServiceLocationStage::Pending(desired),
             },
-            service_evidence: None,
         });
     }
-    if !crate::cluster_api::preview_service_matches(service, &desired) {
-        // Published status is withdrawn before repairing any routing drift.
-        if matches!(
-            status.service_location_projection,
-            PreviewServiceLocationStage::Published(_)
-        ) {
+    let existing = existing.expect("projection exists after semantic match");
+    if matches!(
+        status.service_location_projection,
+        PreviewServiceLocationStage::Published(_)
+    ) {
+        if !crate::cluster_api::preview_service_matches(service, &desired)
+            || existing.service_uid != service_uid
+            || existing.service_resource_version != service_resource_version
+        {
             return Ok(PreviewServiceLocationPlan::PersistStatus {
                 expected: status.clone(),
                 next: PreviewAcceptedStatus {
                     service_location_projection: PreviewServiceLocationStage::Pending(desired),
                 },
-                service_evidence: None,
+            });
+        }
+        return Ok(PreviewServiceLocationPlan::Stable);
+    }
+    if !crate::cluster_api::preview_service_matches(service, &desired) {
+        if existing.service_uid != service_uid
+            || existing.service_resource_version != service_resource_version
+        {
+            return Ok(PreviewServiceLocationPlan::PersistStatus {
+                expected: status.clone(),
+                next: PreviewAcceptedStatus {
+                    service_location_projection: PreviewServiceLocationStage::Pending(desired),
+                },
             });
         }
         return Ok(PreviewServiceLocationPlan::WriteService {
             expected_status: status.clone(),
-            expected_uid: service
-                .metadata
-                .uid
-                .clone()
-                .filter(|uid| !uid.is_empty())
-                .ok_or("Service UID required")?,
-            expected_version: service
-                .metadata
-                .resource_version
-                .clone()
-                .filter(|rv| !rv.is_empty())
-                .ok_or("Service resourceVersion required")?,
-            projection: desired,
+            expected_uid: existing.service_uid.clone(),
+            expected_version: existing.service_resource_version.clone(),
+            projection: existing.clone(),
         });
     }
-    if matches!(
-        status.service_location_projection,
-        PreviewServiceLocationStage::Pending(_)
-    ) {
-        return Ok(PreviewServiceLocationPlan::PersistStatus {
-            expected: status.clone(),
-            next: PreviewAcceptedStatus {
-                service_location_projection: PreviewServiceLocationStage::Published(desired),
-            },
-            service_evidence: Some((
-                service
-                    .metadata
-                    .uid
-                    .clone()
-                    .filter(|uid| !uid.is_empty())
-                    .ok_or("Service UID required")?,
-                service
-                    .metadata
-                    .resource_version
-                    .clone()
-                    .filter(|rv| !rv.is_empty())
-                    .ok_or("Service resourceVersion required")?,
-            )),
-        });
+    Ok(PreviewServiceLocationPlan::PersistStatus {
+        expected: status.clone(),
+        next: PreviewAcceptedStatus {
+            service_location_projection: PreviewServiceLocationStage::Published(desired),
+        },
+    })
+}
+
+fn validate_projection(
+    config: &PublicOperationPreviewEvaluationConfig,
+    projection: &ServiceLocationProjection,
+) -> Result<(), String> {
+    config.validate_identity(&projection.authority.preview)?;
+    projection.authority.validate()?;
+    if projection
+        .authority
+        .lifecycle
+        .as_ref()
+        .is_some_and(|input| projection.primary != input.replica)
+        || (projection.authority.lifecycle.is_none() && !projection.authority.class.is_terminal())
+        || projection.process_session_id != projection.authority.process_session_id
+        || projection.revision != projection.authority.revision
+        || projection.address_digest
+            != service_location_address_digest(projection.location.as_ref())
+        || projection.service_uid.is_empty()
+        || projection.service_resource_version.is_empty()
+        || projection.location.as_ref().is_some_and(|location| {
+            location.resource_uid != projection.resource_uid
+                || location.replica != projection.primary
+                || location.process_session_id != projection.process_session_id
+                || location.revision != projection.revision
+        })
+    {
+        return Err("invalid service-location projection fence".into());
     }
-    Ok(PreviewServiceLocationPlan::Stable)
+    Ok(())
+}
+
+fn same_projection(
+    existing: &ServiceLocationProjection,
+    desired: &ServiceLocationProjection,
+) -> bool {
+    existing.authority == desired.authority
+        && existing.resource_uid == desired.resource_uid
+        && existing.primary == desired.primary
+        && existing.process_session_id == desired.process_session_id
+        && existing.revision == desired.revision
+        && existing.address_digest == desired.address_digest
+        && existing.service_uid == desired.service_uid
+        && existing.location == desired.location
 }

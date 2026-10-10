@@ -140,6 +140,7 @@ fn fixture(
     .unwrap();
     let report = PublicLifecycleReport {
         preview: preview.clone(),
+        resource_uid: ResourceUid::new("resource-1"),
         replica: replica.clone(),
         process_session_id: intent.process_session_id.clone(),
         revision,
@@ -148,6 +149,7 @@ fn fixture(
         write_access: true,
         service_location: address.map(|address| ServiceLocation {
             preview,
+            resource_uid: ResourceUid::new("resource-1"),
             replica,
             process_session_id: intent.process_session_id.clone(),
             revision,
@@ -166,7 +168,15 @@ async fn plan(
     report: &PublicLifecycleReport,
 ) -> PreviewServiceLocationPlan {
     let (status, service) = api.observe_preview().await.unwrap();
-    evaluate_service_location(config, authority, Some(report), &status, &service).unwrap()
+    evaluate_service_location(
+        config,
+        &ResourceUid::new("resource-1"),
+        authority,
+        Some(report),
+        &status,
+        &service,
+    )
+    .unwrap()
 }
 
 async fn converge(
@@ -294,7 +304,15 @@ async fn public_operation_role_address_delayed_old_revision_and_resource_replace
         );
         let (status, service) = api.observe_preview().await.unwrap();
         assert!(
-            evaluate_service_location(&config, &old, Some(&old_report), &status, &service).is_err()
+            evaluate_service_location(
+                &config,
+                &ResourceUid::new("resource-1"),
+                &old,
+                Some(&old_report),
+                &status,
+                &service,
+            )
+            .is_err()
         );
         assert_eq!(
             plan(&api, &config, &new, &new_report).await,
@@ -347,7 +365,59 @@ async fn public_operation_role_address_closed_mixed_stale_fresh_session_reports_
     let api = Api::new();
     let (status, service) = api.observe_preview().await.unwrap();
     assert!(
-        evaluate_service_location(&config, &authority, Some(&report), &status, &service).is_err()
+        evaluate_service_location(
+            &config,
+            &ResourceUid::new("resource-1"),
+            &authority,
+            Some(&report),
+            &status,
+            &service,
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn public_operation_role_address_fresh_session_clear_fences_predecessor_replay() {
+    let (config, authority, predecessor) = fixture(1, Some("old"));
+    let api = Api::new();
+    converge(&api, &config, &authority, &predecessor).await;
+
+    let mut fresh = predecessor.clone();
+    fresh.process_session_id = ProcessSessionId::new("fresh-session");
+    fresh.service_location = None;
+    converge(&api, &config, &authority, &fresh).await;
+
+    let (status, service) = api.observe_preview().await.unwrap();
+    let PreviewServiceLocationStage::Published(projection) = &status.service_location_projection
+    else {
+        panic!("fresh-session clear was not published")
+    };
+    assert!(projection.location.is_none());
+    assert_eq!(projection.resource_uid, ResourceUid::new("resource-1"));
+    assert_eq!(projection.primary, predecessor.replica);
+    assert_eq!(projection.process_session_id, authority.process_session_id);
+    assert_eq!(projection.revision, authority.revision);
+    assert_eq!(
+        projection.address_digest,
+        service_location_address_digest(None)
+    );
+    assert_eq!(projection.service_uid, "service-1");
+    assert_eq!(
+        projection.service_resource_version,
+        service.metadata.resource_version.clone().unwrap()
+    );
+    assert!(preview_service_matches(&service, projection));
+    assert!(
+        evaluate_service_location(
+            &config,
+            &ResourceUid::new("resource-1"),
+            &authority,
+            Some(&predecessor),
+            &status,
+            &service,
+        )
+        .is_err()
     );
 }
 

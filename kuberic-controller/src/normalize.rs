@@ -49,6 +49,7 @@ pub(crate) fn normalize_public_service_location(
         return Ok(None);
     };
     if location.preview != authority.preview
+        || location.resource_uid != report.resource_uid
         || location.replica != input.replica
         || location.process_session_id != authority.process_session_id
         || location.revision != authority.revision

@@ -782,6 +782,7 @@ public-path hidden field crate::protocol::public_operations::PublicLifecycleRepo
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::preview: PublicOperationPreviewIdentity
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::replica: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::revision: u64
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::role: ReplicaRole
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::service_location: Option < ServiceLocation >
@@ -801,7 +802,9 @@ public-path hidden field crate::protocol::public_operations::ServiceLocation::op
 public-path hidden field crate::protocol::public_operations::ServiceLocation::preview: PublicOperationPreviewIdentity
 public-path hidden field crate::protocol::public_operations::ServiceLocation::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::ServiceLocation::replica: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::ServiceLocation::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::ServiceLocation::revision: u64
+public-path hidden fn crate::protocol::public_operations::fn service_location_address_digest (location : Option < & ServiceLocation >) -> String
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn digest (& self) -> String
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicOperationClass::fn is_terminal (& self) -> bool

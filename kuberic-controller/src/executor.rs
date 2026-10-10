@@ -16,21 +16,16 @@ pub async fn execute_preview_service_location(
     use crate::evaluator::test_bridge::PreviewServiceLocationPlan;
     match plan {
         PreviewServiceLocationPlan::Stable => Ok(()),
-        PreviewServiceLocationPlan::PersistStatus {
-            expected,
-            next,
-            service_evidence,
-        } => {
+        PreviewServiceLocationPlan::PersistStatus { expected, next } => {
             if let crate::evaluator::test_bridge::PreviewServiceLocationStage::Published(
                 projection,
             ) = &next.service_location_projection
             {
                 let (status, service) = api.observe_preview().await?;
                 if status != expected
-                    || service_evidence.as_ref().is_none_or(|(uid, version)| {
-                        service.metadata.uid.as_ref() != Some(uid)
-                            || service.metadata.resource_version.as_ref() != Some(version)
-                    })
+                    || service.metadata.uid.as_ref() != Some(&projection.service_uid)
+                    || service.metadata.resource_version.as_ref()
+                        != Some(&projection.service_resource_version)
                     || !crate::cluster_api::preview_service_matches(&service, projection)
                 {
                     return Err("stale service-location publication".into());

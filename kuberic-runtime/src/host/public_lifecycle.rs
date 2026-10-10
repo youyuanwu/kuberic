@@ -27,7 +27,7 @@ pub(crate) struct PublicLifecycleCallbacks {
 pub(crate) fn instructions(input: &PublicLifecycleInput) -> Vec<PublicInstruction> {
     use PublicInstruction::*;
     if input.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
-        return vec![Epoch, Access];
+        return vec![Epoch];
     }
     let mut result = vec![ReplicatorPrimary];
     if input.recipe == PublicLifecycleRecipe::FailoverPromotion {
@@ -168,6 +168,7 @@ pub(crate) async fn report(
         .and_then(|id| preview.operations.get(id));
     let mut report = PublicLifecycleReport {
         preview: identity.clone(),
+        resource_uid: state.identity.resource_uid.clone(),
         replica: state.identity.local_identity,
         process_session_id: session.clone(),
         revision: preview
@@ -208,6 +209,7 @@ pub(crate) async fn report(
             if let PublicInstructionOutcome::ApplicationRole(Some(address)) = outcome {
                 Some(ServiceLocation {
                     preview: identity.clone(),
+                    resource_uid: state.identity.resource_uid.clone(),
                     operation_id: record.intent.operation_id.clone(),
                     replica: report.replica.clone(),
                     process_session_id: session.clone(),

@@ -220,6 +220,12 @@ async fn exact_initial_failover_and_secondary_recipes() {
             Some(PublicOperationDisposition::Succeeded)
         );
         assert_eq!(fixture.begins(), expected, "{recipe:?}");
+        if recipe == SecondaryEpochAdvance {
+            assert_eq!(
+                result.lifecycle.outcomes,
+                vec![PublicInstructionOutcome::Done]
+            );
+        }
         fixture.run(command.clone()).await;
         assert_eq!(
             fixture.begins(),
@@ -616,6 +622,7 @@ async fn public_operation_role_address_terminal_fencing_does_not_wait_for_kubern
         assert!(!closed.write_access && closed.service_location.is_none());
         let plan = evaluate_service_location(
             &fixture.config(),
+            &wire(ResourceUid::new("resource-1")),
             &wire(&terminal),
             Some(&wire(&closed)),
             &status,
@@ -745,6 +752,7 @@ fn converge(
     for _ in 0..5 {
         match evaluate_service_location(
             &fixture.config(),
+            &wire(ResourceUid::new("resource-1")),
             &wire(authority),
             Some(&wire(report)),
             status,

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::{
     ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaId, ReplicaIdentity,
-    ReplicaRole,
+    ReplicaRole, ResourceUid,
 };
 
 pub const PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32 = 10;
@@ -200,6 +200,7 @@ impl PublicLifecycleInput {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceLocation {
     pub preview: PublicOperationPreviewIdentity,
+    pub resource_uid: ResourceUid,
     pub operation_id: OperationId,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
@@ -212,6 +213,7 @@ pub struct ServiceLocation {
 #[serde(rename_all = "camelCase")]
 pub struct PublicLifecycleReport {
     pub preview: PublicOperationPreviewIdentity,
+    pub resource_uid: ResourceUid,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
     pub revision: u64,
@@ -219,4 +221,22 @@ pub struct PublicLifecycleReport {
     pub role: ReplicaRole,
     pub write_access: bool,
     pub service_location: Option<ServiceLocation>,
+}
+
+pub fn service_location_address_digest(location: Option<&ServiceLocation>) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    match location {
+        Some(location) => {
+            hasher.update(b"some:");
+            hasher.update(location.address.len().to_le_bytes());
+            hasher.update(location.address.as_bytes());
+        }
+        None => hasher.update(b"none"),
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
