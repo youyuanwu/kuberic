@@ -14,6 +14,9 @@ use crate::effects::{
 };
 use crate::error::{ContractError, ContractResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
+#[cfg(any(test, feature = "testing"))]
+use crate::protocol::public_operations::PublicOperationIntent;
+use crate::protocol::public_operations::PublicOperationPreviewIdentity;
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaIdentity,
     ReplicaRole, SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
@@ -25,8 +28,13 @@ use crate::host::Result;
 use crate::host::command::is_access_only_configuration;
 use crate::host::state::{
     AgentState, CoordinatorStage, DeactivationState, EffectStage, PendingEffect,
-    ReconfigurationRecord, RetainedCommandResult, RetainedResult, SCHEMA_VERSION, StorageIdentity,
+    PublicOperationPreviewState, ReconfigurationRecord, RetainedCommandResult, RetainedResult,
+    SCHEMA_VERSION, StorageIdentity,
 };
+#[cfg(any(test, feature = "testing"))]
+use crate::host::state::{PublicOperationDisposition, PublicOperationRecord, PublicOperationStage};
+#[cfg(any(test, feature = "testing"))]
+use crate::host::store::BeginPublicOperation;
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
 
 fn switchover_receipt_matches(
@@ -151,6 +159,35 @@ impl SqliteStore {
     }
 
     pub(crate) fn create_authorized(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
+        if state.public_operation_preview.is_some() {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "legacy store creation cannot contain public-operation preview state".into(),
+            ));
+        }
+        Self::create_store(path, state)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_preview_authorized(
+        path: impl AsRef<Path>,
+        mut state: AgentState,
+        preview: PublicOperationPreviewIdentity,
+    ) -> Result<Self> {
+        if !preview.is_valid() {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "invalid public-operation preview identity".into(),
+            ));
+        }
+        if state.public_operation_preview.is_some() {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "public-operation preview state is already initialized".into(),
+            ));
+        }
+        state.public_operation_preview = Some(PublicOperationPreviewState::new(preview));
+        Self::create_store(path, state)
+    }
+
+    fn create_store(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if state.identity.schema_version != SCHEMA_VERSION {
             return Err(crate::host::HostError::SchemaMismatch {
@@ -207,6 +244,11 @@ impl SqliteStore {
             });
         }
         let state = load_state_from_connection(&connection)?;
+        if state.public_operation_preview.is_some() {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "legacy store opener rejected public-operation preview state".into(),
+            ));
+        }
         if state.identity.schema_version != version {
             return Err(crate::host::HostError::SchemaMismatch {
                 expected: version,
@@ -219,6 +261,69 @@ impl SqliteStore {
             return Err(crate::host::HostError::IdentityMismatch(
                 "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
                     .into(),
+            ));
+        }
+        Ok(Self {
+            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+            path,
+            connection: Mutex::new(connection),
+            #[cfg(all(test, feature = "testing"))]
+            authority_admission_failure: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_preview_existing(
+        path: impl AsRef<Path>,
+        expected_identity: Option<&StorageIdentity>,
+        expected_preview: &PublicOperationPreviewIdentity,
+    ) -> Result<Self> {
+        if !expected_preview.is_valid() {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "invalid public-operation preview identity".into(),
+            ));
+        }
+        let path = path.as_ref().to_path_buf();
+        if !path.is_file() {
+            return Err(crate::host::HostError::MissingEstablishedStore);
+        }
+        let connection = open_connection(&path).map_err(|error| {
+            crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
+        })?;
+        configure_durability(&connection)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        validate_integrity(&connection)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(crate::host::HostError::SchemaMismatch {
+                expected: SCHEMA_VERSION,
+                observed: version,
+            });
+        }
+        let state = load_state_from_connection(&connection)?;
+        if state.identity.schema_version != version {
+            return Err(crate::host::HostError::SchemaMismatch {
+                expected: version,
+                observed: state.identity.schema_version,
+            });
+        }
+        if let Some(expected) = expected_identity
+            && &state.identity != expected
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
+                    .into(),
+            ));
+        }
+        let Some(preview) = &state.public_operation_preview else {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "public-operation preview opener rejected legacy state".into(),
+            ));
+        };
+        if &preview.identity != expected_preview {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "public-operation preview identity changed".into(),
             ));
         }
         Ok(Self {
@@ -1445,6 +1550,183 @@ impl AgentStore for SqliteStore {
             write_agent_state(transaction, &state)
         })
     }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn begin_public_operation(
+        &self,
+        intent: &PublicOperationIntent,
+        blockers: &[OperationId],
+    ) -> Result<BeginPublicOperation> {
+        intent
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.to_string()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-operation preview is not enabled for this store".into(),
+                )
+            })?;
+            if preview.identity != intent.preview {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-operation preview identity changed".into(),
+                ));
+            }
+            if let Some(existing) = preview.operations.get(&intent.operation_id) {
+                if &existing.intent != intent {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "public-operation ID was reused with changed input".into(),
+                    ));
+                }
+                return Ok(match existing.stage {
+                    PublicOperationStage::WaitingForContainment => {
+                        BeginPublicOperation::Waiting(existing.clone())
+                    }
+                    PublicOperationStage::Ready | PublicOperationStage::Running => {
+                        BeginPublicOperation::Pending(existing.clone())
+                    }
+                    PublicOperationStage::ContainmentPending => {
+                        BeginPublicOperation::Waiting(existing.clone())
+                    }
+                    PublicOperationStage::Completed => {
+                        BeginPublicOperation::Completed(existing.clone())
+                    }
+                });
+            }
+
+            let mut exact_blockers = std::collections::BTreeSet::new();
+            for blocker in blockers {
+                if blocker == &intent.operation_id {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "public operation cannot block on itself".into(),
+                    ));
+                }
+                let Some(record) = preview.operations.get(blocker) else {
+                    return Err(crate::host::HostError::CommandRejected(format!(
+                        "public-operation blocker {blocker} is unknown"
+                    )));
+                };
+                if record.stage != PublicOperationStage::Completed {
+                    exact_blockers.insert(blocker.clone());
+                }
+            }
+            let stage = if exact_blockers.is_empty() {
+                PublicOperationStage::Ready
+            } else {
+                PublicOperationStage::WaitingForContainment
+            };
+            let record = PublicOperationRecord {
+                intent: intent.clone(),
+                stage,
+                disposition: None,
+                blockers: exact_blockers,
+            };
+            preview
+                .operations
+                .insert(intent.operation_id.clone(), record.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(if stage == PublicOperationStage::Ready {
+                BeginPublicOperation::Ready(record)
+            } else {
+                BeginPublicOperation::Waiting(record)
+            })
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn advance_public_operation(
+        &self,
+        operation_id: &OperationId,
+        expected: PublicOperationStage,
+        next: PublicOperationStage,
+        disposition: Option<PublicOperationDisposition>,
+    ) -> Result<PublicOperationRecord> {
+        self.with_transaction(|transaction| {
+            if !valid_public_operation_transition(expected, next) {
+                return Err(crate::host::HostError::CommandRejected(format!(
+                    "invalid public-operation stage transition {expected:?} -> {next:?}"
+                )));
+            }
+            if next == PublicOperationStage::Completed && disposition.is_none() {
+                return Err(crate::host::HostError::CommandRejected(
+                    "completed public operation requires a disposition".into(),
+                ));
+            }
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-operation preview is not enabled for this store".into(),
+                )
+            })?;
+            let record = preview.operations.get_mut(operation_id).ok_or_else(|| {
+                crate::host::HostError::CommandRejected(format!(
+                    "public operation {operation_id} is unknown"
+                ))
+            })?;
+            if record.stage != expected {
+                return Err(crate::host::HostError::StaleEffectCompletion(format!(
+                    "public operation {operation_id} is at {:?}, expected {expected:?}",
+                    record.stage
+                )));
+            }
+            record.stage = next;
+            record.disposition = disposition;
+            if next == PublicOperationStage::Ready {
+                record.blockers.clear();
+            }
+            let result = record.clone();
+            write_agent_state(transaction, &state)?;
+            Ok(result)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_operation_records(&self) -> Result<Vec<PublicOperationRecord>> {
+        let state = self.load_state().await?;
+        let preview = state.public_operation_preview.ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "public-operation preview is not enabled for this store".into(),
+            )
+        })?;
+        Ok(preview.operations.into_values().collect())
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn valid_public_operation_transition(
+    expected: PublicOperationStage,
+    next: PublicOperationStage,
+) -> bool {
+    matches!(
+        (expected, next),
+        (
+            PublicOperationStage::WaitingForContainment,
+            PublicOperationStage::Ready
+        ) | (
+            PublicOperationStage::WaitingForContainment,
+            PublicOperationStage::ContainmentPending
+        ) | (
+            PublicOperationStage::WaitingForContainment,
+            PublicOperationStage::Completed
+        ) | (PublicOperationStage::Ready, PublicOperationStage::Running)
+            | (
+                PublicOperationStage::Ready,
+                PublicOperationStage::ContainmentPending
+            )
+            | (PublicOperationStage::Ready, PublicOperationStage::Completed)
+            | (
+                PublicOperationStage::Running,
+                PublicOperationStage::ContainmentPending
+            )
+            | (
+                PublicOperationStage::Running,
+                PublicOperationStage::Completed
+            )
+            | (
+                PublicOperationStage::ContainmentPending,
+                PublicOperationStage::Completed
+            )
+    )
 }
 
 fn validate_acceptance_conversion(

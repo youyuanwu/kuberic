@@ -5,10 +5,30 @@ use kuberic_runtime::protocol::observation::{
     ReplicaObservationKey, ReportWatermark, RoutingObservation,
     SecondaryScaleDownResourceObservation,
 };
+use kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity;
 use kuberic_runtime::protocol::types::{AcceptedStatus, ResourceUid};
 use serde::Deserialize;
 
 use super::EvaluationConfig;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicOperationPreviewEvaluationConfig {
+    pub identity: PublicOperationPreviewIdentity,
+    pub evaluation: EvaluationConfig,
+}
+
+impl PublicOperationPreviewEvaluationConfig {
+    pub fn new(identity: PublicOperationPreviewIdentity, evaluation: EvaluationConfig) -> Self {
+        assert!(
+            identity.is_valid(),
+            "public-operation preview identity must be valid"
+        );
+        Self {
+            identity,
+            evaluation,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,4 +73,23 @@ impl From<SnapshotBridge> for ObservationSnapshot {
 pub fn evaluate_json(snapshot: &[u8], config: &EvaluationConfig) -> serde_json::Result<Vec<u8>> {
     let snapshot: SnapshotBridge = serde_json::from_slice(snapshot)?;
     serde_json::to_vec(&super::evaluate(&snapshot.into(), config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_configuration_retains_the_exact_identity() {
+        let identity = PublicOperationPreviewIdentity::new(11);
+        let config = PublicOperationPreviewEvaluationConfig::new(
+            identity.clone(),
+            EvaluationConfig::default(),
+        );
+        assert_eq!(config.identity, identity);
+        assert_eq!(
+            config.evaluation.supported_protocol_version,
+            kuberic_runtime::protocol::PROTOCOL_VERSION
+        );
+    }
 }

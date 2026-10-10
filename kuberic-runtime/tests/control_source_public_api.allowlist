@@ -768,3 +768,28 @@ public-path documented variant crate::protocol::validation::ValidationError::Uni
 public-path documented variant crate::protocol::validation::ValidationError::UninitializedScaffoldingMismatch
 public-path documented variant crate::protocol::validation::ValidationError::UnrelatedReplicaClaimsAuthority((i64))
 public-path documented variant crate::protocol::validation::ValidationError::WriteQuorumMismatch { { actual : u32 , expected : u32 } }
+public-path hidden const crate::protocol::public_operations::PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32
+public-path hidden enum crate::protocol::public_operations::PublicOperationClass
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::class: PublicOperationClass
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::input_digest: String
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::preview: PublicOperationPreviewIdentity
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::process_session_id: ProcessSessionId
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::revision: u64
+public-path hidden field crate::protocol::public_operations::PublicOperationPreviewIdentity::generation: u64
+public-path hidden field crate::protocol::public_operations::PublicOperationPreviewIdentity::protocol_version: u32
+public-path hidden impl crate::protocol::public_operations::PublicOperationClass::fn is_terminal (& self) -> bool
+public-path hidden impl crate::protocol::public_operations::PublicOperationIntent::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicOperationPreviewIdentity::const fn is_valid (& self) -> bool
+public-path hidden impl crate::protocol::public_operations::PublicOperationPreviewIdentity::const fn new (generation : u64) -> Self
+public-path hidden module crate::protocol::public_operations
+public-path hidden struct crate::protocol::public_operations::PublicOperationIntent
+public-path hidden struct crate::protocol::public_operations::PublicOperationPreviewIdentity
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Abort
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Authority
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Build { { target : ReplicaId } }
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Close
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::PermanentFault
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::PlannedSwap
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::Remove { { target : ReplicaId } }
+public-path hidden variant crate::protocol::public_operations::PublicOperationClass::TransientFault

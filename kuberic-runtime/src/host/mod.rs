@@ -8,6 +8,12 @@ mod error;
 #[allow(clippy::disallowed_types)]
 pub(crate) mod hosting;
 mod observation;
+#[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
+mod operation;
+#[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
+mod operation_recovery;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;

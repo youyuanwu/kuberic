@@ -6,6 +6,8 @@
 
 pub mod command;
 pub mod observation;
+#[doc(hidden)]
+pub mod public_operations;
 pub mod types;
 pub mod validation;
 

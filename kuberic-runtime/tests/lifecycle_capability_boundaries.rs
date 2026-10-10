@@ -1849,3 +1849,33 @@ fn lifecycle_capability_guard_rejects_representative_escapes() {
     let nested_view = format!("{lifecycle}\nmod nested {{ impl super::ProcessRuntime {{ fn leak(&self) -> super::BuildLifecycleRuntime {{ unreachable!() }} }} }}");
     assert_rejected(validate_module_policy(&parsed(&nested_view), allowed_aggregates(Path::new("lifecycle.rs")), true), "leak");
 }
+
+#[test]
+fn public_operation_preview_owner_stays_narrow_and_test_gated() {
+    let operation = source("src/host/operation.rs");
+    assert!(operation.contains("Arc<dyn AgentStore>"));
+    assert!(operation.contains("pub(crate) struct PartitionOperation"));
+    for forbidden in [
+        "PodRuntime",
+        "PrimaryReplicator",
+        "StateProvider",
+        "ManagedReplicatorLifecycle",
+        "pub struct PartitionOperation",
+        "pub struct PartitionOperationRegistry",
+    ] {
+        assert!(
+            !operation.contains(forbidden),
+            "public-operation owner gained forbidden capability {forbidden}"
+        );
+    }
+
+    let host_root = source("src/host/mod.rs");
+    for module in ["operation", "operation_recovery"] {
+        let marker =
+            format!("#[cfg(any(test, feature = \"testing\"))]\n#[allow(dead_code)]\nmod {module};");
+        assert!(
+            host_root.contains(&marker),
+            "{module} is not gated to test/preview builds"
+        );
+    }
+}

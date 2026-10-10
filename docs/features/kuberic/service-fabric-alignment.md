@@ -824,6 +824,16 @@ Exit criteria:
 - no broad legacy lock, generation or source-layout cleanup is required to
   finish the phase.
 
+Implementation status: Phase 4.1 is complete. The runtime now has a dormant
+preview protocol/store identity, one exact `PartitionOperationRegistry`
+admission boundary, caller-independent root-task ownership, explicit
+containment-pending state, durable operation records and a
+`PartitionOperationRecoveryOwner`. A strict public application/Replicator
+fixture and API/privacy/source guards prove ownership without changing the
+protected public method sets. Legacy protocol commands, production
+construction and legacy persisted stores cannot select or open this preview
+path. Role/epoch/data-loss/address recipes remain Phase 4.2 work.
+
 ### Phase 5: Establish Public V1 Values, Evidence and Conformance
 
 **Goal:** define the complete SF-shaped values and public completion evidence

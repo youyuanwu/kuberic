@@ -4,6 +4,7 @@ use crate::authority::{DurableBuildProgress, RetiredAuthority};
 use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
+use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationPreviewIdentity};
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
     InitializationId, LoadMetric, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaIdentity,
@@ -75,6 +76,53 @@ impl std::ops::DerefMut for RetainedResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) enum PublicOperationStage {
+    WaitingForContainment,
+    Ready,
+    Running,
+    ContainmentPending,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub(crate) enum PublicOperationDisposition {
+    Succeeded,
+    Failed(String),
+    Ambiguous(String),
+    Cancelled,
+    Contained,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicOperationRecord {
+    pub(crate) intent: PublicOperationIntent,
+    pub(crate) stage: PublicOperationStage,
+    pub(crate) disposition: Option<PublicOperationDisposition>,
+    #[serde(default)]
+    pub(crate) blockers: BTreeSet<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicOperationPreviewState {
+    pub(crate) identity: PublicOperationPreviewIdentity,
+    pub(crate) operations: BTreeMap<OperationId, PublicOperationRecord>,
+}
+
+impl PublicOperationPreviewState {
+    #[allow(dead_code)]
+    pub(crate) fn new(identity: PublicOperationPreviewIdentity) -> Self {
+        Self {
+            identity,
+            operations: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum CoordinatorStage {
     AdmitAuthority,
     FailoverPrefix,
@@ -134,6 +182,8 @@ pub(crate) struct ApplicationStorageBinding {
 pub(crate) struct AgentState {
     pub(crate) identity: StorageIdentity,
     #[serde(default)]
+    pub(crate) public_operation_preview: Option<PublicOperationPreviewState>,
+    #[serde(default)]
     pub(crate) application_storage: Option<ApplicationStorageBinding>,
     #[serde(default)]
     pub(crate) scale_up_initialization: Option<ProvisioningIntent>,
@@ -190,6 +240,7 @@ impl AgentState {
     pub(crate) fn new(identity: StorageIdentity) -> Self {
         Self {
             identity,
+            public_operation_preview: None,
             application_storage: None,
             scale_up_initialization: None,
             admitted_policy: None,
