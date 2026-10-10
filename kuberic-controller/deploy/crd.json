@@ -2678,6 +2678,11 @@
                         ],
                         "type": "string"
                       },
+                      "predecessorProcessId": {
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
                       "predecessorSession": {
                         "type": "string"
                       },
@@ -2745,6 +2750,7 @@
                       "fault",
                       "faultRevision",
                       "kind",
+                      "predecessorProcessId",
                       "predecessorSession",
                       "resources",
                       "target"

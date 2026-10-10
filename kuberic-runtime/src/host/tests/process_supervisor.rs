@@ -120,13 +120,14 @@ impl kuberic_controller::cluster_api::PreviewFaultCommandExecutor for Controller
                 "supervisor omitted successor session".into(),
             )
         })?;
-        let lifecycle = crate::host::public_lifecycle::report(
+        let mut lifecycle = crate::host::public_lifecycle::report(
             self.store.as_ref(),
             &self.binding.preview,
             &successor,
         )
         .await
         .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
+        lifecycle.process_id = result.successor.child_pid;
         let state = self
             .store
             .load_state()
@@ -254,7 +255,10 @@ fn preview_supervisor_parent_entrypoint() {
 async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
     let fixture = Fixture::new();
     let mut predecessor = fixture.spawn_predecessor().await;
-    let action = fixture.action(predecessor.evidence.process_session.clone());
+    let action = fixture.action(
+        predecessor.evidence.process_session.clone(),
+        predecessor.evidence.child_pid,
+    );
     std::fs::write(&fixture.release, b"restart").unwrap();
 
     let result = fixture
@@ -310,8 +314,9 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
     let fixture = Fixture::new();
     let predecessor = fixture.spawn_predecessor().await;
     let predecessor_session = predecessor.evidence.process_session.clone();
+    let predecessor_process_id = predecessor.evidence.child_pid;
     let api = Arc::new(InMemoryClusterApi::new(
-        fixture.controller_observation(&predecessor_session),
+        fixture.controller_observation(&predecessor_session, predecessor_process_id),
     ));
     api.set_preview_fault_executor(Arc::new(ControllerSupervisorExecutor {
         supervisor: fixture.supervisor.clone(),
@@ -383,7 +388,8 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
 #[tokio::test]
 async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_closed() {
     let fixture = Fixture::new();
-    let action = fixture.action(ProcessSessionId::new("predecessor-session"));
+    let predecessor = fixture.stopped_predecessor().await;
+    let action = fixture.action(predecessor.process_session, predecessor.child_pid);
     assert!(
         fixture
             .supervisor
@@ -406,7 +412,10 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
         fixture.store.restart_action().await.unwrap().unwrap().stage,
         RestartActionStage::Accepted
     );
-    assert!(!fixture.data_root.join("child-constructions").exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
+        "1"
+    );
 
     assert!(
         supervisor
@@ -443,12 +452,13 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert_eq!(completed.record.successor_session, Some(session));
     assert_eq!(
         std::fs::read_to_string(fixture.data_root.join("child-constructions")).unwrap(),
-        "1"
+        "2"
     );
     supervisor.shutdown_successor(&action).await.unwrap();
 
     let after_start = Fixture::new();
-    let action = after_start.action(ProcessSessionId::new("old-parent"));
+    let predecessor = after_start.stopped_predecessor().await;
+    let action = after_start.action(predecessor.process_session, predecessor.child_pid);
     let supervisor = after_start.restarted_supervisor().await;
     assert!(
         supervisor
@@ -471,7 +481,8 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     supervisor.shutdown_successor(&action).await.unwrap();
 
     let cancelled = Fixture::new();
-    let action = cancelled.action(ProcessSessionId::new("cancelled-parent"));
+    let predecessor = cancelled.stopped_predecessor().await;
+    let action = cancelled.action(predecessor.process_session, predecessor.child_pid);
     let supervisor = cancelled.restarted_supervisor_with_delay(200).await;
     assert!(
         tokio::time::timeout(
@@ -488,7 +499,7 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
     assert_eq!(completed.record.stage, RestartActionStage::SuccessorStarted);
     assert_eq!(
         std::fs::read_to_string(cancelled.data_root.join("child-constructions")).unwrap(),
-        "1"
+        "2"
     );
     supervisor.shutdown_successor(&action).await.unwrap();
 }
@@ -613,6 +624,7 @@ impl Fixture {
     fn controller_observation(
         &self,
         predecessor_session: &ProcessSessionId,
+        predecessor_process_id: u32,
     ) -> kuberic_controller::observation::RawObservation {
         use k8s_openapi::api::core::v1::{
             PersistentVolumeClaim, Pod, PodCondition, PodStatus, Service, ServicePort, ServiceSpec,
@@ -754,6 +766,7 @@ impl Fixture {
                     resource_uid: self.binding.resource_uid.clone(),
                     replica: self.identity.clone(),
                     process_session_id: predecessor_session.clone(),
+                    process_id: predecessor_process_id,
                     revision: 3,
                     operation_id: None,
                     role: ReplicaRole::None,
@@ -805,7 +818,19 @@ impl Fixture {
         panic!("predecessor child did not report");
     }
 
-    fn action(&self, predecessor_session: ProcessSessionId) -> PublicFaultAction {
+    async fn stopped_predecessor(&self) -> PreviewChildEvidence {
+        let mut predecessor = self.spawn_predecessor().await;
+        std::fs::write(&self.release, b"restart").unwrap();
+        let status = predecessor.child.wait().await.unwrap();
+        assert_eq!(status.code(), Some(PREVIEW_RESTART_DISPOSITION));
+        predecessor.evidence
+    }
+
+    fn action(
+        &self,
+        predecessor_session: ProcessSessionId,
+        predecessor_process_id: u32,
+    ) -> PublicFaultAction {
         let mut action = PublicFaultAction {
             action_id: OperationId::new("pending"),
             binding: self.binding.clone(),
@@ -820,6 +845,7 @@ impl Fixture {
                 endpoint_resource_version: "1".into(),
             },
             predecessor_session,
+            predecessor_process_id,
             fault_revision: 3,
             fault: FaultType::Transient,
             kind: PublicFaultActionKind::Restart,

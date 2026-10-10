@@ -86,6 +86,7 @@ pub struct PublicFaultAction {
     pub target: ReplicaIdentity,
     pub resources: FrozenReplicaResources,
     pub predecessor_session: ProcessSessionId,
+    pub predecessor_process_id: u32,
     pub fault_revision: u64,
     pub fault: FaultType,
     pub kind: PublicFaultActionKind,
@@ -107,7 +108,7 @@ impl PublicFaultAction {
                 "{kind:?}|{fault:?}|{persistence:?}|{resource_uid}|{protocol_version}|\
                  {preview_generation}|{spec_generation}|{replica_id}|{instance_id}|\
                  {agent_generation}|{predecessor_session}|{fault_revision}|{pod_name}|\
-                 {pod_uid}|{pvc_name}|{pvc_uid}|{endpoint_name}|{endpoint_uid}|\
+                 {predecessor_process_id}|{pod_uid}|{pvc_name}|{pvc_uid}|{endpoint_name}|{endpoint_uid}|\
                  {endpoint_resource_version}",
                 kind = self.kind,
                 fault = self.fault,
@@ -122,6 +123,7 @@ impl PublicFaultAction {
                 predecessor_session = self.predecessor_session,
                 fault_revision = self.fault_revision,
                 pod_name = self.resources.pod_name,
+                predecessor_process_id = self.predecessor_process_id,
                 pod_uid = self.resources.pod_uid,
                 pvc_name = self.resources.pvc_name,
                 pvc_uid = self.resources.pvc_uid,
@@ -144,6 +146,7 @@ impl PublicFaultAction {
         self.binding.validate()?;
         if self.action_id.is_empty()
             || self.predecessor_session.is_empty()
+            || self.predecessor_process_id == 0
             || self.fault_revision == 0
             || self.resources.pod_name.is_empty()
             || self.resources.pod_uid.is_empty()
@@ -180,6 +183,8 @@ pub struct RestartActionRecord {
     pub stage: RestartActionStage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_session: Option<ProcessSessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_process_id: Option<u32>,
 }
 
 impl PublicOperationPreviewIdentity {
@@ -534,6 +539,7 @@ pub struct PublicLifecycleReport {
     pub resource_uid: ResourceUid,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
+    pub process_id: u32,
     pub revision: u64,
     pub operation_id: Option<OperationId>,
     pub role: ReplicaRole,

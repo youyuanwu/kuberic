@@ -183,6 +183,7 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
         ) && record.action == *accepted
             && record.stage == RestartActionStage::SuccessorStarted
             && record.successor_session.as_ref() == Some(&report.process_session_id)
+            && record.successor_process_id == Some(lifecycle.process_id)
             && report.process_session_id != accepted.predecessor_session
             && kubernetes.pod_uid.as_ref() == Some(&accepted.resources.pod_uid)
             && kubernetes.pvc_uid.as_ref() == Some(&accepted.resources.pvc_uid)
@@ -268,6 +269,7 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
             endpoint_resource_version: endpoint_resource_version.clone(),
         },
         predecessor_session: report.process_session_id.clone(),
+        predecessor_process_id: lifecycle.process_id,
         fault_revision: lifecycle.revision,
         fault,
         kind,
@@ -376,8 +378,14 @@ fn validate_present_preview_reports(
     binding: &PreviewLifecycleBinding,
 ) -> Result<(), &'static str> {
     for replica in snapshot.replicas.values() {
-        let AgentObservation::Report(report) = &replica.agent else {
-            continue;
+        let report = match &replica.agent {
+            AgentObservation::Report(report) => report,
+            AgentObservation::Invalid { .. } => {
+                return Err("preview cleanup refuses invalid normalized evidence");
+            }
+            AgentObservation::Absent
+            | AgentObservation::Unreachable { .. }
+            | AgentObservation::Uninitialized(_) => continue,
         };
         if replica.kubernetes.is_none() {
             return Err("preview report has no exact Kubernetes scaffolding");

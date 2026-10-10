@@ -148,6 +148,7 @@ fn raw_fault(
             resource_uid: ResourceUid::new(RESOURCE_UID),
             replica: target.clone(),
             process_session_id: ProcessSessionId::new(PREDECESSOR_SESSION),
+            process_id: std::process::id(),
             revision: 3,
             operation_id: None,
             role: ReplicaRole::None,
@@ -321,12 +322,14 @@ async fn persisted_primary_and_secondary_faults_use_one_restart_action_across_re
             action: accepted.clone(),
             stage: RestartActionStage::SuccessorStarted,
             successor_session: Some(successor.clone()),
+            successor_process_id: Some(std::process::id()),
         }));
         report
             .public_lifecycle_report
             .as_mut()
             .unwrap()
             .process_session_id = successor;
+        report.public_lifecycle_report.as_mut().unwrap().process_id = std::process::id();
         let mut invalid_successor = observation.clone();
         invalid_successor.pvcs[0].metadata.uid = Some("changed-pvc".into());
         let RawAgentObservation::PreviewReport(invalid_report) =
@@ -429,7 +432,34 @@ async fn permanent_fault_supersedes_transient_action_without_retargeting() {
         .public_fault_action
         .unwrap();
 
-    let mut observation = api.observation().await;
+    let original = api.observation().await;
+    let stale = ProtocolCommand::RestartReplicaProcess(Box::new(
+        kuberic_runtime::protocol::command::RestartReplicaProcess {
+            action: transient.clone(),
+        },
+    ));
+    let mut changed_pvc = original.clone();
+    changed_pvc.pvcs[0].metadata.uid = Some("changed-before-dispatch".into());
+    api.set_observation(changed_pvc).await;
+    assert!(matches!(
+        api.execute_command(&api.observation().await, &stale).await,
+        Err(kuberic_controller::ControllerError::ObservationStale)
+    ));
+
+    let mut changed_revision = original.clone();
+    let RawAgentObservation::PreviewReport(report) =
+        changed_revision.agents.values_mut().next().unwrap()
+    else {
+        panic!("expected preview report");
+    };
+    report.public_lifecycle_report.as_mut().unwrap().revision += 1;
+    api.set_observation(changed_revision).await;
+    assert!(matches!(
+        api.execute_command(&api.observation().await, &stale).await,
+        Err(kuberic_controller::ControllerError::ObservationStale)
+    ));
+
+    let mut observation = original;
     let RawAgentObservation::PreviewReport(report) =
         observation.agents.values_mut().next().unwrap()
     else {
@@ -438,11 +468,6 @@ async fn permanent_fault_supersedes_transient_action_without_retargeting() {
     report.reported_fault = Some(FaultType::Permanent);
     report.report_sequence += 1;
     api.set_observation(observation).await;
-    let stale = ProtocolCommand::RestartReplicaProcess(Box::new(
-        kuberic_runtime::protocol::command::RestartReplicaProcess {
-            action: transient.clone(),
-        },
-    ));
     assert!(matches!(
         api.execute_command(&api.observation().await, &stale).await,
         Err(kuberic_controller::ControllerError::ObservationStale)
@@ -648,6 +673,45 @@ async fn volatile_cleanup_never_deletes_recreated_pod_or_pvc_names() {
             .iter()
             .any(|pvc| pvc.uid().as_deref() == Some("replacement-pvc-uid"))
     );
+}
+
+#[tokio::test]
+async fn accepted_drop_rejects_invalid_normalized_predecessor_evidence() {
+    let api = Arc::new(InMemoryClusterApi::new(raw_fault(
+        Some(StatePersistence::Volatile),
+        FaultType::Transient,
+        1,
+    )));
+    let reconciler = Reconciler::new(api.clone(), config());
+    for _ in 0..3 {
+        reconciler.reconcile("tests", "fault-db").await.unwrap();
+    }
+    let effects_before = api.effects().await.len();
+    let mut observation = api.observation().await;
+    let RawAgentObservation::PreviewReport(report) =
+        observation.agents.values_mut().next().unwrap()
+    else {
+        panic!("expected preview report");
+    };
+    report.resource_uid = ResourceUid::new("mismatched-resource");
+    api.set_observation(observation).await;
+    assert_eq!(
+        reconciler
+            .reconcile("tests", "fault-db")
+            .await
+            .unwrap()
+            .kind,
+        ReconcileKind::Unsafe
+    );
+    assert!(!api.effects().await[effects_before..].iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::Execute(_)
+                | EffectRecord::DeleteExactService { .. }
+                | EffectRecord::DeleteScaffolding { .. }
+                | EffectRecord::EnsureReplacement(_)
+        )
+    }));
 }
 
 #[test]

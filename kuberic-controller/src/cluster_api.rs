@@ -1108,9 +1108,42 @@ fn validate_preview_dispatch(
         || report.read_status == kuberic_runtime::protocol::types::AccessStatus::Granted
         || report.write_status == kuberic_runtime::protocol::types::AccessStatus::Granted
         || lifecycle.binding.as_ref() != Some(&action.binding)
+        || lifecycle.revision != action.fault_revision
+        || lifecycle.process_id != action.predecessor_process_id
         || lifecycle.role != ReplicaRole::None
         || lifecycle.write_access
         || lifecycle.service_location.is_some()
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    if observation
+        .pods
+        .iter()
+        .find(|pod| pod.name_any() == action.resources.pod_name)
+        .and_then(ResourceExt::uid)
+        .as_deref()
+        != Some(action.resources.pod_uid.as_str())
+        || observation
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == action.resources.pvc_name)
+            .and_then(ResourceExt::uid)
+            .as_deref()
+            != Some(action.resources.pvc_uid.as_str())
+        || observation
+            .services
+            .iter()
+            .find(|service| service.name_any() == action.resources.endpoint_name)
+            .and_then(ResourceExt::uid)
+            .as_deref()
+            != Some(action.resources.endpoint_uid.as_str())
+        || observation
+            .services
+            .iter()
+            .find(|service| service.name_any() == action.resources.endpoint_name)
+            .and_then(ResourceExt::resource_version)
+            .as_deref()
+            != Some(action.resources.endpoint_resource_version.as_str())
     {
         return Err(ControllerError::ObservationStale);
     }
@@ -3282,6 +3315,9 @@ impl ClusterApi for InMemoryClusterApi {
                 .successor_session
                 .as_ref()
                 .ok_or(ControllerError::ObservationStale)?;
+            let successor_process_id = record
+                .successor_process_id
+                .ok_or(ControllerError::ObservationStale)?;
             let lifecycle = report
                 .public_lifecycle_report
                 .as_deref()
@@ -3299,6 +3335,7 @@ impl ClusterApi for InMemoryClusterApi {
                     != kuberic_runtime::protocol::types::AccessStatus::NotPrimary
                 || lifecycle.binding.as_ref() != Some(&action.binding)
                 || lifecycle.process_session_id != *successor
+                || lifecycle.process_id != successor_process_id
                 || lifecycle.role != ReplicaRole::None
                 || lifecycle.write_access
                 || lifecycle.service_location.is_some()

@@ -818,15 +818,16 @@ immediately makes the exact incarnation unhealthy, role-none, access-closed
 and location-free. The selected preview evaluator cannot run ordinary stable,
 election, quorum or routing logic while fault evidence is active. It persists
 one deterministic action over exact replica, Pod/PVC, process-session, fault
-revision and persistence evidence, removes routing, revalidates the same
+revision, predecessor OS PID and persistence evidence, removes routing, revalidates the same
 observation and dispatches the action. Permanent fault supersedes a transient
 action only for the same predecessor identity/session.
 
 Persisted state uses a real parent/child process fixture and one durable
 `Accepted` -> `PredecessorContained` -> `SuccessorStarted` handshake. Exact
 action-bound child PID/session exit or a durable parent PID/start-time marker
-whose exact OS process has terminated is required before re-exec over the same
-data root/PVC. Outstanding
+whose exact OS process has terminated is required before re-exec, and the
+action-bound predecessor child PID must also be gone before the same data
+root/PVC is reused. Outstanding
 successor launch is serialized and recovered rather than replaced on
 redelivery. Quarantine clears predecessor role, PC/CC
 configuration, access and peer/build authority; the fresh application and

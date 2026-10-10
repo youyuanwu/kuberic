@@ -144,6 +144,7 @@ fn fixture(
         resource_uid: ResourceUid::new("resource-1"),
         replica: replica.clone(),
         process_session_id: intent.process_session_id.clone(),
+        process_id: std::process::id(),
         revision,
         operation_id: Some(intent.operation_id.clone()),
         role: ReplicaRole::Primary,

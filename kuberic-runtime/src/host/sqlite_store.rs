@@ -2360,6 +2360,7 @@ impl AgentStore for SqliteStore {
                 action: action.clone(),
                 stage: RestartActionStage::Accepted,
                 successor_session: None,
+                successor_process_id: None,
             };
             preview.restart_action = Some(record.clone());
             write_agent_state(transaction, &state)?;
@@ -2374,6 +2375,7 @@ impl AgentStore for SqliteStore {
         expected: RestartActionStage,
         next: RestartActionStage,
         successor_session: Option<&crate::protocol::types::ProcessSessionId>,
+        successor_process_id: Option<u32>,
     ) -> Result<RestartActionRecord> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
@@ -2417,6 +2419,11 @@ impl AgentStore for SqliteStore {
                         "predecessor containment cannot name a successor session".into(),
                     ));
                 }
+                if successor_process_id.is_some() {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "predecessor containment cannot name a successor process".into(),
+                    ));
+                }
                 state.role = ReplicaRole::None;
                 state.read_status = AccessStatus::NotPrimary;
                 state.write_status = AccessStatus::NotPrimary;
@@ -2430,27 +2437,36 @@ impl AgentStore for SqliteStore {
                 preview.current_operation = None;
                 preview.active_builds.clear();
             }
-            let successor_session = if next == RestartActionStage::SuccessorStarted {
-                let session = successor_session.ok_or_else(|| {
-                    crate::host::HostError::CommandRejected(
-                        "successor-started stage requires a process session".into(),
-                    )
-                })?;
-                if session.is_empty() || session == &action.predecessor_session {
-                    return Err(crate::host::HostError::IdentityMismatch(
-                        "successor process session must be fresh".into(),
-                    ));
-                }
-                Some(session.clone())
-            } else {
-                None
-            };
+            let (successor_session, successor_process_id) =
+                if next == RestartActionStage::SuccessorStarted {
+                    let session = successor_session.ok_or_else(|| {
+                        crate::host::HostError::CommandRejected(
+                            "successor-started stage requires a process session".into(),
+                        )
+                    })?;
+                    if session.is_empty() || session == &action.predecessor_session {
+                        return Err(crate::host::HostError::IdentityMismatch(
+                            "successor process session must be fresh".into(),
+                        ));
+                    }
+                    let process_id = successor_process_id
+                        .filter(|process_id| *process_id > 0)
+                        .ok_or_else(|| {
+                            crate::host::HostError::CommandRejected(
+                                "successor-started stage requires a process ID".into(),
+                            )
+                        })?;
+                    (Some(session.clone()), Some(process_id))
+                } else {
+                    (None, None)
+                };
             let record = preview
                 .restart_action
                 .as_mut()
                 .expect("restart action checked");
             record.stage = next;
             record.successor_session = successor_session;
+            record.successor_process_id = successor_process_id;
             let record = record.clone();
             write_agent_state(transaction, &state)?;
             Ok(record)

@@ -183,6 +183,7 @@ impl ReplicaProcessSupervisor {
 
         if record.stage == RestartActionStage::Accepted {
             if predecessor.evidence.process_session != action.predecessor_session
+                || predecessor.evidence.child_pid != action.predecessor_process_id
                 || predecessor.child.id() != Some(predecessor.evidence.child_pid)
             {
                 return Err(crate::host::HostError::IdentityMismatch(
@@ -204,7 +205,9 @@ impl ReplicaProcessSupervisor {
         action: &PublicFaultAction,
         cut: Option<PreviewRestartCut>,
     ) -> Result<PreviewRestartResult> {
-        if !self.container_restart_proven {
+        if !self.container_restart_proven
+            || Path::new(&format!("/proc/{}", action.predecessor_process_id)).exists()
+        {
             self.store.begin_restart_action(action).await?;
             return Err(crate::host::HostError::CommandRejected(
                 "durable supervisor marker does not prove a parent/container restart".into(),
@@ -234,6 +237,7 @@ impl ReplicaProcessSupervisor {
                     RestartActionStage::Accepted,
                     RestartActionStage::PredecessorContained,
                     None,
+                    None,
                 )
                 .await?;
         }
@@ -261,6 +265,7 @@ impl ReplicaProcessSupervisor {
                 RestartActionStage::PredecessorContained,
                 RestartActionStage::SuccessorStarted,
                 Some(&successor.process_session),
+                Some(successor.child_pid),
             )
             .await?;
         if cut == Some(PreviewRestartCut::SuccessorStarted) {

@@ -811,6 +811,7 @@ public-path hidden field crate::protocol::public_operations::PublicFaultAction::
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::fault: FaultType
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::fault_revision: u64
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::kind: PublicFaultActionKind
+public-path hidden field crate::protocol::public_operations::PublicFaultAction::predecessor_process_id: u32
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::predecessor_session: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::resources: FrozenReplicaResources
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::target: ReplicaIdentity
@@ -823,6 +824,7 @@ public-path hidden field crate::protocol::public_operations::PublicLifecycleInpu
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::binding: Option < PreviewLifecycleBinding >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::operation_id: Option < OperationId >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::preview: PublicOperationPreviewIdentity
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::process_id: u32
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::resource_uid: ResourceUid
@@ -842,6 +844,7 @@ public-path hidden field crate::protocol::public_operations::PublicOperationPrev
 public-path hidden field crate::protocol::public_operations::PublicOperationPreviewIdentity::protocol_version: u32
 public-path hidden field crate::protocol::public_operations::RestartActionRecord::action: PublicFaultAction
 public-path hidden field crate::protocol::public_operations::RestartActionRecord::stage: RestartActionStage
+public-path hidden field crate::protocol::public_operations::RestartActionRecord::successor_process_id: Option < u32 >
 public-path hidden field crate::protocol::public_operations::RestartActionRecord::successor_session: Option < ProcessSessionId >
 public-path hidden field crate::protocol::public_operations::ServiceLocation::address: String
 public-path hidden field crate::protocol::public_operations::ServiceLocation::epoch: Epoch

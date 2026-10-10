@@ -295,6 +295,7 @@ pub(crate) async fn report(
         resource_uid: state.identity.resource_uid.clone(),
         replica: state.identity.local_identity,
         process_session_id: session.clone(),
+        process_id: std::process::id(),
         revision: preview
             .operations
             .values()
