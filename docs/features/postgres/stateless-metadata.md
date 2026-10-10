@@ -2,9 +2,35 @@
 
 ## Status
 
-Proposed architecture. This document defines a CloudNativePG-inspired storage
-and recovery model for the PostgreSQL custom replicator. It does not describe
-behavior that is currently implemented.
+Blocked design draft. This document does not describe behavior that is
+currently implemented and must not be used as an implementation plan.
+
+The earlier draft below assigns PostgreSQL-specific policy, certificate,
+fencing, promotion, and recovery evidence to generic agent/controller
+facilities. That ownership model is rejected. Kuberic instead intends to use
+the existing Service Fabric-shaped lifecycle callbacks as the complete
+application boundary, with PostgreSQL facts reconstructed from PGDATA and
+callback completion serving as the native acceptance boundary.
+
+Three application-neutral reconfiguration changes are required before this
+design can be rewritten or implemented:
+
+1. deferred cold role restoration after listeners and fresh peer sessions are
+   available;
+2. monotonic handoff convergence using progress at or beyond the required
+   boundary rather than exact equality;
+3. target-first planned switchover, followed by former-primary attachment.
+
+See
+[PostgreSQL Stateless Metadata: Service Fabric Prerequisites](stateless-metadata-prerequisites.md).
+PostgreSQL metadata removal remains blocked until those prerequisites pass
+their generic runtime/controller verification gate and a reviewed
+field-by-field disposition matrix accounts for every current
+`PgDurableState`, build, and recovery record.
+
+The remainder of this file is retained as historical design research. Sections
+that move PostgreSQL-specific evidence into `AgentStore`, controller status,
+CRDs, or a runtime relay are superseded and non-authoritative.
 
 The proposal removes the PostgreSQL-specific `state-v2.json` metadata file as
 an independent recovery authority. PostgreSQL state is reconstructed from

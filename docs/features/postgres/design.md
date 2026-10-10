@@ -11,8 +11,13 @@ agent-metadata migration, v1 data import, mixed-version operation or
 rolling-upgrade contract.
 
 The current implementation uses a separate checksummed PostgreSQL metadata
-store. The proposed replacement is documented in
-[PostgreSQL Restart-Stateless Metadata](stateless-metadata.md).
+store. Its removal is blocked on the application-neutral reconfiguration work
+in
+[PostgreSQL Stateless Metadata: Service Fabric Prerequisites](stateless-metadata-prerequisites.md).
+The earlier
+[PostgreSQL Restart-Stateless Metadata](stateless-metadata.md) proposal is
+retained as historical design research and must be rewritten after those
+prerequisites are complete.
 
 ## Architecture and Authority
 
