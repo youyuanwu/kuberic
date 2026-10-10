@@ -99,7 +99,7 @@ fn configuration(
     }
 }
 
-pub(crate) fn abort(
+pub(crate) async fn abort(
     registry: &Arc<PartitionOperationRegistry>,
     store: Arc<dyn AgentStore>,
     intent: PublicOperationIntent,
@@ -113,9 +113,16 @@ pub(crate) fn abort(
             "synchronous abort requires exact abort input".into(),
         ));
     }
+    let operation = registry.admit(intent.clone()).await?;
+    let should_abort = !matches!(
+        operation.snapshot().stage,
+        PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+    );
     registry.fence();
     callbacks.aborted = registry.abort_guard();
-    callbacks.abort_once();
+    if should_abort {
+        callbacks.abort_once();
+    }
     let owner = registry.clone();
     registry.own_control_task(async move {
         if let Err(error) = launch(&owner, store, intent, callbacks).await {

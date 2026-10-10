@@ -114,10 +114,10 @@ pub(crate) async fn launch(
             "preview lifecycle input required".into(),
         ));
     }
+    let operation = registry.admit(intent.clone()).await?;
     if intent.class.is_terminal() {
         registry.fence();
     }
-    let operation = registry.admit(intent.clone()).await?;
     let dispatch = {
         let operation = operation.clone();
         async move {
@@ -167,6 +167,11 @@ async fn execute(
         .into_iter()
         .find(|record| record.intent == intent)
         .ok_or_else(|| HostError::Corrupt("missing lifecycle record".into()))?;
+    if let Some(PublicInstructionOutcome::DataLoss(DataLossOutcome::Error(error))) =
+        record.lifecycle.outcomes.last()
+    {
+        return Err(HostError::CommandRejected(error.clone()));
+    }
     let start = record.lifecycle.outcomes.len();
     for (index, instruction) in instructions(&input).into_iter().enumerate().skip(start) {
         #[cfg(all(test, feature = "testing"))]

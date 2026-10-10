@@ -1663,17 +1663,30 @@ impl AgentStore for SqliteStore {
                 Some(PublicOperationProgram::Build(build)) => {
                     if preview.active_builds.contains_key(&build.replica.replica_id)
                         || preview.operations.values().any(|record| {
-                            record.intent.program.as_ref().is_some_and(|program| match program {
+                            let contains = |configuration: &crate::protocol::types::ConfigurationDescriptor| {
+                                configuration
+                                    .members
+                                    .iter()
+                                    .any(|member| member.identity == build.replica)
+                            };
+                            record.intent.lifecycle.as_ref().is_some_and(|input| {
+                                contains(&input.current)
+                                    || input.previous.as_ref().is_some_and(contains)
+                            }) || record.intent.program.as_ref().is_some_and(|program| match program {
                                 PublicOperationProgram::Configuration(configuration)
                                 | PublicOperationProgram::CatchUp { configuration, .. } => {
-                                    std::iter::once(&configuration.current)
-                                        .chain(configuration.previous.iter())
-                                        .any(|configuration| {
-                                            configuration
-                                                .members
-                                                .iter()
-                                                .any(|member| member.identity == build.replica)
-                                        })
+                                    contains(&configuration.current)
+                                        || configuration.previous.as_ref().is_some_and(contains)
+                                }
+                                PublicOperationProgram::Swap {
+                                    starting,
+                                    refreshed,
+                                    ..
+                                } => {
+                                    contains(&starting.current)
+                                        || starting.previous.as_ref().is_some_and(contains)
+                                        || contains(&refreshed.current)
+                                        || refreshed.previous.as_ref().is_some_and(contains)
                                 }
                                 _ => false,
                             })
@@ -1766,7 +1779,6 @@ impl AgentStore for SqliteStore {
             if matches!(
                 intent.class,
                 crate::protocol::public_operations::PublicOperationClass::Authority
-                    | crate::protocol::public_operations::PublicOperationClass::PlannedSwap
             ) || intent.class.is_terminal()
             {
                 preview.current_operation = Some(intent.operation_id.clone());
@@ -2081,11 +2093,19 @@ impl AgentStore for SqliteStore {
                 || preview.identity != intent.preview
                 || record.stage != PublicOperationStage::Running
                 || record.superseded_by.is_some()
-                || (matches!(
-                    intent.class,
-                    crate::protocol::public_operations::PublicOperationClass::Authority
-                        | crate::protocol::public_operations::PublicOperationClass::PlannedSwap
-                ) && preview.current_operation.as_ref() != Some(&intent.operation_id))
+                || ((intent.class
+                    == crate::protocol::public_operations::PublicOperationClass::Authority
+                    || (intent.class
+                        == crate::protocol::public_operations::PublicOperationClass::PlannedSwap
+                        && matches!(
+                            instruction,
+                            PublicInstruction::ProgramEpoch
+                                | PublicInstruction::RefreshedConfiguration
+                                | PublicInstruction::SecondCatchUp
+                                | PublicInstruction::ReplicatorRole
+                                | PublicInstruction::ApplicationRole
+                        )))
+                    && preview.current_operation.as_ref() != Some(&intent.operation_id))
                 || record.lifecycle.outcomes.len() != index
                 || crate::host::public_lifecycle::operation_instructions(intent).get(index)
                     != Some(&instruction)
@@ -2134,6 +2154,9 @@ impl AgentStore for SqliteStore {
                             | PublicInstruction::ReplicatorClose
                     ) {
                         preview.writes_revoked = true;
+                    }
+                    if instruction == PublicInstruction::Revoke {
+                        preview.current_operation = Some(intent.operation_id.clone());
                     }
                 }
                 Some(outcome) if record.lifecycle.in_flight == Some(instruction) => {

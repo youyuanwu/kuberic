@@ -5,7 +5,8 @@ use crate::host::public_lifecycle::{
 };
 use crate::host::state::{PublicCloseChild, PublicInstruction, PublicInstructionOutcome};
 use crate::protocol::public_operations::{
-    PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicOperationProgram as Program,
+    PossibleDataLossIntent, PublicBuildInput, PublicCatchUpMode, PublicConfiguration,
+    PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationProgram as Program,
 };
 
 struct Fixture {
@@ -49,6 +50,42 @@ fn build(attempt: &str) -> PublicBuildInput {
         replica,
         process_session_id: ProcessSessionId::new("target-session"),
         replication_address: "trace://target".into(),
+    }
+}
+
+fn primary_lifecycle() -> PublicLifecycleInput {
+    let configuration = configuration(1);
+    PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch: configuration.current.epoch,
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: configuration.current,
+        previous: configuration.previous,
+    }
+}
+
+fn configuration_with_target(epoch: i64) -> PublicConfiguration {
+    let mut target = replica_identity();
+    target.replica_id = ReplicaId::new(2);
+    let members = vec![
+        ConfigurationMember {
+            identity: replica_identity(),
+            role: ReplicaRole::Primary,
+        },
+        ConfigurationMember {
+            identity: target,
+            role: ReplicaRole::ActiveSecondary,
+        },
+    ];
+    PublicConfiguration {
+        previous: Some(ConfigurationDescriptor::new(
+            Epoch::new(1, epoch - 1),
+            ReplicaId::new(1),
+            members.clone(),
+            1,
+        )),
+        current: ConfigurationDescriptor::new(Epoch::new(1, epoch), ReplicaId::new(1), members, 1),
     }
 }
 
@@ -112,16 +149,27 @@ impl Fixture {
                 },
             )
             .await;
-        fixture
-            .run(
-                "role",
-                2,
-                Program::Role {
-                    epoch: Epoch::new(1, 1),
-                    role: ReplicaRole::Primary,
-                },
+        let lifecycle = primary_lifecycle();
+        let mut role = intent(
+            &fixture.preview,
+            "role",
+            2,
+            PublicOperationClass::Authority,
+            "session-1",
+        );
+        role.input_digest = lifecycle.digest();
+        role.lifecycle = Some(lifecycle);
+        terminal(
+            &public_lifecycle::launch(
+                &fixture.owner.registry(),
+                fixture.store.clone(),
+                role,
+                fixture.callbacks.clone(),
             )
-            .await;
+            .await
+            .unwrap(),
+        )
+        .await;
         fixture.trace.events.lock().unwrap().clear();
         fixture
     }
@@ -208,16 +256,14 @@ async fn reached(cut: &PublicOperationCut) {
 async fn swap_installs_exact_starting_configuration_before_both_captured_mode_waits() {
     for selected in [PublicCatchUpMode::All, PublicCatchUpMode::WriteQuorum] {
         let fixture = Fixture::new().await;
-        fixture
-            .run("stale", 3, Program::Configuration(configuration(2)))
-            .await;
+        *fixture.trace.installed.lock().unwrap() = Some(configuration(2));
         fixture.trace.events.lock().unwrap().clear();
         let mut program = swap();
         if let Program::Swap { mode, .. } = &mut program {
             *mode = selected;
         }
-        let operation_intent = fixture.intent("swap", 4, program);
-        let revoke = cut(PublicCutPosition::BeforeInstruction, 3);
+        let operation_intent = fixture.intent("swap", 3, program);
+        let revoke = cut(PublicCutPosition::BeforeInstruction, 2);
         let operation = fixture
             .launch(operation_intent.clone(), Some(revoke.clone()))
             .await;
@@ -229,11 +275,22 @@ async fn swap_installs_exact_starting_configuration_before_both_captured_mode_wa
             .unwrap()
             .public_operation_preview
             .unwrap();
-        assert!(state.writes_revoked);
+        assert!(!state.writes_revoked);
         assert_eq!(fixture.trace.waits.lock().unwrap().len(), 1);
-        assert!(!fixture.owner.lifecycle_report().await.unwrap().write_access);
+        assert!(fixture.owner.lifecycle_report().await.unwrap().write_access);
         revoke.release.notify_one();
         let result = terminal(&operation).await;
+        assert!(
+            fixture
+                .store
+                .load_state()
+                .await
+                .unwrap()
+                .public_operation_preview
+                .unwrap()
+                .writes_revoked
+        );
+        assert!(!fixture.owner.lifecycle_report().await.unwrap().write_access);
         assert_eq!(result.lifecycle.outcomes.len(), 8);
         let mode = if selected == PublicCatchUpMode::All {
             ReplicaSetQuorumMode::All
@@ -281,10 +338,8 @@ async fn public_operation_replay_swap_install_cuts_never_wait_on_stale_topology(
         (PublicCutPosition::InstructionApplied, 4),
     ] {
         let fixture = Fixture::new().await;
-        fixture
-            .run("stale", 3, Program::Configuration(configuration(2)))
-            .await;
-        let intent = fixture.intent("swap", 4, swap());
+        *fixture.trace.installed.lock().unwrap() = Some(configuration(2));
+        let intent = fixture.intent("swap", 3, swap());
         let barrier = cut(position, index);
         let operation = fixture.launch(intent.clone(), Some(barrier.clone())).await;
         reached(&barrier).await;
@@ -313,6 +368,85 @@ async fn public_operation_replay_swap_install_cuts_never_wait_on_stale_topology(
         );
         fixture.owner.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn public_operation_replay_retains_applied_data_loss_error_as_failure() {
+    let fixture = Fixture::new().await;
+    let configuration = configuration(3);
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch: configuration.current.epoch,
+        possible_data_loss: PossibleDataLossIntent::Possible,
+        current: configuration.current,
+        previous: configuration.previous,
+    };
+    let mut operation_intent = intent(
+        &fixture.preview,
+        "data-loss-error",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    operation_intent.input_digest = lifecycle.digest();
+    operation_intent.lifecycle = Some(lifecycle);
+    *fixture.trace.data_loss.lock().unwrap() = Some(Err("retained failure".into()));
+    let barrier = cut(PublicCutPosition::InstructionApplied, 2);
+    let mut callbacks = fixture.callbacks.clone();
+    callbacks.cut = Some(barrier.clone());
+    let operation = public_lifecycle::launch(
+        &fixture.owner.registry(),
+        fixture.store.clone(),
+        operation_intent.clone(),
+        callbacks,
+    )
+    .await
+    .unwrap();
+    reached(&barrier).await;
+    operation.crash_root().await;
+    let callbacks_before = fixture
+        .trace
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+        .count();
+    fixture.owner.registry().recover_unowned().await.unwrap();
+    let replayed = public_lifecycle::launch(
+        &fixture.owner.registry(),
+        fixture.store.clone(),
+        operation_intent,
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    let failed = tokio::time::timeout(Duration::from_secs(2), replayed.wait_for_terminal())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        failed.stage,
+        PublicOperationStage::ContainmentPending | PublicOperationStage::Completed
+    ));
+    assert!(matches!(
+        failed.disposition,
+        Some(PublicOperationDisposition::Failed(ref error))
+            if error.contains("retained failure")
+    ));
+    assert_eq!(
+        fixture
+            .trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+            .count(),
+        callbacks_before
+    );
+    fixture.owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -383,6 +517,77 @@ async fn exact_build_is_cancelled_and_drained_before_removal_and_successor() {
             .unwrap()
             .active_builds[&ReplicaId::new(2)],
         build("attempt-2")
+    );
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
+    let fixture = Fixture::new().await;
+    let expanded = configuration_with_target(3);
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch: expanded.current.epoch,
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: expanded.current,
+        previous: expanded.previous,
+    };
+    let mut authority = intent(
+        &fixture.preview,
+        "expanded-authority",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    authority.input_digest = lifecycle.digest();
+    authority.lifecycle = Some(lifecycle);
+    terminal(
+        &public_lifecycle::launch(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            authority,
+            fixture.callbacks.clone(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let lifecycle_build = fixture.intent(
+        "lifecycle-build",
+        3,
+        Program::Build(build("lifecycle-build")),
+    );
+    assert!(
+        fixture
+            .store
+            .begin_public_operation(&lifecycle_build, &[], &[])
+            .await
+            .is_err()
+    );
+    fixture.owner.shutdown().await.unwrap();
+
+    let fixture = Fixture::new().await;
+    let swap = Program::Swap {
+        starting: configuration(3),
+        refreshed: configuration_with_target(4),
+        epoch: Epoch::new(1, 4),
+        handoff: ReplicaRole::ActiveSecondary,
+        mode: PublicCatchUpMode::All,
+    };
+    fixture
+        .owner
+        .registry()
+        .admit(fixture.intent("expanded-swap", 3, swap))
+        .await
+        .unwrap();
+    let swap_build = fixture.intent("swap-build", 3, Program::Build(build("swap-build")));
+    assert!(
+        fixture
+            .store
+            .begin_public_operation(&swap_build, &[], &[])
+            .await
+            .is_err()
     );
     fixture.owner.shutdown().await.unwrap();
 }
@@ -516,6 +721,7 @@ async fn synchronous_repeated_abort_fences_before_return_and_is_ordered_once() {
             intent.clone(),
             fixture.callbacks.clone(),
         )
+        .await
         .unwrap();
         assert!(fixture.owner.registry().is_fenced());
         assert_eq!(
@@ -554,6 +760,72 @@ async fn synchronous_repeated_abort_fences_before_return_and_is_ordered_once() {
             .await
             .is_err()
     );
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_admission_precedes_fencing_and_retained_duplicates_do_not_callback() {
+    let fixture = Fixture::new().await;
+    let mut rejected = fixture.intent("rejected-abort", 3, Program::Abort);
+    rejected.process_session_id = ProcessSessionId::new("predecessor-session");
+    assert!(
+        public_lifecycle::abort(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            rejected,
+            fixture.callbacks.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!fixture.owner.registry().is_fenced());
+    assert!(fixture.trace.events.lock().unwrap().is_empty());
+
+    let accepted = fixture.intent("accepted-abort", 3, Program::Abort);
+    public_lifecycle::abort(
+        &fixture.owner.registry(),
+        fixture.store.clone(),
+        accepted.clone(),
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(operation) = fixture
+                .owner
+                .registry()
+                .operation(&accepted.operation_id)
+                .await
+                && operation.snapshot().stage == PublicOperationStage::Completed
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.trace.events.lock().unwrap().clear();
+
+    let reconstructed = PartitionOperationRegistry::new(
+        fixture.store.clone(),
+        fixture.preview.clone(),
+        ProcessSessionId::new("session-1"),
+    )
+    .unwrap();
+    public_lifecycle::abort(
+        &reconstructed,
+        fixture.store.clone(),
+        accepted,
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    tokio::task::yield_now().await;
+    assert!(reconstructed.is_fenced());
+    assert!(fixture.trace.events.lock().unwrap().is_empty());
+    reconstructed.shutdown().await.unwrap();
     fixture.owner.shutdown().await.unwrap();
 }
 
@@ -664,6 +936,7 @@ async fn callback_cancellation_cross_product_has_exact_root_end_and_descendant_d
                     successor.clone(),
                     fixture.callbacks.clone(),
                 )
+                .await
                 .unwrap();
             }
             let next = fixture.launch(successor, None).await;
@@ -740,6 +1013,7 @@ async fn public_operation_replay_matrix_converges_each_repeatable_program_family
     for (name, program) in replay_programs() {
         for position in [
             PublicCutPosition::CallbackSuccess,
+            PublicCutPosition::InstructionApplied,
             PublicCutPosition::CallbackApplied,
             PublicCutPosition::Completed,
         ] {
@@ -758,7 +1032,7 @@ async fn public_operation_replay_matrix_converges_each_repeatable_program_family
             let intent = fixture.intent(name, revision, program.clone());
             let instruction = match (position, &program) {
                 (
-                    PublicCutPosition::CallbackSuccess,
+                    PublicCutPosition::CallbackSuccess | PublicCutPosition::InstructionApplied,
                     Program::CatchUp { .. } | Program::Close | Program::Abort,
                 ) => 1,
                 _ => 0,
@@ -906,120 +1180,170 @@ async fn ambiguous_build_is_retired_before_a_fresh_attempt() {
 
 #[tokio::test]
 async fn fresh_process_reopen_never_reconstructs_program_authority_at_any_cut() {
-    for cut in 0..5 {
-        let preview = PublicOperationPreviewIdentity::new(500 + cut);
-        let (_directory, path, store) = durable_preview_store(&preview);
-        let program = Program::Epoch {
-            epoch: Epoch::new(1, 2),
-        };
-        let mut operation_intent = intent(
-            &preview,
-            &format!("program-cut-{cut}"),
-            1,
-            PublicOperationClass::Authority,
-            "session-1",
-        );
-        operation_intent.input_digest = program.digest();
-        operation_intent.program = Some(program);
-        store
-            .begin_public_operation(&operation_intent, &[], &[])
+    for family in 0..4 {
+        for cut in 0..5 {
+            let preview = PublicOperationPreviewIdentity::new(500 + family * 10 + cut);
+            let (_directory, path, store) = durable_preview_store(&preview);
+            let mut operation_intent = intent(
+                &preview,
+                &format!("program-{family}-cut-{cut}"),
+                1,
+                PublicOperationClass::Authority,
+                "session-1",
+            );
+            match family {
+                0 => {
+                    let program = Program::Epoch {
+                        epoch: Epoch::new(1, 2),
+                    };
+                    operation_intent.input_digest = program.digest();
+                    operation_intent.program = Some(program);
+                }
+                1 => {
+                    let program = Program::Role {
+                        epoch: Epoch::new(1, 2),
+                        role: ReplicaRole::Primary,
+                    };
+                    operation_intent.input_digest = program.digest();
+                    operation_intent.program = Some(program);
+                }
+                2 => {
+                    let program = Program::Configuration(configuration(2));
+                    operation_intent.input_digest = program.digest();
+                    operation_intent.program = Some(program);
+                }
+                3 => {
+                    let lifecycle = primary_lifecycle();
+                    operation_intent.input_digest = lifecycle.digest();
+                    operation_intent.lifecycle = Some(lifecycle);
+                }
+                _ => unreachable!(),
+            }
+            store
+                .begin_public_operation(&operation_intent, &[], &[])
+                .await
+                .unwrap();
+            if cut >= 1 {
+                store
+                    .advance_public_operation(
+                        &operation_intent.operation_id,
+                        operation_intent.revision,
+                        &operation_intent.process_session_id,
+                        PublicOperationStage::Ready,
+                        PublicOperationStage::Running,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if cut >= 2 {
+                for (index, instruction) in
+                    public_lifecycle::operation_instructions(&operation_intent)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let outcome = match instruction {
+                        PublicInstruction::ApplicationRole
+                        | PublicInstruction::ApplicationPrimary => {
+                            PublicInstructionOutcome::ApplicationRole(Some(
+                                "historical://location".into(),
+                            ))
+                        }
+                        PublicInstruction::ReplicatorOpen => {
+                            PublicInstructionOutcome::Endpoint("historical://replicator".into())
+                        }
+                        PublicInstruction::Progress => PublicInstructionOutcome::Progress(7),
+                        _ => PublicInstructionOutcome::Done,
+                    };
+                    store
+                        .public_instruction(&operation_intent, index, instruction, None)
+                        .await
+                        .unwrap();
+                    store
+                        .public_instruction(&operation_intent, index, instruction, Some(outcome))
+                        .await
+                        .unwrap();
+                }
+            }
+            if cut >= 3 {
+                store
+                    .advance_public_operation(
+                        &operation_intent.operation_id,
+                        operation_intent.revision,
+                        &operation_intent.process_session_id,
+                        PublicOperationStage::Running,
+                        PublicOperationStage::CallbackApplied,
+                        Some(PublicOperationDisposition::Succeeded),
+                    )
+                    .await
+                    .unwrap();
+            }
+            if cut >= 4 {
+                store
+                    .advance_public_operation(
+                        &operation_intent.operation_id,
+                        operation_intent.revision,
+                        &operation_intent.process_session_id,
+                        PublicOperationStage::CallbackApplied,
+                        PublicOperationStage::Completed,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            drop(store);
+
+            let reopened =
+                Arc::new(SqliteStore::open_preview_existing(&path, None, &preview).unwrap());
+            let registry = PartitionOperationRegistry::new(
+                reopened.clone(),
+                preview.clone(),
+                ProcessSessionId::new("session-2"),
+            )
+            .unwrap();
+            registry.recover_unowned().await.unwrap();
+            let record = registry
+                .operation(&operation_intent.operation_id)
+                .await
+                .unwrap()
+                .snapshot();
+            if cut < 4 {
+                assert_eq!(record.stage, PublicOperationStage::ContainmentPending);
+                assert!(matches!(
+                    record.disposition,
+                    Some(PublicOperationDisposition::Ambiguous(_))
+                ));
+            } else {
+                assert_eq!(record.stage, PublicOperationStage::Completed);
+            }
+            let report = public_lifecycle::report(
+                reopened.as_ref(),
+                &preview,
+                &ProcessSessionId::new("session-2"),
+            )
             .await
             .unwrap();
-        if cut >= 1 {
-            store
-                .advance_public_operation(
-                    &operation_intent.operation_id,
-                    operation_intent.revision,
-                    &operation_intent.process_session_id,
-                    PublicOperationStage::Ready,
-                    PublicOperationStage::Running,
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        if cut >= 2 {
-            store
-                .public_instruction(&operation_intent, 0, PublicInstruction::ProgramEpoch, None)
-                .await
-                .unwrap();
-            store
-                .public_instruction(
-                    &operation_intent,
-                    0,
-                    PublicInstruction::ProgramEpoch,
-                    Some(PublicInstructionOutcome::Done),
-                )
-                .await
-                .unwrap();
-        }
-        if cut >= 3 {
-            store
-                .advance_public_operation(
-                    &operation_intent.operation_id,
-                    operation_intent.revision,
-                    &operation_intent.process_session_id,
-                    PublicOperationStage::Running,
-                    PublicOperationStage::CallbackApplied,
-                    Some(PublicOperationDisposition::Succeeded),
-                )
-                .await
-                .unwrap();
-        }
-        if cut >= 4 {
-            store
-                .advance_public_operation(
-                    &operation_intent.operation_id,
-                    operation_intent.revision,
-                    &operation_intent.process_session_id,
-                    PublicOperationStage::CallbackApplied,
-                    PublicOperationStage::Completed,
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        drop(store);
+            assert_eq!(report.role, ReplicaRole::None);
+            assert!(!report.write_access);
+            assert!(report.service_location.is_none());
 
-        let reopened = Arc::new(SqliteStore::open_preview_existing(&path, None, &preview).unwrap());
-        let registry = PartitionOperationRegistry::new(
-            reopened.clone(),
-            preview.clone(),
-            ProcessSessionId::new("session-2"),
-        )
-        .unwrap();
-        registry.recover_unowned().await.unwrap();
-        let record = registry
-            .operation(&operation_intent.operation_id)
-            .await
-            .unwrap()
-            .snapshot();
-        if cut < 4 {
-            assert_eq!(record.stage, PublicOperationStage::ContainmentPending);
-            assert!(matches!(
-                record.disposition,
-                Some(PublicOperationDisposition::Ambiguous(_))
-            ));
-        } else {
-            assert_eq!(record.stage, PublicOperationStage::Completed);
+            let mut successor = operation_intent.clone();
+            successor.operation_id = OperationId::new(format!("successor-{family}-{cut}"));
+            successor.revision = 2;
+            successor.process_session_id = ProcessSessionId::new("session-2");
+            successor.input_digest = successor
+                .program
+                .as_ref()
+                .map(Program::digest)
+                .or_else(|| {
+                    successor
+                        .lifecycle
+                        .as_ref()
+                        .map(PublicLifecycleInput::digest)
+                })
+                .unwrap();
+            assert!(registry.admit(successor).await.is_err());
+            registry.shutdown().await.unwrap();
         }
-        let report = public_lifecycle::report(
-            reopened.as_ref(),
-            &preview,
-            &ProcessSessionId::new("session-2"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(report.role, ReplicaRole::None);
-        assert!(!report.write_access);
-        assert!(report.service_location.is_none());
-
-        let mut successor = operation_intent.clone();
-        successor.operation_id = OperationId::new(format!("successor-{cut}"));
-        successor.revision = 2;
-        successor.process_session_id = ProcessSessionId::new("session-2");
-        successor.input_digest = successor.program.as_ref().unwrap().digest();
-        assert!(registry.admit(successor).await.is_err());
-        registry.shutdown().await.unwrap();
     }
 }
