@@ -824,14 +824,17 @@ action only for the same predecessor identity/session.
 
 Persisted state uses a real parent/child process fixture and one durable
 `Accepted` -> `PredecessorContained` -> `SuccessorStarted` handshake. Exact
-action-bound child PID/session exit or a durable parent/container restart
-marker is required before re-exec over the same data root/PVC. Outstanding
+action-bound child PID/session exit or a durable parent PID/start-time marker
+whose exact OS process has terminated is required before re-exec over the same
+data root/PVC. Outstanding
 successor launch is serialized and recovered rather than replaced on
 redelivery. Quarantine clears predecessor role, PC/CC
 configuration, access and peer/build authority; the fresh application and
 Replicator session remains unassigned and access-closed because Phase 5 owns
 renewal. The accepted, contained and successor-started crash cuts converge to
 one successor session, and unproven descendant containment prevents re-exec.
+The runtime supervisor, rather than the controller, constructs the quarantined
+successor report consumed by the next reconciliation.
 
 Volatile transient faults and all permanent faults freeze the old endpoint,
 including its UID/resourceVersion, plus Pod and PVC identities, remove routing,

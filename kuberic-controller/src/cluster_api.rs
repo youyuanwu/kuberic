@@ -184,7 +184,14 @@ pub trait PreviewFaultCommandExecutor: Send + Sync {
     async fn execute_restart(
         &self,
         action: &kuberic_runtime::protocol::public_operations::PublicFaultAction,
-    ) -> Result<kuberic_runtime::protocol::public_operations::RestartActionRecord>;
+    ) -> Result<PreviewRestartExecution>;
+}
+
+#[cfg(feature = "runtime-test-bridge")]
+#[doc(hidden)]
+pub struct PreviewRestartExecution {
+    pub record: kuberic_runtime::protocol::public_operations::RestartActionRecord,
+    pub report: kuberic_runtime::protocol::observation::AgentReport,
 }
 
 #[derive(Clone)]
@@ -3268,7 +3275,38 @@ impl ClusterApi for InMemoryClusterApi {
         if let Some(action) = restart_action
             && let Some(executor) = self.preview_fault_executor.lock().await.clone()
         {
-            let record = executor.execute_restart(&action).await?;
+            let execution = executor.execute_restart(&action).await?;
+            let record = &execution.record;
+            let report = &execution.report;
+            let successor = record
+                .successor_session
+                .as_ref()
+                .ok_or(ControllerError::ObservationStale)?;
+            let lifecycle = report
+                .public_lifecycle_report
+                .as_deref()
+                .ok_or(ControllerError::ObservationStale)?;
+            if record.action != action
+                || record.stage
+                    != kuberic_runtime::protocol::public_operations::RestartActionStage::SuccessorStarted
+                || report.identity != action.target
+                || &report.process_session_id != successor
+                || report.reported_fault.is_some()
+                || report.role != ReplicaRole::None
+                || report.read_status
+                    != kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+                || report.write_status
+                    != kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+                || lifecycle.binding.as_ref() != Some(&action.binding)
+                || lifecycle.process_session_id != *successor
+                || lifecycle.role != ReplicaRole::None
+                || lifecycle.write_access
+                || lifecycle.service_location.is_some()
+            {
+                return Err(ControllerError::InvalidAgentEvidence(
+                    "supervisor successor report is not quarantined exact evidence".into(),
+                ));
+            }
             let mut state = self.state.lock().await;
             let key = ReplicaObservationKey::new(
                 action.target.replica_id,
@@ -3279,31 +3317,7 @@ impl ClusterApi for InMemoryClusterApi {
             else {
                 return Err(ControllerError::ObservationStale);
             };
-            report.restart_action = Some(Box::new(record.clone()));
-            if record.stage
-                == kuberic_runtime::protocol::public_operations::RestartActionStage::SuccessorStarted
-            {
-                let successor = record
-                    .successor_session
-                    .ok_or(ControllerError::ObservationStale)?;
-                report.process_session_id = successor.clone();
-                report.report_sequence = report.report_sequence.saturating_add(1);
-                report.reported_fault = None;
-                report.healthy = true;
-                report.role = ReplicaRole::None;
-                report.read_status =
-                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
-                report.write_status =
-                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
-                let lifecycle = report
-                    .public_lifecycle_report
-                    .as_mut()
-                    .ok_or(ControllerError::ObservationStale)?;
-                lifecycle.process_session_id = successor;
-                lifecycle.role = ReplicaRole::None;
-                lifecycle.write_access = false;
-                lifecycle.service_location = None;
-            }
+            **report = execution.report;
         }
         if response_lost {
             return Err(ControllerError::AgentUnavailable(

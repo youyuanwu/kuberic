@@ -77,6 +77,7 @@ pub(crate) struct PreviewChildEvidence {
     pub(crate) provider_sentinel: String,
     pub(crate) application_instance_id: String,
     pub(crate) replicator_instance_id: String,
+    pub(crate) callbacks: Vec<String>,
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
@@ -105,6 +106,13 @@ pub(crate) struct PreviewRestartResult {
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PreviewSupervisorIdentity {
+    pid: u32,
+    start_time: String,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
 #[allow(dead_code)]
 pub(crate) struct ReplicaProcessSupervisor {
     store: Arc<SqliteStore>,
@@ -124,11 +132,11 @@ impl ReplicaProcessSupervisor {
         child: PreviewChildCommand,
     ) -> Result<Self> {
         let marker = data_root.join(".kuberic").join("supervisor-session");
-        let container_restart_proven = marker.exists();
-        if let Some(parent) = marker.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&marker, uuid::Uuid::new_v4().to_string())?;
+        let container_restart_proven = std::fs::read(&marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PreviewSupervisorIdentity>(&bytes).ok())
+            .is_some_and(|previous| !process_identity_is_alive(&previous));
+        Self::record_parent_identity(&data_root)?;
         Ok(Self {
             store,
             data_root,
@@ -137,6 +145,27 @@ impl ReplicaProcessSupervisor {
             launch: Mutex::new(()),
             container_restart_proven,
         })
+    }
+
+    pub(crate) fn record_parent_identity(data_root: &Path) -> Result<()> {
+        let marker = data_root.join(".kuberic").join("supervisor-session");
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let identity = PreviewSupervisorIdentity {
+            pid: std::process::id(),
+            start_time: process_start_time(std::process::id()).ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "cannot read supervisor process identity".into(),
+                )
+            })?,
+        };
+        std::fs::write(
+            marker,
+            serde_json::to_vec(&identity)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+        )?;
+        Ok(())
     }
 
     pub(crate) async fn restart_with_child(
@@ -151,6 +180,7 @@ impl ReplicaProcessSupervisor {
                 "injected crash after durable restart acceptance".into(),
             ));
         }
+
         if record.stage == RestartActionStage::Accepted {
             if predecessor.evidence.process_session != action.predecessor_session
                 || predecessor.child.id() != Some(predecessor.evidence.child_pid)
@@ -356,6 +386,12 @@ impl ReplicaProcessSupervisor {
             || evidence.provider_sentinel.is_empty()
             || evidence.application_instance_id.is_empty()
             || evidence.replicator_instance_id.is_empty()
+            || evidence.callbacks
+                != [
+                    "replicator.open",
+                    "replicator.change_role.none",
+                    "application.change_role.none",
+                ]
         {
             return Err(crate::host::HostError::IdentityMismatch(
                 "successor child evidence changed storage, process, or construction identity"
@@ -364,6 +400,18 @@ impl ReplicaProcessSupervisor {
         }
         Ok(())
     }
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn process_start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_whitespace().nth(19).map(str::to_string)
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn process_identity_is_alive(identity: &PreviewSupervisorIdentity) -> bool {
+    process_start_time(identity.pid).as_deref() == Some(identity.start_time.as_str())
 }
 
 #[derive(Debug, Clone, Serialize)]

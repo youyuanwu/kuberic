@@ -24,6 +24,7 @@ use crate::protocol::types::{
 use crate::replicator::Replicator;
 
 const CHILD_OUTPUT: &str = "KUBERIC_PREVIEW_CHILD_OUTPUT";
+const PARENT_MARKER_ROOT: &str = "KUBERIC_PREVIEW_PARENT_MARKER_ROOT";
 
 fn wire<T: serde::Serialize, U: serde::de::DeserializeOwned>(value: T) -> U {
     serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap()
@@ -90,6 +91,9 @@ struct ControllerSupervisorExecutor {
     supervisor: Arc<ReplicaProcessSupervisor>,
     predecessor: tokio::sync::Mutex<Option<PreviewChildProcess>>,
     release: PathBuf,
+    store: Arc<SqliteStore>,
+    binding: PreviewLifecycleBinding,
+    identity: ReplicaIdentity,
 }
 
 #[async_trait]
@@ -97,9 +101,7 @@ impl kuberic_controller::cluster_api::PreviewFaultCommandExecutor for Controller
     async fn execute_restart(
         &self,
         action: &kuberic_controller::protocol::public_operations::PublicFaultAction,
-    ) -> kuberic_controller::Result<
-        kuberic_controller::protocol::public_operations::RestartActionRecord,
-    > {
+    ) -> kuberic_controller::Result<kuberic_controller::cluster_api::PreviewRestartExecution> {
         let action: PublicFaultAction = wire(action);
         std::fs::write(&self.release, b"restart")
             .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
@@ -113,7 +115,43 @@ impl kuberic_controller::cluster_api::PreviewFaultCommandExecutor for Controller
             .restart_with_child(&action, &mut predecessor, None)
             .await
             .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
-        Ok(wire(result.record))
+        let successor = result.record.successor_session.clone().ok_or_else(|| {
+            kuberic_controller::ControllerError::Effect(
+                "supervisor omitted successor session".into(),
+            )
+        })?;
+        let lifecycle = crate::host::public_lifecycle::report(
+            self.store.as_ref(),
+            &self.binding.preview,
+            &successor,
+        )
+        .await
+        .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
+        let state = self
+            .store
+            .load_state()
+            .await
+            .map_err(|error| kuberic_controller::ControllerError::Effect(error.to_string()))?;
+        let report = crate::protocol::observation::AgentReport {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            resource_uid: self.binding.resource_uid.clone(),
+            identity: self.identity.clone(),
+            process_session_id: successor,
+            report_sequence: 1,
+            role: ReplicaRole::None,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            healthy: true,
+            epoch: state.highest_epoch,
+            reported_fault: None,
+            public_lifecycle_report: Some(Box::new(lifecycle)),
+            restart_action: Some(Box::new(result.record.clone())),
+            ..Default::default()
+        };
+        Ok(kuberic_controller::cluster_api::PreviewRestartExecution {
+            record: wire(result.record),
+            report: wire(report),
+        })
     }
 }
 
@@ -149,6 +187,18 @@ fn preview_process_child_entrypoint() {
     });
     let _application: Arc<dyn StatefulServiceReplica> = application.clone();
     let _replicator: Arc<dyn Replicator> = replicator.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        replicator.open().await.unwrap();
+        replicator
+            .change_role(Epoch::default(), ReplicaRole::None)
+            .await
+            .unwrap();
+        application.change_role(ReplicaRole::None).await.unwrap();
+    });
     let evidence = PreviewChildEvidence {
         process_session,
         child_pid: std::process::id(),
@@ -158,10 +208,16 @@ fn preview_process_child_entrypoint() {
         provider_sentinel: sentinel,
         application_instance_id: application.instance_id.clone(),
         replicator_instance_id: replicator.instance_id.clone(),
+        callbacks: vec![
+            "replicator.open".into(),
+            "replicator.change_role.none".into(),
+            "application.change_role.none".into(),
+        ],
     };
     if let Ok(delay) = std::env::var("KUBERIC_PREVIEW_READY_DELAY_MS") {
         std::thread::sleep(std::time::Duration::from_millis(delay.parse().unwrap()));
     }
+
     if let Some(parent) = Path::new(&output).parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -175,6 +231,21 @@ fn preview_process_child_entrypoint() {
     }
     let shutdown = PathBuf::from(std::env::var("KUBERIC_PREVIEW_SHUTDOWN").unwrap());
     while !shutdown.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn preview_supervisor_parent_entrypoint() {
+    let Ok(root) = std::env::var(PARENT_MARKER_ROOT) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    ReplicaProcessSupervisor::record_parent_identity(&root).unwrap();
+    let ready = PathBuf::from(std::env::var("KUBERIC_PREVIEW_PARENT_READY").unwrap());
+    let release = PathBuf::from(std::env::var("KUBERIC_PREVIEW_PARENT_RELEASE").unwrap());
+    std::fs::write(ready, b"ready").unwrap();
+    while !release.exists() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
@@ -246,6 +317,9 @@ async fn controller_executor_drives_the_real_supervisor_and_successor_report() {
         supervisor: fixture.supervisor.clone(),
         predecessor: tokio::sync::Mutex::new(Some(predecessor)),
         release: fixture.release.clone(),
+        store: fixture.store.clone(),
+        binding: fixture.binding.clone(),
+        identity: fixture.identity.clone(),
     }))
     .await;
     let reconciler = Reconciler::new(
@@ -319,7 +393,7 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
             .to_string()
             .contains("does not prove a parent/container restart")
     );
-    let supervisor = fixture.restarted_supervisor();
+    let supervisor = fixture.restarted_supervisor().await;
     assert!(
         supervisor
             .resume_after_container_restart(&action, Some(PreviewRestartCut::Accepted))
@@ -375,7 +449,7 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
 
     let after_start = Fixture::new();
     let action = after_start.action(ProcessSessionId::new("old-parent"));
-    let supervisor = after_start.restarted_supervisor();
+    let supervisor = after_start.restarted_supervisor().await;
     assert!(
         supervisor
             .resume_after_container_restart(&action, Some(PreviewRestartCut::SuccessorStarted))
@@ -398,7 +472,7 @@ async fn restart_crash_cuts_resume_exactly_once_and_uncontained_work_stays_close
 
     let cancelled = Fixture::new();
     let action = cancelled.action(ProcessSessionId::new("cancelled-parent"));
-    let supervisor = cancelled.restarted_supervisor_with_delay(200);
+    let supervisor = cancelled.restarted_supervisor_with_delay(200).await;
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(20),
@@ -495,11 +569,34 @@ impl Fixture {
         }
     }
 
-    fn restarted_supervisor(&self) -> Arc<ReplicaProcessSupervisor> {
-        self.restarted_supervisor_with_delay(0)
+    async fn restarted_supervisor(&self) -> Arc<ReplicaProcessSupervisor> {
+        self.restarted_supervisor_with_delay(0).await
     }
 
-    fn restarted_supervisor_with_delay(&self, delay_millis: u64) -> Arc<ReplicaProcessSupervisor> {
+    async fn restarted_supervisor_with_delay(
+        &self,
+        delay_millis: u64,
+    ) -> Arc<ReplicaProcessSupervisor> {
+        let ready = self.data_root.join("parent-marker-ready");
+        let release = self.data_root.join("parent-marker-release");
+        let mut parent = tokio::process::Command::new(std::env::current_exe().unwrap());
+        parent
+            .arg("preview_supervisor_parent_entrypoint")
+            .arg("--nocapture")
+            .env(PARENT_MARKER_ROOT, &self.data_root)
+            .env("KUBERIC_PREVIEW_PARENT_READY", &ready)
+            .env("KUBERIC_PREVIEW_PARENT_RELEASE", &release)
+            .kill_on_drop(true);
+        let mut parent = parent.spawn().unwrap();
+        for _ in 0..200 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists(), "parent marker helper did not start");
+        std::fs::write(&release, b"exit").unwrap();
+        assert!(parent.wait().await.unwrap().success());
         let mut child = Self::child_command();
         if delay_millis > 0 {
             child.environment.insert(

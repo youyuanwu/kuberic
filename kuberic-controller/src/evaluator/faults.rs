@@ -62,6 +62,14 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
         }
         Some(_) => {}
     }
+    if let Err(message) = validate_present_preview_reports(snapshot, preview, &binding) {
+        return Some(reject(
+            snapshot,
+            "MixedPreviewLegacyReports",
+            message,
+            config,
+        ));
+    }
     if let Some(action) = snapshot
         .status
         .public_fault_action
@@ -360,6 +368,33 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
         }
         PublicFaultActionKind::DropReplacement => evaluate_drop(snapshot, &action, config),
     })
+}
+
+fn validate_present_preview_reports(
+    snapshot: &ObservationSnapshot,
+    preview: &kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity,
+    binding: &PreviewLifecycleBinding,
+) -> Result<(), &'static str> {
+    for replica in snapshot.replicas.values() {
+        let AgentObservation::Report(report) = &replica.agent else {
+            continue;
+        };
+        if replica.kubernetes.is_none() {
+            return Err("preview report has no exact Kubernetes scaffolding");
+        }
+        let Some(lifecycle) = report.public_lifecycle_report.as_deref() else {
+            return Err("preview cleanup refuses a legacy report");
+        };
+        if lifecycle.preview != *preview
+            || lifecycle.binding.as_ref() != Some(binding)
+            || lifecycle.resource_uid != snapshot.resource_uid
+            || lifecycle.replica != report.identity
+            || lifecycle.process_session_id != report.process_session_id
+        {
+            return Err("preview cleanup report identity or binding changed");
+        }
+    }
+    Ok(())
 }
 
 fn evaluate_drop(
