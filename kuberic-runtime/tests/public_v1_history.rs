@@ -179,8 +179,8 @@ fn public_v1_history_data_loss_attempt_renews_higher_epoch() {
 }
 
 #[tokio::test]
-async fn public_v1_schema9_requires_a_fresh_store_and_rejects_schema8() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 9);
+async fn public_v1_history_store_uses_the_current_exact_schema() {
+    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 10);
     let directory = tempfile::tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let preview = PublicOperationPreviewIdentity::public_v1(42);

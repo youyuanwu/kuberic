@@ -611,6 +611,7 @@ message EnsureReplicaBuildCommand {
   BuildAuthority authority = 6;
   string source_session_id = 7;
   bool retire = 8;
+  bytes build_authorization_v1 = 9;
 }
 
 message ExecuteCommandRequest {

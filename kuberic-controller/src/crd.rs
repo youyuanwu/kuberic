@@ -314,13 +314,13 @@ mod tests {
 
         let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
         assert!(
-            generated.len() < 370_000,
+            generated.len() < 465_000,
             "generated CRD unexpectedly grew to {} bytes",
             generated.len()
         );
         assert!(
-            generated.len() <= 368_000,
-            "typed dormant Public V1 schema lost its reviewed headroom at {} bytes",
+            generated.len() <= 460_000,
+            "typed dormant Public V1 authorization schema lost its reviewed headroom at {} bytes",
             generated.len()
         );
     }

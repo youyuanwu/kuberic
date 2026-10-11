@@ -4,6 +4,7 @@
 //! transport conversions use the same canonical types; policy belongs to the
 //! controller.
 
+pub mod authorization;
 pub mod command;
 pub mod observation;
 #[doc(hidden)]

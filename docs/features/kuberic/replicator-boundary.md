@@ -254,6 +254,63 @@ only with nonterminal recovery authority; failed, replacement-required and
 retired state is election-ineligible. Production normalization, gRPC dispatch
 and evaluation still reject the feature-gated protocol-11 path.
 
+Phase 5.3 replaces the disposable schema-9 store with a fresh exact schema-10
+store. Schemas 6, 7, 8 and 9 are rejected before decoding; there is no
+migration, absent-field fallback or retained database fixture. Schema 10 adds
+bounded signed-authorization intent state and process-session renewal
+barriers while protocol 11 remains repository-only.
+
+Authorization uses one fixed Ed25519 construction. Build and peer claims have
+distinct versioned domains and canonical binary field order; signatures cover
+those bytes rather than JSON, protobuf serialization or diagnostic text. Key
+IDs are the full SHA-256 digest of the raw 32-byte verification key, and audit
+digests are SHA-256 of the exact canonical signed envelope. Protobuf carries
+the raw canonical envelope bytes, while JSON/CRD values use strict canonical
+base64. Type confusion, unknown tags/versions, malformed lengths, trailing
+bytes, alternate encodings, wrong keys and re-encoding mismatches fail closed.
+
+Only the controller owns private signing material. One immutable Secret of
+type `kuberic.io/public-v1-authorization-key` is created for each resource and
+Public V1 generation, with exactly three 32-byte binary keys:
+`ed25519-seed`, `ed25519-public-key` and `key-id-sha256`. Every read re-derives
+the public key and key ID from the seed and validates the exact owner UID,
+resource/generation labels, Secret UID/resourceVersion and immutable flag.
+After accepted status binds that identity, loss, recreation, mutation or
+same-generation replacement is terminal; no implicit key regeneration occurs.
+The Secret is never referenced by Pod environment, volume, annotation or
+agent command. Replicas receive only immutable public trust through
+`ReplicatorSettings`.
+
+Accepted Public V1 status owns a bounded authorization intent before dispatch.
+The intent freezes typed build or current/previous peer claims and advances
+monotonically through `Prepared`, `Signed`, `Dispatched`, `Observed` and
+`Retired`. Signing resolves the exact accepted Secret once and persists the
+exact envelope, signature and audit digest before dispatch. Lost responses
+reuse those retained bytes. Observation or retirement must match the exact
+operation, revision, claim kind and audit digest; superseded predecessors
+cannot replay.
+
+An idle target may carry only its exact signed build authorization, including
+history, epoch, operation/build IDs and both storage/process/address
+incarnations. An active remote PC/CC member may carry only its exact peer
+session authorization, including configuration IDs/revision and both endpoint
+sessions/addresses. Immutable public trust is creation-bound and cannot be
+changed by settings update. Copy/build authorization is verified before
+provider mutation; peer authorization is verified before replication traffic
+or acknowledgement contribution. Signature validity alone does not bypass
+local history, epoch, storage, role, session, address or revocation checks.
+
+Replacement active sessions are also explicit schema-10 authority. The new
+session begins unassigned and access-closed with only history-scoped progress.
+Primary/secondary replacement or peer-authorization withdrawal advances the
+configuration epoch, closes affected access, freezes the survivor set,
+completes or explicitly excludes every survivor epoch barrier, replays the
+replacement role when applicable, and only then installs fresh configuration.
+An unreachable survivor is waited for or retired; same-epoch primary-session
+substitution is invalid. Data-loss replacement preserves the Phase 5.2 logical
+authorization and still enforces exact captured replay capability before any
+callback.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

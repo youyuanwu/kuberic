@@ -4,12 +4,12 @@ use crate::effects::{RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::DataLossRenewalDecision;
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::public_operations::PublicOperationIntent;
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 use crate::protocol::public_operations::{
     PublicFaultAction, RestartActionRecord, RestartActionStage,
 };
+#[cfg(any(test, feature = "testing"))]
+use crate::protocol::public_operations::{PublicOperationIntent, PublicV1SessionRenewalStatus};
 use crate::protocol::types::{FaultType, LoadMetric, OperationId};
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::types::{
@@ -156,6 +156,17 @@ pub(crate) trait AgentStore: Send + Sync {
     ) -> Result<RenewPublicDataLossAttempt> {
         Err(crate::host::HostError::CommandRejected(
             "public-v1 data-loss renewal is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn persist_public_v1_session_renewal(
+        &self,
+        _expected: Option<&PublicV1SessionRenewalStatus>,
+        _next: &PublicV1SessionRenewalStatus,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 session renewal is not enabled for this store".into(),
         ))
     }
 

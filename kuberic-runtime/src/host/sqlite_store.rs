@@ -1733,6 +1733,78 @@ impl AgentStore for SqliteStore {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    async fn persist_public_v1_session_renewal(
+        &self,
+        expected: Option<&crate::protocol::public_operations::PublicV1SessionRenewalStatus>,
+        next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    ) -> Result<()> {
+        next.validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("public-v1 preview store required".into())
+            })?;
+            if !preview.identity.is_public_v1()
+                || preview.history.as_ref() != Some(&next.required.history)
+                || next.required.resource_uid != state.identity.resource_uid
+                || !std::iter::once(&next.required.predecessor)
+                    .chain(next.required.replacement.iter())
+                    .chain(next.required.surviving_sessions.iter())
+                    .any(|endpoint| endpoint.identity == state.identity.local_identity)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 session renewal differs from local durable authority".into(),
+                ));
+            }
+            if next.required.predecessor.identity == state.identity.local_identity
+                && preview.storage_incarnation.as_ref()
+                    != Some(&next.required.predecessor.storage_incarnation)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 session renewal changed predecessor storage".into(),
+                ));
+            }
+            if let Some(data_loss) = &next.required.data_loss
+                && (preview.data_loss_authorization.as_ref() != Some(&data_loss.authorization)
+                    || preview.data_loss_recovery.as_ref().is_none_or(|recovery| {
+                        recovery.logical_authorization() != data_loss.authorization
+                            || recovery.attempt != data_loss.predecessor_attempt
+                    }))
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 session renewal changed durable data-loss authority".into(),
+                ));
+            }
+            match (&preview.session_renewal, expected) {
+                (Some(current), Some(expected)) if current == expected => {
+                    if current == next {
+                        return Ok(());
+                    }
+                    if !next.is_successor_of(current) {
+                        return Err(crate::host::HostError::StaleEffectCompletion(
+                            "public-v1 session renewal transition is out of order".into(),
+                        ));
+                    }
+                }
+                (None, None)
+                    if next.stage
+                        == crate::protocol::public_operations::PublicSessionRenewalStage::Required =>
+                {
+                }
+                _ => {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "public-v1 session renewal changed accepted state".into(),
+                    ));
+                }
+            }
+            preview.session_renewal = Some(next.clone());
+            preview.writes_revoked = true;
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     async fn begin_public_operation(
         &self,
         intent: &PublicOperationIntent,
@@ -2166,6 +2238,39 @@ impl AgentStore for SqliteStore {
                     "data-loss renewal lacks durable recovery state".into(),
                 )
             })?;
+            if let Some(session_renewal) = &preview.session_renewal {
+                let required = &session_renewal.required;
+                let Some(data_loss) = &required.data_loss else {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "data-loss attempt differs from durable session renewal".into(),
+                    ));
+                };
+                let expected_stage = match required
+                    .data_loss_decision()
+                    .expect("validated data-loss renewal")
+                {
+                    DataLossRenewalDecision::InvokeCallback => {
+                        crate::protocol::public_operations::PublicSessionRenewalStage::Authorized
+                    }
+                    DataLossRenewalDecision::RetireWithoutCallback => {
+                        crate::protocol::public_operations::PublicSessionRenewalStage::Retired
+                    }
+                    DataLossRenewalDecision::Terminal => {
+                        return Err(crate::host::HostError::Corrupt(
+                            "terminal data-loss session renewal was persisted".into(),
+                        ));
+                    }
+                };
+                if session_renewal.stage != expected_stage
+                    || data_loss.authorization != candidate.authorization
+                    || data_loss.predecessor_attempt != recovery.attempt
+                    || data_loss.replacement_attempt != candidate.attempt
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "data-loss callback renewal has not crossed exact session barriers".into(),
+                    ));
+                }
+            }
             if authorization != &candidate.authorization
                 || recovery.authorization_id != authorization.authorization_id
                 || recovery.predecessor_history != authorization.predecessor

@@ -6,7 +6,7 @@ use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
 use crate::protocol::public_operations::{
     DataLossAuthorization, PublicDataLossRecoveryStatus, PublicOperationIntent,
-    PublicOperationPreviewIdentity,
+    PublicOperationPreviewIdentity, PublicV1SessionRenewalStatus,
 };
 use crate::protocol::public_operations::{PreviewLifecycleBinding, RestartActionRecord};
 use crate::protocol::types::{
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 // Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
-pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 9;
+pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,6 +221,7 @@ pub(crate) struct PublicOperationPreviewState {
     pub(crate) data_loss_authorization: Option<DataLossAuthorization>,
     #[serde(default)]
     pub(crate) data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
+    pub(crate) session_renewal: Option<PublicV1SessionRenewalStatus>,
     #[serde(default)]
     pub(crate) current_operation: Option<OperationId>,
     #[serde(default)]
@@ -252,6 +253,7 @@ impl PublicOperationPreviewState {
             storage_incarnation: None,
             data_loss_authorization: None,
             data_loss_recovery: None,
+            session_renewal: None,
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),
@@ -273,6 +275,7 @@ impl PublicOperationPreviewState {
             storage_incarnation: None,
             data_loss_authorization: None,
             data_loss_recovery: None,
+            session_renewal: None,
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),

@@ -2945,6 +2945,1053 @@
                   "publicV1Authority": {
                     "nullable": true,
                     "properties": {
+                      "authorization": {
+                        "nullable": true,
+                        "properties": {
+                          "intents": {
+                            "default": [],
+                            "items": {
+                              "properties": {
+                                "auditDigest": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "canonicalClaimsBase64": {
+                                  "maxLength": 21848,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "claims": {
+                                  "properties": {
+                                    "build": {
+                                      "nullable": true,
+                                      "properties": {
+                                        "buildId": {
+                                          "type": "string"
+                                        },
+                                        "epoch": {
+                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                          "properties": {
+                                            "configurationNumber": {
+                                              "format": "int64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            },
+                                            "dataLossNumber": {
+                                              "format": "int64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "configurationNumber",
+                                            "dataLossNumber"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "history": {
+                                          "properties": {
+                                            "dataLossNumber": {
+                                              "format": "int64",
+                                              "type": "integer"
+                                            },
+                                            "historyId": {
+                                              "type": "string"
+                                            },
+                                            "protocolGeneration": {
+                                              "format": "uint64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            },
+                                            "resourceUid": {
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "dataLossNumber",
+                                            "historyId",
+                                            "protocolGeneration",
+                                            "resourceUid"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "keyId": {
+                                          "type": "string"
+                                        },
+                                        "operationId": {
+                                          "type": "string"
+                                        },
+                                        "protocolGeneration": {
+                                          "format": "uint64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        },
+                                        "resourceUid": {
+                                          "type": "string"
+                                        },
+                                        "source": {
+                                          "properties": {
+                                            "processSessionId": {
+                                              "type": "string"
+                                            },
+                                            "replicationAddress": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "storageIncarnation": {
+                                              "properties": {
+                                                "replica": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storage": {
+                                                  "properties": {
+                                                    "identity": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "kind": {
+                                                      "type": "string"
+                                                    },
+                                                    "podUid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "pvcUid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "kind"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storageGeneration": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "replica",
+                                                "storage",
+                                                "storageGeneration"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "processSessionId",
+                                            "replicationAddress",
+                                            "role",
+                                            "storageIncarnation"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "target": {
+                                          "properties": {
+                                            "processSessionId": {
+                                              "type": "string"
+                                            },
+                                            "replicationAddress": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "storageIncarnation": {
+                                              "properties": {
+                                                "replica": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storage": {
+                                                  "properties": {
+                                                    "identity": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "kind": {
+                                                      "type": "string"
+                                                    },
+                                                    "podUid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "pvcUid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "kind"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storageGeneration": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "replica",
+                                                "storage",
+                                                "storageGeneration"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "processSessionId",
+                                            "replicationAddress",
+                                            "role",
+                                            "storageIncarnation"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "buildId",
+                                        "epoch",
+                                        "history",
+                                        "keyId",
+                                        "operationId",
+                                        "protocolGeneration",
+                                        "resourceUid",
+                                        "source",
+                                        "target"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "kind": {
+                                      "enum": [
+                                        "build",
+                                        "peer"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "peer": {
+                                      "nullable": true,
+                                      "properties": {
+                                        "configurationRevision": {
+                                          "format": "uint64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "currentConfigurationId": {
+                                          "type": "string"
+                                        },
+                                        "epoch": {
+                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                          "properties": {
+                                            "configurationNumber": {
+                                              "format": "int64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            },
+                                            "dataLossNumber": {
+                                              "format": "int64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "configurationNumber",
+                                            "dataLossNumber"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "history": {
+                                          "properties": {
+                                            "dataLossNumber": {
+                                              "format": "int64",
+                                              "type": "integer"
+                                            },
+                                            "historyId": {
+                                              "type": "string"
+                                            },
+                                            "protocolGeneration": {
+                                              "format": "uint64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            },
+                                            "resourceUid": {
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "dataLossNumber",
+                                            "historyId",
+                                            "protocolGeneration",
+                                            "resourceUid"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "keyId": {
+                                          "type": "string"
+                                        },
+                                        "previousConfigurationId": {
+                                          "nullable": true,
+                                          "type": "string"
+                                        },
+                                        "primary": {
+                                          "properties": {
+                                            "processSessionId": {
+                                              "type": "string"
+                                            },
+                                            "replica": {
+                                              "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                              "properties": {
+                                                "agentGeneration": {
+                                                  "type": "string"
+                                                },
+                                                "instanceId": {
+                                                  "type": "string"
+                                                },
+                                                "replicaId": {
+                                                  "format": "int64",
+                                                  "minimum": 1.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "agentGeneration",
+                                                "instanceId",
+                                                "replicaId"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "replicationAddress": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "processSessionId",
+                                            "replica",
+                                            "replicationAddress",
+                                            "role"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "protocolGeneration": {
+                                          "format": "uint64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        },
+                                        "resourceUid": {
+                                          "type": "string"
+                                        },
+                                        "secondary": {
+                                          "properties": {
+                                            "processSessionId": {
+                                              "type": "string"
+                                            },
+                                            "replica": {
+                                              "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                              "properties": {
+                                                "agentGeneration": {
+                                                  "type": "string"
+                                                },
+                                                "instanceId": {
+                                                  "type": "string"
+                                                },
+                                                "replicaId": {
+                                                  "format": "int64",
+                                                  "minimum": 1.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "agentGeneration",
+                                                "instanceId",
+                                                "replicaId"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "replicationAddress": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "processSessionId",
+                                            "replica",
+                                            "replicationAddress",
+                                            "role"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationRevision",
+                                        "currentConfigurationId",
+                                        "epoch",
+                                        "history",
+                                        "keyId",
+                                        "primary",
+                                        "protocolGeneration",
+                                        "resourceUid",
+                                        "secondary"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "type": "object"
+                                },
+                                "cleanupDisposition": {
+                                  "enum": [
+                                    "retainUntilSuperseded",
+                                    "retireAfterObservation",
+                                    "retired"
+                                  ],
+                                  "type": "string"
+                                },
+                                "envelope": {
+                                  "nullable": true,
+                                  "properties": {
+                                    "build": {
+                                      "nullable": true,
+                                      "properties": {
+                                        "claims": {
+                                          "properties": {
+                                            "buildId": {
+                                              "type": "string"
+                                            },
+                                            "epoch": {
+                                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                              "properties": {
+                                                "configurationNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                },
+                                                "dataLossNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "configurationNumber",
+                                                "dataLossNumber"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "history": {
+                                              "properties": {
+                                                "dataLossNumber": {
+                                                  "format": "int64",
+                                                  "type": "integer"
+                                                },
+                                                "historyId": {
+                                                  "type": "string"
+                                                },
+                                                "protocolGeneration": {
+                                                  "format": "uint64",
+                                                  "minimum": 1.0,
+                                                  "type": "integer"
+                                                },
+                                                "resourceUid": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "dataLossNumber",
+                                                "historyId",
+                                                "protocolGeneration",
+                                                "resourceUid"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "keyId": {
+                                              "type": "string"
+                                            },
+                                            "operationId": {
+                                              "type": "string"
+                                            },
+                                            "protocolGeneration": {
+                                              "format": "uint64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            },
+                                            "resourceUid": {
+                                              "type": "string"
+                                            },
+                                            "source": {
+                                              "properties": {
+                                                "processSessionId": {
+                                                  "type": "string"
+                                                },
+                                                "replicationAddress": {
+                                                  "type": "string"
+                                                },
+                                                "role": {
+                                                  "description": "Runtime role of one exact replica incarnation.",
+                                                  "enum": [
+                                                    "primary",
+                                                    "activeSecondary",
+                                                    "idleSecondary",
+                                                    "none"
+                                                  ],
+                                                  "type": "string"
+                                                },
+                                                "storageIncarnation": {
+                                                  "properties": {
+                                                    "replica": {
+                                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                      "properties": {
+                                                        "agentGeneration": {
+                                                          "type": "string"
+                                                        },
+                                                        "instanceId": {
+                                                          "type": "string"
+                                                        },
+                                                        "replicaId": {
+                                                          "format": "int64",
+                                                          "minimum": 1.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "agentGeneration",
+                                                        "instanceId",
+                                                        "replicaId"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storage": {
+                                                      "properties": {
+                                                        "identity": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "kind": {
+                                                          "type": "string"
+                                                        },
+                                                        "podUid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "pvcUid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "kind"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storageGeneration": {
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "replica",
+                                                    "storage",
+                                                    "storageGeneration"
+                                                  ],
+                                                  "type": "object"
+                                                }
+                                              },
+                                              "required": [
+                                                "processSessionId",
+                                                "replicationAddress",
+                                                "role",
+                                                "storageIncarnation"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "target": {
+                                              "properties": {
+                                                "processSessionId": {
+                                                  "type": "string"
+                                                },
+                                                "replicationAddress": {
+                                                  "type": "string"
+                                                },
+                                                "role": {
+                                                  "description": "Runtime role of one exact replica incarnation.",
+                                                  "enum": [
+                                                    "primary",
+                                                    "activeSecondary",
+                                                    "idleSecondary",
+                                                    "none"
+                                                  ],
+                                                  "type": "string"
+                                                },
+                                                "storageIncarnation": {
+                                                  "properties": {
+                                                    "replica": {
+                                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                      "properties": {
+                                                        "agentGeneration": {
+                                                          "type": "string"
+                                                        },
+                                                        "instanceId": {
+                                                          "type": "string"
+                                                        },
+                                                        "replicaId": {
+                                                          "format": "int64",
+                                                          "minimum": 1.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "agentGeneration",
+                                                        "instanceId",
+                                                        "replicaId"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storage": {
+                                                      "properties": {
+                                                        "identity": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "kind": {
+                                                          "type": "string"
+                                                        },
+                                                        "podUid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "pvcUid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "kind"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storageGeneration": {
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "replica",
+                                                    "storage",
+                                                    "storageGeneration"
+                                                  ],
+                                                  "type": "object"
+                                                }
+                                              },
+                                              "required": [
+                                                "processSessionId",
+                                                "replicationAddress",
+                                                "role",
+                                                "storageIncarnation"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "buildId",
+                                            "epoch",
+                                            "history",
+                                            "keyId",
+                                            "operationId",
+                                            "protocolGeneration",
+                                            "resourceUid",
+                                            "source",
+                                            "target"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "signature": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "claims",
+                                        "signature"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "kind": {
+                                      "enum": [
+                                        "build",
+                                        "peer"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "peer": {
+                                      "nullable": true,
+                                      "properties": {
+                                        "claims": {
+                                          "properties": {
+                                            "configurationRevision": {
+                                              "format": "uint64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            },
+                                            "currentConfigurationId": {
+                                              "type": "string"
+                                            },
+                                            "epoch": {
+                                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                              "properties": {
+                                                "configurationNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                },
+                                                "dataLossNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "configurationNumber",
+                                                "dataLossNumber"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "history": {
+                                              "properties": {
+                                                "dataLossNumber": {
+                                                  "format": "int64",
+                                                  "type": "integer"
+                                                },
+                                                "historyId": {
+                                                  "type": "string"
+                                                },
+                                                "protocolGeneration": {
+                                                  "format": "uint64",
+                                                  "minimum": 1.0,
+                                                  "type": "integer"
+                                                },
+                                                "resourceUid": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "dataLossNumber",
+                                                "historyId",
+                                                "protocolGeneration",
+                                                "resourceUid"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "keyId": {
+                                              "type": "string"
+                                            },
+                                            "previousConfigurationId": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "primary": {
+                                              "properties": {
+                                                "processSessionId": {
+                                                  "type": "string"
+                                                },
+                                                "replica": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "replicationAddress": {
+                                                  "type": "string"
+                                                },
+                                                "role": {
+                                                  "description": "Runtime role of one exact replica incarnation.",
+                                                  "enum": [
+                                                    "primary",
+                                                    "activeSecondary",
+                                                    "idleSecondary",
+                                                    "none"
+                                                  ],
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "processSessionId",
+                                                "replica",
+                                                "replicationAddress",
+                                                "role"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "protocolGeneration": {
+                                              "format": "uint64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            },
+                                            "resourceUid": {
+                                              "type": "string"
+                                            },
+                                            "secondary": {
+                                              "properties": {
+                                                "processSessionId": {
+                                                  "type": "string"
+                                                },
+                                                "replica": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "replicationAddress": {
+                                                  "type": "string"
+                                                },
+                                                "role": {
+                                                  "description": "Runtime role of one exact replica incarnation.",
+                                                  "enum": [
+                                                    "primary",
+                                                    "activeSecondary",
+                                                    "idleSecondary",
+                                                    "none"
+                                                  ],
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "processSessionId",
+                                                "replica",
+                                                "replicationAddress",
+                                                "role"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "configurationRevision",
+                                            "currentConfigurationId",
+                                            "epoch",
+                                            "history",
+                                            "keyId",
+                                            "primary",
+                                            "protocolGeneration",
+                                            "resourceUid",
+                                            "secondary"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "signature": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "claims",
+                                        "signature"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "type": "object"
+                                },
+                                "kind": {
+                                  "enum": [
+                                    "build",
+                                    "peer"
+                                  ],
+                                  "type": "string"
+                                },
+                                "operationId": {
+                                  "type": "string"
+                                },
+                                "revision": {
+                                  "format": "uint64",
+                                  "minimum": 0.0,
+                                  "type": "integer"
+                                },
+                                "scope": {
+                                  "enum": [
+                                    "build",
+                                    "currentPeer",
+                                    "previousPeer"
+                                  ],
+                                  "type": "string"
+                                },
+                                "signature": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "stage": {
+                                  "enum": [
+                                    "prepared",
+                                    "signed",
+                                    "dispatched",
+                                    "observed",
+                                    "retired"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "canonicalClaimsBase64",
+                                "claims",
+                                "cleanupDisposition",
+                                "kind",
+                                "operationId",
+                                "revision",
+                                "scope",
+                                "stage"
+                              ],
+                              "type": "object"
+                            },
+                            "maxItems": 16,
+                            "type": "array"
+                          },
+                          "secretBinding": {
+                            "nullable": true,
+                            "properties": {
+                              "generation": {
+                                "format": "uint64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "keyId": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "maxLength": 253,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "resourceUid": {
+                                "type": "string"
+                              },
+                              "resourceVersion": {
+                                "maxLength": 256,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "uid": {
+                                "maxLength": 256,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "verificationKey": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "generation",
+                              "keyId",
+                              "name",
+                              "resourceUid",
+                              "resourceVersion",
+                              "uid",
+                              "verificationKey"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "completedOperations": {
                         "default": [],
                         "items": {

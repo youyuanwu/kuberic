@@ -164,6 +164,21 @@ page:host/transport/struct.KubernetesDnsResolver.html
 page:host/transport/trait.ReplicaEndpointResolver.html
 page:host/type.Result.html
 page:index.html
+page:protocol/authorization/enum.AuthorizationError.html
+page:protocol/authorization/index.html
+page:protocol/authorization/struct.AuthorizationAuditDigest.html
+page:protocol/authorization/struct.AuthorizationKeyId.html
+page:protocol/authorization/struct.AuthorizationSignature.html
+page:protocol/authorization/struct.AuthorizationVerificationKey.html
+page:protocol/authorization/struct.BuildAuthorizationClaimsV1.html
+page:protocol/authorization/struct.BuildAuthorizationEndpointV1.html
+page:protocol/authorization/struct.BuildAuthorizationV1.html
+page:protocol/authorization/struct.PeerSessionAuthorizationClaimsV1.html
+page:protocol/authorization/struct.PeerSessionAuthorizationV1.html
+page:protocol/authorization/struct.PeerSessionEndpointV1.html
+page:protocol/authorization/type.AuthorizationPublicKey.html
+page:protocol/authorization/type.BuildAuthorizationEnvelopeV1.html
+page:protocol/authorization/type.PeerSessionAuthorizationEnvelopeV1.html
 page:protocol/command/enum.EffectClass.html
 page:protocol/command/enum.KubernetesChange.html
 page:protocol/command/enum.ProtocolCommand.html
@@ -201,6 +216,7 @@ page:protocol/types/enum.ConditionStatus.html
 page:protocol/types/enum.FaultType.html
 page:protocol/types/enum.PlannedSwitchoverOutcome.html
 page:protocol/types/enum.PlannedSwitchoverResolution.html
+page:protocol/types/enum.ProcessSessionRenewalReason.html
 page:protocol/types/enum.ProvisioningKind.html
 page:protocol/types/enum.ReplicaRole.html
 page:protocol/types/enum.ReplicaStorageIdentity.html
@@ -243,6 +259,7 @@ page:protocol/types/struct.PlannedSwitchoverReceipt.html
 page:protocol/types/struct.PlannedSwitchoverRequest.html
 page:protocol/types/struct.PodUid.html
 page:protocol/types/struct.PrimaryFailureObservation.html
+page:protocol/types/struct.ProcessSessionEndpoint.html
 page:protocol/types/struct.ProcessSessionId.html
 page:protocol/types/struct.ProvisioningIntent.html
 page:protocol/types/struct.ProvisioningPurpose.html
@@ -333,6 +350,7 @@ page:replicator/stream/struct.OperationStream.html
 page:replicator/stream/struct.StreamOperation.html
 page:replicator/struct.DefaultReplicator.html
 page:replicator/struct.DefaultReplicatorFactory.html
+page:replicator/struct.PublicAuthorizationTrust.html
 page:replicator/struct.ReplicaInformation.html
 page:replicator/struct.ReplicaSetConfiguration.html
 page:replicator/struct.ReplicatorCapabilities.html

@@ -15,7 +15,9 @@ testing = ["host"]
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
+ed25519-dalek.workspace = true
 futures.workspace = true
 prost.workspace = true
 rusqlite = { workspace = true, optional = true }

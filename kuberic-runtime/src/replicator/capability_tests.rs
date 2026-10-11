@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 use super::*;
 use crate::authority::BuildAuthorityKind;
+use crate::protocol::authorization::AuthorizationSigningKey;
 
 #[derive(Default)]
 struct Control {
@@ -78,6 +79,31 @@ impl Replicator for Control {
 
     async fn catch_up_capability(&self) -> Result<Lsn> {
         Ok(0)
+    }
+}
+
+#[derive(Default)]
+struct SettingsControl {
+    updates: AtomicUsize,
+}
+
+#[async_trait]
+impl StateReplicator for SettingsControl {
+    async fn replicate(&self, _: OperationData) -> Result<Lsn> {
+        Ok(0)
+    }
+
+    async fn get_replication_stream(&self) -> Result<OperationStream> {
+        Ok(OperationStream::channel(1).1)
+    }
+
+    async fn get_copy_stream(&self) -> Result<OperationStream> {
+        Ok(OperationStream::channel(1).1)
+    }
+
+    async fn update_replicator_settings(&self, _: ReplicatorSettings) -> Result<()> {
+        self.updates.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -195,4 +221,81 @@ fn successful_host_registration_disarms_bundle_cleanup() {
     drop(attachment);
     drop(interfaces);
     assert_eq!(control.aborts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn public_authorization_trust_is_creation_bound_and_update_immutable() {
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(41),
+        instance_id: crate::protocol::types::ReplicaInstanceId::new("authorization-instance"),
+        agent_generation: crate::protocol::types::AgentGeneration::new("authorization-generation"),
+    };
+    let signing_key = AuthorizationSigningKey::from_seed([41; 32]);
+    let trust = PublicAuthorizationTrust {
+        resource_uid: ResourceUid::new("authorization-resource"),
+        protocol_generation: PublicProtocolGeneration::new(11),
+        verification_key: signing_key.verification_key(),
+        key_id: signing_key.key_id(),
+    };
+    let settings = ReplicatorSettings {
+        replication_address: "https://10.0.0.41:7000".into(),
+        public_authorization: Some(trust.clone()),
+    };
+    let control = Arc::new(Control::default());
+    let state = Arc::new(SettingsControl::default());
+    let interfaces = ReplicatorInterfaces::primary(
+        control,
+        Some(state.clone()),
+        ReplicatorCapabilities::conservative(),
+    );
+    let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+    interfaces.prepare_attachment(reservation).unwrap();
+    interfaces
+        .creation
+        .bind_settings(identity.clone(), settings.clone())
+        .unwrap();
+
+    interfaces
+        .state_replicator()
+        .unwrap()
+        .update_replicator_settings(ReplicatorSettings {
+            replication_address: "https://10.0.0.41:7001".into(),
+            public_authorization: Some(trust.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.updates.load(Ordering::SeqCst), 1);
+
+    let mut changed_generation = settings.clone();
+    changed_generation
+        .public_authorization
+        .as_mut()
+        .unwrap()
+        .protocol_generation = PublicProtocolGeneration::new(12);
+    assert!(
+        interfaces
+            .state_replicator()
+            .unwrap()
+            .update_replicator_settings(changed_generation)
+            .await
+            .is_err()
+    );
+    let mut removed_trust = settings.clone();
+    removed_trust.public_authorization = None;
+    assert!(
+        interfaces
+            .state_replicator()
+            .unwrap()
+            .update_replicator_settings(removed_trust)
+            .await
+            .is_err()
+    );
+    assert_eq!(state.updates.load(Ordering::SeqCst), 1);
+
+    let other = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+    assert!(interfaces.prepare_attachment(other).is_err());
+    assert_eq!(
+        interfaces.capabilities(),
+        ReplicatorCapabilities::conservative()
+    );
 }

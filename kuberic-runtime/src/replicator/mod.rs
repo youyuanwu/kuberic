@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::protocol::types::{
-    AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, LoadMetric,
-    OperationId, PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
+    AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, HistoryContext,
+    LoadMetric, OperationId, PartitionInformation, ProcessSessionId, PublicProtocolGeneration,
+    ReplicaId, ReplicaIdentity, ReplicaRole, ReplicaStorageIncarnationContext, ResourceUid,
     SecondaryRemovalWitness, SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
     SwitchoverRequestId,
 };
@@ -31,6 +32,10 @@ use crate::authority::{
 };
 use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
+use crate::protocol::authorization::{
+    AuthorizationKeyId, AuthorizationVerificationKey, BuildAuthorizationEndpointV1,
+    BuildAuthorizationV1, PeerSessionAuthorizationV1,
+};
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -382,6 +387,10 @@ pub struct ReplicaInformation {
     pub current_progress: Lsn,
     pub catch_up_capability: Lsn,
     pub must_catchup: bool,
+    pub storage_incarnation: Option<ReplicaStorageIncarnationContext>,
+    pub build_authorization: Option<BuildAuthorizationV1>,
+    pub peer_authorization: Option<PeerSessionAuthorizationV1>,
+    pub configuration_revision: Option<u64>,
 }
 
 impl ReplicaInformation {
@@ -409,6 +418,10 @@ impl ReplicaInformation {
             current_progress: INVALID_LSN,
             catch_up_capability: INVALID_LSN,
             must_catchup: false,
+            storage_incarnation: None,
+            build_authorization: None,
+            peer_authorization: None,
+            configuration_revision: None,
         }
     }
 
@@ -429,6 +442,10 @@ impl ReplicaInformation {
             current_progress,
             catch_up_capability,
             must_catchup,
+            storage_incarnation: None,
+            build_authorization: None,
+            peer_authorization: None,
+            configuration_revision: None,
         };
         information.validate_public_progress()?;
         Ok(information)
@@ -448,12 +465,106 @@ impl ReplicaInformation {
                 "idle public build target must use INVALID_LSN".into(),
             ));
         }
+        self.validate_authorization_shape()?;
+        Ok(())
+    }
+
+    pub fn validate_authorization_shape(&self) -> Result<()> {
+        if self.build_authorization.is_some() && self.peer_authorization.is_some() {
+            return Err(RuntimeError::Application(
+                "build and peer authorization are structurally exclusive".into(),
+            ));
+        }
+        match &self.build_authorization {
+            Some(authorization) => {
+                let storage = self.storage_incarnation.as_ref().ok_or_else(|| {
+                    RuntimeError::Application(
+                        "signed build target lacks its storage incarnation".into(),
+                    )
+                })?;
+                if self.role != ReplicaRole::IdleSecondary
+                    || self.current_progress != INVALID_LSN
+                    || self.catch_up_capability != INVALID_LSN
+                    || self.must_catchup
+                    || self.build_id != authorization.claims.build_id
+                    || self.identity != authorization.claims.target.storage_incarnation.replica
+                    || storage != &authorization.claims.target.storage_incarnation
+                    || self.process_session_id != authorization.claims.target.process_session_id
+                    || self.replication_address != authorization.claims.target.replication_address
+                    || authorization.claims.target.role != ReplicaRole::IdleSecondary
+                    || self.configuration_revision.is_some()
+                {
+                    return Err(RuntimeError::Application(
+                        "signed build authorization differs from the idle target descriptor".into(),
+                    ));
+                }
+            }
+            None if self.storage_incarnation.is_some() => {
+                return Err(RuntimeError::Application(
+                    "descriptor storage incarnation requires build authorization".into(),
+                ));
+            }
+            None => {}
+        }
+        if let Some(authorization) = &self.peer_authorization {
+            if self.role != ReplicaRole::ActiveSecondary
+                || !self.build_id.is_empty()
+                || self.storage_incarnation.is_some()
+                || self.identity != authorization.claims.secondary.replica
+                || self.process_session_id != authorization.claims.secondary.process_session_id
+                || self.replication_address != authorization.claims.secondary.replication_address
+                || authorization.claims.secondary.role != ReplicaRole::ActiveSecondary
+                || self.configuration_revision != Some(authorization.claims.configuration_revision)
+            {
+                return Err(RuntimeError::Application(
+                    "peer authorization differs from the active remote descriptor".into(),
+                ));
+            }
+        } else if self.configuration_revision.is_some() {
+            return Err(RuntimeError::Application(
+                "configuration revision requires peer authorization".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_build_authorization(
+        &self,
+        trust: &PublicAuthorizationTrust,
+        history: &HistoryContext,
+        epoch: Epoch,
+        operation_id: &OperationId,
+        source: &BuildAuthorizationEndpointV1,
+    ) -> Result<()> {
+        trust.validate()?;
+        self.validate_authorization_shape()?;
+        let authorization = self.build_authorization.as_ref().ok_or_else(|| {
+            RuntimeError::Application("signed public build lacks authorization".into())
+        })?;
+        trust
+            .verification_key
+            .verify_build_authorization(authorization)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let claims = &authorization.claims;
+        if claims.resource_uid != trust.resource_uid
+            || claims.protocol_generation != trust.protocol_generation
+            || claims.key_id != trust.key_id
+            || &claims.history != history
+            || claims.epoch != epoch
+            || &claims.operation_id != operation_id
+            || &claims.source != source
+        {
+            return Err(RuntimeError::Application(
+                "signed build authorization differs from immutable local authority".into(),
+            ));
+        }
         Ok(())
     }
 }
 
 impl From<PublicReplicaDescriptor> for ReplicaInformation {
     fn from(replica: PublicReplicaDescriptor) -> Self {
+        register_public_peer_descriptor(&replica);
         Self {
             build_id: replica.build_id,
             identity: replica.identity,
@@ -463,6 +574,10 @@ impl From<PublicReplicaDescriptor> for ReplicaInformation {
             current_progress: replica.current_progress,
             catch_up_capability: replica.catch_up_capability,
             must_catchup: replica.must_catchup,
+            storage_incarnation: None,
+            build_authorization: None,
+            peer_authorization: replica.peer_authorization,
+            configuration_revision: replica.configuration_revision,
         }
     }
 }
@@ -484,9 +599,753 @@ impl From<ConfigurationDescriptor> for ReplicaSetConfiguration {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicAuthorizationTrust {
+    pub resource_uid: ResourceUid,
+    pub protocol_generation: PublicProtocolGeneration,
+    pub verification_key: AuthorizationVerificationKey,
+    pub key_id: AuthorizationKeyId,
+}
+
+impl PublicAuthorizationTrust {
+    pub fn validate(&self) -> Result<()> {
+        if self.resource_uid.is_empty() || self.protocol_generation.value() == 0 {
+            return Err(RuntimeError::Application(
+                "public authorization trust lacks resource or generation".into(),
+            ));
+        }
+        if self.key_id != self.verification_key.key_id() {
+            return Err(RuntimeError::Application(
+                "public authorization key ID does not match the verification key".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplicatorSettings {
     pub replication_address: String,
+    pub public_authorization: Option<PublicAuthorizationTrust>,
+}
+
+impl ReplicatorSettings {
+    fn validate(&self) -> Result<()> {
+        if let Some(trust) = &self.public_authorization {
+            trust.validate()?;
+            if self.replication_address.is_empty() {
+                return Err(RuntimeError::Application(
+                    "signed public authorization requires an exact replication address".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredPublicAuthorizationSettings {
+    owner: ReplicatorCreationIdentity,
+    identity: ReplicaIdentity,
+    trust: PublicAuthorizationTrust,
+    replication_address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicAuthorizationRuntimeContext {
+    pub(crate) identity: ReplicaIdentity,
+    pub(crate) history: HistoryContext,
+    pub(crate) storage_incarnation: ReplicaStorageIncarnationContext,
+    pub(crate) process_session_id: ProcessSessionId,
+    pub(crate) role: ReplicaRole,
+}
+
+#[derive(Default)]
+struct PublicAuthorizationRegistry {
+    settings: Vec<RegisteredPublicAuthorizationSettings>,
+    contexts: Vec<PublicAuthorizationRuntimeContext>,
+    peers: Vec<PeerSessionAuthorizationV1>,
+    revoked_peers: Vec<ReplicaIdentity>,
+    builds: Vec<BuildAuthorizationV1>,
+}
+
+fn public_authorization_registry() -> &'static StdMutex<PublicAuthorizationRegistry> {
+    static REGISTRY: OnceLock<StdMutex<PublicAuthorizationRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| StdMutex::new(PublicAuthorizationRegistry::default()))
+}
+
+fn registered_public_authorization_settings(
+    identity: &ReplicaIdentity,
+) -> Option<RegisteredPublicAuthorizationSettings> {
+    public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .settings
+        .iter()
+        .find(|settings| &settings.identity == identity)
+        .cloned()
+}
+
+fn registered_public_authorization_context(
+    identity: &ReplicaIdentity,
+) -> Option<PublicAuthorizationRuntimeContext> {
+    public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contexts
+        .iter()
+        .find(|context| &context.identity == identity)
+        .cloned()
+}
+
+fn register_public_authorization_settings(
+    owner: ReplicatorCreationIdentity,
+    identity: ReplicaIdentity,
+    settings: &ReplicatorSettings,
+) -> Result<()> {
+    settings.validate()?;
+    let Some(trust) = settings.public_authorization.clone() else {
+        return Ok(());
+    };
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = registry
+        .settings
+        .iter()
+        .find(|registered| registered.identity == identity)
+    {
+        if existing.owner == owner
+            && existing.trust == trust
+            && existing.replication_address == settings.replication_address
+        {
+            return Ok(());
+        }
+        return Err(RuntimeError::Application(
+            "replicator registration cannot replace immutable public authorization trust".into(),
+        ));
+    }
+    registry
+        .settings
+        .push(RegisteredPublicAuthorizationSettings {
+            owner,
+            identity,
+            trust,
+            replication_address: settings.replication_address.clone(),
+        });
+    Ok(())
+}
+
+fn update_public_authorization_settings(
+    owner: ReplicatorCreationIdentity,
+    identity: &ReplicaIdentity,
+    settings: &ReplicatorSettings,
+) -> Result<()> {
+    settings.validate()?;
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(registered) = registry
+        .settings
+        .iter_mut()
+        .find(|registered| registered.identity == *identity && registered.owner == owner)
+    else {
+        return if settings.public_authorization.is_none() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Application(
+                "signed public authorization settings are not registered".into(),
+            ))
+        };
+    };
+    if settings.public_authorization.as_ref() != Some(&registered.trust) {
+        return Err(RuntimeError::Application(
+            "replicator settings cannot change public authorization trust or generation".into(),
+        ));
+    }
+    registered.replication_address = settings.replication_address.clone();
+    Ok(())
+}
+
+fn unregister_public_authorization_settings(owner: ReplicatorCreationIdentity) {
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let identities = registry
+        .settings
+        .iter()
+        .filter(|settings| settings.owner == owner)
+        .map(|settings| settings.identity.clone())
+        .collect::<Vec<_>>();
+    registry.settings.retain(|settings| settings.owner != owner);
+    registry
+        .contexts
+        .retain(|context| !identities.contains(&context.identity));
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn bind_public_authorization_context(
+    context: PublicAuthorizationRuntimeContext,
+) -> Result<()> {
+    let Some(settings) = registered_public_authorization_settings(&context.identity) else {
+        return Ok(());
+    };
+    if context.history.resource_uid != settings.trust.resource_uid
+        || context.history.protocol_generation != settings.trust.protocol_generation
+        || context.storage_incarnation.replica != context.identity
+        || context.process_session_id.is_empty()
+    {
+        return Err(RuntimeError::Application(
+            "public authorization runtime context differs from immutable trust".into(),
+        ));
+    }
+    context
+        .history
+        .validate()
+        .map_err(|message| RuntimeError::Application(message.into()))?;
+    context
+        .storage_incarnation
+        .validate()
+        .map_err(|message| RuntimeError::Application(message.into()))?;
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry
+        .contexts
+        .retain(|registered| registered.identity != context.identity);
+    registry.contexts.push(context);
+    Ok(())
+}
+
+fn register_public_peer_descriptor(replica: &PublicReplicaDescriptor) {
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(authorization) = &replica.peer_authorization {
+        registry
+            .revoked_peers
+            .retain(|identity| identity != &replica.identity);
+        registry.peers.retain(|existing| {
+            existing.claims.primary.replica != authorization.claims.primary.replica
+                || existing.claims.secondary.replica != authorization.claims.secondary.replica
+                || existing.claims.current_configuration_id
+                    != authorization.claims.current_configuration_id
+                || existing.claims.previous_configuration_id
+                    != authorization.claims.previous_configuration_id
+        });
+        registry.peers.push(authorization.clone());
+    } else {
+        if !registry.revoked_peers.contains(&replica.identity) {
+            registry.revoked_peers.push(replica.identity.clone());
+        }
+        registry
+            .peers
+            .retain(|authorization| authorization.claims.secondary.replica != replica.identity);
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn authorize_public_build_descriptor(
+    context: &PublicAuthorizationRuntimeContext,
+    epoch: Epoch,
+    operation_id: &OperationId,
+    replica: &ReplicaInformation,
+) -> Result<()> {
+    let settings = registered_public_authorization_settings(&context.identity);
+    match settings {
+        None => {
+            if replica.build_authorization.is_some() {
+                return Err(RuntimeError::Application(
+                    "signed build authorization lacks immutable runtime trust".into(),
+                ));
+            }
+            return Ok(());
+        }
+        Some(settings) => {
+            if context.role != ReplicaRole::Primary {
+                return Err(RuntimeError::Application(
+                    "only the exact local primary can authorize a public build".into(),
+                ));
+            }
+            let source = BuildAuthorizationEndpointV1 {
+                storage_incarnation: context.storage_incarnation.clone(),
+                process_session_id: context.process_session_id.clone(),
+                replication_address: settings.replication_address,
+                role: ReplicaRole::Primary,
+            };
+            replica.validate_build_authorization(
+                &settings.trust,
+                &context.history,
+                epoch,
+                operation_id,
+                &source,
+            )?;
+        }
+    }
+    let authorization = replica
+        .build_authorization
+        .as_ref()
+        .expect("validated signed build authorization")
+        .clone();
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.builds.retain(|existing| {
+        existing.claims.source.replica() != authorization.claims.source.replica()
+            || existing.claims.target.replica() != authorization.claims.target.replica()
+            || existing.claims.build_id != authorization.claims.build_id
+    });
+    registry.builds.push(authorization);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_peer_authorization_for_wire(
+    local: &ReplicaIdentity,
+    authorization: Option<&PeerSessionAuthorizationV1>,
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+    previous_configuration_id: Option<&ConfigurationId>,
+    current_configuration_id: &ConfigurationId,
+    sender_session: &ProcessSessionId,
+    receiver_session: &ProcessSessionId,
+) -> Result<()> {
+    let settings = registered_public_authorization_settings(local);
+    let Some(settings) = settings else {
+        return if authorization.is_none() {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidReplication(
+                "signed peer authorization lacks immutable local trust".into(),
+            ))
+        };
+    };
+    let authorization = authorization.ok_or_else(|| {
+        RuntimeError::InvalidReplication("public-v1 replication requires peer authorization".into())
+    })?;
+    settings
+        .trust
+        .verification_key
+        .verify_peer_session_authorization(authorization)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    let claims = &authorization.claims;
+    if claims.resource_uid != settings.trust.resource_uid
+        || claims.protocol_generation != settings.trust.protocol_generation
+        || claims.key_id != settings.trust.key_id
+        || claims.epoch != epoch
+        || claims.current_configuration_id != *current_configuration_id
+        || claims.previous_configuration_id.as_ref() != previous_configuration_id
+        || claims.primary.replica != *sender
+        || claims.secondary.replica != *receiver
+        || claims.primary.process_session_id != *sender_session
+        || claims.secondary.process_session_id != *receiver_session
+    {
+        return Err(RuntimeError::InvalidReplication(
+            "peer authorization differs from the exact replication envelope".into(),
+        ));
+    }
+    let local_endpoint = if local == sender {
+        &claims.primary
+    } else if local == receiver {
+        &claims.secondary
+    } else {
+        return Err(RuntimeError::InvalidReplication(
+            "peer authorization does not contain the local identity".into(),
+        ));
+    };
+    if local_endpoint.replication_address != settings.replication_address {
+        return Err(RuntimeError::InvalidReplication(
+            "peer authorization changed the local replication address".into(),
+        ));
+    }
+    if let Some(context) = registered_public_authorization_context(local)
+        && (context.history != claims.history
+            || context.process_session_id != local_endpoint.process_session_id)
+    {
+        return Err(RuntimeError::InvalidReplication(
+            "peer authorization differs from local history or process session".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn outbound_peer_authorization(
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+    previous_configuration_id: Option<&ConfigurationId>,
+    current_configuration_id: &ConfigurationId,
+    sender_session: &ProcessSessionId,
+    receiver_session: &ProcessSessionId,
+) -> Result<Option<Vec<u8>>> {
+    let Some(_) = registered_public_authorization_settings(sender) else {
+        return Ok(None);
+    };
+    let authorization = {
+        let registry = public_authorization_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry.revoked_peers.contains(receiver) {
+            return Err(RuntimeError::InvalidReplication(
+                "peer authorization was withdrawn".into(),
+            ));
+        }
+        registry
+            .peers
+            .iter()
+            .rev()
+            .find(|authorization| {
+                authorization.claims.primary.replica == *sender
+                    && authorization.claims.secondary.replica == *receiver
+                    && authorization.claims.epoch == epoch
+                    && authorization.claims.current_configuration_id == *current_configuration_id
+                    && authorization.claims.previous_configuration_id.as_ref()
+                        == previous_configuration_id
+            })
+            .cloned()
+    }
+    .ok_or_else(|| {
+        RuntimeError::InvalidReplication(
+            "public-v1 replication lacks an admitted peer authorization".into(),
+        )
+    })?;
+    validate_peer_authorization_for_wire(
+        sender,
+        Some(&authorization),
+        sender,
+        receiver,
+        epoch,
+        previous_configuration_id,
+        current_configuration_id,
+        sender_session,
+        receiver_session,
+    )?;
+    authorization
+        .canonical_bytes()
+        .map(Some)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_inbound_peer_authorization(
+    local: &ReplicaIdentity,
+    authorization: Option<PeerSessionAuthorizationV1>,
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+    previous_configuration_id: Option<&ConfigurationId>,
+    current_configuration_id: &ConfigurationId,
+    sender_session: &ProcessSessionId,
+    receiver_session: &ProcessSessionId,
+) -> Result<()> {
+    validate_peer_authorization_for_wire(
+        local,
+        authorization.as_ref(),
+        sender,
+        receiver,
+        epoch,
+        previous_configuration_id,
+        current_configuration_id,
+        sender_session,
+        receiver_session,
+    )?;
+    if let Some(authorization) = authorization {
+        let mut registry = public_authorization_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.peers.retain(|existing| {
+            existing.claims.primary.replica != authorization.claims.primary.replica
+                || existing.claims.secondary.replica != authorization.claims.secondary.replica
+                || existing.claims.current_configuration_id
+                    != authorization.claims.current_configuration_id
+                || existing.claims.previous_configuration_id
+                    != authorization.claims.previous_configuration_id
+        });
+        registry.peers.push(authorization);
+    }
+    Ok(())
+}
+
+pub(crate) fn response_peer_authorization(
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+    previous_configuration_id: Option<&ConfigurationId>,
+    current_configuration_id: &ConfigurationId,
+) -> Result<Option<Vec<u8>>> {
+    let local = if registered_public_authorization_settings(sender).is_some() {
+        sender
+    } else if registered_public_authorization_settings(receiver).is_some() {
+        receiver
+    } else {
+        return Ok(None);
+    };
+    let authorization = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .peers
+        .iter()
+        .rev()
+        .find(|authorization| {
+            authorization.claims.primary.replica == *sender
+                && authorization.claims.secondary.replica == *receiver
+                && authorization.claims.epoch == epoch
+                && authorization.claims.current_configuration_id == *current_configuration_id
+                && authorization.claims.previous_configuration_id.as_ref()
+                    == previous_configuration_id
+        })
+        .cloned()
+        .ok_or_else(|| {
+            RuntimeError::InvalidReplication(
+                "public-v1 acknowledgement lacks peer authorization".into(),
+            )
+        })?;
+    validate_peer_authorization_for_wire(
+        local,
+        Some(&authorization),
+        sender,
+        receiver,
+        epoch,
+        previous_configuration_id,
+        current_configuration_id,
+        &authorization.claims.primary.process_session_id,
+        &authorization.claims.secondary.process_session_id,
+    )?;
+    authorization
+        .canonical_bytes()
+        .map(Some)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_build_authorization_for_wire(
+    local: &ReplicaIdentity,
+    authorization: Option<&BuildAuthorizationV1>,
+    resource_uid: Option<&ResourceUid>,
+    operation_id: &OperationId,
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+    sender_session: &ProcessSessionId,
+    receiver_session: &ProcessSessionId,
+) -> Result<()> {
+    let settings = registered_public_authorization_settings(local);
+    let Some(settings) = settings else {
+        return if authorization.is_none() {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidReplication(
+                "signed build authorization lacks immutable local trust".into(),
+            ))
+        };
+    };
+    let authorization = authorization.ok_or_else(|| {
+        RuntimeError::InvalidReplication("public-v1 copy requires build authorization".into())
+    })?;
+    settings
+        .trust
+        .verification_key
+        .verify_build_authorization(authorization)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    let claims = &authorization.claims;
+    if claims.resource_uid != settings.trust.resource_uid
+        || resource_uid.is_some_and(|resource_uid| resource_uid != &claims.resource_uid)
+        || claims.protocol_generation != settings.trust.protocol_generation
+        || claims.key_id != settings.trust.key_id
+        || claims.epoch != epoch
+        || claims.operation_id != *operation_id
+        || claims.build_id != *operation_id
+        || claims.source.storage_incarnation.replica != *sender
+        || claims.target.storage_incarnation.replica != *receiver
+        || claims.source.process_session_id != *sender_session
+        || claims.target.process_session_id != *receiver_session
+    {
+        return Err(RuntimeError::InvalidReplication(
+            "build authorization differs from the exact copy envelope".into(),
+        ));
+    }
+    let local_endpoint = if local == sender {
+        &claims.source
+    } else if local == receiver {
+        &claims.target
+    } else {
+        return Err(RuntimeError::InvalidReplication(
+            "build authorization does not contain the local identity".into(),
+        ));
+    };
+    if local_endpoint.replication_address != settings.replication_address {
+        return Err(RuntimeError::InvalidReplication(
+            "build authorization changed the local replication address".into(),
+        ));
+    }
+    if let Some(context) = registered_public_authorization_context(local)
+        && (context.history != claims.history
+            || context.storage_incarnation != local_endpoint.storage_incarnation
+            || context.process_session_id != local_endpoint.process_session_id)
+    {
+        return Err(RuntimeError::InvalidReplication(
+            "build authorization differs from local history, storage, or process session".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn outbound_build_authorization(
+    operation_id: &OperationId,
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+    sender_session: &ProcessSessionId,
+    receiver_session: &ProcessSessionId,
+) -> Result<Option<Vec<u8>>> {
+    let Some(_) = registered_public_authorization_settings(sender) else {
+        return Ok(None);
+    };
+    let authorization = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .builds
+        .iter()
+        .rev()
+        .find(|authorization| {
+            authorization.claims.build_id == *operation_id
+                && authorization.claims.source.storage_incarnation.replica == *sender
+                && authorization.claims.target.storage_incarnation.replica == *receiver
+                && authorization.claims.epoch == epoch
+        })
+        .cloned()
+        .ok_or_else(|| {
+            RuntimeError::InvalidReplication(
+                "public-v1 copy lacks an admitted build authorization".into(),
+            )
+        })?;
+    validate_build_authorization_for_wire(
+        sender,
+        Some(&authorization),
+        None,
+        operation_id,
+        sender,
+        receiver,
+        epoch,
+        sender_session,
+        receiver_session,
+    )?;
+    authorization
+        .canonical_bytes()
+        .map(Some)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_inbound_build_authorization(
+    local: &ReplicaIdentity,
+    authorization: Option<BuildAuthorizationV1>,
+    resource_uid: Option<&ResourceUid>,
+    operation_id: &OperationId,
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+    sender_session: &ProcessSessionId,
+    receiver_session: &ProcessSessionId,
+) -> Result<()> {
+    validate_build_authorization_for_wire(
+        local,
+        authorization.as_ref(),
+        resource_uid,
+        operation_id,
+        sender,
+        receiver,
+        epoch,
+        sender_session,
+        receiver_session,
+    )?;
+    if let Some(authorization) = authorization {
+        let mut registry = public_authorization_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.builds.retain(|existing| {
+            existing.claims.build_id != authorization.claims.build_id
+                || existing.claims.source.replica() != authorization.claims.source.replica()
+                || existing.claims.target.replica() != authorization.claims.target.replica()
+        });
+        registry.builds.push(authorization);
+    }
+    Ok(())
+}
+
+pub(crate) fn response_build_authorization(
+    operation_id: &OperationId,
+    sender: &ReplicaIdentity,
+    receiver: &ReplicaIdentity,
+    epoch: Epoch,
+) -> Result<Option<Vec<u8>>> {
+    let local = if registered_public_authorization_settings(sender).is_some() {
+        sender
+    } else if registered_public_authorization_settings(receiver).is_some() {
+        receiver
+    } else {
+        return Ok(None);
+    };
+    let authorization = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .builds
+        .iter()
+        .rev()
+        .find(|authorization| {
+            authorization.claims.build_id == *operation_id
+                && authorization.claims.source.storage_incarnation.replica == *sender
+                && authorization.claims.target.storage_incarnation.replica == *receiver
+                && authorization.claims.epoch == epoch
+        })
+        .cloned()
+        .ok_or_else(|| {
+            RuntimeError::InvalidReplication(
+                "public-v1 copy acknowledgement lacks build authorization".into(),
+            )
+        })?;
+    validate_build_authorization_for_wire(
+        local,
+        Some(&authorization),
+        None,
+        operation_id,
+        sender,
+        receiver,
+        epoch,
+        &authorization.claims.source.process_session_id,
+        &authorization.claims.target.process_session_id,
+    )?;
+    authorization
+        .canonical_bytes()
+        .map(Some)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))
+}
+
+pub(crate) fn has_public_authorization_trust(identity: &ReplicaIdentity) -> bool {
+    registered_public_authorization_settings(identity).is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn testing_register_public_authorization(
+    identity: ReplicaIdentity,
+    replication_address: String,
+    trust: PublicAuthorizationTrust,
+    context: Option<PublicAuthorizationRuntimeContext>,
+) -> Result<()> {
+    let owner = ReplicatorCreationIdentity::new(RuntimeHostToken::new());
+    register_public_authorization_settings(
+        owner,
+        identity,
+        &ReplicatorSettings {
+            replication_address,
+            public_authorization: Some(trust),
+        },
+    )?;
+    if let Some(context) = context {
+        bind_public_authorization_context(context)?;
+    }
+    Ok(())
 }
 
 /// Rust's explicit counterpart of obtaining coherent interfaces from CreateReplicator.
@@ -518,11 +1377,19 @@ struct ManagedReplicatorCapabilities {
     data_plane: Arc<dyn ManagedReplicatorDataPlane>,
 }
 
+#[derive(Clone)]
+struct BoundReplicatorSettings {
+    identity: ReplicaIdentity,
+    owner: ReplicatorCreationIdentity,
+    settings: ReplicatorSettings,
+}
+
 struct ReplicatorCreation {
     identity: OnceLock<ReplicatorCreationIdentity>,
     guarded_control: StdMutex<Arc<dyn Replicator>>,
     capabilities: ReplicatorCapabilities,
     managed: Option<ManagedReplicatorCapabilities>,
+    settings: StdMutex<Option<BoundReplicatorSettings>>,
     armed: AtomicBool,
 }
 
@@ -544,6 +1411,7 @@ impl ReplicatorCreation {
             guarded_control: StdMutex::new(guarded_control),
             capabilities,
             managed,
+            settings: StdMutex::new(None),
             armed: AtomicBool::new(true),
         }
     }
@@ -571,12 +1439,79 @@ impl ReplicatorCreation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guarded = control;
     }
+
+    fn bind_settings(&self, identity: ReplicaIdentity, settings: ReplicatorSettings) -> Result<()> {
+        settings.validate()?;
+        let owner = *self
+            .identity
+            .get()
+            .ok_or_else(|| RuntimeError::Application("replicator identity is not bound".into()))?;
+        let mut bound = self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = bound.as_ref() {
+            if existing.identity != identity
+                || existing.owner != owner
+                || existing.settings.public_authorization != settings.public_authorization
+            {
+                return Err(RuntimeError::Application(
+                    "replicator registration cannot change identity or public trust".into(),
+                ));
+            }
+            return Ok(());
+        }
+        register_public_authorization_settings(owner, identity.clone(), &settings)?;
+        *bound = Some(BoundReplicatorSettings {
+            identity,
+            owner,
+            settings,
+        });
+        Ok(())
+    }
+
+    fn validate_settings_update(&self, settings: &ReplicatorSettings) -> Result<()> {
+        settings.validate()?;
+        let bound = self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing = bound.as_ref().ok_or_else(|| {
+            RuntimeError::Application("replicator settings are not registration-bound".into())
+        })?;
+        if existing.settings.public_authorization != settings.public_authorization {
+            return Err(RuntimeError::Application(
+                "replicator settings cannot change trust or protocol generation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn complete_settings_update(&self, settings: ReplicatorSettings) -> Result<()> {
+        let mut bound = self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing = bound.as_mut().ok_or_else(|| {
+            RuntimeError::Application("replicator settings are not registration-bound".into())
+        })?;
+        update_public_authorization_settings(existing.owner, &existing.identity, &settings)?;
+        existing.settings = settings;
+        Ok(())
+    }
 }
 
 impl Drop for ReplicatorCreation {
     fn drop(&mut self) {
         if !self.armed.load(Ordering::Acquire) {
             return;
+        }
+        if let Some(settings) = self
+            .settings
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            unregister_public_authorization_settings(settings.owner);
         }
         let control = self
             .guarded_control
@@ -589,6 +1524,46 @@ impl Drop for ReplicatorCreation {
             managed.data_plane.abort();
         }
     }
+}
+
+struct ProtectedStateReplicator {
+    inner: Arc<dyn StateReplicator>,
+    creation: Arc<ReplicatorCreation>,
+}
+
+#[async_trait]
+impl StateReplicator for ProtectedStateReplicator {
+    async fn replicate(&self, data: OperationData) -> Result<Lsn> {
+        self.inner.replicate(data).await
+    }
+
+    async fn get_replication_stream(&self) -> Result<OperationStream> {
+        self.inner.get_replication_stream().await
+    }
+
+    async fn get_copy_stream(&self) -> Result<OperationStream> {
+        self.inner.get_copy_stream().await
+    }
+
+    async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()> {
+        self.creation.validate_settings_update(&settings)?;
+        self.inner
+            .update_replicator_settings(settings.clone())
+            .await?;
+        self.creation.complete_settings_update(settings)
+    }
+}
+
+fn protect_state_replicator(
+    state_replicator: Option<Arc<dyn StateReplicator>>,
+    creation: &Arc<ReplicatorCreation>,
+) -> Option<Arc<dyn StateReplicator>> {
+    state_replicator.map(|inner| {
+        Arc::new(ProtectedStateReplicator {
+            inner,
+            creation: creation.clone(),
+        }) as Arc<dyn StateReplicator>
+    })
 }
 
 #[doc(hidden)]
@@ -665,6 +1640,7 @@ impl ReplicatorInterfaces {
             capabilities,
             None,
         ));
+        let state_replicator = protect_state_replicator(state_replicator, &creation);
         Self {
             replicator,
             state_replicator,
@@ -689,6 +1665,7 @@ impl ReplicatorInterfaces {
             capabilities,
             None,
         ));
+        let state_replicator = protect_state_replicator(state_replicator, &creation);
         Self {
             replicator,
             state_replicator,
@@ -721,6 +1698,7 @@ impl ReplicatorInterfaces {
                 data_plane,
             }),
         ));
+        let state_replicator = protect_state_replicator(state_replicator, &creation);
         Self {
             replicator,
             state_replicator,
@@ -765,6 +1743,7 @@ impl ReplicatorInterfaces {
         let replicator: Arc<dyn Replicator> = primary_replicator.clone();
         let primary_replicator: Arc<dyn PrimaryReplicator> = primary_replicator;
         self.creation.replace_guarded_control(replicator.clone());
+        let state_replicator = protect_state_replicator(state_replicator, &self.creation);
         Self {
             replicator,
             state_replicator,
@@ -998,12 +1977,9 @@ impl StatefulServicePartition {
         })?;
         let reservation = self.registration.reserve_replicator_creation()?;
         let context = self.context.for_creation(reservation);
+        let settings = settings.unwrap_or_default();
         let interfaces = match factory
-            .create_replicator(
-                context,
-                state_provider.clone(),
-                settings.unwrap_or_default(),
-            )
+            .create_replicator(context, state_provider.clone(), settings.clone())
             .await
         {
             Ok(interfaces) => interfaces,
@@ -1019,6 +1995,13 @@ impl StatefulServicePartition {
                 return Err(error);
             }
         };
+        if let Err(error) = interfaces
+            .creation
+            .bind_settings(self.context.identity.clone(), settings)
+        {
+            self.registration.cancel_replicator_creation(reservation);
+            return Err(error);
+        }
         if let Err(error) = self
             .registration
             .register_interfaces(&attachment, state_provider, reservation)
@@ -1168,6 +2151,9 @@ impl PrimaryReplicator for DefaultReplicator {
         current: ReplicaSetConfiguration,
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
+        for replica in current.replicas.iter().chain(&previous.replicas) {
+            replica.validate_public_progress()?;
+        }
         self.engine
             .configure_replicas(current.configuration, Some(previous.configuration))
             .await
@@ -1181,12 +2167,16 @@ impl PrimaryReplicator for DefaultReplicator {
         &self,
         current: ReplicaSetConfiguration,
     ) -> Result<()> {
+        for replica in &current.replicas {
+            replica.validate_public_progress()?;
+        }
         self.engine
             .configure_replicas(current.configuration, None)
             .await
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        replica.validate_public_progress()?;
         self.engine.wait_for_build(replica).await
     }
 

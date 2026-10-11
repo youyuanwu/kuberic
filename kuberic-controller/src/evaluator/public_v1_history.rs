@@ -58,6 +58,7 @@ pub fn ensure_bootstrap_history(
         history,
         data_loss_recovery: None,
         completed_operations: Vec::new(),
+        authorization: None,
         extensions: Default::default(),
     })
 }

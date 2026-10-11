@@ -10072,6 +10072,7 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     let primary_app = Arc::new(TestApplication::default());
     *primary_app.settings.lock().unwrap() = Some(ReplicatorSettings {
         replication_address: "replication://primary".into(),
+        public_authorization: None,
     });
     let source = open_primary(primary_app.clone(), members.clone()).await;
     assert_eq!(
@@ -10107,6 +10108,7 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     state
         .update_replicator_settings(ReplicatorSettings {
             replication_address: "replication://updated".into(),
+            public_authorization: None,
         })
         .await
         .unwrap();

@@ -260,6 +260,44 @@ impl ReplicaStorageIncarnationContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessSessionRenewalReason {
+    PrimaryReplacement,
+    ActiveSecondaryReplacement,
+    PeerAuthorizationWithdrawal,
+    DataLossAttempt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessSessionEndpoint {
+    pub identity: ReplicaIdentity,
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    pub process_session_id: ProcessSessionId,
+    pub replicator_creation_id: ReplicatorCreationId,
+    pub role: ReplicaRole,
+}
+
+impl ProcessSessionEndpoint {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.identity.replica_id.value() <= 0
+            || self.identity.instance_id.is_empty()
+            || self.identity.agent_generation.is_empty()
+        {
+            return Err("process-session endpoint identity is incomplete");
+        }
+        self.storage_incarnation.validate()?;
+        if self.storage_incarnation.replica != self.identity
+            || self.process_session_id.is_empty()
+            || self.replicator_creation_id.is_empty()
+        {
+            return Err("process-session endpoint is incomplete or inconsistent");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryContext {

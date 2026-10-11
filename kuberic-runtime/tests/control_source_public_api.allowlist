@@ -17,6 +17,7 @@ private-path documented fn crate::protocol::validation::scale_up::fn validate_sc
 private-path documented fn crate::protocol::validation::scale_up::fn validate_scale_up_receipt (receipt : & ScaleUpReceipt) -> Result
 public-path documented const crate::protocol::PROTOCOL_VERSION: u32
 public-path documented enum crate::control::convert::WireError
+public-path documented enum crate::protocol::authorization::AuthorizationError
 public-path documented enum crate::protocol::command::EffectClass
 public-path documented enum crate::protocol::command::KubernetesChange
 public-path documented enum crate::protocol::command::ProtocolCommand
@@ -31,6 +32,7 @@ public-path documented enum crate::protocol::types::ConditionStatus
 public-path documented enum crate::protocol::types::FaultType
 public-path documented enum crate::protocol::types::PlannedSwitchoverOutcome
 public-path documented enum crate::protocol::types::PlannedSwitchoverResolution
+public-path documented enum crate::protocol::types::ProcessSessionRenewalReason
 public-path documented enum crate::protocol::types::ProvisioningKind
 public-path documented enum crate::protocol::types::ReplicaRole
 public-path documented enum crate::protocol::types::ReplicaStorageIdentity
@@ -39,6 +41,7 @@ public-path documented enum crate::protocol::types::ScaleUpStage
 public-path documented enum crate::protocol::types::SecondaryRemovalStage
 public-path documented enum crate::protocol::types::TransitionKind
 public-path documented enum crate::protocol::validation::ValidationError
+public-path documented field crate::control::convert::CopyAcknowledgement::build_authorization: Option < BuildAuthorizationV1 >
 public-path documented field crate::control::convert::CopyAcknowledgement::build_id: OperationId
 public-path documented field crate::control::convert::CopyAcknowledgement::catch_up_boundary_lsn: Option < i64 >
 public-path documented field crate::control::convert::CopyAcknowledgement::current_configuration_id: ConfigurationId
@@ -50,6 +53,7 @@ public-path documented field crate::control::convert::CopyAcknowledgement::repli
 public-path documented field crate::control::convert::CopyAcknowledgement::sender: ReplicaIdentity
 public-path documented field crate::control::convert::CopyAcknowledgement::sequence: u64
 public-path documented field crate::control::convert::CopyAcknowledgement::snapshot_chunk: bool
+public-path documented field crate::control::convert::CopyEnvelope::build_authorization: Option < BuildAuthorizationV1 >
 public-path documented field crate::control::convert::CopyEnvelope::build_id: OperationId
 public-path documented field crate::control::convert::CopyEnvelope::catch_up_boundary_lsn: Option < i64 >
 public-path documented field crate::control::convert::CopyEnvelope::committed_lsn: i64
@@ -71,6 +75,7 @@ public-path documented field crate::control::convert::ReplicationAcknowledgement
 public-path documented field crate::control::convert::ReplicationAcknowledgement::committed_lsn: i64
 public-path documented field crate::control::convert::ReplicationAcknowledgement::current_configuration_id: ConfigurationId
 public-path documented field crate::control::convert::ReplicationAcknowledgement::epoch: Epoch
+public-path documented field crate::control::convert::ReplicationAcknowledgement::peer_authorization: Option < PeerSessionAuthorizationV1 >
 public-path documented field crate::control::convert::ReplicationAcknowledgement::previous_configuration_id: Option < ConfigurationId >
 public-path documented field crate::control::convert::ReplicationAcknowledgement::received_lsn: i64
 public-path documented field crate::control::convert::ReplicationAcknowledgement::receiver: ReplicaIdentity
@@ -80,9 +85,41 @@ public-path documented field crate::control::convert::ReplicationEnvelope::curre
 public-path documented field crate::control::convert::ReplicationEnvelope::data: Vec < u8 >
 public-path documented field crate::control::convert::ReplicationEnvelope::epoch: Epoch
 public-path documented field crate::control::convert::ReplicationEnvelope::lsn: i64
+public-path documented field crate::control::convert::ReplicationEnvelope::peer_authorization: Option < PeerSessionAuthorizationV1 >
 public-path documented field crate::control::convert::ReplicationEnvelope::previous_configuration_id: Option < ConfigurationId >
 public-path documented field crate::control::convert::ReplicationEnvelope::receiver: ReplicaIdentity
 public-path documented field crate::control::convert::ReplicationEnvelope::sender: ReplicaIdentity
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::build_id: OperationId
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::epoch: Epoch
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::history: HistoryContext
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::key_id: AuthorizationKeyId
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::operation_id: OperationId
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::protocol_generation: PublicProtocolGeneration
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::resource_uid: ResourceUid
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::source: BuildAuthorizationEndpointV1
+public-path documented field crate::protocol::authorization::BuildAuthorizationClaimsV1::target: BuildAuthorizationEndpointV1
+public-path documented field crate::protocol::authorization::BuildAuthorizationEndpointV1::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::authorization::BuildAuthorizationEndpointV1::replication_address: String
+public-path documented field crate::protocol::authorization::BuildAuthorizationEndpointV1::role: ReplicaRole
+public-path documented field crate::protocol::authorization::BuildAuthorizationEndpointV1::storage_incarnation: ReplicaStorageIncarnationContext
+public-path documented field crate::protocol::authorization::BuildAuthorizationV1::claims: BuildAuthorizationClaimsV1
+public-path documented field crate::protocol::authorization::BuildAuthorizationV1::signature: AuthorizationSignature
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::configuration_revision: u64
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::current_configuration_id: ConfigurationId
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::epoch: Epoch
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::history: HistoryContext
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::key_id: AuthorizationKeyId
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::previous_configuration_id: Option < ConfigurationId >
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::primary: PeerSessionEndpointV1
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::protocol_generation: PublicProtocolGeneration
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::resource_uid: ResourceUid
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::secondary: PeerSessionEndpointV1
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationV1::claims: PeerSessionAuthorizationClaimsV1
+public-path documented field crate::protocol::authorization::PeerSessionAuthorizationV1::signature: AuthorizationSignature
+public-path documented field crate::protocol::authorization::PeerSessionEndpointV1::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::authorization::PeerSessionEndpointV1::replica: ReplicaIdentity
+public-path documented field crate::protocol::authorization::PeerSessionEndpointV1::replication_address: String
+public-path documented field crate::protocol::authorization::PeerSessionEndpointV1::role: ReplicaRole
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::committed: crate :: protocol :: types :: SecondaryScaleDownCleanup
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::local_recovery: bool
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::operation_id: OperationId
@@ -310,6 +347,11 @@ public-path documented field crate::protocol::types::PlannedSwitchoverRequest::r
 public-path documented field crate::protocol::types::PlannedSwitchoverRequest::target_replica_id: ReplicaId
 public-path documented field crate::protocol::types::PrimaryFailureObservation::primary: ReplicaIdentity
 public-path documented field crate::protocol::types::PrimaryFailureObservation::started_at_unix_seconds: i64
+public-path documented field crate::protocol::types::ProcessSessionEndpoint::identity: ReplicaIdentity
+public-path documented field crate::protocol::types::ProcessSessionEndpoint::process_session_id: ProcessSessionId
+public-path documented field crate::protocol::types::ProcessSessionEndpoint::replicator_creation_id: ReplicatorCreationId
+public-path documented field crate::protocol::types::ProcessSessionEndpoint::role: ReplicaRole
+public-path documented field crate::protocol::types::ProcessSessionEndpoint::storage_incarnation: ReplicaStorageIncarnationContext
 public-path documented field crate::protocol::types::ProvisioningIntent::operation_id: OperationId
 public-path documented field crate::protocol::types::ProvisioningIntent::pod_uid: PodUid
 public-path documented field crate::protocol::types::ProvisioningIntent::purpose: ProvisioningPurpose
@@ -512,6 +554,37 @@ public-path documented fn crate::protocol::validation::fn validate_report_intern
 public-path documented fn crate::protocol::validation::fn validate_snapshot (snapshot : & ObservationSnapshot) -> Result < () , ValidationError >
 public-path documented fn crate::protocol::validation::fn validate_status (status : & AcceptedStatus) -> Result < () , ValidationError >
 public-path documented fn crate::protocol::validation::fn validate_transition_relationship (kind : TransitionKind , previous : Option < & ConfigurationDescriptor > , current : & ConfigurationDescriptor , policy : & EffectivePolicy ,) -> Result < () , ValidationError >
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::const fn to_bytes (self) -> [u8 ; 32]
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::fn as_bytes (& self) -> & [u8 ; 32]
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::fn from_base64 (encoded : & str) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::fn from_bytes (bytes : [u8 ; 32]) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::fn key_id (self) -> AuthorizationKeyId
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::fn to_base64 (self) -> String
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::fn verify_build_authorization (self , authorization : & BuildAuthorizationV1 ,) -> Result < () , AuthorizationError >
+public-path documented impl crate::protocol::authorization::AuthorizationVerificationKey::fn verify_peer_session_authorization (self , authorization : & PeerSessionAuthorizationV1 ,) -> Result < () , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationClaimsV1::fn canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationClaimsV1::fn from_canonical_bytes (bytes : & [u8]) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationClaimsV1::fn signing_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationClaimsV1::fn to_canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationClaimsV1::fn validate (& self) -> Result < () , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationEndpointV1::fn replica (& self) -> & ReplicaIdentity
+public-path documented impl crate::protocol::authorization::BuildAuthorizationV1::fn audit_digest (& self) -> Result < AuthorizationAuditDigest , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationV1::fn canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationV1::fn from_canonical_bytes (bytes : & [u8]) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationV1::fn from_signature (claims : BuildAuthorizationClaimsV1 , signature : AuthorizationSignature ,) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationV1::fn to_canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::BuildAuthorizationV1::fn verify (& self , verification_key : & AuthorizationVerificationKey ,) -> Result < () , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::fn canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::fn from_canonical_bytes (bytes : & [u8]) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::fn signing_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::fn to_canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationClaimsV1::fn validate (& self) -> Result < () , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationV1::fn audit_digest (& self) -> Result < AuthorizationAuditDigest , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationV1::fn canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationV1::fn from_canonical_bytes (bytes : & [u8]) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationV1::fn from_signature (claims : PeerSessionAuthorizationClaimsV1 , signature : AuthorizationSignature ,) -> Result < Self , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationV1::fn to_canonical_bytes (& self) -> Result < Vec < u8 > , AuthorizationError >
+public-path documented impl crate::protocol::authorization::PeerSessionAuthorizationV1::fn verify (& self , verification_key : & AuthorizationVerificationKey ,) -> Result < () , AuthorizationError >
 public-path documented impl crate::protocol::command::EnsureConfiguration::fn is_switchover_restoration (& self) -> bool
 public-path documented impl crate::protocol::command::ProtocolCommand::fn effect_class (& self) -> EffectClass
 public-path documented impl crate::protocol::observation::KubernetesReplicaObservation::fn has_exact_scaffolding (& self) -> bool
@@ -532,6 +605,7 @@ public-path documented impl crate::protocol::types::Epoch::const fn new (data_lo
 public-path documented impl crate::protocol::types::HistoryContext::fn compare_progress (& self , progress : i64 , other : & Self , other_progress : i64 ,) -> Option < std :: cmp :: Ordering >
 public-path documented impl crate::protocol::types::HistoryContext::fn is_comparable_with (& self , other : & Self) -> bool
 public-path documented impl crate::protocol::types::HistoryContext::fn validate (& self) -> Result < () , & 'static str >
+public-path documented impl crate::protocol::types::ProcessSessionEndpoint::fn validate (& self) -> Result < () , & 'static str >
 public-path documented impl crate::protocol::types::ProvisioningIntent::fn assigned_agent_generation (& self , resource_uid : & ResourceUid) -> AgentGeneration
 public-path documented impl crate::protocol::types::ProvisioningIntent::fn expected_operation_id (& self) -> OperationId
 public-path documented impl crate::protocol::types::ProvisioningIntent::fn initialization_id (& self , resource_uid : & ResourceUid) -> InitializationId
@@ -575,6 +649,7 @@ public-path documented module crate::control
 public-path documented module crate::control::convert
 public-path documented module crate::control::proto
 public-path documented module crate::protocol
+public-path documented module crate::protocol::authorization
 public-path documented module crate::protocol::command
 public-path documented module crate::protocol::observation
 public-path documented module crate::protocol::types
@@ -584,6 +659,13 @@ public-path documented struct crate::control::convert::CopyEnvelope
 public-path documented struct crate::control::convert::ExecuteEnvelope
 public-path documented struct crate::control::convert::ReplicationAcknowledgement
 public-path documented struct crate::control::convert::ReplicationEnvelope
+public-path documented struct crate::protocol::authorization::AuthorizationVerificationKey
+public-path documented struct crate::protocol::authorization::BuildAuthorizationClaimsV1
+public-path documented struct crate::protocol::authorization::BuildAuthorizationEndpointV1
+public-path documented struct crate::protocol::authorization::BuildAuthorizationV1
+public-path documented struct crate::protocol::authorization::PeerSessionAuthorizationClaimsV1
+public-path documented struct crate::protocol::authorization::PeerSessionAuthorizationV1
+public-path documented struct crate::protocol::authorization::PeerSessionEndpointV1
 public-path documented struct crate::protocol::command::AcceptSecondaryRemovalCommit
 public-path documented struct crate::protocol::command::EnsureConfiguration
 public-path documented struct crate::protocol::command::EnsureReplicaBuild
@@ -617,6 +699,7 @@ public-path documented struct crate::protocol::types::PlannedSwitchoverIntent
 public-path documented struct crate::protocol::types::PlannedSwitchoverReceipt
 public-path documented struct crate::protocol::types::PlannedSwitchoverRequest
 public-path documented struct crate::protocol::types::PrimaryFailureObservation
+public-path documented struct crate::protocol::types::ProcessSessionEndpoint
 public-path documented struct crate::protocol::types::ProvisioningIntent
 public-path documented struct crate::protocol::types::ProvisioningPurpose
 public-path documented struct crate::protocol::types::PublicProtocolGeneration
@@ -648,6 +731,9 @@ public-path documented struct crate::protocol::types::StatusCondition
 public-path documented struct crate::protocol::types::SwitchoverHandoff
 public-path documented struct crate::protocol::types::SwitchoverPreparationId
 public-path documented struct crate::protocol::types::TransitionIntent
+public-path documented type crate::protocol::authorization::AuthorizationPublicKey = AuthorizationVerificationKey
+public-path documented type crate::protocol::authorization::BuildAuthorizationEnvelopeV1 = BuildAuthorizationV1
+public-path documented type crate::protocol::authorization::PeerSessionAuthorizationEnvelopeV1 = PeerSessionAuthorizationV1
 public-path documented use crate::control::convert :: { CopyAcknowledgement , CopyEnvelope , ExecuteEnvelope , ReplicationAcknowledgement , ReplicationEnvelope , WireError , configuration_command_to_proto , ensure_supported_version , normalize_agent_status_report , normalize_copy_ack , normalize_copy_item , normalize_execute_request , normalize_public_v1_agent_status_report , normalize_replication_ack , normalize_replication_item , public_v1_agent_status_to_proto , validate_agent_status_report , validate_copy_ack , validate_copy_item , validate_execute_request , validate_replication_ack , validate_replication_item , }
 public-path documented use crate::protocol::validation::scale_down :: *
 public-path documented use crate::protocol::validation::scale_up :: *
@@ -655,6 +741,22 @@ public-path documented variant crate::control::convert::WireError::InvalidAuthor
 public-path documented variant crate::control::convert::WireError::InvalidEnum { { field : & 'static str , value : i32 } }
 public-path documented variant crate::control::convert::WireError::MissingField((& 'static str))
 public-path documented variant crate::control::convert::WireError::UnsupportedProtocolVersion { { expected : u32 , observed : u32 } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::Duplicate { { field : & 'static str } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::FieldTooLong { { field : & 'static str } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::InvalidBase64 { { field : & 'static str } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::InvalidClaims((& 'static str))
+public-path documented variant crate::protocol::authorization::AuthorizationError::InvalidLength { { field : & 'static str , expected : usize , actual : usize , } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::InvalidPublicKey
+public-path documented variant crate::protocol::authorization::AuthorizationError::InvalidSignature
+public-path documented variant crate::protocol::authorization::AuthorizationError::InvalidUtf8 { { field : & 'static str } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::KeyIdMismatch
+public-path documented variant crate::protocol::authorization::AuthorizationError::NonCanonicalEncoding((& 'static str))
+public-path documented variant crate::protocol::authorization::AuthorizationError::PayloadReencodingMismatch((& 'static str))
+public-path documented variant crate::protocol::authorization::AuthorizationError::TrailingBytes
+public-path documented variant crate::protocol::authorization::AuthorizationError::Truncated { { field : & 'static str } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::UnknownDomain { { context : & 'static str } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::UnknownTag { { field : & 'static str , tag : u8 } }
+public-path documented variant crate::protocol::authorization::AuthorizationError::UnknownVersion { { context : & 'static str , version : u8 } }
 public-path documented variant crate::protocol::command::EffectClass::ConvergentEnsure
 public-path documented variant crate::protocol::command::EffectClass::ReconfigurationAction
 public-path documented variant crate::protocol::command::EffectClass::Unsupported
@@ -716,6 +818,10 @@ public-path documented variant crate::protocol::types::PlannedSwitchoverResoluti
 public-path documented variant crate::protocol::types::PlannedSwitchoverResolution::RequestedTarget
 public-path documented variant crate::protocol::types::PlannedSwitchoverResolution::RestoringOldPrimary
 public-path documented variant crate::protocol::types::PlannedSwitchoverResolution::Unsafe
+public-path documented variant crate::protocol::types::ProcessSessionRenewalReason::ActiveSecondaryReplacement
+public-path documented variant crate::protocol::types::ProcessSessionRenewalReason::DataLossAttempt
+public-path documented variant crate::protocol::types::ProcessSessionRenewalReason::PeerAuthorizationWithdrawal
+public-path documented variant crate::protocol::types::ProcessSessionRenewalReason::PrimaryReplacement
 public-path documented variant crate::protocol::types::ProvisioningKind::Replacement
 public-path documented variant crate::protocol::types::ProvisioningKind::ScaleUp
 public-path documented variant crate::protocol::types::ReplicaRole::ActiveSecondary
@@ -814,6 +920,9 @@ public-path documented variant crate::protocol::validation::ValidationError::Uni
 public-path documented variant crate::protocol::validation::ValidationError::UnrelatedReplicaClaimsAuthority((i64))
 public-path documented variant crate::protocol::validation::ValidationError::WriteQuorumMismatch { { actual : u32 , expected : u32 } }
 public-path hidden const crate::protocol::public_operations::INVALID_LSN: i64
+public-path hidden const crate::protocol::public_operations::MAX_PUBLIC_V1_AUTHORIZATION_INTENTS: usize
+public-path hidden const crate::protocol::public_operations::MAX_PUBLIC_V1_BUILD_AUTHORIZATION_INTENTS: usize
+public-path hidden const crate::protocol::public_operations::MAX_PUBLIC_V1_PEER_AUTHORIZATION_INTENTS: usize
 public-path hidden const crate::protocol::public_operations::PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32
 public-path hidden const crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION: u32
 public-path hidden enum crate::protocol::public_operations::CanonicalOperationInputDigest
@@ -831,8 +940,14 @@ public-path hidden enum crate::protocol::public_operations::PublicOperationProgr
 public-path hidden enum crate::protocol::public_operations::PublicOperationReplayDisposition
 public-path hidden enum crate::protocol::public_operations::PublicProgressRole
 public-path hidden enum crate::protocol::public_operations::PublicServiceClearStage
+public-path hidden enum crate::protocol::public_operations::PublicSessionEpochBarrierStage
+public-path hidden enum crate::protocol::public_operations::PublicSessionRenewalStage
 public-path hidden enum crate::protocol::public_operations::PublicV1AcceptedReplayDisposition
 public-path hidden enum crate::protocol::public_operations::PublicV1AcceptedResult
+public-path hidden enum crate::protocol::public_operations::PublicV1AuthorizationCleanupDisposition
+public-path hidden enum crate::protocol::public_operations::PublicV1AuthorizationIntentKind
+public-path hidden enum crate::protocol::public_operations::PublicV1AuthorizationIntentScope
+public-path hidden enum crate::protocol::public_operations::PublicV1AuthorizationIntentStage
 public-path hidden enum crate::protocol::public_operations::PublicV1OperationResult
 public-path hidden enum crate::protocol::public_operations::ReplicaRebuildReason
 public-path hidden enum crate::protocol::public_operations::ReplicaRebuildRequired
@@ -874,6 +989,18 @@ public-path hidden field crate::protocol::public_operations::ProcessAttemptConte
 public-path hidden field crate::protocol::public_operations::ProcessAttemptContext::epoch: Epoch
 public-path hidden field crate::protocol::public_operations::ProcessAttemptContext::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::ProcessAttemptContext::replicator_creation_id: ReplicatorCreationId
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::data_loss: Option < PublicDataLossSessionRenewal >
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::fresh_configuration: ConfigurationDescriptor
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::history: HistoryContext
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::predecessor: ProcessSessionEndpoint
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::predecessor_contained: bool
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::previous_epoch: Epoch
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::reason: ProcessSessionRenewalReason
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::renewal_epoch: Epoch
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::replacement: Option < ProcessSessionEndpoint >
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::resource_uid: ResourceUid
+public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::surviving_sessions: Vec < ProcessSessionEndpoint >
 public-path hidden field crate::protocol::public_operations::ProviderReplicaIdentity::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicBuildAuthorizationReference::audit_digest: AuthorizationAuditDigest
 public-path hidden field crate::protocol::public_operations::PublicBuildAuthorizationReference::build_id: OperationId
@@ -887,6 +1014,7 @@ public-path hidden field crate::protocol::public_operations::PublicBuildAuthoriz
 public-path hidden field crate::protocol::public_operations::PublicBuildAuthorizationReference::target_storage: PvcUid
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::attempt: OperationId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::authorization: Option < PublicBuildAuthorizationReference >
+public-path hidden field crate::protocol::public_operations::PublicBuildInput::build_authorization: Option < BuildAuthorizationV1 >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::history: Option < HistoryContext >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replica: ReplicaIdentity
@@ -905,6 +1033,9 @@ public-path hidden field crate::protocol::public_operations::PublicDataLossRecov
 public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::replay_disposition: DataLossReplay
 public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::reset_scope: ProviderProgressReset
 public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::stage: PublicDataLossRecoveryStage
+public-path hidden field crate::protocol::public_operations::PublicDataLossSessionRenewal::authorization: DataLossAuthorization
+public-path hidden field crate::protocol::public_operations::PublicDataLossSessionRenewal::predecessor_attempt: DataLossAttempt
+public-path hidden field crate::protocol::public_operations::PublicDataLossSessionRenewal::replacement_attempt: DataLossAttempt
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::action_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::binding: PreviewLifecycleBinding
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::fault: FaultType
@@ -950,9 +1081,11 @@ public-path hidden field crate::protocol::public_operations::PublicProgress::las
 public-path hidden field crate::protocol::public_operations::PublicProgress::role: PublicProgressRole
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::build_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::catch_up_capability: i64
+public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::configuration_revision: Option < u64 >
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::current_progress: i64
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::identity: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::must_catchup: bool
+public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::peer_authorization: Option < PeerSessionAuthorizationV1 >
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::replication_address: String
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::role: ReplicaRole
@@ -960,6 +1093,10 @@ public-path hidden field crate::protocol::public_operations::PublicServiceClear:
 public-path hidden field crate::protocol::public_operations::PublicServiceClear::service_resource_version: Option < String >
 public-path hidden field crate::protocol::public_operations::PublicServiceClear::service_uid: Option < String >
 public-path hidden field crate::protocol::public_operations::PublicServiceClear::stage: PublicServiceClearStage
+public-path hidden field crate::protocol::public_operations::PublicSessionEpochBarrier::epoch: Epoch
+public-path hidden field crate::protocol::public_operations::PublicSessionEpochBarrier::retirement_operation_id: Option < OperationId >
+public-path hidden field crate::protocol::public_operations::PublicSessionEpochBarrier::stage: PublicSessionEpochBarrierStage
+public-path hidden field crate::protocol::public_operations::PublicSessionEpochBarrier::survivor: ProcessSessionEndpoint
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::input_digest_sha256: String
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::input_digest_version: u16
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::operation_id: OperationId
@@ -967,6 +1104,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOpe
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::result: PublicV1AcceptedResult
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::result_digest_sha256: String
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::revision: u64
+public-path hidden field crate::protocol::public_operations::PublicV1AcceptedStatus::authorization: Option < PublicV1AuthorizationStatus >
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedStatus::completed_operations: Vec < PublicV1AcceptedOperationCompletion >
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedStatus::data_loss_recovery: Option < PublicDataLossRecoveryStatus >
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedStatus::extensions: PublicV1Extensions
@@ -987,6 +1125,32 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::role: ReplicaRole
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::storage_incarnation: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::write_status: AccessStatus
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationClaims::build: Option < Box < BuildAuthorizationClaimsV1 > >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationClaims::kind: PublicV1AuthorizationIntentKind
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationClaims::peer: Option < Box < PeerSessionAuthorizationClaimsV1 > >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationEnvelope::build: Option < Box < BuildAuthorizationV1 > >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationEnvelope::kind: PublicV1AuthorizationIntentKind
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationEnvelope::peer: Option < Box < PeerSessionAuthorizationV1 > >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::audit_digest: Option < SignedAuthorizationAuditDigest >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::canonical_claims_base64: String
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::claims: PublicV1AuthorizationClaims
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::cleanup_disposition: PublicV1AuthorizationCleanupDisposition
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::envelope: Option < PublicV1AuthorizationEnvelope >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::kind: PublicV1AuthorizationIntentKind
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::revision: u64
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::scope: PublicV1AuthorizationIntentScope
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::signature: Option < AuthorizationSignature >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::stage: PublicV1AuthorizationIntentStage
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::generation: PublicProtocolGeneration
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::key_id: AuthorizationKeyId
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::name: String
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::resource_uid: ResourceUid
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::resource_version: String
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::uid: String
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::verification_key: AuthorizationVerificationKey
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationStatus::intents: Vec < PublicV1AuthorizationIntent >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationStatus::secret_binding: Option < PublicV1AuthorizationSecretBinding >
 public-path hidden field crate::protocol::public_operations::PublicV1ExtensionSlot::version: u16
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::history_recovery: Option < PublicV1ExtensionSlot >
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::public_build_evidence: Option < PublicV1ExtensionSlot >
@@ -996,6 +1160,11 @@ public-path hidden field crate::protocol::public_operations::PublicV1OperationCo
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::replay_disposition: PublicOperationReplayDisposition
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::result: PublicV1OperationResult
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::revision: u64
+public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::barriers: Vec < PublicSessionEpochBarrier >
+public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::installed_configuration: Option < ConfigurationDescriptor >
+public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::replayed_role: Option < ReplicaRole >
+public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::required: ProcessSessionRenewalRequired
+public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::stage: PublicSessionRenewalStage
 public-path hidden field crate::protocol::public_operations::RemoteBuildTargetRebuildRequired::authorization: PublicBuildAuthorizationReference
 public-path hidden field crate::protocol::public_operations::RemoteBuildTargetRebuildRequired::reason: ReplicaRebuildReason
 public-path hidden field crate::protocol::public_operations::RestartActionRecord::action: PublicFaultAction
@@ -1021,6 +1190,9 @@ public-path hidden impl crate::protocol::public_operations::DataLossAttempt::fn 
 public-path hidden impl crate::protocol::public_operations::DataLossAttempt::fn validate_for (& self , authorization : & DataLossAuthorization , minimum_configuration_number : i64 ,) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::DataLossAuthorization::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PreviewLifecycleBinding::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::ProcessSessionRenewalRequired::fn data_loss_decision (& self) -> Option < DataLossRenewalDecision >
+public-path hidden impl crate::protocol::public_operations::ProcessSessionRenewalRequired::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::ProcessSessionRenewalRequired::fn validate_replacement_report (& self , report : & PublicV1AgentReport ,) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn successor (& self) -> Option < & ReplicaIdentity >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn validate_for_local (& self , local_replica_id : ReplicaId) -> Result < () , & 'static str >
@@ -1042,7 +1214,42 @@ public-path hidden impl crate::protocol::public_operations::PublicOperationProgr
 public-path hidden impl crate::protocol::public_operations::PublicOperationProgram::fn digest (& self) -> CanonicalOperationInputDigest
 public-path hidden impl crate::protocol::public_operations::PublicProgress::fn validate (& self , replica_role : ReplicaRole , read : AccessStatus , write : AccessStatus ,) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicReplicaDescriptor::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedStatus::fn authorization (& self) -> Option < & PublicV1AuthorizationStatus >
+public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedStatus::fn authorization_mut (& mut self) -> & mut PublicV1AuthorizationStatus
+public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedStatus::fn is_authorization_successor_of (& self , previous : & Self) -> bool
+public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedStatus::fn validate_authorization (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicV1AgentReport::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationClaims::const fn kind (& self) -> PublicV1AuthorizationIntentKind
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationClaims::fn build (claims : BuildAuthorizationClaimsV1) -> Self
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationClaims::fn build_target (& self) -> Option < & ReplicaIdentity >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationClaims::fn canonical_bytes (& self) -> Result < Vec < u8 > , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationClaims::fn peer (claims : PeerSessionAuthorizationClaimsV1) -> Self
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationClaims::fn peer_secondary (& self) -> Option < & ReplicaIdentity >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationEnvelope::const fn kind (& self) -> PublicV1AuthorizationIntentKind
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationEnvelope::fn audit_digest (& self) -> Result < SignedAuthorizationAuditDigest , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationEnvelope::fn build (authorization : BuildAuthorizationV1) -> Self
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationEnvelope::fn canonical_bytes (& self) -> Result < Vec < u8 > , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationEnvelope::fn claims (& self) -> Result < PublicV1AuthorizationClaims , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationEnvelope::fn peer (authorization : PeerSessionAuthorizationV1) -> Self
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationEnvelope::fn signature (& self) -> Result < AuthorizationSignature , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationIntent::fn is_successor_of (& self , previous : & Self) -> bool
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationIntent::fn prepared (scope : PublicV1AuthorizationIntentScope , operation_id : OperationId , revision : u64 , claims : PublicV1AuthorizationClaims , cleanup_disposition : PublicV1AuthorizationCleanupDisposition ,) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationIntent::fn validate (& self , binding : Option < & PublicV1AuthorizationSecretBinding > ,) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationSecretBinding::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationStatus::fn find_intent (& self , operation_id : & OperationId) -> Option < & PublicV1AuthorizationIntent >
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationStatus::fn is_successor_of (& self , previous : & Self) -> bool
+public-path hidden impl crate::protocol::public_operations::PublicV1AuthorizationStatus::fn validate (& self , identity : & PublicOperationPreviewIdentity , history : & HistoryContext ,) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn begin_epoch_barriers (& self) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn close_access (& self) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn exclude_survivor (& self , survivor : & ProcessSessionEndpoint , retirement_operation_id : OperationId ,) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn finish_epoch_barriers (& self) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn freeze_surviving_set (& self) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn install_fresh_configuration (& self , configuration : & ConfigurationDescriptor ,) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn is_successor_of (& self , previous : & Self) -> bool
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn record_epoch_updated (& self , survivor : & ProcessSessionEndpoint , epoch : Epoch ,) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn replay_replacement_role (& self , process_session_id : & ProcessSessionId , epoch : Epoch , role : ReplicaRole ,) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn required (required : ProcessSessionRenewalRequired) -> Result < Self , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1SessionRenewalStatus::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden module crate::protocol::public_operations
 public-path hidden struct crate::protocol::public_operations::AuthorizationAuditDigest
 public-path hidden struct crate::protocol::public_operations::CanonicalOperationInputDigestV1
@@ -1053,12 +1260,14 @@ public-path hidden struct crate::protocol::public_operations::FrozenReplicaResou
 public-path hidden struct crate::protocol::public_operations::LocalProviderRebuildRequired
 public-path hidden struct crate::protocol::public_operations::PreviewLifecycleBinding
 public-path hidden struct crate::protocol::public_operations::ProcessAttemptContext
+public-path hidden struct crate::protocol::public_operations::ProcessSessionRenewalRequired
 public-path hidden struct crate::protocol::public_operations::ProviderReplicaIdentity
 public-path hidden struct crate::protocol::public_operations::PublicBuildAuthorizationReference
 public-path hidden struct crate::protocol::public_operations::PublicBuildInput
 public-path hidden struct crate::protocol::public_operations::PublicConfiguration
 public-path hidden struct crate::protocol::public_operations::PublicDataLossRecoveryInput
 public-path hidden struct crate::protocol::public_operations::PublicDataLossRecoveryStatus
+public-path hidden struct crate::protocol::public_operations::PublicDataLossSessionRenewal
 public-path hidden struct crate::protocol::public_operations::PublicFaultAction
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleInput
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleReport
@@ -1067,12 +1276,19 @@ public-path hidden struct crate::protocol::public_operations::PublicOperationPre
 public-path hidden struct crate::protocol::public_operations::PublicProgress
 public-path hidden struct crate::protocol::public_operations::PublicReplicaDescriptor
 public-path hidden struct crate::protocol::public_operations::PublicServiceClear
+public-path hidden struct crate::protocol::public_operations::PublicSessionEpochBarrier
 public-path hidden struct crate::protocol::public_operations::PublicV1AcceptedOperationCompletion
 public-path hidden struct crate::protocol::public_operations::PublicV1AcceptedStatus
 public-path hidden struct crate::protocol::public_operations::PublicV1AgentReport
+public-path hidden struct crate::protocol::public_operations::PublicV1AuthorizationClaims
+public-path hidden struct crate::protocol::public_operations::PublicV1AuthorizationEnvelope
+public-path hidden struct crate::protocol::public_operations::PublicV1AuthorizationIntent
+public-path hidden struct crate::protocol::public_operations::PublicV1AuthorizationSecretBinding
+public-path hidden struct crate::protocol::public_operations::PublicV1AuthorizationStatus
 public-path hidden struct crate::protocol::public_operations::PublicV1ExtensionSlot
 public-path hidden struct crate::protocol::public_operations::PublicV1Extensions
 public-path hidden struct crate::protocol::public_operations::PublicV1OperationCompletion
+public-path hidden struct crate::protocol::public_operations::PublicV1SessionRenewalStatus
 public-path hidden struct crate::protocol::public_operations::RemoteBuildTargetRebuildRequired
 public-path hidden struct crate::protocol::public_operations::RestartActionRecord
 public-path hidden struct crate::protocol::public_operations::ServiceLocation
@@ -1138,6 +1354,17 @@ public-path hidden variant crate::protocol::public_operations::PublicProgressRol
 public-path hidden variant crate::protocol::public_operations::PublicProgressRole::Secondary
 public-path hidden variant crate::protocol::public_operations::PublicServiceClearStage::Pending
 public-path hidden variant crate::protocol::public_operations::PublicServiceClearStage::PublishedAbsent
+public-path hidden variant crate::protocol::public_operations::PublicSessionEpochBarrierStage::Excluded
+public-path hidden variant crate::protocol::public_operations::PublicSessionEpochBarrierStage::Pending
+public-path hidden variant crate::protocol::public_operations::PublicSessionEpochBarrierStage::Updated
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::AccessClosed
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::Authorized
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::ConfigurationPending
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::EpochBarriersPending
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::ReplacementRolePending
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::Required
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::Retired
+public-path hidden variant crate::protocol::public_operations::PublicSessionRenewalStage::SurvivingSetFrozen
 public-path hidden variant crate::protocol::public_operations::PublicV1AcceptedReplayDisposition::Containment
 public-path hidden variant crate::protocol::public_operations::PublicV1AcceptedReplayDisposition::Convergent
 public-path hidden variant crate::protocol::public_operations::PublicV1AcceptedReplayDisposition::DataLossConvergent
@@ -1151,6 +1378,19 @@ public-path hidden variant crate::protocol::public_operations::PublicV1AcceptedR
 public-path hidden variant crate::protocol::public_operations::PublicV1AcceptedResult::Failed
 public-path hidden variant crate::protocol::public_operations::PublicV1AcceptedResult::RebuildRequired
 public-path hidden variant crate::protocol::public_operations::PublicV1AcceptedResult::Succeeded
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationCleanupDisposition::RetainUntilSuperseded
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationCleanupDisposition::RetireAfterObservation
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationCleanupDisposition::Retired
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentKind::Build
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentKind::Peer
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentScope::Build
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentScope::CurrentPeer
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentScope::PreviousPeer
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Dispatched
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Observed
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Prepared
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Retired
+public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Signed
 public-path hidden variant crate::protocol::public_operations::PublicV1OperationResult::Ambiguous((String))
 public-path hidden variant crate::protocol::public_operations::PublicV1OperationResult::Cancelled
 public-path hidden variant crate::protocol::public_operations::PublicV1OperationResult::Failed((String))

@@ -64,6 +64,7 @@ fn build(attempt: &str) -> PublicBuildInput {
         replication_address: "trace://target".into(),
         history: None,
         authorization: None,
+        build_authorization: None,
     }
 }
 
@@ -103,6 +104,8 @@ fn configuration_with_target(epoch: i64) -> PublicConfiguration {
         current_progress: 0,
         catch_up_capability: 0,
         must_catchup: false,
+        peer_authorization: None,
+        configuration_revision: None,
     };
     PublicConfiguration {
         previous: Some(ConfigurationDescriptor::new(
@@ -1832,6 +1835,7 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         replication_address: "trace://target".into(),
         history: Some(public_v1_history(&preview).1),
         authorization: Some(authorization.clone()),
+        build_authorization: None,
     };
     let program = Program::Build(input.clone());
     let mut operation = intent(

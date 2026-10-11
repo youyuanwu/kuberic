@@ -3,11 +3,13 @@ use std::sync::Arc;
 
 use crate::authority::{BuildAuthorityStore, BuildProgressStore, LocalWriteJournal};
 use crate::host::store::AgentStore;
-use crate::protocol::command::EnsureReplicaBuild;
-use crate::protocol::command::PublicV1HistoryCommand;
+use crate::protocol::command::{
+    EnsureReplicaBuild, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
+};
 use crate::protocol::public_operations::{
     DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
-    PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport, StatePersistence,
+    PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport,
+    PublicV1SessionRenewalStatus, StatePersistence,
 };
 use crate::protocol::types::{
     AccessStatus, BuildAuthority, OperationId, ProcessSessionId, ReplicaRole,
@@ -34,6 +36,7 @@ pub struct PublicV1HistorySnapshot {
     pub storage: ReplicaStorageIncarnationContext,
     pub authorization: Option<DataLossAuthorization>,
     pub recovery: Option<PublicDataLossRecoveryStatus>,
+    pub session_renewal: Option<PublicV1SessionRenewalStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +157,7 @@ impl SqliteStore {
             })?,
             authorization: preview.data_loss_authorization,
             recovery: preview.data_loss_recovery,
+            session_renewal: preview.session_renewal,
         })
     }
 
@@ -197,7 +201,67 @@ impl SqliteStore {
                 }
                 Ok(())
             }
+            PublicV1HistoryCommand::SessionRenewal(command) => self
+                .apply_public_v1_session_renewal_command(command)
+                .await
+                .map(|_| ()),
         }
+    }
+
+    pub async fn persist_public_v1_session_renewal(
+        &self,
+        expected: Option<&PublicV1SessionRenewalStatus>,
+        next: &PublicV1SessionRenewalStatus,
+    ) -> crate::host::Result<()> {
+        self.inner
+            .persist_public_v1_session_renewal(expected, next)
+            .await
+    }
+
+    pub async fn apply_public_v1_session_renewal_command(
+        &self,
+        command: &PublicV1SessionRenewalCommand,
+    ) -> crate::host::Result<PublicV1SessionRenewalStatus> {
+        command
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        let accepted = command.accepted();
+        let current = self
+            .inner
+            .load_state()
+            .await?
+            .public_operation_preview
+            .and_then(|preview| preview.session_renewal)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-v1 session renewal is not durable".into(),
+                )
+            })?;
+        if &current != accepted {
+            return Err(crate::host::HostError::StaleEffectCompletion(
+                "public-v1 session renewal command changed accepted state".into(),
+            ));
+        }
+        let next = match command {
+            PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. } => accepted.close_access(),
+            PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+                survivor, epoch, ..
+            } => accepted.record_epoch_updated(survivor, *epoch),
+            PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                process_session_id,
+                epoch,
+                role,
+                ..
+            } => accepted.replay_replacement_role(process_session_id, *epoch, *role),
+            PublicV1SessionRenewalCommand::InstallFreshConfiguration { configuration, .. } => {
+                accepted.install_fresh_configuration(configuration)
+            }
+        }
+        .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.inner
+            .persist_public_v1_session_renewal(Some(accepted), &next)
+            .await?;
+        Ok(next)
     }
 
     pub async fn contain_public_v1_data_loss_attempt(

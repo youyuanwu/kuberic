@@ -73,6 +73,7 @@ fn public_v1_history_command_is_typed_and_production_dormant() {
         history: derive_bootstrap_history(&resource_uid, generation, &initialization),
         data_loss_recovery: None,
         completed_operations: Vec::new(),
+        authorization: None,
         extensions: Default::default(),
     };
     let storage = ReplicaStorageIncarnationContext {

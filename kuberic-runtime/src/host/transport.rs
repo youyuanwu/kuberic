@@ -335,7 +335,7 @@ where
             &endpoint.identity,
             &target_session,
             target_command,
-        ));
+        )?);
         add_bearer_token(&mut request, &self.bearer_token)?;
         let response = tokio::time::timeout(self.deadline, control.execute(request))
             .await
@@ -407,6 +407,18 @@ where
         let expected_sender_session = item.sender_session_id.clone();
         let expected_receiver_session = item.receiver_session_id.clone();
         let endpoint = self.resolver.replication_endpoint(&receiver);
+        if !item.build_authorization_v1.is_empty() {
+            let authorization =
+                crate::protocol::authorization::BuildAuthorizationV1::from_canonical_bytes(
+                    &item.build_authorization_v1,
+                )
+                .map_err(|error| crate::host::HostError::SessionRejected(error.to_string()))?;
+            if authorization.claims.target.replication_address != endpoint {
+                return Err(crate::host::HostError::SessionRejected(
+                    "signed build target address differs from the resolved endpoint".into(),
+                ));
+            }
+        }
         let mut client = tokio::time::timeout(
             self.deadline,
             proto::replication_data_client::ReplicationDataClient::connect(endpoint),
@@ -524,6 +536,19 @@ where
                     .await?;
                 item.receiver_session_id = session.to_string();
                 let endpoint = self.resolver.replication_endpoint(&receiver);
+                if !item.peer_session_authorization_v1.is_empty() {
+                    let authorization = crate::protocol::authorization::PeerSessionAuthorizationV1::from_canonical_bytes(
+                        &item.peer_session_authorization_v1,
+                    )
+                    .map_err(|error| {
+                        crate::host::HostError::SessionRejected(error.to_string())
+                    })?;
+                    if authorization.claims.secondary.replication_address != endpoint {
+                        return Err(crate::host::HostError::SessionRejected(
+                            "signed peer address differs from the resolved endpoint".into(),
+                        ));
+                    }
+                }
                 let mut client = tokio::time::timeout(
                     self.deadline,
                     proto::replication_data_client::ReplicationDataClient::connect(endpoint),
@@ -610,7 +635,10 @@ fn add_bearer_token<T>(request: &mut Request<T>, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_build_to_proto(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuildCommand {
+fn ensure_build_to_proto(
+    command: EnsureReplicaBuild,
+    build_authorization_v1: Vec<u8>,
+) -> proto::EnsureReplicaBuildCommand {
     proto::EnsureReplicaBuildCommand {
         operation_id: command.operation_id.to_string(),
         local_replica_id: command.local_replica_id.value(),
@@ -622,6 +650,7 @@ fn ensure_build_to_proto(command: EnsureReplicaBuild) -> proto::EnsureReplicaBui
             .source_session_id
             .map_or_else(String::new, |session| session.to_string()),
         retire: command.retire,
+        build_authorization_v1,
     }
 }
 
@@ -630,16 +659,37 @@ fn build_target_admission_request(
     target: &ReplicaIdentity,
     target_session: &ProcessSessionId,
     command: EnsureReplicaBuild,
-) -> proto::ExecuteCommandRequest {
-    proto::ExecuteCommandRequest {
-        protocol_version: crate::protocol::PROTOCOL_VERSION,
+) -> Result<proto::ExecuteCommandRequest> {
+    let authorization = if let Some(authority) = &command.authority {
+        crate::replicator::outbound_build_authorization(
+            &command.operation_id,
+            &authority.source,
+            &authority.target,
+            authority.current_configuration.epoch,
+            command.source_session_id.as_ref().ok_or_else(|| {
+                crate::host::HostError::SessionRejected(
+                    "build target command lacks source process session".into(),
+                )
+            })?,
+            target_session,
+        )?
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(proto::ExecuteCommandRequest {
+        protocol_version: if authorization.is_empty() {
+            crate::protocol::PROTOCOL_VERSION
+        } else {
+            crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+        },
         resource_uid: resource_uid.to_string(),
         target: Some(target.clone().into()),
         expected_process_session_id: target_session.to_string(),
         command: Some(proto::execute_command_request::Command::EnsureReplicaBuild(
-            ensure_build_to_proto(command),
+            ensure_build_to_proto(command, authorization),
         )),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -669,7 +719,8 @@ mod build_request_tests {
                 source_session_id: None,
                 retire: false,
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(request.expected_process_session_id, "session-2");
         assert_eq!(
@@ -876,7 +927,7 @@ async fn deliver_outbound_with_runtime<D: OutboundDispatcher>(
             (sender.queue(outbound.clone()), sender.retry_delay())
         };
         match queued {
-            Ok(queued) => break sender_outbound_to_queued(queued),
+            Ok(queued) => break sender_outbound_to_queued(queued)?,
             Err(RuntimeError::ReconfigurationPending) => {
                 if let Some(receiver) = domain_outbound_receiver(&outbound) {
                     let _ = dispatcher.refresh_peer(receiver).await;
@@ -1112,8 +1163,8 @@ async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
-fn sender_outbound_to_queued(outbound: SenderOutbound) -> QueuedOutbound {
-    match outbound {
+fn sender_outbound_to_queued(outbound: SenderOutbound) -> Result<QueuedOutbound> {
+    Ok(match outbound {
         SenderOutbound::Replication {
             receiver,
             sender_session,
@@ -1122,11 +1173,11 @@ fn sender_outbound_to_queued(outbound: SenderOutbound) -> QueuedOutbound {
         } => QueuedOutbound::Replication {
             receiver,
             sequence: message.sequence,
-            item: replication_to_session_proto(
+            item: authorized_replication_to_session_proto(
                 message.payload,
                 sender_session.as_str(),
                 receiver_session.as_str(),
-            ),
+            )?,
         },
         SenderOutbound::Copy {
             receiver,
@@ -1136,16 +1187,16 @@ fn sender_outbound_to_queued(outbound: SenderOutbound) -> QueuedOutbound {
         } => QueuedOutbound::Copy {
             receiver,
             sequence: message.sequence,
-            item: copy_to_session_proto(
+            item: authorized_copy_to_session_proto(
                 message.payload,
                 sender_session.as_str(),
                 receiver_session.as_str(),
-            ),
+            )?,
         },
         SenderOutbound::Build(endpoint) => QueuedOutbound::Build(endpoint),
         SenderOutbound::Remove(replica_id) => QueuedOutbound::Remove(replica_id),
         SenderOutbound::Evict(identity) => QueuedOutbound::Evict(identity),
-    }
+    })
 }
 
 fn domain_outbound_receiver(outbound: &OutboundOperation) -> Option<&ReplicaIdentity> {
@@ -1171,8 +1222,21 @@ fn queued_outbound_receiver(outbound: &QueuedOutbound) -> Option<&ReplicaIdentit
 pub(crate) fn replication_from_proto(
     item: proto::ReplicationItem,
 ) -> RuntimeResult<ReplicationItem> {
+    let sender_session = ProcessSessionId::new(item.sender_session_id.clone());
+    let receiver_session = ProcessSessionId::new(item.receiver_session_id.clone());
     let item = normalize_replication_item(item)
         .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    crate::replicator::verify_inbound_peer_authorization(
+        &item.receiver,
+        item.peer_authorization,
+        &item.sender,
+        &item.receiver,
+        item.epoch,
+        item.previous_configuration_id.as_ref(),
+        &item.current_configuration_id,
+        &sender_session,
+        &receiver_session,
+    )?;
     Ok(ReplicationItem {
         sender: item.sender,
         receiver: item.receiver,
@@ -1200,6 +1264,7 @@ pub(crate) fn replication_to_proto(item: ReplicationItem) -> proto::ReplicationI
         receiver: Some(item.receiver.into()),
         sender_session_id: String::new(),
         receiver_session_id: String::new(),
+        peer_session_authorization_v1: Vec::new(),
     }
 }
 
@@ -1214,11 +1279,47 @@ pub(crate) fn replication_to_session_proto(
     item
 }
 
+fn authorized_replication_to_session_proto(
+    item: ReplicationItem,
+    sender_session: &str,
+    receiver_session: &str,
+) -> RuntimeResult<proto::ReplicationItem> {
+    let authorization = crate::replicator::outbound_peer_authorization(
+        &item.sender,
+        &item.receiver,
+        item.epoch,
+        item.previous_configuration_id.as_ref(),
+        &item.current_configuration_id,
+        &ProcessSessionId::new(sender_session),
+        &ProcessSessionId::new(receiver_session),
+    )?;
+    let mut item = replication_to_session_proto(item, sender_session, receiver_session);
+    if let Some(authorization) = authorization {
+        item.protocol_version =
+            crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION;
+        item.peer_session_authorization_v1 = authorization;
+    }
+    Ok(item)
+}
+
 pub(crate) fn replication_ack_from_proto(
     acknowledgement: proto::ReplicationAck,
 ) -> RuntimeResult<ReplicationAck> {
+    let sender_session = ProcessSessionId::new(acknowledgement.sender_session_id.clone());
+    let receiver_session = ProcessSessionId::new(acknowledgement.receiver_session_id.clone());
     let acknowledgement = normalize_replication_ack(acknowledgement)
         .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    crate::replicator::verify_inbound_peer_authorization(
+        &acknowledgement.sender,
+        acknowledgement.peer_authorization,
+        &acknowledgement.sender,
+        &acknowledgement.receiver,
+        acknowledgement.epoch,
+        acknowledgement.previous_configuration_id.as_ref(),
+        &acknowledgement.current_configuration_id,
+        &sender_session,
+        &receiver_session,
+    )?;
     Ok(ReplicationAck {
         sender: acknowledgement.sender,
         receiver: acknowledgement.receiver,
@@ -1232,7 +1333,17 @@ pub(crate) fn replication_ack_from_proto(
 }
 
 pub(crate) fn replication_ack_to_proto(acknowledgement: ReplicationAck) -> proto::ReplicationAck {
-    proto::ReplicationAck {
+    let local_has_trust =
+        crate::replicator::has_public_authorization_trust(&acknowledgement.sender)
+            || crate::replicator::has_public_authorization_trust(&acknowledgement.receiver);
+    let authorization = crate::replicator::response_peer_authorization(
+        &acknowledgement.sender,
+        &acknowledgement.receiver,
+        acknowledgement.epoch,
+        acknowledgement.previous_configuration_id.as_ref(),
+        &acknowledgement.current_configuration_id,
+    );
+    let mut wire = proto::ReplicationAck {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         sender: Some(acknowledgement.sender.into()),
         receiver: Some(acknowledgement.receiver.into()),
@@ -1246,12 +1357,39 @@ pub(crate) fn replication_ack_to_proto(acknowledgement: ReplicationAck) -> proto
         committed_lsn: acknowledgement.committed_lsn,
         sender_session_id: String::new(),
         receiver_session_id: String::new(),
+        peer_session_authorization_v1: Vec::new(),
+    };
+    match authorization {
+        Ok(Some(authorization)) => {
+            wire.protocol_version =
+                crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION;
+            wire.peer_session_authorization_v1 = authorization;
+        }
+        Err(_) if local_has_trust => {
+            wire.protocol_version =
+                crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION;
+        }
+        Ok(None) | Err(_) => {}
     }
+    wire
 }
 
 pub(crate) fn copy_from_proto(item: proto::CopyItem) -> RuntimeResult<CopyItem> {
+    let sender_session = ProcessSessionId::new(item.sender_session_id.clone());
+    let receiver_session = ProcessSessionId::new(item.receiver_session_id.clone());
     let item = normalize_copy_item(item)
         .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    crate::replicator::verify_inbound_build_authorization(
+        &item.receiver,
+        item.build_authorization,
+        None,
+        &item.build_id,
+        &item.sender,
+        &item.receiver,
+        item.epoch,
+        &sender_session,
+        &receiver_session,
+    )?;
     Ok(CopyItem {
         build_id: item.build_id,
         sender: item.sender,
@@ -1287,6 +1425,7 @@ pub(crate) fn copy_to_proto(item: CopyItem) -> proto::CopyItem {
         snapshot_chunk: item.snapshot_chunk,
         sender_session_id: String::new(),
         receiver_session_id: String::new(),
+        build_authorization_v1: Vec::new(),
     }
 }
 
@@ -1301,9 +1440,44 @@ pub(crate) fn copy_to_session_proto(
     item
 }
 
+fn authorized_copy_to_session_proto(
+    item: CopyItem,
+    sender_session: &str,
+    receiver_session: &str,
+) -> RuntimeResult<proto::CopyItem> {
+    let authorization = crate::replicator::outbound_build_authorization(
+        &item.build_id,
+        &item.sender,
+        &item.receiver,
+        item.epoch,
+        &ProcessSessionId::new(sender_session),
+        &ProcessSessionId::new(receiver_session),
+    )?;
+    let mut item = copy_to_session_proto(item, sender_session, receiver_session);
+    if let Some(authorization) = authorization {
+        item.protocol_version =
+            crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION;
+        item.build_authorization_v1 = authorization;
+    }
+    Ok(item)
+}
+
 pub(crate) fn copy_ack_from_proto(acknowledgement: proto::CopyAck) -> RuntimeResult<CopyAck> {
+    let sender_session = ProcessSessionId::new(acknowledgement.sender_session_id.clone());
+    let receiver_session = ProcessSessionId::new(acknowledgement.receiver_session_id.clone());
     let acknowledgement = normalize_copy_ack(acknowledgement)
         .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    crate::replicator::verify_inbound_build_authorization(
+        &acknowledgement.sender,
+        acknowledgement.build_authorization,
+        None,
+        &acknowledgement.build_id,
+        &acknowledgement.sender,
+        &acknowledgement.receiver,
+        acknowledgement.epoch,
+        &sender_session,
+        &receiver_session,
+    )?;
     Ok(CopyAck {
         build_id: acknowledgement.build_id,
         sender: acknowledgement.sender,
@@ -1320,7 +1494,16 @@ pub(crate) fn copy_ack_from_proto(acknowledgement: proto::CopyAck) -> RuntimeRes
 }
 
 pub(crate) fn copy_ack_to_proto(acknowledgement: CopyAck) -> proto::CopyAck {
-    proto::CopyAck {
+    let authorization = crate::replicator::response_build_authorization(
+        &acknowledgement.build_id,
+        &acknowledgement.sender,
+        &acknowledgement.receiver,
+        acknowledgement.epoch,
+    );
+    let local_has_trust =
+        crate::replicator::has_public_authorization_trust(&acknowledgement.sender)
+            || crate::replicator::has_public_authorization_trust(&acknowledgement.receiver);
+    let mut wire = proto::CopyAck {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         build_id: acknowledgement.build_id.to_string(),
         sender: Some(acknowledgement.sender.into()),
@@ -1335,13 +1518,40 @@ pub(crate) fn copy_ack_to_proto(acknowledgement: CopyAck) -> proto::CopyAck {
         snapshot_chunk: acknowledgement.snapshot_chunk,
         sender_session_id: String::new(),
         receiver_session_id: String::new(),
+        build_authorization_v1: Vec::new(),
+    };
+    match authorization {
+        Ok(Some(authorization)) => {
+            wire.protocol_version =
+                crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION;
+            wire.build_authorization_v1 = authorization;
+        }
+        Err(_) if local_has_trust => {
+            wire.protocol_version =
+                crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION;
+        }
+        Ok(None) | Err(_) => {}
     }
+    wire
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{AgentGeneration, ConfigurationId, Epoch, ReplicaInstanceId};
+    use crate::protocol::authorization::{
+        AuthorizationSigningKey, BuildAuthorizationClaimsV1, BuildAuthorizationEndpointV1,
+        PeerSessionAuthorizationClaimsV1, PeerSessionEndpointV1,
+    };
+    use crate::protocol::public_operations::PublicReplicaDescriptor;
+    use crate::protocol::types::{
+        AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
+        ConfigurationId, ConfigurationMember, Epoch, HistoryContext, HistoryId, OperationId,
+        PodUid, PublicProtocolGeneration, PvcUid, ReplicaInstanceId, ReplicaRole,
+        ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration,
+    };
+    use crate::replicator::{
+        PublicAuthorizationRuntimeContext, PublicAuthorizationTrust, ReplicaInformation,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -1423,6 +1633,316 @@ mod tests {
             instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
             agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
         }
+    }
+
+    fn storage(identity: &ReplicaIdentity, name: &str) -> ReplicaStorageIncarnationContext {
+        ReplicaStorageIncarnationContext {
+            replica: identity.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new(format!("{name}-pod")),
+                pvc_uid: PvcUid::new(format!("{name}-pvc")),
+            },
+            storage_generation: StorageGeneration::new(format!("{name}-storage")),
+        }
+    }
+
+    fn authorization_history(resource: &str) -> HistoryContext {
+        HistoryContext {
+            resource_uid: ResourceUid::new(resource),
+            protocol_generation: PublicProtocolGeneration::new(11),
+            history_id: HistoryId::new(format!("{resource}-history")),
+            data_loss_number: 0,
+        }
+    }
+
+    fn register_authorization_endpoint(
+        identity: &ReplicaIdentity,
+        address: &str,
+        session: &str,
+        role: ReplicaRole,
+        history: &HistoryContext,
+        storage: ReplicaStorageIncarnationContext,
+        signing_key: &AuthorizationSigningKey,
+    ) {
+        crate::replicator::testing_register_public_authorization(
+            identity.clone(),
+            address.to_owned(),
+            PublicAuthorizationTrust {
+                resource_uid: history.resource_uid.clone(),
+                protocol_generation: history.protocol_generation,
+                verification_key: signing_key.verification_key(),
+                key_id: signing_key.key_id(),
+            },
+            Some(PublicAuthorizationRuntimeContext {
+                identity: identity.clone(),
+                history: history.clone(),
+                storage_incarnation: storage,
+                process_session_id: ProcessSessionId::new(session),
+                role,
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn signed_peer_transport_rejects_tampering_and_stale_sessions_before_delivery() {
+        let signing_key = AuthorizationSigningKey::from_seed([71; 32]);
+        let primary = identity(71);
+        let secondary = identity(72);
+        let history = authorization_history("peer-transport-resource");
+        let primary_address = "https://10.0.0.71:7000";
+        let secondary_address = "https://10.0.0.72:7000";
+        register_authorization_endpoint(
+            &primary,
+            primary_address,
+            "peer-primary-session",
+            ReplicaRole::Primary,
+            &history,
+            storage(&primary, "peer-primary"),
+            &signing_key,
+        );
+        register_authorization_endpoint(
+            &secondary,
+            secondary_address,
+            "peer-secondary-session",
+            ReplicaRole::ActiveSecondary,
+            &history,
+            storage(&secondary, "peer-secondary"),
+            &signing_key,
+        );
+        let current_configuration_id = ConfigurationId::new("peer-current");
+        let previous_configuration_id = ConfigurationId::new("peer-previous");
+        let authorization = signing_key
+            .sign_peer_session_authorization(PeerSessionAuthorizationClaimsV1 {
+                resource_uid: history.resource_uid.clone(),
+                protocol_generation: history.protocol_generation,
+                key_id: signing_key.key_id(),
+                history: history.clone(),
+                epoch: Epoch::new(0, 9),
+                current_configuration_id: current_configuration_id.clone(),
+                previous_configuration_id: Some(previous_configuration_id.clone()),
+                primary: PeerSessionEndpointV1 {
+                    replica: primary.clone(),
+                    process_session_id: ProcessSessionId::new("peer-primary-session"),
+                    replication_address: primary_address.into(),
+                    role: ReplicaRole::Primary,
+                },
+                secondary: PeerSessionEndpointV1 {
+                    replica: secondary.clone(),
+                    process_session_id: ProcessSessionId::new("peer-secondary-session"),
+                    replication_address: secondary_address.into(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                configuration_revision: 17,
+            })
+            .unwrap();
+        let _: ReplicaInformation = PublicReplicaDescriptor {
+            build_id: OperationId::default(),
+            identity: secondary.clone(),
+            replication_address: secondary_address.into(),
+            process_session_id: ProcessSessionId::new("peer-secondary-session"),
+            role: ReplicaRole::ActiveSecondary,
+            current_progress: 0,
+            catch_up_capability: 0,
+            must_catchup: false,
+            peer_authorization: Some(authorization),
+            configuration_revision: Some(17),
+        }
+        .into();
+        let item = ReplicationItem {
+            sender: primary,
+            receiver: secondary,
+            epoch: Epoch::new(0, 9),
+            previous_configuration_id: Some(previous_configuration_id),
+            current_configuration_id,
+            lsn: 1,
+            committed_lsn: 0,
+            data: Bytes::from_static(b"signed"),
+        };
+        let wire = authorized_replication_to_session_proto(
+            item,
+            "peer-primary-session",
+            "peer-secondary-session",
+        )
+        .unwrap();
+        assert_eq!(
+            wire.protocol_version,
+            crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+        );
+        assert!(!wire.peer_session_authorization_v1.is_empty());
+        replication_from_proto(wire.clone()).unwrap();
+
+        let mut tampered = wire.clone();
+        *tampered.peer_session_authorization_v1.last_mut().unwrap() ^= 1;
+        assert!(replication_from_proto(tampered).is_err());
+        let mut stale = wire;
+        stale.sender_session_id = "predecessor-primary-session".into();
+        assert!(replication_from_proto(stale).is_err());
+    }
+
+    #[test]
+    fn signed_build_transport_requires_exact_storage_and_rejects_mixed_domain() {
+        let signing_key = AuthorizationSigningKey::from_seed([81; 32]);
+        let source = identity(81);
+        let target = identity(82);
+        let history = authorization_history("build-transport-resource");
+        let source_storage = storage(&source, "build-source");
+        let target_storage = storage(&target, "build-target");
+        let source_address = "https://10.0.0.81:7000";
+        let target_address = "https://10.0.0.82:7000";
+        register_authorization_endpoint(
+            &source,
+            source_address,
+            "build-source-session",
+            ReplicaRole::Primary,
+            &history,
+            source_storage.clone(),
+            &signing_key,
+        );
+        register_authorization_endpoint(
+            &target,
+            target_address,
+            "build-target-session",
+            ReplicaRole::IdleSecondary,
+            &history,
+            target_storage.clone(),
+            &signing_key,
+        );
+        let build_id = OperationId::new("signed-build-transport");
+        let authorization = signing_key
+            .sign_build_authorization(BuildAuthorizationClaimsV1 {
+                resource_uid: history.resource_uid.clone(),
+                protocol_generation: history.protocol_generation,
+                key_id: signing_key.key_id(),
+                history: history.clone(),
+                epoch: Epoch::new(0, 10),
+                operation_id: build_id.clone(),
+                build_id: build_id.clone(),
+                source: BuildAuthorizationEndpointV1 {
+                    storage_incarnation: source_storage,
+                    process_session_id: ProcessSessionId::new("build-source-session"),
+                    replication_address: source_address.into(),
+                    role: ReplicaRole::Primary,
+                },
+                target: BuildAuthorizationEndpointV1 {
+                    storage_incarnation: target_storage.clone(),
+                    process_session_id: ProcessSessionId::new("build-target-session"),
+                    replication_address: target_address.into(),
+                    role: ReplicaRole::IdleSecondary,
+                },
+            })
+            .unwrap();
+        let context = PublicAuthorizationRuntimeContext {
+            identity: source.clone(),
+            history,
+            storage_incarnation: authorization.claims.source.storage_incarnation.clone(),
+            process_session_id: ProcessSessionId::new("build-source-session"),
+            role: ReplicaRole::Primary,
+        };
+        let mut descriptor =
+            ReplicaInformation::idle_build(build_id.clone(), target.clone(), target_address.into());
+        descriptor.process_session_id = ProcessSessionId::new("build-target-session");
+        descriptor.storage_incarnation = Some(target_storage);
+        descriptor.build_authorization = Some(authorization.clone());
+        crate::replicator::authorize_public_build_descriptor(
+            &context,
+            Epoch::new(0, 10),
+            &build_id,
+            &descriptor,
+        )
+        .unwrap();
+        let request = build_target_admission_request(
+            &authorization.claims.resource_uid.to_string(),
+            &target,
+            &ProcessSessionId::new("build-target-session"),
+            EnsureReplicaBuild {
+                operation_id: build_id.clone(),
+                local_replica_id: target.replica_id,
+                expected_instance_id: target.instance_id.clone(),
+                expected_agent_generation: target.agent_generation.clone(),
+                target: target.clone(),
+                authority: Some(BuildAuthority {
+                    build_id: build_id.clone(),
+                    kind: BuildAuthorityKind::Provisioning,
+                    source: source.clone(),
+                    target: target.clone(),
+                    current_configuration: ConfigurationDescriptor::new(
+                        Epoch::new(0, 10),
+                        source.replica_id,
+                        vec![ConfigurationMember {
+                            identity: source.clone(),
+                            role: ReplicaRole::Primary,
+                        }],
+                        1,
+                    ),
+                    replication_boundary_lsn: 0,
+                }),
+                source_session_id: Some(ProcessSessionId::new("build-source-session")),
+                retire: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            request.protocol_version,
+            crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+        );
+        crate::control::validate_execute_request(&request).unwrap();
+        let proto::execute_command_request::Command::EnsureReplicaBuild(command) =
+            request.command.unwrap()
+        else {
+            panic!("expected build command");
+        };
+        assert_eq!(
+            command.build_authorization_v1,
+            authorization.canonical_bytes().unwrap()
+        );
+        let item = CopyItem {
+            build_id,
+            sender: source,
+            receiver: target,
+            epoch: Epoch::new(0, 10),
+            current_configuration_id: ConfigurationId::new("build-current"),
+            sequence: 1,
+            lsn: 0,
+            committed_lsn: 0,
+            replication_boundary_lsn: 0,
+            catch_up_boundary_lsn: None,
+            final_item: false,
+            snapshot_chunk: true,
+            data: Bytes::from_static(b"snapshot"),
+        };
+        let wire =
+            authorized_copy_to_session_proto(item, "build-source-session", "build-target-session")
+                .unwrap();
+        copy_from_proto(wire.clone()).unwrap();
+
+        let peer = signing_key
+            .sign_peer_session_authorization(PeerSessionAuthorizationClaimsV1 {
+                resource_uid: ResourceUid::new("mixed-domain"),
+                protocol_generation: PublicProtocolGeneration::new(11),
+                key_id: signing_key.key_id(),
+                history: authorization_history("mixed-domain"),
+                epoch: Epoch::new(0, 10),
+                current_configuration_id: ConfigurationId::new("mixed-current"),
+                previous_configuration_id: None,
+                primary: PeerSessionEndpointV1 {
+                    replica: identity(91),
+                    process_session_id: ProcessSessionId::new("mixed-primary-session"),
+                    replication_address: "https://10.0.0.91:7000".into(),
+                    role: ReplicaRole::Primary,
+                },
+                secondary: PeerSessionEndpointV1 {
+                    replica: identity(92),
+                    process_session_id: ProcessSessionId::new("mixed-secondary-session"),
+                    replication_address: "https://10.0.0.92:7000".into(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                configuration_revision: 1,
+            })
+            .unwrap();
+        let mut mixed = wire;
+        mixed.build_authorization_v1 = peer.canonical_bytes().unwrap();
+        assert!(copy_from_proto(mixed).is_err());
     }
 
     fn outbound(receiver: ReplicaIdentity) -> OutboundOperation {
@@ -1576,6 +2096,7 @@ mod tests {
                 .await
                 .queue(outbound(identity(2)))
                 .map(sender_outbound_to_queued)
+                .unwrap()
                 .unwrap();
             blocked.send(queued).unwrap();
         }
@@ -1584,6 +2105,7 @@ mod tests {
             .await
             .queue(outbound(identity(3)))
             .map(sender_outbound_to_queued)
+            .unwrap()
             .unwrap();
         healthy.send(queued).unwrap();
 

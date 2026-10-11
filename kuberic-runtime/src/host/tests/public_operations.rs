@@ -383,7 +383,7 @@ fn public_v1_values_distinguishes_invalid_lsn() {
 }
 
 #[tokio::test]
-async fn public_v1_schema9_requires_a_fresh_exact_store() {
+async fn public_v1_current_schema_requires_a_fresh_exact_store() {
     let preview = PublicOperationPreviewIdentity::public_v1(9);
     let (_directory, path, store) = durable_preview_store(&preview);
     let original = store.load_state().await.unwrap();
@@ -2272,6 +2272,8 @@ impl PrimaryReplicator for TraceReplicator {
                         current_progress: replica.current_progress,
                         catch_up_capability: replica.catch_up_capability,
                         must_catchup: replica.must_catchup,
+                        peer_authorization: replica.peer_authorization,
+                        configuration_revision: replica.configuration_revision,
                     },
                 )
                 .collect(),
@@ -2318,6 +2320,8 @@ impl PrimaryReplicator for TraceReplicator {
                         current_progress: replica.current_progress,
                         catch_up_capability: replica.catch_up_capability,
                         must_catchup: replica.must_catchup,
+                        peer_authorization: replica.peer_authorization,
+                        configuration_revision: replica.configuration_revision,
                     },
                 )
                 .collect(),

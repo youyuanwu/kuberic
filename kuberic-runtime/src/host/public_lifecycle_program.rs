@@ -195,6 +195,35 @@ pub(super) async fn execute(
         .into_iter()
         .find(|record| record.intent == intent)
         .ok_or_else(|| HostError::Corrupt("missing public program".into()))?;
+    let authorization_context = if intent.preview.is_public_v1() {
+        let state = store.load_state().await?;
+        let preview = state
+            .public_operation_preview
+            .as_ref()
+            .ok_or_else(|| HostError::Corrupt("missing public-v1 preview state".into()))?;
+        let context = crate::replicator::PublicAuthorizationRuntimeContext {
+            identity: state.identity.local_identity.clone(),
+            history: preview
+                .history
+                .clone()
+                .ok_or_else(|| HostError::Corrupt("missing public-v1 history".into()))?,
+            storage_incarnation: preview.storage_incarnation.clone().ok_or_else(|| {
+                HostError::Corrupt("missing public-v1 storage incarnation".into())
+            })?,
+            process_session_id: intent.process_session_id.clone(),
+            role: state.role,
+        };
+        crate::replicator::bind_public_authorization_context(context.clone())?;
+        Some((
+            context,
+            state
+                .current_configuration
+                .as_ref()
+                .map_or(state.highest_epoch, |configuration| configuration.epoch),
+        ))
+    } else {
+        None
+    };
     let start = record.lifecycle.outcomes.len();
     // An interrupted close that already recorded a child failure still needs
     // process-local abort containment; the durable diagnostic is not a proof.
@@ -311,19 +340,30 @@ pub(super) async fn execute(
                 let P::Build(build) = program else {
                     unreachable!()
                 };
-                match callbacks
-                    .primary
-                    .build_replica({
-                        let mut replica = ReplicaInformation::idle_build(
-                            build.attempt.clone(),
-                            build.replica.clone(),
-                            build.replication_address.clone(),
-                        );
-                        replica.process_session_id = build.process_session_id.clone();
-                        replica
-                    })
-                    .await
-                {
+                let mut replica = ReplicaInformation::idle_build(
+                    build.attempt.clone(),
+                    build.replica.clone(),
+                    build.replication_address.clone(),
+                );
+                replica.process_session_id = build.process_session_id.clone();
+                replica.build_authorization = build.build_authorization.clone();
+                replica.storage_incarnation = build
+                    .build_authorization
+                    .as_ref()
+                    .map(|authorization| authorization.claims.target.storage_incarnation.clone());
+                if let Some((context, epoch)) = &authorization_context {
+                    crate::replicator::authorize_public_build_descriptor(
+                        context,
+                        *epoch,
+                        &intent.operation_id,
+                        &replica,
+                    )?;
+                } else if replica.build_authorization.is_some() {
+                    return Err(HostError::CommandRejected(
+                        "signed build authorization requires public-v1 runtime context".into(),
+                    ));
+                }
+                match callbacks.primary.build_replica(replica).await {
                     Ok(()) => O::Done,
                     Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
                         if matches!(
