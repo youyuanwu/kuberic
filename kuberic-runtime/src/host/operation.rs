@@ -1411,7 +1411,13 @@ mod tests {
             revision,
             process_session_id: ProcessSessionId::new("session"),
             class,
-            input_digest: format!("digest-{revision}"),
+            input_digest:
+                crate::protocol::public_operations::CanonicalOperationInputDigest::opaque_v1(
+                    "kuberic-operation-test-input-v1",
+                    format!("digest-{revision}").as_bytes(),
+                ),
+            replay_disposition:
+                crate::protocol::public_operations::PublicOperationReplayDisposition::Convergent,
             lifecycle: None,
             program: None,
         }

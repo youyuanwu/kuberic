@@ -1,4 +1,5 @@
 page:all.html
+page:application/constant.INVALID_LSN.html
 page:application/enum.OpenMode.html
 page:application/index.html
 page:application/struct.ClientWrite.html
@@ -21,8 +22,10 @@ page:control/convert/fn.normalize_agent_status_report.html
 page:control/convert/fn.normalize_copy_ack.html
 page:control/convert/fn.normalize_copy_item.html
 page:control/convert/fn.normalize_execute_request.html
+page:control/convert/fn.normalize_public_v1_agent_status_report.html
 page:control/convert/fn.normalize_replication_ack.html
 page:control/convert/fn.normalize_replication_item.html
+page:control/convert/fn.public_v1_agent_status_to_proto.html
 page:control/convert/fn.validate_agent_status_report.html
 page:control/convert/fn.validate_copy_ack.html
 page:control/convert/fn.validate_copy_item.html
@@ -48,6 +51,11 @@ page:control/proto/enum.AccessStatus.html
 page:control/proto/enum.AgentStorageState.html
 page:control/proto/enum.BuildAuthorityKind.html
 page:control/proto/enum.FaultType.html
+page:control/proto/enum.PublicV1OperationResultKind.html
+page:control/proto/enum.PublicV1ProgressRole.html
+page:control/proto/enum.PublicV1RebuildKind.html
+page:control/proto/enum.PublicV1RebuildReason.html
+page:control/proto/enum.PublicV1ReplayDisposition.html
 page:control/proto/enum.ReplicaRole.html
 page:control/proto/enum.TransitionKind.html
 page:control/proto/execute_command_request/enum.Command.html
@@ -90,6 +98,11 @@ page:control/proto/struct.LoadMetric.html
 page:control/proto/struct.PrepareSecondaryRemovalCommand.html
 page:control/proto/struct.PrepareSwitchoverCommand.html
 page:control/proto/struct.ProvisioningIntent.html
+page:control/proto/struct.PublicV1AgentStatus.html
+page:control/proto/struct.PublicV1BuildAuthorizationReference.html
+page:control/proto/struct.PublicV1CapturedOperationIdentity.html
+page:control/proto/struct.PublicV1OperationCompletion.html
+page:control/proto/struct.PublicV1ReplicaRebuildRequired.html
 page:control/proto/struct.ReplicaCleanupIdentity.html
 page:control/proto/struct.ReplicaIdentity.html
 page:control/proto/struct.ReplicaRetirementReport.html
@@ -303,6 +316,7 @@ page:replicator/struct.DefaultReplicator.html
 page:replicator/struct.DefaultReplicatorFactory.html
 page:replicator/struct.ReplicaInformation.html
 page:replicator/struct.ReplicaSetConfiguration.html
+page:replicator/struct.ReplicatorCapabilities.html
 page:replicator/struct.ReplicatorFactoryContext.html
 page:replicator/struct.ReplicatorInterfaces.html
 page:replicator/struct.ReplicatorSettings.html

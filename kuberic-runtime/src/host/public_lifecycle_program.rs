@@ -2,8 +2,9 @@ use super::*;
 use crate::host::state::{PublicCloseChild, PublicInstructionOutcome};
 use crate::protocol::public_operations::{
     PublicCatchUpMode, PublicConfiguration, PublicOperationProgram,
+    PublicOperationReplayDisposition, ReplicaRebuildRequired,
 };
-use crate::replicator::ReplicaInformation;
+use crate::replicator::{ReplicaInformation, ReplicaSetConfiguration};
 
 pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<PublicInstruction> {
     use PublicInstruction::*;
@@ -48,7 +49,18 @@ pub(crate) fn replayable(record: &PublicOperationRecord) -> bool {
     if record.intent.lifecycle.is_none() && record.intent.program.is_none() {
         return false;
     }
-    record.lifecycle.in_flight.is_none_or(repeatable)
+    record
+        .lifecycle
+        .in_flight
+        .is_none_or(|instruction| match record.intent.replay_disposition {
+            PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
+            | PublicOperationReplayDisposition::DataLoss(_) => false,
+            PublicOperationReplayDisposition::Convergent
+            | PublicOperationReplayDisposition::RepeatableRead
+            | PublicOperationReplayDisposition::ReevaluateCatchUp
+            | PublicOperationReplayDisposition::ExactRemoval
+            | PublicOperationReplayDisposition::Containment => repeatable(instruction),
+        })
 }
 
 fn mode(selection: PublicCatchUpMode) -> ReplicaSetQuorumMode {
@@ -58,19 +70,40 @@ fn mode(selection: PublicCatchUpMode) -> ReplicaSetQuorumMode {
     }
 }
 
+pub(super) fn replica_set(
+    input: &PublicConfiguration,
+    configuration: &crate::protocol::types::ConfigurationDescriptor,
+) -> ReplicaSetConfiguration {
+    ReplicaSetConfiguration {
+        configuration: configuration.clone(),
+        replicas: input
+            .replicas
+            .iter()
+            .filter(|replica| {
+                configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == replica.identity)
+            })
+            .cloned()
+            .map(Into::into)
+            .collect(),
+    }
+}
+
 async fn install(callbacks: &PublicLifecycleCallbacks, input: &PublicConfiguration) -> Result<()> {
     if let Some(previous) = &input.previous {
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
-                input.current.clone().into(),
-                previous.clone().into(),
+                replica_set(input, &input.current),
+                replica_set(input, previous),
             )
             .await?;
     } else {
         callbacks
             .primary
-            .update_current_replica_set_configuration(input.current.clone().into())
+            .update_current_replica_set_configuration(replica_set(input, &input.current))
             .await?;
     }
     Ok(())
@@ -154,8 +187,18 @@ pub(super) async fn execute(
         .lifecycle
         .outcomes
         .iter()
-        .any(|outcome| matches!(outcome, O::CloseFailure { .. }))
+        .any(|outcome| matches!(outcome, O::CloseFailure { .. } | O::RebuildRequired(_)))
     {
+        if record
+            .lifecycle
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, O::RebuildRequired(_)))
+        {
+            return Err(HostError::CommandRejected(
+                "retained replica rebuild requirement".into(),
+            ));
+        }
         callbacks.abort_once();
     }
     for (index, instruction) in operation_instructions(&intent)
@@ -170,6 +213,7 @@ pub(super) async fn execute(
         store
             .public_instruction(&intent, index, instruction, None)
             .await?;
+        let mut rebuild_failure = None;
         let outcome = match instruction {
             ApplicationOpen => {
                 let P::Open { replica, existing } = program else {
@@ -252,19 +296,44 @@ pub(super) async fn execute(
                 let P::Build(build) = program else {
                     unreachable!()
                 };
-                callbacks
+                match callbacks
                     .primary
-                    .build_replica(ReplicaInformation {
-                        build_id: build.attempt.clone(),
-                        identity: build.replica.clone(),
-                        replication_address: build.replication_address.clone(),
-                        process_session_id: build.process_session_id.clone(),
-                        role: ReplicaRole::IdleSecondary,
-                        current_progress: 0,
-                        catch_up_capability: 0,
+                    .build_replica({
+                        let mut replica = ReplicaInformation::idle_build(
+                            build.attempt.clone(),
+                            build.replica.clone(),
+                            build.replication_address.clone(),
+                        );
+                        replica.process_session_id = build.process_session_id.clone();
+                        replica
                     })
-                    .await?;
-                O::Done
+                    .await
+                {
+                    Ok(()) => O::Done,
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
+                        if matches!(
+                            failure.as_ref(),
+                            ReplicaRebuildRequired::RemoteBuildTarget(_)
+                        ) =>
+                    {
+                        let state = store.load_state().await?;
+                        let canonical = super::enrich_remote_rebuild(
+                            &state.identity,
+                            &intent,
+                            build,
+                            *failure,
+                        )?;
+                        rebuild_failure = Some("remote build target requires replacement");
+                        O::RebuildRequired(Box::new(canonical))
+                    }
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => {
+                        return Err(HostError::CommandRejected(
+                            "local-provider rebuild failure substituted for remote build failure"
+                                .into(),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             Remove => {
                 let P::Remove(build) = program else {
@@ -328,6 +397,9 @@ pub(super) async fn execute(
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::InstructionApplied, index)
                 .await;
+        }
+        if let Some(message) = rebuild_failure {
+            return Err(HostError::CommandRejected(message.into()));
         }
     }
     Ok(())

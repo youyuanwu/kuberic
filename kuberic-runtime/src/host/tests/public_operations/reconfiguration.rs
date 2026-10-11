@@ -39,6 +39,7 @@ fn configuration(epoch: i64) -> PublicConfiguration {
             1,
         )),
         current,
+        replicas: Vec::new(),
     }
 }
 
@@ -50,6 +51,7 @@ fn build(attempt: &str) -> PublicBuildInput {
         replica,
         process_session_id: ProcessSessionId::new("target-session"),
         replication_address: "trace://target".into(),
+        authorization: None,
     }
 }
 
@@ -62,6 +64,7 @@ fn primary_lifecycle() -> PublicLifecycleInput {
         possible_data_loss: PossibleDataLossIntent::NotPossible,
         current: configuration.current,
         previous: configuration.previous,
+        replicas: Vec::new(),
     }
 }
 
@@ -74,10 +77,20 @@ fn configuration_with_target(epoch: i64) -> PublicConfiguration {
             role: ReplicaRole::Primary,
         },
         ConfigurationMember {
-            identity: target,
+            identity: target.clone(),
             role: ReplicaRole::ActiveSecondary,
         },
     ];
+    let replica = crate::protocol::public_operations::PublicReplicaDescriptor {
+        build_id: OperationId::default(),
+        identity: target.clone(),
+        replication_address: "trace://secondary".into(),
+        process_session_id: ProcessSessionId::new("secondary-session"),
+        role: ReplicaRole::ActiveSecondary,
+        current_progress: 0,
+        catch_up_capability: 0,
+        must_catchup: false,
+    };
     PublicConfiguration {
         previous: Some(ConfigurationDescriptor::new(
             Epoch::new(1, epoch - 1),
@@ -86,6 +99,7 @@ fn configuration_with_target(epoch: i64) -> PublicConfiguration {
             1,
         )),
         current: ConfigurationDescriptor::new(Epoch::new(1, epoch), ReplicaId::new(1), members, 1),
+        replicas: vec![replica],
     }
 }
 
@@ -95,13 +109,36 @@ fn swap() -> Program {
         refreshed: configuration(11),
         epoch: Epoch::new(1, 11),
         handoff: ReplicaRole::ActiveSecondary,
+        catch_up_specific_quorum: false,
         mode: PublicCatchUpMode::All,
+    }
+}
+
+fn specific_quorum_swap() -> Program {
+    let mut starting = configuration_with_target(10);
+    starting.replicas[0].must_catchup = true;
+    let mut refreshed = configuration_with_target(11);
+    refreshed.replicas[0].must_catchup = true;
+    Program::Swap {
+        starting,
+        refreshed,
+        epoch: Epoch::new(1, 11),
+        handoff: ReplicaRole::ActiveSecondary,
+        catch_up_specific_quorum: true,
+        mode: PublicCatchUpMode::WriteQuorum,
     }
 }
 
 impl Fixture {
     async fn new() -> Self {
-        let preview = PublicOperationPreviewIdentity::new(430);
+        Self::new_with_preview(PublicOperationPreviewIdentity::new(430)).await
+    }
+
+    async fn public_v1() -> Self {
+        Self::new_with_preview(PublicOperationPreviewIdentity::public_v1(430)).await
+    }
+
+    async fn new_with_preview(preview: PublicOperationPreviewIdentity) -> Self {
         let (directory, path, store) = durable_preview_store(&preview);
         let (trace, application, replicator, _) = trace_fixture();
         application.convergent_open.store(true, Ordering::Release);
@@ -189,6 +226,7 @@ impl Fixture {
         };
         let mut intent = intent(&self.preview, id, revision, class, "session-1");
         intent.input_digest = program.digest();
+        intent.replay_disposition = program.replay_disposition();
         intent.program = Some(program);
         intent
     }
@@ -258,10 +296,11 @@ async fn swap_installs_exact_starting_configuration_before_both_captured_mode_wa
         let fixture = Fixture::new().await;
         *fixture.trace.installed.lock().unwrap() = Some(configuration(2));
         fixture.trace.events.lock().unwrap().clear();
-        let mut program = swap();
-        if let Program::Swap { mode, .. } = &mut program {
-            *mode = selected;
-        }
+        let program = if selected == PublicCatchUpMode::WriteQuorum {
+            specific_quorum_swap()
+        } else {
+            swap()
+        };
         let operation_intent = fixture.intent("swap", 3, program);
         let revoke = cut(PublicCutPosition::BeforeInstruction, 2);
         let operation = fixture
@@ -297,9 +336,21 @@ async fn swap_installs_exact_starting_configuration_before_both_captured_mode_wa
         } else {
             ReplicaSetQuorumMode::WriteQuorum
         };
+        let expected_configurations = if selected == PublicCatchUpMode::All {
+            vec![configuration(10), configuration(11)]
+        } else {
+            let mut starting = configuration_with_target(10);
+            starting.replicas[0].must_catchup = true;
+            let mut refreshed = configuration_with_target(11);
+            refreshed.replicas[0].must_catchup = true;
+            vec![starting, refreshed]
+        };
         assert_eq!(
             *fixture.trace.waits.lock().unwrap(),
-            vec![(configuration(10), mode), (configuration(11), mode)]
+            vec![
+                (expected_configurations[0].clone(), mode),
+                (expected_configurations[1].clone(), mode),
+            ]
         );
         assert_eq!(
             *fixture.trace.events.lock().unwrap(),
@@ -326,6 +377,65 @@ async fn swap_installs_exact_starting_configuration_before_both_captured_mode_wa
         assert_eq!(fixture.trace.waits.lock().unwrap().len(), 2);
         fixture.owner.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn public_v1_swap_captures_specific_quorum_capability() {
+    let fixture = Fixture::public_v1().await;
+    let program = specific_quorum_swap();
+    let admitted = fixture.intent("public-v1-specific-swap", 3, program);
+    let operation = fixture.launch(admitted.clone(), None).await;
+    terminal(&operation).await;
+    assert_eq!(
+        fixture
+            .trace
+            .waits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, mode)| *mode)
+            .collect::<Vec<_>>(),
+        vec![
+            ReplicaSetQuorumMode::WriteQuorum,
+            ReplicaSetQuorumMode::WriteQuorum,
+        ]
+    );
+    let successors = fixture
+        .trace
+        .waits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(configuration, _)| configuration.successor().cloned())
+        .collect::<Vec<_>>();
+    assert!(successors.iter().all(Option::is_some));
+    assert_eq!(successors[0], successors[1]);
+
+    let mut changed = admitted;
+    let program = changed.program.as_mut().unwrap();
+    let Program::Swap {
+        catch_up_specific_quorum,
+        mode,
+        ..
+    } = program
+    else {
+        unreachable!()
+    };
+    *catch_up_specific_quorum = false;
+    *mode = PublicCatchUpMode::All;
+    changed.input_digest = program.digest();
+    changed.replay_disposition = program.replay_disposition();
+    assert!(
+        public_lifecycle::launch(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            changed,
+            fixture.callbacks.clone(),
+        )
+        .await
+        .is_err()
+    );
+    fixture.owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -381,6 +491,7 @@ async fn public_operation_replay_retains_applied_data_loss_error_as_failure() {
         possible_data_loss: PossibleDataLossIntent::Possible,
         current: configuration.current,
         previous: configuration.previous,
+        replicas: Vec::new(),
     };
     let mut operation_intent = intent(
         &fixture.preview,
@@ -390,6 +501,10 @@ async fn public_operation_replay_retains_applied_data_loss_error_as_failure() {
         "session-1",
     );
     operation_intent.input_digest = lifecycle.digest();
+    operation_intent.replay_disposition =
+        crate::protocol::public_operations::PublicOperationReplayDisposition::DataLoss(
+            crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity,
+        );
     operation_intent.lifecycle = Some(lifecycle);
     *fixture.trace.data_loss.lock().unwrap() = Some(Err("retained failure".into()));
     let barrier = cut(PublicCutPosition::InstructionApplied, 2);
@@ -447,6 +562,234 @@ async fn public_operation_replay_retains_applied_data_loss_error_as_failure() {
         callbacks_before
     );
     fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
+    use crate::protocol::public_operations::{
+        DataLossReplay, LocalProviderRebuildRequired, ProviderReplicaIdentity,
+        PublicOperationReplayDisposition, PublicProgress, PublicProgressRole,
+        PublicV1OperationResult, ReplicaRebuildReason, ReplicaRebuildRequired,
+    };
+
+    let fixture = Fixture::public_v1().await;
+    *fixture.trace.rebuild.lock().unwrap() = Some(ReplicaRebuildRequired::LocalProvider(
+        LocalProviderRebuildRequired {
+            reason: ReplicaRebuildReason::IncompatibleRetainedHistory,
+            provider: ProviderReplicaIdentity {
+                replica: replica_identity(),
+            },
+        },
+    ));
+    let configuration = configuration(3);
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch: configuration.current.epoch,
+        possible_data_loss: PossibleDataLossIntent::Possible,
+        current: configuration.current,
+        previous: configuration.previous,
+        replicas: Vec::new(),
+    };
+    let mut operation_intent = intent(
+        &fixture.preview,
+        "public-v1-local-rebuild",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    operation_intent.input_digest = lifecycle.digest();
+    operation_intent.replay_disposition =
+        PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity);
+    operation_intent.lifecycle = Some(lifecycle);
+    let operation = fixture.launch(operation_intent.clone(), None).await;
+    let record = tokio::time::timeout(Duration::from_secs(2), operation.wait_for_terminal())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.stage, PublicOperationStage::Completed);
+    assert!(matches!(
+        record.disposition,
+        Some(PublicOperationDisposition::Failed(ref message))
+            if message.contains("local provider requires replica rebuild")
+    ));
+    let canonical = record
+        .lifecycle
+        .outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            PublicInstructionOutcome::RebuildRequired(failure) => Some((**failure).clone()),
+            _ => None,
+        })
+        .expect("typed local rebuild outcome");
+    let crate::protocol::public_operations::CanonicalReplicaRebuildRequired::LocalProvider {
+        operation: captured,
+        local_replica,
+        local_storage,
+        ..
+    } = &canonical
+    else {
+        panic!("local provider result changed variant");
+    };
+    assert_eq!(captured.operation_id, operation_intent.operation_id);
+    assert_eq!(captured.revision, operation_intent.revision);
+    assert_eq!(
+        captured.detecting_session,
+        operation_intent.process_session_id
+    );
+    assert_eq!(local_replica, &replica_identity());
+    assert_eq!(local_storage, &PvcUid::new("pvc-1"));
+
+    // A delayed or superseded completion is checked against the captured
+    // operation record rather than whichever operation is current.
+    assert!(
+        fixture
+            .store
+            .public_instruction(
+                &operation_intent,
+                3,
+                PublicInstruction::DataLoss,
+                Some(PublicInstructionOutcome::RebuildRequired(Box::new(
+                    canonical.clone(),
+                ))),
+            )
+            .await
+            .is_err()
+    );
+
+    let report = public_lifecycle::public_v1_report(
+        fixture.store.as_ref(),
+        &fixture.preview,
+        public_lifecycle::PublicV1ReportProjection {
+            process_session_id: ProcessSessionId::new("session-1"),
+            report_sequence: 1,
+            role: ReplicaRole::Primary,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            progress: PublicProgress {
+                role: PublicProgressRole::Recovery,
+                first: 0,
+                last: 0,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.completed_operations.iter().any(|completion| {
+        matches!(
+            &completion.result,
+            PublicV1OperationResult::RebuildRequired(failure)
+                if failure.as_ref() == &canonical
+        )
+    }));
+    let wire = crate::control::public_v1_agent_status_to_proto(&report);
+    assert_eq!(
+        crate::control::normalize_public_v1_agent_status_report(wire).unwrap(),
+        report
+    );
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
+    use crate::protocol::public_operations::{
+        AuthorizationAuditDigest, PublicBuildAuthorizationReference, PublicProgress,
+        PublicProgressRole, PublicV1AgentReport, PublicV1OperationCompletion,
+        PublicV1OperationResult, RemoteBuildTargetRebuildRequired, ReplicaRebuildReason,
+        ReplicaRebuildRequired,
+    };
+
+    let preview = PublicOperationPreviewIdentity::public_v1(902);
+    let (_directory, _path, store) = durable_preview_store(&preview);
+    let mut target = replica_identity();
+    target.replica_id = ReplicaId::new(2);
+    let authorization = PublicBuildAuthorizationReference {
+        resource_uid: ResourceUid::new("resource-1"),
+        epoch: Epoch::new(1, 9),
+        build_id: OperationId::new("public-v1-remote-build"),
+        source: replica_identity(),
+        source_storage: PvcUid::new("pvc-1"),
+        source_session: ProcessSessionId::new("session-1"),
+        target: target.clone(),
+        target_storage: PvcUid::new("pvc-2"),
+        target_session: ProcessSessionId::new("target-session"),
+        audit_digest: AuthorizationAuditDigest("ab".repeat(32)),
+    };
+    let input = PublicBuildInput {
+        attempt: authorization.build_id.clone(),
+        replica: target,
+        process_session_id: authorization.target_session.clone(),
+        replication_address: "trace://target".into(),
+        authorization: Some(authorization.clone()),
+    };
+    let program = Program::Build(input.clone());
+    let mut operation = intent(
+        &preview,
+        authorization.build_id.as_str(),
+        4,
+        PublicOperationClass::Build {
+            target: input.replica.replica_id,
+        },
+        "session-1",
+    );
+    operation.input_digest = program.digest();
+    operation.replay_disposition = program.replay_disposition();
+    operation.program = Some(program);
+    let state = store.load_state().await.unwrap();
+    let canonical = public_lifecycle::enrich_remote_rebuild(
+        &state.identity,
+        &operation,
+        &input,
+        ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
+            reason: ReplicaRebuildReason::RemoteCopyConflict,
+            authorization: authorization.clone(),
+        })),
+    )
+    .unwrap();
+
+    let mut changed = authorization;
+    changed.source_session = ProcessSessionId::new("changed-source-session");
+    assert!(
+        public_lifecycle::enrich_remote_rebuild(
+            &state.identity,
+            &operation,
+            &input,
+            ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
+                reason: ReplicaRebuildReason::RemoteCopyConflict,
+                authorization: changed,
+            },)),
+        )
+        .is_err()
+    );
+
+    let report = PublicV1AgentReport {
+        identity: preview,
+        resource_uid: ResourceUid::new("resource-1"),
+        replica: replica_identity(),
+        process_session_id: ProcessSessionId::new("session-1"),
+        report_sequence: 1,
+        role: ReplicaRole::Primary,
+        read_status: AccessStatus::NotPrimary,
+        write_status: AccessStatus::NotPrimary,
+        progress: PublicProgress {
+            role: PublicProgressRole::Recovery,
+            first: 0,
+            last: 0,
+        },
+        completed_operations: vec![PublicV1OperationCompletion {
+            operation_id: operation.operation_id,
+            revision: operation.revision,
+            input_digest: operation.input_digest,
+            replay_disposition: operation.replay_disposition,
+            result: PublicV1OperationResult::RebuildRequired(Box::new(canonical)),
+        }],
+        extensions: Default::default(),
+    };
+    let wire = crate::control::public_v1_agent_status_to_proto(&report);
+    assert_eq!(
+        crate::control::normalize_public_v1_agent_status_report(wire).unwrap(),
+        report
+    );
 }
 
 #[tokio::test]
@@ -532,6 +875,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
         possible_data_loss: PossibleDataLossIntent::NotPossible,
         current: expanded.current,
         previous: expanded.previous,
+        replicas: expanded.replicas,
     };
     let mut authority = intent(
         &fixture.preview,
@@ -586,6 +930,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
                 refreshed: configuration(4),
                 epoch: Epoch::new(1, 4),
                 handoff: ReplicaRole::ActiveSecondary,
+                catch_up_specific_quorum: false,
                 mode: PublicCatchUpMode::All,
             },
         ),
@@ -596,6 +941,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
                 refreshed: configuration_with_target(4),
                 epoch: Epoch::new(1, 4),
                 handoff: ReplicaRole::ActiveSecondary,
+                catch_up_specific_quorum: false,
                 mode: PublicCatchUpMode::All,
             },
         ),
@@ -1166,6 +1512,110 @@ async fn public_operation_replay_matrix_converges_each_repeatable_program_family
             fixture.owner.shutdown().await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn public_v1_replay_preserves_declared_disposition() {
+    use crate::protocol::public_operations::{
+        AuthorizationAuditDigest, PublicOperationReplayDisposition,
+    };
+
+    let preview = PublicOperationPreviewIdentity::public_v1(901);
+    let (_directory, path, store) = durable_preview_store(&preview);
+    let program = Program::Progress { capability: false };
+    let mut exact = intent(
+        &preview,
+        "public-v1-progress-read",
+        1,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    exact.input_digest = program.digest();
+    exact.replay_disposition = program.replay_disposition();
+    exact.program = Some(program);
+    assert_eq!(
+        exact.replay_disposition,
+        PublicOperationReplayDisposition::RepeatableRead
+    );
+    store
+        .begin_public_operation(&exact, &[], &[])
+        .await
+        .unwrap();
+    store
+        .advance_public_operation(
+            &exact.operation_id,
+            exact.revision,
+            &exact.process_session_id,
+            PublicOperationStage::Ready,
+            PublicOperationStage::Running,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .public_instruction(&exact, 0, PublicInstruction::Progress, None)
+        .await
+        .unwrap();
+    store
+        .public_instruction(
+            &exact,
+            0,
+            PublicInstruction::Progress,
+            Some(PublicInstructionOutcome::Progress(0)),
+        )
+        .await
+        .unwrap();
+    store
+        .advance_public_operation(
+            &exact.operation_id,
+            exact.revision,
+            &exact.process_session_id,
+            PublicOperationStage::Running,
+            PublicOperationStage::CallbackApplied,
+            Some(PublicOperationDisposition::Succeeded),
+        )
+        .await
+        .unwrap();
+    store
+        .advance_public_operation(
+            &exact.operation_id,
+            exact.revision,
+            &exact.process_session_id,
+            PublicOperationStage::CallbackApplied,
+            PublicOperationStage::Completed,
+            None,
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = Arc::new(SqliteStore::open_preview_existing(&path, None, &preview).unwrap());
+    assert!(matches!(
+        reopened
+            .begin_public_operation(&exact, &[], &[])
+            .await
+            .unwrap(),
+        crate::host::store::BeginPublicOperation::Completed(_)
+    ));
+    assert_eq!(exact.input_digest.version(), 1);
+    let audit_digest = AuthorizationAuditDigest(exact.input_digest.sha256().to_string());
+    assert_eq!(audit_digest.0, exact.input_digest.sha256());
+    assert_ne!(
+        std::any::TypeId::of::<AuthorizationAuditDigest>(),
+        std::any::TypeId::of::<crate::protocol::public_operations::CanonicalOperationInputDigest>()
+    );
+
+    let changed_program = Program::Progress { capability: true };
+    let mut changed = exact.clone();
+    changed.input_digest = changed_program.digest();
+    changed.replay_disposition = changed_program.replay_disposition();
+    changed.program = Some(changed_program);
+    assert!(
+        reopened
+            .begin_public_operation(&changed, &[], &[])
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

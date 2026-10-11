@@ -44,6 +44,7 @@ fn controller_exports_observation_and_evaluation_contracts() {
     set.metadata.generation = Some(1);
     set.status = Some(KubericSetStatus {
         authority: AcceptedStatus::default(),
+        public_v1_authority: None,
     });
     let raw = RawObservation {
         set,

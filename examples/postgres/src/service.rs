@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use kuberic_runtime::application::{OpenContext, OpenMode, RoleChange, StateProvider};
 use kuberic_runtime::host::ApplicationStorageState;
 use kuberic_runtime::protocol::types::{FaultType, ReplicaRole, ResourceUid};
-use kuberic_runtime::replicator::{ReplicatorFactoryContext, ReplicatorSettings};
+use kuberic_runtime::replicator::{
+    ReplicatorCapabilities, ReplicatorFactoryContext, ReplicatorSettings,
+};
 use kuberic_runtime::{
     Replicator, ReplicatorFactory, ReplicatorInterfaces, Result, RuntimeError,
     StatefulServiceReplica,
@@ -235,7 +237,7 @@ struct PgReplicatorFactory(Arc<PgReplicator>);
 
 impl PgReplicatorFactory {
     fn interfaces(&self) -> ReplicatorInterfaces {
-        ReplicatorInterfaces::primary(self.0.clone(), None)
+        ReplicatorInterfaces::primary(self.0.clone(), None, ReplicatorCapabilities::conservative())
     }
 }
 

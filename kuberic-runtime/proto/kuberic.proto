@@ -150,6 +150,111 @@ message AgentStatusReport {
   ScaleUpIntent scale_up_intent = 37;
   EnsureConfigurationCommand pending_configuration = 38;
   string replication_address = 39;
+  PublicV1AgentStatus public_v1 = 40;
+}
+
+message PublicV1AgentStatus {
+  uint32 protocol_version = 1;
+  uint64 generation = 2;
+  string resource_uid = 3;
+  ReplicaIdentity identity = 4;
+  string process_session_id = 5;
+  uint64 report_sequence = 6;
+  ReplicaRole role = 7;
+  AccessStatus read_status = 8;
+  AccessStatus write_status = 9;
+  PublicV1ProgressRole progress_role = 10;
+  int64 first_progress = 11;
+  int64 last_progress = 12;
+  repeated PublicV1OperationCompletion completed_operations = 13;
+  optional uint32 history_recovery_extension_version = 14;
+  optional uint32 signed_authorization_extension_version = 15;
+  optional uint32 public_build_evidence_extension_version = 16;
+}
+
+enum PublicV1ProgressRole {
+  PUBLIC_V1_PROGRESS_ROLE_UNKNOWN = 0;
+  PUBLIC_V1_PROGRESS_ROLE_PRIMARY = 1;
+  PUBLIC_V1_PROGRESS_ROLE_SECONDARY = 2;
+  PUBLIC_V1_PROGRESS_ROLE_RECOVERY = 3;
+}
+
+enum PublicV1ReplayDisposition {
+  PUBLIC_V1_REPLAY_DISPOSITION_UNKNOWN = 0;
+  PUBLIC_V1_REPLAY_DISPOSITION_CONVERGENT = 1;
+  PUBLIC_V1_REPLAY_DISPOSITION_REPEATABLE_READ = 2;
+  PUBLIC_V1_REPLAY_DISPOSITION_REEVALUATE_CATCH_UP = 3;
+  PUBLIC_V1_REPLAY_DISPOSITION_RETAIN_BUILD_SUCCESS_RETIRE_AMBIGUITY = 4;
+  PUBLIC_V1_REPLAY_DISPOSITION_DATA_LOSS_CONVERGENT = 5;
+  PUBLIC_V1_REPLAY_DISPOSITION_DATA_LOSS_REPLACE_ON_AMBIGUITY = 6;
+  PUBLIC_V1_REPLAY_DISPOSITION_EXACT_REMOVAL = 7;
+  PUBLIC_V1_REPLAY_DISPOSITION_CONTAINMENT = 8;
+}
+
+enum PublicV1OperationResultKind {
+  PUBLIC_V1_OPERATION_RESULT_UNKNOWN = 0;
+  PUBLIC_V1_OPERATION_RESULT_SUCCEEDED = 1;
+  PUBLIC_V1_OPERATION_RESULT_FAILED = 2;
+  PUBLIC_V1_OPERATION_RESULT_AMBIGUOUS = 3;
+  PUBLIC_V1_OPERATION_RESULT_CANCELLED = 4;
+  PUBLIC_V1_OPERATION_RESULT_REBUILD_REQUIRED = 5;
+}
+
+enum PublicV1RebuildKind {
+  PUBLIC_V1_REBUILD_KIND_UNKNOWN = 0;
+  PUBLIC_V1_REBUILD_KIND_LOCAL_PROVIDER = 1;
+  PUBLIC_V1_REBUILD_KIND_REMOTE_BUILD_TARGET = 2;
+}
+
+enum PublicV1RebuildReason {
+  PUBLIC_V1_REBUILD_REASON_UNKNOWN = 0;
+  PUBLIC_V1_REBUILD_REASON_INCOMPATIBLE_RETAINED_HISTORY = 1;
+  PUBLIC_V1_REBUILD_REASON_PROVIDER_MISMATCH = 2;
+  PUBLIC_V1_REBUILD_REASON_REMOTE_COPY_CONFLICT = 3;
+}
+
+message PublicV1CapturedOperationIdentity {
+  string resource_uid = 1;
+  uint32 protocol_version = 2;
+  uint64 generation = 3;
+  Epoch epoch = 4;
+  string operation_id = 5;
+  uint64 revision = 6;
+  string detecting_session = 7;
+}
+
+message PublicV1BuildAuthorizationReference {
+  string resource_uid = 1;
+  Epoch epoch = 2;
+  string build_id = 3;
+  ReplicaIdentity source = 4;
+  string source_storage = 5;
+  string source_session = 6;
+  ReplicaIdentity target = 7;
+  string target_storage = 8;
+  string target_session = 9;
+  string audit_digest_sha256 = 10;
+}
+
+message PublicV1ReplicaRebuildRequired {
+  PublicV1RebuildKind kind = 1;
+  PublicV1RebuildReason reason = 2;
+  PublicV1CapturedOperationIdentity operation = 3;
+  ReplicaIdentity provider_replica = 4;
+  ReplicaIdentity local_replica = 5;
+  string local_storage = 6;
+  PublicV1BuildAuthorizationReference authorization = 7;
+}
+
+message PublicV1OperationCompletion {
+  string operation_id = 1;
+  uint64 revision = 2;
+  uint32 input_digest_version = 3;
+  string input_digest_sha256 = 4;
+  PublicV1ReplayDisposition replay_disposition = 5;
+  PublicV1OperationResultKind result = 6;
+  string detail = 7;
+  PublicV1ReplicaRebuildRequired rebuild_required = 8;
 }
 
 message InitializeAgentStoreCommand {

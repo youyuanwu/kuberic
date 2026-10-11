@@ -19,6 +19,7 @@ use std::path::PathBuf;
 // Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
+pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +164,7 @@ pub(crate) enum PublicInstructionOutcome {
         child: PublicCloseChild,
         error: String,
     },
+    RebuildRequired(Box<crate::protocol::public_operations::CanonicalReplicaRebuildRequired>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -41,6 +41,8 @@ pub enum RuntimeError {
     LocalWritePending(String),
     #[error("local write was fenced by data-loss recovery")]
     DataLossFenced,
+    #[error("replica rebuild required: {0:?}")]
+    ReplicaRebuildRequired(Box<crate::protocol::public_operations::ReplicaRebuildRequired>),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

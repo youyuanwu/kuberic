@@ -368,6 +368,7 @@ fn stable_observation() -> RawObservation {
             }),
             ..Default::default()
         },
+        public_v1_authority: None,
     });
     stable.agents.insert(
         replica_key(POD_UID),
@@ -1420,6 +1421,7 @@ async fn each_execute_requires_a_fresh_full_observation() {
     let mut observation = fresh_bootstrap_observation();
     observation.set.status = Some(KubericSetStatus {
         authority: bootstrap_status(&observation),
+        public_v1_authority: None,
     });
     let api = Arc::new(InMemoryClusterApi::new(observation));
     let reconciler = Reconciler::new(api.clone(), config());
@@ -1472,6 +1474,7 @@ async fn ambiguous_execute_is_reobserved_and_replayed_with_identical_authority()
     let mut observation = fresh_bootstrap_observation();
     observation.set.status = Some(KubericSetStatus {
         authority: bootstrap_status(&observation),
+        public_v1_authority: None,
     });
     let api = Arc::new(InMemoryClusterApi::new(observation));
     let reconciler = Reconciler::new(api.clone(), config());
@@ -1524,6 +1527,7 @@ async fn startup_unavailable_is_a_bounded_wait() {
     let mut observation = with_scaffolding(raw(1));
     observation.set.status = Some(KubericSetStatus {
         authority: bootstrap_status(&observation),
+        public_v1_authority: None,
     });
     observation.agents.insert(
         replica_key(POD_UID),
@@ -1631,6 +1635,7 @@ async fn stale_report_watermark_survives_repeated_rejection() {
     let mut observation = fresh_bootstrap_observation();
     observation.set.status = Some(KubericSetStatus {
         authority: bootstrap_status(&observation),
+        public_v1_authority: None,
     });
     let RawAgentObservation::Report(report) =
         observation.agents.get_mut(&replica_key(POD_UID)).unwrap()

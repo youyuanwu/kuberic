@@ -145,6 +145,51 @@ controller-owned: endpoint, Pod and PVC identities are frozen before deletion,
 and replacement scaffolding does not imply history/build/serving completion.
 Production construction and dispatch cannot select either preview action.
 
+Phase 5.1 introduces a second, incompatible dormant preview identity for the
+Public V1 contract. Protocol 11 uses schema 8 while production remains on
+protocol 9/schema 6 and the Phase 4 preview remains on protocol 10/schema 7.
+Schema 8 owns a transactional internal layout ledger whose first revision
+retains canonical operation inputs; later Phase 5 revisions are reserved but
+cannot authorize unfinished history, signing, renewal, or build behavior.
+Legacy and Phase 4 readers reject schema 8, and the Public V1 opener rejects
+the older stores.
+
+Public V1 operation inputs use versioned, domain-separated canonical binary
+digests rather than Rust diagnostic formatting. The digest version remains
+part of the retained operation evidence and is distinct from the signed
+authorization audit digest added by a later Phase 5 phase. Protocol 11 also
+has a structurally separate report and accepted-status branch containing only
+public identity, role/access, first/last progress, and exact public-operation
+completion. It cannot carry the managed engine's verified, committed, quorum,
+ACK, copy-boundary, topology, or build-cursor evidence. Production
+normalization and evaluation reject this branch.
+
+`ReplicaInformation` now distinguishes an idle build target from an active
+remote peer. Unknown or inapplicable progress is `INVALID_LSN` (`-1`); zero
+remains a valid empty-history position. Active public configuration entries
+are exact remote, ready secondaries and may identify one `must_catchup`
+successor. Immutable `ReplicatorCapabilities` are bound to the coherent
+`ReplicatorInterfaces` creation identity, survive wrapping and attachment, and
+cannot manufacture managed provenance. They freeze specific-quorum support
+and the data-loss replay disposition used by durable operations.
+
+Typed rebuild-required results preserve the public/provider-visible reason
+without exposing agent workflow state through a callback. The operation owner
+enriches a local result from the exact captured operation, storage, epoch,
+revision, and process session; delayed completion is never enriched from
+current state. Remote build failures retain exact signed-claim references and
+are validated against the captured build input. This two-level construction
+does not change the protected Replicator, PrimaryReplicator, StateReplicator,
+StateProvider, or DurableState method sets and adds no host-only callback.
+
+The Public V1 replay table is operation-specific: lifecycle, configuration,
+settings, and exact removal converge; progress is a repeatable read; catch-up
+reevaluates its captured predicate; terminal build success is retained while
+ambiguity retires the attempt; data-loss ambiguity follows the creation's
+frozen disposition; and Close, Abort, and fault containment are idempotent.
+All of this remains repository-only and dormant. Phase 5 has not selected a
+replacement Replicator or changed the legacy production path.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

@@ -154,6 +154,7 @@ pub(super) fn fixture(count: u32, desired: u32) -> RawObservation {
             topology: Some(AcceptedTopology { configuration }),
             ..Default::default()
         },
+        public_v1_authority: None,
     });
     raw.services.push(write_service("pod-uid-1"));
     raw

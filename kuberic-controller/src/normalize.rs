@@ -84,6 +84,17 @@ pub fn normalize(
             "KubericSet generation is negative".to_string(),
         ));
     }
+    if raw
+        .set
+        .status
+        .as_ref()
+        .is_some_and(|status| status.public_v1_authority.is_some())
+    {
+        return Err(ControllerError::Observation(
+            "protocol-11 public-v1 status is dormant and unavailable to production evaluation"
+                .to_string(),
+        ));
+    }
 
     let status = raw
         .set

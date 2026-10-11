@@ -2563,7 +2563,13 @@ impl PreviewFaultBridge {
             revision,
             process_session_id: self.process_session.clone(),
             class,
-            input_digest: format!("fault:{fault:?}:{revision}"),
+            input_digest:
+                crate::protocol::public_operations::CanonicalOperationInputDigest::opaque_v1(
+                    "kuberic-public-fault-input-v1",
+                    format!("{fault:?}:{revision}").as_bytes(),
+                ),
+            replay_disposition:
+                crate::protocol::public_operations::PublicOperationReplayDisposition::Containment,
             lifecycle: None,
             program: None,
         };

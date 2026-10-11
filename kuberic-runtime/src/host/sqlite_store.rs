@@ -33,8 +33,9 @@ use crate::host::Result;
 use crate::host::command::is_access_only_configuration;
 use crate::host::state::{
     AgentState, CoordinatorStage, DeactivationState, EffectStage,
-    PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, PendingEffect, PublicOperationPreviewState,
-    ReconfigurationRecord, RetainedCommandResult, RetainedResult, SCHEMA_VERSION, StorageIdentity,
+    PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PendingEffect,
+    PublicOperationPreviewState, ReconfigurationRecord, RetainedCommandResult, RetainedResult,
+    SCHEMA_VERSION, StorageIdentity,
 };
 #[cfg(any(test, feature = "testing"))]
 use crate::host::state::{
@@ -152,6 +153,21 @@ fn apply_process_completion(
 }
 
 const DATABASE_FILE: &str = "agent.sqlite3";
+const SCHEMA8_BASE_LAYOUT_REVISION: u32 = 1;
+const SCHEMA8_LAYOUT_MIGRATIONS: &[(u32, &str)] = &[
+    (1, "base-public-v1"),
+    (2, "history-recovery"),
+    (3, "signed-authorization-renewal"),
+    (4, "public-build-evidence"),
+];
+
+fn preview_schema_version(preview: &PublicOperationPreviewIdentity) -> u32 {
+    if preview.is_public_v1() {
+        PUBLIC_V1_PREVIEW_SCHEMA_VERSION
+    } else {
+        PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION
+    }
+}
 
 pub(crate) struct SqliteStore {
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -195,7 +211,7 @@ impl SqliteStore {
                 "public-operation preview state is already initialized".into(),
             ));
         }
-        state.identity.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+        state.identity.schema_version = preview_schema_version(&preview);
         state.public_operation_preview = Some(PublicOperationPreviewState::new(preview));
         Self::create_store(path, state)
     }
@@ -219,18 +235,18 @@ impl SqliteStore {
                 "public-operation preview state is already initialized".into(),
             ));
         }
-        state.identity.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+        state.identity.schema_version = preview_schema_version(&binding.preview);
         state.public_operation_preview = Some(PublicOperationPreviewState::new_bound(binding));
         Self::create_store(path, state)
     }
 
     fn create_store(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let expected_version = if state.public_operation_preview.is_some() {
-            PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION
-        } else {
-            SCHEMA_VERSION
-        };
+        let expected_version = state
+            .public_operation_preview
+            .as_ref()
+            .map(|preview| preview_schema_version(&preview.identity))
+            .unwrap_or(SCHEMA_VERSION);
         if state.identity.schema_version != expected_version {
             return Err(crate::host::HostError::SchemaMismatch {
                 expected: expected_version,
@@ -337,7 +353,7 @@ impl SqliteStore {
         if !path.is_file() {
             return Err(crate::host::HostError::MissingEstablishedStore);
         }
-        let connection = open_connection(&path).map_err(|error| {
+        let mut connection = open_connection(&path).map_err(|error| {
             crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
         })?;
         configure_durability(&connection)
@@ -345,11 +361,15 @@ impl SqliteStore {
         validate_integrity(&connection)
             .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION {
+        let expected_version = preview_schema_version(expected_preview);
+        if version != expected_version {
             return Err(crate::host::HostError::SchemaMismatch {
-                expected: PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
+                expected: expected_version,
                 observed: version,
             });
+        }
+        if expected_version == PUBLIC_V1_PREVIEW_SCHEMA_VERSION {
+            run_schema8_layout_migrations(&mut connection, SCHEMA8_BASE_LAYOUT_REVISION)?;
         }
         let state = load_state_from_connection(&connection)?;
         if state.identity.schema_version != version {
@@ -360,7 +380,7 @@ impl SqliteStore {
         }
         if let Some(expected) = expected_identity {
             let mut expected = expected.clone();
-            expected.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+            expected.schema_version = expected_version;
             if state.identity != expected {
                 return Err(crate::host::HostError::IdentityMismatch(
                     "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
@@ -1676,11 +1696,34 @@ impl AgentStore for SqliteStore {
                     "public-operation preview identity changed".into(),
                 ));
             }
+            let public_v1 = preview.identity.is_public_v1();
             if let Some(existing) = preview.operations.get(&intent.operation_id) {
                 if &existing.intent != intent {
                     return Err(crate::host::HostError::DurableEffectConflict(
                         "public-operation ID was reused with changed input".into(),
                     ));
+                }
+                if public_v1 {
+                    let retained: Option<(u32, String, String)> = transaction
+                        .query_row(
+                            "SELECT digest_version, digest_sha256, intent_json
+                             FROM public_v1_operation_inputs WHERE operation_id = ?1",
+                            [intent.operation_id.as_str()],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?;
+                    let expected_json = serde_json::to_string(intent)?;
+                    if retained.as_ref()
+                        != Some(&(
+                            u32::from(intent.input_digest.version()),
+                            intent.input_digest.sha256().to_string(),
+                            expected_json,
+                        ))
+                    {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "public-v1 operation input ledger changed".into(),
+                        ));
+                    }
                 }
                 return Ok(match existing.stage {
                     PublicOperationStage::WaitingForContainment => {
@@ -1938,6 +1981,19 @@ impl AgentStore for SqliteStore {
             preview
                 .operations
                 .insert(intent.operation_id.clone(), record.clone());
+            if public_v1 {
+                transaction.execute(
+                    "INSERT INTO public_v1_operation_inputs(
+                        operation_id, digest_version, digest_sha256, intent_json
+                     ) VALUES(?1, ?2, ?3, ?4)",
+                    params![
+                        intent.operation_id.as_str(),
+                        u32::from(intent.input_digest.version()),
+                        intent.input_digest.sha256(),
+                        serde_json::to_string(intent)?,
+                    ],
+                )?;
+            }
             write_agent_state(transaction, &state)?;
             Ok(if stage == PublicOperationStage::Ready {
                 BeginPublicOperation::Ready(record)
@@ -2313,6 +2369,10 @@ impl AgentStore for SqliteStore {
                                 | DataLossOutcome::True
                                 | DataLossOutcome::Error(_),
                             ),
+                        ) => true,
+                        (
+                            PublicInstruction::DataLoss | PublicInstruction::Build,
+                            PublicInstructionOutcome::RebuildRequired(_),
                         ) => true,
                         (
                             PublicInstruction::ApplicationPrimary
@@ -3514,6 +3574,70 @@ fn configure_durability(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn run_schema8_layout_migrations(connection: &mut Connection, target_revision: u32) -> Result<()> {
+    let transaction = connection.transaction()?;
+    apply_schema8_layout_migrations(&transaction, target_revision)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_schema8_layout_migrations(
+    transaction: &Transaction<'_>,
+    target_revision: u32,
+) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema8_layout_migrations (
+            revision INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
+         );",
+    )?;
+    for (revision, name) in SCHEMA8_LAYOUT_MIGRATIONS
+        .iter()
+        .copied()
+        .take_while(|(revision, _)| *revision <= target_revision)
+    {
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT name FROM schema8_layout_migrations WHERE revision = ?1",
+                [revision],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != name {
+                return Err(crate::host::HostError::Corrupt(format!(
+                    "schema-8 layout revision {revision} changed from {existing} to {name}"
+                )));
+            }
+            continue;
+        }
+        match revision {
+            1 => transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS public_v1_operation_inputs (
+                    operation_id TEXT PRIMARY KEY,
+                    digest_version INTEGER NOT NULL,
+                    digest_sha256 TEXT NOT NULL,
+                    intent_json TEXT NOT NULL
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS public_v1_operation_input_digest
+                   ON public_v1_operation_inputs(
+                     operation_id, digest_version, digest_sha256
+                   );",
+            )?,
+            _ => {
+                return Err(crate::host::HostError::Corrupt(format!(
+                    "schema-8 layout migration {revision}/{name} is not owned by this phase"
+                )));
+            }
+        }
+        transaction.execute(
+            "INSERT INTO schema8_layout_migrations(revision, name) VALUES(?1, ?2)",
+            params![revision, name],
+        )?;
+    }
+    Ok(())
+}
+
 fn create_schema(connection: &mut Connection, state: &AgentState) -> Result<()> {
     let transaction = connection.transaction()?;
     transaction.execute_batch(
@@ -3564,6 +3688,9 @@ fn create_schema(connection: &mut Connection, state: &AgentState) -> Result<()> 
         "INSERT INTO schema_migrations(version) VALUES(?1)",
         [state.identity.schema_version],
     )?;
+    if state.identity.schema_version == PUBLIC_V1_PREVIEW_SCHEMA_VERSION {
+        apply_schema8_layout_migrations(&transaction, SCHEMA8_BASE_LAYOUT_REVISION)?;
+    }
     write_agent_state(&transaction, state)?;
     transaction.commit()?;
     Ok(())

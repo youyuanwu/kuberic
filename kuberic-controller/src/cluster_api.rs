@@ -918,6 +918,7 @@ where
         let mut set = observation.set.clone();
         set.status = Some(KubericSetStatus {
             authority: status.clone(),
+            public_v1_authority: None,
         });
         sets.replace_status(&set.name_any(), &PostParams::default(), &set)
             .await
@@ -3331,6 +3332,7 @@ impl ClusterApi for InMemoryClusterApi {
         }
         state.observation.set.status = Some(KubericSetStatus {
             authority: status.clone(),
+            public_v1_authority: None,
         });
         let next = state
             .observation

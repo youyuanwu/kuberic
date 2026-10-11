@@ -140,6 +140,7 @@ impl Fixture {
                     possible_data_loss: PossibleDataLossIntent::Possible,
                     current,
                     previous,
+                    replicas: Vec::new(),
                 }),
                 transition,
             )

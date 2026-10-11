@@ -81,10 +81,64 @@ impl Replicator for Control {
     }
 }
 
+#[async_trait]
+impl PrimaryReplicator for Control {
+    async fn on_data_loss(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        _: ReplicaSetConfiguration,
+        _: ReplicaSetConfiguration,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn wait_for_catch_up_quorum(&self, _: ReplicaSetQuorumMode) -> Result<()> {
+        Ok(())
+    }
+
+    async fn update_current_replica_set_configuration(
+        &self,
+        _: ReplicaSetConfiguration,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn build_replica(&self, _: ReplicaInformation) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_replica(&self, _: ReplicaId) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn public_capabilities_are_immutable_across_wrapping_and_failed_attachment() {
+    let capabilities = ReplicatorCapabilities {
+        catch_up_specific_quorum: true,
+        data_loss_replay: DataLossReplay::Convergent,
+    };
+    let original = Arc::new(Control::default());
+    let interfaces = ReplicatorInterfaces::primary(original, None, capabilities);
+    assert_eq!(interfaces.capabilities(), capabilities);
+    let wrapped = interfaces.wrap_primary(Arc::new(Control::default()), None);
+    assert_eq!(wrapped.capabilities(), capabilities);
+    let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+    wrapped.prepare_attachment(reservation).unwrap();
+    assert_eq!(wrapped.capabilities(), capabilities);
+    let other = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+    assert!(wrapped.prepare_attachment(other).is_err());
+    assert_eq!(wrapped.capabilities(), capabilities);
+}
+
 #[test]
 fn attachment_retries_bind_only_the_original_creation_reservation() {
     let control = Arc::new(Control::default());
-    let interfaces = ReplicatorInterfaces::secondary(control, None);
+    let interfaces =
+        ReplicatorInterfaces::secondary(control, None, ReplicatorCapabilities::conservative());
     let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
     let attachment = interfaces.prepare_attachment(reservation).unwrap();
     let retry = interfaces.prepare_attachment(reservation).unwrap();
@@ -110,7 +164,11 @@ fn attachment_retries_bind_only_the_original_creation_reservation() {
 #[test]
 fn unregistered_capability_bundle_aborts_once_after_its_last_handle_drops() {
     let control = Arc::new(Control::default());
-    let interfaces = ReplicatorInterfaces::secondary(control.clone(), None);
+    let interfaces = ReplicatorInterfaces::secondary(
+        control.clone(),
+        None,
+        ReplicatorCapabilities::conservative(),
+    );
     let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
     let attachment = interfaces.prepare_attachment(reservation).unwrap();
     drop(interfaces);
@@ -122,7 +180,11 @@ fn unregistered_capability_bundle_aborts_once_after_its_last_handle_drops() {
 #[test]
 fn successful_host_registration_disarms_bundle_cleanup() {
     let control = Arc::new(Control::default());
-    let interfaces = ReplicatorInterfaces::secondary(control.clone(), None);
+    let interfaces = ReplicatorInterfaces::secondary(
+        control.clone(),
+        None,
+        ReplicatorCapabilities::conservative(),
+    );
     let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
     let attachment = interfaces.prepare_attachment(reservation).unwrap();
     attachment.disarm();

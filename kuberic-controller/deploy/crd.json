@@ -2942,6 +2942,146 @@
                     ],
                     "type": "object"
                   },
+                  "publicV1Authority": {
+                    "nullable": true,
+                    "properties": {
+                      "completedOperations": {
+                        "default": [],
+                        "items": {
+                          "properties": {
+                            "inputDigestSha256": {
+                              "type": "string"
+                            },
+                            "inputDigestVersion": {
+                              "format": "uint16",
+                              "maximum": 65535.0,
+                              "minimum": 0.0,
+                              "type": "integer"
+                            },
+                            "operationId": {
+                              "type": "string"
+                            },
+                            "replayDisposition": {
+                              "enum": [
+                                "convergent",
+                                "repeatableRead",
+                                "reevaluateCatchUp",
+                                "retainBuildSuccessRetireAmbiguity",
+                                "dataLossConvergent",
+                                "dataLossReplaceOnAmbiguity",
+                                "exactRemoval",
+                                "containment"
+                              ],
+                              "type": "string"
+                            },
+                            "result": {
+                              "enum": [
+                                "succeeded",
+                                "failed",
+                                "ambiguous",
+                                "cancelled",
+                                "rebuildRequired"
+                              ],
+                              "type": "string"
+                            },
+                            "resultDigestSha256": {
+                              "type": "string"
+                            },
+                            "revision": {
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "inputDigestSha256",
+                            "inputDigestVersion",
+                            "operationId",
+                            "replayDisposition",
+                            "result",
+                            "resultDigestSha256",
+                            "revision"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "extensions": {
+                        "default": {},
+                        "properties": {
+                          "historyRecovery": {
+                            "nullable": true,
+                            "properties": {
+                              "version": {
+                                "format": "uint16",
+                                "maximum": 65535.0,
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "version"
+                            ],
+                            "type": "object"
+                          },
+                          "publicBuildEvidence": {
+                            "nullable": true,
+                            "properties": {
+                              "version": {
+                                "format": "uint16",
+                                "maximum": 65535.0,
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "version"
+                            ],
+                            "type": "object"
+                          },
+                          "signedAuthorization": {
+                            "nullable": true,
+                            "properties": {
+                              "version": {
+                                "format": "uint16",
+                                "maximum": 65535.0,
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "version"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "identity": {
+                        "properties": {
+                          "generation": {
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "protocolVersion": {
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "generation",
+                          "protocolVersion"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "identity"
+                    ],
+                    "type": "object"
+                  },
                   "quorumLoss": {
                     "nullable": true,
                     "properties": {

@@ -51,8 +51,8 @@ use crate::protocol::types::{
 use crate::replicator::stream::OperationMetadata;
 use crate::replicator::stream::OperationStream;
 use crate::replicator::{
-    Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
-    ReplicatorSettings, StateReplicator,
+    Replicator, ReplicatorCapabilities, ReplicatorFactory, ReplicatorFactoryContext,
+    ReplicatorInterfaces, ReplicatorSettings, StateReplicator,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1116,6 +1116,7 @@ impl ReplicatorFactory for NoopFactory {
         Ok(ReplicatorInterfaces::secondary(
             replicator.clone(),
             Some(replicator),
+            ReplicatorCapabilities::conservative(),
         ))
     }
 }
