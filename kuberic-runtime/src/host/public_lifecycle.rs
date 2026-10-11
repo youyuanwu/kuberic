@@ -418,6 +418,9 @@ pub(super) fn enrich_remote_rebuild(
     if &failure.authorization != authorization
         || authorization.resource_uid != identity.resource_uid
         || authorization.build_id != intent.operation_id
+        || authorization.source != identity.local_identity
+        || authorization.source_storage != identity.pvc_uid
+        || authorization.source_session != intent.process_session_id
         || authorization.target != build.replica
         || authorization.target_session != build.process_session_id
     {

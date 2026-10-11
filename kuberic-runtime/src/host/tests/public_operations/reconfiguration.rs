@@ -853,6 +853,29 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
                 if failure.as_ref() == &canonical
         )
     }));
+    let mut crossed_completion = report.clone();
+    let rebuild = crossed_completion
+        .completed_operations
+        .iter_mut()
+        .find_map(|completion| match &mut completion.result {
+            PublicV1OperationResult::RebuildRequired(rebuild) => Some(rebuild),
+            _ => None,
+        })
+        .expect("local rebuild completion");
+    let crate::protocol::public_operations::CanonicalReplicaRebuildRequired::LocalProvider {
+        operation,
+        ..
+    } = rebuild.as_mut()
+    else {
+        panic!("local rebuild evidence changed variant");
+    };
+    operation.operation_id = OperationId::new("crossed-operation");
+    assert!(crossed_completion.validate().is_err());
+
+    let mut crossed_reporter = report.clone();
+    crossed_reporter.replica.replica_id = ReplicaId::new(9);
+    assert!(crossed_reporter.validate().is_err());
+
     let wire = crate::control::public_v1_agent_status_to_proto(&report);
     assert_eq!(
         crate::control::normalize_public_v1_agent_status_report(wire).unwrap(),
@@ -918,7 +941,7 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
     )
     .unwrap();
 
-    let mut changed = authorization;
+    let mut changed = authorization.clone();
     changed.source_session = ProcessSessionId::new("changed-source-session");
     assert!(
         public_lifecycle::enrich_remote_rebuild(
@@ -932,6 +955,35 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         )
         .is_err()
     );
+
+    let reject_consistent_wrong_source =
+        |changed_authorization: PublicBuildAuthorizationReference| {
+            let mut changed_input = input.clone();
+            changed_input.authorization = Some(changed_authorization.clone());
+            assert!(
+                public_lifecycle::enrich_remote_rebuild(
+                    &state.identity,
+                    &operation,
+                    &changed_input,
+                    ReplicaRebuildRequired::RemoteBuildTarget(Box::new(
+                        RemoteBuildTargetRebuildRequired {
+                            reason: ReplicaRebuildReason::RemoteCopyConflict,
+                            authorization: changed_authorization,
+                        },
+                    )),
+                )
+                .is_err()
+            );
+        };
+    let mut wrong_source = authorization.clone();
+    wrong_source.source.replica_id = ReplicaId::new(9);
+    reject_consistent_wrong_source(wrong_source);
+    let mut wrong_storage = authorization.clone();
+    wrong_storage.source_storage = PvcUid::new("wrong-source-pvc");
+    reject_consistent_wrong_source(wrong_storage);
+    let mut wrong_session = authorization.clone();
+    wrong_session.source_session = ProcessSessionId::new("wrong-source-session");
+    reject_consistent_wrong_source(wrong_session);
 
     let report = PublicV1AgentReport {
         identity: preview,
@@ -995,6 +1047,42 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         .unwrap()
         .revision = 0;
     assert!(crate::control::normalize_public_v1_agent_status_report(invalid_operation).is_err());
+
+    let mut crossed_completion = wire.clone();
+    crossed_completion
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .completed_operations[0]
+        .operation_id = "crossed-operation".into();
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_completion).is_err());
+
+    let mut crossed_resource = wire.clone();
+    crossed_resource.public_v1.as_mut().unwrap().resource_uid = "crossed-resource".into();
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_resource).is_err());
+
+    let mut crossed_generation = wire.clone();
+    crossed_generation.public_v1.as_mut().unwrap().generation += 1;
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_generation).is_err());
+
+    let mut crossed_reporter = wire.clone();
+    crossed_reporter
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .identity
+        .as_mut()
+        .unwrap()
+        .replica_id = 9;
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_reporter).is_err());
+
+    let mut crossed_session = wire.clone();
+    crossed_session
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .process_session_id = "crossed-session".into();
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_session).is_err());
 
     let mut invalid_authorization = wire;
     invalid_authorization

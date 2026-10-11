@@ -1096,6 +1096,43 @@ impl CanonicalReplicaRebuildRequired {
         }
         Ok(())
     }
+
+    fn validate_for_report(
+        &self,
+        completion_id: &OperationId,
+        completion_revision: u64,
+        report_identity: &PublicOperationPreviewIdentity,
+        report_resource_uid: &ResourceUid,
+        report_replica: &ReplicaIdentity,
+        report_session: &ProcessSessionId,
+    ) -> Result<(), &'static str> {
+        self.validate()?;
+        let operation = match self {
+            Self::LocalProvider { operation, .. } | Self::RemoteBuildTarget { operation, .. } => {
+                operation
+            }
+        };
+        if &operation.operation_id != completion_id
+            || operation.revision != completion_revision
+            || &operation.preview != report_identity
+            || &operation.resource_uid != report_resource_uid
+            || &operation.detecting_session != report_session
+        {
+            return Err("rebuild evidence differs from its containing completion or report");
+        }
+        match self {
+            Self::LocalProvider { local_replica, .. } if local_replica != report_replica => {
+                Err("local rebuild evidence differs from the reporting replica")
+            }
+            Self::RemoteBuildTarget { authorization, .. }
+                if &authorization.source != report_replica
+                    || &authorization.source_session != report_session =>
+            {
+                Err("remote rebuild source differs from the reporting replica")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1165,7 +1202,13 @@ pub struct PublicV1OperationCompletion {
 }
 
 impl PublicV1OperationCompletion {
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(
+        &self,
+        report_identity: &PublicOperationPreviewIdentity,
+        report_resource_uid: &ResourceUid,
+        report_replica: &ReplicaIdentity,
+        report_session: &ProcessSessionId,
+    ) -> Result<(), &'static str> {
         if self.operation_id.is_empty() || self.revision == 0 {
             return Err("public-v1 operation completion is incomplete");
         }
@@ -1177,7 +1220,14 @@ impl PublicV1OperationCompletion {
             {
                 return Err("public-v1 failure completion lacks detail");
             }
-            PublicV1OperationResult::RebuildRequired(rebuild) => rebuild.validate()?,
+            PublicV1OperationResult::RebuildRequired(rebuild) => rebuild.validate_for_report(
+                &self.operation_id,
+                self.revision,
+                report_identity,
+                report_resource_uid,
+                report_replica,
+                report_session,
+            )?,
             _ => {}
         }
         Ok(())
@@ -1242,7 +1292,12 @@ impl PublicV1AgentReport {
             .validate(self.role, self.read_status, self.write_status)?;
         let mut operations = std::collections::BTreeSet::new();
         for completion in &self.completed_operations {
-            completion.validate()?;
+            completion.validate(
+                &self.identity,
+                &self.resource_uid,
+                &self.replica,
+                &self.process_session_id,
+            )?;
             if !operations.insert(&completion.operation_id) {
                 return Err("public-v1 operation completion is incomplete or duplicated");
             }
