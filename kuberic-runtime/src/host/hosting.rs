@@ -35,8 +35,8 @@ use crate::replicator::copy::{
 use crate::replicator::{
     DefaultReplicatorDependencies, ManagedReplicaStore, ManagedReplicatorDataPlane,
     PartitionAccessView, PrimaryReplicator, Replicator, ReplicatorAttachment,
-    ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorRegistration,
-    StatefulServicePartition,
+    ReplicatorCapabilities, ReplicatorCreationReservation, ReplicatorFactoryContext,
+    ReplicatorRegistration, StatefulServicePartition,
 };
 use crate::runtime::PendingReplication as RuntimePendingReplication;
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -383,6 +383,8 @@ struct HostState {
 struct RegisteredReplicator {
     control: Arc<dyn Replicator>,
     primary: Option<Arc<dyn PrimaryReplicator>>,
+    #[allow(dead_code)]
+    capabilities: ReplicatorCapabilities,
     provider: Option<Arc<dyn StateProvider>>,
     process_lifecycle: Option<lifecycle::ProcessRuntime>,
     authority_lifecycle: Option<lifecycle::AuthorityRuntime>,
@@ -1026,6 +1028,7 @@ impl PodRuntime {
             application: self.host.application.clone(),
             replicator: registered.control.clone(),
             primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
+            capabilities: registered.capabilities,
             open_context: None,
             containment: None,
             aborted: Arc::new(std::sync::Mutex::new(false)),
@@ -2747,6 +2750,7 @@ impl ReplicatorRegistration for RuntimeHost {
         let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
         let control = attachment.replicator(RuntimeHostToken::new());
         let primary = attachment.primary_replicator(RuntimeHostToken::new());
+        let capabilities = attachment.capabilities(RuntimeHostToken::new());
         if let Some(lifecycle) = managed_lifecycle.as_ref() {
             lifecycle
                 .attach_interfaces(control.clone(), primary.clone())
@@ -2826,6 +2830,7 @@ impl ReplicatorRegistration for RuntimeHost {
             .set(RegisteredReplicator {
                 control,
                 primary,
+                capabilities,
                 provider,
                 process_lifecycle,
                 authority_lifecycle,

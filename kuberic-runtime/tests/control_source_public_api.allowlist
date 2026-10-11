@@ -974,7 +974,7 @@ public-path hidden impl crate::protocol::public_operations::PublicOperationPrevi
 public-path hidden impl crate::protocol::public_operations::PublicOperationPreviewIdentity::const fn public_v1 (generation : u64) -> Self
 public-path hidden impl crate::protocol::public_operations::PublicOperationProgram::const fn replay_disposition (& self) -> PublicOperationReplayDisposition
 public-path hidden impl crate::protocol::public_operations::PublicOperationProgram::fn digest (& self) -> CanonicalOperationInputDigest
-public-path hidden impl crate::protocol::public_operations::PublicProgress::fn validate (& self , read : AccessStatus , write : AccessStatus) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicProgress::fn validate (& self , replica_role : ReplicaRole , read : AccessStatus , write : AccessStatus ,) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicReplicaDescriptor::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicV1AgentReport::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden module crate::protocol::public_operations

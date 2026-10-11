@@ -14,11 +14,14 @@ use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
     PublicBuildInput, PublicLifecycleInput, PublicLifecycleRecipe, PublicLifecycleReport,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport,
-    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildRequired, ServiceLocation,
+    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram, PublicProgress,
+    PublicV1AgentReport, PublicV1OperationCompletion, PublicV1OperationResult,
+    ReplicaRebuildRequired, ServiceLocation,
 };
 use crate::protocol::types::{AccessStatus, ProcessSessionId, ReplicaRole};
-use crate::replicator::{PrimaryReplicator, ReplicaSetQuorumMode, Replicator};
+use crate::replicator::{
+    PrimaryReplicator, ReplicaSetQuorumMode, Replicator, ReplicatorCapabilities,
+};
 
 #[path = "public_lifecycle_program.rs"]
 mod program;
@@ -30,6 +33,7 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) application: Arc<dyn StatefulServiceReplica>,
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
+    pub(crate) capabilities: ReplicatorCapabilities,
     pub(crate) open_context: Option<crate::application::OpenContext>,
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) aborted: Arc<std::sync::Mutex<bool>>,
@@ -74,6 +78,36 @@ impl PublicLifecycleCallbacks {
             self.application.abort();
         }
     }
+
+    fn validate_intent_capabilities(&self, intent: &PublicOperationIntent) -> Result<()> {
+        if !intent.preview.is_public_v1() {
+            return Ok(());
+        }
+        if let Some(PublicOperationProgram::Swap {
+            catch_up_specific_quorum,
+            ..
+        }) = &intent.program
+            && *catch_up_specific_quorum != self.capabilities.catch_up_specific_quorum
+        {
+            return Err(HostError::CommandRejected(
+                "captured swap capability differs from attached Replicator creation".into(),
+            ));
+        }
+        if intent
+            .lifecycle
+            .as_ref()
+            .is_some_and(|input| input.possible_data_loss == PossibleDataLossIntent::Possible)
+            && intent.replay_disposition
+                != crate::protocol::public_operations::PublicOperationReplayDisposition::DataLoss(
+                    self.capabilities.data_loss_replay,
+                )
+        {
+            return Err(HostError::CommandRejected(
+                "captured data-loss replay differs from attached Replicator creation".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn instructions(input: &PublicLifecycleInput) -> Vec<PublicInstruction> {
@@ -110,6 +144,7 @@ pub(crate) async fn launch(
     intent
         .validate()
         .map_err(|message| HostError::CommandRejected(message.into()))?;
+    callbacks.validate_intent_capabilities(&intent)?;
     callbacks.aborted = registry.abort_guard();
     if intent.lifecycle.is_none() && intent.program.is_none() {
         return Err(HostError::CommandRejected(

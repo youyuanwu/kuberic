@@ -1,7 +1,7 @@
 use super::*;
 use crate::host::state::{PublicCloseChild, PublicInstructionOutcome};
 use crate::protocol::public_operations::{
-    PublicCatchUpMode, PublicConfiguration, PublicOperationProgram,
+    DataLossReplay, PublicCatchUpMode, PublicConfiguration, PublicOperationProgram,
     PublicOperationReplayDisposition, ReplicaRebuildRequired,
 };
 use crate::replicator::{ReplicaInformation, ReplicaSetConfiguration};
@@ -49,15 +49,29 @@ pub(crate) fn replayable(record: &PublicOperationRecord) -> bool {
     if record.intent.lifecycle.is_none() && record.intent.program.is_none() {
         return false;
     }
+    if record.intent.preview.is_legacy_preview() {
+        return record.lifecycle.in_flight.is_none_or(repeatable);
+    }
     record
         .lifecycle
         .in_flight
         .is_none_or(|instruction| match record.intent.replay_disposition {
             PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
-            | PublicOperationReplayDisposition::DataLoss(_) => false,
+                if instruction == PublicInstruction::Build =>
+            {
+                false
+            }
+            PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity)
+                if instruction == PublicInstruction::DataLoss =>
+            {
+                false
+            }
+            PublicOperationReplayDisposition::DataLoss(DataLossReplay::Convergent) => true,
             PublicOperationReplayDisposition::Convergent
             | PublicOperationReplayDisposition::RepeatableRead
             | PublicOperationReplayDisposition::ReevaluateCatchUp
+            | PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
+            | PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity)
             | PublicOperationReplayDisposition::ExactRemoval
             | PublicOperationReplayDisposition::Containment => repeatable(instruction),
         })
@@ -141,6 +155,7 @@ pub(crate) async fn abort(
     intent
         .validate()
         .map_err(|message| HostError::CommandRejected(message.into()))?;
+    callbacks.validate_intent_capabilities(&intent)?;
     if intent.program != Some(PublicOperationProgram::Abort) {
         return Err(HostError::CommandRejected(
             "synchronous abort requires exact abort input".into(),

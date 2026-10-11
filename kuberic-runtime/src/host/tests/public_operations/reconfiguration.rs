@@ -129,6 +129,17 @@ fn specific_quorum_swap() -> Program {
     }
 }
 
+fn legacy_write_quorum_swap() -> Program {
+    Program::Swap {
+        starting: configuration(10),
+        refreshed: configuration(11),
+        epoch: Epoch::new(1, 11),
+        handoff: ReplicaRole::ActiveSecondary,
+        catch_up_specific_quorum: false,
+        mode: PublicCatchUpMode::WriteQuorum,
+    }
+}
+
 impl Fixture {
     async fn new() -> Self {
         Self::new_with_preview(PublicOperationPreviewIdentity::new(430)).await
@@ -151,6 +162,15 @@ impl Fixture {
             application,
             replicator: replicator.clone(),
             primary: replicator.clone(),
+            capabilities: if preview.is_public_v1() {
+                ReplicatorCapabilities {
+                    catch_up_specific_quorum: true,
+                    data_loss_replay:
+                        crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity,
+                }
+            } else {
+                ReplicatorCapabilities::conservative()
+            },
             open_context: Some(
                 host.public_open_context(crate::application::OpenMode::New)
                     .await,
@@ -226,7 +246,9 @@ impl Fixture {
         };
         let mut intent = intent(&self.preview, id, revision, class, "session-1");
         intent.input_digest = program.digest();
-        intent.replay_disposition = program.replay_disposition();
+        if self.preview.is_public_v1() {
+            intent.replay_disposition = program.replay_disposition();
+        }
         intent.program = Some(program);
         intent
     }
@@ -297,7 +319,7 @@ async fn swap_installs_exact_starting_configuration_before_both_captured_mode_wa
         *fixture.trace.installed.lock().unwrap() = Some(configuration(2));
         fixture.trace.events.lock().unwrap().clear();
         let program = if selected == PublicCatchUpMode::WriteQuorum {
-            specific_quorum_swap()
+            legacy_write_quorum_swap()
         } else {
             swap()
         };
@@ -336,15 +358,7 @@ async fn swap_installs_exact_starting_configuration_before_both_captured_mode_wa
         } else {
             ReplicaSetQuorumMode::WriteQuorum
         };
-        let expected_configurations = if selected == PublicCatchUpMode::All {
-            vec![configuration(10), configuration(11)]
-        } else {
-            let mut starting = configuration_with_target(10);
-            starting.replicas[0].must_catchup = true;
-            let mut refreshed = configuration_with_target(11);
-            refreshed.replicas[0].must_catchup = true;
-            vec![starting, refreshed]
-        };
+        let expected_configurations = [configuration(10), configuration(11)];
         assert_eq!(
             *fixture.trace.waits.lock().unwrap(),
             vec![
@@ -411,6 +425,24 @@ async fn public_v1_swap_captures_specific_quorum_capability() {
     assert!(successors.iter().all(Option::is_some));
     assert_eq!(successors[0], successors[1]);
 
+    let unsupported = fixture.intent(
+        "public-v1-unsupported-specific-swap",
+        4,
+        specific_quorum_swap(),
+    );
+    let mut callbacks = fixture.callbacks.clone();
+    callbacks.capabilities.catch_up_specific_quorum = false;
+    assert!(
+        public_lifecycle::launch(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            unsupported,
+            callbacks,
+        )
+        .await
+        .is_err()
+    );
+
     let mut changed = admitted;
     let program = changed.program.as_mut().unwrap();
     let Program::Swap {
@@ -436,6 +468,67 @@ async fn public_v1_swap_captures_specific_quorum_capability() {
         .is_err()
     );
     fixture.owner.shutdown().await.unwrap();
+}
+
+#[test]
+fn protocol_10_rejects_public_v1_command_shapes() {
+    use crate::protocol::public_operations::{
+        AuthorizationAuditDigest, PublicBuildAuthorizationReference,
+        PublicOperationReplayDisposition,
+    };
+
+    let preview = PublicOperationPreviewIdentity::new(431);
+    let program = specific_quorum_swap();
+    let mut specific = intent(
+        &preview,
+        "legacy-specific-quorum",
+        3,
+        PublicOperationClass::PlannedSwap,
+        "session-1",
+    );
+    specific.input_digest = program.digest();
+    specific.program = Some(program);
+    assert!(specific.validate().is_err());
+
+    let program = Program::Progress { capability: false };
+    let mut replay = intent(
+        &preview,
+        "legacy-repeatable-read",
+        4,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    replay.input_digest = program.digest();
+    replay.replay_disposition = PublicOperationReplayDisposition::RepeatableRead;
+    replay.program = Some(program);
+    assert!(replay.validate().is_err());
+
+    let mut input = build("legacy-authorized-build");
+    input.authorization = Some(PublicBuildAuthorizationReference {
+        resource_uid: ResourceUid::new("resource-1"),
+        epoch: Epoch::new(1, 3),
+        build_id: input.attempt.clone(),
+        source: replica_identity(),
+        source_storage: PvcUid::new("pvc-1"),
+        source_session: ProcessSessionId::new("session-1"),
+        target: input.replica.clone(),
+        target_storage: PvcUid::new("pvc-2"),
+        target_session: input.process_session_id.clone(),
+        audit_digest: AuthorizationAuditDigest("ab".repeat(32)),
+    });
+    let program = Program::Build(input);
+    let mut authorized = intent(
+        &preview,
+        "legacy-authorized-build",
+        5,
+        PublicOperationClass::Build {
+            target: ReplicaId::new(2),
+        },
+        "session-1",
+    );
+    authorized.input_digest = program.digest();
+    authorized.program = Some(program);
+    assert!(authorized.validate().is_err());
 }
 
 #[tokio::test]
@@ -501,10 +594,6 @@ async fn public_operation_replay_retains_applied_data_loss_error_as_failure() {
         "session-1",
     );
     operation_intent.input_digest = lifecycle.digest();
-    operation_intent.replay_disposition =
-        crate::protocol::public_operations::PublicOperationReplayDisposition::DataLoss(
-            crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity,
-        );
     operation_intent.lifecycle = Some(lifecycle);
     *fixture.trace.data_loss.lock().unwrap() = Some(Err("retained failure".into()));
     let barrier = cut(PublicCutPosition::InstructionApplied, 2);
@@ -560,6 +649,88 @@ async fn public_operation_replay_retains_applied_data_loss_error_as_failure() {
             .filter(|event| event.as_str() == "primary.on_data_loss.begin")
             .count(),
         callbacks_before
+    );
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_v1_data_loss_replay_uses_attached_capability() {
+    use crate::protocol::public_operations::{DataLossReplay, PublicOperationReplayDisposition};
+
+    let fixture = Fixture::public_v1().await;
+    let configuration = configuration(3);
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch: configuration.current.epoch,
+        possible_data_loss: PossibleDataLossIntent::Possible,
+        current: configuration.current,
+        previous: configuration.previous,
+        replicas: Vec::new(),
+    };
+    let mut operation_intent = intent(
+        &fixture.preview,
+        "convergent-data-loss",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    operation_intent.input_digest = lifecycle.digest();
+    operation_intent.replay_disposition =
+        PublicOperationReplayDisposition::DataLoss(DataLossReplay::Convergent);
+    operation_intent.lifecycle = Some(lifecycle);
+
+    let barrier = cut(PublicCutPosition::CallbackSuccess, 2);
+    let mut callbacks = fixture.callbacks.clone();
+    callbacks.capabilities.data_loss_replay = DataLossReplay::Convergent;
+    callbacks.cut = Some(barrier.clone());
+    let operation = public_lifecycle::launch(
+        &fixture.owner.registry(),
+        fixture.store.clone(),
+        operation_intent.clone(),
+        callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    reached(&barrier).await;
+    operation.crash_root().await;
+    let interrupted = fixture
+        .store
+        .public_operation_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.intent == operation_intent)
+        .unwrap();
+    assert_eq!(
+        interrupted.lifecycle.in_flight,
+        Some(PublicInstruction::DataLoss)
+    );
+    assert!(public_lifecycle::replayable(&interrupted));
+
+    fixture.owner.registry().recover_unowned().await.unwrap();
+    callbacks.cut = None;
+    terminal(
+        &public_lifecycle::launch(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            operation_intent,
+            callbacks,
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        fixture
+            .trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+            .count(),
+        2
     );
     fixture.owner.shutdown().await.unwrap();
 }
@@ -787,8 +958,59 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
     };
     let wire = crate::control::public_v1_agent_status_to_proto(&report);
     assert_eq!(
-        crate::control::normalize_public_v1_agent_status_report(wire).unwrap(),
+        crate::control::normalize_public_v1_agent_status_report(wire.clone()).unwrap(),
         report
+    );
+
+    let mut oversized_extension = wire.clone();
+    oversized_extension
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .history_recovery_extension_version = Some(u32::MAX);
+    assert!(crate::control::normalize_public_v1_agent_status_report(oversized_extension).is_err());
+
+    let mut ignored_rebuild = wire.clone();
+    let completion = &mut ignored_rebuild
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .completed_operations[0];
+    completion.result =
+        crate::control::proto::PublicV1OperationResultKind::PublicV1OperationResultFailed as i32;
+    completion.detail = "failed".into();
+    assert!(crate::control::normalize_public_v1_agent_status_report(ignored_rebuild).is_err());
+
+    let mut invalid_operation = wire.clone();
+    invalid_operation
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .completed_operations[0]
+        .rebuild_required
+        .as_mut()
+        .unwrap()
+        .operation
+        .as_mut()
+        .unwrap()
+        .revision = 0;
+    assert!(crate::control::normalize_public_v1_agent_status_report(invalid_operation).is_err());
+
+    let mut invalid_authorization = wire;
+    invalid_authorization
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .completed_operations[0]
+        .rebuild_required
+        .as_mut()
+        .unwrap()
+        .authorization
+        .as_mut()
+        .unwrap()
+        .audit_digest_sha256 = "invalid".into();
+    assert!(
+        crate::control::normalize_public_v1_agent_status_report(invalid_authorization).is_err()
     );
 }
 
@@ -866,7 +1088,7 @@ async fn exact_build_is_cancelled_and_drained_before_removal_and_successor() {
 
 #[tokio::test]
 async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::public_v1().await;
     let expanded = configuration_with_target(3);
     let lifecycle = PublicLifecycleInput {
         recipe: PublicLifecycleRecipe::InitialPrimary,
@@ -946,7 +1168,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
             },
         ),
     ] {
-        let fixture = Fixture::new().await;
+        let fixture = Fixture::public_v1().await;
         fixture
             .owner
             .registry()
@@ -966,7 +1188,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
         fixture.owner.shutdown().await.unwrap();
     }
 
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::public_v1().await;
     fixture
         .run(
             "historical-configuration",
@@ -996,7 +1218,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
     );
     fixture.owner.shutdown().await.unwrap();
 
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::public_v1().await;
     fixture
         .run(
             "topology-before-progress",

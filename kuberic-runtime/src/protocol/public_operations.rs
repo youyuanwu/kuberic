@@ -367,6 +367,7 @@ impl PublicOperationIntent {
         if !self.preview.is_valid() {
             return Err("invalid public-operation preview identity");
         }
+        let public_v1 = self.preview.is_public_v1();
         if self.operation_id.is_empty() {
             return Err("public-operation ID is empty");
         }
@@ -384,35 +385,44 @@ impl PublicOperationIntent {
             if self.class != PublicOperationClass::Authority {
                 return Err("lifecycle input requires authority operation");
             }
-            input.validate()?;
+            input.validate_for_preview(public_v1)?;
             if self.input_digest != input.digest() {
                 return Err("lifecycle digest does not match frozen input");
             }
-            match input.possible_data_loss {
-                PossibleDataLossIntent::NotPossible
-                    if self.replay_disposition != PublicOperationReplayDisposition::Convergent =>
-                {
-                    return Err("ordinary lifecycle replay disposition changed");
+            if public_v1 {
+                match input.possible_data_loss {
+                    PossibleDataLossIntent::NotPossible
+                        if self.replay_disposition
+                            != PublicOperationReplayDisposition::Convergent =>
+                    {
+                        return Err("ordinary lifecycle replay disposition changed");
+                    }
+                    PossibleDataLossIntent::Possible
+                        if !matches!(
+                            self.replay_disposition,
+                            PublicOperationReplayDisposition::DataLoss(_)
+                        ) =>
+                    {
+                        return Err("data-loss lifecycle requires captured replay capability");
+                    }
+                    _ => {}
                 }
-                PossibleDataLossIntent::Possible
-                    if !matches!(
-                        self.replay_disposition,
-                        PublicOperationReplayDisposition::DataLoss(_)
-                    ) =>
-                {
-                    return Err("data-loss lifecycle requires captured replay capability");
-                }
-                _ => {}
             }
         }
         if let Some(program) = &self.program {
-            program.validate(&self.class, &self.operation_id)?;
+            program.validate(&self.class, &self.operation_id, public_v1)?;
             if self.input_digest != program.digest() {
                 return Err("program digest does not match frozen input");
             }
-            if self.replay_disposition != program.replay_disposition() {
+            if public_v1 && self.replay_disposition != program.replay_disposition() {
                 return Err("program replay disposition does not match frozen input");
             }
+        }
+        if !public_v1
+            && (self.lifecycle.is_some() || self.program.is_some())
+            && self.replay_disposition != PublicOperationReplayDisposition::Convergent
+        {
+            return Err("protocol-10 operation cannot use public-v1 replay disposition");
         }
         Ok(())
     }
@@ -465,6 +475,18 @@ impl PublicConfiguration {
             }
         }
         Ok(())
+    }
+
+    fn validate_for_preview(&self, public_v1: bool) -> Result<(), &'static str> {
+        if public_v1 {
+            self.validate()
+        } else {
+            self.validate_descriptors()?;
+            if !self.replicas.is_empty() {
+                return Err("protocol-10 configuration cannot carry public-v1 descriptors");
+            }
+            Ok(())
+        }
     }
 
     pub fn validate_for_local(&self, local_replica_id: ReplicaId) -> Result<(), &'static str> {
@@ -528,16 +550,12 @@ pub struct PublicReplicaDescriptor {
 
 impl PublicReplicaDescriptor {
     pub fn validate(&self) -> Result<(), &'static str> {
+        validate_exact_replica_identity(&self.identity)?;
         if self.replication_address.is_empty() || self.process_session_id.is_empty() {
             return Err("public replica descriptor lacks an exact address or process session");
         }
         validate_progress_value(self.current_progress)?;
         validate_progress_value(self.catch_up_capability)?;
-        if self.role == ReplicaRole::ActiveSecondary
-            && (self.current_progress == INVALID_LSN || self.catch_up_capability == INVALID_LSN)
-        {
-            return Err("ready public peer cannot use invalid progress");
-        }
         if self.role == ReplicaRole::IdleSecondary
             && (self.current_progress != INVALID_LSN
                 || self.catch_up_capability != INVALID_LSN
@@ -547,6 +565,16 @@ impl PublicReplicaDescriptor {
         }
         Ok(())
     }
+}
+
+fn validate_exact_replica_identity(identity: &ReplicaIdentity) -> Result<(), &'static str> {
+    if identity.replica_id.value() <= 0
+        || identity.instance_id.is_empty()
+        || identity.agent_generation.is_empty()
+    {
+        return Err("replica identity is incomplete");
+    }
+    Ok(())
 }
 
 pub fn validate_progress_value(progress: i64) -> Result<(), &'static str> {
@@ -587,7 +615,7 @@ pub struct PublicBuildAuthorizationReference {
 }
 
 impl PublicBuildAuthorizationReference {
-    fn validate(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.resource_uid.is_empty()
             || self.build_id.is_empty()
             || self.source_storage.is_empty()
@@ -597,6 +625,11 @@ impl PublicBuildAuthorizationReference {
         {
             return Err("public build authorization reference is incomplete");
         }
+        if self.epoch.data_loss_number < 0 || self.epoch.configuration_number < 0 {
+            return Err("public build authorization epoch is invalid");
+        }
+        validate_exact_replica_identity(&self.source)?;
+        validate_exact_replica_identity(&self.target)?;
         self.audit_digest.validate()
     }
 }
@@ -670,7 +703,12 @@ impl PublicOperationProgram {
         }
     }
 
-    fn validate(&self, class: &PublicOperationClass, id: &OperationId) -> Result<(), &'static str> {
+    fn validate(
+        &self,
+        class: &PublicOperationClass,
+        id: &OperationId,
+        public_v1: bool,
+    ) -> Result<(), &'static str> {
         let expected = match self {
             Self::Swap {
                 starting,
@@ -680,29 +718,33 @@ impl PublicOperationProgram {
                 catch_up_specific_quorum,
                 mode,
             } => {
-                starting.validate()?;
-                refreshed.validate()?;
+                starting.validate_for_preview(public_v1)?;
+                refreshed.validate_for_preview(public_v1)?;
                 if starting.current.epoch >= *epoch
                     || refreshed.current.epoch != *epoch
                     || !matches!(handoff, ReplicaRole::ActiveSecondary | ReplicaRole::None)
                 {
                     return Err("invalid swap epoch or handoff");
                 }
-                let expected_mode = if *catch_up_specific_quorum {
-                    PublicCatchUpMode::WriteQuorum
-                } else {
-                    PublicCatchUpMode::All
-                };
-                if *mode != expected_mode || starting.successor() != refreshed.successor() {
-                    return Err("swap capability, successor, or catch-up mode changed");
-                }
-                if *catch_up_specific_quorum && starting.successor().is_none() {
-                    return Err("specific-quorum swap lacks a must-catchup successor");
+                if public_v1 {
+                    let expected_mode = if *catch_up_specific_quorum {
+                        PublicCatchUpMode::WriteQuorum
+                    } else {
+                        PublicCatchUpMode::All
+                    };
+                    if *mode != expected_mode || starting.successor() != refreshed.successor() {
+                        return Err("swap capability, successor, or catch-up mode changed");
+                    }
+                    if *catch_up_specific_quorum && starting.successor().is_none() {
+                        return Err("specific-quorum swap lacks a must-catchup successor");
+                    }
+                } else if *catch_up_specific_quorum {
+                    return Err("protocol-10 swap cannot carry public-v1 capability metadata");
                 }
                 PublicOperationClass::PlannedSwap
             }
             Self::Configuration(configuration) | Self::CatchUp { configuration, .. } => {
-                configuration.validate()?;
+                configuration.validate_for_preview(public_v1)?;
                 PublicOperationClass::Authority
             }
             Self::Build(build) | Self::Remove(build) => {
@@ -711,6 +753,9 @@ impl PublicOperationProgram {
                     || build.replication_address.is_empty()
                 {
                     return Err("incomplete exact build identity");
+                }
+                if !public_v1 && build.authorization.is_some() {
+                    return Err("protocol-10 build cannot carry public-v1 authorization");
                 }
                 if let Some(authorization) = &build.authorization {
                     authorization.validate()?;
@@ -859,6 +904,10 @@ impl PublicLifecycleInput {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.validate_for_preview(true)
+    }
+
+    fn validate_for_preview(&self, public_v1: bool) -> Result<(), &'static str> {
         if self.current.epoch != self.epoch {
             return Err("lifecycle epoch does not match configuration");
         }
@@ -890,12 +939,16 @@ impl PublicLifecycleInput {
                 return Err("lifecycle epoch must advance the previous epoch");
             }
         }
-        PublicConfiguration {
+        let configuration = PublicConfiguration {
             current: self.current.clone(),
             previous: self.previous.clone(),
             replicas: self.replicas.clone(),
+        };
+        if public_v1 {
+            configuration.validate_for_local(self.replica.replica_id)?;
+        } else {
+            configuration.validate_for_preview(false)?;
         }
-        .validate_for_local(self.replica.replica_id)?;
         let role = if self.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
             if self.possible_data_loss != PossibleDataLossIntent::NotPossible {
                 return Err("secondary epoch update cannot request data loss");
@@ -976,6 +1029,22 @@ pub struct CapturedPublicOperationIdentity {
     pub detecting_session: ProcessSessionId,
 }
 
+impl CapturedPublicOperationIdentity {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.resource_uid.is_empty()
+            || !self.preview.is_public_v1()
+            || self.epoch.data_loss_number < 0
+            || self.epoch.configuration_number < 0
+            || self.operation_id.is_empty()
+            || self.revision == 0
+            || self.detecting_session.is_empty()
+        {
+            return Err("captured public-v1 operation identity is incomplete");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
 pub enum CanonicalReplicaRebuildRequired {
@@ -991,6 +1060,42 @@ pub enum CanonicalReplicaRebuildRequired {
         operation: CapturedPublicOperationIdentity,
         authorization: PublicBuildAuthorizationReference,
     },
+}
+
+impl CanonicalReplicaRebuildRequired {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::LocalProvider {
+                provider,
+                operation,
+                local_replica,
+                local_storage,
+                ..
+            } => {
+                operation.validate()?;
+                validate_exact_replica_identity(&provider.replica)?;
+                validate_exact_replica_identity(local_replica)?;
+                if provider.replica != *local_replica || local_storage.is_empty() {
+                    return Err("local rebuild identity differs from the captured provider");
+                }
+            }
+            Self::RemoteBuildTarget {
+                operation,
+                authorization,
+                ..
+            } => {
+                operation.validate()?;
+                authorization.validate()?;
+                if authorization.resource_uid != operation.resource_uid
+                    || authorization.epoch != operation.epoch
+                    || authorization.build_id != operation.operation_id
+                {
+                    return Err("remote rebuild authorization differs from captured operation");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1010,11 +1115,25 @@ pub struct PublicProgress {
 }
 
 impl PublicProgress {
-    pub fn validate(&self, read: AccessStatus, write: AccessStatus) -> Result<(), &'static str> {
+    pub fn validate(
+        &self,
+        replica_role: ReplicaRole,
+        read: AccessStatus,
+        write: AccessStatus,
+    ) -> Result<(), &'static str> {
         validate_progress_value(self.first)?;
         validate_progress_value(self.last)?;
         if self.first == -1 || self.last == -1 || self.first > self.last {
             return Err("completed public progress must be a valid ordered range");
+        }
+        if matches!(self.role, PublicProgressRole::Primary) && replica_role != ReplicaRole::Primary
+        {
+            return Err("primary progress requires the primary replica role");
+        }
+        if matches!(self.role, PublicProgressRole::Secondary)
+            && replica_role != ReplicaRole::ActiveSecondary
+        {
+            return Err("secondary progress requires the active-secondary replica role");
         }
         if self.role == PublicProgressRole::Recovery
             && (read == AccessStatus::Granted || write == AccessStatus::Granted)
@@ -1045,10 +1164,39 @@ pub struct PublicV1OperationCompletion {
     pub result: PublicV1OperationResult,
 }
 
+impl PublicV1OperationCompletion {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.operation_id.is_empty() || self.revision == 0 {
+            return Err("public-v1 operation completion is incomplete");
+        }
+        self.input_digest.validate()?;
+        match &self.result {
+            PublicV1OperationResult::Failed(detail)
+            | PublicV1OperationResult::Ambiguous(detail)
+                if detail.is_empty() =>
+            {
+                return Err("public-v1 failure completion lacks detail");
+            }
+            PublicV1OperationResult::RebuildRequired(rebuild) => rebuild.validate()?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1ExtensionSlot {
     pub version: u16,
+}
+
+impl PublicV1ExtensionSlot {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.version == 0 {
+            return Err("public-v1 extension version must be positive");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -1089,17 +1237,25 @@ impl PublicV1AgentReport {
         {
             return Err("invalid public-v1 report identity");
         }
+        validate_exact_replica_identity(&self.replica)?;
         self.progress
-            .validate(self.read_status, self.write_status)?;
+            .validate(self.role, self.read_status, self.write_status)?;
         let mut operations = std::collections::BTreeSet::new();
         for completion in &self.completed_operations {
-            completion.input_digest.validate()?;
-            if completion.operation_id.is_empty()
-                || completion.revision == 0
-                || !operations.insert(&completion.operation_id)
-            {
+            completion.validate()?;
+            if !operations.insert(&completion.operation_id) {
                 return Err("public-v1 operation completion is incomplete or duplicated");
             }
+        }
+        for extension in [
+            self.extensions.history_recovery.as_ref(),
+            self.extensions.signed_authorization.as_ref(),
+            self.extensions.public_build_evidence.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            extension.validate()?;
         }
         Ok(())
     }

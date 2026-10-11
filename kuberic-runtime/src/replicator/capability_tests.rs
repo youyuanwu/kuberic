@@ -127,7 +127,11 @@ fn public_capabilities_are_immutable_across_wrapping_and_failed_attachment() {
     let wrapped = interfaces.wrap_primary(Arc::new(Control::default()), None);
     assert_eq!(wrapped.capabilities(), capabilities);
     let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
-    wrapped.prepare_attachment(reservation).unwrap();
+    let attachment = wrapped.prepare_attachment(reservation).unwrap();
+    assert_eq!(
+        attachment.capabilities(RuntimeHostToken::new()),
+        capabilities
+    );
     assert_eq!(wrapped.capabilities(), capabilities);
     let other = ReplicatorCreationReservation::new(RuntimeHostToken::new());
     assert!(wrapped.prepare_attachment(other).is_err());

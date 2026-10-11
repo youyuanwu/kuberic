@@ -439,13 +439,6 @@ impl ReplicaInformation {
             .map_err(|message| RuntimeError::Application(message.into()))?;
         crate::protocol::public_operations::validate_progress_value(self.catch_up_capability)
             .map_err(|message| RuntimeError::Application(message.into()))?;
-        if self.role == ReplicaRole::ActiveSecondary
-            && (self.current_progress == INVALID_LSN || self.catch_up_capability == INVALID_LSN)
-        {
-            return Err(RuntimeError::Application(
-                "ready public peer cannot use INVALID_LSN".into(),
-            ));
-        }
         if self.role == ReplicaRole::IdleSecondary
             && (self.current_progress != INVALID_LSN
                 || self.catch_up_capability != INVALID_LSN
@@ -644,6 +637,10 @@ impl ReplicatorAttachment {
         _token: RuntimeHostToken,
     ) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary_replicator.clone()
+    }
+
+    pub(crate) fn capabilities(&self, _token: RuntimeHostToken) -> ReplicatorCapabilities {
+        self.creation.capabilities
     }
 
     fn disarm(&self) {

@@ -254,13 +254,16 @@ pub fn normalize_public_v1_agent_status_report(
     let extensions = PublicV1Extensions {
         history_recovery: public
             .history_recovery_extension_version
-            .map(extension_slot),
+            .map(extension_slot)
+            .transpose()?,
         signed_authorization: public
             .signed_authorization_extension_version
-            .map(extension_slot),
+            .map(extension_slot)
+            .transpose()?,
         public_build_evidence: public
             .public_build_evidence_extension_version
-            .map(extension_slot),
+            .map(extension_slot)
+            .transpose()?,
     };
     let report = PublicV1AgentReport {
         identity: PublicOperationPreviewIdentity {
@@ -335,10 +338,12 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
     }
 }
 
-fn extension_slot(version: u32) -> PublicV1ExtensionSlot {
-    PublicV1ExtensionSlot {
-        version: u16::try_from(version).unwrap_or(u16::MAX),
-    }
+fn extension_slot(version: u32) -> Result<PublicV1ExtensionSlot, WireError> {
+    Ok(PublicV1ExtensionSlot {
+        version: u16::try_from(version).map_err(|_| {
+            WireError::InvalidAuthority("public-v1 extension version exceeds u16".into())
+        })?,
+    })
 }
 
 fn legacy_status_fields_present(report: &proto::AgentStatusReport) -> bool {
@@ -495,7 +500,7 @@ fn captured_operation_from_proto(
         .epoch
         .ok_or(WireError::MissingField("public_v1.rebuild.operation.epoch"))?
         .into();
-    Ok(CapturedPublicOperationIdentity {
+    let identity = CapturedPublicOperationIdentity {
         resource_uid: ResourceUid::new(value.resource_uid),
         preview: PublicOperationPreviewIdentity {
             protocol_version: value.protocol_version,
@@ -505,7 +510,11 @@ fn captured_operation_from_proto(
         operation_id: OperationId::new(value.operation_id),
         revision: value.revision,
         detecting_session: ProcessSessionId::new(value.detecting_session),
-    })
+    };
+    identity
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(identity)
 }
 
 fn captured_operation_to_proto(
@@ -525,7 +534,7 @@ fn captured_operation_to_proto(
 fn build_authorization_from_proto(
     value: proto::PublicV1BuildAuthorizationReference,
 ) -> Result<PublicBuildAuthorizationReference, WireError> {
-    Ok(PublicBuildAuthorizationReference {
+    let authorization = PublicBuildAuthorizationReference {
         resource_uid: ResourceUid::new(value.resource_uid),
         epoch: value
             .epoch
@@ -551,7 +560,11 @@ fn build_authorization_from_proto(
         target_storage: PvcUid::new(value.target_storage),
         target_session: ProcessSessionId::new(value.target_session),
         audit_digest: AuthorizationAuditDigest(value.audit_digest_sha256),
-    })
+    };
+    authorization
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(authorization)
 }
 
 fn build_authorization_to_proto(
@@ -585,14 +598,14 @@ fn rebuild_from_proto(
             .operation
             .ok_or(WireError::MissingField("public_v1.rebuild.operation"))?,
     )?;
-    match kind {
+    let rebuild = match kind {
         proto::PublicV1RebuildKind::LocalProvider => {
             if value.authorization.is_some() {
                 return Err(WireError::InvalidAuthority(
                     "local rebuild failure contains remote authorization".into(),
                 ));
             }
-            Ok(CanonicalReplicaRebuildRequired::LocalProvider {
+            CanonicalReplicaRebuildRequired::LocalProvider {
                 reason,
                 provider: ProviderReplicaIdentity {
                     replica: value
@@ -608,7 +621,7 @@ fn rebuild_from_proto(
                     .ok_or(WireError::MissingField("public_v1.rebuild.local_replica"))?
                     .try_into()?,
                 local_storage: PvcUid::new(value.local_storage),
-            })
+            }
         }
         proto::PublicV1RebuildKind::RemoteBuildTarget => {
             if value.provider_replica.is_some()
@@ -619,7 +632,7 @@ fn rebuild_from_proto(
                     "remote rebuild failure contains local-provider identity".into(),
                 ));
             }
-            Ok(CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+            CanonicalReplicaRebuildRequired::RemoteBuildTarget {
                 reason,
                 operation,
                 authorization: build_authorization_from_proto(
@@ -627,13 +640,19 @@ fn rebuild_from_proto(
                         .authorization
                         .ok_or(WireError::MissingField("public_v1.rebuild.authorization"))?,
                 )?,
-            })
+            }
         }
-        proto::PublicV1RebuildKind::Unknown => Err(WireError::InvalidEnum {
-            field: "public_v1.rebuild.kind",
-            value: value.kind,
-        }),
-    }
+        proto::PublicV1RebuildKind::Unknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.rebuild.kind",
+                value: value.kind,
+            });
+        }
+    };
+    rebuild
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(rebuild)
 }
 
 fn rebuild_to_proto(
@@ -695,12 +714,27 @@ fn public_v1_completion_from_proto(
             PublicV1OperationResult::Succeeded
         }
         proto::PublicV1OperationResultKind::PublicV1OperationResultFailed => {
+            if value.detail.is_empty() || value.rebuild_required.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "failed public-v1 completion has a noncanonical payload".into(),
+                ));
+            }
             PublicV1OperationResult::Failed(value.detail)
         }
         proto::PublicV1OperationResultKind::PublicV1OperationResultAmbiguous => {
+            if value.detail.is_empty() || value.rebuild_required.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "ambiguous public-v1 completion has a noncanonical payload".into(),
+                ));
+            }
             PublicV1OperationResult::Ambiguous(value.detail)
         }
         proto::PublicV1OperationResultKind::PublicV1OperationResultCancelled => {
+            if !value.detail.is_empty() || value.rebuild_required.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "cancelled public-v1 completion contains failure detail".into(),
+                ));
+            }
             PublicV1OperationResult::Cancelled
         }
         proto::PublicV1OperationResultKind::PublicV1OperationResultRebuildRequired => {

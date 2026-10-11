@@ -37,14 +37,23 @@ pub fn plan_public_lifecycle(
         process_session_id: source_session,
         class: PublicOperationClass::Authority,
         input_digest: input.digest(),
-        replay_disposition: match input.possible_data_loss {
-            PossibleDataLossIntent::NotPossible => kuberic_runtime::protocol::public_operations::
-                PublicOperationReplayDisposition::Convergent,
-            PossibleDataLossIntent::Possible => kuberic_runtime::protocol::public_operations::
-                PublicOperationReplayDisposition::DataLoss(
-                    kuberic_runtime::protocol::public_operations::DataLossReplay::
-                        ReplaceOnAmbiguity,
-                ),
+        replay_disposition: if config.identity.is_public_v1() {
+            match input.possible_data_loss {
+                PossibleDataLossIntent::NotPossible => {
+                    kuberic_runtime::protocol::public_operations::
+                        PublicOperationReplayDisposition::Convergent
+                }
+                PossibleDataLossIntent::Possible => {
+                    kuberic_runtime::protocol::public_operations::
+                        PublicOperationReplayDisposition::DataLoss(
+                            kuberic_runtime::protocol::public_operations::DataLossReplay::
+                                ReplaceOnAmbiguity,
+                        )
+                }
+            }
+        } else {
+            kuberic_runtime::protocol::public_operations::PublicOperationReplayDisposition::
+                Convergent
         },
         lifecycle: Some(input),
         program: None,

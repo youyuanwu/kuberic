@@ -223,6 +223,16 @@ fn public_v1_values_distinguishes_invalid_lsn() {
     )
     .unwrap();
     assert_eq!(active.current_progress, 0);
+    let unknown = ReplicaInformation::active_peer(
+        replica_identity(),
+        "trace://unknown".into(),
+        ProcessSessionId::new("unknown-session"),
+        INVALID_LSN,
+        INVALID_LSN,
+        false,
+    )
+    .unwrap();
+    assert_eq!(unknown.current_progress, INVALID_LSN);
     let mut invalid = active;
     invalid.current_progress = -2;
     assert!(invalid.validate_public_progress().is_err());
@@ -257,6 +267,16 @@ fn public_v1_values_distinguishes_invalid_lsn() {
     let mut serving_recovery = recovery;
     serving_recovery.write_status = AccessStatus::Granted;
     assert!(serving_recovery.validate().is_err());
+
+    let mut wrong_primary_progress = serving_recovery;
+    wrong_primary_progress.write_status = AccessStatus::NotPrimary;
+    wrong_primary_progress.role = ReplicaRole::ActiveSecondary;
+    wrong_primary_progress.progress.role = PublicProgressRole::Primary;
+    assert!(wrong_primary_progress.validate().is_err());
+
+    wrong_primary_progress.role = ReplicaRole::Primary;
+    wrong_primary_progress.progress.role = PublicProgressRole::Secondary;
+    assert!(wrong_primary_progress.validate().is_err());
 }
 
 #[tokio::test]
@@ -817,7 +837,8 @@ async fn repeatable_redelivery_reaps_a_finished_root_after_completion_persistenc
         process_session_id: ProcessSessionId::new("session-1"),
         class: PublicOperationClass::Authority,
         input_digest: program.digest(),
-        replay_disposition: program.replay_disposition(),
+        replay_disposition:
+            crate::protocol::public_operations::PublicOperationReplayDisposition::Convergent,
         lifecycle: None,
         program: Some(program),
     };
