@@ -383,6 +383,8 @@ struct HostState {
 struct RegisteredReplicator {
     control: Arc<dyn Replicator>,
     primary: Option<Arc<dyn PrimaryReplicator>>,
+    #[cfg(feature = "testing")]
+    identity: ReplicatorCreationIdentity,
     #[allow(dead_code)]
     capabilities: ReplicatorCapabilities,
     provider: Option<Arc<dyn StateProvider>>,
@@ -1029,6 +1031,7 @@ impl PodRuntime {
             replicator: registered.control.clone(),
             primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
             capabilities: registered.capabilities,
+            replicator_creation_id: registered.identity.to_public_id(),
             open_context: None,
             containment: None,
             aborted: Arc::new(std::sync::Mutex::new(false)),
@@ -2746,6 +2749,8 @@ impl ReplicatorRegistration for RuntimeHost {
                 ));
             }
         }
+        #[cfg(feature = "testing")]
+        let identity = attachment.identity(RuntimeHostToken::new());
         let managed_lifecycle = attachment.managed_lifecycle(RuntimeHostToken::new());
         let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
         let control = attachment.replicator(RuntimeHostToken::new());
@@ -2830,6 +2835,8 @@ impl ReplicatorRegistration for RuntimeHost {
             .set(RegisteredReplicator {
                 control,
                 primary,
+                #[cfg(feature = "testing")]
+                identity,
                 capabilities,
                 provider,
                 process_lifecycle,

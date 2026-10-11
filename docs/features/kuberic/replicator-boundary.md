@@ -221,7 +221,9 @@ terminal and cannot be upgraded by a convergent replacement. These outcomes
 remain distinct in durable/report state as `Retired` versus
 `ReplacementRequired`. Every ordinary Public V1 lifecycle/program epoch is
 fenced to the current history data-loss number; only the exact recovery
-authorization may admit the one specified increment.
+authorization may admit the one specified increment. Public V1 build/removal
+inputs carry the exact current `HistoryContext` even before Phase 3 adds signed
+authorization, so authorization-free preview builds cannot escape the fence.
 
 After ambiguous predecessor containment, the controller conditionally replaces
 the accepted process attempt with the exact higher-epoch successor before
@@ -237,7 +239,9 @@ and old-history build/configuration state, and records the full logical
 authorization plus exact process attempt before callback execution. This is
 not a distributed transaction: every command and report revalidates resource,
 operation, history, storage, reset scope, replay disposition, creation
-capabilities and process identity.
+capabilities and process identity. The attempt's public creation ID is derived
+from the actually attached `ReplicatorAttachment` identity and must match it
+exactly before admission.
 
 The agent then orders Replicator primary role, explicit epoch, application
 primary role, `on_data_loss`, fresh progress, proposed-history configuration

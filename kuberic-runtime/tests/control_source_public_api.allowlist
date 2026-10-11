@@ -887,6 +887,7 @@ public-path hidden field crate::protocol::public_operations::PublicBuildAuthoriz
 public-path hidden field crate::protocol::public_operations::PublicBuildAuthorizationReference::target_storage: PvcUid
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::attempt: OperationId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::authorization: Option < PublicBuildAuthorizationReference >
+public-path hidden field crate::protocol::public_operations::PublicBuildInput::history: Option < HistoryContext >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replication_address: String

@@ -655,6 +655,8 @@ pub struct PublicBuildInput {
     pub process_session_id: ProcessSessionId,
     pub replication_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<PublicBuildAuthorizationReference>,
 }
 
@@ -718,10 +720,11 @@ impl PublicOperationProgram {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn validate_history_data_loss_number(
+    pub(crate) fn validate_history(
         &self,
-        expected_data_loss_number: i64,
+        expected_history: &HistoryContext,
     ) -> Result<(), &'static str> {
+        let expected_data_loss_number = expected_history.data_loss_number;
         let matches = |epoch: Epoch| epoch.data_loss_number == expected_data_loss_number;
         let configuration_matches = |configuration: &PublicConfiguration| {
             matches(configuration.current.epoch)
@@ -745,10 +748,13 @@ impl PublicOperationProgram {
                     && configuration_matches(starting)
                     && configuration_matches(refreshed)
             }
-            Self::Build(build) | Self::Remove(build) => build
-                .authorization
-                .as_ref()
-                .is_none_or(|authorization| matches(authorization.epoch)),
+            Self::Build(build) | Self::Remove(build) => {
+                build.history.as_ref() == Some(expected_history)
+                    && build
+                        .authorization
+                        .as_ref()
+                        .is_none_or(|authorization| matches(authorization.epoch))
+            }
             Self::Open { .. } | Self::Progress { .. } | Self::Close | Self::Abort => true,
         };
         if valid {
@@ -811,6 +817,15 @@ impl PublicOperationProgram {
                 }
                 if !public_v1 && build.authorization.is_some() {
                     return Err("protocol-10 build cannot carry public-v1 authorization");
+                }
+                if public_v1 {
+                    let history = build
+                        .history
+                        .as_ref()
+                        .ok_or("public-v1 build lacks exact history")?;
+                    history.validate()?;
+                } else if build.history.is_some() {
+                    return Err("protocol-10 build cannot carry public-v1 history");
                 }
                 if let Some(authorization) = &build.authorization {
                     authorization.validate()?;
@@ -1968,6 +1983,9 @@ impl CanonicalEncoder {
         self.replica_identity(&build.replica);
         self.string(build.process_session_id.as_str());
         self.string(&build.replication_address);
+        self.option(build.history.as_ref(), |encoder, history| {
+            encoder.history(history);
+        });
         self.option(build.authorization.as_ref(), |encoder, authorization| {
             encoder.authorization(authorization);
         });

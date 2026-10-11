@@ -1815,7 +1815,7 @@ impl AgentStore for SqliteStore {
                 }
                 if let Some(program) = &intent.program {
                     program
-                        .validate_history_data_loss_number(history.data_loss_number)
+                        .validate_history(history)
                         .map_err(|message| {
                             crate::host::HostError::CommandRejected(message.into())
                         })?;

@@ -18,7 +18,7 @@ use crate::protocol::public_operations::{
     PublicV1AgentReport, PublicV1OperationCompletion, PublicV1OperationResult,
     ReplicaRebuildRequired, ServiceLocation,
 };
-use crate::protocol::types::{AccessStatus, ProcessSessionId, ReplicaRole};
+use crate::protocol::types::{AccessStatus, ProcessSessionId, ReplicaRole, ReplicatorCreationId};
 use crate::replicator::{
     PrimaryReplicator, ReplicaSetQuorumMode, Replicator, ReplicatorCapabilities,
 };
@@ -34,6 +34,7 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
     pub(crate) capabilities: ReplicatorCapabilities,
+    pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) aborted: Arc<std::sync::Mutex<bool>>,
@@ -98,7 +99,8 @@ impl PublicLifecycleCallbacks {
             .as_ref()
             .filter(|input| input.possible_data_loss == PossibleDataLossIntent::Possible)
             .and_then(|input| input.data_loss_recovery.as_ref())
-            && (recovery.attempt.process.data_loss_replay != self.capabilities.data_loss_replay
+            && (recovery.attempt.process.replicator_creation_id != self.replicator_creation_id
+                || recovery.attempt.process.data_loss_replay != self.capabilities.data_loss_replay
                 || recovery.attempt.process.catch_up_specific_quorum
                     != self.capabilities.catch_up_specific_quorum)
         {

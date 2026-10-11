@@ -62,6 +62,7 @@ fn build(attempt: &str) -> PublicBuildInput {
         replica,
         process_session_id: ProcessSessionId::new("target-session"),
         replication_address: "trace://target".into(),
+        history: None,
         authorization: None,
     }
 }
@@ -183,6 +184,7 @@ impl Fixture {
             } else {
                 ReplicatorCapabilities::conservative()
             },
+            replicator_creation_id: crate::protocol::types::ReplicatorCreationId::new("creation-1"),
             open_context: Some(
                 host.public_open_context(crate::application::OpenMode::New)
                     .await,
@@ -243,7 +245,12 @@ impl Fixture {
         fixture
     }
 
-    fn intent(&self, id: &str, revision: u64, program: Program) -> PublicOperationIntent {
+    fn intent(&self, id: &str, revision: u64, mut program: Program) -> PublicOperationIntent {
+        if self.preview.is_public_v1()
+            && let Program::Build(build) | Program::Remove(build) = &mut program
+        {
+            build.history = Some(public_v1_history(&self.preview).1);
+        }
         let class = match &program {
             Program::Swap { .. } => PublicOperationClass::PlannedSwap,
             Program::Build(input) => PublicOperationClass::Build {
@@ -479,6 +486,54 @@ async fn public_v1_swap_captures_specific_quorum_capability() {
         .await
         .is_err()
     );
+
+    let missing_history_program = Program::Build(build("missing-history-build"));
+    let mut missing_history = intent(
+        &fixture.preview,
+        "missing-history-build",
+        3,
+        PublicOperationClass::Build {
+            target: ReplicaId::new(2),
+        },
+        "session-1",
+    );
+    missing_history.input_digest = missing_history_program.digest();
+    missing_history.replay_disposition = missing_history_program.replay_disposition();
+    missing_history.program = Some(missing_history_program);
+    assert!(
+        fixture
+            .owner
+            .registry()
+            .admit(missing_history)
+            .await
+            .is_err()
+    );
+
+    let mut stale_build = build("stale-history-build");
+    let (_, predecessor) = public_v1_history(&fixture.preview);
+    stale_build.history = Some(
+        crate::protocol::types::derive_data_loss_history(
+            &OperationId::new("stale-history"),
+            &predecessor,
+            1,
+            &public_v1_storage_incarnation(),
+        )
+        .unwrap(),
+    );
+    let stale_program = Program::Build(stale_build);
+    let mut stale_history = intent(
+        &fixture.preview,
+        "stale-history-build",
+        3,
+        PublicOperationClass::Build {
+            target: ReplicaId::new(2),
+        },
+        "session-1",
+    );
+    stale_history.input_digest = stale_program.digest();
+    stale_history.replay_disposition = stale_program.replay_disposition();
+    stale_history.program = Some(stale_program);
+    assert!(fixture.owner.registry().admit(stale_history).await.is_err());
     fixture.owner.shutdown().await.unwrap();
 }
 
@@ -700,6 +755,30 @@ async fn public_v1_data_loss_replay_uses_attached_capability() {
     operation_intent.replay_disposition =
         PublicOperationReplayDisposition::DataLoss(DataLossReplay::Convergent);
     operation_intent.lifecycle = Some(lifecycle);
+
+    let mut wrong_creation = operation_intent.clone();
+    let wrong_creation_lifecycle = wrong_creation.lifecycle.as_mut().unwrap();
+    wrong_creation_lifecycle
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .attempt
+        .process
+        .replicator_creation_id =
+        crate::protocol::types::ReplicatorCreationId::new("other-creation");
+    wrong_creation.input_digest = wrong_creation_lifecycle.digest();
+    let mut wrong_callbacks = fixture.callbacks.clone();
+    wrong_callbacks.capabilities.data_loss_replay = DataLossReplay::Convergent;
+    assert!(
+        public_lifecycle::launch(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            wrong_creation,
+            wrong_callbacks,
+        )
+        .await
+        .is_err()
+    );
 
     let mut wrong_quorum = operation_intent.clone();
     let wrong_quorum_lifecycle = wrong_quorum.lifecycle.as_mut().unwrap();
@@ -1112,6 +1191,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
                 catch_up_specific_quorum: true,
                 data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
             },
+            replicator_creation_id: ReplicatorCreationId::new("creation-2"),
             open_context: None,
             containment: None,
             aborted: Arc::new(Mutex::new(false)),
@@ -1190,6 +1270,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
                 catch_up_specific_quorum: true,
                 data_loss_replay: DataLossReplay::Convergent,
             },
+            replicator_creation_id: ReplicatorCreationId::new("creation-2"),
             open_context: None,
             containment: None,
             aborted: Arc::new(Mutex::new(false)),
@@ -1749,6 +1830,7 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         replica: target,
         process_session_id: authorization.target_session.clone(),
         replication_address: "trace://target".into(),
+        history: Some(public_v1_history(&preview).1),
         authorization: Some(authorization.clone()),
     };
     let program = Program::Build(input.clone());

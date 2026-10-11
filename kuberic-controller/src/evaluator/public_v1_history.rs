@@ -100,21 +100,22 @@ pub fn election_status(
     if report.validate().is_err() {
         return PublicV1ElectionStatus::Ineligible;
     }
-    if report.data_loss_recovery.as_ref().is_some_and(|recovery| {
-        matches!(
+    if let Some(recovery) = &report.data_loss_recovery {
+        if matches!(
             recovery.stage,
-            PublicDataLossRecoveryStage::Authorized
-                | PublicDataLossRecoveryStage::Invalidated
-                | PublicDataLossRecoveryStage::CallbackProcessing
-                | PublicDataLossRecoveryStage::HistoryPending
-                | PublicDataLossRecoveryStage::ConfigurationPending
-        )
-    }) {
-        return if is_provisional_primary(report) {
-            PublicV1ElectionStatus::ProvisionalPrimary
-        } else {
-            PublicV1ElectionStatus::RecoveryPending
-        };
+            PublicDataLossRecoveryStage::Failed
+                | PublicDataLossRecoveryStage::ReplacementRequired
+                | PublicDataLossRecoveryStage::Retired
+        ) {
+            return PublicV1ElectionStatus::Ineligible;
+        }
+        if recovery.stage != PublicDataLossRecoveryStage::Admitted {
+            return if is_provisional_primary(report) {
+                PublicV1ElectionStatus::ProvisionalPrimary
+            } else {
+                PublicV1ElectionStatus::RecoveryPending
+            };
+        }
     }
     if admitted_storage.contains(&report.storage_incarnation) {
         PublicV1ElectionStatus::Eligible

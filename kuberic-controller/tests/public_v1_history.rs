@@ -238,19 +238,21 @@ fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() 
         public_v1_election_status(&report, &[]),
         PublicV1ElectionStatus::RecoveryPending
     );
+    let admitted_storage = report.storage_incarnation.clone();
+    report.progress.role = PublicProgressRole::Secondary;
     report
         .data_loss_recovery
         .as_mut()
         .unwrap()
         .stage = kuberic_runtime::protocol::public_operations::PublicDataLossRecoveryStage::ReplacementRequired;
     assert_eq!(
-        public_v1_election_status(&report, &[]),
+        public_v1_election_status(&report, std::slice::from_ref(&admitted_storage)),
         PublicV1ElectionStatus::Ineligible
     );
     report.data_loss_recovery.as_mut().unwrap().stage =
         kuberic_runtime::protocol::public_operations::PublicDataLossRecoveryStage::Retired;
     assert_eq!(
-        public_v1_election_status(&report, &[]),
+        public_v1_election_status(&report, std::slice::from_ref(&admitted_storage)),
         PublicV1ElectionStatus::Ineligible
     );
 }
