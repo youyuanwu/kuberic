@@ -1184,6 +1184,59 @@ fn validate_preview_dispatch(
     Ok(())
 }
 
+#[cfg(feature = "runtime-test-bridge")]
+fn validate_preview_cleanup(
+    observation: &RawObservation,
+    action: &kuberic_runtime::protocol::public_operations::PublicFaultAction,
+) -> Result<()> {
+    if !observation.failures.is_empty() {
+        return Err(ControllerError::ObservationStale);
+    }
+    let status = observation
+        .set
+        .status
+        .as_ref()
+        .ok_or(ControllerError::ObservationStale)?;
+    if status.authority.public_fault_action.as_ref() != Some(action)
+        || status
+            .authority
+            .public_service_clear
+            .as_ref()
+            .is_none_or(|clear| {
+                clear.action_id != action.action_id
+                    || clear.stage
+                        != kuberic_runtime::protocol::public_operations::PublicServiceClearStage::PublishedAbsent
+            })
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    let key =
+        ReplicaObservationKey::new(action.target.replica_id, action.target.instance_id.clone());
+    match observation.agents.get(&key) {
+        Some(RawAgentObservation::PreviewReport(report)) => {
+            let lifecycle = report
+                .public_lifecycle_report
+                .as_deref()
+                .ok_or(ControllerError::ObservationStale)?;
+            if report.identity != action.target
+                || report.process_session_id != action.predecessor_session
+                || report.reported_fault != Some(action.fault)
+                || lifecycle.process_session_id != action.predecessor_session
+                || lifecycle.process_id != action.predecessor_process_id
+                || lifecycle.operation_id.as_ref() != Some(&action.fault_operation_id)
+                || lifecycle.revision != action.fault_revision
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+        }
+        None | Some(RawAgentObservation::Absent | RawAgentObservation::Unavailable { .. }) => {}
+        Some(RawAgentObservation::Report(_) | RawAgentObservation::Invalid { .. }) => {
+            return Err(ControllerError::ObservationStale);
+        }
+    }
+    Ok(())
+}
+
 impl<A> KubeClusterApi<A>
 where
     A: AgentApi,
@@ -3030,6 +3083,23 @@ impl ClusterApi for InMemoryClusterApi {
             }
         }
         let mut state = self.state.lock().await;
+        #[cfg(feature = "runtime-test-bridge")]
+        if let Some(action) = state
+            .observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.public_fault_action.as_ref())
+            .filter(|action| {
+                pod_name == Some(action.resources.pod_name.as_str())
+                    && pod_uid == Some(&action.resources.pod_uid)
+                    && pvc_name == Some(action.resources.pvc_name.as_str())
+                    && pvc_uid == Some(&action.resources.pvc_uid)
+            })
+            .cloned()
+        {
+            validate_preview_cleanup(&state.observation, &action)?;
+        }
         if let Some(service) = service {
             let name = service.name_any();
             let uid = service.uid().ok_or(ControllerError::ObservationStale)?;
@@ -3128,6 +3198,22 @@ impl ClusterApi for InMemoryClusterApi {
         let mut state = self.state.lock().await;
         if state.observation.set.resource_version() != observation.set.resource_version() {
             return Err(ControllerError::ObservationStale);
+        }
+        #[cfg(feature = "runtime-test-bridge")]
+        if let Some(action) = state
+            .observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.authority.public_fault_action.as_ref())
+            .filter(|action| {
+                name == action.resources.endpoint_name
+                    && uid == action.resources.endpoint_uid
+                    && resource_version == action.resources.endpoint_resource_version
+            })
+            .cloned()
+        {
+            validate_preview_cleanup(&state.observation, &action)?;
         }
         let current = state
             .observation

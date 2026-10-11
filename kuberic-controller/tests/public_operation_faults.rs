@@ -872,6 +872,10 @@ async fn accepted_drop_never_targets_a_successor_on_the_same_storage() {
     for _ in 0..5 {
         reconciler.reconcile("tests", "fault-db").await.unwrap();
     }
+    let planned_raw = api.observation().await;
+    let planned_snapshot =
+        kuberic_controller::normalize::normalize(planned_raw.clone(), BTreeMap::new()).unwrap();
+    let stale_plan = kuberic_controller::evaluate(&planned_snapshot, &config());
     let effects_before = api.effects().await.len();
     let mut observation = api.observation().await;
     let RawAgentObservation::PreviewReport(report) =
@@ -887,6 +891,16 @@ async fn accepted_drop_never_targets_a_successor_on_the_same_storage() {
     lifecycle.process_session_id = ProcessSessionId::new("successor-session");
     lifecycle.process_id = std::process::id().saturating_add(1);
     api.set_observation(observation).await;
+    assert!(matches!(
+        kuberic_controller::executor::execute_plan(
+            api.as_ref(),
+            &planned_raw,
+            &planned_snapshot,
+            stale_plan,
+        )
+        .await,
+        Err(kuberic_controller::ControllerError::ObservationStale)
+    ));
     assert_eq!(
         reconciler
             .reconcile("tests", "fault-db")

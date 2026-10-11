@@ -190,25 +190,30 @@ impl ReplicaProcessSupervisor {
         launch_nonce: &str,
         supervisor_id: &str,
     ) -> Result<()> {
-        let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
-            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-        if owner.nonce != launch_nonce || owner.supervisor_id != supervisor_id {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "child launch nonce differs from durable owner".into(),
-            ));
-        }
-        owner.child_pid = Some(std::process::id());
-        owner.child_start_time = Some(process_start_time(std::process::id()).ok_or_else(|| {
-            crate::host::HostError::CommandRejected("cannot read child process identity".into())
-        })?);
-        let temporary = owner_path.with_extension("child.tmp");
-        std::fs::write(
-            &temporary,
-            serde_json::to_vec(&owner)
-                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
-        )?;
-        std::fs::rename(temporary, owner_path)?;
-        Ok(())
+        with_launch_owner_lock(owner_path, || {
+            let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            if owner.nonce != launch_nonce || owner.supervisor_id != supervisor_id {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "child launch nonce differs from durable owner".into(),
+                ));
+            }
+            owner.child_pid = Some(std::process::id());
+            owner.child_start_time =
+                Some(process_start_time(std::process::id()).ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "cannot read child process identity".into(),
+                    )
+                })?);
+            let temporary = owner_path.with_extension("child.tmp");
+            std::fs::write(
+                &temporary,
+                serde_json::to_vec(&owner)
+                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+            )?;
+            std::fs::rename(temporary, owner_path)?;
+            Ok(())
+        })
     }
 
     pub(crate) async fn restart_with_child(
@@ -445,31 +450,24 @@ impl ReplicaProcessSupervisor {
                     if owner.child_pid.is_none() && age < 5_000 {
                         return Ok((nonce, false));
                     }
-                    let takeover = path.with_extension("takeover");
-                    match std::fs::create_dir(&takeover) {
-                        Ok(()) => {
-                            let latest: PreviewLaunchOwner = serde_json::from_slice(
-                                &std::fs::read(&path)?,
-                            )
-                            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-                            let unchanged = latest.nonce == owner.nonce
-                                && latest.supervisor_id == owner.supervisor_id
-                                && latest.pid == owner.pid
-                                && latest.start_time == owner.start_time
-                                && latest.child_pid == owner.child_pid
-                                && latest.child_start_time == owner.child_start_time;
-                            if unchanged {
-                                std::fs::remove_file(&path)?;
-                            }
-                            std::fs::remove_dir(&takeover)?;
-                            if !unchanged {
-                                return Ok((nonce, false));
-                            }
+                    let unchanged = with_launch_owner_lock(&path, || {
+                        let latest: PreviewLaunchOwner =
+                            serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
+                                crate::host::HostError::Corrupt(error.to_string())
+                            })?;
+                        let unchanged = latest.nonce == owner.nonce
+                            && latest.supervisor_id == owner.supervisor_id
+                            && latest.pid == owner.pid
+                            && latest.start_time == owner.start_time
+                            && latest.child_pid == owner.child_pid
+                            && latest.child_start_time == owner.child_start_time;
+                        if unchanged {
+                            std::fs::remove_file(&path)?;
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            return Ok((nonce, false));
-                        }
-                        Err(error) => return Err(error.into()),
+                        Ok(unchanged)
+                    })?;
+                    if !unchanged {
+                        return Ok((nonce, false));
                     }
                 }
                 Err(error) => return Err(error.into()),
@@ -558,23 +556,25 @@ impl ReplicaProcessSupervisor {
         child_start_time: &str,
     ) -> Result<()> {
         let path = self.launch_owner_path(action);
-        let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(&path)?)
-            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-        if owner.nonce != launch_nonce || owner.supervisor_id != self.instance_id {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "launch owner nonce changed before child publication".into(),
-            ));
-        }
-        owner.child_pid = Some(child_pid);
-        owner.child_start_time = Some(child_start_time.into());
-        let temporary = path.with_extension("tmp");
-        std::fs::write(
-            &temporary,
-            serde_json::to_vec(&owner)
-                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
-        )?;
-        std::fs::rename(temporary, path)?;
-        Ok(())
+        with_launch_owner_lock(&path, || {
+            let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(&path)?)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            if owner.nonce != launch_nonce || owner.supervisor_id != self.instance_id {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "launch owner nonce changed before child publication".into(),
+                ));
+            }
+            owner.child_pid = Some(child_pid);
+            owner.child_start_time = Some(child_start_time.into());
+            let temporary = path.with_extension("tmp");
+            std::fs::write(
+                &temporary,
+                serde_json::to_vec(&owner)
+                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+            )?;
+            std::fs::rename(temporary, &path)?;
+            Ok(())
+        })
     }
 
     async fn await_successor_evidence(
@@ -687,6 +687,63 @@ fn process_start_time(pid: u32) -> Option<String> {
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 fn process_identity_is_alive(identity: &PreviewSupervisorIdentity) -> bool {
     process_start_time(identity.pid).as_deref() == Some(identity.start_time.as_str())
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn with_launch_owner_lock<T>(
+    owner_path: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock = owner_path.with_extension("lock");
+    let identity_path = lock.join("owner.json");
+    for _ in 0..500 {
+        match std::fs::create_dir(&lock) {
+            Ok(()) => {
+                let identity = PreviewSupervisorIdentity {
+                    pid: std::process::id(),
+                    start_time: process_start_time(std::process::id()).ok_or_else(|| {
+                        crate::host::HostError::CommandRejected(
+                            "cannot read launch-lock owner identity".into(),
+                        )
+                    })?,
+                };
+                std::fs::write(
+                    &identity_path,
+                    serde_json::to_vec(&identity)
+                        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+                )?;
+                let result = operation();
+                std::fs::remove_dir_all(&lock)?;
+                return result;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let identity = std::fs::read(&identity_path).ok().and_then(|bytes| {
+                    serde_json::from_slice::<PreviewSupervisorIdentity>(&bytes).ok()
+                });
+                let stale = identity
+                    .as_ref()
+                    .is_some_and(|identity| !process_identity_is_alive(identity))
+                    || (identity.is_none()
+                        && std::fs::metadata(&lock)
+                            .and_then(|metadata| metadata.modified())
+                            .ok()
+                            .and_then(|modified| modified.elapsed().ok())
+                            .is_some_and(|age| age >= Duration::from_secs(5)));
+                if stale {
+                    match std::fs::remove_dir_all(&lock) {
+                        Ok(()) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(crate::host::HostError::CommandRejected(
+        "launch-owner lock timed out".into(),
+    ))
 }
 
 #[derive(Debug, Clone, Serialize)]
