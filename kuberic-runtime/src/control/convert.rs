@@ -2,7 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::protocol::authorization::{BuildAuthorizationV1, PeerSessionAuthorizationV1};
+use crate::protocol::authorization::{
+    AuthorizationAuditDigest as SignedAuthorizationAuditDigest, AuthorizationKeyId,
+    BuildAuthorizationV1, PeerSessionAuthorizationV1,
+};
 use crate::protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
     ProtocolCommand,
@@ -14,10 +17,11 @@ use crate::protocol::public_operations::{
     AuthorizationAuditDigest, CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
     DataLossReplay, ProcessAttemptContext, ProviderProgressReset, ProviderReplicaIdentity,
-    PublicBuildAuthorizationReference, PublicDataLossRecoveryStage, PublicDataLossRecoveryStatus,
-    PublicOperationPreviewIdentity, PublicOperationReplayDisposition, PublicProgress,
-    PublicProgressRole, PublicV1AgentReport, PublicV1ExtensionSlot, PublicV1Extensions,
-    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
+    PublicBuildAuthorizationReference, PublicCatchUpMode, PublicDataLossRecoveryStage,
+    PublicDataLossRecoveryStatus, PublicOperationPreviewIdentity, PublicOperationReplayDisposition,
+    PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1CallKind,
+    PublicV1ExtensionSlot, PublicV1Extensions, PublicV1OperationCompletion,
+    PublicV1OperationResult, ReplicaRebuildReason,
 };
 use crate::protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
@@ -1098,6 +1102,78 @@ fn rebuild_to_proto(
     }
 }
 
+fn public_v1_call_kind_from_proto(value: i32) -> Result<PublicV1CallKind, WireError> {
+    Ok(
+        match proto::PublicV1CallKind::try_from(value).map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.completion.call_kind",
+            value,
+        })? {
+            proto::PublicV1CallKind::InitialPrimary => PublicV1CallKind::InitialPrimary,
+            proto::PublicV1CallKind::FailoverPromotion => PublicV1CallKind::FailoverPromotion,
+            proto::PublicV1CallKind::SecondaryEpochAdvance => {
+                PublicV1CallKind::SecondaryEpochAdvance
+            }
+            proto::PublicV1CallKind::Open => PublicV1CallKind::Open,
+            proto::PublicV1CallKind::Role => PublicV1CallKind::Role,
+            proto::PublicV1CallKind::Epoch => PublicV1CallKind::Epoch,
+            proto::PublicV1CallKind::Configuration => PublicV1CallKind::Configuration,
+            proto::PublicV1CallKind::CatchUp => PublicV1CallKind::CatchUp,
+            proto::PublicV1CallKind::Progress => PublicV1CallKind::Progress,
+            proto::PublicV1CallKind::Swap => PublicV1CallKind::Swap,
+            proto::PublicV1CallKind::Build => PublicV1CallKind::Build,
+            proto::PublicV1CallKind::Remove => PublicV1CallKind::Remove,
+            proto::PublicV1CallKind::Close => PublicV1CallKind::Close,
+            proto::PublicV1CallKind::Abort => PublicV1CallKind::Abort,
+            proto::PublicV1CallKind::Unknown => {
+                return Err(WireError::InvalidEnum {
+                    field: "public_v1.completion.call_kind",
+                    value,
+                });
+            }
+        },
+    )
+}
+
+fn public_v1_call_kind_to_proto(value: PublicV1CallKind) -> proto::PublicV1CallKind {
+    match value {
+        PublicV1CallKind::InitialPrimary => proto::PublicV1CallKind::InitialPrimary,
+        PublicV1CallKind::FailoverPromotion => proto::PublicV1CallKind::FailoverPromotion,
+        PublicV1CallKind::SecondaryEpochAdvance => proto::PublicV1CallKind::SecondaryEpochAdvance,
+        PublicV1CallKind::Open => proto::PublicV1CallKind::Open,
+        PublicV1CallKind::Role => proto::PublicV1CallKind::Role,
+        PublicV1CallKind::Epoch => proto::PublicV1CallKind::Epoch,
+        PublicV1CallKind::Configuration => proto::PublicV1CallKind::Configuration,
+        PublicV1CallKind::CatchUp => proto::PublicV1CallKind::CatchUp,
+        PublicV1CallKind::Progress => proto::PublicV1CallKind::Progress,
+        PublicV1CallKind::Swap => proto::PublicV1CallKind::Swap,
+        PublicV1CallKind::Build => proto::PublicV1CallKind::Build,
+        PublicV1CallKind::Remove => proto::PublicV1CallKind::Remove,
+        PublicV1CallKind::Close => proto::PublicV1CallKind::Close,
+        PublicV1CallKind::Abort => proto::PublicV1CallKind::Abort,
+    }
+}
+
+fn public_v1_catch_up_mode_from_proto(value: i32) -> Result<PublicCatchUpMode, WireError> {
+    match proto::PublicV1CatchUpMode::try_from(value).map_err(|_| WireError::InvalidEnum {
+        field: "public_v1.completion.catch_up_mode",
+        value,
+    })? {
+        proto::PublicV1CatchUpMode::WriteQuorum => Ok(PublicCatchUpMode::WriteQuorum),
+        proto::PublicV1CatchUpMode::All => Ok(PublicCatchUpMode::All),
+        proto::PublicV1CatchUpMode::Unknown => Err(WireError::InvalidEnum {
+            field: "public_v1.completion.catch_up_mode",
+            value,
+        }),
+    }
+}
+
+fn public_v1_catch_up_mode_to_proto(value: PublicCatchUpMode) -> proto::PublicV1CatchUpMode {
+    match value {
+        PublicCatchUpMode::WriteQuorum => proto::PublicV1CatchUpMode::WriteQuorum,
+        PublicCatchUpMode::All => proto::PublicV1CatchUpMode::All,
+    }
+}
+
 fn public_v1_completion_from_proto(
     value: proto::PublicV1OperationCompletion,
 ) -> Result<PublicV1OperationCompletion, WireError> {
@@ -1164,13 +1240,56 @@ fn public_v1_completion_from_proto(
             });
         }
     };
+    let (authorization_key_id, authorization_audit_digest) = match (
+        value.authorization_key_id.as_slice(),
+        value.authorization_audit_digest.as_slice(),
+    ) {
+        ([], []) => (None, None),
+        (key_id, audit_digest) => (
+            Some(AuthorizationKeyId::from_bytes(key_id.try_into().map_err(
+                |_| {
+                    WireError::InvalidAuthority(
+                        "public-v1 completion key ID must contain exactly 32 bytes".into(),
+                    )
+                },
+            )?)),
+            Some(SignedAuthorizationAuditDigest::from_bytes(
+                audit_digest.try_into().map_err(|_| {
+                    WireError::InvalidAuthority(
+                        "public-v1 completion audit digest must contain exactly 32 bytes".into(),
+                    )
+                })?,
+            )),
+        ),
+    };
     Ok(PublicV1OperationCompletion {
         operation_id: OperationId::new(value.operation_id),
         revision: value.revision,
+        call_kind: public_v1_call_kind_from_proto(value.call_kind)?,
+        process_session_id: ProcessSessionId::new(value.process_session_id),
         input_digest: CanonicalOperationInputDigest::V1(CanonicalOperationInputDigestV1 {
             sha256: value.input_digest_sha256,
         }),
         replay_disposition: replay_from_proto(value.replay_disposition)?,
+        history: public_v1_history_from_proto(
+            value
+                .history
+                .ok_or(WireError::MissingField("public_v1.completion.history"))?,
+        )?,
+        storage_incarnation: public_v1_storage_from_proto(value.storage_incarnation.ok_or(
+            WireError::MissingField("public_v1.completion.storage_incarnation"),
+        )?)?,
+        previous_configuration_id: (!value.previous_configuration_id.is_empty())
+            .then(|| ConfigurationId::new(value.previous_configuration_id)),
+        current_configuration_id: (!value.current_configuration_id.is_empty())
+            .then(|| ConfigurationId::new(value.current_configuration_id)),
+        catch_up_mode: value
+            .catch_up_mode
+            .map(public_v1_catch_up_mode_from_proto)
+            .transpose()?,
+        catch_up_specific_quorum: value.catch_up_specific_quorum,
+        authorization_key_id,
+        authorization_audit_digest,
         result,
     })
 }
@@ -1208,9 +1327,31 @@ fn public_v1_completion_to_proto(
     proto::PublicV1OperationCompletion {
         operation_id: value.operation_id.as_str().to_string(),
         revision: value.revision,
+        call_kind: public_v1_call_kind_to_proto(value.call_kind) as i32,
+        process_session_id: value.process_session_id.to_string(),
         input_digest_version: u32::from(value.input_digest.version()),
         input_digest_sha256: value.input_digest.sha256().to_string(),
         replay_disposition: replay_to_proto(value.replay_disposition) as i32,
+        history: Some(public_v1_history_to_proto(&value.history)),
+        storage_incarnation: Some(public_v1_storage_to_proto(&value.storage_incarnation)),
+        previous_configuration_id: value
+            .previous_configuration_id
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string),
+        current_configuration_id: value
+            .current_configuration_id
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string),
+        catch_up_mode: value
+            .catch_up_mode
+            .map(|mode| public_v1_catch_up_mode_to_proto(mode) as i32),
+        catch_up_specific_quorum: value.catch_up_specific_quorum,
+        authorization_key_id: value
+            .authorization_key_id
+            .map_or_else(Vec::new, |key_id| key_id.to_bytes().to_vec()),
+        authorization_audit_digest: value
+            .authorization_audit_digest
+            .map_or_else(Vec::new, |digest| digest.to_bytes().to_vec()),
         result: result as i32,
         detail,
         rebuild_required,

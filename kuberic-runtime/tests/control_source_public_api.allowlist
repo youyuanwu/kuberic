@@ -948,6 +948,7 @@ public-path hidden enum crate::protocol::public_operations::PublicV1Authorizatio
 public-path hidden enum crate::protocol::public_operations::PublicV1AuthorizationIntentKind
 public-path hidden enum crate::protocol::public_operations::PublicV1AuthorizationIntentScope
 public-path hidden enum crate::protocol::public_operations::PublicV1AuthorizationIntentStage
+public-path hidden enum crate::protocol::public_operations::PublicV1CallKind
 public-path hidden enum crate::protocol::public_operations::PublicV1OperationResult
 public-path hidden enum crate::protocol::public_operations::ReplicaRebuildReason
 public-path hidden enum crate::protocol::public_operations::ReplicaRebuildRequired
@@ -1014,6 +1015,7 @@ public-path hidden field crate::protocol::public_operations::PublicBuildAuthoriz
 public-path hidden field crate::protocol::public_operations::PublicBuildAuthorizationReference::target_storage: PvcUid
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::attempt: OperationId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::authorization: Option < PublicBuildAuthorizationReference >
+public-path hidden field crate::protocol::public_operations::PublicBuildInput::authorization_verification_key: Option < AuthorizationVerificationKey >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::build_authorization: Option < BuildAuthorizationV1 >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::history: Option < HistoryContext >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::process_session_id: ProcessSessionId
@@ -1155,11 +1157,21 @@ public-path hidden field crate::protocol::public_operations::PublicV1ExtensionSl
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::history_recovery: Option < PublicV1ExtensionSlot >
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::public_build_evidence: Option < PublicV1ExtensionSlot >
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::signed_authorization: Option < PublicV1ExtensionSlot >
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::authorization_audit_digest: Option < SignedAuthorizationAuditDigest >
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::authorization_key_id: Option < AuthorizationKeyId >
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::call_kind: PublicV1CallKind
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::catch_up_mode: Option < PublicCatchUpMode >
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::catch_up_specific_quorum: Option < bool >
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::current_configuration_id: Option < ConfigurationId >
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::history: HistoryContext
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::input_digest: CanonicalOperationInputDigest
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::previous_configuration_id: Option < ConfigurationId >
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::replay_disposition: PublicOperationReplayDisposition
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::result: PublicV1OperationResult
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::revision: u64
+public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::storage_incarnation: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::barriers: Vec < PublicSessionEpochBarrier >
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::installed_configuration: Option < ConfigurationDescriptor >
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::replayed_role: Option < ReplicaRole >
@@ -1391,6 +1403,20 @@ public-path hidden variant crate::protocol::public_operations::PublicV1Authoriza
 public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Prepared
 public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Retired
 public-path hidden variant crate::protocol::public_operations::PublicV1AuthorizationIntentStage::Signed
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Abort
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Build
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::CatchUp
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Close
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Configuration
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Epoch
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::FailoverPromotion
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::InitialPrimary
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Open
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Progress
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Remove
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Role
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::SecondaryEpochAdvance
+public-path hidden variant crate::protocol::public_operations::PublicV1CallKind::Swap
 public-path hidden variant crate::protocol::public_operations::PublicV1OperationResult::Ambiguous((String))
 public-path hidden variant crate::protocol::public_operations::PublicV1OperationResult::Cancelled
 public-path hidden variant crate::protocol::public_operations::PublicV1OperationResult::Failed((String))

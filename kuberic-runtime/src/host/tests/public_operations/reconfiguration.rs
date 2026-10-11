@@ -64,6 +64,7 @@ fn build(attempt: &str) -> PublicBuildInput {
         replication_address: "trace://target".into(),
         history: None,
         authorization: None,
+        authorization_verification_key: None,
         build_authorization: None,
     }
 }
@@ -1866,6 +1867,7 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         replication_address: "trace://target".into(),
         history: Some(public_v1_history(&preview).1),
         authorization: Some(authorization.clone()),
+        authorization_verification_key: None,
         build_authorization: None,
     };
     let program = Program::Build(input.clone());
@@ -1957,8 +1959,18 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         completed_operations: vec![PublicV1OperationCompletion {
             operation_id: operation.operation_id,
             revision: operation.revision,
+            call_kind: crate::protocol::public_operations::PublicV1CallKind::Build,
+            process_session_id: operation.process_session_id,
             input_digest: operation.input_digest,
             replay_disposition: operation.replay_disposition,
+            history: public_v1_history(&preview).1,
+            storage_incarnation: public_v1_storage_incarnation(),
+            previous_configuration_id: None,
+            current_configuration_id: None,
+            catch_up_mode: None,
+            catch_up_specific_quorum: None,
+            authorization_key_id: None,
+            authorization_audit_digest: None,
             result: PublicV1OperationResult::RebuildRequired(Box::new(canonical)),
         }],
         extensions: Default::default(),

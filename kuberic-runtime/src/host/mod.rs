@@ -17,6 +17,7 @@ mod operation_recovery;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;
+pub(crate) mod public_build_store;
 #[cfg(any(test, feature = "testing"))]
 #[allow(dead_code)]
 #[allow(clippy::disallowed_types)]

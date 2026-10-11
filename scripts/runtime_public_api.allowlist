@@ -51,6 +51,8 @@ page:control/proto/enum.AccessStatus.html
 page:control/proto/enum.AgentStorageState.html
 page:control/proto/enum.BuildAuthorityKind.html
 page:control/proto/enum.FaultType.html
+page:control/proto/enum.PublicV1CallKind.html
+page:control/proto/enum.PublicV1CatchUpMode.html
 page:control/proto/enum.PublicV1DataLossRecoveryStage.html
 page:control/proto/enum.PublicV1OperationResultKind.html
 page:control/proto/enum.PublicV1ProgressRole.html

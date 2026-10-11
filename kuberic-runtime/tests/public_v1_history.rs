@@ -180,7 +180,7 @@ fn public_v1_history_data_loss_attempt_renews_higher_epoch() {
 
 #[tokio::test]
 async fn public_v1_history_store_uses_the_current_exact_schema() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 10);
+    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 11);
     let directory = tempfile::tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let preview = PublicOperationPreviewIdentity::public_v1(42);
@@ -226,11 +226,11 @@ async fn public_v1_history_store_uses_the_current_exact_schema() {
     drop(reopened);
 
     let connection = rusqlite::Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 8).unwrap();
+    connection.pragma_update(None, "user_version", 10).unwrap();
     drop(connection);
     assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
 
-    for rejected_version in [6, 7] {
+    for rejected_version in [6, 7, 8, 9] {
         let directory = tempfile::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let store = SqliteStore::create_public_v1(

@@ -331,6 +331,40 @@ message PublicV1OperationCompletion {
   PublicV1OperationResultKind result = 6;
   string detail = 7;
   PublicV1ReplicaRebuildRequired rebuild_required = 8;
+  PublicV1CallKind call_kind = 9;
+  string process_session_id = 10;
+  PublicV1HistoryContext history = 11;
+  PublicV1StorageIncarnation storage_incarnation = 12;
+  string previous_configuration_id = 13;
+  string current_configuration_id = 14;
+  optional PublicV1CatchUpMode catch_up_mode = 15;
+  optional bool catch_up_specific_quorum = 16;
+  bytes authorization_key_id = 17;
+  bytes authorization_audit_digest = 18;
+}
+
+enum PublicV1CallKind {
+  PUBLIC_V1_CALL_KIND_UNKNOWN = 0;
+  PUBLIC_V1_CALL_KIND_INITIAL_PRIMARY = 1;
+  PUBLIC_V1_CALL_KIND_FAILOVER_PROMOTION = 2;
+  PUBLIC_V1_CALL_KIND_SECONDARY_EPOCH_ADVANCE = 3;
+  PUBLIC_V1_CALL_KIND_OPEN = 4;
+  PUBLIC_V1_CALL_KIND_ROLE = 5;
+  PUBLIC_V1_CALL_KIND_EPOCH = 6;
+  PUBLIC_V1_CALL_KIND_CONFIGURATION = 7;
+  PUBLIC_V1_CALL_KIND_CATCH_UP = 8;
+  PUBLIC_V1_CALL_KIND_PROGRESS = 9;
+  PUBLIC_V1_CALL_KIND_SWAP = 10;
+  PUBLIC_V1_CALL_KIND_BUILD = 11;
+  PUBLIC_V1_CALL_KIND_REMOVE = 12;
+  PUBLIC_V1_CALL_KIND_CLOSE = 13;
+  PUBLIC_V1_CALL_KIND_ABORT = 14;
+}
+
+enum PublicV1CatchUpMode {
+  PUBLIC_V1_CATCH_UP_MODE_UNKNOWN = 0;
+  PUBLIC_V1_CATCH_UP_MODE_WRITE_QUORUM = 1;
+  PUBLIC_V1_CATCH_UP_MODE_ALL = 2;
 }
 
 message InitializeAgentStoreCommand {

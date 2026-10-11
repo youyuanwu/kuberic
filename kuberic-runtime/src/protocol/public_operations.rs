@@ -10,8 +10,8 @@ use crate::protocol::authorization::{
     BuildAuthorizationV1, PeerSessionAuthorizationClaimsV1, PeerSessionAuthorizationV1,
 };
 use crate::protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, HistoryContext, OperationId, PodUid,
-    ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
+    AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, HistoryContext,
+    OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
     PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole,
     ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
     derive_data_loss_history,
@@ -770,7 +770,21 @@ pub struct PublicBuildInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<PublicBuildAuthorizationReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_verification_key: Option<AuthorizationVerificationKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_authorization: Option<BuildAuthorizationV1>,
+}
+
+impl PublicBuildInput {
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn same_attempt_as(&self, other: &Self) -> bool {
+        self.attempt == other.attempt
+            && self.replica == other.replica
+            && self.process_session_id == other.process_session_id
+            && self.replication_address == other.replication_address
+            && self.history == other.history
+            && self.authorization == other.authorization
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -934,6 +948,9 @@ impl PublicOperationProgram {
                 if !public_v1 && build.build_authorization.is_some() {
                     return Err("protocol-10 build cannot carry signed authorization");
                 }
+                if !public_v1 && build.authorization_verification_key.is_some() {
+                    return Err("protocol-10 build cannot carry authorization trust");
+                }
                 if public_v1 {
                     let history = build
                         .history
@@ -953,10 +970,17 @@ impl PublicOperationProgram {
                     }
                 }
                 if let Some(authorization) = &build.build_authorization {
+                    let verification_key = build
+                        .authorization_verification_key
+                        .as_ref()
+                        .ok_or("signed build authorization lacks its verification key")?;
                     authorization
                         .claims
                         .validate()
                         .map_err(|_| "invalid signed build authorization claims")?;
+                    verification_key
+                        .verify_build_authorization(authorization)
+                        .map_err(|_| "signed build authorization signature is invalid")?;
                     if matches!(self, Self::Remove(_)) {
                         return Err("remove operation cannot carry signed build authorization");
                     }
@@ -977,6 +1001,8 @@ impl PublicOperationProgram {
                     if let Some(reference) = &build.authorization {
                         validate_signed_build_reference(reference, authorization)?;
                     }
+                } else if build.authorization_verification_key.is_some() {
+                    return Err("authorization verification key lacks a signed build envelope");
                 }
                 if matches!(self, Self::Build(_)) {
                     if &build.attempt != id {
@@ -2336,13 +2362,48 @@ pub enum PublicV1OperationResult {
     RebuildRequired(Box<CanonicalReplicaRebuildRequired>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicV1CallKind {
+    InitialPrimary,
+    FailoverPromotion,
+    SecondaryEpochAdvance,
+    Open,
+    Role,
+    Epoch,
+    Configuration,
+    CatchUp,
+    Progress,
+    Swap,
+    Build,
+    Remove,
+    Close,
+    Abort,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1OperationCompletion {
     pub operation_id: OperationId,
     pub revision: u64,
+    pub call_kind: PublicV1CallKind,
+    pub process_session_id: ProcessSessionId,
     pub input_digest: CanonicalOperationInputDigest,
     pub replay_disposition: PublicOperationReplayDisposition,
+    pub history: HistoryContext,
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_configuration_id: Option<ConfigurationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_configuration_id: Option<ConfigurationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_mode: Option<PublicCatchUpMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_specific_quorum: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_key_id: Option<AuthorizationKeyId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_audit_digest: Option<SignedAuthorizationAuditDigest>,
     pub result: PublicV1OperationResult,
 }
 
@@ -2356,6 +2417,30 @@ impl PublicV1OperationCompletion {
     ) -> Result<(), &'static str> {
         if self.operation_id.is_empty() || self.revision == 0 {
             return Err("public-v1 operation completion is incomplete");
+        }
+        if self.process_session_id.is_empty()
+            || &self.process_session_id != report_session
+            || self.history.resource_uid != *report_resource_uid
+            || self.history.protocol_generation.value() != report_identity.generation
+            || self.storage_incarnation.replica != *report_replica
+        {
+            return Err(
+                "public-v1 operation completion differs from its report history, storage, or session",
+            );
+        }
+        self.history.validate()?;
+        self.storage_incarnation.validate()?;
+        if self
+            .previous_configuration_id
+            .as_ref()
+            .is_some_and(ConfigurationId::is_empty)
+            || self
+                .current_configuration_id
+                .as_ref()
+                .is_some_and(ConfigurationId::is_empty)
+            || self.authorization_key_id.is_some() != self.authorization_audit_digest.is_some()
+        {
+            return Err("public-v1 operation completion authority metadata is incomplete");
         }
         self.input_digest.validate()?;
         match &self.result {
@@ -3471,6 +3556,10 @@ impl CanonicalEncoder {
         self.option(build.authorization.as_ref(), |encoder, authorization| {
             encoder.authorization(authorization);
         });
+        self.option(
+            build.authorization_verification_key.as_ref(),
+            |encoder, verification_key| encoder.bytes(verification_key.as_bytes()),
+        );
         self.option(
             build.build_authorization.as_ref(),
             |encoder, authorization| {

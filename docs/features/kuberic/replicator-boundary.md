@@ -322,6 +322,24 @@ substitution is invalid. Data-loss replacement preserves the Phase 5.2 logical
 authorization and still enforces exact captured replay capability before any
 callback.
 
+Phase 5.4 replaces the disposable schema-10 store with the final fresh
+schema-11 Public V1 store. Schemas 8, 9 and 10 are rejected before record
+decoding. Each completed protocol-11 call now reports its exact call kind,
+canonical input digest, replay disposition, accepted history/storage/process
+session, applicable PC/CC IDs, catch-up mode/capability, and signed
+authorization key/audit identity without native committed/quorum/ACK/copy
+evidence.
+
+Schema 11 also owns one signed public build record per admitted attempt. The
+record retains the exact verification key, key ID, canonical envelope and
+audit digest; source/target history, epoch, storage, process sessions and
+addresses; admission revision; terminal public result; and retirement
+disposition. It never stores an engine cursor, copy sequence, snapshot or
+catch-up boundary, durable target LSN, ACK/quorum state, or a Replicator store
+handle. Callback ambiguity requires retirement, successful removal retires the
+exact record, and malformed or incompletely bound current-schema records fail
+on reopen.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

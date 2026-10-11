@@ -376,6 +376,7 @@ fn public_v1_authorization_runtime_never_receives_private_seed() {
         replication_address: authorization.claims.target.replication_address.clone(),
         history: Some(authorization.claims.history.clone()),
         authorization: None,
+        authorization_verification_key: Some(verification_key),
         build_authorization: Some(authorization.clone()),
     });
     let stored_intent = PublicOperationIntent {

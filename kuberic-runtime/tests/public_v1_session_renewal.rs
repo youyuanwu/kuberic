@@ -26,8 +26,9 @@ use kuberic_runtime::protocol::types::{
     derive_data_loss_history, derive_history_initialization_id,
 };
 use kuberic_runtime::testing::sqlite_store::{
-    PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PublicV1OperationSnapshotDisposition,
-    PublicV1OperationSnapshotStage, SqliteStore,
+    PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PublicV1BuildRetirementSnapshot,
+    PublicV1OperationSnapshotDisposition, PublicV1OperationSnapshotStage, PublicV1ReportProjection,
+    SqliteStore,
 };
 use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
 
@@ -76,9 +77,9 @@ fn signed_build_intent(
     let signing_key = SigningKey::from_bytes(&[13; 32]);
     let verification_key =
         AuthorizationVerificationKey::from_bytes(signing_key.verifying_key().to_bytes()).unwrap();
-    let operation_id = OperationId::new("schema10-signed-build");
-    let source_session = ProcessSessionId::new("schema10-source-session");
-    let target_session = ProcessSessionId::new("schema10-target-session");
+    let operation_id = OperationId::new("schema11-signed-build");
+    let source_session = ProcessSessionId::new("schema11-source-session");
+    let target_session = ProcessSessionId::new("schema11-target-session");
     let claims = BuildAuthorizationClaimsV1 {
         resource_uid: history.resource_uid.clone(),
         protocol_generation: history.protocol_generation,
@@ -113,6 +114,7 @@ fn signed_build_intent(
         replication_address: "https://10.0.0.2:7000".into(),
         history: Some(history.clone()),
         authorization: None,
+        authorization_verification_key: Some(verification_key),
         build_authorization: Some(authorization),
     });
     PublicOperationIntent {
@@ -728,9 +730,9 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 }
 
 #[tokio::test]
-async fn public_v1_schema10_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 10);
-    let root = test_root("schema10-fresh");
+async fn public_v1_schema11_requires_a_fresh_exact_store() {
+    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 11);
+    let root = test_root("schema11-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicOperationPreviewIdentity::public_v1(42);
     let local = replica(1);
@@ -775,6 +777,24 @@ async fn public_v1_schema10_requires_a_fresh_exact_store() {
     assert_eq!(
         reopened.public_v1_operation_intents().await.unwrap(),
         vec![signed_intent.clone()]
+    );
+    let active_builds = reopened.public_v1_build_records().await.unwrap();
+    assert_eq!(active_builds.len(), 1);
+    assert_eq!(
+        active_builds[0].retirement,
+        PublicV1BuildRetirementSnapshot::Retain
+    );
+    assert!(active_builds[0].result.is_none());
+    let PublicOperationProgram::Build(build) = signed_intent.program.as_ref().unwrap() else {
+        panic!("expected signed build program");
+    };
+    assert_eq!(
+        active_builds[0].authorization,
+        build.build_authorization.as_ref().unwrap().clone()
+    );
+    assert_eq!(
+        active_builds[0].verification_key,
+        build.authorization_verification_key.unwrap()
     );
     assert_eq!(
         reopened
@@ -841,6 +861,91 @@ async fn public_v1_schema10_requires_a_fresh_exact_store() {
     assert_eq!(
         terminal_signed.intent.replay_disposition,
         PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
+    );
+    let terminal_builds = reopened.public_v1_build_records().await.unwrap();
+    assert_eq!(terminal_builds.len(), 1);
+    assert_eq!(
+        terminal_builds[0].result,
+        Some(kuberic_runtime::protocol::public_operations::PublicV1OperationResult::Succeeded)
+    );
+    let report = reopened
+        .public_v1_agent_report(
+            &preview,
+            PublicV1ReportProjection {
+                process_session_id: ProcessSessionId::new("schema11-source-session"),
+                report_sequence: 1,
+                role: ReplicaRole::Primary,
+                read_status: AccessStatus::NotPrimary,
+                write_status: AccessStatus::NotPrimary,
+                progress: PublicProgress {
+                    role: PublicProgressRole::Primary,
+                    first: 0,
+                    last: 0,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.completed_operations.len(), 1);
+    let completion = &report.completed_operations[0];
+    assert_eq!(
+        completion.call_kind,
+        kuberic_runtime::protocol::public_operations::PublicV1CallKind::Build
+    );
+    assert_eq!(
+        completion.process_session_id,
+        ProcessSessionId::new("schema11-source-session")
+    );
+    assert_eq!(
+        completion.authorization_key_id,
+        Some(terminal_builds[0].key_id)
+    );
+    assert_eq!(
+        completion.authorization_audit_digest,
+        Some(terminal_builds[0].audit_digest)
+    );
+    assert_eq!(
+        kuberic_runtime::control::normalize_public_v1_agent_status_report(
+            kuberic_runtime::control::public_v1_agent_status_to_proto(&report),
+        )
+        .unwrap(),
+        report
+    );
+    let PublicOperationProgram::Build(build) = signed_intent.program.as_ref().unwrap() else {
+        panic!("expected signed build program");
+    };
+    let mut removal_build = build.clone();
+    removal_build.authorization_verification_key = None;
+    removal_build.build_authorization = None;
+    let removal_program = PublicOperationProgram::Remove(removal_build.clone());
+    let removal_intent = PublicOperationIntent {
+        preview: preview.clone(),
+        operation_id: OperationId::new("schema11-remove-build"),
+        revision: 2,
+        process_session_id: ProcessSessionId::new("schema11-source-session"),
+        class: PublicOperationClass::Remove {
+            target: removal_build.replica.replica_id,
+        },
+        input_digest: removal_program.digest(),
+        replay_disposition: removal_program.replay_disposition(),
+        lifecycle: None,
+        program: Some(removal_program),
+    };
+    reopened
+        .begin_public_v1_operation(&removal_intent)
+        .await
+        .unwrap();
+    reopened
+        .complete_public_v1_remove(&removal_intent)
+        .await
+        .unwrap();
+    drop(reopened);
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let retired_builds = reopened.public_v1_build_records().await.unwrap();
+    assert_eq!(retired_builds.len(), 1);
+    assert_eq!(
+        retired_builds[0].retirement,
+        PublicV1BuildRetirementSnapshot::Retired
     );
     let closed = active.close_access().unwrap();
     reopened
@@ -933,13 +1038,35 @@ async fn public_v1_schema10_requires_a_fresh_exact_store() {
             |row| row.get(0),
         )
         .unwrap();
-    let mut state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+    let original_state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+    let mut mismatched_record = original_state.clone();
+    *mismatched_record
+        .get_mut("publicOperationPreview")
+        .and_then(|preview| preview.get_mut("buildRecords"))
+        .and_then(|records| records.get_mut("schema11-signed-build"))
+        .and_then(|record| record.get_mut("admissionRevision"))
+        .unwrap() = serde_json::json!(2);
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&mismatched_record).unwrap()],
+        )
+        .unwrap();
+    assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [state_json],
+        )
+        .unwrap();
+
+    let mut state = original_state;
     let operations = state
         .get_mut("publicOperationPreview")
         .and_then(|preview| preview.get_mut("operations"))
         .and_then(serde_json::Value::as_object_mut)
         .unwrap();
-    let record = operations.get_mut("schema10-signed-build").unwrap();
+    let record = operations.get_mut("schema11-signed-build").unwrap();
     let signature = record
         .get_mut("intent")
         .and_then(|intent| intent.get_mut("program"))
@@ -960,11 +1087,60 @@ async fn public_v1_schema10_requires_a_fresh_exact_store() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn public_v1_schema10_rejects_prior_preview_stores() {
+#[tokio::test]
+async fn public_v1_schema11_build_ambiguity_requires_retirement() {
+    let root = test_root("schema11-build-ambiguity");
+    let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicOperationPreviewIdentity::public_v1(42);
-    for version in [6, 7, 8, 9] {
-        let root = test_root(&format!("schema10-reject-{version}"));
+    let local = replica(1);
+    let local_storage = storage(local.clone());
+    let store = SqliteStore::create_public_v1(
+        &path,
+        preview.clone(),
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource-1"),
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+            initialization_id: InitializationId::new("local-initialization"),
+            local_identity: local,
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        },
+    )
+    .unwrap();
+    let generation = PublicProtocolGeneration::new(42);
+    let initialization =
+        derive_history_initialization_id(&ResourceUid::new("resource-1"), generation);
+    let history =
+        derive_bootstrap_history(&ResourceUid::new("resource-1"), generation, &initialization);
+    store
+        .initialize_public_v1_history(&initialization, &history, &local_storage)
+        .await
+        .unwrap();
+    let intent = signed_build_intent(&preview, &history, local_storage, storage(replica(2)));
+    store.begin_public_v1_operation(&intent).await.unwrap();
+    store.mark_public_v1_build_ambiguous(&intent).await.unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let records = reopened.public_v1_build_records().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].retirement,
+        PublicV1BuildRetirementSnapshot::Required
+    );
+    assert!(matches!(
+        records[0].result,
+        Some(kuberic_runtime::protocol::public_operations::PublicV1OperationResult::Ambiguous(_))
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn public_v1_schema11_rejects_prior_preview_stores() {
+    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    for version in [6, 7, 8, 9, 10] {
+        let root = test_root(&format!("schema11-reject-{version}"));
         let path = SqliteStore::metadata_database_path(&root);
         let store = SqliteStore::create_public_v1(
             &path,

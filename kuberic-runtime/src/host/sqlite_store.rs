@@ -33,6 +33,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::host::Result;
 use crate::host::command::is_access_only_configuration;
+#[cfg(any(test, feature = "testing"))]
+use crate::host::public_build_store::{PublicV1BuildRecord, PublicV1BuildRetirement};
 use crate::host::state::{
     AgentState, CoordinatorStage, DeactivationState, EffectStage,
     PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PendingEffect,
@@ -162,6 +164,85 @@ fn preview_schema_version(preview: &PublicOperationPreviewIdentity) -> u32 {
     } else {
         PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION
     }
+}
+
+fn validate_public_v1_state(state: &AgentState) -> Result<()> {
+    let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+        crate::host::HostError::Corrupt("schema-11 store lacks public-v1 preview state".into())
+    })?;
+    if !preview.identity.is_public_v1() {
+        return Err(crate::host::HostError::Corrupt(
+            "schema-11 store contains another preview identity".into(),
+        ));
+    }
+    for (operation_id, operation) in &preview.operations {
+        operation.intent.validate().map_err(|message| {
+            crate::host::HostError::Corrupt(format!(
+                "invalid schema-11 operation {operation_id}: {message}"
+            ))
+        })?;
+        if operation_id != &operation.intent.operation_id {
+            return Err(crate::host::HostError::Corrupt(
+                "schema-11 operation key differs from its intent".into(),
+            ));
+        }
+        operation
+            .accepted_history
+            .as_ref()
+            .ok_or_else(|| {
+                crate::host::HostError::Corrupt("schema-11 operation lacks accepted history".into())
+            })?
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+        operation
+            .accepted_storage
+            .as_ref()
+            .ok_or_else(|| {
+                crate::host::HostError::Corrupt(
+                    "schema-11 operation lacks accepted storage incarnation".into(),
+                )
+            })?
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+    }
+    for (operation_id, build_record) in &preview.build_records {
+        build_record
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+        if operation_id != &build_record.operation_id {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record key differs from its operation".into(),
+            ));
+        }
+        let operation = preview.operations.get(operation_id).ok_or_else(|| {
+            crate::host::HostError::Corrupt(
+                "public-v1 build record lacks its durable operation".into(),
+            )
+        })?;
+        let Some(crate::protocol::public_operations::PublicOperationProgram::Build(build)) =
+            operation.intent.program.as_ref()
+        else {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record operation has another call kind".into(),
+            ));
+        };
+        if operation.intent.revision != build_record.admission_revision
+            || operation.accepted_history.as_ref() != Some(&build_record.history)
+            || operation.accepted_storage.as_ref() != Some(&build_record.source.storage_incarnation)
+            || build.attempt != build_record.build_id
+            || build.build_authorization.as_ref() != Some(&build_record.authorization)
+            || build.authorization_verification_key != Some(build_record.verification_key)
+            || build.history.as_ref() != Some(&build_record.history)
+            || build.replica != build_record.target.storage_incarnation.replica
+            || build.process_session_id != build_record.target.process_session_id
+            || build.replication_address != build_record.target.replication_address
+        {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record differs from its accepted intent".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct SqliteStore {
@@ -389,6 +470,9 @@ impl SqliteStore {
             return Err(crate::host::HostError::IdentityMismatch(
                 "public-operation preview identity changed".into(),
             ));
+        }
+        if expected_preview.is_public_v1() {
+            validate_public_v1_state(&state)?;
         }
         Ok(Self {
             #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -1957,9 +2041,43 @@ impl AgentStore for SqliteStore {
                     preview
                         .active_builds
                         .insert(build.replica.replica_id, build.clone());
+                    if let (Some(authorization), Some(verification_key)) = (
+                        build.build_authorization.as_ref(),
+                        build.authorization_verification_key,
+                    ) {
+                        let build_record = PublicV1BuildRecord {
+                            operation_id: intent.operation_id.clone(),
+                            build_id: build.attempt.clone(),
+                            admission_revision: intent.revision,
+                            verification_key,
+                            key_id: authorization.claims.key_id,
+                            audit_digest: authorization.audit_digest().map_err(|_| {
+                                crate::host::HostError::CommandRejected(
+                                    "signed public-v1 build has an invalid audit digest".into(),
+                                )
+                            })?,
+                            history: authorization.claims.history.clone(),
+                            epoch: authorization.claims.epoch,
+                            source: authorization.claims.source.clone(),
+                            target: authorization.claims.target.clone(),
+                            authorization: authorization.clone(),
+                            retirement: PublicV1BuildRetirement::Retain,
+                            result: None,
+                        };
+                        build_record.validate().map_err(|message| {
+                            crate::host::HostError::CommandRejected(message.into())
+                        })?;
+                        preview
+                            .build_records
+                            .insert(intent.operation_id.clone(), build_record);
+                    }
                 }
                 Some(PublicOperationProgram::Remove(build)) => {
-                    if preview.active_builds.get(&build.replica.replica_id) != Some(build) {
+                    if !preview
+                        .active_builds
+                        .get(&build.replica.replica_id)
+                        .is_some_and(|active| active.same_attempt_as(build))
+                    {
                         return Err(crate::host::HostError::CommandRejected(
                             "removal does not name the exact active attempt".into(),
                         ));
@@ -2058,6 +2176,7 @@ impl AgentStore for SqliteStore {
                         }
                         preview.writes_revoked = true;
                         preview.active_builds.clear();
+                        preview.build_records.clear();
                         preview.absent_builds.clear();
                         preview.operations.clear();
                         preview.current_topology_operation = None;
@@ -2168,6 +2287,8 @@ impl AgentStore for SqliteStore {
             };
             let record = PublicOperationRecord {
                 intent: intent.clone(),
+                accepted_history: preview.history.clone(),
+                accepted_storage: preview.storage_incarnation.clone(),
                 stage,
                 disposition: None,
                 containment: PublicOperationContainment::NotRequired,
@@ -2352,6 +2473,8 @@ impl AgentStore for SqliteStore {
             );
             let successor = PublicOperationRecord {
                 intent: intent.clone(),
+                accepted_history: preview.history.clone(),
+                accepted_storage: preview.storage_incarnation.clone(),
                 stage: if decision == DataLossRenewalDecision::InvokeCallback {
                     PublicOperationStage::Ready
                 } else {
@@ -2539,6 +2662,54 @@ impl AgentStore for SqliteStore {
                 record.lifecycle.in_flight = None;
             }
             let result = record.clone();
+            if let Some(build_record) = preview.build_records.get_mut(operation_id)
+                && matches!(
+                    result.intent.program,
+                    Some(crate::protocol::public_operations::PublicOperationProgram::Build(_))
+                )
+            {
+                match result.disposition.as_ref() {
+                    Some(PublicOperationDisposition::Succeeded) => {
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::Succeeded,
+                        );
+                    }
+                    Some(PublicOperationDisposition::Failed(message)) => {
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::Failed(
+                                message.clone(),
+                            ),
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                    }
+                    Some(PublicOperationDisposition::Ambiguous(message)) => {
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                                message.clone(),
+                            ),
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                    }
+                    Some(PublicOperationDisposition::Cancelled) => {
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::Cancelled,
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                    }
+                    Some(PublicOperationDisposition::Attached(owner)) => {
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                                format!("attached to {owner}"),
+                            ),
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                    }
+                    None => {}
+                }
+                build_record.validate().map_err(|message| {
+                    crate::host::HostError::DurableEffectConflict(message.into())
+                })?;
+            }
             write_agent_state(transaction, &state)?;
             Ok(result)
         })
@@ -2605,6 +2776,8 @@ impl AgentStore for SqliteStore {
             let owner_completed = owner_record.stage == PublicOperationStage::Completed;
             let record = PublicOperationRecord {
                 intent: intent.clone(),
+                accepted_history: owner_record.accepted_history.clone(),
+                accepted_storage: owner_record.accepted_storage.clone(),
                 stage: if owner_completed {
                     PublicOperationStage::Completed
                 } else {
@@ -3020,13 +3193,33 @@ impl AgentStore for SqliteStore {
                             ),
                         ) = &intent.program
                     {
-                        if preview.active_builds.get(&build.replica.replica_id) != Some(build) {
+                        if !preview
+                            .active_builds
+                            .get(&build.replica.replica_id)
+                            .is_some_and(|active| active.same_attempt_as(build))
+                        {
                             return Err(crate::host::HostError::StaleEffectCompletion(
                                 "removal attempt changed".into(),
                             ));
                         }
                         preview.active_builds.remove(&build.replica.replica_id);
                         preview.absent_builds.insert(build.attempt.clone());
+                        if let Some(build_record) =
+                            preview.build_records.get_mut(&build.attempt)
+                        {
+                            if build_record.target.storage_incarnation.replica != build.replica
+                                || build_record.target.process_session_id
+                                    != build.process_session_id
+                            {
+                                return Err(crate::host::HostError::StaleEffectCompletion(
+                                    "build retirement differs from signed build record".into(),
+                                ));
+                            }
+                            build_record.retirement = PublicV1BuildRetirement::Retired;
+                            build_record.validate().map_err(|message| {
+                                crate::host::HostError::DurableEffectConflict(message.into())
+                            })?;
+                        }
                     }
                     record.lifecycle.outcomes.push(outcome);
                     record.lifecycle.in_flight = None;
@@ -3207,6 +3400,19 @@ impl AgentStore for SqliteStore {
                 state.secondary_removal_evidence = None;
                 state.prepared_switchover = None;
                 preview.current_operation = None;
+                for build_record in preview.build_records.values_mut() {
+                    if build_record.result.is_none() {
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                                "predecessor process exited during signed build".into(),
+                            ),
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                        build_record.validate().map_err(|message| {
+                            crate::host::HostError::DurableEffectConflict(message.into())
+                        })?;
+                    }
+                }
                 preview.active_builds.clear();
             }
             if next == RestartActionStage::SuccessorLaunching {

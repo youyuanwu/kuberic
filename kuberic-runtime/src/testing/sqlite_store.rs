@@ -3,12 +3,16 @@ use std::sync::Arc;
 
 use crate::authority::{BuildAuthorityStore, BuildProgressStore, LocalWriteJournal};
 use crate::host::store::AgentStore;
+use crate::protocol::authorization::{
+    AuthorizationAuditDigest, AuthorizationKeyId, AuthorizationVerificationKey,
+    BuildAuthorizationEndpointV1, BuildAuthorizationV1,
+};
 use crate::protocol::command::{
     EnsureReplicaBuild, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
 };
 use crate::protocol::public_operations::{
     DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
-    PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport,
+    PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport, PublicV1OperationResult,
     PublicV1SessionRenewalStatus, StatePersistence,
 };
 use crate::protocol::types::{
@@ -73,6 +77,30 @@ pub struct PublicV1OperationSnapshot {
     pub intent: crate::protocol::public_operations::PublicOperationIntent,
     pub stage: PublicV1OperationSnapshotStage,
     pub disposition: Option<PublicV1OperationSnapshotDisposition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicV1BuildRetirementSnapshot {
+    Retain,
+    Required,
+    Retired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicV1BuildSnapshot {
+    pub operation_id: OperationId,
+    pub build_id: OperationId,
+    pub admission_revision: u64,
+    pub verification_key: AuthorizationVerificationKey,
+    pub key_id: AuthorizationKeyId,
+    pub audit_digest: AuthorizationAuditDigest,
+    pub history: HistoryContext,
+    pub epoch: crate::protocol::types::Epoch,
+    pub source: BuildAuthorizationEndpointV1,
+    pub target: BuildAuthorizationEndpointV1,
+    pub authorization: BuildAuthorizationV1,
+    pub retirement: PublicV1BuildRetirementSnapshot,
+    pub result: Option<PublicV1OperationResult>,
 }
 
 impl SqliteStore {
@@ -318,6 +346,108 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub async fn complete_public_v1_remove(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+    ) -> crate::host::Result<()> {
+        let record = self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| record.intent == *intent)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-v1 signed build removal is not journaled".into(),
+                )
+            })?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                record.stage,
+                crate::host::state::PublicOperationStage::Running,
+                None,
+            )
+            .await?;
+        self.inner
+            .public_instruction(
+                intent,
+                0,
+                crate::host::state::PublicInstruction::Remove,
+                None,
+            )
+            .await?;
+        self.inner
+            .public_instruction(
+                intent,
+                0,
+                crate::host::state::PublicInstruction::Remove,
+                Some(crate::host::state::PublicInstructionOutcome::Done),
+            )
+            .await?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                crate::host::state::PublicOperationStage::Running,
+                crate::host::state::PublicOperationStage::Completed,
+                Some(crate::host::state::PublicOperationDisposition::Succeeded),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_public_v1_build_ambiguous(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+    ) -> crate::host::Result<()> {
+        let record = self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| record.intent == *intent)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-v1 signed build is not journaled".into(),
+                )
+            })?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                record.stage,
+                crate::host::state::PublicOperationStage::Running,
+                None,
+            )
+            .await?;
+        self.inner
+            .public_instruction(
+                intent,
+                0,
+                crate::host::state::PublicInstruction::Build,
+                None,
+            )
+            .await?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                crate::host::state::PublicOperationStage::Running,
+                crate::host::state::PublicOperationStage::ContainmentPending,
+                Some(crate::host::state::PublicOperationDisposition::Ambiguous(
+                    "signed build callback outcome was not durably observed".into(),
+                )),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn public_v1_operation_snapshot(
         &self,
         operation_id: &OperationId,
@@ -375,6 +505,44 @@ impl SqliteStore {
             stage,
             disposition,
         })
+    }
+
+    pub async fn public_v1_build_records(&self) -> crate::host::Result<Vec<PublicV1BuildSnapshot>> {
+        let state = self.inner.load_state().await?;
+        let preview = state.public_operation_preview.ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "public-v1 build store requires preview state".into(),
+            )
+        })?;
+        Ok(preview
+            .build_records
+            .into_values()
+            .map(|record| PublicV1BuildSnapshot {
+                operation_id: record.operation_id,
+                build_id: record.build_id,
+                admission_revision: record.admission_revision,
+                verification_key: record.verification_key,
+                key_id: record.key_id,
+                audit_digest: record.audit_digest,
+                history: record.history,
+                epoch: record.epoch,
+                source: record.source,
+                target: record.target,
+                authorization: record.authorization,
+                retirement: match record.retirement {
+                    crate::host::public_build_store::PublicV1BuildRetirement::Retain => {
+                        PublicV1BuildRetirementSnapshot::Retain
+                    }
+                    crate::host::public_build_store::PublicV1BuildRetirement::Required => {
+                        PublicV1BuildRetirementSnapshot::Required
+                    }
+                    crate::host::public_build_store::PublicV1BuildRetirement::Retired => {
+                        PublicV1BuildRetirementSnapshot::Retired
+                    }
+                },
+                result: record.result,
+            })
+            .collect())
     }
 
     pub async fn apply_public_v1_session_renewal_command(

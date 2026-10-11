@@ -2,6 +2,7 @@
 
 use crate::authority::{DurableBuildProgress, RetiredAuthority};
 use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
+use crate::host::public_build_store::PublicV1BuildRecord;
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
 use crate::protocol::public_operations::{
@@ -23,7 +24,7 @@ use std::path::PathBuf;
 // Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
-pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 10;
+pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,6 +116,10 @@ pub(crate) enum PublicOperationContainment {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicOperationRecord {
     pub(crate) intent: PublicOperationIntent,
+    #[serde(default)]
+    pub(crate) accepted_history: Option<HistoryContext>,
+    #[serde(default)]
+    pub(crate) accepted_storage: Option<ReplicaStorageIncarnationContext>,
     pub(crate) stage: PublicOperationStage,
     pub(crate) disposition: Option<PublicOperationDisposition>,
     #[serde(default)]
@@ -232,6 +237,8 @@ pub(crate) struct PublicOperationPreviewState {
         crate::protocol::public_operations::PublicBuildInput,
     >,
     #[serde(default)]
+    pub(crate) build_records: BTreeMap<OperationId, PublicV1BuildRecord>,
+    #[serde(default)]
     pub(crate) absent_builds: BTreeSet<OperationId>,
     #[serde(default)]
     pub(crate) writes_revoked: bool,
@@ -257,6 +264,7 @@ impl PublicOperationPreviewState {
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),
+            build_records: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
             writes_revoked: false,
             terminal: false,
@@ -279,6 +287,7 @@ impl PublicOperationPreviewState {
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),
+            build_records: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
             writes_revoked: false,
             terminal: false,

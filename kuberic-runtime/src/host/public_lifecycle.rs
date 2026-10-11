@@ -13,12 +13,14 @@ use crate::host::store::AgentStore;
 use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
-    PublicBuildInput, PublicLifecycleInput, PublicLifecycleRecipe, PublicLifecycleReport,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram, PublicProgress,
-    PublicV1AgentReport, PublicV1OperationCompletion, PublicV1OperationResult,
-    ReplicaRebuildRequired, ServiceLocation,
+    PublicBuildInput, PublicCatchUpMode, PublicLifecycleInput, PublicLifecycleRecipe,
+    PublicLifecycleReport, PublicOperationIntent, PublicOperationPreviewIdentity,
+    PublicOperationProgram, PublicProgress, PublicV1AgentReport, PublicV1CallKind,
+    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildRequired, ServiceLocation,
 };
-use crate::protocol::types::{AccessStatus, ProcessSessionId, ReplicaRole, ReplicatorCreationId};
+use crate::protocol::types::{
+    AccessStatus, ConfigurationId, ProcessSessionId, ReplicaRole, ReplicatorCreationId,
+};
 use crate::replicator::{
     PrimaryReplicator, ReplicaSetQuorumMode, Replicator, ReplicatorCapabilities,
 };
@@ -542,6 +544,125 @@ pub(crate) struct PublicV1ReportProjection {
     pub(crate) progress: PublicProgress,
 }
 
+fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind> {
+    if let Some(lifecycle) = &intent.lifecycle {
+        return Ok(match lifecycle.recipe {
+            PublicLifecycleRecipe::InitialPrimary => PublicV1CallKind::InitialPrimary,
+            PublicLifecycleRecipe::FailoverPromotion => PublicV1CallKind::FailoverPromotion,
+            PublicLifecycleRecipe::SecondaryEpochAdvance => PublicV1CallKind::SecondaryEpochAdvance,
+        });
+    }
+    match intent.program.as_ref() {
+        Some(PublicOperationProgram::Open { .. }) => Ok(PublicV1CallKind::Open),
+        Some(PublicOperationProgram::Role { .. }) => Ok(PublicV1CallKind::Role),
+        Some(PublicOperationProgram::Epoch { .. }) => Ok(PublicV1CallKind::Epoch),
+        Some(PublicOperationProgram::Configuration(_)) => Ok(PublicV1CallKind::Configuration),
+        Some(PublicOperationProgram::CatchUp { .. }) => Ok(PublicV1CallKind::CatchUp),
+        Some(PublicOperationProgram::Progress { .. }) => Ok(PublicV1CallKind::Progress),
+        Some(PublicOperationProgram::Swap { .. }) => Ok(PublicV1CallKind::Swap),
+        Some(PublicOperationProgram::Build(_)) => Ok(PublicV1CallKind::Build),
+        Some(PublicOperationProgram::Remove(_)) => Ok(PublicV1CallKind::Remove),
+        Some(PublicOperationProgram::Close) => Ok(PublicV1CallKind::Close),
+        Some(PublicOperationProgram::Abort) => Ok(PublicV1CallKind::Abort),
+        None => Err(HostError::Corrupt(
+            "schema-11 completion lacks a public call kind".into(),
+        )),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn public_v1_completion_authority(
+    intent: &PublicOperationIntent,
+) -> Result<(
+    Option<ConfigurationId>,
+    Option<ConfigurationId>,
+    Option<PublicCatchUpMode>,
+    Option<bool>,
+    Option<crate::protocol::authorization::AuthorizationKeyId>,
+    Option<crate::protocol::authorization::AuthorizationAuditDigest>,
+)> {
+    let configuration_ids =
+        |configuration: &crate::protocol::public_operations::PublicConfiguration| {
+            (
+                configuration
+                    .previous
+                    .as_ref()
+                    .map(|configuration| configuration.configuration_id.clone()),
+                Some(configuration.current.configuration_id.clone()),
+            )
+        };
+    if let Some(lifecycle) = &intent.lifecycle {
+        return Ok((
+            lifecycle
+                .previous
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            Some(lifecycle.current.configuration_id.clone()),
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+    let Some(program) = intent.program.as_ref() else {
+        return Err(HostError::Corrupt(
+            "schema-11 completion lacks public authority".into(),
+        ));
+    };
+    Ok(match program {
+        PublicOperationProgram::Configuration(configuration) => {
+            let (previous, current) = configuration_ids(configuration);
+            (previous, current, None, None, None, None)
+        }
+        PublicOperationProgram::CatchUp {
+            configuration,
+            mode,
+        } => {
+            let (previous, current) = configuration_ids(configuration);
+            (previous, current, Some(*mode), None, None, None)
+        }
+        PublicOperationProgram::Swap {
+            refreshed,
+            mode,
+            catch_up_specific_quorum,
+            ..
+        } => {
+            let (previous, current) = configuration_ids(refreshed);
+            (
+                previous,
+                current,
+                Some(*mode),
+                Some(*catch_up_specific_quorum),
+                None,
+                None,
+            )
+        }
+        PublicOperationProgram::Build(build) => {
+            let (key_id, audit_digest) =
+                if let Some(authorization) = build.build_authorization.as_ref() {
+                    (
+                        Some(authorization.claims.key_id),
+                        Some(authorization.audit_digest().map_err(|_| {
+                            HostError::Corrupt(
+                                "schema-11 build completion has an invalid authorization".into(),
+                            )
+                        })?),
+                    )
+                } else {
+                    (None, None)
+                };
+            (None, None, None, None, key_id, audit_digest)
+        }
+        PublicOperationProgram::Open { .. }
+        | PublicOperationProgram::Role { .. }
+        | PublicOperationProgram::Epoch { .. }
+        | PublicOperationProgram::Progress { .. }
+        | PublicOperationProgram::Remove(_)
+        | PublicOperationProgram::Close
+        | PublicOperationProgram::Abort => (None, None, None, None, None, None),
+    })
+}
+
 pub(crate) async fn public_v1_report(
     store: &dyn AgentStore,
     identity: &PublicOperationPreviewIdentity,
@@ -572,7 +693,7 @@ pub(crate) async fn public_v1_report(
         .operations
         .values()
         .filter(|record| record.stage == PublicOperationStage::Completed)
-        .filter_map(|record| {
+        .map(|record| {
             let rebuild = record.lifecycle.outcomes.iter().find_map(|outcome| {
                 if let PublicInstructionOutcome::RebuildRequired(failure) = outcome {
                     Some(failure.clone())
@@ -583,7 +704,9 @@ pub(crate) async fn public_v1_report(
             let result = if let Some(rebuild) = rebuild {
                 PublicV1OperationResult::RebuildRequired(rebuild)
             } else {
-                match record.disposition.as_ref()? {
+                match record.disposition.as_ref().ok_or_else(|| {
+                    HostError::Corrupt("schema-11 completed operation lacks a disposition".into())
+                })? {
                     PublicOperationDisposition::Succeeded => PublicV1OperationResult::Succeeded,
                     PublicOperationDisposition::Failed(message) => {
                         PublicV1OperationResult::Failed(message.clone())
@@ -597,15 +720,39 @@ pub(crate) async fn public_v1_report(
                     }
                 }
             };
-            Some(PublicV1OperationCompletion {
+            let history = record.accepted_history.clone().ok_or_else(|| {
+                HostError::Corrupt("schema-11 completion lacks accepted history".into())
+            })?;
+            let storage_incarnation = record.accepted_storage.clone().ok_or_else(|| {
+                HostError::Corrupt("schema-11 completion lacks accepted storage".into())
+            })?;
+            let (
+                previous_configuration_id,
+                current_configuration_id,
+                catch_up_mode,
+                catch_up_specific_quorum,
+                authorization_key_id,
+                authorization_audit_digest,
+            ) = public_v1_completion_authority(&record.intent)?;
+            Ok(PublicV1OperationCompletion {
                 operation_id: record.intent.operation_id.clone(),
                 revision: record.intent.revision,
+                call_kind: public_v1_call_kind(&record.intent)?,
+                process_session_id: record.intent.process_session_id.clone(),
                 input_digest: record.intent.input_digest.clone(),
                 replay_disposition: record.intent.replay_disposition,
+                history,
+                storage_incarnation,
+                previous_configuration_id,
+                current_configuration_id,
+                catch_up_mode,
+                catch_up_specific_quorum,
+                authorization_key_id,
+                authorization_audit_digest,
                 result,
             })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let report = PublicV1AgentReport {
         identity: identity.clone(),
         resource_uid: state.identity.resource_uid,
