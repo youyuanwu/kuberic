@@ -2080,9 +2080,9 @@ mod tests {
             authorization.canonical_bytes().unwrap()
         );
         let item = CopyItem {
-            build_id,
-            sender: source,
-            receiver: target,
+            build_id: build_id.clone(),
+            sender: source.clone(),
+            receiver: target.clone(),
             epoch: Epoch::new(0, 10),
             current_configuration_id: ConfigurationId::new("build-current"),
             sequence: 1,
@@ -2094,9 +2094,12 @@ mod tests {
             snapshot_chunk: true,
             data: Bytes::from_static(b"snapshot"),
         };
-        let wire =
-            authorized_copy_to_session_proto(item, "build-source-session", "build-target-session")
-                .unwrap();
+        let wire = authorized_copy_to_session_proto(
+            item.clone(),
+            "build-source-session",
+            "build-target-session",
+        )
+        .unwrap();
         copy_from_proto(wire.clone()).unwrap();
 
         let target_context = PublicAuthorizationRuntimeContext {
@@ -2123,6 +2126,47 @@ mod tests {
         crate::replicator::bind_public_authorization_context(wrong_local_role).unwrap();
         assert!(copy_from_proto(wire.clone()).is_err());
         crate::replicator::bind_public_authorization_context(target_context).unwrap();
+
+        let configuration = crate::protocol::public_operations::PublicConfiguration {
+            current: ConfigurationDescriptor::new(
+                epoch,
+                source.replica_id,
+                vec![ConfigurationMember {
+                    identity: source.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            previous: None,
+            replicas: Vec::new(),
+        };
+        let rollback = crate::replicator::admit_public_peer_configuration(&context, &configuration)
+            .unwrap()
+            .unwrap();
+        assert!(
+            authorized_copy_to_session_proto(
+                item.clone(),
+                "build-source-session",
+                "build-target-session",
+            )
+            .is_err(),
+            "configuration admission must invalidate predecessor build authority"
+        );
+        crate::replicator::restore_public_peer_authorization(rollback).unwrap();
+        authorized_copy_to_session_proto(
+            item.clone(),
+            "build-source-session",
+            "build-target-session",
+        )
+        .unwrap();
+        let _ = crate::replicator::admit_public_peer_configuration(&context, &configuration)
+            .unwrap()
+            .unwrap();
+        assert!(
+            authorized_copy_to_session_proto(item, "build-source-session", "build-target-session",)
+                .is_err(),
+            "successful configuration must not restore predecessor build authority"
+        );
 
         let peer = signing_key
             .sign_peer_session_authorization(PeerSessionAuthorizationClaimsV1 {

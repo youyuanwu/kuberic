@@ -672,6 +672,7 @@ pub(crate) struct PublicPeerAuthorizationSnapshot {
     identity: ReplicaIdentity,
     context: Option<PublicAuthorizationRuntimeContext>,
     peers: Vec<PeerSessionAuthorizationV1>,
+    builds: Vec<BuildAuthorizationV1>,
 }
 
 #[derive(Default)]
@@ -955,6 +956,7 @@ pub(crate) fn admit_public_peer_configuration(
         identity: registered.identity.clone(),
         context: registered.context.clone(),
         peers: registered.peers.clone(),
+        builds: registered.builds.clone(),
     };
     let mut current_context = context.clone();
     current_context.epoch = configuration.current.epoch;
@@ -962,6 +964,7 @@ pub(crate) fn admit_public_peer_configuration(
     current_context.current_configuration_id = Some(configuration.current.configuration_id.clone());
     registered.context = Some(current_context);
     registered.peers = admitted;
+    registered.builds.clear();
     Ok(Some(snapshot))
 }
 
@@ -983,6 +986,7 @@ pub(crate) fn restore_public_peer_authorization(
         })?;
     registered.context = snapshot.context;
     registered.peers = snapshot.peers;
+    registered.builds = snapshot.builds;
     Ok(())
 }
 
