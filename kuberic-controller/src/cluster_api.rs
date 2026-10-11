@@ -1637,6 +1637,7 @@ fn replica_pod_named(
             ..Default::default()
         },
         spec: Some(PodSpec {
+            automount_service_account_token: Some(false),
             hostname: Some(pod_name.to_string()),
             subdomain: Some(format!("{}-peer", set.name_any())),
             security_context: Some(PodSecurityContext {

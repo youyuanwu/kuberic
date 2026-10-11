@@ -218,6 +218,26 @@ impl SqliteStore {
             .await
     }
 
+    pub async fn begin_public_v1_operation(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+    ) -> crate::host::Result<()> {
+        self.inner.begin_public_operation(intent, &[], &[]).await?;
+        Ok(())
+    }
+
+    pub async fn public_v1_operation_intents(
+        &self,
+    ) -> crate::host::Result<Vec<crate::protocol::public_operations::PublicOperationIntent>> {
+        Ok(self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .map(|record| record.intent)
+            .collect())
+    }
+
     pub async fn apply_public_v1_session_renewal_command(
         &self,
         command: &PublicV1SessionRenewalCommand,

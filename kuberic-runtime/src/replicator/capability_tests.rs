@@ -299,3 +299,83 @@ async fn public_authorization_trust_is_creation_bound_and_update_immutable() {
         ReplicatorCapabilities::conservative()
     );
 }
+
+#[test]
+fn public_authorization_registry_is_creation_scoped_and_conversion_is_pure() {
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(51),
+        instance_id: crate::protocol::types::ReplicaInstanceId::new("registry-instance"),
+        agent_generation: crate::protocol::types::AgentGeneration::new("registry-generation"),
+    };
+    let signing_key = AuthorizationSigningKey::from_seed([51; 32]);
+    let trust = PublicAuthorizationTrust {
+        resource_uid: ResourceUid::new("registry-resource"),
+        protocol_generation: PublicProtocolGeneration::new(11),
+        verification_key: signing_key.verification_key(),
+        key_id: signing_key.key_id(),
+    };
+    let interfaces = ReplicatorInterfaces::secondary(
+        Arc::new(Control::default()),
+        None,
+        ReplicatorCapabilities::conservative(),
+    );
+    let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+    let attachment = interfaces.prepare_attachment(reservation).unwrap();
+    interfaces
+        .creation
+        .bind_settings(
+            identity.clone(),
+            ReplicatorSettings {
+                replication_address: "https://10.0.0.51:7000".into(),
+                public_authorization: Some(trust),
+            },
+        )
+        .unwrap();
+    let before = public_authorization_registry()
+        .lock()
+        .unwrap()
+        .settings
+        .iter()
+        .find(|settings| settings.identity == identity)
+        .map(|settings| (settings.peers.len(), settings.builds.len()))
+        .unwrap();
+    let _: ReplicaInformation = PublicReplicaDescriptor {
+        build_id: OperationId::default(),
+        identity: ReplicaIdentity {
+            replica_id: ReplicaId::new(52),
+            instance_id: crate::protocol::types::ReplicaInstanceId::new("remote-instance"),
+            agent_generation: crate::protocol::types::AgentGeneration::new("remote-generation"),
+        },
+        replication_address: "https://10.0.0.52:7000".into(),
+        process_session_id: ProcessSessionId::new("remote-session"),
+        role: ReplicaRole::ActiveSecondary,
+        current_progress: 0,
+        catch_up_capability: 0,
+        must_catchup: false,
+        peer_authorization: None,
+        configuration_revision: None,
+    }
+    .into();
+    let after = public_authorization_registry()
+        .lock()
+        .unwrap()
+        .settings
+        .iter()
+        .find(|settings| settings.identity == identity)
+        .map(|settings| (settings.peers.len(), settings.builds.len()))
+        .unwrap();
+    assert_eq!(before, after, "value conversion must not mutate authority");
+
+    attachment.disarm();
+    drop(attachment);
+    drop(interfaces);
+    assert!(
+        public_authorization_registry()
+            .lock()
+            .unwrap()
+            .settings
+            .iter()
+            .all(|settings| settings.identity != identity),
+        "dropping the creation must remove its trust and all scoped authority"
+    );
+}

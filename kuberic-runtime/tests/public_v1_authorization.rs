@@ -5,10 +5,16 @@ use kuberic_runtime::protocol::authorization::{
     BuildAuthorizationClaimsV1, BuildAuthorizationEndpointV1, BuildAuthorizationV1,
     PeerSessionAuthorizationClaimsV1, PeerSessionAuthorizationV1, PeerSessionEndpointV1,
 };
+use kuberic_runtime::protocol::public_operations::{
+    PublicBuildInput, PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
+    PublicOperationProgram, PublicOperationReplayDisposition, PublicProgress, PublicProgressRole,
+    PublicV1AgentReport,
+};
 use kuberic_runtime::protocol::types::{
-    AgentGeneration, ConfigurationId, Epoch, HistoryContext, HistoryId, OperationId, PodUid,
-    ProcessSessionId, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole,
-    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration,
+    AccessStatus, AgentGeneration, ConfigurationId, Epoch, HistoryContext, HistoryId, OperationId,
+    PodUid, ProcessSessionId, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaRole, ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid,
+    StorageGeneration,
 };
 use kuberic_runtime::replicator::{
     PublicAuthorizationTrust, ReplicaInformation, ReplicatorSettings,
@@ -324,6 +330,7 @@ fn public_v1_authorization_rejects_tampering_before_mutation() {
 fn public_v1_authorization_runtime_never_receives_private_seed() {
     let seed = [0x5a; 32];
     let encoded_seed = BASE64_STANDARD.encode(seed);
+    let hex_seed = hex(&seed);
     let signing_key = TestSigningKey::from_seed(seed);
     let verification_key = signing_key.verification_key();
     let authorization = signing_key
@@ -334,11 +341,117 @@ fn public_v1_authorization_runtime_never_receives_private_seed() {
     let mut invalid = authorization.clone();
     invalid.signature = AuthorizationSignature::from_bytes([0; 64]);
     let error = invalid.verify(&verification_key).unwrap_err().to_string();
+    let trust = PublicAuthorizationTrust {
+        resource_uid: authorization.claims.resource_uid.clone(),
+        protocol_generation: authorization.claims.protocol_generation,
+        verification_key,
+        key_id: verification_key.key_id(),
+    };
+    let settings = ReplicatorSettings {
+        replication_address: authorization.claims.source.replication_address.clone(),
+        public_authorization: Some(trust),
+    };
+    let mut descriptor = ReplicaInformation::idle_build(
+        authorization.claims.build_id.clone(),
+        authorization
+            .claims
+            .target
+            .storage_incarnation
+            .replica
+            .clone(),
+        authorization.claims.target.replication_address.clone(),
+    );
+    descriptor.process_session_id = authorization.claims.target.process_session_id.clone();
+    descriptor.storage_incarnation = Some(authorization.claims.target.storage_incarnation.clone());
+    descriptor.build_authorization = Some(authorization.clone());
+    let program = PublicOperationProgram::Build(PublicBuildInput {
+        attempt: authorization.claims.build_id.clone(),
+        replica: authorization
+            .claims
+            .target
+            .storage_incarnation
+            .replica
+            .clone(),
+        process_session_id: authorization.claims.target.process_session_id.clone(),
+        replication_address: authorization.claims.target.replication_address.clone(),
+        history: Some(authorization.claims.history.clone()),
+        authorization: None,
+        build_authorization: Some(authorization.clone()),
+    });
+    let stored_intent = PublicOperationIntent {
+        preview: PublicOperationPreviewIdentity::public_v1(
+            authorization.claims.protocol_generation.value(),
+        ),
+        operation_id: authorization.claims.operation_id.clone(),
+        revision: 1,
+        process_session_id: authorization.claims.source.process_session_id.clone(),
+        class: PublicOperationClass::Build {
+            target: authorization
+                .claims
+                .target
+                .storage_incarnation
+                .replica
+                .replica_id,
+        },
+        input_digest: program.digest(),
+        replay_disposition: PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity,
+        lifecycle: None,
+        program: Some(program),
+    };
+    let report = PublicV1AgentReport {
+        identity: PublicOperationPreviewIdentity::public_v1(
+            authorization.claims.protocol_generation.value(),
+        ),
+        resource_uid: authorization.claims.resource_uid.clone(),
+        replica: authorization
+            .claims
+            .source
+            .storage_incarnation
+            .replica
+            .clone(),
+        process_session_id: authorization.claims.source.process_session_id.clone(),
+        report_sequence: 1,
+        role: ReplicaRole::Primary,
+        read_status: AccessStatus::Granted,
+        write_status: AccessStatus::Granted,
+        history: authorization.claims.history.clone(),
+        storage_incarnation: authorization.claims.source.storage_incarnation.clone(),
+        progress: PublicProgress {
+            role: PublicProgressRole::Primary,
+            first: 1,
+            last: 1,
+        },
+        data_loss_recovery: None,
+        completed_operations: Vec::new(),
+        extensions: Default::default(),
+    };
+    let runtime_surfaces = [
+        ("authorization JSON", json.clone()),
+        ("replicator settings", format!("{settings:?}")),
+        ("build descriptor", format!("{descriptor:?}")),
+        (
+            "durable operation intent",
+            serde_json::to_string(&stored_intent).unwrap(),
+        ),
+        ("agent report", serde_json::to_string(&report).unwrap()),
+        ("diagnostic", error.clone()),
+    ];
 
     assert_eq!(format!("{signing_key:?}"), "TestSigningKey(<redacted>)");
-    assert!(!json.contains(&encoded_seed));
+    for (surface, value) in runtime_surfaces {
+        assert!(
+            !value.contains(&encoded_seed) && !value.contains(&hex_seed),
+            "{surface} leaked private seed material"
+        );
+        assert!(
+            !value
+                .as_bytes()
+                .windows(seed.len())
+                .any(|window| window == seed),
+            "{surface} leaked raw private seed bytes"
+        );
+    }
     assert!(!canonical.windows(seed.len()).any(|window| window == seed));
-    assert!(!error.contains(&encoded_seed));
     assert_ne!(verification_key.to_bytes(), seed);
 }
 

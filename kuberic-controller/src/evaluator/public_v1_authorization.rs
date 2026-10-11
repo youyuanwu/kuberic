@@ -154,6 +154,17 @@ pub fn plan_public_v1_authorization(
         if evidence.is_some() {
             return Err("public-v1 authorization evidence lacks an accepted intent".into());
         }
+        if authorization
+            .intents
+            .iter()
+            .any(|intent| intent.stage == PublicV1AuthorizationIntentStage::Retired)
+        {
+            return Ok(PublicV1AuthorizationPlan::PersistStatus {
+                expected: Box::new(accepted.clone()),
+                next: Box::new(compact_retired_intents(accepted)?),
+                owner: owner.clone(),
+            });
+        }
         return Ok(PublicV1AuthorizationPlan::Stable);
     };
     request.validate()?;
@@ -165,6 +176,17 @@ pub fn plan_public_v1_authorization(
             && intent.operation_id == request.operation_id
     }) {
         return Err("retired public-v1 authorization predecessor cannot be replayed".into());
+    }
+    if authorization
+        .intents
+        .iter()
+        .any(|intent| intent.stage == PublicV1AuthorizationIntentStage::Retired)
+    {
+        return Ok(PublicV1AuthorizationPlan::PersistStatus {
+            expected: Box::new(accepted.clone()),
+            next: Box::new(compact_retired_intents(accepted)?),
+            owner: owner.clone(),
+        });
     }
     if let Some((accepted_slot, intent)) = active_intents_with_slots(&authorization)
         .find(|(_, intent)| intent.operation_id == request.operation_id)
@@ -312,10 +334,20 @@ fn matching_slot_index(
         intent.stage != PublicV1AuthorizationIntentStage::Retired
             && intent.scope == request.slot
             && match request.slot {
-                PublicV1AuthorizationIntentSlot::Build => intent.claims.build_target() == Some(key),
+                PublicV1AuthorizationIntentSlot::Build => {
+                    intent
+                        .claims
+                        .as_ref()
+                        .and_then(PublicV1AuthorizationClaims::build_target)
+                        == Some(key)
+                }
                 PublicV1AuthorizationIntentSlot::CurrentPeer
                 | PublicV1AuthorizationIntentSlot::PreviousPeer => {
-                    intent.claims.peer_secondary() == Some(key)
+                    intent
+                        .claims
+                        .as_ref()
+                        .and_then(PublicV1AuthorizationClaims::peer_secondary)
+                        == Some(key)
                 }
             }
     }))
@@ -374,11 +406,29 @@ fn as_retired(
     let previous = intent.clone();
     intent.stage = PublicV1AuthorizationIntentStage::Retired;
     intent.cleanup_disposition = PublicV1AuthorizationCleanupDisposition::Retired;
+    intent.claims = None;
+    intent.canonical_claims_base64 = None;
+    intent.envelope = None;
+    intent.signature = None;
     intent.validate(Some(binding)).map_err(str::to_owned)?;
     if !intent.is_successor_of(&previous) {
         return Err("public-v1 authorization retirement is not monotonic".into());
     }
     Ok(intent)
+}
+
+fn compact_retired_intents(
+    accepted: &PublicV1AcceptedStatus,
+) -> Result<PublicV1AcceptedStatus, String> {
+    let mut next = accepted.clone();
+    next.authorization_mut()
+        .intents
+        .retain(|intent| intent.stage != PublicV1AuthorizationIntentStage::Retired);
+    next.validate_authorization().map_err(str::to_owned)?;
+    if !next.is_authorization_successor_of(accepted) {
+        return Err("public-v1 authorization compaction is not monotonic".into());
+    }
+    Ok(next)
 }
 
 fn retire_intent(
@@ -419,10 +469,11 @@ pub(crate) fn sign_public_v1_authorization(
         return Err("public-v1 authorization signing is out of order".into());
     }
     let previous = intent.clone();
-    let envelope = match (
-        intent.claims.build.as_deref(),
-        intent.claims.peer.as_deref(),
-    ) {
+    let claims = intent
+        .claims
+        .as_ref()
+        .ok_or_else(|| "public-v1 authorization signing lacks typed claims".to_string())?;
+    let envelope = match (claims.build.as_deref(), claims.peer.as_deref()) {
         (Some(claims), None) => PublicV1AuthorizationEnvelope::build(
             material
                 .signing_key()

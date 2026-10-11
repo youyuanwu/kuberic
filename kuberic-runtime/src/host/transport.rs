@@ -1655,6 +1655,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_authorization_endpoint(
         identity: &ReplicaIdentity,
         address: &str,
@@ -1663,6 +1664,9 @@ mod tests {
         history: &HistoryContext,
         storage: ReplicaStorageIncarnationContext,
         signing_key: &AuthorizationSigningKey,
+        epoch: Epoch,
+        previous_configuration_id: Option<ConfigurationId>,
+        current_configuration_id: ConfigurationId,
     ) {
         crate::replicator::testing_register_public_authorization(
             identity.clone(),
@@ -1679,6 +1683,9 @@ mod tests {
                 storage_incarnation: storage,
                 process_session_id: ProcessSessionId::new(session),
                 role,
+                epoch,
+                previous_configuration_id,
+                current_configuration_id: Some(current_configuration_id),
             }),
         )
         .unwrap();
@@ -1692,14 +1699,36 @@ mod tests {
         let history = authorization_history("peer-transport-resource");
         let primary_address = "https://10.0.0.71:7000";
         let secondary_address = "https://10.0.0.72:7000";
+        let epoch = Epoch::new(0, 9);
+        let members = vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: secondary.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ];
+        let current_configuration =
+            ConfigurationDescriptor::new(epoch, primary.replica_id, members.clone(), 1);
+        let previous_configuration =
+            ConfigurationDescriptor::new(Epoch::new(0, 8), primary.replica_id, members, 1);
+        let current_configuration_id = current_configuration.configuration_id.clone();
+        let previous_configuration_id = previous_configuration.configuration_id.clone();
+        let primary_storage = storage(&primary, "peer-primary");
+        let secondary_storage = storage(&secondary, "peer-secondary");
         register_authorization_endpoint(
             &primary,
             primary_address,
             "peer-primary-session",
             ReplicaRole::Primary,
             &history,
-            storage(&primary, "peer-primary"),
+            primary_storage.clone(),
             &signing_key,
+            epoch,
+            Some(previous_configuration_id.clone()),
+            current_configuration_id.clone(),
         );
         register_authorization_endpoint(
             &secondary,
@@ -1707,18 +1736,19 @@ mod tests {
             "peer-secondary-session",
             ReplicaRole::ActiveSecondary,
             &history,
-            storage(&secondary, "peer-secondary"),
+            secondary_storage.clone(),
             &signing_key,
+            epoch,
+            Some(previous_configuration_id.clone()),
+            current_configuration_id.clone(),
         );
-        let current_configuration_id = ConfigurationId::new("peer-current");
-        let previous_configuration_id = ConfigurationId::new("peer-previous");
         let authorization = signing_key
             .sign_peer_session_authorization(PeerSessionAuthorizationClaimsV1 {
                 resource_uid: history.resource_uid.clone(),
                 protocol_generation: history.protocol_generation,
                 key_id: signing_key.key_id(),
                 history: history.clone(),
-                epoch: Epoch::new(0, 9),
+                epoch,
                 current_configuration_id: current_configuration_id.clone(),
                 previous_configuration_id: Some(previous_configuration_id.clone()),
                 primary: PeerSessionEndpointV1 {
@@ -1736,7 +1766,7 @@ mod tests {
                 configuration_revision: 17,
             })
             .unwrap();
-        let _: ReplicaInformation = PublicReplicaDescriptor {
+        let descriptor = PublicReplicaDescriptor {
             build_id: OperationId::default(),
             identity: secondary.clone(),
             replication_address: secondary_address.into(),
@@ -1747,14 +1777,31 @@ mod tests {
             must_catchup: false,
             peer_authorization: Some(authorization),
             configuration_revision: Some(17),
-        }
-        .into();
+        };
+        let _ = crate::replicator::admit_public_peer_configuration(
+            &PublicAuthorizationRuntimeContext {
+                identity: primary.clone(),
+                history: history.clone(),
+                storage_incarnation: primary_storage,
+                process_session_id: ProcessSessionId::new("peer-primary-session"),
+                role: ReplicaRole::Primary,
+                epoch,
+                previous_configuration_id: Some(previous_configuration_id.clone()),
+                current_configuration_id: Some(current_configuration_id.clone()),
+            },
+            &crate::protocol::public_operations::PublicConfiguration {
+                current: current_configuration,
+                previous: Some(previous_configuration),
+                replicas: vec![descriptor],
+            },
+        )
+        .unwrap();
         let item = ReplicationItem {
             sender: primary,
-            receiver: secondary,
-            epoch: Epoch::new(0, 9),
-            previous_configuration_id: Some(previous_configuration_id),
-            current_configuration_id,
+            receiver: secondary.clone(),
+            epoch,
+            previous_configuration_id: Some(previous_configuration_id.clone()),
+            current_configuration_id: current_configuration_id.clone(),
             lsn: 1,
             committed_lsn: 0,
             data: Bytes::from_static(b"signed"),
@@ -1771,6 +1818,26 @@ mod tests {
         );
         assert!(!wire.peer_session_authorization_v1.is_empty());
         replication_from_proto(wire.clone()).unwrap();
+
+        let secondary_context = PublicAuthorizationRuntimeContext {
+            identity: secondary.clone(),
+            history: history.clone(),
+            storage_incarnation: secondary_storage,
+            process_session_id: ProcessSessionId::new("peer-secondary-session"),
+            role: ReplicaRole::ActiveSecondary,
+            epoch,
+            previous_configuration_id: Some(previous_configuration_id.clone()),
+            current_configuration_id: Some(current_configuration_id.clone()),
+        };
+        let mut stale_local_epoch = secondary_context.clone();
+        stale_local_epoch.epoch = Epoch::new(0, 8);
+        crate::replicator::bind_public_authorization_context(stale_local_epoch).unwrap();
+        assert!(replication_from_proto(wire.clone()).is_err());
+        let mut wrong_local_role = secondary_context.clone();
+        wrong_local_role.role = ReplicaRole::None;
+        crate::replicator::bind_public_authorization_context(wrong_local_role).unwrap();
+        assert!(replication_from_proto(wire.clone()).is_err());
+        crate::replicator::bind_public_authorization_context(secondary_context).unwrap();
 
         let mut tampered = wire.clone();
         *tampered.peer_session_authorization_v1.last_mut().unwrap() ^= 1;
@@ -1790,6 +1857,8 @@ mod tests {
         let target_storage = storage(&target, "build-target");
         let source_address = "https://10.0.0.81:7000";
         let target_address = "https://10.0.0.82:7000";
+        let epoch = Epoch::new(0, 10);
+        let current_configuration_id = ConfigurationId::new("build-current");
         register_authorization_endpoint(
             &source,
             source_address,
@@ -1798,6 +1867,9 @@ mod tests {
             &history,
             source_storage.clone(),
             &signing_key,
+            epoch,
+            None,
+            current_configuration_id.clone(),
         );
         register_authorization_endpoint(
             &target,
@@ -1807,6 +1879,9 @@ mod tests {
             &history,
             target_storage.clone(),
             &signing_key,
+            epoch,
+            None,
+            current_configuration_id,
         );
         let build_id = OperationId::new("signed-build-transport");
         let authorization = signing_key
@@ -1815,7 +1890,7 @@ mod tests {
                 protocol_generation: history.protocol_generation,
                 key_id: signing_key.key_id(),
                 history: history.clone(),
-                epoch: Epoch::new(0, 10),
+                epoch,
                 operation_id: build_id.clone(),
                 build_id: build_id.clone(),
                 source: BuildAuthorizationEndpointV1 {
@@ -1838,6 +1913,9 @@ mod tests {
             storage_incarnation: authorization.claims.source.storage_incarnation.clone(),
             process_session_id: ProcessSessionId::new("build-source-session"),
             role: ReplicaRole::Primary,
+            epoch,
+            previous_configuration_id: None,
+            current_configuration_id: Some(ConfigurationId::new("build-current")),
         };
         let mut descriptor =
             ReplicaInformation::idle_build(build_id.clone(), target.clone(), target_address.into());
@@ -1846,7 +1924,7 @@ mod tests {
         descriptor.build_authorization = Some(authorization.clone());
         crate::replicator::authorize_public_build_descriptor(
             &context,
-            Epoch::new(0, 10),
+            epoch,
             &build_id,
             &descriptor,
         )
@@ -1915,6 +1993,31 @@ mod tests {
             authorized_copy_to_session_proto(item, "build-source-session", "build-target-session")
                 .unwrap();
         copy_from_proto(wire.clone()).unwrap();
+
+        let target_context = PublicAuthorizationRuntimeContext {
+            identity: authorization
+                .claims
+                .target
+                .storage_incarnation
+                .replica
+                .clone(),
+            history: authorization.claims.history.clone(),
+            storage_incarnation: authorization.claims.target.storage_incarnation.clone(),
+            process_session_id: ProcessSessionId::new("build-target-session"),
+            role: ReplicaRole::IdleSecondary,
+            epoch,
+            previous_configuration_id: None,
+            current_configuration_id: Some(ConfigurationId::new("build-current")),
+        };
+        let mut stale_local_epoch = target_context.clone();
+        stale_local_epoch.epoch = Epoch::new(0, 9);
+        crate::replicator::bind_public_authorization_context(stale_local_epoch).unwrap();
+        assert!(copy_from_proto(wire.clone()).is_err());
+        let mut wrong_local_role = target_context.clone();
+        wrong_local_role.role = ReplicaRole::None;
+        crate::replicator::bind_public_authorization_context(wrong_local_role).unwrap();
+        assert!(copy_from_proto(wire.clone()).is_err());
+        crate::replicator::bind_public_authorization_context(target_context).unwrap();
 
         let peer = signing_key
             .sign_peer_session_authorization(PeerSessionAuthorizationClaimsV1 {

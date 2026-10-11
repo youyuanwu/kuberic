@@ -278,8 +278,10 @@ resource/generation labels, Secret UID/resourceVersion and immutable flag.
 After accepted status binds that identity, loss, recreation, mutation or
 same-generation replacement is terminal; no implicit key regeneration occurs.
 The Secret is never referenced by Pod environment, volume, annotation or
-agent command. Replicas receive only immutable public trust through
-`ReplicatorSettings`.
+agent command. Replica Pods disable service-account token automount, so the
+application/agent process receives no Kubernetes API credential that could
+read the controller-only Secret. Replicas receive only immutable public trust
+through `ReplicatorSettings`.
 
 Accepted Public V1 status owns a bounded authorization intent before dispatch.
 The intent freezes typed build or current/previous peer claims and advances
@@ -288,7 +290,10 @@ monotonically through `Prepared`, `Signed`, `Dispatched`, `Observed` and
 exact envelope, signature and audit digest before dispatch. Lost responses
 reuse those retained bytes. Observation or retirement must match the exact
 operation, revision, claim kind and audit digest; superseded predecessors
-cannot replay.
+cannot replay. Retirement clears claims, canonical bytes, envelopes and
+signatures, leaving only bounded audit identity and disposition; a later
+conditional status transition removes the retired tombstone after replay is
+no longer permitted.
 
 An idle target may carry only its exact signed build authorization, including
 history, epoch, operation/build IDs and both storage/process/address
@@ -298,7 +303,11 @@ sessions/addresses. Immutable public trust is creation-bound and cannot be
 changed by settings update. Copy/build authorization is verified before
 provider mutation; peer authorization is verified before replication traffic
 or acknowledgement contribution. Signature validity alone does not bypass
-local history, epoch, storage, role, session, address or revocation checks.
+current local history, epoch, configuration IDs, storage, role, session or
+address checks. Dormant authority is scoped to the exact Replicator creation
+and local resource identity; descriptor value conversion has no side effects,
+failed configuration installation restores prior authority, and dropping the
+creation removes its trust, peer and build state.
 
 Replacement active sessions are also explicit schema-10 authority. The new
 session begins unassigned and access-closed with only history-scoped progress.

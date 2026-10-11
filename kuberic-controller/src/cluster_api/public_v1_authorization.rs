@@ -332,6 +332,16 @@ pub fn validate_pods_do_not_reference_public_v1_authorization_secret(
     }
     for pod in pods {
         if pod
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.automount_service_account_token != Some(false))
+        {
+            return Err(format!(
+                "Pod {} can receive Kubernetes service-account credentials",
+                pod.metadata.name.as_deref().unwrap_or("<unknown>")
+            ));
+        }
+        if pod
             .metadata
             .annotations
             .as_ref()

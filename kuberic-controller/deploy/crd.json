@@ -2959,9 +2959,11 @@
                                 "canonicalClaimsBase64": {
                                   "maxLength": 21848,
                                   "minLength": 1,
+                                  "nullable": true,
                                   "type": "string"
                                 },
                                 "claims": {
+                                  "nullable": true,
                                   "properties": {
                                     "build": {
                                       "nullable": true,
@@ -3931,8 +3933,6 @@
                                 }
                               },
                               "required": [
-                                "canonicalClaimsBase64",
-                                "claims",
                                 "cleanupDisposition",
                                 "kind",
                                 "operationId",

@@ -105,20 +105,43 @@ pub(super) fn replica_set(
     }
 }
 
-async fn install(callbacks: &PublicLifecycleCallbacks, input: &PublicConfiguration) -> Result<()> {
-    if let Some(previous) = &input.previous {
+async fn install(
+    callbacks: &PublicLifecycleCallbacks,
+    input: &PublicConfiguration,
+    authorization_context: Option<&crate::replicator::PublicAuthorizationRuntimeContext>,
+) -> Result<()> {
+    let authorization_snapshot = if let Some(context) = authorization_context {
+        crate::replicator::admit_public_peer_configuration(context, input)?
+    } else if input
+        .replicas
+        .iter()
+        .any(|replica| replica.peer_authorization.is_some())
+    {
+        return Err(HostError::CommandRejected(
+            "signed peer authorization requires public-v1 runtime context".into(),
+        ));
+    } else {
+        None
+    };
+    let result = if let Some(previous) = &input.previous {
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
                 replica_set(input, &input.current),
                 replica_set(input, previous),
             )
-            .await?;
+            .await
     } else {
         callbacks
             .primary
             .update_current_replica_set_configuration(replica_set(input, &input.current))
-            .await?;
+            .await
+    };
+    if let Err(error) = result {
+        if let Some(snapshot) = authorization_snapshot {
+            crate::replicator::restore_public_peer_authorization(snapshot)?;
+        }
+        return Err(error.into());
     }
     Ok(())
 }
@@ -212,15 +235,21 @@ pub(super) async fn execute(
             })?,
             process_session_id: intent.process_session_id.clone(),
             role: state.role,
-        };
-        crate::replicator::bind_public_authorization_context(context.clone())?;
-        Some((
-            context,
-            state
+            epoch: state
                 .current_configuration
                 .as_ref()
                 .map_or(state.highest_epoch, |configuration| configuration.epoch),
-        ))
+            previous_configuration_id: state
+                .previous_configuration
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            current_configuration_id: state
+                .current_configuration
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+        };
+        crate::replicator::bind_public_authorization_context(context.clone())?;
+        Some(context)
     } else {
         None
     };
@@ -307,14 +336,24 @@ pub(super) async fn execute(
                 O::Done
             }
             Configuration | StartingConfiguration | RefreshedConfiguration => {
-                install(&callbacks, configuration(program, instruction)).await?;
+                install(
+                    &callbacks,
+                    configuration(program, instruction),
+                    authorization_context.as_ref(),
+                )
+                .await?;
                 O::Done
             }
             FirstCatchUp | SecondCatchUp => {
                 // At a recovery cut, the persisted install result is historical.
                 // Reinstall the exact input before reevaluating the wait.
                 if index == start && start > 0 {
-                    install(&callbacks, configuration(program, instruction)).await?;
+                    install(
+                        &callbacks,
+                        configuration(program, instruction),
+                        authorization_context.as_ref(),
+                    )
+                    .await?;
                 }
                 let (P::CatchUp { mode: selected, .. } | P::Swap { mode: selected, .. }) = program
                 else {
@@ -351,10 +390,10 @@ pub(super) async fn execute(
                     .build_authorization
                     .as_ref()
                     .map(|authorization| authorization.claims.target.storage_incarnation.clone());
-                if let Some((context, epoch)) = &authorization_context {
+                if let Some(context) = &authorization_context {
                     crate::replicator::authorize_public_build_descriptor(
                         context,
-                        *epoch,
+                        context.epoch,
                         &intent.operation_id,
                         &replica,
                     )?;

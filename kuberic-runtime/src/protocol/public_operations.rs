@@ -2674,9 +2674,11 @@ pub struct PublicV1AuthorizationIntent {
     pub scope: PublicV1AuthorizationIntentScope,
     pub operation_id: OperationId,
     pub revision: u64,
-    pub claims: PublicV1AuthorizationClaims,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims: Option<PublicV1AuthorizationClaims>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 21848))]
-    pub canonical_claims_base64: String,
+    pub canonical_claims_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<PublicV1AuthorizationEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2707,8 +2709,8 @@ impl PublicV1AuthorizationIntent {
             scope,
             operation_id,
             revision,
-            claims,
-            canonical_claims_base64: BASE64_STANDARD.encode(canonical_claims),
+            claims: Some(claims),
+            canonical_claims_base64: Some(BASE64_STANDARD.encode(canonical_claims)),
             envelope: None,
             signature: None,
             audit_digest: None,
@@ -2734,32 +2736,12 @@ impl PublicV1AuthorizationIntent {
                     | PublicV1AuthorizationIntentScope::PreviousPeer
             )
         );
-        if self.operation_id.is_empty()
-            || self.revision == 0
-            || self.kind != self.claims.kind()
-            || !valid_scope
-        {
+        if self.operation_id.is_empty() || self.revision == 0 || !valid_scope {
             return Err("public-v1 authorization intent identity is incomplete");
-        }
-        self.claims.validate()?;
-        let canonical_claims = BASE64_STANDARD
-            .decode(&self.canonical_claims_base64)
-            .map_err(|_| "public-v1 authorization claims are not canonical base64")?;
-        if canonical_claims.len() > MAX_PUBLIC_V1_AUTHORIZATION_CANONICAL_BYTES
-            || BASE64_STANDARD.encode(&canonical_claims) != self.canonical_claims_base64
-            || canonical_claims != self.claims.canonical_bytes()?
-        {
-            return Err("public-v1 authorization claims differ from their canonical bytes");
-        }
-        if let Some(binding) = binding
-            && (self.claims.resource_uid() != &binding.resource_uid
-                || self.claims.generation() != binding.generation
-                || self.claims.key_id() != binding.key_id)
-        {
-            return Err("public-v1 authorization claims differ from the Secret binding");
         }
         match self.stage {
             PublicV1AuthorizationIntentStage::Prepared => {
+                self.validate_active_claims(binding)?;
                 if self.envelope.is_some()
                     || self.signature.is_some()
                     || self.audit_digest.is_some()
@@ -2771,6 +2753,7 @@ impl PublicV1AuthorizationIntent {
             PublicV1AuthorizationIntentStage::Signed
             | PublicV1AuthorizationIntentStage::Dispatched
             | PublicV1AuthorizationIntentStage::Observed => {
+                let claims = self.validate_active_claims(binding)?;
                 let binding =
                     binding.ok_or("signed public-v1 authorization lacks its Secret binding")?;
                 let envelope = self
@@ -2779,7 +2762,7 @@ impl PublicV1AuthorizationIntent {
                     .ok_or("signed public-v1 authorization lacks its envelope")?;
                 envelope.validate_shape()?;
                 if envelope.kind() != self.kind
-                    || envelope.claims()? != self.claims
+                    || envelope.claims()? != *claims
                     || self.signature != Some(envelope.signature()?)
                     || self.audit_digest != Some(envelope.audit_digest()?)
                 {
@@ -2794,65 +2777,105 @@ impl PublicV1AuthorizationIntent {
                 if self.cleanup_disposition != PublicV1AuthorizationCleanupDisposition::Retired {
                     return Err("public-v1 authorization retirement disposition is inconsistent");
                 }
-                match (&self.envelope, self.signature, self.audit_digest) {
-                    (None, None, None) => {}
-                    (Some(envelope), Some(signature), Some(audit_digest)) => {
-                        let binding = binding
-                            .ok_or("retired public-v1 authorization lacks its Secret binding")?;
-                        envelope.validate_shape()?;
-                        if envelope.kind() != self.kind
-                            || envelope.claims()? != self.claims
-                            || signature != envelope.signature()?
-                            || audit_digest != envelope.audit_digest()?
-                        {
-                            return Err(
-                                "retired public-v1 authorization differs from its exact envelope",
-                            );
-                        }
-                        envelope.verify(&binding.verification_key)?;
-                    }
-                    _ => {
-                        return Err(
-                            "retired public-v1 authorization contains partial signed authority",
-                        );
-                    }
+                if self.claims.is_some()
+                    || self.canonical_claims_base64.is_some()
+                    || self.envelope.is_some()
+                    || self.signature.is_some()
+                {
+                    return Err("retired public-v1 authorization must retain audit identity only");
                 }
             }
         }
         Ok(())
     }
 
+    fn validate_active_claims(
+        &self,
+        binding: Option<&PublicV1AuthorizationSecretBinding>,
+    ) -> Result<&PublicV1AuthorizationClaims, &'static str> {
+        let claims = self
+            .claims
+            .as_ref()
+            .ok_or("active public-v1 authorization lacks typed claims")?;
+        let canonical_claims_base64 = self
+            .canonical_claims_base64
+            .as_ref()
+            .ok_or("active public-v1 authorization lacks canonical claims")?;
+        if self.kind != claims.kind() {
+            return Err("public-v1 authorization intent kind differs from its claims");
+        }
+        claims.validate()?;
+        let canonical_claims = BASE64_STANDARD
+            .decode(canonical_claims_base64)
+            .map_err(|_| "public-v1 authorization claims are not canonical base64")?;
+        if canonical_claims.len() > MAX_PUBLIC_V1_AUTHORIZATION_CANONICAL_BYTES
+            || BASE64_STANDARD.encode(&canonical_claims) != *canonical_claims_base64
+            || canonical_claims != claims.canonical_bytes()?
+        {
+            return Err("public-v1 authorization claims differ from their canonical bytes");
+        }
+        if let Some(binding) = binding
+            && (claims.resource_uid() != &binding.resource_uid
+                || claims.generation() != binding.generation
+                || claims.key_id() != binding.key_id)
+        {
+            return Err("public-v1 authorization claims differ from the Secret binding");
+        }
+        Ok(claims)
+    }
+
     pub fn is_successor_of(&self, previous: &Self) -> bool {
-        self.kind == previous.kind
+        let identity_matches = self.kind == previous.kind
             && self.scope == previous.scope
             && self.operation_id == previous.operation_id
             && self.revision == previous.revision
-            && self.claims == previous.claims
-            && self.canonical_claims_base64 == previous.canonical_claims_base64
             && (self.cleanup_disposition == previous.cleanup_disposition
                 || self.stage == PublicV1AuthorizationIntentStage::Retired
-                    && self.cleanup_disposition == PublicV1AuthorizationCleanupDisposition::Retired)
-            && matches!(
-                (previous.stage, self.stage),
-                (
-                    PublicV1AuthorizationIntentStage::Prepared,
-                    PublicV1AuthorizationIntentStage::Signed
-                ) | (
-                    PublicV1AuthorizationIntentStage::Signed,
-                    PublicV1AuthorizationIntentStage::Dispatched
-                ) | (
-                    PublicV1AuthorizationIntentStage::Dispatched,
-                    PublicV1AuthorizationIntentStage::Observed
-                ) | (
-                    PublicV1AuthorizationIntentStage::Observed,
-                    PublicV1AuthorizationIntentStage::Retired
-                ) | (
-                    PublicV1AuthorizationIntentStage::Prepared
-                        | PublicV1AuthorizationIntentStage::Signed
-                        | PublicV1AuthorizationIntentStage::Dispatched,
-                    PublicV1AuthorizationIntentStage::Retired
-                )
+                    && self.cleanup_disposition
+                        == PublicV1AuthorizationCleanupDisposition::Retired);
+        if !identity_matches {
+            return false;
+        }
+        let valid_transition = matches!(
+            (previous.stage, self.stage),
+            (
+                PublicV1AuthorizationIntentStage::Prepared,
+                PublicV1AuthorizationIntentStage::Signed
+            ) | (
+                PublicV1AuthorizationIntentStage::Signed,
+                PublicV1AuthorizationIntentStage::Dispatched
+            ) | (
+                PublicV1AuthorizationIntentStage::Dispatched,
+                PublicV1AuthorizationIntentStage::Observed
+            ) | (
+                PublicV1AuthorizationIntentStage::Observed,
+                PublicV1AuthorizationIntentStage::Retired
+            ) | (
+                PublicV1AuthorizationIntentStage::Prepared
+                    | PublicV1AuthorizationIntentStage::Signed
+                    | PublicV1AuthorizationIntentStage::Dispatched,
+                PublicV1AuthorizationIntentStage::Retired
             )
+        );
+        if !valid_transition {
+            return false;
+        }
+        if self.stage == PublicV1AuthorizationIntentStage::Retired {
+            self.claims.is_none()
+                && self.canonical_claims_base64.is_none()
+                && self.envelope.is_none()
+                && self.signature.is_none()
+                && self.audit_digest == previous.audit_digest
+        } else {
+            let claims_match = self.claims == previous.claims
+                && self.canonical_claims_base64 == previous.canonical_claims_base64;
+            claims_match
+                && (previous.stage == PublicV1AuthorizationIntentStage::Prepared
+                    && self.stage == PublicV1AuthorizationIntentStage::Signed
+                    || self.envelope == previous.envelope
+                        && self.signature == previous.signature
+                        && self.audit_digest == previous.audit_digest)
+        }
     }
 }
 
@@ -2908,7 +2931,11 @@ impl PublicV1AuthorizationStatus {
             if intent.stage == PublicV1AuthorizationIntentStage::Retired {
                 continue;
             }
-            if intent.claims.history() != history {
+            let claims = intent
+                .claims
+                .as_ref()
+                .ok_or("active public-v1 authorization lacks typed claims")?;
+            if claims.history() != history {
                 return Err("active public-v1 authorization history is stale");
             }
             match intent.scope {
@@ -2917,6 +2944,8 @@ impl PublicV1AuthorizationStatus {
                     if !build_targets.insert(
                         intent
                             .claims
+                            .as_ref()
+                            .ok_or("build authorization lacks claims")?
                             .build_target()
                             .ok_or("build authorization lacks a target")?,
                     ) {
@@ -2930,6 +2959,8 @@ impl PublicV1AuthorizationStatus {
                     if !current_peers.insert(
                         intent
                             .claims
+                            .as_ref()
+                            .ok_or("peer authorization lacks claims")?
                             .peer_secondary()
                             .ok_or("peer authorization lacks a secondary")?,
                     ) {
@@ -2943,6 +2974,8 @@ impl PublicV1AuthorizationStatus {
                     if !previous_peers.insert(
                         intent
                             .claims
+                            .as_ref()
+                            .ok_or("peer authorization lacks claims")?
                             .peer_secondary()
                             .ok_or("peer authorization lacks a secondary")?,
                     ) {
@@ -2980,6 +3013,9 @@ impl PublicV1AuthorizationStatus {
         }
         for previous_intent in previous.intents() {
             let Some(next_intent) = self.find_intent(&previous_intent.operation_id) else {
+                if previous_intent.stage == PublicV1AuthorizationIntentStage::Retired {
+                    continue;
+                }
                 return false;
             };
             if next_intent != previous_intent && !next_intent.is_successor_of(previous_intent) {

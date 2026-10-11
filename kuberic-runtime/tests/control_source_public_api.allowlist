@@ -1132,8 +1132,8 @@ public-path hidden field crate::protocol::public_operations::PublicV1Authorizati
 public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationEnvelope::kind: PublicV1AuthorizationIntentKind
 public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationEnvelope::peer: Option < Box < PeerSessionAuthorizationV1 > >
 public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::audit_digest: Option < SignedAuthorizationAuditDigest >
-public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::canonical_claims_base64: String
-public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::claims: PublicV1AuthorizationClaims
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::canonical_claims_base64: Option < String >
+public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::claims: Option < PublicV1AuthorizationClaims >
 public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::cleanup_disposition: PublicV1AuthorizationCleanupDisposition
 public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::envelope: Option < PublicV1AuthorizationEnvelope >
 public-path hidden field crate::protocol::public_operations::PublicV1AuthorizationIntent::kind: PublicV1AuthorizationIntentKind

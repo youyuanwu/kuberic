@@ -1,16 +1,21 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ed25519_dalek::{Signer as _, SigningKey};
+use kuberic_runtime::protocol::authorization::{
+    AuthorizationSignature, AuthorizationVerificationKey, BuildAuthorizationClaimsV1,
+    BuildAuthorizationEndpointV1, BuildAuthorizationV1,
+};
 use kuberic_runtime::protocol::command::{PublicV1HistoryCommand, PublicV1SessionRenewalCommand};
 use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, DataLossRenewalDecision, DataLossReplay,
     PossibleDataLossIntent, ProcessAttemptContext, ProcessSessionRenewalRequired,
-    ProviderProgressReset, PublicDataLossRecoveryInput, PublicDataLossRecoveryStage,
-    PublicDataLossRecoveryStatus, PublicDataLossSessionRenewal, PublicLifecycleInput,
-    PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
-    PublicOperationPreviewIdentity, PublicOperationReplayDisposition, PublicProgress,
-    PublicProgressRole, PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1AgentReport,
-    PublicV1SessionRenewalStatus,
+    ProviderProgressReset, PublicBuildInput, PublicDataLossRecoveryInput,
+    PublicDataLossRecoveryStage, PublicDataLossRecoveryStatus, PublicDataLossSessionRenewal,
+    PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
+    PublicOperationPreviewIdentity, PublicOperationProgram, PublicOperationReplayDisposition,
+    PublicProgress, PublicProgressRole, PublicSessionRenewalStage, PublicV1AcceptedStatus,
+    PublicV1AgentReport, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -56,6 +61,69 @@ fn storage(identity: ReplicaIdentity) -> ReplicaStorageIncarnationContext {
             pvc_uid: PvcUid::new(format!("pvc-{id}")),
         },
         storage_generation: StorageGeneration::new(format!("storage-{id}")),
+    }
+}
+
+fn signed_build_intent(
+    preview: &PublicOperationPreviewIdentity,
+    history: &kuberic_runtime::protocol::types::HistoryContext,
+    source: ReplicaStorageIncarnationContext,
+    target: ReplicaStorageIncarnationContext,
+) -> PublicOperationIntent {
+    let signing_key = SigningKey::from_bytes(&[13; 32]);
+    let verification_key =
+        AuthorizationVerificationKey::from_bytes(signing_key.verifying_key().to_bytes()).unwrap();
+    let operation_id = OperationId::new("schema10-signed-build");
+    let source_session = ProcessSessionId::new("schema10-source-session");
+    let target_session = ProcessSessionId::new("schema10-target-session");
+    let claims = BuildAuthorizationClaimsV1 {
+        resource_uid: history.resource_uid.clone(),
+        protocol_generation: history.protocol_generation,
+        key_id: verification_key.key_id(),
+        history: history.clone(),
+        epoch: Epoch::new(history.data_loss_number, 7),
+        operation_id: operation_id.clone(),
+        build_id: operation_id.clone(),
+        source: BuildAuthorizationEndpointV1 {
+            storage_incarnation: source,
+            process_session_id: source_session.clone(),
+            replication_address: "https://10.0.0.1:7000".into(),
+            role: ReplicaRole::Primary,
+        },
+        target: BuildAuthorizationEndpointV1 {
+            storage_incarnation: target.clone(),
+            process_session_id: target_session.clone(),
+            replication_address: "https://10.0.0.2:7000".into(),
+            role: ReplicaRole::IdleSecondary,
+        },
+    };
+    let signature = AuthorizationSignature::from_bytes(
+        signing_key
+            .sign(&claims.signing_bytes().unwrap())
+            .to_bytes(),
+    );
+    let authorization = BuildAuthorizationV1::from_signature(claims, signature).unwrap();
+    let program = PublicOperationProgram::Build(PublicBuildInput {
+        attempt: operation_id.clone(),
+        replica: target.replica.clone(),
+        process_session_id: target_session,
+        replication_address: "https://10.0.0.2:7000".into(),
+        history: Some(history.clone()),
+        authorization: None,
+        build_authorization: Some(authorization),
+    });
+    PublicOperationIntent {
+        preview: preview.clone(),
+        operation_id,
+        revision: 1,
+        process_session_id: source_session,
+        class: PublicOperationClass::Build {
+            target: target.replica.replica_id,
+        },
+        input_digest: program.digest(),
+        replay_disposition: PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity,
+        lifecycle: None,
+        program: Some(program),
     }
 }
 
@@ -516,6 +584,13 @@ async fn public_v1_data_loss_attempt_renews_same_authorization() {
         .contain_public_v1_data_loss_attempt(&predecessor_intent)
         .await
         .unwrap();
+    drop(store);
+    let store = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    assert_eq!(
+        store.public_v1_operation_intents().await.unwrap(),
+        vec![predecessor_intent.clone()],
+        "an ambiguous contained callback attempt must survive exact schema-10 restart"
+    );
 
     let accepted = PublicV1SessionRenewalStatus::required(required.clone()).unwrap();
     store
@@ -675,16 +750,143 @@ async fn public_v1_schema10_requires_a_fresh_exact_store() {
         derive_history_initialization_id(&ResourceUid::new("resource-1"), generation);
     let history =
         derive_bootstrap_history(&ResourceUid::new("resource-1"), generation, &initialization);
+    let local_storage = storage(local);
     store
-        .initialize_public_v1_history(&initialization, &history, &storage(local))
+        .initialize_public_v1_history(&initialization, &history, &local_storage)
+        .await
+        .unwrap();
+    let signed_intent = signed_build_intent(&preview, &history, local_storage, storage(replica(2)));
+    signed_intent.validate().unwrap();
+    store
+        .begin_public_v1_operation(&signed_intent)
+        .await
+        .unwrap();
+    let required = ordinary_required(Epoch::new(0, 10), Epoch::new(0, 11));
+    let active = PublicV1SessionRenewalStatus::required(required.clone()).unwrap();
+    store
+        .persist_public_v1_session_renewal(None, &active)
         .await
         .unwrap();
     drop(store);
-    assert!(SqliteStore::open_public_v1(&path, &preview).is_ok());
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    assert_eq!(
+        reopened.public_v1_operation_intents().await.unwrap(),
+        vec![signed_intent.clone()]
+    );
+    assert_eq!(
+        reopened
+            .public_v1_history_snapshot()
+            .await
+            .unwrap()
+            .session_renewal,
+        Some(active.clone())
+    );
+    let mut stale_required = required.clone();
+    stale_required.operation_id = OperationId::new("stale-renewal");
+    assert!(
+        reopened
+            .persist_public_v1_session_renewal(
+                None,
+                &PublicV1SessionRenewalStatus::required(stale_required).unwrap(),
+            )
+            .await
+            .is_err()
+    );
+    let mut superseded_intent = signed_intent.clone();
+    let PublicOperationProgram::Build(build) = superseded_intent.program.as_mut().unwrap() else {
+        panic!("expected signed build program");
+    };
+    build.replication_address = "https://10.0.0.2:7001".into();
+    superseded_intent.input_digest = superseded_intent.program.as_ref().unwrap().digest();
+    assert!(
+        reopened
+            .begin_public_v1_operation(&superseded_intent)
+            .await
+            .is_err()
+    );
+    let mut incomplete_intent = signed_intent.clone();
+    let PublicOperationProgram::Build(build) = incomplete_intent.program.as_mut().unwrap() else {
+        panic!("expected signed build program");
+    };
+    build.build_authorization = None;
+    incomplete_intent.input_digest = incomplete_intent.program.as_ref().unwrap().digest();
+    assert!(
+        reopened
+            .begin_public_v1_operation(&incomplete_intent)
+            .await
+            .is_err()
+    );
+    let closed = active.close_access().unwrap();
+    reopened
+        .persist_public_v1_session_renewal(Some(&active), &closed)
+        .await
+        .unwrap();
+    drop(reopened);
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    assert_eq!(
+        reopened
+            .public_v1_history_snapshot()
+            .await
+            .unwrap()
+            .session_renewal,
+        Some(closed.clone())
+    );
+    let frozen = closed.freeze_surviving_set().unwrap();
+    reopened
+        .persist_public_v1_session_renewal(Some(&closed), &frozen)
+        .await
+        .unwrap();
+    let barriers = frozen.begin_epoch_barriers().unwrap();
+    reopened
+        .persist_public_v1_session_renewal(Some(&frozen), &barriers)
+        .await
+        .unwrap();
+    let survivor = required.surviving_sessions[0].clone();
+    let barriers_complete = barriers
+        .record_epoch_updated(&survivor, required.renewal_epoch)
+        .unwrap();
+    reopened
+        .persist_public_v1_session_renewal(Some(&barriers), &barriers_complete)
+        .await
+        .unwrap();
+    let role_pending = barriers_complete.finish_epoch_barriers().unwrap();
+    reopened
+        .persist_public_v1_session_renewal(Some(&barriers_complete), &role_pending)
+        .await
+        .unwrap();
+    let configuration_pending = role_pending
+        .replay_replacement_role(
+            &required.replacement.as_ref().unwrap().process_session_id,
+            required.renewal_epoch,
+            ReplicaRole::Primary,
+        )
+        .unwrap();
+    reopened
+        .persist_public_v1_session_renewal(Some(&role_pending), &configuration_pending)
+        .await
+        .unwrap();
+    let terminal = configuration_pending
+        .install_fresh_configuration(&required.fresh_configuration)
+        .unwrap();
+    reopened
+        .persist_public_v1_session_renewal(Some(&configuration_pending), &terminal)
+        .await
+        .unwrap();
+    drop(reopened);
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    assert_eq!(
+        reopened
+            .public_v1_history_snapshot()
+            .await
+            .unwrap()
+            .session_renewal,
+        Some(terminal)
+    );
+    drop(reopened);
     assert!(
         SqliteStore::create_public_v1(
             &path,
-            preview,
+            preview.clone(),
             StorageIdentity {
                 schema_version: SCHEMA_VERSION,
                 resource_uid: ResourceUid::new("resource-1"),
@@ -697,6 +899,38 @@ async fn public_v1_schema10_requires_a_fresh_exact_store() {
         )
         .is_err()
     );
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let state_json: String = connection
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
+    let operations = state
+        .get_mut("publicOperationPreview")
+        .and_then(|preview| preview.get_mut("operations"))
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap();
+    let record = operations.get_mut("schema10-signed-build").unwrap();
+    let signature = record
+        .get_mut("intent")
+        .and_then(|intent| intent.get_mut("program"))
+        .and_then(|program| program.get_mut("Build"))
+        .and_then(|build| build.get_mut("build_authorization"))
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .remove("signature");
+    assert!(signature.is_some());
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&state).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 
