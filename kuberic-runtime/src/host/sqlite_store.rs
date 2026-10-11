@@ -2826,6 +2826,101 @@ impl AgentStore for SqliteStore {
                             "public instruction outcome does not match callback".into(),
                         ));
                     }
+                    if intent.preview.is_public_v1()
+                        && matches!(outcome, PublicInstructionOutcome::Done)
+                    {
+                        match instruction {
+                            PublicInstruction::ReplicatorRole => {
+                                let (epoch, role) = match intent.program.as_ref() {
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Role {
+                                            epoch,
+                                            role,
+                                        },
+                                    ) => (*epoch, *role),
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            epoch,
+                                            handoff,
+                                            ..
+                                        },
+                                    ) => (*epoch, *handoff),
+                                    _ => {
+                                        return Err(crate::host::HostError::Corrupt(
+                                            "public-v1 role completion lacks typed program".into(),
+                                        ));
+                                    }
+                                };
+                                state.highest_epoch = epoch;
+                                state.role = role;
+                            }
+                            PublicInstruction::ProgramEpoch => {
+                                state.highest_epoch = match intent.program.as_ref() {
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Epoch {
+                                            epoch,
+                                        }
+                                        | crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            epoch,
+                                            ..
+                                        },
+                                    ) => *epoch,
+                                    _ => {
+                                        return Err(crate::host::HostError::Corrupt(
+                                            "public-v1 epoch completion lacks typed program".into(),
+                                        ));
+                                    }
+                                };
+                            }
+                            PublicInstruction::Configuration
+                            | PublicInstruction::StartingConfiguration
+                            | PublicInstruction::RefreshedConfiguration => {
+                                let configuration = match intent.program.as_ref() {
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Configuration(
+                                            configuration,
+                                        )
+                                        | crate::protocol::public_operations::PublicOperationProgram::CatchUp {
+                                            configuration,
+                                            ..
+                                        },
+                                    ) => configuration,
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            starting,
+                                            refreshed,
+                                            ..
+                                        },
+                                    ) if matches!(
+                                        instruction,
+                                        PublicInstruction::StartingConfiguration
+                                    ) => starting,
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            refreshed,
+                                            ..
+                                        },
+                                    ) => refreshed,
+                                    _ => {
+                                        return Err(crate::host::HostError::Corrupt(
+                                            "public-v1 configuration completion lacks typed program"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                state.highest_epoch = configuration.current.epoch;
+                                state.previous_configuration = configuration.previous.clone();
+                                state.current_configuration =
+                                    Some(configuration.current.clone());
+                            }
+                            PublicInstruction::ReplicatorClose | PublicInstruction::Abort => {
+                                state.role = crate::protocol::types::ReplicaRole::None;
+                                state.previous_configuration = None;
+                                state.current_configuration = None;
+                            }
+                            _ => {}
+                        }
+                    }
                     if let PublicInstructionOutcome::DataLoss(result) = &outcome {
                         preview
                             .history_barriers

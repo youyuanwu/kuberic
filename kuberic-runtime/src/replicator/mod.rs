@@ -821,6 +821,58 @@ pub(crate) fn bind_public_authorization_context(
 }
 
 #[cfg(any(test, feature = "testing"))]
+pub(crate) fn advance_public_authorization_context(
+    context: PublicAuthorizationRuntimeContext,
+) -> Result<()> {
+    let Some(settings) = registered_public_authorization_settings(&context.identity) else {
+        return Ok(());
+    };
+    if context.history.resource_uid != settings.trust.resource_uid
+        || context.history.protocol_generation != settings.trust.protocol_generation
+        || context.storage_incarnation.replica != context.identity
+        || context.process_session_id.is_empty()
+        || context.epoch.data_loss_number < 0
+        || context.epoch.configuration_number < 0
+    {
+        return Err(RuntimeError::Application(
+            "advanced public authorization context differs from immutable trust".into(),
+        ));
+    }
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registered = registry
+        .settings
+        .iter_mut()
+        .find(|registered| registered.identity == context.identity)
+        .ok_or_else(|| {
+            RuntimeError::Application(
+                "advanced public authorization context lacks registered trust".into(),
+            )
+        })?;
+    registered.context = Some(context);
+    registered.peers.clear();
+    registered.builds.clear();
+    Ok(())
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn clear_public_authorization_context(identity: &ReplicaIdentity) {
+    let mut registry = public_authorization_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(registered) = registry
+        .settings
+        .iter_mut()
+        .find(|registered| registered.identity == *identity)
+    {
+        registered.context = None;
+        registered.peers.clear();
+        registered.builds.clear();
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn admit_public_peer_configuration(
     context: &PublicAuthorizationRuntimeContext,
     configuration: &PublicConfiguration,

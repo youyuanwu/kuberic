@@ -1778,26 +1778,27 @@ mod tests {
             peer_authorization: Some(authorization),
             configuration_revision: Some(17),
         };
+        let primary_context = PublicAuthorizationRuntimeContext {
+            identity: primary.clone(),
+            history: history.clone(),
+            storage_incarnation: primary_storage,
+            process_session_id: ProcessSessionId::new("peer-primary-session"),
+            role: ReplicaRole::Primary,
+            epoch,
+            previous_configuration_id: Some(previous_configuration_id.clone()),
+            current_configuration_id: Some(current_configuration_id.clone()),
+        };
         let _ = crate::replicator::admit_public_peer_configuration(
-            &PublicAuthorizationRuntimeContext {
-                identity: primary.clone(),
-                history: history.clone(),
-                storage_incarnation: primary_storage,
-                process_session_id: ProcessSessionId::new("peer-primary-session"),
-                role: ReplicaRole::Primary,
-                epoch,
-                previous_configuration_id: Some(previous_configuration_id.clone()),
-                current_configuration_id: Some(current_configuration_id.clone()),
-            },
+            &primary_context,
             &crate::protocol::public_operations::PublicConfiguration {
-                current: current_configuration,
+                current: current_configuration.clone(),
                 previous: Some(previous_configuration),
                 replicas: vec![descriptor],
             },
         )
         .unwrap();
         let item = ReplicationItem {
-            sender: primary,
+            sender: primary.clone(),
             receiver: secondary.clone(),
             epoch,
             previous_configuration_id: Some(previous_configuration_id.clone()),
@@ -1838,6 +1839,110 @@ mod tests {
         crate::replicator::bind_public_authorization_context(wrong_local_role).unwrap();
         assert!(replication_from_proto(wire.clone()).is_err());
         crate::replicator::bind_public_authorization_context(secondary_context).unwrap();
+
+        let successor_epoch = Epoch::new(0, 10);
+        let successor_members = vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: secondary.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ];
+        let successor_configuration =
+            ConfigurationDescriptor::new(successor_epoch, primary.replica_id, successor_members, 1);
+        let successor_authorization = signing_key
+            .sign_peer_session_authorization(PeerSessionAuthorizationClaimsV1 {
+                resource_uid: history.resource_uid.clone(),
+                protocol_generation: history.protocol_generation,
+                key_id: signing_key.key_id(),
+                history: history.clone(),
+                epoch: successor_epoch,
+                current_configuration_id: successor_configuration.configuration_id.clone(),
+                previous_configuration_id: Some(current_configuration_id.clone()),
+                primary: PeerSessionEndpointV1 {
+                    replica: primary.clone(),
+                    process_session_id: ProcessSessionId::new("peer-primary-session"),
+                    replication_address: primary_address.into(),
+                    role: ReplicaRole::Primary,
+                },
+                secondary: PeerSessionEndpointV1 {
+                    replica: secondary.clone(),
+                    process_session_id: ProcessSessionId::new("peer-secondary-session"),
+                    replication_address: secondary_address.into(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                configuration_revision: 18,
+            })
+            .unwrap();
+        let mut successor_primary_context = primary_context;
+        successor_primary_context.epoch = successor_epoch;
+        successor_primary_context.previous_configuration_id =
+            Some(current_configuration_id.clone());
+        successor_primary_context.current_configuration_id =
+            Some(successor_configuration.configuration_id.clone());
+        crate::replicator::advance_public_authorization_context(successor_primary_context.clone())
+            .unwrap();
+        let mut successor_secondary_context = PublicAuthorizationRuntimeContext {
+            identity: secondary.clone(),
+            history: history.clone(),
+            storage_incarnation: storage(&secondary, "peer-secondary"),
+            process_session_id: ProcessSessionId::new("peer-secondary-session"),
+            role: ReplicaRole::ActiveSecondary,
+            epoch: successor_epoch,
+            previous_configuration_id: Some(current_configuration_id.clone()),
+            current_configuration_id: Some(successor_configuration.configuration_id.clone()),
+        };
+        crate::replicator::advance_public_authorization_context(
+            successor_secondary_context.clone(),
+        )
+        .unwrap();
+        assert!(
+            replication_from_proto(wire.clone()).is_err(),
+            "a successful lifecycle epoch transition must invalidate predecessor authority"
+        );
+        let successor_descriptor = PublicReplicaDescriptor {
+            build_id: OperationId::default(),
+            identity: secondary.clone(),
+            replication_address: secondary_address.into(),
+            process_session_id: ProcessSessionId::new("peer-secondary-session"),
+            role: ReplicaRole::ActiveSecondary,
+            current_progress: 0,
+            catch_up_capability: 0,
+            must_catchup: false,
+            peer_authorization: Some(successor_authorization),
+            configuration_revision: Some(18),
+        };
+        let _ = crate::replicator::admit_public_peer_configuration(
+            &successor_primary_context,
+            &crate::protocol::public_operations::PublicConfiguration {
+                current: successor_configuration.clone(),
+                previous: Some(current_configuration),
+                replicas: vec![successor_descriptor],
+            },
+        )
+        .unwrap();
+        let successor_wire = authorized_replication_to_session_proto(
+            ReplicationItem {
+                sender: primary,
+                receiver: secondary,
+                epoch: successor_epoch,
+                previous_configuration_id: Some(current_configuration_id),
+                current_configuration_id: successor_configuration.configuration_id,
+                lsn: 2,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"successor"),
+            },
+            "peer-primary-session",
+            "peer-secondary-session",
+        )
+        .unwrap();
+        replication_from_proto(successor_wire).unwrap();
+        successor_secondary_context.role = ReplicaRole::None;
+        crate::replicator::advance_public_authorization_context(successor_secondary_context)
+            .unwrap();
 
         let mut tampered = wire.clone();
         *tampered.peer_session_authorization_v1.last_mut().unwrap() ^= 1;

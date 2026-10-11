@@ -335,6 +335,37 @@ async fn reached(cut: &PublicOperationCut) {
 }
 
 #[tokio::test]
+async fn public_v1_role_and_epoch_transitions_persist_current_authority() {
+    let fixture = Fixture::public_v1().await;
+    fixture
+        .run(
+            "authorization-role-transition",
+            3,
+            Program::Role {
+                epoch: Epoch::new(0, 3),
+                role: ReplicaRole::Primary,
+            },
+        )
+        .await;
+    let state = fixture.store.load_state().await.unwrap();
+    assert_eq!(state.role, ReplicaRole::Primary);
+    assert_eq!(state.highest_epoch, Epoch::new(0, 3));
+
+    fixture
+        .run(
+            "authorization-epoch-transition",
+            4,
+            Program::Epoch {
+                epoch: Epoch::new(0, 4),
+            },
+        )
+        .await;
+    let state = fixture.store.load_state().await.unwrap();
+    assert_eq!(state.role, ReplicaRole::Primary);
+    assert_eq!(state.highest_epoch, Epoch::new(0, 4));
+}
+
+#[tokio::test]
 async fn swap_installs_exact_starting_configuration_before_both_captured_mode_waits() {
     for selected in [PublicCatchUpMode::All, PublicCatchUpMode::WriteQuorum] {
         let fixture = Fixture::new().await;

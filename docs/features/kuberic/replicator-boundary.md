@@ -307,7 +307,9 @@ current local history, epoch, configuration IDs, storage, role, session or
 address checks. Dormant authority is scoped to the exact Replicator creation
 and local resource identity; descriptor value conversion has no side effects,
 failed configuration installation restores prior authority, and dropping the
-creation removes its trust, peer and build state.
+creation removes its trust, peer and build state. Successful role, epoch and
+configuration callbacks durably advance the local authority snapshot and
+invalidate predecessor peer/build capabilities before later traffic.
 
 Replacement active sessions are also explicit schema-10 authority. The new
 session begins unassigned and access-closed with only history-scoped progress.

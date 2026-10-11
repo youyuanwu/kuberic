@@ -49,6 +49,32 @@ pub struct PublicV1ReportProjection {
     pub progress: PublicProgress,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicV1OperationSnapshotStage {
+    WaitingForContainment,
+    Ready,
+    Running,
+    CallbackApplied,
+    ContainmentPending,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicV1OperationSnapshotDisposition {
+    Succeeded,
+    Failed(String),
+    Ambiguous(String),
+    Cancelled,
+    Attached(OperationId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicV1OperationSnapshot {
+    pub intent: crate::protocol::public_operations::PublicOperationIntent,
+    pub stage: PublicV1OperationSnapshotStage,
+    pub disposition: Option<PublicV1OperationSnapshotDisposition>,
+}
+
 impl SqliteStore {
     pub fn metadata_database_path(root: &Path) -> PathBuf {
         crate::host::sqlite_store::SqliteStore::metadata_database_path(root)
@@ -236,6 +262,119 @@ impl SqliteStore {
             .into_iter()
             .map(|record| record.intent)
             .collect())
+    }
+
+    pub async fn complete_public_v1_build(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+    ) -> crate::host::Result<()> {
+        let record = self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| record.intent == *intent)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-v1 signed build is not journaled".into(),
+                )
+            })?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                record.stage,
+                crate::host::state::PublicOperationStage::Running,
+                None,
+            )
+            .await?;
+        self.inner
+            .public_instruction(
+                intent,
+                0,
+                crate::host::state::PublicInstruction::Build,
+                None,
+            )
+            .await?;
+        self.inner
+            .public_instruction(
+                intent,
+                0,
+                crate::host::state::PublicInstruction::Build,
+                Some(crate::host::state::PublicInstructionOutcome::Done),
+            )
+            .await?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                crate::host::state::PublicOperationStage::Running,
+                crate::host::state::PublicOperationStage::Completed,
+                Some(crate::host::state::PublicOperationDisposition::Succeeded),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn public_v1_operation_snapshot(
+        &self,
+        operation_id: &OperationId,
+    ) -> crate::host::Result<PublicV1OperationSnapshot> {
+        let record = self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| &record.intent.operation_id == operation_id)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-v1 operation snapshot is absent".into(),
+                )
+            })?;
+        let stage = match record.stage {
+            crate::host::state::PublicOperationStage::WaitingForContainment => {
+                PublicV1OperationSnapshotStage::WaitingForContainment
+            }
+            crate::host::state::PublicOperationStage::Ready => {
+                PublicV1OperationSnapshotStage::Ready
+            }
+            crate::host::state::PublicOperationStage::Running => {
+                PublicV1OperationSnapshotStage::Running
+            }
+            crate::host::state::PublicOperationStage::CallbackApplied => {
+                PublicV1OperationSnapshotStage::CallbackApplied
+            }
+            crate::host::state::PublicOperationStage::ContainmentPending => {
+                PublicV1OperationSnapshotStage::ContainmentPending
+            }
+            crate::host::state::PublicOperationStage::Completed => {
+                PublicV1OperationSnapshotStage::Completed
+            }
+        };
+        let disposition = record.disposition.map(|disposition| match disposition {
+            crate::host::state::PublicOperationDisposition::Succeeded => {
+                PublicV1OperationSnapshotDisposition::Succeeded
+            }
+            crate::host::state::PublicOperationDisposition::Failed(message) => {
+                PublicV1OperationSnapshotDisposition::Failed(message)
+            }
+            crate::host::state::PublicOperationDisposition::Ambiguous(message) => {
+                PublicV1OperationSnapshotDisposition::Ambiguous(message)
+            }
+            crate::host::state::PublicOperationDisposition::Cancelled => {
+                PublicV1OperationSnapshotDisposition::Cancelled
+            }
+            crate::host::state::PublicOperationDisposition::Attached(operation_id) => {
+                PublicV1OperationSnapshotDisposition::Attached(operation_id)
+            }
+        });
+        Ok(PublicV1OperationSnapshot {
+            intent: record.intent,
+            stage,
+            disposition,
+        })
     }
 
     pub async fn apply_public_v1_session_renewal_command(

@@ -25,7 +25,10 @@ use kuberic_runtime::protocol::types::{
     ReplicatorCreationId, ResourceUid, StorageGeneration, derive_bootstrap_history,
     derive_data_loss_history, derive_history_initialization_id,
 };
-use kuberic_runtime::testing::sqlite_store::{PUBLIC_V1_PREVIEW_SCHEMA_VERSION, SqliteStore};
+use kuberic_runtime::testing::sqlite_store::{
+    PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PublicV1OperationSnapshotDisposition,
+    PublicV1OperationSnapshotStage, SqliteStore,
+};
 use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -815,6 +818,29 @@ async fn public_v1_schema10_requires_a_fresh_exact_store() {
             .begin_public_v1_operation(&incomplete_intent)
             .await
             .is_err()
+    );
+    reopened
+        .complete_public_v1_build(&signed_intent)
+        .await
+        .unwrap();
+    drop(reopened);
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let terminal_signed = reopened
+        .public_v1_operation_snapshot(&signed_intent.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(&terminal_signed.intent, &signed_intent);
+    assert_eq!(
+        terminal_signed.stage,
+        PublicV1OperationSnapshotStage::Completed
+    );
+    assert_eq!(
+        terminal_signed.disposition,
+        Some(PublicV1OperationSnapshotDisposition::Succeeded)
+    );
+    assert_eq!(
+        terminal_signed.intent.replay_disposition,
+        PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
     );
     let closed = active.close_access().unwrap();
     reopened

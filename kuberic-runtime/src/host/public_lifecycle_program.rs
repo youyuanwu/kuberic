@@ -108,9 +108,9 @@ pub(super) fn replica_set(
 async fn install(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
-    authorization_context: Option<&crate::replicator::PublicAuthorizationRuntimeContext>,
+    authorization_context: Option<&mut crate::replicator::PublicAuthorizationRuntimeContext>,
 ) -> Result<()> {
-    let authorization_snapshot = if let Some(context) = authorization_context {
+    let authorization_snapshot = if let Some(context) = authorization_context.as_deref() {
         crate::replicator::admit_public_peer_configuration(context, input)?
     } else if input
         .replicas
@@ -142,6 +142,14 @@ async fn install(
             crate::replicator::restore_public_peer_authorization(snapshot)?;
         }
         return Err(error.into());
+    }
+    if let Some(context) = authorization_context {
+        context.epoch = input.current.epoch;
+        context.previous_configuration_id = input
+            .previous
+            .as_ref()
+            .map(|configuration| configuration.configuration_id.clone());
+        context.current_configuration_id = Some(input.current.configuration_id.clone());
     }
     Ok(())
 }
@@ -218,7 +226,7 @@ pub(super) async fn execute(
         .into_iter()
         .find(|record| record.intent == intent)
         .ok_or_else(|| HostError::Corrupt("missing public program".into()))?;
-    let authorization_context = if intent.preview.is_public_v1() {
+    let mut authorization_context = if intent.preview.is_public_v1() {
         let state = store.load_state().await?;
         let preview = state
             .public_operation_preview
@@ -317,6 +325,11 @@ pub(super) async fn execute(
                 };
                 if instruction == ReplicatorRole {
                     callbacks.replicator.change_role(epoch, role).await?;
+                    if let Some(context) = authorization_context.as_mut() {
+                        context.epoch = epoch;
+                        context.role = role;
+                        crate::replicator::advance_public_authorization_context(context.clone())?;
+                    }
                     O::Done
                 } else {
                     O::ApplicationRole(
@@ -333,13 +346,17 @@ pub(super) async fn execute(
                     unreachable!()
                 };
                 callbacks.replicator.update_epoch(*epoch).await?;
+                if let Some(context) = authorization_context.as_mut() {
+                    context.epoch = *epoch;
+                    crate::replicator::advance_public_authorization_context(context.clone())?;
+                }
                 O::Done
             }
             Configuration | StartingConfiguration | RefreshedConfiguration => {
                 install(
                     &callbacks,
                     configuration(program, instruction),
-                    authorization_context.as_ref(),
+                    authorization_context.as_mut(),
                 )
                 .await?;
                 O::Done
@@ -351,7 +368,7 @@ pub(super) async fn execute(
                     install(
                         &callbacks,
                         configuration(program, instruction),
-                        authorization_context.as_ref(),
+                        authorization_context.as_mut(),
                     )
                     .await?;
                 }
@@ -452,7 +469,16 @@ pub(super) async fn execute(
                     )
                 };
                 match result {
-                    Ok(()) => O::Done,
+                    Ok(()) => {
+                        if instruction == ReplicatorClose
+                            && let Some(context) = authorization_context.as_ref()
+                        {
+                            crate::replicator::clear_public_authorization_context(
+                                &context.identity,
+                            );
+                        }
+                        O::Done
+                    }
                     Err(error) => {
                         callbacks.abort_once();
                         O::CloseFailure {
@@ -464,6 +490,9 @@ pub(super) async fn execute(
             }
             Abort => {
                 callbacks.abort_once();
+                if let Some(context) = authorization_context.as_ref() {
+                    crate::replicator::clear_public_authorization_context(&context.identity);
+                }
                 O::Done
             }
             Cleanup => {
