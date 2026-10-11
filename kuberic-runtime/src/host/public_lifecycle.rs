@@ -98,10 +98,12 @@ impl PublicLifecycleCallbacks {
             .as_ref()
             .filter(|input| input.possible_data_loss == PossibleDataLossIntent::Possible)
             .and_then(|input| input.data_loss_recovery.as_ref())
-            && recovery.attempt.process.data_loss_replay != self.capabilities.data_loss_replay
+            && (recovery.attempt.process.data_loss_replay != self.capabilities.data_loss_replay
+                || recovery.attempt.process.catch_up_specific_quorum
+                    != self.capabilities.catch_up_specific_quorum)
         {
             return Err(HostError::CommandRejected(
-                "data-loss attempt capability differs from attached Replicator creation".into(),
+                "data-loss attempt capabilities differ from attached Replicator creation".into(),
             ));
         }
         Ok(())
@@ -114,7 +116,9 @@ pub(crate) fn instructions(input: &PublicLifecycleInput) -> Vec<PublicInstructio
         return vec![Epoch];
     }
     let mut result = vec![ReplicatorPrimary];
-    if input.recipe == PublicLifecycleRecipe::FailoverPromotion {
+    if input.recipe == PublicLifecycleRecipe::FailoverPromotion
+        || input.data_loss_recovery.is_some()
+    {
         result.push(Epoch);
     }
     result.push(ApplicationPrimary);

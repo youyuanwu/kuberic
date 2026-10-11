@@ -12,7 +12,7 @@ use crate::protocol::observation::{
 use crate::protocol::public_operations::{
     AuthorizationAuditDigest, CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
-    DataLossReplay, ProcessAttemptContext, ProviderReplicaIdentity,
+    DataLossReplay, ProcessAttemptContext, ProviderProgressReset, ProviderReplicaIdentity,
     PublicBuildAuthorizationReference, PublicDataLossRecoveryStage, PublicDataLossRecoveryStatus,
     PublicOperationPreviewIdentity, PublicOperationReplayDisposition, PublicProgress,
     PublicProgressRole, PublicV1AgentReport, PublicV1ExtensionSlot, PublicV1Extensions,
@@ -519,6 +519,41 @@ fn public_v1_attempt_to_proto(value: &DataLossAttempt) -> proto::PublicV1DataLos
 fn public_v1_recovery_from_proto(
     value: proto::PublicV1DataLossRecoveryStatus,
 ) -> Result<PublicDataLossRecoveryStatus, WireError> {
+    let reset_kind = proto::PublicV1ProviderProgressResetKind::try_from(value.reset_scope_kind)
+        .map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.recovery.reset_scope_kind",
+            value: value.reset_scope_kind,
+        })?;
+    let reset_scope = match (reset_kind, value.retired_storage) {
+        (proto::PublicV1ProviderProgressResetKind::Preserve, None) => {
+            ProviderProgressReset::Preserve
+        }
+        (proto::PublicV1ProviderProgressResetKind::ResetToEmpty, None) => {
+            ProviderProgressReset::ResetToEmpty
+        }
+        (proto::PublicV1ProviderProgressResetKind::ReplaceIncarnation, Some(retired)) => {
+            ProviderProgressReset::ReplaceIncarnation {
+                retired: public_v1_storage_from_proto(retired)?,
+            }
+        }
+        (proto::PublicV1ProviderProgressResetKind::Unknown, _) => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.recovery.reset_scope_kind",
+                value: value.reset_scope_kind,
+            });
+        }
+        _ => {
+            return Err(WireError::InvalidAuthority(
+                "public-v1 recovery reset scope is noncanonical".into(),
+            ));
+        }
+    };
+    let replay = replay_from_proto(value.authorization_replay)?;
+    let PublicOperationReplayDisposition::DataLoss(replay_disposition) = replay else {
+        return Err(WireError::InvalidAuthority(
+            "public-v1 recovery authorization has a non-data-loss replay disposition".into(),
+        ));
+    };
     let stage = proto::PublicV1DataLossRecoveryStage::try_from(value.stage).map_err(|_| {
         WireError::InvalidEnum {
             field: "public_v1.recovery.stage",
@@ -595,6 +630,8 @@ fn public_v1_recovery_from_proto(
         provisional_primary: public_v1_storage_from_proto(value.provisional_primary.ok_or(
             WireError::MissingField("public_v1.recovery.provisional_primary"),
         )?)?,
+        reset_scope,
+        replay_disposition,
         stage,
         observed_progress,
     })
@@ -603,12 +640,29 @@ fn public_v1_recovery_from_proto(
 fn public_v1_recovery_to_proto(
     value: &PublicDataLossRecoveryStatus,
 ) -> proto::PublicV1DataLossRecoveryStatus {
+    let (reset_scope_kind, retired_storage) = match &value.reset_scope {
+        ProviderProgressReset::Preserve => {
+            (proto::PublicV1ProviderProgressResetKind::Preserve, None)
+        }
+        ProviderProgressReset::ResetToEmpty => {
+            (proto::PublicV1ProviderProgressResetKind::ResetToEmpty, None)
+        }
+        ProviderProgressReset::ReplaceIncarnation { retired } => (
+            proto::PublicV1ProviderProgressResetKind::ReplaceIncarnation,
+            Some(public_v1_storage_to_proto(retired)),
+        ),
+    };
     proto::PublicV1DataLossRecoveryStatus {
         authorization_id: value.authorization_id.as_str().to_string(),
         attempt: Some(public_v1_attempt_to_proto(&value.attempt)),
         predecessor_history: Some(public_v1_history_to_proto(&value.predecessor_history)),
         proposed_history: Some(public_v1_history_to_proto(&value.proposed_history)),
         provisional_primary: Some(public_v1_storage_to_proto(&value.provisional_primary)),
+        reset_scope_kind: reset_scope_kind as i32,
+        retired_storage,
+        authorization_replay: replay_to_proto(PublicOperationReplayDisposition::DataLoss(
+            value.replay_disposition,
+        )) as i32,
         stage: match value.stage {
             PublicDataLossRecoveryStage::Authorized => {
                 proto::PublicV1DataLossRecoveryStage::Authorized

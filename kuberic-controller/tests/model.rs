@@ -2711,3 +2711,43 @@ fn scale_down_model_enumerates_quorum_availability_without_target_credit() {
         }
     }
 }
+
+#[test]
+#[cfg(feature = "runtime-test-bridge")]
+fn public_v1_model_never_orders_incompatible_histories() {
+    use kuberic_controller::evaluator::test_bridge::compare_public_v1_election_progress;
+    use kuberic_runtime::protocol::types::{
+        AgentGeneration, OperationId, PodUid, PublicProtocolGeneration, PvcUid, ReplicaId,
+        ReplicaIdentity, ReplicaInstanceId, ReplicaStorageIdentity,
+        ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration, derive_bootstrap_history,
+        derive_data_loss_history, derive_history_initialization_id,
+    };
+
+    let resource_uid = ResourceUid::new("resource-1");
+    let generation = PublicProtocolGeneration::new(42);
+    let initialization = derive_history_initialization_id(&resource_uid, generation);
+    let bootstrap = derive_bootstrap_history(&resource_uid, generation, &initialization);
+    let storage = ReplicaStorageIncarnationContext {
+        replica: ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-1"),
+            agent_generation: AgentGeneration::new("generation-1"),
+        },
+        storage: ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+        },
+        storage_generation: StorageGeneration::new("storage-1"),
+    };
+    let successor =
+        derive_data_loss_history(&OperationId::new("data-loss"), &bootstrap, 1, &storage).unwrap();
+
+    assert_eq!(
+        compare_public_v1_election_progress(&bootstrap, 10, &bootstrap, 20),
+        Some(std::cmp::Ordering::Less)
+    );
+    assert_eq!(
+        compare_public_v1_election_progress(&bootstrap, i64::MAX, &successor, 0),
+        None
+    );
+}

@@ -677,6 +677,7 @@ public-path documented variant crate::protocol::command::ProtocolCommand::Ensure
 public-path documented variant crate::protocol::command::ProtocolCommand::InitializeAgentStore((Box < InitializeAgentStore >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSecondaryRemoval((Box < PrepareSecondaryRemoval >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSwitchover((Box < PrepareSwitchover >))
+public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1History((Box < PublicV1HistoryCommand >))
 public-path documented variant crate::protocol::command::ProtocolCommand::RestartReplicaProcess((Box < RestartReplicaProcess >))
 public-path documented variant crate::protocol::command::ProtocolCommand::RetireReplica((Box < RetireReplica >))
 public-path documented variant crate::protocol::command::SafetyChange::RemoveWriteRouting
@@ -900,6 +901,8 @@ public-path hidden field crate::protocol::public_operations::PublicDataLossRecov
 public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::predecessor_history: HistoryContext
 public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::proposed_history: HistoryContext
 public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::provisional_primary: ReplicaStorageIncarnationContext
+public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::replay_disposition: DataLossReplay
+public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::reset_scope: ProviderProgressReset
 public-path hidden field crate::protocol::public_operations::PublicDataLossRecoveryStatus::stage: PublicDataLossRecoveryStage
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::action_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::binding: PreviewLifecycleBinding
@@ -1020,6 +1023,7 @@ public-path hidden impl crate::protocol::public_operations::PreviewLifecycleBind
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn successor (& self) -> Option < & ReplicaIdentity >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn validate_for_local (& self , local_replica_id : ReplicaId) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicDataLossRecoveryStatus::fn logical_authorization (& self) -> DataLossAuthorization
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_id (& self) -> OperationId
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_kind (persistence : StatePersistence , fault : FaultType) -> PublicFaultActionKind
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn validate (& self) -> Result < () , & 'static str >

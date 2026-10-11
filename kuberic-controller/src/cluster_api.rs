@@ -2248,6 +2248,10 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
             command.action.target.clone(),
             command.action.target.replica_id,
         ),
+        #[cfg(feature = "runtime-test-bridge")]
+        ProtocolCommand::PublicV1History(command) => {
+            (command.target().clone(), command.target().replica_id)
+        }
     }
 }
 
@@ -2292,9 +2296,11 @@ fn command_request(
             ))
         }
         #[cfg(feature = "runtime-test-bridge")]
-        ProtocolCommand::RestartReplicaProcess(_) | ProtocolCommand::DropReplicaIncarnation(_) => {
+        ProtocolCommand::RestartReplicaProcess(_)
+        | ProtocolCommand::DropReplicaIncarnation(_)
+        | ProtocolCommand::PublicV1History(_) => {
             return Err(ControllerError::Effect(
-                "preview fault commands cannot use the production gRPC dispatcher".into(),
+                "preview commands cannot use the production gRPC dispatcher".into(),
             ));
         }
     };
@@ -3740,6 +3746,10 @@ mod scale_down_fixture;
 mod public_lifecycle;
 #[cfg(feature = "runtime-test-bridge")]
 pub use public_lifecycle::{PreviewServiceApi, preview_service_matches, preview_service_update};
+#[cfg(feature = "runtime-test-bridge")]
+mod public_v1_history;
+#[cfg(feature = "runtime-test-bridge")]
+pub use public_v1_history::PublicV1HistoryApi;
 
 #[cfg(test)]
 mod tests {

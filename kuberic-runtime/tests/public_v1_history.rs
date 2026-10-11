@@ -140,6 +140,20 @@ fn public_v1_history_data_loss_attempt_renews_higher_epoch() {
         DataLossRenewalDecision::Terminal
     );
 
+    let lower_epoch = attempt(
+        &authorization_id,
+        "attempt-lower",
+        "session-lower",
+        "creation-lower",
+        Epoch::new(1, 9),
+        3,
+        DataLossReplay::Convergent,
+    );
+    assert_eq!(
+        DataLossAttempt::renewal_decision(&authorization, &first, &lower_epoch, true),
+        DataLossRenewalDecision::Terminal
+    );
+
     let conservative = attempt(
         &authorization_id,
         "attempt-4",
@@ -189,7 +203,7 @@ async fn public_v1_schema9_requires_a_fresh_store_and_rejects_schema8() {
     let generation = PublicProtocolGeneration::new(preview.generation);
     let initialization = derive_history_initialization_id(&resource_uid, generation);
     let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-    let incarnation = storage(local, "pod-1", "pvc-1");
+    let incarnation = storage(local.clone(), "pod-1", "pvc-1");
     store
         .initialize_public_v1_history(&initialization, &history, &incarnation)
         .await
@@ -215,4 +229,34 @@ async fn public_v1_schema9_requires_a_fresh_store_and_rejects_schema8() {
     connection.pragma_update(None, "user_version", 8).unwrap();
     drop(connection);
     assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+
+    for rejected_version in [6, 7] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = SqliteStore::create_public_v1(
+            &path,
+            preview.clone(),
+            StorageIdentity {
+                schema_version: SCHEMA_VERSION,
+                resource_uid: resource_uid.clone(),
+                pod_uid: PodUid::new("pod-1"),
+                pvc_uid: PvcUid::new("pvc-1"),
+                initialization_id: InitializationId::new("local-initialization"),
+                local_identity: local.clone(),
+                effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+            },
+        )
+        .unwrap();
+        store
+            .initialize_public_v1_history(&initialization, &history, &incarnation)
+            .await
+            .unwrap();
+        drop(store);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", rejected_version)
+            .unwrap();
+        drop(connection);
+        assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+    }
 }

@@ -1958,7 +1958,9 @@ impl AgentStore for SqliteStore {
                         preview.writes_revoked = true;
                         preview.active_builds.clear();
                         preview.absent_builds.clear();
+                        preview.operations.clear();
                         preview.current_topology_operation = None;
+                        preview.current_operation = None;
                         preview.data_loss_authorization =
                             Some(recovery.authorization.clone());
                         preview.data_loss_recovery = Some(
@@ -1974,6 +1976,8 @@ impl AgentStore for SqliteStore {
                                     .authorization
                                     .provisional_primary
                                     .clone(),
+                                reset_scope: recovery.authorization.reset_scope.clone(),
+                                replay_disposition: recovery.authorization.replay_disposition,
                                 stage: crate::protocol::public_operations::
                                     PublicDataLossRecoveryStage::Invalidated,
                                 observed_progress: None,
@@ -2138,6 +2142,8 @@ impl AgentStore for SqliteStore {
                 || recovery.predecessor_history != authorization.predecessor
                 || recovery.proposed_history != authorization.proposed
                 || recovery.provisional_primary != authorization.provisional_primary
+                || recovery.reset_scope != authorization.reset_scope
+                || recovery.replay_disposition != authorization.replay_disposition
                 || recovery.stage
                     != crate::protocol::public_operations::PublicDataLossRecoveryStage::
                         CallbackProcessing
@@ -2255,6 +2261,8 @@ impl AgentStore for SqliteStore {
                         predecessor_history: authorization.predecessor.clone(),
                         proposed_history: authorization.proposed.clone(),
                         provisional_primary: authorization.provisional_primary.clone(),
+                        reset_scope: authorization.reset_scope.clone(),
+                        replay_disposition: authorization.replay_disposition,
                         stage: crate::protocol::public_operations::
                             PublicDataLossRecoveryStage::Invalidated,
                         observed_progress: None,

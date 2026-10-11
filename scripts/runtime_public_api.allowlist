@@ -54,6 +54,7 @@ page:control/proto/enum.FaultType.html
 page:control/proto/enum.PublicV1DataLossRecoveryStage.html
 page:control/proto/enum.PublicV1OperationResultKind.html
 page:control/proto/enum.PublicV1ProgressRole.html
+page:control/proto/enum.PublicV1ProviderProgressResetKind.html
 page:control/proto/enum.PublicV1RebuildKind.html
 page:control/proto/enum.PublicV1RebuildReason.html
 page:control/proto/enum.PublicV1ReplayDisposition.html

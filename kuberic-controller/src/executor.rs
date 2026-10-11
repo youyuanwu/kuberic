@@ -64,6 +64,38 @@ pub async fn execute_preview_service_location(
     }
 }
 
+#[cfg(feature = "runtime-test-bridge")]
+pub async fn execute_public_v1_history(
+    api: &dyn crate::cluster_api::PublicV1HistoryApi,
+    plan: crate::evaluator::test_bridge::PublicV1HistoryPlan,
+) -> std::result::Result<(), String> {
+    use crate::evaluator::test_bridge::PublicV1HistoryPlan;
+    match plan {
+        PublicV1HistoryPlan::Stable => Ok(()),
+        PublicV1HistoryPlan::PersistStatus { expected, next } => {
+            if api.observe_public_v1_status().await? != expected {
+                return Err("stale public-v1 accepted status".into());
+            }
+            api.persist_public_v1_status(expected.as_ref(), &next).await
+        }
+        PublicV1HistoryPlan::Dispatch { expected, command } => {
+            if api.observe_public_v1_status().await?.as_ref() != Some(&expected) {
+                return Err("stale public-v1 dispatch authority".into());
+            }
+            let kuberic_runtime::protocol::command::ProtocolCommand::PublicV1History(
+                public_command,
+            ) = &command
+            else {
+                return Err("public-v1 history executor received another command".into());
+            };
+            if public_command.accepted() != &expected {
+                return Err("public-v1 command differs from accepted status".into());
+            }
+            api.dispatch_public_v1_history(&expected, &command).await
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionKind {
     Stable,

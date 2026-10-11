@@ -4,11 +4,14 @@ use std::sync::Arc;
 use crate::authority::{BuildAuthorityStore, BuildProgressStore, LocalWriteJournal};
 use crate::host::store::AgentStore;
 use crate::protocol::command::EnsureReplicaBuild;
+use crate::protocol::command::PublicV1HistoryCommand;
 use crate::protocol::public_operations::{
     DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
-    PublicOperationPreviewIdentity, StatePersistence,
+    PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport, StatePersistence,
 };
-use crate::protocol::types::{BuildAuthority, OperationId};
+use crate::protocol::types::{
+    AccessStatus, BuildAuthority, OperationId, ProcessSessionId, ReplicaRole,
+};
 use crate::protocol::types::{
     HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
 };
@@ -31,6 +34,16 @@ pub struct PublicV1HistorySnapshot {
     pub storage: ReplicaStorageIncarnationContext,
     pub authorization: Option<DataLossAuthorization>,
     pub recovery: Option<PublicDataLossRecoveryStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicV1ReportProjection {
+    pub process_session_id: ProcessSessionId,
+    pub report_sequence: u64,
+    pub role: ReplicaRole,
+    pub read_status: AccessStatus,
+    pub write_status: AccessStatus,
+    pub progress: PublicProgress,
 }
 
 impl SqliteStore {
@@ -142,6 +155,52 @@ impl SqliteStore {
             authorization: preview.data_loss_authorization,
             recovery: preview.data_loss_recovery,
         })
+    }
+
+    pub async fn apply_public_v1_history_command(
+        &self,
+        command: &PublicV1HistoryCommand,
+    ) -> crate::host::Result<()> {
+        command
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        match command {
+            PublicV1HistoryCommand::Initialize {
+                accepted, storage, ..
+            } => {
+                self.inner
+                    .initialize_public_v1_history(
+                        &accepted.history_initialization_id,
+                        &accepted.history,
+                        storage,
+                    )
+                    .await
+            }
+            PublicV1HistoryCommand::Recover { intent, .. } => {
+                self.inner.begin_public_operation(intent, &[], &[]).await?;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn public_v1_agent_report(
+        &self,
+        identity: &PublicOperationPreviewIdentity,
+        projection: PublicV1ReportProjection,
+    ) -> crate::host::Result<PublicV1AgentReport> {
+        crate::host::public_lifecycle::public_v1_report(
+            self.inner.as_ref(),
+            identity,
+            crate::host::public_lifecycle::PublicV1ReportProjection {
+                process_session_id: projection.process_session_id,
+                report_sequence: projection.report_sequence,
+                role: projection.role,
+                read_status: projection.read_status,
+                write_status: projection.write_status,
+                progress: projection.progress,
+            },
+        )
+        .await
     }
 
     pub async fn journal_build(

@@ -220,17 +220,23 @@ callback invocation; a captured `ReplaceOnAmbiguity` authorization is
 terminal and cannot be upgraded by a convergent replacement.
 
 Recovery begins with two separately fenced owner-local commits. The controller
-conditionally removes accepted election/serving witnesses before dispatch,
-and the agent atomically revokes executable access plus old-history build,
-configuration, replay and serving state before callback execution. This is not
-a distributed transaction: every command and report revalidates resource,
-operation, history, storage and process identity. The agent then orders
-Replicator primary role, application primary role, `on_data_loss`, fresh
-progress, proposed-history configuration and catch-up, explicit history
-admission, and finally access. Callback `false`, `true`, typed failure,
-rebuild-required and lost-result ambiguity remain distinct; none is itself a
-history certificate. Pending reports carry the exact predecessor history,
-while admitted reports carry the exact proposed history.
+conditionally persists bootstrap or invalidated accepted status before a
+feature-gated `PublicV1History` command can dispatch. The agent command journal
+then atomically revokes executable access, clears prior operation completions
+and old-history build/configuration state, and records the full logical
+authorization plus exact process attempt before callback execution. This is
+not a distributed transaction: every command and report revalidates resource,
+operation, history, storage, reset scope, replay disposition, creation
+capabilities and process identity.
+
+The agent then orders Replicator primary role, explicit epoch, application
+primary role, `on_data_loss`, fresh progress, proposed-history configuration
+and catch-up, explicit history admission, and finally access. Callback
+`false`, `true`, typed failure, rebuild-required and lost-result ambiguity
+remain distinct; none is itself a history certificate. Pending reports carry
+the exact predecessor history and immutable authorization fields, while
+admitted reports carry the exact proposed history. Production normalization,
+gRPC dispatch and evaluation still reject the feature-gated protocol-11 path.
 
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the

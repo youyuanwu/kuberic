@@ -888,6 +888,14 @@ pub enum ProviderProgressReset {
     },
 }
 
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProgressResetSchema {
+    kind: String,
+    retired: Option<ReplicaStorageIncarnationContext>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DataLossAuthorization {
@@ -1051,12 +1059,26 @@ pub struct PublicDataLossRecoveryStatus {
     pub predecessor_history: HistoryContext,
     pub proposed_history: HistoryContext,
     pub provisional_primary: ReplicaStorageIncarnationContext,
+    #[schemars(with = "ProviderProgressResetSchema")]
+    pub reset_scope: ProviderProgressReset,
+    pub replay_disposition: DataLossReplay,
     pub stage: PublicDataLossRecoveryStage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_progress: Option<PublicProgress>,
 }
 
 impl PublicDataLossRecoveryStatus {
+    pub fn logical_authorization(&self) -> DataLossAuthorization {
+        DataLossAuthorization {
+            authorization_id: self.authorization_id.clone(),
+            predecessor: self.predecessor_history.clone(),
+            proposed: self.proposed_history.clone(),
+            provisional_primary: self.provisional_primary.clone(),
+            reset_scope: self.reset_scope.clone(),
+            replay_disposition: self.replay_disposition,
+        }
+    }
+
     fn validate_for_report(
         &self,
         identity: &PublicOperationPreviewIdentity,
@@ -1070,6 +1092,7 @@ impl PublicDataLossRecoveryStatus {
         self.proposed_history.validate()?;
         self.provisional_primary.validate()?;
         self.attempt.process.validate()?;
+        self.logical_authorization().validate()?;
         if self.authorization_id.is_empty()
             || self.attempt.attempt_id.is_empty()
             || self.authorization_id != self.attempt.authorization_id
@@ -1089,6 +1112,11 @@ impl PublicDataLossRecoveryStatus {
             || self.attempt.process.process_session_id != *process_session_id
             || self.provisional_primary != *storage_incarnation
             || self.provisional_primary.replica != *replica
+            || (!matches!(
+                self.stage,
+                PublicDataLossRecoveryStage::ReplacementRequired
+                    | PublicDataLossRecoveryStage::Retired
+            ) && self.attempt.process.data_loss_replay != self.replay_disposition)
         {
             return Err("public-v1 recovery status differs from report authority");
         }

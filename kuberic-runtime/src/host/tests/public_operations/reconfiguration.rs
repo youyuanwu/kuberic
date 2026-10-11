@@ -690,7 +690,41 @@ async fn public_v1_data_loss_replay_uses_attached_capability() {
         PublicOperationReplayDisposition::DataLoss(DataLossReplay::Convergent);
     operation_intent.lifecycle = Some(lifecycle);
 
-    let barrier = cut(PublicCutPosition::CallbackSuccess, 2);
+    let mut wrong_quorum = operation_intent.clone();
+    let wrong_quorum_lifecycle = wrong_quorum.lifecycle.as_mut().unwrap();
+    wrong_quorum_lifecycle
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .attempt
+        .process
+        .catch_up_specific_quorum = false;
+    wrong_quorum.input_digest = wrong_quorum_lifecycle.digest();
+    let mut wrong_callbacks = fixture.callbacks.clone();
+    wrong_callbacks.capabilities.data_loss_replay = DataLossReplay::Convergent;
+    assert!(
+        public_lifecycle::launch(
+            &fixture.owner.registry(),
+            fixture.store.clone(),
+            wrong_quorum,
+            wrong_callbacks,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        fixture
+            .trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+            .count(),
+        0
+    );
+
+    let barrier = cut(PublicCutPosition::CallbackSuccess, 3);
     let mut callbacks = fixture.callbacks.clone();
     callbacks.capabilities.data_loss_replay = DataLossReplay::Convergent;
     callbacks.cut = Some(barrier.clone());
@@ -808,6 +842,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
             .unwrap();
         for (index, outcome) in [
             PublicInstructionOutcome::Done,
+            PublicInstructionOutcome::Done,
             PublicInstructionOutcome::ApplicationRole(None),
         ]
         .into_iter()
@@ -824,7 +859,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
                 .unwrap();
         }
         store
-            .public_instruction(&first, 2, PublicInstruction::DataLoss, None)
+            .public_instruction(&first, 3, PublicInstruction::DataLoss, None)
             .await
             .unwrap();
         store
@@ -906,6 +941,45 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
             .await
             .is_err()
     );
+    assert!(
+        registry
+            .admit(successor(
+                &preview,
+                &recovery,
+                DataLossReplay::Convergent,
+                2,
+            ))
+            .await
+            .is_err()
+    );
+    let mut changed_reset = successor(&preview, &recovery, DataLossReplay::Convergent, 4);
+    let changed_reset_input = changed_reset.lifecycle.as_mut().unwrap();
+    changed_reset_input
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .authorization
+        .reset_scope = crate::protocol::public_operations::ProviderProgressReset::Preserve;
+    changed_reset.input_digest = changed_reset_input.digest();
+    assert!(registry.admit(changed_reset).await.is_err());
+
+    let mut changed_storage = successor(&preview, &recovery, DataLossReplay::Convergent, 4);
+    let changed_storage_input = changed_storage.lifecycle.as_mut().unwrap();
+    let changed_recovery = changed_storage_input.data_loss_recovery.as_mut().unwrap();
+    changed_recovery
+        .authorization
+        .provisional_primary
+        .storage_generation = crate::protocol::types::StorageGeneration::new("changed-storage");
+    changed_recovery.authorization.proposed = crate::protocol::types::derive_data_loss_history(
+        &changed_recovery.authorization.authorization_id,
+        &changed_recovery.authorization.predecessor,
+        changed_recovery.authorization.proposed.data_loss_number,
+        &changed_recovery.authorization.provisional_primary,
+    )
+    .unwrap();
+    changed_storage.input_digest = changed_storage_input.digest();
+    assert!(registry.admit(changed_storage).await.is_err());
+
     let renewed = registry
         .admit(successor(
             &preview,
@@ -945,16 +1019,45 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
         ProcessSessionId::new("session-2"),
     )
     .unwrap();
-    let retired = registry
-        .admit(successor(
-            &preview,
-            &recovery,
-            DataLossReplay::ReplaceOnAmbiguity,
-            4,
-        ))
-        .await
-        .unwrap();
+    let (trace, application, replicator, _) = trace_fixture();
+    let callbacks_before = trace
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+        .count();
+    let retired = public_lifecycle::launch(
+        &registry,
+        store.clone(),
+        successor(&preview, &recovery, DataLossReplay::ReplaceOnAmbiguity, 4),
+        PublicLifecycleCallbacks {
+            application,
+            replicator: replicator.clone(),
+            primary: replicator.clone(),
+            capabilities: ReplicatorCapabilities {
+                catch_up_specific_quorum: true,
+                data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
+            },
+            open_context: None,
+            containment: None,
+            aborted: Arc::new(Mutex::new(false)),
+            cut: None,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(retired.snapshot().stage, PublicOperationStage::Completed);
+    assert_eq!(
+        trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+            .count(),
+        callbacks_before
+    );
     assert_eq!(
         DataLossAttempt::renewal_decision(
             &recovery.authorization,
@@ -979,16 +1082,45 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
         ProcessSessionId::new("session-2"),
     )
     .unwrap();
-    let terminal = registry
-        .admit(successor(
-            &preview,
-            &recovery,
-            DataLossReplay::Convergent,
-            4,
-        ))
-        .await
-        .unwrap();
+    let (trace, application, replicator, _) = trace_fixture();
+    let callbacks_before = trace
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+        .count();
+    let terminal = public_lifecycle::launch(
+        &registry,
+        store.clone(),
+        successor(&preview, &recovery, DataLossReplay::Convergent, 4),
+        PublicLifecycleCallbacks {
+            application,
+            replicator: replicator.clone(),
+            primary: replicator.clone(),
+            capabilities: ReplicatorCapabilities {
+                catch_up_specific_quorum: true,
+                data_loss_replay: DataLossReplay::Convergent,
+            },
+            open_context: None,
+            containment: None,
+            aborted: Arc::new(Mutex::new(false)),
+            cut: None,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(terminal.snapshot().stage, PublicOperationStage::Completed);
+    assert_eq!(
+        trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "primary.on_data_loss.begin")
+            .count(),
+        callbacks_before
+    );
     assert!(matches!(
         store
             .load_state()
@@ -1062,6 +1194,8 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
         assert_eq!(preview.history, Some(proposed));
         assert!(preview.history_barriers.is_empty());
         assert!(!preview.writes_revoked);
+        assert_eq!(preview.operations.len(), 1);
+        assert!(preview.operations.contains_key(&attempt_id));
         assert!(matches!(
             preview.data_loss_recovery,
             Some(
@@ -1090,6 +1224,34 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
         )
         .await
         .unwrap();
+        assert!(report.completed_operations.iter().all(|completion| {
+            completion.operation_id == attempt_id
+                && completion.revision == 3
+                && completion.replay_disposition
+                    == PublicOperationReplayDisposition::DataLoss(
+                        DataLossReplay::ReplaceOnAmbiguity,
+                    )
+        }));
+        {
+            let events = fixture.trace.events.lock().unwrap();
+            let position = |name: &str| {
+                events
+                    .iter()
+                    .position(|event| event == name)
+                    .expect("typed recovery trace event")
+            };
+            assert!(
+                position("replicator.change_role.begin")
+                    < position("replicator.update_epoch.begin")
+            );
+            assert!(
+                position("replicator.update_epoch.begin")
+                    < position("application.change_role.begin")
+            );
+            assert!(
+                position("application.change_role.begin") < position("primary.on_data_loss.begin")
+            );
+        }
         let wire = crate::control::public_v1_agent_status_to_proto(&report);
         assert_eq!(
             crate::control::normalize_public_v1_agent_status_report(wire.clone()).unwrap(),
@@ -1141,7 +1303,7 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
     operation_intent.replay_disposition =
         PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity);
     operation_intent.lifecycle = Some(lifecycle);
-    let barrier = cut(PublicCutPosition::CallbackSuccess, 2);
+    let barrier = cut(PublicCutPosition::CallbackSuccess, 3);
     let operation = fixture
         .launch(operation_intent, Some(barrier.clone()))
         .await;
@@ -1162,6 +1324,12 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
         .unwrap();
     assert_eq!(preview.history, Some(predecessor));
     assert!(preview.writes_revoked);
+    assert_eq!(preview.operations.len(), 1);
+    assert!(
+        preview
+            .operations
+            .contains_key(&OperationId::new("data-loss-ambiguous-v1"))
+    );
     assert!(matches!(
         preview.data_loss_recovery,
         Some(
@@ -1435,6 +1603,31 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
         .unwrap()
         .process_session_id = "crossed-session".into();
     assert!(crate::control::normalize_public_v1_agent_status_report(crossed_session).is_err());
+
+    let wire = crate::control::public_v1_agent_status_to_proto(&report);
+    let mut invalid_replay = wire.clone();
+    invalid_replay
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .authorization_replay = crate::control::proto::PublicV1ReplayDisposition::Convergent as i32;
+    assert!(crate::control::normalize_public_v1_agent_status_report(invalid_replay).is_err());
+
+    let mut noncanonical_reset = wire;
+    let recovery = noncanonical_reset
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .data_loss_recovery
+        .as_mut()
+        .unwrap();
+    recovery.reset_scope_kind =
+        crate::control::proto::PublicV1ProviderProgressResetKind::Preserve as i32;
+    recovery.retired_storage = recovery.provisional_primary.clone();
+    assert!(crate::control::normalize_public_v1_agent_status_report(noncanonical_reset).is_err());
     fixture.owner.shutdown().await.unwrap();
 }
 

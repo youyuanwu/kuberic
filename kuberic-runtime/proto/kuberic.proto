@@ -236,6 +236,16 @@ message PublicV1DataLossRecoveryStatus {
   PublicV1DataLossRecoveryStage stage = 5;
   PublicV1RecoveryProgress observed_progress = 6;
   PublicV1HistoryContext predecessor_history = 7;
+  PublicV1ProviderProgressResetKind reset_scope_kind = 8;
+  PublicV1StorageIncarnation retired_storage = 9;
+  PublicV1ReplayDisposition authorization_replay = 10;
+}
+
+enum PublicV1ProviderProgressResetKind {
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_UNKNOWN = 0;
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_PRESERVE = 1;
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_RESET_TO_EMPTY = 2;
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_REPLACE_INCARNATION = 3;
 }
 
 enum PublicV1ProgressRole {
