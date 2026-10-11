@@ -3,12 +3,18 @@
 use crate::effects::{RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 #[cfg(any(test, feature = "testing"))]
+use crate::protocol::public_operations::DataLossRenewalDecision;
+#[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::PublicOperationIntent;
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 use crate::protocol::public_operations::{
     PublicFaultAction, RestartActionRecord, RestartActionStage,
 };
 use crate::protocol::types::{FaultType, LoadMetric, OperationId};
+#[cfg(any(test, feature = "testing"))]
+use crate::protocol::types::{
+    HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
+};
 use async_trait::async_trait;
 
 use crate::authority::AdmittedAuthority;
@@ -47,6 +53,14 @@ pub(crate) enum BeginPublicOperation {
     Waiting(PublicOperationRecord),
     Pending(PublicOperationRecord),
     Completed(PublicOperationRecord),
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenewPublicDataLossAttempt {
+    pub(crate) decision: DataLossRenewalDecision,
+    pub(crate) predecessor: PublicOperationRecord,
+    pub(crate) successor: Option<PublicOperationRecord>,
 }
 
 #[async_trait]
@@ -112,6 +126,18 @@ pub(crate) trait AgentStore: Send + Sync {
     ) -> Result<()>;
 
     #[cfg(any(test, feature = "testing"))]
+    async fn initialize_public_v1_history(
+        &self,
+        _initialization_id: &HistoryInitializationId,
+        _history: &HistoryContext,
+        _storage: &ReplicaStorageIncarnationContext,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 history is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     async fn begin_public_operation(
         &self,
         _intent: &PublicOperationIntent,
@@ -120,6 +146,16 @@ pub(crate) trait AgentStore: Send + Sync {
     ) -> Result<BeginPublicOperation> {
         Err(crate::host::HostError::CommandRejected(
             "public-operation preview is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn renew_public_v1_data_loss_attempt(
+        &self,
+        _intent: &PublicOperationIntent,
+    ) -> Result<RenewPublicDataLossAttempt> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 data-loss renewal is not enabled for this store".into(),
         ))
     }
 

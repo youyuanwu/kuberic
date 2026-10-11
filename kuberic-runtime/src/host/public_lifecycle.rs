@@ -93,17 +93,15 @@ impl PublicLifecycleCallbacks {
                 "captured swap capability differs from attached Replicator creation".into(),
             ));
         }
-        if intent
+        if let Some(recovery) = intent
             .lifecycle
             .as_ref()
-            .is_some_and(|input| input.possible_data_loss == PossibleDataLossIntent::Possible)
-            && intent.replay_disposition
-                != crate::protocol::public_operations::PublicOperationReplayDisposition::DataLoss(
-                    self.capabilities.data_loss_replay,
-                )
+            .filter(|input| input.possible_data_loss == PossibleDataLossIntent::Possible)
+            .and_then(|input| input.data_loss_recovery.as_ref())
+            && recovery.attempt.process.data_loss_replay != self.capabilities.data_loss_replay
         {
             return Err(HostError::CommandRejected(
-                "captured data-loss replay differs from attached Replicator creation".into(),
+                "data-loss attempt capability differs from attached Replicator creation".into(),
             ));
         }
         Ok(())
@@ -122,6 +120,15 @@ pub(crate) fn instructions(input: &PublicLifecycleInput) -> Vec<PublicInstructio
     result.push(ApplicationPrimary);
     if input.possible_data_loss == PossibleDataLossIntent::Possible {
         result.push(DataLoss);
+        if input.data_loss_recovery.is_some() {
+            result.extend([
+                Progress,
+                CurrentConfiguration,
+                CatchUp,
+                HistoryAdmission,
+                Access,
+            ]);
+        }
         return result;
     }
     match input.recipe {
@@ -282,6 +289,9 @@ async fn execute(
                 };
                 PublicInstructionOutcome::DataLoss(outcome)
             }
+            Progress => {
+                PublicInstructionOutcome::Progress(callbacks.replicator.current_progress().await?)
+            }
             CurrentConfiguration => {
                 let configuration = input.configuration();
                 callbacks
@@ -333,6 +343,7 @@ async fn execute(
                     .await?;
                 PublicInstructionOutcome::Done
             }
+            HistoryAdmission => PublicInstructionOutcome::Done,
             Access => PublicInstructionOutcome::Done,
             _ => unreachable!("program instruction in role recipe"),
         };
@@ -544,6 +555,13 @@ pub(crate) async fn public_v1_report(
             "public-v1 report identity changed".into(),
         ));
     }
+    let history = preview.history.clone().ok_or_else(|| {
+        HostError::CommandRejected("public-v1 report requires initialized history".into())
+    })?;
+    let storage_incarnation = preview.storage_incarnation.clone().ok_or_else(|| {
+        HostError::CommandRejected("public-v1 report requires storage incarnation".into())
+    })?;
+    let data_loss_recovery = preview.data_loss_recovery.clone();
     let completed_operations = preview
         .operations
         .values()
@@ -591,7 +609,10 @@ pub(crate) async fn public_v1_report(
         role: projection.role,
         read_status: projection.read_status,
         write_status: projection.write_status,
+        history,
+        storage_incarnation,
         progress: projection.progress,
+        data_loss_recovery,
         completed_operations,
         extensions: Default::default(),
     };

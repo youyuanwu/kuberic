@@ -1675,6 +1675,9 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         match transition.kind {
             TransitionKind::ScaleUp => unreachable!("validated independently above"),
             TransitionKind::SecondaryScaleDown => unreachable!("validated independently above"),
+            TransitionKind::DataLossRecovery => {
+                return Err(ValidationError::TransitionDataLossChanged);
+            }
             TransitionKind::Bootstrap => {
                 if transition.switchover.is_some() {
                     return Err(ValidationError::UnexpectedSwitchoverIntent);
@@ -1901,6 +1904,9 @@ pub fn validate_transition_relationship(
             "requires explicit dual-policy scale-up intent",
         ));
     }
+    if kind == TransitionKind::DataLossRecovery {
+        return Err(ValidationError::TransitionDataLossChanged);
+    }
     validate_policy(policy)?;
     validate_configuration(current, Some(policy))?;
     if kind == TransitionKind::Bootstrap {
@@ -1936,6 +1942,7 @@ pub fn validate_transition_relationship(
     match kind {
         TransitionKind::ScaleUp => unreachable!("requires typed authority above"),
         TransitionKind::SecondaryScaleDown => unreachable!("requires typed authority above"),
+        TransitionKind::DataLossRecovery => unreachable!("rejected above"),
         TransitionKind::Bootstrap => unreachable!("bootstrap returned above"),
         TransitionKind::Failover => {
             let previous_identities = previous

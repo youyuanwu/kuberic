@@ -65,6 +65,7 @@ fn primary_lifecycle() -> PublicLifecycleInput {
         current: configuration.current,
         previous: configuration.previous,
         replicas: Vec::new(),
+        data_loss_recovery: None,
     }
 }
 
@@ -585,6 +586,7 @@ async fn public_operation_replay_retains_applied_data_loss_error_as_failure() {
         current: configuration.current,
         previous: configuration.previous,
         replicas: Vec::new(),
+        data_loss_recovery: None,
     };
     let mut operation_intent = intent(
         &fixture.preview,
@@ -659,6 +661,7 @@ async fn public_v1_data_loss_replay_uses_attached_capability() {
 
     let fixture = Fixture::public_v1().await;
     let configuration = configuration(3);
+    let epoch = configuration.current.epoch;
     let lifecycle = PublicLifecycleInput {
         recipe: PublicLifecycleRecipe::InitialPrimary,
         replica: replica_identity(),
@@ -667,6 +670,13 @@ async fn public_v1_data_loss_replay_uses_attached_capability() {
         current: configuration.current,
         previous: configuration.previous,
         replicas: Vec::new(),
+        data_loss_recovery: Some(public_v1_data_loss_recovery(
+            &fixture.preview,
+            "convergent-data-loss",
+            3,
+            epoch,
+            DataLossReplay::Convergent,
+        )),
     };
     let mut operation_intent = intent(
         &fixture.preview,
@@ -736,6 +746,501 @@ async fn public_v1_data_loss_replay_uses_attached_capability() {
 }
 
 #[tokio::test]
+async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
+    use crate::protocol::public_operations::{
+        DataLossAttempt, DataLossRenewalDecision, DataLossReplay, ProcessAttemptContext,
+        PublicDataLossRecoveryInput, PublicOperationReplayDisposition,
+    };
+    use crate::protocol::types::ReplicatorCreationId;
+
+    async fn seed_ambiguous_attempt(
+        replay: DataLossReplay,
+    ) -> (
+        tempfile::TempDir,
+        Arc<SqliteStore>,
+        PublicOperationPreviewIdentity,
+        PublicDataLossRecoveryInput,
+    ) {
+        let preview = PublicOperationPreviewIdentity::public_v1(430);
+        let (directory, _path, store) = durable_preview_store(&preview);
+        let configuration = configuration(3);
+        let recovery = public_v1_data_loss_recovery(
+            &preview,
+            "attempt-1",
+            3,
+            configuration.current.epoch,
+            replay,
+        );
+        let lifecycle = PublicLifecycleInput {
+            recipe: PublicLifecycleRecipe::InitialPrimary,
+            replica: replica_identity(),
+            epoch: configuration.current.epoch,
+            possible_data_loss: PossibleDataLossIntent::Possible,
+            current: configuration.current,
+            previous: configuration.previous,
+            replicas: Vec::new(),
+            data_loss_recovery: Some(recovery.clone()),
+        };
+        let mut first = intent(
+            &preview,
+            "attempt-1",
+            3,
+            PublicOperationClass::Authority,
+            "session-1",
+        );
+        first.input_digest = lifecycle.digest();
+        first.replay_disposition = PublicOperationReplayDisposition::DataLoss(replay);
+        first.lifecycle = Some(lifecycle);
+        store
+            .begin_public_operation(&first, &[], &[])
+            .await
+            .unwrap();
+        store
+            .advance_public_operation(
+                &first.operation_id,
+                first.revision,
+                &first.process_session_id,
+                PublicOperationStage::Ready,
+                PublicOperationStage::Running,
+                None,
+            )
+            .await
+            .unwrap();
+        for (index, outcome) in [
+            PublicInstructionOutcome::Done,
+            PublicInstructionOutcome::ApplicationRole(None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let instruction = public_lifecycle::operation_instructions(&first)[index];
+            store
+                .public_instruction(&first, index, instruction, None)
+                .await
+                .unwrap();
+            store
+                .public_instruction(&first, index, instruction, Some(outcome))
+                .await
+                .unwrap();
+        }
+        store
+            .public_instruction(&first, 2, PublicInstruction::DataLoss, None)
+            .await
+            .unwrap();
+        store
+            .advance_public_operation(
+                &first.operation_id,
+                first.revision,
+                &first.process_session_id,
+                PublicOperationStage::Running,
+                PublicOperationStage::ContainmentPending,
+                Some(PublicOperationDisposition::Ambiguous(
+                    "predecessor process exited".into(),
+                )),
+            )
+            .await
+            .unwrap();
+        (directory, store, preview, recovery)
+    }
+
+    fn successor(
+        preview: &PublicOperationPreviewIdentity,
+        recovery: &PublicDataLossRecoveryInput,
+        replay: DataLossReplay,
+        configuration_number: i64,
+    ) -> PublicOperationIntent {
+        let configuration = configuration(configuration_number);
+        let mut recovery = recovery.clone();
+        recovery.attempt = DataLossAttempt {
+            authorization_id: recovery.authorization.authorization_id.clone(),
+            attempt_id: OperationId::new("attempt-2"),
+            process: ProcessAttemptContext {
+                process_session_id: ProcessSessionId::new("session-2"),
+                replicator_creation_id: ReplicatorCreationId::new("creation-2"),
+                catch_up_specific_quorum: true,
+                data_loss_replay: replay,
+                epoch: configuration.current.epoch,
+                attempt_revision: 4,
+            },
+        };
+        let lifecycle = PublicLifecycleInput {
+            recipe: PublicLifecycleRecipe::InitialPrimary,
+            replica: replica_identity(),
+            epoch: configuration.current.epoch,
+            possible_data_loss: PossibleDataLossIntent::Possible,
+            current: configuration.current,
+            previous: configuration.previous,
+            replicas: Vec::new(),
+            data_loss_recovery: Some(recovery.clone()),
+        };
+        let mut intent = intent(
+            preview,
+            "attempt-2",
+            4,
+            PublicOperationClass::Authority,
+            "session-2",
+        );
+        intent.input_digest = lifecycle.digest();
+        intent.replay_disposition =
+            PublicOperationReplayDisposition::DataLoss(recovery.authorization.replay_disposition);
+        intent.lifecycle = Some(lifecycle);
+        intent
+    }
+
+    let (_directory, store, preview, recovery) =
+        seed_ambiguous_attempt(DataLossReplay::Convergent).await;
+    let registry = PartitionOperationRegistry::new(
+        store.clone(),
+        preview.clone(),
+        ProcessSessionId::new("session-2"),
+    )
+    .unwrap();
+    assert!(
+        registry
+            .admit(successor(
+                &preview,
+                &recovery,
+                DataLossReplay::Convergent,
+                3,
+            ))
+            .await
+            .is_err()
+    );
+    let renewed = registry
+        .admit(successor(
+            &preview,
+            &recovery,
+            DataLossReplay::Convergent,
+            4,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(renewed.snapshot().stage, PublicOperationStage::Ready);
+    let state = store
+        .load_state()
+        .await
+        .unwrap()
+        .public_operation_preview
+        .unwrap();
+    assert_eq!(
+        state.data_loss_recovery.unwrap().attempt.attempt_id,
+        OperationId::new("attempt-2")
+    );
+    assert!(
+        state
+            .history_barriers
+            .contains_key(&OperationId::new("attempt-2"))
+    );
+    assert!(
+        !state
+            .history_barriers
+            .contains_key(&OperationId::new("attempt-1"))
+    );
+
+    let (_directory, store, preview, recovery) =
+        seed_ambiguous_attempt(DataLossReplay::Convergent).await;
+    let registry = PartitionOperationRegistry::new(
+        store.clone(),
+        preview.clone(),
+        ProcessSessionId::new("session-2"),
+    )
+    .unwrap();
+    let retired = registry
+        .admit(successor(
+            &preview,
+            &recovery,
+            DataLossReplay::ReplaceOnAmbiguity,
+            4,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retired.snapshot().stage, PublicOperationStage::Completed);
+    assert_eq!(
+        DataLossAttempt::renewal_decision(
+            &recovery.authorization,
+            &recovery.attempt,
+            &retired
+                .intent()
+                .lifecycle
+                .unwrap()
+                .data_loss_recovery
+                .unwrap()
+                .attempt,
+            true,
+        ),
+        DataLossRenewalDecision::RetireWithoutCallback
+    );
+
+    let (_directory, store, preview, recovery) =
+        seed_ambiguous_attempt(DataLossReplay::ReplaceOnAmbiguity).await;
+    let registry = PartitionOperationRegistry::new(
+        store.clone(),
+        preview.clone(),
+        ProcessSessionId::new("session-2"),
+    )
+    .unwrap();
+    let terminal = registry
+        .admit(successor(
+            &preview,
+            &recovery,
+            DataLossReplay::Convergent,
+            4,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(terminal.snapshot().stage, PublicOperationStage::Completed);
+    assert!(matches!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .public_operation_preview
+            .unwrap()
+            .data_loss_recovery,
+        Some(crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+            stage: crate::protocol::public_operations::PublicDataLossRecoveryStage::ReplacementRequired,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
+    use crate::protocol::public_operations::{
+        DataLossReplay, PublicDataLossRecoveryStage, PublicOperationReplayDisposition,
+        PublicProgress, PublicProgressRole,
+    };
+
+    for changed in [false, true] {
+        let fixture = Fixture::public_v1().await;
+        *fixture.trace.data_loss.lock().unwrap() = Some(Ok(changed));
+        let configuration = configuration(3);
+        let epoch = configuration.current.epoch;
+        let recovery = public_v1_data_loss_recovery(
+            &fixture.preview,
+            if changed {
+                "data-loss-true"
+            } else {
+                "data-loss-false"
+            },
+            3,
+            epoch,
+            DataLossReplay::ReplaceOnAmbiguity,
+        );
+        let predecessor = recovery.authorization.predecessor.clone();
+        let proposed = recovery.authorization.proposed.clone();
+        let attempt_id = recovery.attempt.attempt_id.clone();
+        let lifecycle = PublicLifecycleInput {
+            recipe: PublicLifecycleRecipe::InitialPrimary,
+            replica: replica_identity(),
+            epoch,
+            possible_data_loss: PossibleDataLossIntent::Possible,
+            current: configuration.current,
+            previous: configuration.previous,
+            replicas: Vec::new(),
+            data_loss_recovery: Some(recovery),
+        };
+        let mut operation_intent = intent(
+            &fixture.preview,
+            attempt_id.as_str(),
+            3,
+            PublicOperationClass::Authority,
+            "session-1",
+        );
+        operation_intent.input_digest = lifecycle.digest();
+        operation_intent.replay_disposition =
+            PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity);
+        operation_intent.lifecycle = Some(lifecycle);
+        terminal(&fixture.launch(operation_intent, None).await).await;
+        let preview = fixture
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .public_operation_preview
+            .unwrap();
+        assert_eq!(preview.history, Some(proposed));
+        assert!(preview.history_barriers.is_empty());
+        assert!(!preview.writes_revoked);
+        assert!(matches!(
+            preview.data_loss_recovery,
+            Some(
+                crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                    stage: PublicDataLossRecoveryStage::Admitted,
+                    observed_progress: Some(_),
+                    ..
+                }
+            )
+        ));
+        let report = public_lifecycle::public_v1_report(
+            fixture.store.as_ref(),
+            &fixture.preview,
+            public_lifecycle::PublicV1ReportProjection {
+                process_session_id: ProcessSessionId::new("session-1"),
+                report_sequence: 1,
+                role: ReplicaRole::Primary,
+                read_status: AccessStatus::Granted,
+                write_status: AccessStatus::Granted,
+                progress: PublicProgress {
+                    role: PublicProgressRole::Primary,
+                    first: 0,
+                    last: 0,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let wire = crate::control::public_v1_agent_status_to_proto(&report);
+        assert_eq!(
+            crate::control::normalize_public_v1_agent_status_report(wire.clone()).unwrap(),
+            report
+        );
+        let mut crossed_history = wire;
+        let history = crossed_history
+            .public_v1
+            .as_mut()
+            .unwrap()
+            .history
+            .as_mut()
+            .unwrap();
+        history.history_id = predecessor.history_id.as_str().to_string();
+        history.data_loss_number = predecessor.data_loss_number;
+        assert!(crate::control::normalize_public_v1_agent_status_report(crossed_history).is_err());
+        fixture.owner.shutdown().await.unwrap();
+    }
+
+    let fixture = Fixture::public_v1().await;
+    let ambiguous_configuration = configuration(3);
+    let epoch = ambiguous_configuration.current.epoch;
+    let recovery = public_v1_data_loss_recovery(
+        &fixture.preview,
+        "data-loss-ambiguous-v1",
+        3,
+        epoch,
+        DataLossReplay::ReplaceOnAmbiguity,
+    );
+    let predecessor = recovery.authorization.predecessor.clone();
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch,
+        possible_data_loss: PossibleDataLossIntent::Possible,
+        current: ambiguous_configuration.current,
+        previous: ambiguous_configuration.previous,
+        replicas: Vec::new(),
+        data_loss_recovery: Some(recovery),
+    };
+    let mut operation_intent = intent(
+        &fixture.preview,
+        "data-loss-ambiguous-v1",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    operation_intent.input_digest = lifecycle.digest();
+    operation_intent.replay_disposition =
+        PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity);
+    operation_intent.lifecycle = Some(lifecycle);
+    let barrier = cut(PublicCutPosition::CallbackSuccess, 2);
+    let operation = fixture
+        .launch(operation_intent, Some(barrier.clone()))
+        .await;
+    reached(&barrier).await;
+    operation.crash_root().await;
+    fixture.owner.registry().recover_unowned().await.unwrap();
+    let pending = wait_for_stage(&operation, PublicOperationStage::ContainmentPending).await;
+    assert!(matches!(
+        pending.disposition,
+        Some(PublicOperationDisposition::Ambiguous(_))
+    ));
+    let preview = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .public_operation_preview
+        .unwrap();
+    assert_eq!(preview.history, Some(predecessor));
+    assert!(preview.writes_revoked);
+    assert!(matches!(
+        preview.data_loss_recovery,
+        Some(
+            crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                stage: PublicDataLossRecoveryStage::CallbackProcessing,
+                ..
+            }
+        )
+    ));
+    fixture.owner.registry().recover_unowned().await.unwrap();
+    wait_for_stage(&operation, PublicOperationStage::Completed).await;
+    fixture.owner.shutdown().await.unwrap();
+
+    let fixture = Fixture::public_v1().await;
+    *fixture.trace.data_loss.lock().unwrap() = Some(Err("typed data-loss failure".into()));
+    let configuration = configuration(3);
+    let epoch = configuration.current.epoch;
+    let recovery = public_v1_data_loss_recovery(
+        &fixture.preview,
+        "data-loss-error-v1",
+        3,
+        epoch,
+        DataLossReplay::ReplaceOnAmbiguity,
+    );
+    let predecessor = recovery.authorization.predecessor.clone();
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch,
+        possible_data_loss: PossibleDataLossIntent::Possible,
+        current: configuration.current,
+        previous: configuration.previous,
+        replicas: Vec::new(),
+        data_loss_recovery: Some(recovery),
+    };
+    let mut operation_intent = intent(
+        &fixture.preview,
+        "data-loss-error-v1",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    operation_intent.input_digest = lifecycle.digest();
+    operation_intent.replay_disposition =
+        PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity);
+    operation_intent.lifecycle = Some(lifecycle);
+    let failed = fixture.launch(operation_intent, None).await;
+    let record = tokio::time::timeout(Duration::from_secs(2), failed.wait_for_terminal())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        record.disposition,
+        Some(PublicOperationDisposition::Failed(ref message))
+            if message.contains("typed data-loss failure")
+    ));
+    let preview = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .public_operation_preview
+        .unwrap();
+    assert_eq!(preview.history, Some(predecessor));
+    assert!(!preview.history_barriers.is_empty());
+    assert!(preview.writes_revoked);
+    assert!(matches!(
+        preview.data_loss_recovery,
+        Some(
+            crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                stage: PublicDataLossRecoveryStage::Failed,
+                ..
+            }
+        )
+    ));
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
     use crate::protocol::public_operations::{
         DataLossReplay, LocalProviderRebuildRequired, ProviderReplicaIdentity,
@@ -753,6 +1258,7 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
         },
     ));
     let configuration = configuration(3);
+    let epoch = configuration.current.epoch;
     let lifecycle = PublicLifecycleInput {
         recipe: PublicLifecycleRecipe::InitialPrimary,
         replica: replica_identity(),
@@ -761,6 +1267,13 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
         current: configuration.current,
         previous: configuration.previous,
         replicas: Vec::new(),
+        data_loss_recovery: Some(public_v1_data_loss_recovery(
+            &fixture.preview,
+            "public-v1-local-rebuild",
+            3,
+            epoch,
+            DataLossReplay::ReplaceOnAmbiguity,
+        )),
     };
     let mut operation_intent = intent(
         &fixture.preview,
@@ -878,9 +1391,50 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
 
     let wire = crate::control::public_v1_agent_status_to_proto(&report);
     assert_eq!(
-        crate::control::normalize_public_v1_agent_status_report(wire).unwrap(),
+        crate::control::normalize_public_v1_agent_status_report(wire.clone()).unwrap(),
         report
     );
+    let mut crossed_history = wire.clone();
+    crossed_history
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .predecessor_history
+        .as_mut()
+        .unwrap()
+        .history_id = "crossed-history".into();
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_history).is_err());
+
+    let mut crossed_storage = wire.clone();
+    crossed_storage
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .provisional_primary
+        .as_mut()
+        .unwrap()
+        .storage_generation = "crossed-storage".into();
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_storage).is_err());
+
+    let mut crossed_session = wire;
+    crossed_session
+        .public_v1
+        .as_mut()
+        .unwrap()
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .attempt
+        .as_mut()
+        .unwrap()
+        .process_session_id = "crossed-session".into();
+    assert!(crate::control::normalize_public_v1_agent_status_report(crossed_session).is_err());
     fixture.owner.shutdown().await.unwrap();
 }
 
@@ -986,7 +1540,7 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
     reject_consistent_wrong_source(wrong_session);
 
     let report = PublicV1AgentReport {
-        identity: preview,
+        identity: preview.clone(),
         resource_uid: ResourceUid::new("resource-1"),
         replica: replica_identity(),
         process_session_id: ProcessSessionId::new("session-1"),
@@ -994,11 +1548,14 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         role: ReplicaRole::Primary,
         read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,
+        history: public_v1_history(&preview).1,
+        storage_incarnation: public_v1_storage_incarnation(),
         progress: PublicProgress {
             role: PublicProgressRole::Recovery,
             first: 0,
             last: 0,
         },
+        data_loss_recovery: None,
         completed_operations: vec![PublicV1OperationCompletion {
             operation_id: operation.operation_id,
             revision: operation.revision,
@@ -1186,6 +1743,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
         current: expanded.current,
         previous: expanded.previous,
         replicas: expanded.replicas,
+        data_loss_recovery: None,
     };
     let mut authority = intent(
         &fixture.preview,

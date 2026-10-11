@@ -1,4 +1,6 @@
 fn main() {
+    println!("cargo:rerun-if-changed=proto/kuberic.proto");
+    println!("cargo:rerun-if-changed=proto/replication.proto");
     println!("cargo:rerun-if-env-changed=KUBERIC_WORKSPACE_TESTS");
     println!("cargo:rustc-check-cfg=cfg(kuberic_workspace_tests)");
     if std::env::var_os("KUBERIC_WORKSPACE_TESTS").is_some() {

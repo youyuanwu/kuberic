@@ -4,8 +4,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, OperationId, PodUid, ProcessSessionId,
-    PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole, ResourceUid,
+    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, HistoryContext, OperationId, PodUid,
+    ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole, ReplicaStorageIdentity,
+    ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, derive_data_loss_history,
 };
 
 pub const PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32 = 10;
@@ -406,6 +407,19 @@ impl PublicOperationIntent {
                         return Err("data-loss lifecycle requires captured replay capability");
                     }
                     _ => {}
+                }
+                if let Some(recovery) = &input.data_loss_recovery
+                    && (recovery.attempt.process.process_session_id != self.process_session_id
+                        || recovery.attempt.attempt_id != self.operation_id
+                        || recovery.attempt.process.attempt_revision != self.revision
+                        || self.replay_disposition
+                            != PublicOperationReplayDisposition::DataLoss(
+                                recovery.authorization.replay_disposition,
+                            ))
+                {
+                    return Err(
+                        "data-loss attempt session or replay differs from captured operation",
+                    );
                 }
             }
         }
@@ -864,6 +878,241 @@ pub enum PublicLifecycleRecipe {
     SecondaryEpochAdvance,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ProviderProgressReset {
+    Preserve,
+    ResetToEmpty,
+    ReplaceIncarnation {
+        retired: ReplicaStorageIncarnationContext,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DataLossAuthorization {
+    pub authorization_id: OperationId,
+    pub predecessor: HistoryContext,
+    pub proposed: HistoryContext,
+    pub provisional_primary: ReplicaStorageIncarnationContext,
+    pub reset_scope: ProviderProgressReset,
+    pub replay_disposition: DataLossReplay,
+}
+
+impl DataLossAuthorization {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.predecessor.validate()?;
+        self.proposed.validate()?;
+        self.provisional_primary.validate()?;
+        if self.authorization_id.is_empty()
+            || self.predecessor.resource_uid != self.proposed.resource_uid
+            || self.predecessor.protocol_generation != self.proposed.protocol_generation
+            || self.proposed
+                != derive_data_loss_history(
+                    &self.authorization_id,
+                    &self.predecessor,
+                    self.proposed.data_loss_number,
+                    &self.provisional_primary,
+                )?
+        {
+            return Err("data-loss authorization does not name the exact successor history");
+        }
+        if let ProviderProgressReset::ReplaceIncarnation { retired } = &self.reset_scope {
+            retired.validate()?;
+            if retired == &self.provisional_primary {
+                return Err("data-loss replacement scope cannot retire its provisional primary");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessAttemptContext {
+    pub process_session_id: ProcessSessionId,
+    pub replicator_creation_id: ReplicatorCreationId,
+    pub catch_up_specific_quorum: bool,
+    pub data_loss_replay: DataLossReplay,
+    pub epoch: Epoch,
+    pub attempt_revision: u64,
+}
+
+impl ProcessAttemptContext {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.process_session_id.is_empty()
+            || self.replicator_creation_id.is_empty()
+            || self.epoch.data_loss_number < 0
+            || self.epoch.configuration_number < 0
+            || self.attempt_revision == 0
+        {
+            return Err("process attempt context is incomplete");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DataLossAttempt {
+    pub authorization_id: OperationId,
+    pub attempt_id: OperationId,
+    pub process: ProcessAttemptContext,
+}
+
+impl DataLossAttempt {
+    pub fn validate_for(
+        &self,
+        authorization: &DataLossAuthorization,
+        minimum_configuration_number: i64,
+    ) -> Result<(), &'static str> {
+        self.process.validate()?;
+        if self.authorization_id != authorization.authorization_id
+            || self.attempt_id.is_empty()
+            || self.process.epoch.data_loss_number != authorization.proposed.data_loss_number
+            || self.process.epoch.configuration_number <= minimum_configuration_number
+        {
+            return Err("data-loss attempt differs from its logical authorization");
+        }
+        Ok(())
+    }
+
+    pub fn renewal_decision(
+        authorization: &DataLossAuthorization,
+        predecessor: &Self,
+        successor: &Self,
+        predecessor_contained: bool,
+    ) -> DataLossRenewalDecision {
+        if !predecessor_contained
+            || predecessor.authorization_id != authorization.authorization_id
+            || successor.authorization_id != authorization.authorization_id
+            || successor.attempt_id == predecessor.attempt_id
+            || successor.process.process_session_id == predecessor.process.process_session_id
+            || successor.process.epoch.data_loss_number != authorization.proposed.data_loss_number
+            || successor.process.epoch.configuration_number
+                <= predecessor.process.epoch.configuration_number
+        {
+            return DataLossRenewalDecision::Terminal;
+        }
+        match authorization.replay_disposition {
+            DataLossReplay::Convergent
+                if successor.process.data_loss_replay == DataLossReplay::Convergent =>
+            {
+                DataLossRenewalDecision::InvokeCallback
+            }
+            DataLossReplay::Convergent => DataLossRenewalDecision::RetireWithoutCallback,
+            DataLossReplay::ReplaceOnAmbiguity => DataLossRenewalDecision::Terminal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DataLossRenewalDecision {
+    InvokeCallback,
+    RetireWithoutCallback,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicDataLossRecoveryInput {
+    pub authorization: DataLossAuthorization,
+    pub attempt: DataLossAttempt,
+}
+
+impl PublicDataLossRecoveryInput {
+    fn validate(&self, previous_configuration_number: i64) -> Result<(), &'static str> {
+        self.authorization.validate()?;
+        self.attempt
+            .validate_for(&self.authorization, previous_configuration_number)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicDataLossRecoveryStage {
+    Authorized,
+    Invalidated,
+    CallbackProcessing,
+    HistoryPending,
+    ConfigurationPending,
+    Admitted,
+    Failed,
+    ReplacementRequired,
+    Retired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicDataLossRecoveryStatus {
+    pub authorization_id: OperationId,
+    pub attempt: DataLossAttempt,
+    pub predecessor_history: HistoryContext,
+    pub proposed_history: HistoryContext,
+    pub provisional_primary: ReplicaStorageIncarnationContext,
+    pub stage: PublicDataLossRecoveryStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_progress: Option<PublicProgress>,
+}
+
+impl PublicDataLossRecoveryStatus {
+    fn validate_for_report(
+        &self,
+        identity: &PublicOperationPreviewIdentity,
+        resource_uid: &ResourceUid,
+        replica: &ReplicaIdentity,
+        storage_incarnation: &ReplicaStorageIncarnationContext,
+        process_session_id: &ProcessSessionId,
+        current_history: &HistoryContext,
+    ) -> Result<(), &'static str> {
+        self.predecessor_history.validate()?;
+        self.proposed_history.validate()?;
+        self.provisional_primary.validate()?;
+        self.attempt.process.validate()?;
+        if self.authorization_id.is_empty()
+            || self.attempt.attempt_id.is_empty()
+            || self.authorization_id != self.attempt.authorization_id
+            || self.predecessor_history.resource_uid != *resource_uid
+            || self.predecessor_history.protocol_generation.value() != identity.generation
+            || self.proposed_history.resource_uid != *resource_uid
+            || self.proposed_history.protocol_generation.value() != identity.generation
+            || self.proposed_history.data_loss_number
+                != self.predecessor_history.data_loss_number + 1
+            || self.proposed_history
+                != derive_data_loss_history(
+                    &self.authorization_id,
+                    &self.predecessor_history,
+                    self.proposed_history.data_loss_number,
+                    &self.provisional_primary,
+                )?
+            || self.attempt.process.process_session_id != *process_session_id
+            || self.provisional_primary != *storage_incarnation
+            || self.provisional_primary.replica != *replica
+        {
+            return Err("public-v1 recovery status differs from report authority");
+        }
+        if self.stage == PublicDataLossRecoveryStage::Admitted {
+            if &self.proposed_history != current_history {
+                return Err("admitted recovery history differs from current report history");
+            }
+        } else if &self.predecessor_history != current_history {
+            return Err("pending recovery history differs from current report history");
+        }
+        if let Some(progress) = &self.observed_progress {
+            progress.validate(
+                ReplicaRole::None,
+                AccessStatus::NotPrimary,
+                AccessStatus::NotPrimary,
+            )?;
+            if progress.role != PublicProgressRole::Recovery {
+                return Err("data-loss recovery progress is not election-only");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicLifecycleInput {
@@ -875,6 +1124,8 @@ pub struct PublicLifecycleInput {
     pub previous: Option<ConfigurationDescriptor>,
     #[serde(default)]
     pub replicas: Vec<PublicReplicaDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_loss_recovery: Option<PublicDataLossRecoveryInput>,
 }
 
 impl PublicLifecycleInput {
@@ -897,6 +1148,9 @@ impl PublicLifecycleInput {
         });
         encoder.vec(&self.replicas, |encoder, replica| {
             encoder.public_replica(replica);
+        });
+        encoder.option(self.data_loss_recovery.as_ref(), |encoder, recovery| {
+            encoder.data_loss_recovery(recovery)
         });
         CanonicalOperationInputDigest::V1(CanonicalOperationInputDigestV1::from_bytes(
             &encoder.finish(),
@@ -970,6 +1224,30 @@ impl PublicLifecycleInput {
         }
         if self.recipe == PublicLifecycleRecipe::FailoverPromotion && self.previous.is_none() {
             return Err("failover requires frozen previous configuration");
+        }
+        match (public_v1, self.possible_data_loss, &self.data_loss_recovery) {
+            (true, PossibleDataLossIntent::Possible, Some(recovery)) => {
+                let previous_configuration_number = self
+                    .previous
+                    .as_ref()
+                    .map_or(-1, |previous| previous.epoch.configuration_number);
+                recovery.validate(previous_configuration_number)?;
+                if recovery.authorization.provisional_primary.replica != self.replica
+                    || recovery.attempt.process.epoch != self.epoch
+                {
+                    return Err("data-loss recovery target or attempt epoch changed");
+                }
+            }
+            (true, PossibleDataLossIntent::Possible, None) => {
+                return Err("public-v1 data loss requires typed authorization");
+            }
+            (_, PossibleDataLossIntent::NotPossible, Some(_)) => {
+                return Err("ordinary lifecycle cannot carry data-loss authorization");
+            }
+            (false, _, Some(_)) => {
+                return Err("protocol-10 lifecycle cannot carry public-v1 recovery");
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1271,7 +1549,11 @@ pub struct PublicV1AgentReport {
     pub role: ReplicaRole,
     pub read_status: AccessStatus,
     pub write_status: AccessStatus,
+    pub history: HistoryContext,
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub progress: PublicProgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
     #[serde(default)]
     pub completed_operations: Vec<PublicV1OperationCompletion>,
     #[serde(default)]
@@ -1288,8 +1570,32 @@ impl PublicV1AgentReport {
             return Err("invalid public-v1 report identity");
         }
         validate_exact_replica_identity(&self.replica)?;
+        self.history.validate()?;
+        self.storage_incarnation.validate()?;
+        if self.history.resource_uid != self.resource_uid
+            || self.history.protocol_generation.value() != self.identity.generation
+            || self.storage_incarnation.replica != self.replica
+        {
+            return Err("public-v1 history or storage differs from report identity");
+        }
         self.progress
             .validate(self.role, self.read_status, self.write_status)?;
+        if let Some(recovery) = &self.data_loss_recovery {
+            recovery.validate_for_report(
+                &self.identity,
+                &self.resource_uid,
+                &self.replica,
+                &self.storage_incarnation,
+                &self.process_session_id,
+                &self.history,
+            )?;
+            if recovery.stage != PublicDataLossRecoveryStage::Admitted
+                && (self.read_status == AccessStatus::Granted
+                    || self.write_status == AccessStatus::Granted)
+            {
+                return Err("pending data-loss recovery cannot imply serving access");
+            }
+        }
         let mut operations = std::collections::BTreeSet::new();
         for completion in &self.completed_operations {
             completion.validate(
@@ -1376,6 +1682,10 @@ pub struct PublicV1AcceptedOperationCompletion {
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1AcceptedStatus {
     pub identity: PublicOperationPreviewIdentity,
+    pub history_initialization_id: crate::protocol::types::HistoryInitializationId,
+    pub history: HistoryContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
     #[serde(default)]
     pub completed_operations: Vec<PublicV1AcceptedOperationCompletion>,
     #[serde(default)]
@@ -1455,6 +1765,10 @@ impl CanonicalEncoder {
     }
 
     fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
@@ -1574,5 +1888,60 @@ impl CanonicalEncoder {
         self.option(build.authorization.as_ref(), |encoder, authorization| {
             encoder.authorization(authorization);
         });
+    }
+
+    fn history(&mut self, history: &HistoryContext) {
+        self.string(history.resource_uid.as_str());
+        self.u64(history.protocol_generation.value());
+        self.string(history.history_id.as_str());
+        self.i64(history.data_loss_number);
+    }
+
+    fn storage_incarnation(&mut self, storage: &ReplicaStorageIncarnationContext) {
+        self.replica_identity(&storage.replica);
+        match &storage.storage {
+            ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } => {
+                self.u8(1);
+                self.string(pod_uid.as_str());
+                self.string(pvc_uid.as_str());
+            }
+            ReplicaStorageIdentity::Volatile { identity } => {
+                self.u8(2);
+                self.string(identity);
+            }
+        }
+        self.string(storage.storage_generation.as_str());
+    }
+
+    fn data_loss_recovery(&mut self, recovery: &PublicDataLossRecoveryInput) {
+        let authorization = &recovery.authorization;
+        self.string(authorization.authorization_id.as_str());
+        self.history(&authorization.predecessor);
+        self.history(&authorization.proposed);
+        self.storage_incarnation(&authorization.provisional_primary);
+        match &authorization.reset_scope {
+            ProviderProgressReset::Preserve => self.u8(1),
+            ProviderProgressReset::ResetToEmpty => self.u8(2),
+            ProviderProgressReset::ReplaceIncarnation { retired } => {
+                self.u8(3);
+                self.storage_incarnation(retired);
+            }
+        }
+        self.u8(match authorization.replay_disposition {
+            DataLossReplay::Convergent => 1,
+            DataLossReplay::ReplaceOnAmbiguity => 2,
+        });
+        let attempt = &recovery.attempt;
+        self.string(attempt.authorization_id.as_str());
+        self.string(attempt.attempt_id.as_str());
+        self.string(attempt.process.process_session_id.as_str());
+        self.string(attempt.process.replicator_creation_id.as_str());
+        self.bool(attempt.process.catch_up_specific_quorum);
+        self.u8(match attempt.process.data_loss_replay {
+            DataLossReplay::Convergent => 1,
+            DataLossReplay::ReplaceOnAmbiguity => 2,
+        });
+        self.epoch(attempt.process.epoch);
+        self.u64(attempt.process.attempt_revision);
     }
 }

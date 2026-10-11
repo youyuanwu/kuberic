@@ -2444,6 +2444,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
         TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
         TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
+        TransitionKind::DataLossRecovery => proto::TransitionKind::DataLossRecovery,
     }
 }
 

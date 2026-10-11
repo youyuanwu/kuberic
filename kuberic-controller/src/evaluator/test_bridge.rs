@@ -15,6 +15,12 @@ pub use super::public_lifecycle::{
     PreviewAcceptedStatus, PreviewServiceLocationPlan, PreviewServiceLocationStage,
     PreviewTransition, ServiceLocationProjection, evaluate_service_location, plan_public_lifecycle,
 };
+pub use super::public_v1_history::{
+    compare_election_progress as compare_public_v1_election_progress,
+    ensure_bootstrap_history as ensure_public_v1_bootstrap_history,
+    invalidate_for_data_loss as invalidate_public_v1_for_data_loss,
+    is_provisional_primary as is_public_v1_provisional_primary,
+};
 pub use crate::cluster_api::{PreviewServiceApi, preview_service_matches, preview_service_update};
 pub use crate::executor::execute_preview_service_location;
 pub use k8s_openapi::api::core::v1::Service as PreviewWriteService;

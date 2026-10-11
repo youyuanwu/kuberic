@@ -834,14 +834,59 @@ impl PartitionOperationRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        if !intent.class.is_terminal()
+        let has_history_barrier = !intent.class.is_terminal()
             && self
                 .store
                 .load_state()
                 .await?
                 .public_operation_preview
-                .is_some_and(|preview| !preview.history_barriers.is_empty())
+                .is_some_and(|preview| !preview.history_barriers.is_empty());
+        if has_history_barrier
+            && intent.preview.is_public_v1()
+            && intent.lifecycle.as_ref().is_some_and(|input| {
+                input.possible_data_loss
+                    == crate::protocol::public_operations::PossibleDataLossIntent::Possible
+                    && input.data_loss_recovery.is_some()
+            })
         {
+            for operation in &existing {
+                operation
+                    .recover_if_needed(&self.process_session_id)
+                    .await?;
+            }
+            let renewed = self
+                .store
+                .renew_public_v1_data_loss_attempt(&intent)
+                .await?;
+            if let Some(predecessor) = existing.iter().find(|operation| {
+                operation.intent().operation_id == renewed.predecessor.intent.operation_id
+            }) {
+                predecessor.record.send_replace(renewed.predecessor);
+                predecessor.recovery_complete();
+            }
+            if let Some(successor) = renewed.successor {
+                let operation = Arc::new(PartitionOperation::new(
+                    self.store.clone(),
+                    successor,
+                    self.revision.clone(),
+                    false,
+                    self.shutting_down.clone(),
+                ));
+                self.state
+                    .lock()
+                    .await
+                    .operations
+                    .insert(intent.operation_id.clone(), operation.clone());
+                self.bump_revision();
+                drop(admission);
+                return Ok(operation);
+            }
+            return Err(HostError::CommandRejected(format!(
+                "data-loss renewal is terminal: {:?}",
+                renewed.decision
+            )));
+        }
+        if has_history_barrier {
             // A rejected successor may contain its predecessor, but never acquires
             // authority or removes the logical history-admission barrier.
             drop(admission);

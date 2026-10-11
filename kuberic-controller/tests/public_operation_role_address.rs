@@ -135,6 +135,7 @@ fn fixture(
             ),
             previous: None,
             replicas: Vec::new(),
+            data_loss_recovery: None,
         },
         PreviewTransition::Ordinary,
     )

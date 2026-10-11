@@ -4,12 +4,16 @@ use crate::authority::{DurableBuildProgress, RetiredAuthority};
 use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
+use crate::protocol::public_operations::{
+    DataLossAuthorization, PublicDataLossRecoveryStatus, PublicOperationIntent,
+    PublicOperationPreviewIdentity,
+};
 use crate::protocol::public_operations::{PreviewLifecycleBinding, RestartActionRecord};
-use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationPreviewIdentity};
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
-    InitializationId, LoadMetric, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaIdentity,
-    ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, SecondaryRemovalEvidence,
+    HistoryContext, HistoryInitializationId, InitializationId, LoadMetric, OperationId, PodUid,
+    ProvisioningIntent, PvcUid, ReplicaIdentity, ReplicaRole, ReplicaStorageIncarnationContext,
+    ResourceUid, ScaleUpConfigurationEvidence, SecondaryRemovalEvidence,
     SecondaryRemovalPreparation, SecondaryScaleDownCleanup, SwitchoverHandoff,
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +23,7 @@ use std::path::PathBuf;
 // Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
-pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 8;
+pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -150,6 +154,7 @@ pub(crate) enum PublicInstruction {
     CurrentConfiguration,
     CatchUpConfiguration,
     CatchUp,
+    HistoryAdmission,
     Access,
 }
 
@@ -207,6 +212,16 @@ pub(crate) struct PublicOperationPreviewState {
     #[serde(default)]
     pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
     #[serde(default)]
+    pub(crate) history_initialization_id: Option<HistoryInitializationId>,
+    #[serde(default)]
+    pub(crate) history: Option<HistoryContext>,
+    #[serde(default)]
+    pub(crate) storage_incarnation: Option<ReplicaStorageIncarnationContext>,
+    #[serde(default)]
+    pub(crate) data_loss_authorization: Option<DataLossAuthorization>,
+    #[serde(default)]
+    pub(crate) data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
+    #[serde(default)]
     pub(crate) current_operation: Option<OperationId>,
     #[serde(default)]
     pub(crate) current_topology_operation: Option<OperationId>,
@@ -232,6 +247,11 @@ impl PublicOperationPreviewState {
             restart_action: None,
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
+            history_initialization_id: None,
+            history: None,
+            storage_incarnation: None,
+            data_loss_authorization: None,
+            data_loss_recovery: None,
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),
@@ -248,6 +268,11 @@ impl PublicOperationPreviewState {
             restart_action: None,
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
+            history_initialization_id: None,
+            history: None,
+            storage_incarnation: None,
+            data_loss_authorization: None,
+            data_loss_recovery: None,
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),

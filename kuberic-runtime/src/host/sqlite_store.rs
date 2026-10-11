@@ -15,9 +15,11 @@ use crate::effects::{
 use crate::error::{ContractError, ContractResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use crate::protocol::public_operations::PreviewLifecycleBinding;
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::public_operations::PublicOperationIntent;
 use crate::protocol::public_operations::PublicOperationPreviewIdentity;
+#[cfg(any(test, feature = "testing"))]
+use crate::protocol::public_operations::{
+    DataLossRenewalDecision, PossibleDataLossIntent, PublicOperationIntent,
+};
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 use crate::protocol::public_operations::{
     PublicFaultAction, RestartActionRecord, RestartActionStage,
@@ -42,9 +44,9 @@ use crate::host::state::{
     PublicOperationContainment, PublicOperationDisposition, PublicOperationRecord,
     PublicOperationStage,
 };
-#[cfg(any(test, feature = "testing"))]
-use crate::host::store::BeginPublicOperation;
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
+#[cfg(any(test, feature = "testing"))]
+use crate::host::store::{BeginPublicOperation, RenewPublicDataLossAttempt};
 
 fn switchover_receipt_matches(
     receipt: &crate::receipts::SwitchoverReceipt,
@@ -1665,6 +1667,72 @@ impl AgentStore for SqliteStore {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    async fn initialize_public_v1_history(
+        &self,
+        initialization_id: &crate::protocol::types::HistoryInitializationId,
+        history: &crate::protocol::types::HistoryContext,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<()> {
+        history
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        storage
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("public-v1 preview store required".into())
+            })?;
+            if !preview.identity.is_public_v1()
+                || initialization_id.is_empty()
+                || history.resource_uid != state.identity.resource_uid
+                || history.protocol_generation.value() != preview.identity.generation
+                || storage.replica != state.identity.local_identity
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 history initialization differs from store identity".into(),
+                ));
+            }
+            if let crate::protocol::types::ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } =
+                &storage.storage
+                && (pod_uid != &state.identity.pod_uid || pvc_uid != &state.identity.pvc_uid)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 storage incarnation differs from local storage".into(),
+                ));
+            }
+            let expected = crate::protocol::types::derive_bootstrap_history(
+                &state.identity.resource_uid,
+                crate::protocol::types::PublicProtocolGeneration::new(preview.identity.generation),
+                initialization_id,
+            );
+            if history != &expected {
+                return Err(crate::host::HostError::CommandRejected(
+                    "public-v1 bootstrap history differs from accepted initialization".into(),
+                ));
+            }
+            let existing = (
+                preview.history_initialization_id.as_ref(),
+                preview.history.as_ref(),
+                preview.storage_incarnation.as_ref(),
+            );
+            if existing.0.is_some() || existing.1.is_some() || existing.2.is_some() {
+                if existing != (Some(initialization_id), Some(history), Some(storage)) {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "public-v1 history initialization changed".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            preview.history_initialization_id = Some(initialization_id.clone());
+            preview.history = Some(history.clone());
+            preview.storage_incarnation = Some(storage.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     async fn begin_public_operation(
         &self,
         intent: &PublicOperationIntent,
@@ -1829,6 +1897,15 @@ impl AgentStore for SqliteStore {
                 _ => {}
             }
             if let Some(input) = &intent.lifecycle {
+                if intent.preview.is_public_v1()
+                    && (preview.history_initialization_id.is_none()
+                        || preview.history.is_none()
+                        || preview.storage_incarnation.is_none())
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "public-v1 lifecycle requires initialized history and storage".into(),
+                    ));
+                }
                 if input.replica != state.identity.local_identity {
                     return Err(crate::host::HostError::IdentityMismatch(
                         "lifecycle target does not match local replica".into(),
@@ -1855,6 +1932,54 @@ impl AgentStore for SqliteStore {
                 if input.possible_data_loss
                     == crate::protocol::public_operations::PossibleDataLossIntent::Possible
                 {
+                    if intent.preview.is_public_v1() {
+                        let recovery = input.data_loss_recovery.as_ref().ok_or_else(|| {
+                            crate::host::HostError::CommandRejected(
+                                "public-v1 data loss requires typed recovery".into(),
+                            )
+                        })?;
+                        if recovery.attempt.process.data_loss_replay
+                            != recovery.authorization.replay_disposition
+                        {
+                            return Err(crate::host::HostError::CommandRejected(
+                                "initial data-loss attempt lacks exact captured replay capability"
+                                    .into(),
+                            ));
+                        }
+                        if preview.history.as_ref() != Some(&recovery.authorization.predecessor)
+                            || preview.storage_incarnation.as_ref()
+                                != Some(&recovery.authorization.provisional_primary)
+                        {
+                            return Err(crate::host::HostError::IdentityMismatch(
+                                "data-loss authorization differs from current history or storage"
+                                    .into(),
+                            ));
+                        }
+                        preview.writes_revoked = true;
+                        preview.active_builds.clear();
+                        preview.absent_builds.clear();
+                        preview.current_topology_operation = None;
+                        preview.data_loss_authorization =
+                            Some(recovery.authorization.clone());
+                        preview.data_loss_recovery = Some(
+                            crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                                authorization_id: recovery
+                                    .authorization
+                                    .authorization_id
+                                    .clone(),
+                                attempt: recovery.attempt.clone(),
+                                predecessor_history: recovery.authorization.predecessor.clone(),
+                                proposed_history: recovery.authorization.proposed.clone(),
+                                provisional_primary: recovery
+                                    .authorization
+                                    .provisional_primary
+                                    .clone(),
+                                stage: crate::protocol::public_operations::
+                                    PublicDataLossRecoveryStage::Invalidated,
+                                observed_progress: None,
+                            },
+                        );
+                    }
                     preview.history_barriers.insert(
                         intent.operation_id.clone(),
                         crate::host::state::HistoryAdmissionBarrier {
@@ -1953,6 +2078,213 @@ impl AgentStore for SqliteStore {
                 BeginPublicOperation::Ready(record)
             } else {
                 BeginPublicOperation::Waiting(record)
+            })
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn renew_public_v1_data_loss_attempt(
+        &self,
+        intent: &PublicOperationIntent,
+    ) -> Result<RenewPublicDataLossAttempt> {
+        intent
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.to_string()))?;
+        let input = intent.lifecycle.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "public-v1 data-loss renewal requires lifecycle input".into(),
+            )
+        })?;
+        let candidate = input.data_loss_recovery.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "public-v1 data-loss renewal requires typed recovery".into(),
+            )
+        })?;
+        if !intent.preview.is_public_v1()
+            || input.possible_data_loss != PossibleDataLossIntent::Possible
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "public-v1 data-loss renewal requires protocol 11 possible-loss authority".into(),
+            ));
+        }
+
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("preview store required".into())
+            })?;
+            if preview.identity != intent.preview {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-operation preview identity changed".into(),
+                ));
+            }
+            if preview.operations.contains_key(&intent.operation_id) {
+                return Err(crate::host::HostError::DurableEffectConflict(
+                    "data-loss renewal attempt already exists".into(),
+                ));
+            }
+            let authorization = preview.data_loss_authorization.as_ref().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "data-loss renewal lacks durable authorization".into(),
+                )
+            })?;
+            let recovery = preview.data_loss_recovery.as_ref().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "data-loss renewal lacks durable recovery state".into(),
+                )
+            })?;
+            if authorization != &candidate.authorization
+                || recovery.authorization_id != authorization.authorization_id
+                || recovery.predecessor_history != authorization.predecessor
+                || recovery.proposed_history != authorization.proposed
+                || recovery.provisional_primary != authorization.provisional_primary
+                || recovery.stage
+                    != crate::protocol::public_operations::PublicDataLossRecoveryStage::
+                        CallbackProcessing
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "data-loss renewal differs from durable logical authorization".into(),
+                ));
+            }
+
+            let predecessor_id = recovery.attempt.attempt_id.clone();
+            let predecessor = preview
+                .operations
+                .get(&predecessor_id)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::host::HostError::Corrupt(
+                        "data-loss renewal predecessor operation is absent".into(),
+                    )
+                })?;
+            let predecessor_barrier =
+                preview
+                    .history_barriers
+                    .get(&predecessor_id)
+                    .ok_or_else(|| {
+                        crate::host::HostError::Corrupt(
+                            "data-loss renewal predecessor barrier is absent".into(),
+                        )
+                    })?;
+            if predecessor.stage != PublicOperationStage::ContainmentPending
+                || predecessor.containment != PublicOperationContainment::Pending
+                || !matches!(
+                    predecessor.disposition,
+                    Some(PublicOperationDisposition::Ambiguous(_))
+                )
+                || predecessor_barrier.outcome != crate::host::state::DataLossOutcome::Ambiguous
+                || predecessor_barrier.retired_by.is_some()
+                || predecessor.intent.lifecycle.as_ref().and_then(|input| {
+                    input
+                        .data_loss_recovery
+                        .as_ref()
+                        .map(|recovery| &recovery.attempt)
+                }) != Some(&recovery.attempt)
+            {
+                return Err(crate::host::HostError::CommandRejected(
+                    "data-loss renewal predecessor is not durably contained".into(),
+                ));
+            }
+
+            if candidate
+                .attempt
+                .validate_for(
+                    authorization,
+                    recovery.attempt.process.epoch.configuration_number,
+                )
+                .is_err()
+                || candidate.attempt.attempt_id == recovery.attempt.attempt_id
+                || candidate.attempt.process.process_session_id
+                    == recovery.attempt.process.process_session_id
+            {
+                return Ok(RenewPublicDataLossAttempt {
+                    decision: DataLossRenewalDecision::Terminal,
+                    predecessor,
+                    successor: None,
+                });
+            }
+
+            let decision = crate::protocol::public_operations::DataLossAttempt::renewal_decision(
+                authorization,
+                &recovery.attempt,
+                &candidate.attempt,
+                true,
+            );
+            let successor = PublicOperationRecord {
+                intent: intent.clone(),
+                stage: if decision == DataLossRenewalDecision::InvokeCallback {
+                    PublicOperationStage::Ready
+                } else {
+                    PublicOperationStage::Completed
+                },
+                disposition: (decision != DataLossRenewalDecision::InvokeCallback)
+                    .then_some(PublicOperationDisposition::Cancelled),
+                containment: if decision == DataLossRenewalDecision::InvokeCallback {
+                    PublicOperationContainment::NotRequired
+                } else {
+                    PublicOperationContainment::Complete
+                },
+                superseded_by: None,
+                blockers: Default::default(),
+                lifecycle: Default::default(),
+            };
+
+            let predecessor = preview
+                .operations
+                .get_mut(&predecessor_id)
+                .expect("validated predecessor operation");
+            predecessor.stage = PublicOperationStage::Completed;
+            predecessor.containment = PublicOperationContainment::Complete;
+            predecessor.superseded_by = Some(intent.operation_id.clone());
+            let predecessor = predecessor.clone();
+
+            if decision == DataLossRenewalDecision::InvokeCallback {
+                preview.history_barriers.remove(&predecessor_id);
+                preview.history_barriers.insert(
+                    intent.operation_id.clone(),
+                    crate::host::state::HistoryAdmissionBarrier {
+                        intent: intent.clone(),
+                        outcome: crate::host::state::DataLossOutcome::NotInvoked,
+                        retired_by: None,
+                    },
+                );
+                preview.data_loss_recovery = Some(
+                    crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                        authorization_id: authorization.authorization_id.clone(),
+                        attempt: candidate.attempt.clone(),
+                        predecessor_history: authorization.predecessor.clone(),
+                        proposed_history: authorization.proposed.clone(),
+                        provisional_primary: authorization.provisional_primary.clone(),
+                        stage: crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::Invalidated,
+                        observed_progress: None,
+                    },
+                );
+            } else {
+                preview
+                    .history_barriers
+                    .get_mut(&predecessor_id)
+                    .expect("validated predecessor barrier")
+                    .retired_by = Some(intent.operation_id.clone());
+                let recovery = preview
+                    .data_loss_recovery
+                    .as_mut()
+                    .expect("validated durable recovery");
+                recovery.attempt = candidate.attempt.clone();
+                recovery.stage = crate::protocol::public_operations::
+                    PublicDataLossRecoveryStage::ReplacementRequired;
+                recovery.observed_progress = None;
+            }
+            preview.current_operation = Some(intent.operation_id.clone());
+            preview.current_topology_operation = Some(intent.operation_id.clone());
+            preview
+                .operations
+                .insert(intent.operation_id.clone(), successor.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(RenewPublicDataLossAttempt {
+                decision,
+                predecessor,
+                successor: Some(successor),
             })
         })
     }
@@ -2244,9 +2576,7 @@ impl AgentStore for SqliteStore {
             }
             if matches!(
                 instruction,
-                PublicInstruction::CurrentConfiguration
-                    | PublicInstruction::CatchUpConfiguration
-                    | PublicInstruction::CatchUp
+                PublicInstruction::CatchUpConfiguration
                     | PublicInstruction::Access
                     | PublicInstruction::Configuration
                     | PublicInstruction::StartingConfiguration
@@ -2274,6 +2604,10 @@ impl AgentStore for SqliteStore {
                                 crate::host::HostError::Corrupt("missing history barrier".into())
                             })?
                             .outcome = DataLossOutcome::Ambiguous;
+                        if let Some(recovery) = preview.data_loss_recovery.as_mut() {
+                            recovery.stage = crate::protocol::public_operations::
+                                PublicDataLossRecoveryStage::CallbackProcessing;
+                        }
                     }
                     if matches!(
                         instruction,
@@ -2352,6 +2686,86 @@ impl AgentStore for SqliteStore {
                                 crate::host::HostError::Corrupt("missing history barrier".into())
                             })?
                             .outcome = result.clone();
+                        if let Some(recovery) = preview.data_loss_recovery.as_mut() {
+                            recovery.stage = match result {
+                                DataLossOutcome::False | DataLossOutcome::True => {
+                                    crate::protocol::public_operations::
+                                        PublicDataLossRecoveryStage::HistoryPending
+                                }
+                                DataLossOutcome::Error(_) => {
+                                    crate::protocol::public_operations::
+                                        PublicDataLossRecoveryStage::Failed
+                                }
+                                DataLossOutcome::NotInvoked | DataLossOutcome::Ambiguous => {
+                                    return Err(crate::host::HostError::DurableEffectConflict(
+                                        "invalid completed data-loss outcome".into(),
+                                    ));
+                                }
+                            };
+                        }
+                    }
+                    if let PublicInstructionOutcome::RebuildRequired(_) = &outcome
+                        && instruction == PublicInstruction::DataLoss
+                        && let Some(recovery) = preview.data_loss_recovery.as_mut()
+                    {
+                        recovery.stage = crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::ReplacementRequired;
+                    }
+                    if let PublicInstructionOutcome::Progress(progress) = &outcome
+                        && instruction == PublicInstruction::Progress
+                        && let Some(recovery) = preview.data_loss_recovery.as_mut()
+                    {
+                        recovery.observed_progress =
+                            Some(crate::protocol::public_operations::PublicProgress {
+                                role: crate::protocol::public_operations::PublicProgressRole::
+                                    Recovery,
+                                first: *progress,
+                                last: *progress,
+                            });
+                    }
+                    if matches!(
+                        instruction,
+                        PublicInstruction::CurrentConfiguration | PublicInstruction::CatchUp
+                    ) && let Some(recovery) = preview.data_loss_recovery.as_mut()
+                    {
+                        recovery.stage = crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::ConfigurationPending;
+                    }
+                    if instruction == PublicInstruction::HistoryAdmission {
+                        let recovery_input = intent
+                            .lifecycle
+                            .as_ref()
+                            .and_then(|input| input.data_loss_recovery.as_ref())
+                            .ok_or_else(|| {
+                                crate::host::HostError::Corrupt(
+                                    "history admission lacks typed recovery".into(),
+                                )
+                            })?;
+                        let recovery = preview.data_loss_recovery.as_mut().ok_or_else(|| {
+                            crate::host::HostError::Corrupt(
+                                "history admission lacks durable recovery state".into(),
+                            )
+                        })?;
+                        if recovery.authorization_id
+                            != recovery_input.authorization.authorization_id
+                            || preview.data_loss_authorization.as_ref()
+                                != Some(&recovery_input.authorization)
+                            || recovery.attempt != recovery_input.attempt
+                            || recovery.proposed_history != recovery_input.authorization.proposed
+                            || !matches!(
+                                recovery.stage,
+                                crate::protocol::public_operations::
+                                    PublicDataLossRecoveryStage::ConfigurationPending
+                            )
+                        {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "history admission differs from durable recovery".into(),
+                            ));
+                        }
+                        preview.history = Some(recovery.proposed_history.clone());
+                        recovery.stage = crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::Admitted;
+                        preview.history_barriers.remove(&intent.operation_id);
                     }
                     if instruction == PublicInstruction::Access && !preview.terminal {
                         preview.writes_revoked = false;

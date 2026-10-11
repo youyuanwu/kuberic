@@ -189,6 +189,49 @@ frozen disposition; and Close, Abort, and fault containment are idempotent.
 All of this remains repository-only and dormant. Phase 5 has not selected a
 replacement Replicator or changed the legacy production path.
 
+Phase 5.2 replaces the disposable Public V1 schema-8 store with a fresh,
+incompatible schema-9 store. There is no conversion or absent-field fallback:
+production schema 6, the Phase 4 schema-7 preview, and the earlier Public V1
+schema are rejected before state decoding. The controller owns one
+partition-wide `HistoryInitializationId` per resource and Public V1 protocol
+generation. Every initial replica receives that accepted value and derives the
+same domain-separated bootstrap history; local initialization, Pod/PVC
+identity, process session, epoch and LSN do not define partition history.
+
+History, storage and process identity remain separate. `HistoryContext` binds
+resource, Public V1 generation, opaque history and data-loss number.
+`ReplicaStorageIncarnationContext` binds the exact logical replica and
+persistent or volatile storage generation without a process session.
+`ProcessAttemptContext` binds one process session and Replicator creation to an
+epoch and attempt revision. Numeric progress is comparable only within the
+same resource, Public V1 generation, history and data-loss number. Recovery
+progress may identify an access-closed provisional primary, but it is not
+health, routing, quorum, catch-up or serving evidence.
+
+One immutable `DataLossAuthorization` names the predecessor and deterministic
+successor history, provisional primary storage, progress-reset scope and
+captured replay disposition. Renewable `DataLossAttempt` values bind that
+logical decision to process-local creation capabilities. A convergent
+successor requires durable predecessor containment, a different process
+session and a strictly higher configuration number while preserving the same
+authorization and storage. If the replacement creation declares
+`ReplaceOnAmbiguity`, a captured convergent authorization retires without
+callback invocation; a captured `ReplaceOnAmbiguity` authorization is
+terminal and cannot be upgraded by a convergent replacement.
+
+Recovery begins with two separately fenced owner-local commits. The controller
+conditionally removes accepted election/serving witnesses before dispatch,
+and the agent atomically revokes executable access plus old-history build,
+configuration, replay and serving state before callback execution. This is not
+a distributed transaction: every command and report revalidates resource,
+operation, history, storage and process identity. The agent then orders
+Replicator primary role, application primary role, `on_data_loss`, fresh
+progress, proposed-history configuration and catch-up, explicit history
+admission, and finally access. Callback `false`, `true`, typed failure,
+rebuild-required and lost-result ambiguity remain distinct; none is itself a
+history certificate. Pending reports carry the exact predecessor history,
+while admitted reports carry the exact proposed history.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

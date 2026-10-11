@@ -141,6 +141,7 @@ impl Fixture {
                     current,
                     previous,
                     replicas: Vec::new(),
+                    data_loss_recovery: None,
                 }),
                 transition,
             )
