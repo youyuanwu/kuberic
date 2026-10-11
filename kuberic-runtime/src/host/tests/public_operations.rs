@@ -260,26 +260,11 @@ fn public_v1_values_distinguishes_invalid_lsn() {
 }
 
 #[tokio::test]
-async fn public_v1_schema8_layout_is_transactional_idempotent_and_fail_closed() {
+async fn public_v1_schema8_requires_a_fresh_exact_store() {
     let preview = PublicOperationPreviewIdentity::public_v1(8);
     let (_directory, path, store) = durable_preview_store(&preview);
     let original = store.load_state().await.unwrap();
     drop(store);
-
-    let retained_directory = tempdir().unwrap();
-    let retained_path = SqliteStore::metadata_database_path(retained_directory.path());
-    std::fs::create_dir_all(retained_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &retained_path,
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/schema8/base-public-v1.sqlite"
-        )),
-    )
-    .unwrap();
-    let retained = SqliteStore::open_preview_existing(&retained_path, None, &preview).unwrap();
-    assert_eq!(retained.load_state().await.unwrap(), original);
-    drop(retained);
 
     let connection = rusqlite::Connection::open(&path).unwrap();
     let version: u32 = connection
@@ -289,67 +274,12 @@ async fn public_v1_schema8_layout_is_transactional_idempotent_and_fail_closed() 
         version,
         crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION
     );
-    let migrations = connection
-        .prepare("SELECT revision, name FROM schema8_layout_migrations ORDER BY revision")
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
-        })
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(migrations, vec![(1, "base-public-v1".into())]);
-    connection
-        .execute_batch(
-            "DROP TABLE public_v1_operation_inputs;
-             DROP TABLE schema8_layout_migrations;",
-        )
-        .unwrap();
     drop(connection);
 
-    // Before-migration cut: reopen owns and commits the base layout before
-    // decoding the retained state.
     let reopened = SqliteStore::open_preview_existing(&path, None, &preview).unwrap();
     assert_eq!(reopened.load_state().await.unwrap(), original);
     drop(reopened);
 
-    // During-migration cut: an uncommitted layout transaction rolls back as a
-    // unit and the next reopen applies the same named revision exactly once.
-    let mut connection = rusqlite::Connection::open(&path).unwrap();
-    connection
-        .execute_batch(
-            "DROP TABLE public_v1_operation_inputs;
-             DROP TABLE schema8_layout_migrations;",
-        )
-        .unwrap();
-    {
-        let transaction = connection.transaction().unwrap();
-        transaction
-            .execute_batch(
-                "CREATE TABLE schema8_layout_migrations (
-                    revision INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE
-                 );
-                 CREATE TABLE public_v1_operation_inputs (
-                    operation_id TEXT PRIMARY KEY,
-                    digest_version INTEGER NOT NULL,
-                    digest_sha256 TEXT NOT NULL,
-                    intent_json TEXT NOT NULL
-                 );
-                 INSERT INTO schema8_layout_migrations(revision, name)
-                   VALUES(1, 'base-public-v1');",
-            )
-            .unwrap();
-        // Dropping without commit is the crash cut.
-    }
-    drop(connection);
-    let reopened = SqliteStore::open_preview_existing(&path, None, &preview).unwrap();
-    assert_eq!(reopened.load_state().await.unwrap(), original);
-    drop(reopened);
-
-    // After-migration cut: repeated reopen is idempotent and cannot be
-    // confused with either legacy schema/protocol identity.
-    drop(SqliteStore::open_preview_existing(&path, None, &preview).unwrap());
     assert!(matches!(
         SqliteStore::open_existing(&path, None),
         Err(crate::host::HostError::SchemaMismatch {
@@ -357,51 +287,23 @@ async fn public_v1_schema8_layout_is_transactional_idempotent_and_fail_closed() 
             observed: crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION,
         })
     ));
-    assert!(matches!(
-        SqliteStore::open_preview_existing(
-            &path,
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .pragma_update(
             None,
-            &PublicOperationPreviewIdentity::new(preview.generation),
-        ),
+            "user_version",
+            crate::host::state::PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        SqliteStore::open_preview_existing(&path, None, &preview),
         Err(crate::host::HostError::SchemaMismatch {
-            expected: crate::host::state::PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
-            observed: crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION,
+            expected: crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION,
+            observed: crate::host::state::PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
         })
     ));
-}
-
-#[test]
-fn legacy_schema7_intent_deserializes_with_inferred_replay_contract() {
-    let intent: PublicOperationIntent = serde_json::from_value(serde_json::json!({
-        "preview": {
-            "protocolVersion": crate::protocol::public_operations::
-                PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION,
-            "generation": 7
-        },
-        "operationId": "legacy-progress",
-        "revision": 1,
-        "processSessionId": "session-1",
-        "class": {
-            "kind": "authority"
-        },
-        "inputDigest": "retained-schema7-digest",
-        "program": {
-            "Progress": {
-                "capability": false
-            }
-        }
-    }))
-    .unwrap();
-
-    assert!(matches!(
-        intent.input_digest,
-        crate::protocol::public_operations::CanonicalOperationInputDigest::Legacy(_)
-    ));
-    assert_eq!(
-        intent.replay_disposition,
-        crate::protocol::public_operations::PublicOperationReplayDisposition::RepeatableRead
-    );
-    intent.validate().unwrap();
 }
 
 #[tokio::test]

@@ -726,7 +726,6 @@ fn public_v1_completion_from_proto(
         operation_id: OperationId::new(value.operation_id),
         revision: value.revision,
         input_digest: CanonicalOperationInputDigest::V1(CanonicalOperationInputDigestV1 {
-            version: 1,
             sha256: value.input_digest_sha256,
         }),
         replay_disposition: replay_from_proto(value.replay_disposition)?,

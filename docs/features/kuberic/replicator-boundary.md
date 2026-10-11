@@ -148,11 +148,10 @@ Production construction and dispatch cannot select either preview action.
 Phase 5.1 introduces a second, incompatible dormant preview identity for the
 Public V1 contract. Protocol 11 uses schema 8 while production remains on
 protocol 9/schema 6 and the Phase 4 preview remains on protocol 10/schema 7.
-Schema 8 owns a transactional internal layout ledger whose first revision
-retains canonical operation inputs; later Phase 5 revisions are reserved but
-cannot authorize unfinished history, signing, renewal, or build behavior.
-Legacy and Phase 4 readers reject schema 8, and the Public V1 opener rejects
-the older stores.
+The preview has no storage-migration contract: legacy and Phase 4 readers
+reject schema 8, the Public V1 opener rejects older schemas, and later dormant
+schema changes may require a fresh preview store. No production or application
+data is migrated through this boundary.
 
 Public V1 operation inputs use versioned, domain-separated canonical binary
 digests rather than Rust diagnostic formatting. The digest version remains

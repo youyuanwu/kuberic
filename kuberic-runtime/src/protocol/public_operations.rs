@@ -266,7 +266,6 @@ impl PublicOperationClass {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CanonicalOperationInputDigestV1 {
-    pub version: u16,
     pub sha256: String,
 }
 
@@ -274,7 +273,6 @@ impl CanonicalOperationInputDigestV1 {
     fn from_bytes(bytes: &[u8]) -> Self {
         use sha2::Digest;
         Self {
-            version: 1,
             sha256: sha2::Sha256::digest(bytes)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -283,8 +281,7 @@ impl CanonicalOperationInputDigestV1 {
     }
 
     fn validate(&self) -> Result<(), &'static str> {
-        if self.version != 1
-            || self.sha256.len() != 64
+        if self.sha256.len() != 64
             || !self
                 .sha256
                 .bytes()
@@ -297,17 +294,12 @@ impl CanonicalOperationInputDigestV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(rename_all = "camelCase", tag = "version", content = "value")]
 pub enum CanonicalOperationInputDigest {
-    Legacy(String),
     V1(CanonicalOperationInputDigestV1),
 }
 
 impl CanonicalOperationInputDigest {
-    pub fn legacy(value: impl Into<String>) -> Self {
-        Self::Legacy(value.into())
-    }
-
     pub fn opaque_v1(domain: &str, value: &[u8]) -> Self {
         let mut encoder = CanonicalEncoder::new(domain);
         encoder.bytes(value);
@@ -318,24 +310,18 @@ impl CanonicalOperationInputDigest {
 
     pub const fn version(&self) -> u16 {
         match self {
-            Self::Legacy(_) => 0,
             Self::V1(_) => 1,
         }
     }
 
     pub fn sha256(&self) -> &str {
         match self {
-            Self::Legacy(value) => value,
             Self::V1(value) => &value.sha256,
         }
     }
 
     fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Legacy(value) if value.is_empty() => {
-                Err("legacy operation-input digest is empty")
-            }
-            Self::Legacy(_) => Ok(()),
             Self::V1(value) => value.validate(),
         }
     }
@@ -360,7 +346,7 @@ pub enum PublicOperationReplayDisposition {
     Containment,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicOperationIntent {
     pub preview: PublicOperationPreviewIdentity,
@@ -374,57 +360,6 @@ pub struct PublicOperationIntent {
     pub lifecycle: Option<PublicLifecycleInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<PublicOperationProgram>,
-}
-
-impl<'de> Deserialize<'de> for PublicOperationIntent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RawIntent {
-            preview: PublicOperationPreviewIdentity,
-            operation_id: OperationId,
-            revision: u64,
-            process_session_id: ProcessSessionId,
-            class: PublicOperationClass,
-            input_digest: CanonicalOperationInputDigest,
-            #[serde(default)]
-            replay_disposition: Option<PublicOperationReplayDisposition>,
-            #[serde(default)]
-            lifecycle: Option<PublicLifecycleInput>,
-            #[serde(default)]
-            program: Option<PublicOperationProgram>,
-        }
-
-        let raw = RawIntent::deserialize(deserializer)?;
-        let replay_disposition =
-            raw.replay_disposition.unwrap_or_else(|| {
-                if let Some(program) = raw.program.as_ref() {
-                    program.replay_disposition()
-                } else if raw.lifecycle.as_ref().is_some_and(|input| {
-                    input.possible_data_loss == PossibleDataLossIntent::Possible
-                }) {
-                    PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity)
-                } else if raw.class.is_terminal() {
-                    PublicOperationReplayDisposition::Containment
-                } else {
-                    PublicOperationReplayDisposition::Convergent
-                }
-            });
-        Ok(Self {
-            preview: raw.preview,
-            operation_id: raw.operation_id,
-            revision: raw.revision,
-            process_session_id: raw.process_session_id,
-            class: raw.class,
-            input_digest: raw.input_digest,
-            replay_disposition,
-            lifecycle: raw.lifecycle,
-            program: raw.program,
-        })
-    }
 }
 
 impl PublicOperationIntent {
@@ -442,10 +377,6 @@ impl PublicOperationIntent {
             return Err("public-operation process session is empty");
         }
         self.input_digest.validate()?;
-        if self.preview.is_public_v1() && self.input_digest.version() != 1 {
-            return Err("public-v1 operation requires a canonical V1 input digest");
-        }
-        let legacy_input = self.input_digest.version() == 0;
         if let Some(input) = &self.lifecycle {
             if self.program.is_some() {
                 return Err("operation cannot carry two programs");
@@ -453,12 +384,8 @@ impl PublicOperationIntent {
             if self.class != PublicOperationClass::Authority {
                 return Err("lifecycle input requires authority operation");
             }
-            if legacy_input {
-                input.validate_legacy()?;
-            } else {
-                input.validate()?;
-            }
-            if !legacy_input && self.input_digest != input.digest() {
+            input.validate()?;
+            if self.input_digest != input.digest() {
                 return Err("lifecycle digest does not match frozen input");
             }
             match input.possible_data_loss {
@@ -479,12 +406,8 @@ impl PublicOperationIntent {
             }
         }
         if let Some(program) = &self.program {
-            if legacy_input {
-                program.validate_legacy(&self.class, &self.operation_id)?;
-            } else {
-                program.validate(&self.class, &self.operation_id)?;
-            }
-            if !legacy_input && self.input_digest != program.digest() {
+            program.validate(&self.class, &self.operation_id)?;
+            if self.input_digest != program.digest() {
                 return Err("program digest does not match frozen input");
             }
             if self.replay_disposition != program.replay_disposition() {
@@ -542,10 +465,6 @@ impl PublicConfiguration {
             }
         }
         Ok(())
-    }
-
-    fn validate_legacy(&self) -> Result<(), &'static str> {
-        self.validate_descriptors()
     }
 
     pub fn validate_for_local(&self, local_replica_id: ReplicaId) -> Result<(), &'static str> {
@@ -645,7 +564,6 @@ pub struct AuthorizationAuditDigest(pub String);
 impl AuthorizationAuditDigest {
     pub fn validate(&self) -> Result<(), &'static str> {
         CanonicalOperationInputDigestV1 {
-            version: 1,
             sha256: self.0.clone(),
         }
         .validate()
@@ -719,7 +637,6 @@ pub enum PublicOperationProgram {
         refreshed: PublicConfiguration,
         epoch: Epoch,
         handoff: ReplicaRole,
-        #[serde(default)]
         catch_up_specific_quorum: bool,
         mode: PublicCatchUpMode,
     },
@@ -751,63 +668,6 @@ impl PublicOperationProgram {
             | Self::Configuration(_)
             | Self::Swap { .. } => PublicOperationReplayDisposition::Convergent,
         }
-    }
-
-    fn validate_legacy(
-        &self,
-        class: &PublicOperationClass,
-        id: &OperationId,
-    ) -> Result<(), &'static str> {
-        let expected = match self {
-            Self::Swap {
-                starting,
-                refreshed,
-                epoch,
-                handoff,
-                ..
-            } => {
-                starting.validate_legacy()?;
-                refreshed.validate_legacy()?;
-                if starting.current.epoch >= *epoch
-                    || refreshed.current.epoch != *epoch
-                    || !matches!(handoff, ReplicaRole::ActiveSecondary | ReplicaRole::None)
-                {
-                    return Err("invalid swap epoch or handoff");
-                }
-                PublicOperationClass::PlannedSwap
-            }
-            Self::Configuration(configuration) | Self::CatchUp { configuration, .. } => {
-                configuration.validate_legacy()?;
-                PublicOperationClass::Authority
-            }
-            Self::Build(build) | Self::Remove(build) => {
-                if build.attempt.is_empty()
-                    || build.process_session_id.is_empty()
-                    || build.replication_address.is_empty()
-                {
-                    return Err("incomplete exact build identity");
-                }
-                if matches!(self, Self::Build(_)) {
-                    if &build.attempt != id {
-                        return Err("build operation is not its exact attempt");
-                    }
-                    PublicOperationClass::Build {
-                        target: build.replica.replica_id,
-                    }
-                } else {
-                    PublicOperationClass::Remove {
-                        target: build.replica.replica_id,
-                    }
-                }
-            }
-            Self::Close => PublicOperationClass::Close,
-            Self::Abort => PublicOperationClass::Abort,
-            _ => PublicOperationClass::Authority,
-        };
-        if *class != expected {
-            return Err("program does not match operation class");
-        }
-        Ok(())
     }
 
     fn validate(&self, class: &PublicOperationClass, id: &OperationId) -> Result<(), &'static str> {
@@ -1036,63 +896,6 @@ impl PublicLifecycleInput {
             replicas: self.replicas.clone(),
         }
         .validate_for_local(self.replica.replica_id)?;
-        let role = if self.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
-            if self.possible_data_loss != PossibleDataLossIntent::NotPossible {
-                return Err("secondary epoch update cannot request data loss");
-            }
-            ReplicaRole::ActiveSecondary
-        } else {
-            if self.current.primary_id != self.replica.replica_id {
-                return Err("promotion target is not configuration primary");
-            }
-            ReplicaRole::Primary
-        };
-        if !self
-            .current
-            .members
-            .iter()
-            .any(|member| member.identity == self.replica && member.role == role)
-        {
-            return Err("lifecycle target is not an exact configuration member");
-        }
-        if self.recipe == PublicLifecycleRecipe::FailoverPromotion && self.previous.is_none() {
-            return Err("failover requires frozen previous configuration");
-        }
-        Ok(())
-    }
-
-    fn validate_legacy(&self) -> Result<(), &'static str> {
-        if self.current.epoch != self.epoch {
-            return Err("lifecycle epoch does not match configuration");
-        }
-        for configuration in std::iter::once(&self.current).chain(self.previous.iter()) {
-            if configuration.configuration_id != configuration.expected_id()
-                || configuration.write_quorum == 0
-                || configuration.write_quorum as usize > configuration.members.len()
-                || configuration
-                    .members
-                    .iter()
-                    .map(|member| &member.identity)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    != configuration.members.len()
-                || configuration
-                    .members
-                    .iter()
-                    .filter(|member| member.role == ReplicaRole::Primary)
-                    .count()
-                    != 1
-            {
-                return Err("invalid frozen lifecycle configuration");
-            }
-            if self
-                .previous
-                .as_ref()
-                .is_some_and(|previous| previous.epoch >= self.epoch)
-            {
-                return Err("lifecycle epoch must advance the previous epoch");
-            }
-        }
         let role = if self.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
             if self.possible_data_loss != PossibleDataLossIntent::NotPossible {
                 return Err("secondary epoch update cannot request data loss");
