@@ -22,8 +22,19 @@ struct Fixture {
 }
 
 fn configuration(epoch: i64) -> PublicConfiguration {
+    configuration_with_data_loss(0, epoch)
+}
+
+fn data_loss_configuration(epoch: i64) -> PublicConfiguration {
+    configuration_with_data_loss(1, epoch)
+}
+
+fn configuration_with_data_loss(
+    data_loss_number: i64,
+    configuration_number: i64,
+) -> PublicConfiguration {
     let current = ConfigurationDescriptor::new(
-        Epoch::new(1, epoch),
+        Epoch::new(data_loss_number, configuration_number),
         ReplicaId::new(1),
         vec![ConfigurationMember {
             identity: replica_identity(),
@@ -33,7 +44,7 @@ fn configuration(epoch: i64) -> PublicConfiguration {
     );
     PublicConfiguration {
         previous: Some(ConfigurationDescriptor::new(
-            Epoch::new(1, epoch - 1),
+            Epoch::new(data_loss_number, configuration_number - 1),
             ReplicaId::new(1),
             current.members.clone(),
             1,
@@ -94,12 +105,12 @@ fn configuration_with_target(epoch: i64) -> PublicConfiguration {
     };
     PublicConfiguration {
         previous: Some(ConfigurationDescriptor::new(
-            Epoch::new(1, epoch - 1),
+            Epoch::new(0, epoch - 1),
             ReplicaId::new(1),
             members.clone(),
             1,
         )),
-        current: ConfigurationDescriptor::new(Epoch::new(1, epoch), ReplicaId::new(1), members, 1),
+        current: ConfigurationDescriptor::new(Epoch::new(0, epoch), ReplicaId::new(1), members, 1),
         replicas: vec![replica],
     }
 }
@@ -108,7 +119,7 @@ fn swap() -> Program {
     Program::Swap {
         starting: configuration(10),
         refreshed: configuration(11),
-        epoch: Epoch::new(1, 11),
+        epoch: Epoch::new(0, 11),
         handoff: ReplicaRole::ActiveSecondary,
         catch_up_specific_quorum: false,
         mode: PublicCatchUpMode::All,
@@ -123,7 +134,7 @@ fn specific_quorum_swap() -> Program {
     Program::Swap {
         starting,
         refreshed,
-        epoch: Epoch::new(1, 11),
+        epoch: Epoch::new(0, 11),
         handoff: ReplicaRole::ActiveSecondary,
         catch_up_specific_quorum: true,
         mode: PublicCatchUpMode::WriteQuorum,
@@ -134,7 +145,7 @@ fn legacy_write_quorum_swap() -> Program {
     Program::Swap {
         starting: configuration(10),
         refreshed: configuration(11),
-        epoch: Epoch::new(1, 11),
+        epoch: Epoch::new(0, 11),
         handoff: ReplicaRole::ActiveSecondary,
         catch_up_specific_quorum: false,
         mode: PublicCatchUpMode::WriteQuorum,
@@ -507,7 +518,7 @@ fn protocol_10_rejects_public_v1_command_shapes() {
     let mut input = build("legacy-authorized-build");
     input.authorization = Some(PublicBuildAuthorizationReference {
         resource_uid: ResourceUid::new("resource-1"),
-        epoch: Epoch::new(1, 3),
+        epoch: Epoch::new(0, 3),
         build_id: input.attempt.clone(),
         source: replica_identity(),
         source_storage: PvcUid::new("pvc-1"),
@@ -660,7 +671,7 @@ async fn public_v1_data_loss_replay_uses_attached_capability() {
     use crate::protocol::public_operations::{DataLossReplay, PublicOperationReplayDisposition};
 
     let fixture = Fixture::public_v1().await;
-    let configuration = configuration(3);
+    let configuration = data_loss_configuration(3);
     let epoch = configuration.current.epoch;
     let lifecycle = PublicLifecycleInput {
         recipe: PublicLifecycleRecipe::InitialPrimary,
@@ -780,6 +791,68 @@ async fn public_v1_data_loss_replay_uses_attached_capability() {
 }
 
 #[tokio::test]
+async fn public_v1_ordinary_operations_cannot_advance_data_loss_number() {
+    let fixture = Fixture::public_v1().await;
+    let changed = data_loss_configuration(3);
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch: changed.current.epoch,
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: changed.current,
+        previous: changed.previous,
+        replicas: Vec::new(),
+        data_loss_recovery: None,
+    };
+    let mut ordinary = intent(
+        &fixture.preview,
+        "ordinary-data-loss-change",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    ordinary.input_digest = lifecycle.digest();
+    ordinary.lifecycle = Some(lifecycle);
+    assert!(
+        fixture
+            .owner
+            .registry()
+            .admit(ordinary.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .begin_public_operation(&ordinary, &[], &[])
+            .await
+            .is_err()
+    );
+
+    let program = Program::Epoch {
+        epoch: Epoch::new(1, 3),
+    };
+    let mut epoch = intent(
+        &fixture.preview,
+        "ordinary-program-data-loss-change",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    epoch.input_digest = program.digest();
+    epoch.program = Some(program);
+    assert!(fixture.owner.registry().admit(epoch.clone()).await.is_err());
+    assert!(
+        fixture
+            .store
+            .begin_public_operation(&epoch, &[], &[])
+            .await
+            .is_err()
+    );
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
     use crate::protocol::public_operations::{
         DataLossAttempt, DataLossRenewalDecision, DataLossReplay, ProcessAttemptContext,
@@ -797,7 +870,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
     ) {
         let preview = PublicOperationPreviewIdentity::public_v1(430);
         let (directory, _path, store) = durable_preview_store(&preview);
-        let configuration = configuration(3);
+        let configuration = data_loss_configuration(3);
         let recovery = public_v1_data_loss_recovery(
             &preview,
             "attempt-1",
@@ -884,7 +957,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
         replay: DataLossReplay,
         configuration_number: i64,
     ) -> PublicOperationIntent {
-        let configuration = configuration(configuration_number);
+        let configuration = data_loss_configuration(configuration_number);
         let mut recovery = recovery.clone();
         recovery.attempt = DataLossAttempt {
             authorization_id: recovery.authorization.authorization_id.clone(),
@@ -1058,6 +1131,21 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
             .count(),
         callbacks_before
     );
+    assert!(matches!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .public_operation_preview
+            .unwrap()
+            .data_loss_recovery,
+        Some(
+            crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                stage: crate::protocol::public_operations::PublicDataLossRecoveryStage::Retired,
+                ..
+            }
+        )
+    ));
     assert_eq!(
         DataLossAttempt::renewal_decision(
             &recovery.authorization,
@@ -1146,7 +1234,7 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
     for changed in [false, true] {
         let fixture = Fixture::public_v1().await;
         *fixture.trace.data_loss.lock().unwrap() = Some(Ok(changed));
-        let configuration = configuration(3);
+        let configuration = data_loss_configuration(3);
         let epoch = configuration.current.epoch;
         let recovery = public_v1_data_loss_recovery(
             &fixture.preview,
@@ -1272,7 +1360,7 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
     }
 
     let fixture = Fixture::public_v1().await;
-    let ambiguous_configuration = configuration(3);
+    let ambiguous_configuration = data_loss_configuration(3);
     let epoch = ambiguous_configuration.current.epoch;
     let recovery = public_v1_data_loss_recovery(
         &fixture.preview,
@@ -1345,7 +1433,7 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
 
     let fixture = Fixture::public_v1().await;
     *fixture.trace.data_loss.lock().unwrap() = Some(Err("typed data-loss failure".into()));
-    let configuration = configuration(3);
+    let configuration = data_loss_configuration(3);
     let epoch = configuration.current.epoch;
     let recovery = public_v1_data_loss_recovery(
         &fixture.preview,
@@ -1425,7 +1513,7 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
             },
         },
     ));
-    let configuration = configuration(3);
+    let configuration = data_loss_configuration(3);
     let epoch = configuration.current.epoch;
     let lifecycle = PublicLifecycleInput {
         recipe: PublicLifecycleRecipe::InitialPrimary,
@@ -1519,7 +1607,7 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
             read_status: AccessStatus::NotPrimary,
             write_status: AccessStatus::NotPrimary,
             progress: PublicProgress {
-                role: PublicProgressRole::Recovery,
+                role: PublicProgressRole::Primary,
                 first: 0,
                 last: 0,
             },
@@ -1646,7 +1734,7 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
     target.replica_id = ReplicaId::new(2);
     let authorization = PublicBuildAuthorizationReference {
         resource_uid: ResourceUid::new("resource-1"),
-        epoch: Epoch::new(1, 9),
+        epoch: Epoch::new(0, 9),
         build_id: OperationId::new("public-v1-remote-build"),
         source: replica_identity(),
         source_storage: PvcUid::new("pvc-1"),
@@ -1744,7 +1832,7 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         history: public_v1_history(&preview).1,
         storage_incarnation: public_v1_storage_incarnation(),
         progress: PublicProgress {
-            role: PublicProgressRole::Recovery,
+            role: PublicProgressRole::Primary,
             first: 0,
             last: 0,
         },
@@ -1989,7 +2077,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
             Program::Swap {
                 starting: configuration_with_target(3),
                 refreshed: configuration(4),
-                epoch: Epoch::new(1, 4),
+                epoch: Epoch::new(0, 4),
                 handoff: ReplicaRole::ActiveSecondary,
                 catch_up_specific_quorum: false,
                 mode: PublicCatchUpMode::All,
@@ -2000,7 +2088,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
             Program::Swap {
                 starting: configuration(3),
                 refreshed: configuration_with_target(4),
-                epoch: Epoch::new(1, 4),
+                epoch: Epoch::new(0, 4),
                 handoff: ReplicaRole::ActiveSecondary,
                 catch_up_specific_quorum: false,
                 mode: PublicCatchUpMode::All,
@@ -2250,7 +2338,7 @@ async fn synchronous_repeated_abort_fences_before_return_and_is_ordered_once() {
                 "late",
                 4,
                 Program::Epoch {
-                    epoch: Epoch::new(1, 2)
+                    epoch: Epoch::new(0, 2)
                 }
             ))
             .await
@@ -2359,27 +2447,27 @@ async fn callback_cancellation_cross_product_has_exact_root_end_and_descendant_d
         ),
         (
             Program::Role {
-                epoch: Epoch::new(1, 3),
+                epoch: Epoch::new(0, 3),
                 role: ReplicaRole::Primary,
             },
             "replicator.change_role",
         ),
         (
             Program::Role {
-                epoch: Epoch::new(1, 3),
+                epoch: Epoch::new(0, 3),
                 role: ReplicaRole::Primary,
             },
             "application.change_role",
         ),
         (
             Program::Epoch {
-                epoch: Epoch::new(1, 3),
+                epoch: Epoch::new(0, 3),
             },
             "replicator.update_epoch",
         ),
         (
             Program::Epoch {
-                epoch: Epoch::new(1, 3),
+                epoch: Epoch::new(0, 3),
             },
             "provider.update_epoch",
         ),
@@ -2490,14 +2578,14 @@ fn replay_programs() -> Vec<(&'static str, Program)> {
         (
             "role-replay",
             Program::Role {
-                epoch: Epoch::new(1, 3),
+                epoch: Epoch::new(0, 3),
                 role: ReplicaRole::Primary,
             },
         ),
         (
             "epoch-replay",
             Program::Epoch {
-                epoch: Epoch::new(1, 3),
+                epoch: Epoch::new(0, 3),
             },
         ),
         (
@@ -2809,14 +2897,14 @@ async fn fresh_process_reopen_never_reconstructs_program_authority_at_any_cut() 
             match family {
                 0 => {
                     let program = Program::Epoch {
-                        epoch: Epoch::new(1, 2),
+                        epoch: Epoch::new(0, 2),
                     };
                     operation_intent.input_digest = program.digest();
                     operation_intent.program = Some(program);
                 }
                 1 => {
                     let program = Program::Role {
-                        epoch: Epoch::new(1, 2),
+                        epoch: Epoch::new(0, 2),
                         role: ReplicaRole::Primary,
                     };
                     operation_intent.input_digest = program.digest();

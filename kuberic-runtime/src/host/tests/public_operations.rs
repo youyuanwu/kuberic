@@ -354,14 +354,17 @@ fn public_v1_values_distinguishes_invalid_lsn() {
         completed_operations: Vec::new(),
         extensions: Default::default(),
     };
-    recovery.validate().unwrap();
-    let wire = crate::control::public_v1_agent_status_to_proto(&recovery);
+    assert!(recovery.validate().is_err());
+    let mut ordinary = recovery.clone();
+    ordinary.progress.role = PublicProgressRole::Primary;
+    ordinary.validate().unwrap();
+    let wire = crate::control::public_v1_agent_status_to_proto(&ordinary);
     assert!(wire.verified_replication_lsn.is_none());
     assert!(wire.builds.is_empty());
     assert!(crate::control::normalize_agent_status_report(wire.clone()).is_err());
     assert_eq!(
         crate::control::normalize_public_v1_agent_status_report(wire).unwrap(),
-        recovery
+        ordinary
     );
 
     let mut serving_recovery = recovery;

@@ -1792,6 +1792,35 @@ impl AgentStore for SqliteStore {
                 ));
             }
             use crate::protocol::public_operations::PublicOperationProgram;
+            if intent.preview.is_public_v1() {
+                let history = preview.history.as_ref().ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "public-v1 operation requires initialized history".into(),
+                    )
+                })?;
+                if let Some(input) = &intent.lifecycle
+                    && input.possible_data_loss
+                        == crate::protocol::public_operations::PossibleDataLossIntent::NotPossible
+                        && (input.current.epoch.data_loss_number != history.data_loss_number
+                            || input
+                                .previous
+                                .as_ref()
+                                .is_some_and(|previous| {
+                                    previous.epoch.data_loss_number != history.data_loss_number
+                                }))
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "ordinary public-v1 lifecycle changed the history data-loss number".into(),
+                    ));
+                }
+                if let Some(program) = &intent.program {
+                    program
+                        .validate_history_data_loss_number(history.data_loss_number)
+                        .map_err(|message| {
+                            crate::host::HostError::CommandRejected(message.into())
+                        })?;
+                }
+            }
             match &intent.program {
                 Some(PublicOperationProgram::Build(build)) => {
                     if preview.active_builds.contains_key(&build.replica.replica_id)
@@ -2279,8 +2308,14 @@ impl AgentStore for SqliteStore {
                     .as_mut()
                     .expect("validated durable recovery");
                 recovery.attempt = candidate.attempt.clone();
-                recovery.stage = crate::protocol::public_operations::
-                    PublicDataLossRecoveryStage::ReplacementRequired;
+                recovery.stage = match decision {
+                    DataLossRenewalDecision::RetireWithoutCallback => {
+                        crate::protocol::public_operations::PublicDataLossRecoveryStage::Retired
+                    }
+                    DataLossRenewalDecision::Terminal => crate::protocol::public_operations::
+                        PublicDataLossRecoveryStage::ReplacementRequired,
+                    DataLossRenewalDecision::InvokeCallback => unreachable!(),
+                };
                 recovery.observed_progress = None;
             }
             preview.current_operation = Some(intent.operation_id.clone());

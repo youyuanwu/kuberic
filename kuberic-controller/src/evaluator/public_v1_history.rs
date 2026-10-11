@@ -100,11 +100,16 @@ pub fn election_status(
     if report.validate().is_err() {
         return PublicV1ElectionStatus::Ineligible;
     }
-    if report
-        .data_loss_recovery
-        .as_ref()
-        .is_some_and(|recovery| recovery.stage != PublicDataLossRecoveryStage::Admitted)
-    {
+    if report.data_loss_recovery.as_ref().is_some_and(|recovery| {
+        matches!(
+            recovery.stage,
+            PublicDataLossRecoveryStage::Authorized
+                | PublicDataLossRecoveryStage::Invalidated
+                | PublicDataLossRecoveryStage::CallbackProcessing
+                | PublicDataLossRecoveryStage::HistoryPending
+                | PublicDataLossRecoveryStage::ConfigurationPending
+        )
+    }) {
         return if is_provisional_primary(report) {
             PublicV1ElectionStatus::ProvisionalPrimary
         } else {
@@ -149,6 +154,7 @@ pub fn plan_data_loss_recovery(
     authorization: &DataLossAuthorization,
     attempt: &DataLossAttempt,
     intent: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
+    predecessor_contained: bool,
 ) -> Result<PublicV1HistoryPlan, String> {
     intent.validate().map_err(str::to_owned)?;
     let lifecycle = intent
@@ -182,6 +188,51 @@ pub fn plan_data_loss_recovery(
         .data_loss_recovery
         .as_ref()
         .expect("checked accepted recovery");
+    if recovery.attempt != *attempt {
+        report.validate().map_err(str::to_owned)?;
+        if !predecessor_contained
+            || recovery.stage != PublicDataLossRecoveryStage::CallbackProcessing
+            || accepted.identity != report.identity
+            || accepted.history != authorization.predecessor
+            || report.history != authorization.predecessor
+            || report.storage_incarnation != authorization.provisional_primary
+            || report.process_session_id != attempt.process.process_session_id
+            || report.read_status == kuberic_runtime::protocol::types::AccessStatus::Granted
+            || report.write_status == kuberic_runtime::protocol::types::AccessStatus::Granted
+            || recovery.logical_authorization() != *authorization
+            || attempt
+                .validate_for(
+                    authorization,
+                    recovery.attempt.process.epoch.configuration_number,
+                )
+                .is_err()
+            || attempt.attempt_id == recovery.attempt.attempt_id
+            || attempt.process.process_session_id == recovery.attempt.process.process_session_id
+        {
+            return Err("public-v1 recovery renewal lacks exact contained authority".into());
+        }
+        let mut next = accepted.clone();
+        let mut renewed = recovery.clone();
+        renewed.attempt = attempt.clone();
+        renewed.stage = PublicDataLossRecoveryStage::Invalidated;
+        renewed.observed_progress = None;
+        next.data_loss_recovery = Some(renewed);
+        return Ok(PublicV1HistoryPlan::PersistStatus {
+            expected: Some(accepted.clone()),
+            next: Box::new(next),
+        });
+    }
+    if matches!(
+        recovery.stage,
+        PublicDataLossRecoveryStage::Failed
+            | PublicDataLossRecoveryStage::ReplacementRequired
+            | PublicDataLossRecoveryStage::Retired
+    ) {
+        return Ok(PublicV1HistoryPlan::Stable);
+    }
+    if recovery.stage != PublicDataLossRecoveryStage::Invalidated {
+        return Ok(PublicV1HistoryPlan::Stable);
+    }
     if recovery.logical_authorization() != *authorization
         || recovery.attempt != *attempt
         || input.authorization != *authorization
@@ -305,8 +356,14 @@ pub fn is_provisional_primary(report: &PublicV1AgentReport) -> bool {
         && report.role == kuberic_runtime::protocol::types::ReplicaRole::Primary
         && report.progress.role == PublicProgressRole::Recovery
         && report.data_loss_recovery.as_ref().is_some_and(|recovery| {
-            recovery.stage != PublicDataLossRecoveryStage::Admitted
-                && report.read_status != kuberic_runtime::protocol::types::AccessStatus::Granted
+            matches!(
+                recovery.stage,
+                PublicDataLossRecoveryStage::Authorized
+                    | PublicDataLossRecoveryStage::Invalidated
+                    | PublicDataLossRecoveryStage::CallbackProcessing
+                    | PublicDataLossRecoveryStage::HistoryPending
+                    | PublicDataLossRecoveryStage::ConfigurationPending
+            ) && report.read_status != kuberic_runtime::protocol::types::AccessStatus::Granted
                 && report.write_status != kuberic_runtime::protocol::types::AccessStatus::Granted
         })
 }

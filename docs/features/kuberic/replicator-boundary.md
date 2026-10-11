@@ -217,7 +217,17 @@ session and a strictly higher configuration number while preserving the same
 authorization and storage. If the replacement creation declares
 `ReplaceOnAmbiguity`, a captured convergent authorization retires without
 callback invocation; a captured `ReplaceOnAmbiguity` authorization is
-terminal and cannot be upgraded by a convergent replacement.
+terminal and cannot be upgraded by a convergent replacement. These outcomes
+remain distinct in durable/report state as `Retired` versus
+`ReplacementRequired`. Every ordinary Public V1 lifecycle/program epoch is
+fenced to the current history data-loss number; only the exact recovery
+authorization may admit the one specified increment.
+
+After ambiguous predecessor containment, the controller conditionally replaces
+the accepted process attempt with the exact higher-epoch successor before
+dispatch. Subsequent command and report acceptance require that successor
+attempt byte-for-byte; a predecessor attempt cannot resume through the new
+process.
 
 Recovery begins with two separately fenced owner-local commits. The controller
 conditionally persists bootstrap or invalidated accepted status before a
@@ -235,8 +245,10 @@ and catch-up, explicit history admission, and finally access. Callback
 `false`, `true`, typed failure, rebuild-required and lost-result ambiguity
 remain distinct; none is itself a history certificate. Pending reports carry
 the exact predecessor history and immutable authorization fields, while
-admitted reports carry the exact proposed history. Production normalization,
-gRPC dispatch and evaluation still reject the feature-gated protocol-11 path.
+admitted reports carry the exact proposed history. Recovery progress is valid
+only with nonterminal recovery authority; failed, replacement-required and
+retired state is election-ineligible. Production normalization, gRPC dispatch
+and evaluation still reject the feature-gated protocol-11 path.
 
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the

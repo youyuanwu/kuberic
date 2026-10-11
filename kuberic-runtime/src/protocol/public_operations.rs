@@ -717,6 +717,47 @@ impl PublicOperationProgram {
         }
     }
 
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn validate_history_data_loss_number(
+        &self,
+        expected_data_loss_number: i64,
+    ) -> Result<(), &'static str> {
+        let matches = |epoch: Epoch| epoch.data_loss_number == expected_data_loss_number;
+        let configuration_matches = |configuration: &PublicConfiguration| {
+            matches(configuration.current.epoch)
+                && configuration
+                    .previous
+                    .as_ref()
+                    .is_none_or(|previous| matches(previous.epoch))
+        };
+        let valid = match self {
+            Self::Role { epoch, .. } | Self::Epoch { epoch } => matches(*epoch),
+            Self::Configuration(configuration) | Self::CatchUp { configuration, .. } => {
+                configuration_matches(configuration)
+            }
+            Self::Swap {
+                starting,
+                refreshed,
+                epoch,
+                ..
+            } => {
+                matches(*epoch)
+                    && configuration_matches(starting)
+                    && configuration_matches(refreshed)
+            }
+            Self::Build(build) | Self::Remove(build) => build
+                .authorization
+                .as_ref()
+                .is_none_or(|authorization| matches(authorization.epoch)),
+            Self::Open { .. } | Self::Progress { .. } | Self::Close | Self::Abort => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err("ordinary public-v1 operation changed the history data-loss number")
+        }
+    }
+
     fn validate(
         &self,
         class: &PublicOperationClass,
@@ -1623,6 +1664,20 @@ impl PublicV1AgentReport {
             {
                 return Err("pending data-loss recovery cannot imply serving access");
             }
+        }
+        if self.progress.role == PublicProgressRole::Recovery
+            && !self.data_loss_recovery.as_ref().is_some_and(|recovery| {
+                matches!(
+                    recovery.stage,
+                    PublicDataLossRecoveryStage::Authorized
+                        | PublicDataLossRecoveryStage::Invalidated
+                        | PublicDataLossRecoveryStage::CallbackProcessing
+                        | PublicDataLossRecoveryStage::HistoryPending
+                        | PublicDataLossRecoveryStage::ConfigurationPending
+                )
+            })
+        {
+            return Err("recovery progress requires nonterminal recovery authority");
         }
         let mut operations = std::collections::BTreeSet::new();
         for completion in &self.completed_operations {

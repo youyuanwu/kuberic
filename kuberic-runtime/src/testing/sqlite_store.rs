@@ -177,10 +177,89 @@ impl SqliteStore {
                     .await
             }
             PublicV1HistoryCommand::Recover { intent, .. } => {
-                self.inner.begin_public_operation(intent, &[], &[]).await?;
+                let renewal = self
+                    .inner
+                    .load_state()
+                    .await?
+                    .public_operation_preview
+                    .and_then(|preview| preview.data_loss_recovery)
+                    .is_some_and(|recovery| {
+                        intent
+                            .lifecycle
+                            .as_ref()
+                            .and_then(|input| input.data_loss_recovery.as_ref())
+                            .is_some_and(|candidate| candidate.attempt != recovery.attempt)
+                    });
+                if renewal {
+                    self.inner.renew_public_v1_data_loss_attempt(intent).await?;
+                } else {
+                    self.inner.begin_public_operation(intent, &[], &[]).await?;
+                }
                 Ok(())
             }
         }
+    }
+
+    pub async fn contain_public_v1_data_loss_attempt(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+    ) -> crate::host::Result<()> {
+        let record = self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| record.intent == *intent)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "public-v1 data-loss attempt is not journaled".into(),
+                )
+            })?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                record.stage,
+                crate::host::state::PublicOperationStage::Running,
+                None,
+            )
+            .await?;
+        for (index, instruction) in crate::host::public_lifecycle::operation_instructions(intent)
+            .into_iter()
+            .enumerate()
+        {
+            self.inner
+                .public_instruction(intent, index, instruction, None)
+                .await?;
+            if instruction == crate::host::state::PublicInstruction::DataLoss {
+                self.inner
+                    .advance_public_operation(
+                        &intent.operation_id,
+                        intent.revision,
+                        &intent.process_session_id,
+                        crate::host::state::PublicOperationStage::Running,
+                        crate::host::state::PublicOperationStage::ContainmentPending,
+                        Some(crate::host::state::PublicOperationDisposition::Ambiguous(
+                            "predecessor process exited".into(),
+                        )),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            let outcome = match instruction {
+                crate::host::state::PublicInstruction::ApplicationPrimary => {
+                    crate::host::state::PublicInstructionOutcome::ApplicationRole(None)
+                }
+                _ => crate::host::state::PublicInstructionOutcome::Done,
+            };
+            self.inner
+                .public_instruction(intent, index, instruction, Some(outcome))
+                .await?;
+        }
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 recovery has no data-loss instruction".into(),
+        ))
     }
 
     pub async fn public_v1_agent_report(

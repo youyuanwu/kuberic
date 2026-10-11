@@ -238,6 +238,21 @@ fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() 
         public_v1_election_status(&report, &[]),
         PublicV1ElectionStatus::RecoveryPending
     );
+    report
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .stage = kuberic_runtime::protocol::public_operations::PublicDataLossRecoveryStage::ReplacementRequired;
+    assert_eq!(
+        public_v1_election_status(&report, &[]),
+        PublicV1ElectionStatus::Ineligible
+    );
+    report.data_loss_recovery.as_mut().unwrap().stage =
+        kuberic_runtime::protocol::public_operations::PublicDataLossRecoveryStage::Retired;
+    assert_eq!(
+        public_v1_election_status(&report, &[]),
+        PublicV1ElectionStatus::Ineligible
+    );
 }
 
 #[test]
@@ -495,6 +510,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
             &authorization,
             &attempt,
             &intent,
+            false,
         )
         .unwrap(),
     )
@@ -509,6 +525,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
             &authorization,
             &attempt,
             &intent,
+            false,
         )
         .unwrap(),
     )
@@ -589,5 +606,185 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         .unwrap()
         .reset_scope = ProviderProgressReset::Preserve;
     assert!(plan_public_v1_recovery_report(&invalidated, &changed_reset).is_err());
-    assert_eq!(api.dispatched.lock().unwrap().len(), 2);
+
+    store
+        .contain_public_v1_data_loss_attempt(&intent)
+        .await
+        .unwrap();
+    let contained_report = store
+        .public_v1_agent_report(
+            &identity,
+            PublicV1ReportProjection {
+                process_session_id: ProcessSessionId::new("session-1"),
+                report_sequence: 3,
+                role: ReplicaRole::Primary,
+                read_status: AccessStatus::NotPrimary,
+                write_status: AccessStatus::NotPrimary,
+                progress: PublicProgress {
+                    role: PublicProgressRole::Recovery,
+                    first: 0,
+                    last: 0,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    execute_public_v1_history(
+        &api,
+        plan_public_v1_recovery_report(&invalidated, &contained_report).unwrap(),
+    )
+    .await
+    .unwrap();
+    let contained = api.status.lock().unwrap().clone().unwrap();
+
+    let successor_attempt = DataLossAttempt {
+        authorization_id: authorization.authorization_id.clone(),
+        attempt_id: OperationId::new("attempt-2"),
+        process: ProcessAttemptContext {
+            process_session_id: ProcessSessionId::new("session-2"),
+            replicator_creation_id: ReplicatorCreationId::new("creation-2"),
+            catch_up_specific_quorum: true,
+            data_loss_replay: DataLossReplay::Convergent,
+            epoch: Epoch::new(1, 2),
+            attempt_revision: 2,
+        },
+    };
+    let successor_members = vec![ConfigurationMember {
+        identity: authorization.provisional_primary.replica.clone(),
+        role: ReplicaRole::Primary,
+    }];
+    let successor_lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: authorization.provisional_primary.replica.clone(),
+        epoch: successor_attempt.process.epoch,
+        possible_data_loss: PossibleDataLossIntent::Possible,
+        current: ConfigurationDescriptor::new(
+            successor_attempt.process.epoch,
+            authorization.provisional_primary.replica.replica_id,
+            successor_members.clone(),
+            1,
+        ),
+        previous: Some(ConfigurationDescriptor::new(
+            Epoch::new(1, 1),
+            authorization.provisional_primary.replica.replica_id,
+            successor_members,
+            1,
+        )),
+        replicas: Vec::new(),
+        data_loss_recovery: Some(PublicDataLossRecoveryInput {
+            authorization: authorization.clone(),
+            attempt: successor_attempt.clone(),
+        }),
+    };
+    let successor_intent = PublicOperationIntent {
+        preview: identity.clone(),
+        operation_id: successor_attempt.attempt_id.clone(),
+        revision: successor_attempt.process.attempt_revision,
+        process_session_id: successor_attempt.process.process_session_id.clone(),
+        class: PublicOperationClass::Authority,
+        input_digest: successor_lifecycle.digest(),
+        replay_disposition: PublicOperationReplayDisposition::DataLoss(DataLossReplay::Convergent),
+        lifecycle: Some(successor_lifecycle),
+        program: None,
+    };
+    let replacement_report = PublicV1AgentReport {
+        identity: identity.clone(),
+        resource_uid: resource_uid.clone(),
+        replica: authorization.provisional_primary.replica.clone(),
+        process_session_id: successor_attempt.process.process_session_id.clone(),
+        report_sequence: 1,
+        role: ReplicaRole::ActiveSecondary,
+        read_status: AccessStatus::NotPrimary,
+        write_status: AccessStatus::NotPrimary,
+        history: authorization.predecessor.clone(),
+        storage_incarnation: authorization.provisional_primary.clone(),
+        progress: PublicProgress {
+            role: PublicProgressRole::Secondary,
+            first: 0,
+            last: 0,
+        },
+        data_loss_recovery: None,
+        completed_operations: Vec::new(),
+        extensions: Default::default(),
+    };
+    assert!(
+        plan_public_v1_data_loss_recovery(
+            &contained,
+            &replacement_report,
+            &authorization,
+            &successor_attempt,
+            &successor_intent,
+            false,
+        )
+        .is_err()
+    );
+    execute_public_v1_history(
+        &api,
+        plan_public_v1_data_loss_recovery(
+            &contained,
+            &replacement_report,
+            &authorization,
+            &successor_attempt,
+            &successor_intent,
+            true,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let renewed = api.status.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        renewed.data_loss_recovery.as_ref().unwrap().attempt,
+        successor_attempt
+    );
+    execute_public_v1_history(
+        &api,
+        plan_public_v1_data_loss_recovery(
+            &renewed,
+            &replacement_report,
+            &authorization,
+            &successor_attempt,
+            &successor_intent,
+            true,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .public_v1_history_snapshot()
+            .await
+            .unwrap()
+            .recovery
+            .unwrap()
+            .attempt,
+        successor_attempt
+    );
+    let renewed_report = store
+        .public_v1_agent_report(
+            &identity,
+            PublicV1ReportProjection {
+                process_session_id: ProcessSessionId::new("session-2"),
+                report_sequence: 2,
+                role: ReplicaRole::Primary,
+                read_status: AccessStatus::NotPrimary,
+                write_status: AccessStatus::NotPrimary,
+                progress: PublicProgress {
+                    role: PublicProgressRole::Recovery,
+                    first: 0,
+                    last: 0,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let renewed_wire = kuberic_runtime::control::public_v1_agent_status_to_proto(&renewed_report);
+    let renewed_normalized =
+        kuberic_runtime::control::normalize_public_v1_agent_status_report(renewed_wire).unwrap();
+    assert!(matches!(
+        plan_public_v1_recovery_report(&renewed, &renewed_normalized).unwrap(),
+        kuberic_controller::evaluator::test_bridge::PublicV1HistoryPlan::Stable
+    ));
+    assert_eq!(api.dispatched.lock().unwrap().len(), 3);
 }
