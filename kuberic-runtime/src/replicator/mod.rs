@@ -36,9 +36,9 @@ use crate::protocol::authorization::{
     AuthorizationKeyId, AuthorizationVerificationKey, BuildAuthorizationEndpointV1,
     BuildAuthorizationV1, PeerSessionAuthorizationV1,
 };
-use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::PublicConfiguration;
+use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 #[cfg(all(test, kuberic_workspace_tests))]

@@ -2408,25 +2408,18 @@ pub struct PublicV1OperationCompletion {
 }
 
 impl PublicV1OperationCompletion {
-    fn validate(
+    pub fn validate_for_status(
         &self,
-        report_identity: &PublicOperationPreviewIdentity,
-        report_resource_uid: &ResourceUid,
-        report_replica: &ReplicaIdentity,
-        report_session: &ProcessSessionId,
+        identity: &PublicOperationPreviewIdentity,
+        history: &HistoryContext,
     ) -> Result<(), &'static str> {
-        if self.operation_id.is_empty() || self.revision == 0 {
-            return Err("public-v1 operation completion is incomplete");
-        }
-        if self.process_session_id.is_empty()
-            || &self.process_session_id != report_session
-            || self.history.resource_uid != *report_resource_uid
-            || self.history.protocol_generation.value() != report_identity.generation
-            || self.storage_incarnation.replica != *report_replica
+        if self.operation_id.is_empty()
+            || self.revision == 0
+            || self.process_session_id.is_empty()
+            || &self.history != history
+            || self.history.protocol_generation.value() != identity.generation
         {
-            return Err(
-                "public-v1 operation completion differs from its report history, storage, or session",
-            );
+            return Err("public-v1 operation completion status identity is incomplete");
         }
         self.history.validate()?;
         self.storage_incarnation.validate()?;
@@ -2443,6 +2436,35 @@ impl PublicV1OperationCompletion {
             return Err("public-v1 operation completion authority metadata is incomplete");
         }
         self.input_digest.validate()?;
+        match &self.result {
+            PublicV1OperationResult::Failed(detail)
+            | PublicV1OperationResult::Ambiguous(detail)
+                if detail.is_empty() =>
+            {
+                return Err("public-v1 failure completion lacks detail");
+            }
+            PublicV1OperationResult::RebuildRequired(rebuild) => rebuild.validate()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+        report_identity: &PublicOperationPreviewIdentity,
+        report_resource_uid: &ResourceUid,
+        report_replica: &ReplicaIdentity,
+        report_session: &ProcessSessionId,
+    ) -> Result<(), &'static str> {
+        self.validate_for_status(report_identity, &self.history)?;
+        if &self.process_session_id != report_session
+            || self.history.resource_uid != *report_resource_uid
+            || self.storage_incarnation.replica != *report_replica
+        {
+            return Err(
+                "public-v1 operation completion differs from its report history, storage, or session",
+            );
+        }
         match &self.result {
             PublicV1OperationResult::Failed(detail)
             | PublicV1OperationResult::Ambiguous(detail)
@@ -3211,6 +3233,9 @@ impl PublicV1AgentReport {
         }
         let mut operations = std::collections::BTreeSet::new();
         for completion in &self.completed_operations {
+            if completion.history != self.history {
+                return Err("public-v1 completion history differs from its report");
+            }
             completion.validate(
                 &self.identity,
                 &self.resource_uid,
@@ -3279,16 +3304,174 @@ pub enum PublicV1AcceptedResult {
     RebuildRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub enum PublicV1AcceptedRebuildKind {
+    LocalProvider,
+    RemoteBuildTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicV1AcceptedRebuildRequired {
+    pub kind: PublicV1AcceptedRebuildKind,
+    pub reason: ReplicaRebuildReason,
+    pub operation: CapturedPublicOperationIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replica: Option<ReplicaIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_replica: Option<ReplicaIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_storage: Option<PvcUid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<PublicBuildAuthorizationReference>,
+}
+
+impl PublicV1AcceptedRebuildRequired {
+    fn from_rebuild(rebuild: &CanonicalReplicaRebuildRequired) -> Self {
+        match rebuild {
+            CanonicalReplicaRebuildRequired::LocalProvider {
+                reason,
+                provider,
+                operation,
+                local_replica,
+                local_storage,
+            } => Self {
+                kind: PublicV1AcceptedRebuildKind::LocalProvider,
+                reason: *reason,
+                operation: operation.clone(),
+                provider_replica: Some(provider.replica.clone()),
+                local_replica: Some(local_replica.clone()),
+                local_storage: Some(local_storage.clone()),
+                authorization: None,
+            },
+            CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+                reason,
+                operation,
+                authorization,
+            } => Self {
+                kind: PublicV1AcceptedRebuildKind::RemoteBuildTarget,
+                reason: *reason,
+                operation: operation.clone(),
+                provider_replica: None,
+                local_replica: None,
+                local_storage: None,
+                authorization: Some(authorization.clone()),
+            },
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        self.operation.validate()?;
+        match self.kind {
+            PublicV1AcceptedRebuildKind::LocalProvider => {
+                let provider = self
+                    .provider_replica
+                    .as_ref()
+                    .ok_or("accepted local rebuild lacks provider identity")?;
+                let local = self
+                    .local_replica
+                    .as_ref()
+                    .ok_or("accepted local rebuild lacks local replica")?;
+                if provider != local
+                    || self.local_storage.as_ref().is_none_or(PvcUid::is_empty)
+                    || self.authorization.is_some()
+                {
+                    return Err("accepted local rebuild shape is inconsistent");
+                }
+            }
+            PublicV1AcceptedRebuildKind::RemoteBuildTarget => {
+                let authorization = self
+                    .authorization
+                    .as_ref()
+                    .ok_or("accepted remote rebuild lacks authorization")?;
+                authorization.validate()?;
+                if self.provider_replica.is_some()
+                    || self.local_replica.is_some()
+                    || self.local_storage.is_some()
+                    || authorization.resource_uid != self.operation.resource_uid
+                    || authorization.epoch != self.operation.epoch
+                    || authorization.build_id != self.operation.operation_id
+                {
+                    return Err("accepted remote rebuild shape is inconsistent");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicV1AcceptedOperationCompletion {
     pub operation_id: OperationId,
     pub revision: u64,
+    pub call_kind: PublicV1CallKind,
+    pub process_session_id: ProcessSessionId,
     pub input_digest_version: u16,
     pub input_digest_sha256: String,
     pub replay_disposition: PublicV1AcceptedReplayDisposition,
+    pub history: HistoryContext,
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_configuration_id: Option<ConfigurationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_configuration_id: Option<ConfigurationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_mode: Option<PublicCatchUpMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_specific_quorum: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_key_id: Option<AuthorizationKeyId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_audit_digest: Option<SignedAuthorizationAuditDigest>,
     pub result: PublicV1AcceptedResult,
-    pub result_digest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild_required: Option<PublicV1AcceptedRebuildRequired>,
+}
+
+impl PublicV1AcceptedOperationCompletion {
+    pub fn from_completion(completion: &PublicV1OperationCompletion) -> Self {
+        let (result, failure_detail, rebuild_required) = match &completion.result {
+            PublicV1OperationResult::Succeeded => (PublicV1AcceptedResult::Succeeded, None, None),
+            PublicV1OperationResult::Failed(detail) => {
+                (PublicV1AcceptedResult::Failed, Some(detail.clone()), None)
+            }
+            PublicV1OperationResult::Ambiguous(detail) => (
+                PublicV1AcceptedResult::Ambiguous,
+                Some(detail.clone()),
+                None,
+            ),
+            PublicV1OperationResult::Cancelled => (PublicV1AcceptedResult::Cancelled, None, None),
+            PublicV1OperationResult::RebuildRequired(rebuild) => (
+                PublicV1AcceptedResult::RebuildRequired,
+                None,
+                Some(PublicV1AcceptedRebuildRequired::from_rebuild(rebuild)),
+            ),
+        };
+        Self {
+            operation_id: completion.operation_id.clone(),
+            revision: completion.revision,
+            call_kind: completion.call_kind,
+            process_session_id: completion.process_session_id.clone(),
+            input_digest_version: completion.input_digest.version(),
+            input_digest_sha256: completion.input_digest.sha256().to_string(),
+            replay_disposition: completion.replay_disposition.into(),
+            history: completion.history.clone(),
+            storage_incarnation: completion.storage_incarnation.clone(),
+            previous_configuration_id: completion.previous_configuration_id.clone(),
+            current_configuration_id: completion.current_configuration_id.clone(),
+            catch_up_mode: completion.catch_up_mode,
+            catch_up_specific_quorum: completion.catch_up_specific_quorum,
+            authorization_key_id: completion.authorization_key_id,
+            authorization_audit_digest: completion.authorization_audit_digest,
+            result,
+            failure_detail,
+            rebuild_required,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -3300,6 +3483,7 @@ pub struct PublicV1AcceptedStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
     #[serde(default)]
+    #[schemars(length(max = 64))]
     pub completed_operations: Vec<PublicV1AcceptedOperationCompletion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<PublicV1AuthorizationStatus>,
@@ -3308,6 +3492,72 @@ pub struct PublicV1AcceptedStatus {
 }
 
 impl PublicV1AcceptedStatus {
+    pub fn validate_evidence(&self) -> Result<(), &'static str> {
+        if !self.identity.is_public_v1()
+            || self.completed_operations.len() > 64
+            || self.history.protocol_generation.value() != self.identity.generation
+        {
+            return Err("public-v1 accepted evidence identity or bound is invalid");
+        }
+        self.history.validate()?;
+        let mut operations = std::collections::BTreeSet::new();
+        for completion in &self.completed_operations {
+            if completion.operation_id.is_empty()
+                || completion.revision == 0
+                || completion.process_session_id.is_empty()
+                || completion.history != self.history
+                || completion.input_digest_version != 1
+                || completion.input_digest_sha256.len() != 64
+                || completion.authorization_key_id.is_some()
+                    != completion.authorization_audit_digest.is_some()
+                || completion.failure_detail.is_some()
+                    != matches!(
+                        completion.result,
+                        PublicV1AcceptedResult::Failed | PublicV1AcceptedResult::Ambiguous
+                    )
+                || completion.rebuild_required.is_some()
+                    != (completion.result == PublicV1AcceptedResult::RebuildRequired)
+            {
+                return Err("public-v1 accepted completion is incomplete");
+            }
+            completion.history.validate()?;
+            completion.storage_incarnation.validate()?;
+            if let Some(rebuild) = &completion.rebuild_required {
+                rebuild.validate()?;
+                if rebuild.operation.operation_id != completion.operation_id
+                    || rebuild.operation.revision != completion.revision
+                    || rebuild.operation.preview != self.identity
+                    || rebuild.operation.resource_uid != self.history.resource_uid
+                    || rebuild.operation.detecting_session != completion.process_session_id
+                {
+                    return Err("accepted rebuild differs from its completion");
+                }
+            }
+            if !operations.insert(&completion.operation_id) {
+                return Err("public-v1 accepted completions contain a duplicate operation");
+            }
+        }
+        self.validate_authorization()
+    }
+
+    pub fn is_evidence_successor_of(&self, previous: &Self) -> bool {
+        if self.identity != previous.identity
+            || self.history_initialization_id != previous.history_initialization_id
+            || self.history != previous.history
+            || self.data_loss_recovery != previous.data_loss_recovery
+            || self.authorization != previous.authorization
+            || self.extensions != previous.extensions
+            || self.completed_operations.len() > previous.completed_operations.len() + 1
+        {
+            return false;
+        }
+        previous.completed_operations.iter().all(|completion| {
+            self.completed_operations
+                .iter()
+                .any(|next| next == completion)
+        })
+    }
+
     pub fn authorization(&self) -> Option<&PublicV1AuthorizationStatus> {
         self.authorization.as_ref()
     }

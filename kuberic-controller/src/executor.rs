@@ -142,6 +142,59 @@ pub async fn execute_public_v1_session_renewal(
 }
 
 #[cfg(feature = "runtime-test-bridge")]
+pub async fn execute_public_v1_evidence(
+    api: &dyn crate::cluster_api::PublicV1EvidenceApi,
+    plan: crate::evaluator::test_bridge::PublicV1EvidencePlan,
+) -> std::result::Result<(), String> {
+    use crate::evaluator::test_bridge::PublicV1EvidencePlan;
+    match plan {
+        PublicV1EvidencePlan::PersistStatus { expected, next } => {
+            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 evidence status".into());
+            }
+            if !next.is_evidence_successor_of(&expected) {
+                return Err("public-v1 evidence status transition is not monotonic".into());
+            }
+            api.persist_public_v1_evidence_status(&expected, &next)
+                .await
+        }
+        PublicV1EvidencePlan::Accept {
+            expected,
+            completion,
+        } => {
+            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 completion acceptance".into());
+            }
+            api.accept_public_v1_completion(&expected, &completion)
+                .await
+        }
+        PublicV1EvidencePlan::RetireExactIncarnation {
+            expected,
+            completion,
+            storage,
+        } => {
+            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 retirement authority".into());
+            }
+            api.retire_public_v1_incarnation(&expected, &completion, &storage)
+                .await
+        }
+        PublicV1EvidencePlan::ProvisionReplacement {
+            expected,
+            completion,
+            rebuild,
+        } => {
+            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 replacement authority".into());
+            }
+            api.provision_public_v1_replacement(&expected, &completion, &rebuild)
+                .await
+        }
+        PublicV1EvidencePlan::Wait => Ok(()),
+    }
+}
+
+#[cfg(feature = "runtime-test-bridge")]
 pub async fn execute_public_v1_authorization(
     api: &dyn crate::cluster_api::PublicV1AuthorizationApi,
     plan: crate::evaluator::test_bridge::PublicV1AuthorizationPlan,

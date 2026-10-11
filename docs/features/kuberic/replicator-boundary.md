@@ -340,6 +340,17 @@ handle. Callback ambiguity requires retirement, successful removal retires the
 exact record, and malformed or incompletely bound current-schema records fail
 on reopen.
 
+The dormant controller stores a structural, lossless shadow of each exact
+public completion before using it. The shadow preserves call kind, canonical
+input identity, replay disposition, accepted history/storage/process session,
+PC/CC IDs, capability/mode, signed key/audit identity, typed failure detail
+and typed local/remote rebuild authority. Failover, switchover,
+repair/replacement, scale-up/down, removal, data loss and session renewal all
+use the same conditional evidence gate. Missing completion waits; changed
+history/session/incarnation/configuration/authorization fails closed; typed
+failure retires the exact incarnation and typed rebuild authority provisions
+only the captured replacement.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

@@ -19,6 +19,10 @@ pub use super::public_v1_authorization::{
     PublicV1AuthorizationEvidence, PublicV1AuthorizationIntentSlot, PublicV1AuthorizationPlan,
     PublicV1AuthorizationRequest, plan_public_v1_authorization,
 };
+pub use super::public_v1_evidence::{
+    PublicV1CompletionRequirement, PublicV1EvidenceConsumer, PublicV1EvidencePlan,
+    plan_public_v1_evidence,
+};
 pub use super::public_v1_history::{
     PublicV1ElectionStatus, PublicV1HistoryPlan,
     accept_recovery_report as accept_public_v1_recovery_report,
@@ -46,14 +50,15 @@ pub use crate::cluster_api::{
     PUBLIC_V1_AUTHORIZATION_PUBLIC_KEY, PUBLIC_V1_AUTHORIZATION_RESOURCE_UID_LABEL,
     PUBLIC_V1_AUTHORIZATION_SECRET_TYPE, PUBLIC_V1_AUTHORIZATION_SEED_KEY, PreviewServiceApi,
     PublicV1AuthorizationApi, PublicV1AuthorizationDispatch, PublicV1AuthorizationSecretOwner,
-    PublicV1HistoryApi, PublicV1SessionRenewalApi, generate_public_v1_authorization_secret,
-    preview_service_matches, preview_service_update, public_v1_authorization_secret_binding,
+    PublicV1EvidenceApi, PublicV1HistoryApi, PublicV1SessionRenewalApi,
+    generate_public_v1_authorization_secret, preview_service_matches, preview_service_update,
+    public_v1_authorization_secret_binding,
     validate_pods_do_not_reference_public_v1_authorization_secret,
     validate_public_v1_authorization_binding, validate_public_v1_authorization_secret,
 };
 pub use crate::executor::{
-    execute_preview_service_location, execute_public_v1_authorization, execute_public_v1_history,
-    execute_public_v1_session_renewal,
+    execute_preview_service_location, execute_public_v1_authorization, execute_public_v1_evidence,
+    execute_public_v1_history, execute_public_v1_session_renewal,
 };
 pub use k8s_openapi::api::core::v1::Service as PreviewWriteService;
 

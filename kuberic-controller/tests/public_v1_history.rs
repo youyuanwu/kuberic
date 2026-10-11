@@ -10,9 +10,9 @@ use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, DataLossReplay, PossibleDataLossIntent,
     ProcessAttemptContext, ProviderProgressReset, PublicDataLossRecoveryInput,
     PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
-    PublicOperationPreviewIdentity, PublicOperationReplayDisposition, PublicProgress,
-    PublicProgressRole, PublicV1AcceptedOperationCompletion, PublicV1AcceptedReplayDisposition,
-    PublicV1AcceptedResult, PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicOperationPreviewIdentity, PublicOperationProgram, PublicOperationReplayDisposition,
+    PublicProgress, PublicProgressRole, PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -83,17 +83,27 @@ fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
     let resource_uid = ResourceUid::new("resource-1");
     let identity = PublicOperationPreviewIdentity::public_v1(42);
     let mut accepted = ensure_public_v1_bootstrap_history(None, &resource_uid, &identity).unwrap();
-    accepted
-        .completed_operations
-        .push(PublicV1AcceptedOperationCompletion {
+    let old_program = PublicOperationProgram::Abort;
+    accepted.completed_operations.push(
+        kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
+            from_completion(&PublicV1OperationCompletion {
             operation_id: OperationId::new("old-completion"),
             revision: 1,
-            input_digest_version: 1,
-            input_digest_sha256: "old-input".into(),
-            replay_disposition: PublicV1AcceptedReplayDisposition::Convergent,
-            result: PublicV1AcceptedResult::Succeeded,
-            result_digest_sha256: "old-result".into(),
-        });
+            call_kind: PublicV1CallKind::Abort,
+            process_session_id: ProcessSessionId::new("session-1"),
+            input_digest: old_program.digest(),
+            replay_disposition: old_program.replay_disposition(),
+            history: accepted.history.clone(),
+            storage_incarnation: storage(),
+            previous_configuration_id: None,
+            current_configuration_id: None,
+            catch_up_mode: None,
+            catch_up_specific_quorum: None,
+            authorization_key_id: None,
+            authorization_audit_digest: None,
+            result: PublicV1OperationResult::Succeeded,
+        }),
+    );
     let storage = storage();
     let report = PublicV1AgentReport {
         identity: identity.clone(),

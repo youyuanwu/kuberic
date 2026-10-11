@@ -3753,6 +3753,10 @@ mod public_v1_history;
 #[cfg(feature = "runtime-test-bridge")]
 pub use public_v1_history::{PublicV1HistoryApi, PublicV1SessionRenewalApi};
 #[cfg(feature = "runtime-test-bridge")]
+mod public_v1_evidence;
+#[cfg(feature = "runtime-test-bridge")]
+pub use public_v1_evidence::PublicV1EvidenceApi;
+#[cfg(feature = "runtime-test-bridge")]
 mod public_v1_authorization;
 #[cfg(feature = "runtime-test-bridge")]
 pub use public_v1_authorization::{

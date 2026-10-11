@@ -693,6 +693,7 @@ pub(crate) async fn public_v1_report(
         .operations
         .values()
         .filter(|record| record.stage == PublicOperationStage::Completed)
+        .filter(|record| record.intent.process_session_id == projection.process_session_id)
         .map(|record| {
             let rebuild = record.lifecycle.outcomes.iter().find_map(|outcome| {
                 if let PublicInstructionOutcome::RebuildRequired(failure) = outcome {
