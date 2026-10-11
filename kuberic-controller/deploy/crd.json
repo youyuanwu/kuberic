@@ -51,6 +51,22 @@
                     "minLength": 1,
                     "type": "string"
                   },
+                  "previewLifecycle": {
+                    "nullable": true,
+                    "properties": {
+                      "statePersistence": {
+                        "enum": [
+                          "persisted",
+                          "volatile"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "statePersistence"
+                    ],
+                    "type": "object"
+                  },
                   "replicas": {
                     "format": "uint32",
                     "minimum": 1.0,
@@ -152,6 +168,159 @@
                   },
                   "initialized": {
                     "type": "boolean"
+                  },
+                  "lastPublicFaultAction": {
+                    "nullable": true,
+                    "properties": {
+                      "actionId": {
+                        "type": "string"
+                      },
+                      "binding": {
+                        "properties": {
+                          "preview": {
+                            "properties": {
+                              "generation": {
+                                "format": "uint64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "protocolVersion": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "generation",
+                              "protocolVersion"
+                            ],
+                            "type": "object"
+                          },
+                          "resourceUid": {
+                            "type": "string"
+                          },
+                          "specGeneration": {
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "statePersistence": {
+                            "enum": [
+                              "persisted",
+                              "volatile"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "preview",
+                          "resourceUid",
+                          "specGeneration",
+                          "statePersistence"
+                        ],
+                        "type": "object"
+                      },
+                      "fault": {
+                        "enum": [
+                          "transient",
+                          "permanent"
+                        ],
+                        "type": "string"
+                      },
+                      "faultOperationId": {
+                        "type": "string"
+                      },
+                      "faultRevision": {
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "kind": {
+                        "enum": [
+                          "restart",
+                          "dropReplacement"
+                        ],
+                        "type": "string"
+                      },
+                      "predecessorProcessId": {
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "predecessorSession": {
+                        "type": "string"
+                      },
+                      "resources": {
+                        "properties": {
+                          "endpointName": {
+                            "type": "string"
+                          },
+                          "endpointResourceVersion": {
+                            "type": "string"
+                          },
+                          "endpointUid": {
+                            "type": "string"
+                          },
+                          "podName": {
+                            "type": "string"
+                          },
+                          "podUid": {
+                            "type": "string"
+                          },
+                          "pvcName": {
+                            "type": "string"
+                          },
+                          "pvcUid": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "endpointName",
+                          "endpointResourceVersion",
+                          "endpointUid",
+                          "podName",
+                          "podUid",
+                          "pvcName",
+                          "pvcUid"
+                        ],
+                        "type": "object"
+                      },
+                      "target": {
+                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                        "properties": {
+                          "agentGeneration": {
+                            "type": "string"
+                          },
+                          "instanceId": {
+                            "type": "string"
+                          },
+                          "replicaId": {
+                            "format": "int64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "agentGeneration",
+                          "instanceId",
+                          "replicaId"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "actionId",
+                      "binding",
+                      "fault",
+                      "faultOperationId",
+                      "faultRevision",
+                      "kind",
+                      "predecessorProcessId",
+                      "predecessorSession",
+                      "resources",
+                      "target"
+                    ],
+                    "type": "object"
                   },
                   "lastReplacement": {
                     "nullable": true,
@@ -2277,6 +2446,52 @@
                     ],
                     "type": "object"
                   },
+                  "previewLifecycle": {
+                    "nullable": true,
+                    "properties": {
+                      "preview": {
+                        "properties": {
+                          "generation": {
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "protocolVersion": {
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "generation",
+                          "protocolVersion"
+                        ],
+                        "type": "object"
+                      },
+                      "resourceUid": {
+                        "type": "string"
+                      },
+                      "specGeneration": {
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "statePersistence": {
+                        "enum": [
+                          "persisted",
+                          "volatile"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "preview",
+                      "resourceUid",
+                      "specGeneration",
+                      "statePersistence"
+                    ],
+                    "type": "object"
+                  },
                   "primaryFailure": {
                     "nullable": true,
                     "properties": {
@@ -2543,6 +2758,187 @@
                       "podUid",
                       "purpose",
                       "pvcUid"
+                    ],
+                    "type": "object"
+                  },
+                  "publicFaultAction": {
+                    "nullable": true,
+                    "properties": {
+                      "actionId": {
+                        "type": "string"
+                      },
+                      "binding": {
+                        "properties": {
+                          "preview": {
+                            "properties": {
+                              "generation": {
+                                "format": "uint64",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              },
+                              "protocolVersion": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "generation",
+                              "protocolVersion"
+                            ],
+                            "type": "object"
+                          },
+                          "resourceUid": {
+                            "type": "string"
+                          },
+                          "specGeneration": {
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "statePersistence": {
+                            "enum": [
+                              "persisted",
+                              "volatile"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "preview",
+                          "resourceUid",
+                          "specGeneration",
+                          "statePersistence"
+                        ],
+                        "type": "object"
+                      },
+                      "fault": {
+                        "enum": [
+                          "transient",
+                          "permanent"
+                        ],
+                        "type": "string"
+                      },
+                      "faultOperationId": {
+                        "type": "string"
+                      },
+                      "faultRevision": {
+                        "format": "uint64",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "kind": {
+                        "enum": [
+                          "restart",
+                          "dropReplacement"
+                        ],
+                        "type": "string"
+                      },
+                      "predecessorProcessId": {
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "predecessorSession": {
+                        "type": "string"
+                      },
+                      "resources": {
+                        "properties": {
+                          "endpointName": {
+                            "type": "string"
+                          },
+                          "endpointResourceVersion": {
+                            "type": "string"
+                          },
+                          "endpointUid": {
+                            "type": "string"
+                          },
+                          "podName": {
+                            "type": "string"
+                          },
+                          "podUid": {
+                            "type": "string"
+                          },
+                          "pvcName": {
+                            "type": "string"
+                          },
+                          "pvcUid": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "endpointName",
+                          "endpointResourceVersion",
+                          "endpointUid",
+                          "podName",
+                          "podUid",
+                          "pvcName",
+                          "pvcUid"
+                        ],
+                        "type": "object"
+                      },
+                      "target": {
+                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                        "properties": {
+                          "agentGeneration": {
+                            "type": "string"
+                          },
+                          "instanceId": {
+                            "type": "string"
+                          },
+                          "replicaId": {
+                            "format": "int64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "agentGeneration",
+                          "instanceId",
+                          "replicaId"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "actionId",
+                      "binding",
+                      "fault",
+                      "faultOperationId",
+                      "faultRevision",
+                      "kind",
+                      "predecessorProcessId",
+                      "predecessorSession",
+                      "resources",
+                      "target"
+                    ],
+                    "type": "object"
+                  },
+                  "publicServiceClear": {
+                    "nullable": true,
+                    "properties": {
+                      "actionId": {
+                        "type": "string"
+                      },
+                      "serviceResourceVersion": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "serviceUid": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "stage": {
+                        "enum": [
+                          "pending",
+                          "publishedAbsent"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "actionId",
+                      "stage"
                     ],
                     "type": "object"
                   },

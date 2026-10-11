@@ -128,6 +128,7 @@ fn build_report(
                 })
                 .map(|p| &p.operation_id)
         });
+    let preview_fault_fenced = state.public_operation_preview.is_some() && reported_fault.is_some();
     proto::AgentStatusReport {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         replication_address: snapshot
@@ -152,7 +153,11 @@ fn build_report(
         pod_uid: state.identity.pod_uid.to_string(),
         pvc_uid: state.identity.pvc_uid.to_string(),
         storage_error: String::new(),
-        healthy: reported_fault != Some(FaultType::Permanent),
+        healthy: if state.public_operation_preview.is_some() {
+            !preview_fault_fenced
+        } else {
+            reported_fault != Some(FaultType::Permanent)
+        },
         replica_id: state.identity.local_identity.replica_id.value(),
         read_status: access_to_proto(snapshot.host.read_status) as i32,
         current_configuration_quorum_progress: snapshot

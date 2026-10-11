@@ -405,6 +405,9 @@ pub(crate) struct AgentService<S, E> {
     bearer_token: Arc<str>,
     ready_state: Arc<AtomicBool>,
     command_tasks: Arc<CommandTaskOwner>,
+    #[cfg(feature = "testing")]
+    public_operation_preview:
+        Arc<Mutex<Option<crate::host::operation_recovery::PartitionOperationRuntime>>>,
 }
 
 struct CommandTaskOwner {
@@ -469,6 +472,8 @@ impl<S, E> Clone for AgentService<S, E> {
             bearer_token: self.bearer_token.clone(),
             ready_state: self.ready_state.clone(),
             command_tasks: self.command_tasks.clone(),
+            #[cfg(feature = "testing")]
+            public_operation_preview: self.public_operation_preview.clone(),
         }
     }
 }
@@ -502,11 +507,43 @@ where
             bearer_token,
             ready_state: Arc::new(AtomicBool::new(false)),
             command_tasks: CommandTaskOwner::new(),
+            #[cfg(feature = "testing")]
+            public_operation_preview: Arc::new(Mutex::new(None)),
         })
     }
 
     pub(crate) fn sessions(&self) -> &Arc<SessionRegistry> {
         &self.sessions
+    }
+
+    #[cfg(feature = "testing")]
+    #[allow(dead_code)]
+    pub(crate) async fn public_operation_preview_runtime(
+        &self,
+        preview: crate::protocol::public_operations::PublicOperationPreviewIdentity,
+    ) -> Result<Arc<crate::host::operation::PartitionOperationRegistry>> {
+        let mut owner = self.public_operation_preview.lock().await;
+        if owner.is_some() {
+            return Err(crate::host::HostError::CommandRejected(
+                "public-operation preview runtime is already active".into(),
+            ));
+        }
+        let runtime = crate::host::testing::PublicOperationPreviewRuntime::start(
+            self.store.clone(),
+            preview.clone(),
+            self.sessions.local_session().clone(),
+        )?;
+        let registry = runtime.registry();
+        self.runtime
+            .bind_public_fault_preview(
+                self.store.clone(),
+                registry.clone(),
+                preview,
+                self.sessions.local_session().clone(),
+            )
+            .await?;
+        *owner = Some(runtime.into_owner());
+        Ok(registry)
     }
 
     pub(crate) async fn serve(
@@ -529,6 +566,12 @@ where
         ready: watch::Sender<bool>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
+        let preview_quarantine = self
+            .store
+            .load_state()
+            .await?
+            .public_operation_preview
+            .is_some();
         let control_service = self.clone();
         let peer_service = self.clone();
         let replication_service = self.clone();
@@ -582,9 +625,15 @@ where
             replication.abort();
             let _ = tokio::join!(&mut control, &mut replication);
             self.runtime.shutdown_recovery_tasks().await;
-            let _ = self.runtime.shutdown_configuration_work().await;
+            if !preview_quarantine {
+                let _ = self.runtime.shutdown_configuration_work().await;
+            }
             self.runtime.quiesce_partition_reports().await;
-            let persisted = self.persist_partition_fault().await;
+            let persisted = if preview_quarantine {
+                Ok(())
+            } else {
+                self.persist_partition_fault().await
+            };
             self.runtime.abort();
             if let Err(persisted) = persisted {
                 return Err(crate::host::HostError::CommandRejected(format!(
@@ -594,28 +643,44 @@ where
             return Err(error);
         }
 
-        let recovery_owner = RecoveryOwner::with_admission_lock(
-            self.runtime.recovery_owner_runtime(),
-            self.store.clone(),
-            self.coordinator.recovery_admission_lock(),
-        );
         let (recovery_stop, recovery_shutdown) = watch::channel(false);
-        let mut recovery_owner_task =
-            tokio::spawn(async move { recovery_owner.run(recovery_shutdown).await });
-        let partition_owner =
-            PartitionReportOwner::new(self.runtime.recovery_owner_runtime(), self.store.clone());
+        let mut recovery_owner_task = if preview_quarantine {
+            None
+        } else {
+            let recovery_owner = RecoveryOwner::with_admission_lock(
+                self.runtime.recovery_owner_runtime(),
+                self.store.clone(),
+                self.coordinator.recovery_admission_lock(),
+            );
+            Some(tokio::spawn(async move {
+                recovery_owner.run(recovery_shutdown).await
+            }))
+        };
         let (partition_stop, partition_shutdown) = watch::channel(false);
-        let mut partition_owner_task =
-            tokio::spawn(async move { partition_owner.run(partition_shutdown).await });
+        let mut partition_owner_task = if preview_quarantine {
+            None
+        } else {
+            let partition_owner = PartitionReportOwner::new(
+                self.runtime.recovery_owner_runtime(),
+                self.store.clone(),
+            );
+            Some(tokio::spawn(async move {
+                partition_owner.run(partition_shutdown).await
+            }))
+        };
 
         self.ready_state.store(true, Ordering::Release);
         ready.send_replace(true);
-        let recovery_coordinator = self.coordinator.clone();
-        let configuration_recovery_task = tokio::spawn(async move {
-            if let Err(error) = recovery_coordinator.resume_configuration().await {
-                tracing::warn!(%error, "background configuration recovery stopped");
-            }
-        });
+        let configuration_recovery_task = if preview_quarantine {
+            None
+        } else {
+            let recovery_coordinator = self.coordinator.clone();
+            Some(tokio::spawn(async move {
+                if let Err(error) = recovery_coordinator.resume_configuration().await {
+                    tracing::warn!(%error, "background configuration recovery stopped");
+                }
+            }))
+        };
         let result = tokio::select! {
             result = &mut control => {
                 replication.abort();
@@ -640,30 +705,49 @@ where
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
-        configuration_recovery_task.abort();
-        let _ = configuration_recovery_task.await;
+        if let Some(configuration_recovery_task) = configuration_recovery_task {
+            configuration_recovery_task.abort();
+            let _ = configuration_recovery_task.await;
+        }
+        #[cfg(feature = "testing")]
+        let public_operation_preview_result =
+            if let Some(owner) = self.public_operation_preview.lock().await.take() {
+                owner.shutdown().await
+            } else {
+                Ok(())
+            };
         self.command_tasks.shutdown().await;
         recovery_stop.send_replace(true);
         partition_stop.send_replace(true);
         self.runtime.shutdown_recovery_tasks().await;
-        if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut recovery_owner_task)
-            .await
-            .is_err()
+        if let Some(recovery_owner_task) = &mut recovery_owner_task
+            && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut *recovery_owner_task)
+                .await
+                .is_err()
         {
             recovery_owner_task.abort();
             let _ = recovery_owner_task.await;
         }
-        if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut partition_owner_task)
-            .await
-            .is_err()
+        if let Some(partition_owner_task) = &mut partition_owner_task
+            && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut *partition_owner_task)
+                .await
+                .is_err()
         {
             partition_owner_task.abort();
             let _ = partition_owner_task.await;
         }
-        self.runtime.shutdown_configuration_work().await?;
+        if !preview_quarantine {
+            self.runtime.shutdown_configuration_work().await?;
+        }
         self.runtime.quiesce_partition_reports().await;
-        let persisted = self.persist_partition_fault().await;
+        let persisted = if preview_quarantine {
+            Ok(())
+        } else {
+            self.persist_partition_fault().await
+        };
         self.runtime.abort();
+        #[cfg(feature = "testing")]
+        public_operation_preview_result?;
         persisted?;
         result
     }
@@ -684,58 +768,74 @@ where
 
     pub(crate) async fn reconstruct_runtime(&self) -> Result<()> {
         let state = self.store.load_state().await?;
+        let preview_quarantine = state.public_operation_preview.is_some();
         self.runtime.bind_replica_session(
             state.identity.resource_uid.clone(),
             self.sessions.local_session().clone(),
         )?;
-        self.runtime.stage_authority_recovery(
-            state
-                .pending_effect
-                .as_ref()
-                .map(|pending| pending.effect.clone()),
-        );
-        let transition = startup_transition(&state);
-        let removal_pending = state.pending_effect.as_ref().is_some_and(|p| {
-            matches!(
-                p.effect.action,
-                crate::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                    | crate::effects::RuntimeEffectAction::RetireReplica(_)
-            )
-        }) || state.reconfiguration.as_ref().is_some_and(|r| {
-            r.command.transition_kind == crate::protocol::types::TransitionKind::SecondaryScaleDown
-        });
-        let planned_switchover_pending = state.reconfiguration.as_ref().is_some_and(|record| {
-            record.command.transition_kind
-                == crate::protocol::types::TransitionKind::PlannedSwitchover
-        });
         self.runtime
-            .reconstruct(
-                if state
-                    .application_storage
+            .stage_authority_recovery(if preview_quarantine {
+                None
+            } else {
+                state
+                    .pending_effect
                     .as_ref()
-                    .is_some_and(|b| b.initializing)
-                {
-                    OpenMode::New
-                } else {
-                    OpenMode::Existing
-                },
-                state.role,
-                if removal_pending {
-                    crate::protocol::types::AccessStatus::ReconfigurationPending
-                } else {
-                    state.read_status
-                },
-                startup_write_status(
-                    state.write_status,
-                    state
-                        .pending_effect
-                        .as_ref()
-                        .map(|pending| &pending.effect.action),
-                    removal_pending || planned_switchover_pending,
-                ),
-                transition,
-            )
-            .await?;
+                    .map(|pending| pending.effect.clone())
+            });
+        let transition = if preview_quarantine {
+            None
+        } else {
+            startup_transition(&state)
+        };
+        let removal_pending = !preview_quarantine
+            && (state.pending_effect.as_ref().is_some_and(|p| {
+                matches!(
+                    p.effect.action,
+                    crate::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                        | crate::effects::RuntimeEffectAction::RetireReplica(_)
+                )
+            }) || state.reconfiguration.as_ref().is_some_and(|r| {
+                r.command.transition_kind
+                    == crate::protocol::types::TransitionKind::SecondaryScaleDown
+            }));
+        let planned_switchover_pending = !preview_quarantine
+            && state.reconfiguration.as_ref().is_some_and(|record| {
+                record.command.transition_kind
+                    == crate::protocol::types::TransitionKind::PlannedSwitchover
+            });
+        let open_mode = if state
+            .application_storage
+            .as_ref()
+            .is_some_and(|b| b.initializing)
+        {
+            OpenMode::New
+        } else {
+            OpenMode::Existing
+        };
+        if preview_quarantine {
+            self.runtime.reconstruct_quarantined(open_mode).await?;
+        } else {
+            self.runtime
+                .reconstruct(
+                    open_mode,
+                    state.role,
+                    if removal_pending {
+                        crate::protocol::types::AccessStatus::ReconfigurationPending
+                    } else {
+                        state.read_status
+                    },
+                    startup_write_status(
+                        state.write_status,
+                        state
+                            .pending_effect
+                            .as_ref()
+                            .map(|pending| &pending.effect.action),
+                        removal_pending || planned_switchover_pending,
+                    ),
+                    transition,
+                )
+                .await?;
+        }
         // Consume creation permission before readiness permits any authority/access commands.
         if state
             .application_storage
@@ -743,6 +843,9 @@ where
             .is_some_and(|b| b.initializing)
         {
             self.store.complete_application_initialization().await?;
+        }
+        if preview_quarantine {
+            return Ok(());
         }
         if let Some(committed) = state.accepted_secondary_removal
             && self
@@ -1003,6 +1106,13 @@ where
                     .run(async move { coordinator.ensure_build(*command).await })
                     .await
                     .map_err(status_from_agent)?;
+            }
+            #[cfg(feature = "testing")]
+            ProtocolCommand::RestartReplicaProcess(_)
+            | ProtocolCommand::DropReplicaIncarnation(_) => {
+                return Err(Status::failed_precondition(
+                    "preview fault commands require the repository-only supervisor path",
+                ));
             }
         }
         let report_runtime = self.runtime.report_runtime();

@@ -44,6 +44,7 @@ fn config() -> EvaluationConfig {
         stable_resync_seconds: 11,
         wait_requeue_seconds: 3,
         unsafe_requeue_seconds: 7,
+        public_operation_preview: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn raw(replicas: u32) -> RawObservation {
             image: "example/db:latest".to_string(),
             failover_delay_seconds: 9,
             switchover: None,
+            preview_lifecycle: None,
         },
     );
     set.metadata.namespace = Some("tests".to_string());

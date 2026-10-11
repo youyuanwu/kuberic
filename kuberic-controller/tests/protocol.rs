@@ -874,6 +874,9 @@ fn evaluator_scale_down_same_name_replacements_are_never_deleted_even_after_clea
                 image: Some("example:v1".into()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
         },
     );
@@ -1963,6 +1966,7 @@ fn desired(replicas: u32) -> DesiredState {
         image: "example:v1".to_string(),
         failover_delay_seconds: 10,
         switchover: None,
+        preview_lifecycle: None,
     }
 }
 
@@ -2190,6 +2194,9 @@ fn scaffolded_snapshot() -> ObservationSnapshot {
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -2227,6 +2234,9 @@ fn attest_stable_topology(
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -5252,6 +5262,9 @@ fn failover_corrects_provisional_candidate_with_a_newer_epoch() {
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -5523,6 +5536,9 @@ fn failover_authorizes_full_copy_when_primary_history_cannot_repair_a_member() {
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -5696,6 +5712,9 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -5842,6 +5861,9 @@ fn failover_uses_exact_surviving_deactivation_evidence_when_old_primary_cannot_r
                     image: Some("example:v1".to_string()),
                     pod_ready: primary,
                     peer_endpoint_ready: primary,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -6023,6 +6045,9 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -6160,6 +6185,9 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -6205,6 +6233,9 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
                 image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Report(Box::new(AgentReport {
                 protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -6241,6 +6272,9 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
                 image: Some("example:v1".to_string()),
                 pod_ready: false,
                 peer_endpoint_ready: false,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Unreachable {
                 message: "primary unavailable".to_string(),
@@ -6609,6 +6643,9 @@ fn accepted_incarnation_missing_its_store_is_unsafe() {
                 image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                 protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -6704,6 +6741,9 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
                     image: Some("example:v1".to_string()),
                     pod_ready: false,
                     peer_endpoint_ready: false,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Absent,
             },
@@ -6754,6 +6794,9 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
                     image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -7042,6 +7085,9 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
                 image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Report(Box::new(AgentReport {
                 protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -7073,6 +7119,9 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
                 image: Some("example:v1".to_string()),
                 pod_ready: false,
                 peer_endpoint_ready: false,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Absent,
         },
@@ -7563,6 +7612,9 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
                 image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Report(Box::new(AgentReport {
                 protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -7620,6 +7672,9 @@ fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
                 image: Some("example:v1".to_string()),
                 pod_ready: false,
                 peer_endpoint_ready: false,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Absent,
         },
@@ -7655,6 +7710,9 @@ fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
                 image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
+                endpoint_name: None,
+                endpoint_uid: None,
+                endpoint_resource_version: None,
             }),
             agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                 protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
@@ -12549,6 +12607,9 @@ fn scale_up_historical_receipt_does_not_block_ready_after_replacement_and_failov
                         image: Some(model.snapshot.desired.image.clone()),
                         pod_ready: true,
                         peer_endpoint_ready: true,
+                        endpoint_name: None,
+                        endpoint_uid: None,
+                        endpoint_resource_version: None,
                     }),
                     agent: AgentObservation::Report(Box::new(AgentReport {
                         protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,

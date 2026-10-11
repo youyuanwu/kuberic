@@ -1,4 +1,5 @@
 use kube::CustomResource;
+use kuberic_runtime::protocol::public_operations::StatePersistence;
 use kuberic_runtime::protocol::types::AcceptedStatus;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,14 @@ pub struct KubericSetSpec {
     pub failover_delay_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switchover: Option<PlannedSwitchoverRequestSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_lifecycle: Option<PreviewLifecycleSpec>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewLifecycleSpec {
+    pub state_persistence: StatePersistence,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -72,6 +81,17 @@ mod tests {
         let root = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"];
         let spec = &root["spec"]["properties"];
         assert_eq!(spec["replicas"]["minimum"], 1.0);
+        assert!(
+            spec["previewLifecycle"]["properties"]
+                .get("statePersistence")
+                .is_some()
+        );
+        assert!(
+            spec["previewLifecycle"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("statePersistence"))
+        );
         assert!(spec.get("removalTarget").is_none());
         assert!(spec.get("minimumReplicas").is_none());
         let status = &root["status"]["properties"];
@@ -130,6 +150,17 @@ mod tests {
         assert!(
             serde_json::from_value::<KubericSetSpec>(json!({"replicas": -1, "image": "db"}))
                 .is_err()
+        );
+        let legacy: KubericSetSpec =
+            serde_json::from_value(json!({"replicas": 1, "image": "db"})).unwrap();
+        assert!(legacy.preview_lifecycle.is_none());
+        assert!(
+            serde_json::from_value::<KubericSetSpec>(json!({
+                "replicas": 1,
+                "image": "db",
+                "previewLifecycle": {}
+            }))
+            .is_err()
         );
     }
 
@@ -281,12 +312,12 @@ mod tests {
 
         let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
         assert!(
-            generated.len() < 350_000,
+            generated.len() < 370_000,
             "generated CRD unexpectedly grew to {} bytes",
             generated.len()
         );
         assert!(
-            generated.len() <= 345_000,
+            generated.len() <= 365_000,
             "compact final-election schema lost its reviewed headroom at {} bytes",
             generated.len()
         );

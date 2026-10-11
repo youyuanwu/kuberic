@@ -103,6 +103,9 @@ impl Model {
                             image: Some("example:v1".into()),
                             pod_ready: true,
                             peer_endpoint_ready: true,
+                            endpoint_name: None,
+                            endpoint_uid: None,
+                            endpoint_resource_version: None,
                         }),
                         agent: AgentObservation::Report(Box::new(AgentReport {
                             protocol_version: super::protocol::PROTOCOL_VERSION,
@@ -169,6 +172,7 @@ impl Model {
                     image: "example:v1".into(),
                     failover_delay_seconds: 10,
                     switchover: None,
+                    preview_lifecycle: None,
                 },
                 status: AcceptedStatus {
                     initialized: true,
@@ -186,6 +190,7 @@ impl Model {
                     service_present: true,
                     unresolved_write_target: false,
                     write_target: Some(members[0].identity.clone()),
+                    ..Default::default()
                 },
                 observation_failures: Vec::new(),
                 now_unix_seconds: 100,
@@ -769,6 +774,9 @@ impl Model {
                     image: Some("example:v1".into()),
                     pod_ready: true,
                     peer_endpoint_ready: false,
+                    endpoint_name: None,
+                    endpoint_uid: None,
+                    endpoint_resource_version: None,
                 }),
                 agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                     protocol_version: super::protocol::PROTOCOL_VERSION,

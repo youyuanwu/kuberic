@@ -20,6 +20,10 @@ use kuberic_runtime::protocol::validation::{
     validate_report_internal, validate_snapshot, validate_transition_relationship,
 };
 
+#[cfg(feature = "runtime-test-bridge")]
+mod faults;
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) mod public_lifecycle;
 mod replacement_cleanup;
 mod scale_up;
 mod secondary_scale_down;
@@ -37,6 +41,9 @@ pub struct EvaluationConfig {
     pub stable_resync_seconds: u64,
     pub wait_requeue_seconds: u64,
     pub unsafe_requeue_seconds: u64,
+    #[cfg(feature = "runtime-test-bridge")]
+    pub public_operation_preview:
+        Option<kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity>,
 }
 
 impl Default for EvaluationConfig {
@@ -48,12 +55,32 @@ impl Default for EvaluationConfig {
             stable_resync_seconds: 30,
             wait_requeue_seconds: 5,
             unsafe_requeue_seconds: 30,
+            #[cfg(feature = "runtime-test-bridge")]
+            public_operation_preview: None,
         }
     }
 }
 
 /// Validates one snapshot and returns the next safe reconciliation outcome.
 pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
+    #[cfg(feature = "runtime-test-bridge")]
+    if let Some(plan) = faults::evaluate(snapshot, config) {
+        return plan;
+    }
+    if snapshot.desired.preview_lifecycle.is_some()
+        || snapshot.status.preview_lifecycle.is_some()
+        || snapshot.status.public_fault_action.is_some()
+        || snapshot.status.last_public_fault_action.is_some()
+        || snapshot.status.public_service_clear.is_some()
+    {
+        return unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::InvalidDesiredState(
+                "public-operation preview lifecycle is not enabled".into(),
+            ),
+            config,
+        );
+    }
     if !config.enable_secondary_scale_down && (snapshot.status.secondary_scale_down_cleanup.is_some()
         || snapshot.status.last_secondary_removal.is_some()
         || snapshot.status.transition.as_ref().is_some_and(|transition| transition.kind == TransitionKind::SecondaryScaleDown)

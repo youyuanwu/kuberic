@@ -154,6 +154,20 @@ pub struct AcceptSecondaryRemovalCommit {
     pub local_recovery: bool,
 }
 
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartReplicaProcess {
+    pub action: crate::protocol::public_operations::PublicFaultAction,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropReplicaIncarnation {
+    pub action: crate::protocol::public_operations::PublicFaultAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// One fenced, idempotent authority command issued after a full observation.
@@ -165,6 +179,10 @@ pub enum ProtocolCommand {
     PrepareSecondaryRemoval(Box<PrepareSecondaryRemoval>),
     RetireReplica(Box<RetireReplica>),
     AcceptSecondaryRemovalCommit(Box<AcceptSecondaryRemovalCommit>),
+    #[cfg(feature = "testing")]
+    RestartReplicaProcess(Box<RestartReplicaProcess>),
+    #[cfg(feature = "testing")]
+    DropReplicaIncarnation(Box<DropReplicaIncarnation>),
 }
 
 impl ProtocolCommand {
@@ -177,6 +195,10 @@ impl ProtocolCommand {
             | Self::AcceptSecondaryRemovalCommit(_)
             | Self::EnsureConfiguration(_)
             | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
+            #[cfg(feature = "testing")]
+            Self::RestartReplicaProcess(_) | Self::DropReplicaIncarnation(_) => {
+                EffectClass::ReconfigurationAction
+            }
         }
     }
 }
@@ -205,6 +227,11 @@ pub enum KubernetesChange {
     DeleteExactPod {
         pod_name: String,
         pod_uid: PodUid,
+    },
+    DeleteExactService {
+        name: String,
+        uid: String,
+        resource_version: String,
     },
     DeleteScaleDownResource {
         resource: ScaleDownResource,

@@ -703,6 +703,154 @@ custom implementation and are not compatible with a strict SF V1 Replicator.
 
 ## Conformance Verdict
 
+### Dormant Phase 4.2 Implementation
+
+The repository-only public-operation preview now implements these sequences
+through the Phase 4.1 operation-owned root task and exact durable instruction
+journal (`kuberic-runtime/src/host/public_lifecycle.rs`):
+
+| Preview recipe | Ordered operations |
+|---|---|
+| Initial primary, ordinary | Replicator primary role -> application primary role -> current configuration -> preview access decision |
+| Failover, ordinary | Replicator primary role -> promoted epoch -> application primary role -> catch-up configuration -> write-quorum wait -> preview access decision |
+| Same-role active secondary | New-epoch update -> preview access decision; no repeated role callback |
+| Possible data loss | Required primary role/epoch sequence -> application primary role -> `on_data_loss` -> retained history-admission barrier; no configuration, catch-up or access |
+
+The selected controller preview planner is the source of
+`PossibleDataLossIntent::{NotPossible, Possible}`. Neither progress nor a
+data-loss-number change selects it. Its frozen input binds the preview
+identity, exact replica, operation ID, source session, epoch, revision and
+configuration. Store transactions reject changed duplicates, stale sessions,
+non-advancing epochs and out-of-order callbacks.
+
+The barrier is created at `Possible` admission, before callbacks can mutate
+application state. It distinguishes not-yet-invoked, `false`, `true`, callback
+error and ambiguous execution. An in-flight marker is committed before
+`on_data_loss`; loss of its completion journal remains ambiguous, not a
+successful history repair. Every outcome stays access-closed. A rejected newer
+authority request may cancel/drain the old root but does not acquire authority
+or remove the barrier. Close, Abort and faults retain it as retired historical
+evidence. Phase 5 still owns authorized history reconciliation/admission;
+neither boolean changes progress, configurations, builds or serving permission.
+
+Exact optional application addresses are retained in role outcomes, including
+`None` and the empty string. `PublicLifecycleReport.service_location` contains
+a distinct `ServiceLocation`, not `replication_address`, and is suppressed
+unless the current exact primary/session/revision has completed all required
+instructions with write permission. Pending, failed, superseded, terminal and
+fresh-session observations cannot publish historical addresses.
+
+The controller preview normalizes that report into
+`PreviewAcceptedStatus.service_location_projection`: `None` -> `Pending` ->
+one conditional Service write -> `Published`. Clearing follows the same
+protocol with desired absence and a disabled selector. The Service write
+atomically changes the selector and opaque
+`operator.kuberic.io/preview-service-location` annotation, preserving unrelated
+metadata. Status writes are conditional; Service writes use UID and
+resourceVersion preconditions. Publication reobserves the exact Service
+version and desired metadata. Response loss, controller restart and API
+unavailability converge by reobservation, not by assuming a cross-resource
+transaction. Already-running Pods remain locally fenced while Kubernetes is
+unavailable.
+
+These paths require the existing exact preview identity, preview store and
+repository test/preview constructors. They deliberately do **not** extend
+production CRD/status/effect variants or activate the legacy custom-authority
+and access recipes, even in all-features builds. Tests use the real preview
+planner, runtime journal, normalizer and executor with a conditional
+in-memory Kubernetes Service model. They do not claim live-cluster cutover,
+Phase 5 public-value conformance, or production activation.
+
+### Dormant Phase 4.3 Implementation
+
+The preview operation journal now also accepts exact frozen programs for Open,
+role, epoch, configuration, catch-up, progress, planned swap, build, removal,
+Close, and Abort. Planned swap follows:
+
+1. install the exact captured starting current/previous configuration;
+2. wait using one captured opaque catch-up mode;
+3. revoke preview write/location publication;
+4. apply the swap epoch;
+5. install the exact refreshed configuration;
+6. repeat the same captured mode;
+7. change Replicator role and then application role.
+
+Interrupted waits reinstall the corresponding frozen configuration before
+reevaluation. Tests deliberately seed a different installed configuration and
+cut before/after the first install, proving stale topology cannot satisfy the
+first wait. The mode is retained as caller input only; Phase 5 still owns the
+capability-dependent value policy.
+
+Build admission retains one exact attempt per target. Removal names that exact
+attempt, cancels and joins its build callback and provider descendant, then
+invokes `remove_replica` and records exact absence. An ambiguous build is not
+reinvoked; it must be contained and removed before a fresh attempt can be
+admitted. Stale completion and stale removal cannot affect a newer attempt.
+
+Close revokes preview serving before teardown, drains conflicting operations,
+calls Replicator close before application close, and waits for tracked
+descendants. A child close error triggers ordered abort containment and is
+retained as a typed diagnostic while remaining teardown continues; outer
+success means containment completed. Synchronous Abort fences admission and
+invokes Replicator abort before application abort exactly once, while its
+durable cleanup is still host-owned.
+
+Replay is operation-specific rather than universally exactly-once. Exact
+terminal completion returns without callbacks; same-session convergent
+Open/role/epoch/configuration work and exact catch-up may resume; progress is a
+repeatable read; swap reinstalls captured topology/mode; durable build success
+is not reinvoked; ambiguous build/data loss remains closed; removal converges
+to exact absence; Close/Abort converges to terminal containment. Reopening any
+durable cut in a fresh process session yields only historical evidence and
+remains unassigned, access-closed, and location-free.
+
+### Dormant Phase 4.4 Implementation
+
+The CRD now has optional `previewLifecycle.statePersistence` with explicit
+`Persisted` and `Volatile` values. Omission keeps legacy objects on the
+production path; the repository preview constructor freezes classification
+with resource UID, preview identity and spec generation in accepted status and
+schema-7 preview state. Mutation, stale status, mixed preview/legacy reports
+and production construction fail closed.
+
+A public transient or permanent fault is durably admitted before returning and
+immediately makes the exact incarnation unhealthy, role-none, access-closed
+and location-free. Fault kind and terminal operation/fence are committed in
+one transaction; identical reports reuse the same episode. The selected preview evaluator cannot run ordinary stable,
+election, quorum or routing logic while fault evidence is active. It persists
+one deterministic action over exact replica, Pod/PVC, process-session, fault
+revision, predecessor OS PID and persistence evidence, removes routing, revalidates the same
+observation and clears the application location through pending,
+conditional-Service-write and exact published-absence stages before dispatch.
+Permanent fault supersedes a transient
+action only for the same predecessor identity/session.
+
+Persisted state uses a real parent/child process fixture and one durable
+`Accepted` -> `PredecessorContained` -> `SuccessorStarted` handshake. Exact
+action-bound child PID/session exit or a durable parent PID/start-time marker
+whose exact OS process has terminated is required before re-exec, and the
+action-bound predecessor child PID must also be gone before the same data
+root/PVC is reused. Outstanding
+successor launch is serialized and recovered rather than replaced on
+redelivery. An action-specific durable launch nonce plus owner PID/start-time
+precedes child construction. Quarantine clears predecessor role, PC/CC
+configuration, access and peer/build authority; the fresh application and
+Replicator session remains unassigned and access-closed because Phase 5 owns
+renewal. The accepted, contained and successor-started crash cuts converge to
+one successor session, and unproven descendant containment prevents re-exec.
+The runtime supervisor, rather than the controller, constructs the quarantined
+successor report consumed by the next reconciliation.
+
+Volatile transient faults and all permanent faults freeze the old endpoint,
+including its UID/resourceVersion, plus Pod and PVC identities, remove routing,
+delete only those resources and create distinct replacement scaffolding.
+Cleanup continues from accepted status after the predecessor disappears. This
+remains repository-only preview
+behavior. Production evaluation and gRPC dispatch reject the preview identity
+and restart/drop commands even in all-features builds.
+
+### Production Verdict
+
 **Overall: materially misaligned.**
 
 | Area | Current verdict |

@@ -824,6 +824,20 @@ Exit criteria:
 - no broad legacy lock, generation or source-layout cleanup is required to
   finish the phase.
 
+Implementation status: Phase 4 is complete as a dormant repository preview.
+The runtime has the exact registry/task owner, SF lifecycle ordering, staged
+application-address projection, swap/build/Close/Abort programs and
+operation-specific replay. Explicit persisted/volatile classification now
+drives one deterministic controller fault action after local closure and
+routing removal. Persisted state uses a durable accepted/contained/successor
+handshake and a real parent/child same-storage restart fixture; volatile state
+freezes and removes the exact old resources before distinct replacement
+scaffolding. Successors remain unassigned and access-closed pending Phase 5
+authority renewal. Schema-7 preview state, repository-only controller
+selection and preview commands remain incompatible with and unreachable from
+legacy production construction, without changing protected public method
+sets.
+
 ### Phase 5: Establish Public V1 Values, Evidence and Conformance
 
 **Goal:** define the complete SF-shaped values and public completion evidence

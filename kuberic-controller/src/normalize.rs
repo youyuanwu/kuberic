@@ -17,6 +17,50 @@ use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL};
 use crate::observation::{RawAgentObservation, RawObservation};
 use crate::{ControllerError, Result};
 
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) fn normalize_public_service_location(
+    config: &crate::evaluator::test_bridge::PublicOperationPreviewEvaluationConfig,
+    authority: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
+    report: Option<&kuberic_runtime::protocol::public_operations::PublicLifecycleReport>,
+) -> std::result::Result<
+    Option<kuberic_runtime::protocol::public_operations::ServiceLocation>,
+    String,
+> {
+    let Some(report) = report else {
+        return Ok(None);
+    };
+    config.validate_identity(&report.preview)?;
+    let Some(input) = &authority.lifecycle else {
+        return Ok(None);
+    };
+    if authority.class.is_terminal()
+        || report.replica != input.replica
+        || report.process_session_id != authority.process_session_id
+        || report.revision != authority.revision
+        || report.operation_id.as_ref() != Some(&authority.operation_id)
+        || !report.write_access
+        || report.role != kuberic_runtime::protocol::types::ReplicaRole::Primary
+        || input.possible_data_loss
+            != kuberic_runtime::protocol::public_operations::PossibleDataLossIntent::NotPossible
+    {
+        return Ok(None);
+    }
+    let Some(location) = &report.service_location else {
+        return Ok(None);
+    };
+    if location.preview != authority.preview
+        || location.resource_uid != report.resource_uid
+        || location.replica != input.replica
+        || location.process_session_id != authority.process_session_id
+        || location.revision != authority.revision
+        || location.epoch != input.epoch
+        || location.operation_id != authority.operation_id
+    {
+        return Ok(None);
+    }
+    Ok(Some(location.clone()))
+}
+
 pub fn normalize(
     raw: RawObservation,
     previous_report_watermarks: BTreeMap<ReplicaObservationKey, ReportWatermark>,
@@ -105,13 +149,12 @@ pub fn normalize(
                 .cloned()
                 .unwrap_or(RawAgentObservation::Absent);
             let pvc_uid = pvc.and_then(|pvc| pvc.uid()).map(PvcUid::new);
-            let peer_endpoint_ready =
-                pod_uid
-                    .as_ref()
-                    .zip(pvc_uid.as_ref())
-                    .is_some_and(|(pod_uid, pvc_uid)| {
-                        exact_peer_endpoint_ready(&raw, &resource_uid, replica_id, pod_uid, pvc_uid)
-                    });
+            let endpoint = pod_uid
+                .as_ref()
+                .zip(pvc_uid.as_ref())
+                .and_then(|(pod_uid, pvc_uid)| {
+                    exact_peer_endpoint(&raw, &resource_uid, replica_id, pod_uid, pvc_uid)
+                });
             insert_replica_observation(
                 &mut replicas,
                 &mut failures,
@@ -121,7 +164,7 @@ pub fn normalize(
                 Some(pod),
                 pvc,
                 raw_agent,
-                peer_endpoint_ready,
+                endpoint,
                 &resource_uid,
                 &previous_report_watermarks,
                 switchover_active,
@@ -146,7 +189,7 @@ pub fn normalize(
                 None,
                 Some(pvc),
                 RawAgentObservation::Absent,
-                false,
+                None,
                 &resource_uid,
                 &previous_report_watermarks,
                 switchover_active,
@@ -185,6 +228,11 @@ pub fn normalize(
                     request_id: SwitchoverRequestId::new(request.request_id),
                     target_replica_id: ReplicaId::new(i64::from(request.target_replica_id)),
                 }),
+            preview_lifecycle: raw
+                .set
+                .spec
+                .preview_lifecycle
+                .map(|preview| preview.state_persistence),
         },
         status,
         replicas,
@@ -364,6 +412,16 @@ fn normalize_agent(
                 }
             }
         }
+        #[cfg(feature = "runtime-test-bridge")]
+        RawAgentObservation::PreviewReport(report) => {
+            if report.resource_uid != *resource_uid {
+                return AgentObservation::Invalid {
+                    message: "preview report resource UID differs from the observed set".into(),
+                    uninitialized_report: None,
+                };
+            }
+            AgentObservation::Report(report)
+        }
     };
     let mismatch = match &observation {
         AgentObservation::Uninitialized(report) => (report.resource_uid != *resource_uid)
@@ -455,7 +513,7 @@ fn insert_replica_observation(
     pod: Option<&Pod>,
     pvc: Option<&PersistentVolumeClaim>,
     raw_agent: RawAgentObservation,
-    peer_endpoint_ready: bool,
+    endpoint: Option<EndpointObservation>,
     resource_uid: &ResourceUid,
     previous: &BTreeMap<ReplicaObservationKey, ReportWatermark>,
     switchover_active: bool,
@@ -478,7 +536,10 @@ fn insert_replica_observation(
             pvc_uid,
             image: pod.and_then(application_image),
             pod_ready: pod.is_some_and(pod_ready),
-            peer_endpoint_ready,
+            peer_endpoint_ready: endpoint.as_ref().is_some_and(|endpoint| endpoint.ready),
+            endpoint_name: endpoint.as_ref().map(|endpoint| endpoint.name.clone()),
+            endpoint_uid: endpoint.as_ref().and_then(|endpoint| endpoint.uid.clone()),
+            endpoint_resource_version: endpoint.and_then(|endpoint| endpoint.resource_version),
         }),
         agent,
     };
@@ -500,13 +561,20 @@ fn application_image(pod: &Pod) -> Option<String> {
         .clone()
 }
 
-fn exact_peer_endpoint_ready(
+struct EndpointObservation {
+    name: String,
+    uid: Option<String>,
+    resource_version: Option<String>,
+    ready: bool,
+}
+
+fn exact_peer_endpoint(
     raw: &RawObservation,
     resource_uid: &ResourceUid,
     replica_id: ReplicaId,
     pod_uid: &PodUid,
     pvc_uid: &PvcUid,
-) -> bool {
+) -> Option<EndpointObservation> {
     let initialization_id = derive_initialization_id(resource_uid, replica_id, pod_uid, pvc_uid);
     let identity = ReplicaIdentity {
         replica_id,
@@ -514,16 +582,20 @@ fn exact_peer_endpoint_ready(
         agent_generation: derive_agent_generation(&initialization_id),
     };
     let name = derive_replica_endpoint_name(resource_uid, &identity);
-    raw.services.iter().any(|service| {
-        service.name_any() == name
-            && owned_by_set(service, resource_uid)
-            && service.spec.as_ref().is_some_and(|spec| {
+    raw.services
+        .iter()
+        .find(|service| service.name_any() == name && owned_by_set(*service, resource_uid))
+        .map(|service| EndpointObservation {
+            name,
+            uid: service.uid(),
+            resource_version: service.resource_version(),
+            ready: service.spec.as_ref().is_some_and(|spec| {
                 spec.selector.as_ref().is_some_and(|selector| {
                     selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
                 }) && has_service_port(service, "control", 50051)
                     && has_service_port(service, "replication", 50052)
-            })
-    })
+            }),
+        })
 }
 
 fn pvc_for_pod<'a>(
@@ -564,6 +636,11 @@ fn normalize_routing(
     resource_uid: &ResourceUid,
     failures: &mut Vec<ObservationFailure>,
 ) -> RoutingObservation {
+    let service_identities = raw
+        .services
+        .iter()
+        .filter_map(|service| Some((service.name_any(), service.uid()?)))
+        .collect::<Vec<_>>();
     let write_services = raw
         .services
         .iter()
@@ -581,11 +658,23 @@ fn normalize_routing(
             service_present: true,
             unresolved_write_target: true,
             write_target: None,
+            preview_service_location_present: true,
+            write_service_uid: None,
+            write_service_resource_version: None,
+            service_identities,
         };
     }
-    let Some(_service) = write_services.first() else {
-        return RoutingObservation::default();
+    let Some(service) = write_services.first() else {
+        return RoutingObservation {
+            service_identities,
+            ..Default::default()
+        };
     };
+    let preview_service_location_present = service
+        .annotations()
+        .contains_key(crate::cluster_api::PREVIEW_SERVICE_LOCATION_ANNOTATION);
+    let write_service_uid = service.uid();
+    let write_service_resource_version = service.resource_version();
     let Some(instance) = write_services
         .first()
         .and_then(|service| service.spec.as_ref())
@@ -597,6 +686,10 @@ fn normalize_routing(
             service_present: true,
             unresolved_write_target: false,
             write_target: None,
+            preview_service_location_present,
+            write_service_uid,
+            write_service_resource_version,
+            service_identities,
         };
     };
     let matches = replicas
@@ -625,12 +718,20 @@ fn normalize_routing(
             service_present: true,
             unresolved_write_target: false,
             write_target: matches.into_iter().next(),
+            preview_service_location_present,
+            write_service_uid,
+            write_service_resource_version,
+            service_identities,
         }
     } else {
         RoutingObservation {
             service_present: true,
             unresolved_write_target: true,
             write_target: None,
+            preview_service_location_present,
+            write_service_uid,
+            write_service_resource_version,
+            service_identities,
         }
     }
 }

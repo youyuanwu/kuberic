@@ -132,6 +132,8 @@ pub fn production_evaluation_config(
         stable_resync_seconds,
         wait_requeue_seconds,
         unsafe_requeue_seconds,
+        #[cfg(feature = "runtime-test-bridge")]
+        public_operation_preview: None,
     }
 }
 

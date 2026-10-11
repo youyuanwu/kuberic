@@ -20732,6 +20732,7 @@ async fn evaluator_scale_up_sqlite_trace() {
             image: "example:v1".into(),
             failover_delay_seconds: 30,
             switchover: None,
+            preview_lifecycle: None,
         },
         status: AcceptedStatus {
             initialized: true,
@@ -20756,6 +20757,9 @@ async fn evaluator_scale_up_sqlite_trace() {
                         image: Some("example:v1".into()),
                         pod_ready: true,
                         peer_endpoint_ready: true,
+                        endpoint_name: None,
+                        endpoint_uid: None,
+                        endpoint_resource_version: None,
                     }),
                     agent: AgentObservation::Report(Box::new(AgentReport {
                         protocol_version: crate::protocol::PROTOCOL_VERSION,
@@ -20790,6 +20794,9 @@ async fn evaluator_scale_up_sqlite_trace() {
                         image: Some("example:v1".into()),
                         pod_ready: true,
                         peer_endpoint_ready: true,
+                        endpoint_name: None,
+                        endpoint_uid: None,
+                        endpoint_resource_version: None,
                     }),
                     agent: AgentObservation::Report(Box::new(AgentReport {
                         protocol_version: crate::protocol::PROTOCOL_VERSION,
@@ -20819,6 +20826,7 @@ async fn evaluator_scale_up_sqlite_trace() {
             service_present: true,
             unresolved_write_target: false,
             write_target: Some(source.clone()),
+            ..Default::default()
         },
         observation_failures: Vec::new(),
         now_unix_seconds: 100,

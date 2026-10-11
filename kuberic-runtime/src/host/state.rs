@@ -4,6 +4,8 @@ use crate::authority::{DurableBuildProgress, RetiredAuthority};
 use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
+use crate::protocol::public_operations::{PreviewLifecycleBinding, RestartActionRecord};
+use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationPreviewIdentity};
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
     InitializationId, LoadMetric, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaIdentity,
@@ -16,6 +18,7 @@ use std::path::PathBuf;
 
 // Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
 pub(crate) const SCHEMA_VERSION: u32 = 6;
+pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +73,186 @@ impl std::ops::Deref for RetainedResult {
 impl std::ops::DerefMut for RetainedResult {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.record
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PublicOperationStage {
+    WaitingForContainment,
+    Ready,
+    Running,
+    CallbackApplied,
+    ContainmentPending,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub(crate) enum PublicOperationDisposition {
+    Succeeded,
+    Failed(String),
+    Ambiguous(String),
+    Cancelled,
+    Attached(OperationId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PublicOperationContainment {
+    #[default]
+    NotRequired,
+    Pending,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicOperationRecord {
+    pub(crate) intent: PublicOperationIntent,
+    pub(crate) stage: PublicOperationStage,
+    pub(crate) disposition: Option<PublicOperationDisposition>,
+    #[serde(default)]
+    pub(crate) containment: PublicOperationContainment,
+    #[serde(default)]
+    pub(crate) superseded_by: Option<OperationId>,
+    #[serde(default)]
+    pub(crate) blockers: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub(crate) lifecycle: PublicLifecycleRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PublicInstruction {
+    ApplicationOpen,
+    ReplicatorOpen,
+    ReplicatorRole,
+    ApplicationRole,
+    ProgramEpoch,
+    Configuration,
+    StartingConfiguration,
+    RefreshedConfiguration,
+    FirstCatchUp,
+    SecondCatchUp,
+    Revoke,
+    Progress,
+    Build,
+    Remove,
+    ReplicatorClose,
+    ApplicationClose,
+    Abort,
+    Cleanup,
+    ReplicatorPrimary,
+    Epoch,
+    ApplicationPrimary,
+    DataLoss,
+    CurrentConfiguration,
+    CatchUpConfiguration,
+    CatchUp,
+    Access,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PublicInstructionOutcome {
+    Done,
+    ApplicationRole(Option<String>),
+    DataLoss(DataLossOutcome),
+    Endpoint(String),
+    Progress(i64),
+    CloseFailure {
+        child: PublicCloseChild,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PublicCloseChild {
+    Replicator,
+    Application,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DataLossOutcome {
+    NotInvoked,
+    False,
+    True,
+    Error(String),
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) struct PublicLifecycleRecord {
+    pub(crate) in_flight: Option<PublicInstruction>,
+    pub(crate) outcomes: Vec<PublicInstructionOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HistoryAdmissionBarrier {
+    pub(crate) intent: PublicOperationIntent,
+    pub(crate) outcome: DataLossOutcome,
+    pub(crate) retired_by: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicOperationPreviewState {
+    pub(crate) identity: PublicOperationPreviewIdentity,
+    #[serde(default)]
+    pub(crate) binding: Option<PreviewLifecycleBinding>,
+    #[serde(default)]
+    pub(crate) restart_action: Option<RestartActionRecord>,
+    pub(crate) operations: BTreeMap<OperationId, PublicOperationRecord>,
+    #[serde(default)]
+    pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
+    #[serde(default)]
+    pub(crate) current_operation: Option<OperationId>,
+    #[serde(default)]
+    pub(crate) current_topology_operation: Option<OperationId>,
+    #[serde(default)]
+    pub(crate) active_builds: BTreeMap<
+        crate::protocol::types::ReplicaId,
+        crate::protocol::public_operations::PublicBuildInput,
+    >,
+    #[serde(default)]
+    pub(crate) absent_builds: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub(crate) writes_revoked: bool,
+    #[serde(default)]
+    pub(crate) terminal: bool,
+}
+
+impl PublicOperationPreviewState {
+    #[allow(dead_code)]
+    pub(crate) fn new(identity: PublicOperationPreviewIdentity) -> Self {
+        Self {
+            identity,
+            binding: None,
+            restart_action: None,
+            operations: BTreeMap::new(),
+            history_barriers: BTreeMap::new(),
+            current_operation: None,
+            current_topology_operation: None,
+            active_builds: BTreeMap::new(),
+            absent_builds: BTreeSet::new(),
+            writes_revoked: false,
+            terminal: false,
+        }
+    }
+
+    pub(crate) fn new_bound(binding: PreviewLifecycleBinding) -> Self {
+        Self {
+            identity: binding.preview.clone(),
+            binding: Some(binding),
+            restart_action: None,
+            operations: BTreeMap::new(),
+            history_barriers: BTreeMap::new(),
+            current_operation: None,
+            current_topology_operation: None,
+            active_builds: BTreeMap::new(),
+            absent_builds: BTreeSet::new(),
+            writes_revoked: false,
+            terminal: false,
+        }
     }
 }
 
@@ -134,6 +317,8 @@ pub(crate) struct ApplicationStorageBinding {
 pub(crate) struct AgentState {
     pub(crate) identity: StorageIdentity,
     #[serde(default)]
+    pub(crate) public_operation_preview: Option<PublicOperationPreviewState>,
+    #[serde(default)]
     pub(crate) application_storage: Option<ApplicationStorageBinding>,
     #[serde(default)]
     pub(crate) scale_up_initialization: Option<ProvisioningIntent>,
@@ -190,6 +375,7 @@ impl AgentState {
     pub(crate) fn new(identity: StorageIdentity) -> Self {
         Self {
             identity,
+            public_operation_preview: None,
             application_storage: None,
             scale_up_initialization: None,
             admitted_policy: None,

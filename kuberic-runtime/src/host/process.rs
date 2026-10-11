@@ -24,6 +24,13 @@ use crate::host::transport::{
     run_peer_discovery,
 };
 
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+use crate::protocol::public_operations::{
+    PublicFaultAction, RestartActionRecord, RestartActionStage,
+};
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+use crate::protocol::types::ProcessSessionId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationStorageState {
     FreshEmpty,
@@ -42,6 +49,664 @@ pub struct ReplicaProcessConfig {
     pub bearer_token: String,
     pub rpc_deadline: Duration,
     pub transport_window_capacity: usize,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+pub(crate) const PREVIEW_RESTART_DISPOSITION: i32 = 75;
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewChildCommand {
+    pub(crate) executable: PathBuf,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) environment: BTreeMap<String, String>,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreviewChildEvidence {
+    pub(crate) process_session: ProcessSessionId,
+    pub(crate) child_pid: u32,
+    pub(crate) child_start_time: String,
+    pub(crate) data_root: PathBuf,
+    pub(crate) pod_uid: PodUid,
+    pub(crate) pvc_uid: PvcUid,
+    pub(crate) provider_sentinel: String,
+    pub(crate) application_instance_id: String,
+    pub(crate) replicator_instance_id: String,
+    pub(crate) callbacks: Vec<String>,
+    pub(crate) launch_nonce: String,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+pub(crate) struct PreviewChildProcess {
+    pub(crate) child: tokio::process::Child,
+    pub(crate) evidence: PreviewChildEvidence,
+    pub(crate) restart_signal: PathBuf,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewRestartCut {
+    Accepted,
+    PredecessorContained,
+    SuccessorLaunched,
+    SuccessorStarted,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreviewRestartResult {
+    pub(crate) record: RestartActionRecord,
+    pub(crate) successor: PreviewChildEvidence,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PreviewSupervisorIdentity {
+    pid: u32,
+    start_time: String,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PreviewLaunchOwner {
+    nonce: String,
+    supervisor_id: String,
+    pid: u32,
+    start_time: String,
+    claimed_at_unix_millis: u128,
+    child_pid: Option<u32>,
+    child_start_time: Option<String>,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+pub(crate) struct ReplicaProcessSupervisor {
+    store: Arc<SqliteStore>,
+    data_root: PathBuf,
+    child: PreviewChildCommand,
+    active_child: Mutex<Option<tokio::process::Child>>,
+    launch: Mutex<()>,
+    container_restart_proven: bool,
+    instance_id: String,
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+#[allow(dead_code)]
+impl ReplicaProcessSupervisor {
+    pub(crate) fn new(
+        store: Arc<SqliteStore>,
+        data_root: PathBuf,
+        child: PreviewChildCommand,
+    ) -> Result<Self> {
+        let marker = data_root.join(".kuberic").join("supervisor-session");
+        let container_restart_proven = std::fs::read(&marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PreviewSupervisorIdentity>(&bytes).ok())
+            .is_some_and(|previous| !process_identity_is_alive(&previous));
+        Self::record_parent_identity(&data_root)?;
+        Ok(Self {
+            store,
+            data_root,
+            child,
+            active_child: Mutex::new(None),
+            launch: Mutex::new(()),
+            container_restart_proven,
+            instance_id: uuid::Uuid::new_v4().to_string(),
+        })
+    }
+
+    pub(crate) fn record_parent_identity(data_root: &Path) -> Result<()> {
+        let marker = data_root.join(".kuberic").join("supervisor-session");
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let identity = PreviewSupervisorIdentity {
+            pid: std::process::id(),
+            start_time: process_start_time(std::process::id()).ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "cannot read supervisor process identity".into(),
+                )
+            })?,
+        };
+        std::fs::write(
+            marker,
+            serde_json::to_vec(&identity)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_current_child_launch(
+        owner_path: &Path,
+        launch_nonce: &str,
+        supervisor_id: &str,
+    ) -> Result<()> {
+        with_launch_owner_lock(owner_path, || {
+            let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            if owner.nonce != launch_nonce || owner.supervisor_id != supervisor_id {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "child launch nonce differs from durable owner".into(),
+                ));
+            }
+            owner.child_pid = Some(std::process::id());
+            owner.child_start_time =
+                Some(process_start_time(std::process::id()).ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "cannot read child process identity".into(),
+                    )
+                })?);
+            write_json_atomic(owner_path, "child", &owner)
+        })
+    }
+
+    pub(crate) fn publish_current_child_evidence(
+        owner_path: &Path,
+        launch_nonce: &str,
+        supervisor_id: &str,
+        evidence_path: &Path,
+        evidence: &PreviewChildEvidence,
+    ) -> Result<()> {
+        with_launch_owner_lock(owner_path, || {
+            let owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            if owner.nonce != launch_nonce
+                || owner.supervisor_id != supervisor_id
+                || owner.child_pid != Some(std::process::id())
+                || owner.child_start_time.as_deref()
+                    != process_start_time(std::process::id()).as_deref()
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "child lost launch ownership before readiness".into(),
+                ));
+            }
+            write_json_atomic(evidence_path, "evidence", evidence)
+        })
+    }
+
+    pub(crate) async fn restart_with_child(
+        &self,
+        action: &PublicFaultAction,
+        predecessor: &mut PreviewChildProcess,
+        cut: Option<PreviewRestartCut>,
+    ) -> Result<PreviewRestartResult> {
+        let record = self.store.begin_restart_action(action).await?;
+        if cut == Some(PreviewRestartCut::Accepted) {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after durable restart acceptance".into(),
+            ));
+        }
+
+        if record.stage == RestartActionStage::Accepted {
+            if predecessor.evidence.process_session != action.predecessor_session
+                || predecessor.evidence.child_pid != action.predecessor_process_id
+                || predecessor.child.id() != Some(predecessor.evidence.child_pid)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "restart action does not name the supervised predecessor child".into(),
+                ));
+            }
+            std::fs::write(&predecessor.restart_signal, b"restart")?;
+            let status = predecessor.child.wait().await?;
+            if status.code() != Some(PREVIEW_RESTART_DISPOSITION) {
+                return Err(crate::host::HostError::CommandRejected(format!(
+                    "predecessor did not exit with restart disposition {PREVIEW_RESTART_DISPOSITION}"
+                )));
+            }
+        }
+        self.resume_existing(action, cut).await
+    }
+
+    pub(crate) async fn resume_after_container_restart(
+        &self,
+        action: &PublicFaultAction,
+        cut: Option<PreviewRestartCut>,
+    ) -> Result<PreviewRestartResult> {
+        let record = self.store.restart_action().await?.ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "container recovery cannot admit a new restart action".into(),
+            )
+        })?;
+        if record.action != *action {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "container recovery action differs from durable acceptance".into(),
+            ));
+        }
+        if record.stage == RestartActionStage::Accepted
+            && (!self.container_restart_proven
+                || Path::new(&format!("/proc/{}", action.predecessor_process_id)).exists())
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "durable supervisor marker does not prove a parent/container restart".into(),
+            ));
+        }
+        self.resume_existing(action, cut).await
+    }
+
+    async fn resume_existing(
+        &self,
+        action: &PublicFaultAction,
+        cut: Option<PreviewRestartCut>,
+    ) -> Result<PreviewRestartResult> {
+        let _launch = self.launch.lock().await;
+        let mut record = self.store.restart_action().await?.ok_or_else(|| {
+            crate::host::HostError::CommandRejected("restart action is not accepted".into())
+        })?;
+        if record.action != *action {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "restart action changed during recovery".into(),
+            ));
+        }
+        if cut == Some(PreviewRestartCut::Accepted) && record.stage == RestartActionStage::Accepted
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after durable restart acceptance".into(),
+            ));
+        }
+        if record.stage == RestartActionStage::Accepted {
+            record = self
+                .store
+                .advance_restart_action(
+                    action,
+                    RestartActionStage::Accepted,
+                    RestartActionStage::PredecessorContained,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+        }
+        if cut == Some(PreviewRestartCut::PredecessorContained)
+            && record.stage == RestartActionStage::PredecessorContained
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after predecessor containment".into(),
+            ));
+        }
+        let (launch_nonce, may_spawn) = self.claim_successor_launch(action)?;
+        if record.stage == RestartActionStage::PredecessorContained {
+            record = self
+                .store
+                .advance_restart_action(
+                    action,
+                    RestartActionStage::PredecessorContained,
+                    RestartActionStage::SuccessorLaunching,
+                    None,
+                    None,
+                    Some(&launch_nonce),
+                )
+                .await?;
+        }
+        if record.stage == RestartActionStage::SuccessorStarted {
+            let successor = self.read_successor_evidence(action)?;
+            return Ok(PreviewRestartResult { record, successor });
+        }
+        if record.stage != RestartActionStage::SuccessorLaunching
+            || record.launch_nonce.as_deref() != Some(launch_nonce.as_str())
+        {
+            return Err(crate::host::HostError::DurableEffectConflict(
+                "successor launch claim differs from durable restart state".into(),
+            ));
+        }
+        let successor = self
+            .launch_successor(action, &launch_nonce, may_spawn)
+            .await?;
+        if cut == Some(PreviewRestartCut::SuccessorLaunched) {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after successor launch".into(),
+            ));
+        }
+        record = self
+            .store
+            .advance_restart_action(
+                action,
+                RestartActionStage::SuccessorLaunching,
+                RestartActionStage::SuccessorStarted,
+                Some(&successor.process_session),
+                Some(successor.child_pid),
+                None,
+            )
+            .await?;
+        if cut == Some(PreviewRestartCut::SuccessorStarted) {
+            return Err(crate::host::HostError::CommandRejected(
+                "injected crash after successor start".into(),
+            ));
+        }
+        Ok(PreviewRestartResult { record, successor })
+    }
+
+    fn evidence_path(&self, action: &PublicFaultAction) -> PathBuf {
+        self.data_root
+            .join(".kuberic")
+            .join(format!("{}.successor.json", action.action_id))
+    }
+
+    fn shutdown_path(&self, action: &PublicFaultAction) -> PathBuf {
+        self.data_root
+            .join(".kuberic")
+            .join(format!("{}.successor.shutdown", action.action_id))
+    }
+
+    fn launch_owner_path(&self, action: &PublicFaultAction) -> PathBuf {
+        self.data_root
+            .join(".kuberic")
+            .join(format!("{}.launch-owner.json", action.action_id))
+    }
+
+    fn claim_successor_launch(&self, action: &PublicFaultAction) -> Result<(String, bool)> {
+        let path = self.launch_owner_path(action);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let nonce = format!("{}-successor", action.action_id);
+        let current = PreviewLaunchOwner {
+            nonce: nonce.clone(),
+            supervisor_id: self.instance_id.clone(),
+            pid: std::process::id(),
+            start_time: process_start_time(std::process::id()).ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "cannot read launch-owner process identity".into(),
+                )
+            })?,
+            claimed_at_unix_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
+                .as_millis(),
+            child_pid: None,
+            child_start_time: None,
+        };
+        with_launch_owner_lock(&path, || {
+            let owner = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PreviewLaunchOwner>(&bytes).ok());
+            let Some(owner) = owner else {
+                write_json_atomic(&path, "owner", &current)?;
+                return Ok((nonce, true));
+            };
+            if owner.nonce != nonce {
+                return Err(crate::host::HostError::DurableEffectConflict(
+                    "successor launch nonce changed".into(),
+                ));
+            }
+            if let (Some(child_pid), Some(child_start_time)) =
+                (owner.child_pid, owner.child_start_time.as_ref())
+                && process_start_time(child_pid).as_deref() == Some(child_start_time.as_str())
+            {
+                return Ok((nonce, false));
+            }
+            let identity = PreviewSupervisorIdentity {
+                pid: owner.pid,
+                start_time: owner.start_time.clone(),
+            };
+            if process_identity_is_alive(&identity) {
+                return Ok((nonce, owner.supervisor_id == current.supervisor_id));
+            }
+            let age = current
+                .claimed_at_unix_millis
+                .saturating_sub(owner.claimed_at_unix_millis);
+            if owner.child_pid.is_none() && age < 5_000 {
+                return Ok((nonce, false));
+            }
+            write_json_atomic(&path, "owner", &current)?;
+            Ok((nonce, true))
+        })
+    }
+
+    fn read_successor_evidence(&self, action: &PublicFaultAction) -> Result<PreviewChildEvidence> {
+        let bytes = std::fs::read(self.evidence_path(action))?;
+        let evidence: PreviewChildEvidence = serde_json::from_slice(&bytes)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        self.validate_successor(action, &evidence)?;
+        Ok(evidence)
+    }
+
+    async fn launch_successor(
+        &self,
+        action: &PublicFaultAction,
+        launch_nonce: &str,
+        may_spawn: bool,
+    ) -> Result<PreviewChildEvidence> {
+        let evidence_path = self.evidence_path(action);
+        let existing = with_launch_owner_lock(&self.launch_owner_path(action), || {
+            if evidence_path.exists() {
+                let evidence: PreviewChildEvidence =
+                    serde_json::from_slice(&std::fs::read(&evidence_path)?)
+                        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+                if process_start_time(evidence.child_pid).as_deref()
+                    == Some(evidence.child_start_time.as_str())
+                {
+                    self.validate_successor(action, &evidence)?;
+                    return Ok(Some(evidence));
+                }
+                std::fs::remove_file(&evidence_path)?;
+            }
+            Ok(None)
+        })?;
+        if let Some(evidence) = existing {
+            return Ok(evidence);
+        }
+        if self.active_child.lock().await.is_some() {
+            return self.await_successor_evidence(action, launch_nonce).await;
+        }
+        if !may_spawn {
+            return self.await_successor_evidence(action, launch_nonce).await;
+        }
+        if let Some(parent) = evidence_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let shutdown_path = self.shutdown_path(action);
+        if shutdown_path.exists() {
+            std::fs::remove_file(&shutdown_path)?;
+        }
+        let mut command = tokio::process::Command::new(&self.child.executable);
+        command
+            .args(&self.child.arguments)
+            .envs(&self.child.environment)
+            .env("KUBERIC_PREVIEW_CHILD_OUTPUT", &evidence_path)
+            .env("KUBERIC_PREVIEW_DATA_ROOT", &self.data_root)
+            .env("KUBERIC_PREVIEW_CHILD_MODE", "successor")
+            .env("KUBERIC_PREVIEW_SHUTDOWN", &shutdown_path)
+            .env("KUBERIC_PREVIEW_POD_UID", action.resources.pod_uid.as_str())
+            .env("KUBERIC_PREVIEW_PVC_UID", action.resources.pvc_uid.as_str())
+            .env("KUBERIC_PREVIEW_LAUNCH_NONCE", launch_nonce)
+            .env("KUBERIC_PREVIEW_SUPERVISOR_ID", &self.instance_id)
+            .env(
+                "KUBERIC_PREVIEW_LAUNCH_OWNER",
+                self.launch_owner_path(action),
+            );
+        let child = command.spawn()?;
+        let child_pid = child.id().ok_or_else(|| {
+            crate::host::HostError::CommandRejected("successor child has no PID".into())
+        })?;
+        let child_start_time = process_start_time(child_pid).ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "cannot read successor child process identity".into(),
+            )
+        })?;
+        self.record_launched_child(action, launch_nonce, child_pid, &child_start_time)?;
+        *self.active_child.lock().await = Some(child);
+        self.await_successor_evidence(action, launch_nonce).await
+    }
+
+    fn record_launched_child(
+        &self,
+        action: &PublicFaultAction,
+        launch_nonce: &str,
+        child_pid: u32,
+        child_start_time: &str,
+    ) -> Result<()> {
+        let path = self.launch_owner_path(action);
+        with_launch_owner_lock(&path, || {
+            let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(&path)?)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            if owner.nonce != launch_nonce || owner.supervisor_id != self.instance_id {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "launch owner nonce changed before child publication".into(),
+                ));
+            }
+            owner.child_pid = Some(child_pid);
+            owner.child_start_time = Some(child_start_time.into());
+            write_json_atomic(&path, "parent", &owner)
+        })
+    }
+
+    async fn await_successor_evidence(
+        &self,
+        action: &PublicFaultAction,
+        launch_nonce: &str,
+    ) -> Result<PreviewChildEvidence> {
+        let evidence_path = self.evidence_path(action);
+        for _ in 0..500 {
+            if evidence_path.exists() {
+                let evidence = self.read_successor_evidence(action)?;
+                if evidence.launch_nonce != launch_nonce {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "successor evidence launch nonce changed".into(),
+                    ));
+                }
+                return Ok(evidence);
+            }
+            let status = {
+                let mut child = self.active_child.lock().await;
+                match child.as_mut() {
+                    Some(child) => child.try_wait()?,
+                    None => None,
+                }
+            };
+            if let Some(status) = status {
+                self.active_child.lock().await.take();
+                return Err(crate::host::HostError::CommandRejected(format!(
+                    "successor child exited before readiness with {status}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(crate::host::HostError::CommandRejected(
+            "successor child readiness timed out".into(),
+        ))
+    }
+
+    pub(crate) async fn shutdown_successor(&self, action: &PublicFaultAction) -> Result<()> {
+        let shutdown_path = self.shutdown_path(action);
+        if let Some(parent) = shutdown_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&shutdown_path, b"shutdown")?;
+        if let Some(mut child) = self.active_child.lock().await.take() {
+            let status = child.wait().await?;
+            if !status.success() {
+                return Err(crate::host::HostError::CommandRejected(format!(
+                    "successor child shutdown failed with {status}"
+                )));
+            }
+        } else if let Some(process_id) = self
+            .store
+            .restart_action()
+            .await?
+            .and_then(|record| record.successor_process_id)
+        {
+            for _ in 0..500 {
+                if !Path::new(&format!("/proc/{process_id}")).exists() {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            return Err(crate::host::HostError::CommandRejected(
+                "adopted successor did not stop".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_successor(
+        &self,
+        action: &PublicFaultAction,
+        evidence: &PreviewChildEvidence,
+    ) -> Result<()> {
+        if evidence.process_session.is_empty()
+            || evidence.process_session == action.predecessor_session
+            || evidence.child_pid == 0
+            || process_start_time(evidence.child_pid).as_deref()
+                != Some(evidence.child_start_time.as_str())
+            || evidence.data_root != self.data_root
+            || evidence.pod_uid != action.resources.pod_uid
+            || evidence.pvc_uid != action.resources.pvc_uid
+            || evidence.provider_sentinel.is_empty()
+            || evidence.application_instance_id.is_empty()
+            || evidence.replicator_instance_id.is_empty()
+            || evidence.callbacks
+                != [
+                    "replicator.open",
+                    "replicator.change_role.none",
+                    "application.change_role.none",
+                ]
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "successor child evidence changed storage, process, or construction identity"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn process_start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_whitespace().nth(19).map(str::to_string)
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn process_identity_is_alive(identity: &PreviewSupervisorIdentity) -> bool {
+    process_start_time(identity.pid).as_deref() == Some(identity.start_time.as_str())
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn with_launch_owner_lock<T>(
+    owner_path: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock = owner_path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock)?;
+    file.lock()?;
+    let result = operation();
+    file.unlock()?;
+    result
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn write_json_atomic(path: &Path, tag: &str, value: &impl serde::Serialize) -> Result<()> {
+    let temporary = path.with_extension(format!(
+        "{tag}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]

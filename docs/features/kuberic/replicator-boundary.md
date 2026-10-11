@@ -60,6 +60,91 @@ is exposed as `ReplicationEngineObservation`. `ReportObservation` composes the
 host and engine owners without becoming durable state
 (`kuberic-runtime/src/host/observation.rs:1-244`).
 
+Phase 4.1 adds a separate dormant public-operation preview boundary. A
+`PartitionOperationRegistry` admits exact preview intents and retains each
+`PartitionOperation` independently of the waiting caller. The live owner holds
+only callback tasks, cancellation and containment state; exact intent, stage,
+input digest, blockers, callback-applied evidence, containment state and
+terminal disposition remain in the agent store.
+`PartitionOperationRecoveryOwner` reconstructs unfinished durable obligations
+without replaying predecessor authority into a new process session
+(`kuberic-runtime/src/host/operation.rs`;
+`kuberic-runtime/src/host/operation_recovery.rs`;
+`kuberic-runtime/src/host/state.rs`).
+
+This preview uses a distinct immutable protocol identity and schema-7
+preview-marked store state. Schema-6 legacy readers reject it before state
+deserialization, preview openers reject legacy or mismatched preview state, and
+the operation modules are compiled only for tests or the repository `testing`
+feature. A preview runtime owner joins registry coordination/root tasks during
+shutdown; object-owned work remains pending until explicit containment. No
+legacy coordinator, production protocol command or current persisted effect
+selects the preview owner (`kuberic-runtime/src/protocol/public_operations.rs`;
+`kuberic-runtime/src/host/sqlite_store.rs`;
+`kuberic-runtime/src/host/mod.rs`).
+
+Phase 4.2 implements distinct initial-primary, failover-promotion and
+same-role-secondary epoch recipes inside that boundary. The controller preview
+planner freezes `PossibleDataLossIntent` with the exact operation/session,
+epoch, replica and revision. Ordinary planning always selects `NotPossible`;
+only the explicit preview transition selects `Possible`. Every possible-loss
+operation retains a durable history-admission barrier, including `false`,
+`true`, callback error and interrupted/unrecorded outcomes. A later ordinary
+request cannot remove it; Close/Abort/fault may retire, but never clear, it.
+
+Application role completion retains its exact optional address independently
+of the Replicator endpoint. A preview report exposes it only after the exact
+current primary operation completes with write permission. The controller
+preview uses a separate accepted-status projection, persists `Pending`, writes
+the write-Service selector and opaque `operator.kuberic.io/preview-service-location`
+annotation together, then records `Published` after exact reobservation.
+Supersession and terminal admission fence the local projection without waiting
+for Kubernetes. This is a repository-only Service model, not production
+`AcceptedStatus`, routing or CRD activation. The existing custom-authority
+and legacy access engines remain unchanged.
+
+Phase 4.3 extends the same dormant owner with exact public-operation programs.
+A planned swap durably installs the captured starting PC/CC configuration
+before its first wait, revokes preview writes/location, applies the swap epoch,
+installs the refreshed configuration, repeats the same caller-selected
+catch-up mode, and hands off Replicator role before application role. Recovery
+reinstalls the exact captured configuration before reevaluating an interrupted
+wait, so an incidental previously installed topology cannot satisfy the
+operation.
+
+Build state is keyed by exact attempt identity. Same-target removal supersedes
+and drains the owned build root and provider descendants before
+`remove_replica`, then durably records that exact attempt absent. Ambiguous
+build execution remains fenced until the attempt is contained and retired;
+late completion cannot remove or publish a successor attempt.
+
+Preview Close and Abort are also operation programs. Close revokes publication,
+drains blockers, closes Replicator before application, and waits for descendant
+containment. A child close error invokes Replicator-before-application abort,
+continues cleanup, retains typed child diagnostics, and normalizes the outer
+result only after containment. Abort fences synchronously and invokes those
+abort callbacks once while durable cleanup remains registry-owned. The replay
+table distinguishes repeatable convergent callbacks, read-only progress,
+non-repeatable ambiguous build/data-loss work, exact removal, and terminal
+containment; a fresh process session never executes predecessor program state.
+
+Phase 4.4 binds reported faults to explicit persisted/volatile preview
+classification and one frozen controller action identity. Fault admission
+commits the terminal preview/write fence before reporting returns. The
+repository-only controller path excludes the exact incarnation from
+readiness, routing, election and stable completion, persists the action,
+removes routing and then dispatches.
+
+Persisted restart records `Accepted`, `PredecessorContained` and
+`SuccessorStarted` in the agent aggregate. The process supervisor requires
+exact predecessor termination before same-PVC child re-exec, and quarantine
+clears executable role, PC/CC, access and peer/build authority before storage
+reuse. A new session constructs fresh application/Replicator objects but
+remains unassigned and access-closed. Volatile and permanent actions remain
+controller-owned: endpoint, Pod and PVC identities are frozen before deletion,
+and replacement scaffolding does not imply history/build/serving completion.
+Production construction and dispatch cannot select either preview action.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

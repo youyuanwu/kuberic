@@ -3,6 +3,7 @@
 //! This owns data-plane polling, not authority or application lifetime. Callers
 //! admit configurations/builds themselves and supply a fresh session on restart.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -14,7 +15,116 @@ use futures::future::{BoxFuture, poll_fn};
 use futures::task::noop_waker_ref;
 
 use crate::host::hosting::{OutboundReplication, PendingReplication, PodRuntime};
+use crate::host::operation::{CallbackContainment, PartitionOperationRegistry};
+use crate::host::operation_recovery::PartitionOperationRuntime;
+use crate::host::state::PublicOperationRecord;
+use crate::host::store::AgentStore;
 use crate::host::transport::{copy_from_proto, replication_from_proto};
+use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationPreviewIdentity};
+
+#[allow(dead_code)]
+pub(crate) struct PublicOperationPreviewRuntime {
+    owner: PartitionOperationRuntime,
+    store: Arc<dyn AgentStore>,
+    preview: PublicOperationPreviewIdentity,
+    session: ProcessSessionId,
+}
+
+#[allow(dead_code)]
+impl PublicOperationPreviewRuntime {
+    pub(crate) fn start(
+        store: Arc<dyn AgentStore>,
+        preview: PublicOperationPreviewIdentity,
+        process_session_id: ProcessSessionId,
+    ) -> crate::host::Result<Self> {
+        let registry = PartitionOperationRegistry::new(
+            store.clone(),
+            preview.clone(),
+            process_session_id.clone(),
+        )?;
+        Ok(Self {
+            owner: PartitionOperationRuntime::start(registry),
+            store,
+            preview,
+            session: process_session_id,
+        })
+    }
+
+    pub(crate) fn registry(&self) -> Arc<PartitionOperationRegistry> {
+        self.owner.registry()
+    }
+
+    pub(crate) fn into_owner(self) -> PartitionOperationRuntime {
+        self.owner
+    }
+
+    pub(crate) async fn run_root<F, E>(
+        &self,
+        intent: PublicOperationIntent,
+        containment: CallbackContainment,
+        future: F,
+    ) -> crate::host::Result<PublicOperationRecord>
+    where
+        F: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        let operation = self.registry().admit(intent).await?;
+        operation.spawn_root(containment, future).await?;
+        operation.wait_for_terminal().await
+    }
+
+    pub(crate) async fn shutdown(self) -> crate::host::Result<()> {
+        self.owner.shutdown().await
+    }
+
+    pub(crate) async fn launch_lifecycle(
+        &self,
+        intent: PublicOperationIntent,
+        runtime: &PodRuntime,
+    ) -> crate::host::Result<Arc<crate::host::operation::PartitionOperation>> {
+        let snapshot = runtime.snapshot().await;
+        let input = intent.lifecycle.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected("preview lifecycle input required".into())
+        })?;
+        if !snapshot.open || snapshot.identity != input.replica {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "preview lifecycle requires exact opened replica".into(),
+            ));
+        }
+        if input.recipe
+            == crate::protocol::public_operations::PublicLifecycleRecipe::SecondaryEpochAdvance
+            && snapshot.role != crate::protocol::types::ReplicaRole::ActiveSecondary
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "same-role epoch update requires an active secondary".into(),
+            ));
+        }
+        crate::host::public_lifecycle::launch(
+            &self.registry(),
+            self.store.clone(),
+            intent,
+            runtime.public_lifecycle_callbacks()?,
+        )
+        .await
+    }
+
+    pub(crate) async fn lifecycle_report(
+        &self,
+    ) -> crate::host::Result<crate::protocol::public_operations::PublicLifecycleReport> {
+        let mut report = crate::host::public_lifecycle::report(
+            self.store.as_ref(),
+            &self.preview,
+            &self.session,
+        )
+        .await?;
+        if self.registry().is_fenced() {
+            report.write_access = false;
+            report.service_location = None;
+            report.role = crate::protocol::types::ReplicaRole::None;
+        }
+        Ok(report)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransportError {

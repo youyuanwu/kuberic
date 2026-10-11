@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::public_operations::{
+    PublicLifecycleReport, RestartActionRecord, StatePersistence,
+};
 use crate::protocol::types::{
     AcceptedStatus, AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric,
     OperationId, PlannedSwitchoverRequest, PodUid, ProcessSessionId, PvcUid, ReplicaId,
@@ -19,6 +22,8 @@ pub struct DesiredState {
     pub failover_delay_seconds: u64,
     #[serde(default)]
     pub switchover: Option<PlannedSwitchoverRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_lifecycle: Option<StatePersistence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +39,12 @@ pub struct KubernetesReplicaObservation {
     pub pod_ready: bool,
     #[serde(default)]
     pub peer_endpoint_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_resource_version: Option<String>,
 }
 
 impl KubernetesReplicaObservation {
@@ -109,6 +120,10 @@ pub struct AgentReport {
     pub accepted_secondary_removal: Option<crate::protocol::types::SecondaryScaleDownCleanup>,
     #[serde(default)]
     pub scale_up_intent: Option<Box<crate::protocol::types::ScaleUpIntent>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_lifecycle_report: Option<Box<PublicLifecycleReport>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_action: Option<Box<RestartActionRecord>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +183,8 @@ impl Default for AgentReport {
             retired_replica: None,
             accepted_secondary_removal: None,
             scale_up_intent: None,
+            public_lifecycle_report: None,
+            restart_action: None,
         }
     }
 }
@@ -269,6 +286,14 @@ pub struct RoutingObservation {
     #[serde(default)]
     pub unresolved_write_target: bool,
     pub write_target: Option<ReplicaIdentity>,
+    #[serde(default)]
+    pub preview_service_location_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_service_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_service_resource_version: Option<String>,
+    #[serde(default)]
+    pub service_identities: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

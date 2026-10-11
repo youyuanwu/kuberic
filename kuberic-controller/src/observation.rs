@@ -10,9 +10,15 @@ use crate::crd::KubericSet;
 #[derive(Debug, Clone)]
 pub enum RawAgentObservation {
     Absent,
-    Unavailable { message: String },
-    Invalid { message: String },
+    Unavailable {
+        message: String,
+    },
+    Invalid {
+        message: String,
+    },
     Report(Box<proto::AgentStatusReport>),
+    #[cfg(feature = "runtime-test-bridge")]
+    PreviewReport(Box<kuberic_runtime::protocol::observation::AgentReport>),
 }
 
 #[derive(Debug, Clone)]

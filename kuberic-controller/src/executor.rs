@@ -8,6 +8,62 @@ use crate::Result;
 use crate::cluster_api::ClusterApi;
 use crate::observation::RawObservation;
 
+#[cfg(feature = "runtime-test-bridge")]
+pub async fn execute_preview_service_location(
+    api: &dyn crate::cluster_api::PreviewServiceApi,
+    plan: crate::evaluator::test_bridge::PreviewServiceLocationPlan,
+) -> std::result::Result<(), String> {
+    use crate::evaluator::test_bridge::PreviewServiceLocationPlan;
+    match plan {
+        PreviewServiceLocationPlan::Stable => Ok(()),
+        PreviewServiceLocationPlan::PersistStatus { expected, next } => {
+            if let crate::evaluator::test_bridge::PreviewServiceLocationStage::Published(
+                projection,
+            ) = &next.service_location_projection
+            {
+                let (status, service) = api.observe_preview().await?;
+                if status != expected
+                    || service.metadata.uid.as_ref() != Some(&projection.service_uid)
+                    || service.metadata.resource_version.as_ref()
+                        != Some(&projection.service_resource_version)
+                    || !crate::cluster_api::preview_service_matches(&service, projection)
+                {
+                    return Err("stale service-location publication".into());
+                }
+            }
+            api.persist_preview_status(&expected, &next).await
+        }
+        PreviewServiceLocationPlan::WriteService {
+            expected_status,
+            expected_uid,
+            expected_version,
+            projection,
+        } => {
+            let (status, service) = api.observe_preview().await?;
+            if status != expected_status
+                || service.metadata.uid.as_ref() != Some(&expected_uid)
+                || service.metadata.resource_version.as_ref() != Some(&expected_version)
+            {
+                return Err("stale service-location write".into());
+            }
+            if expected_status.service_location_projection
+                != crate::evaluator::test_bridge::PreviewServiceLocationStage::Pending(
+                    projection.clone(),
+                )
+            {
+                return Err(
+                    "service-location mutation is not the accepted pending projection".into(),
+                );
+            }
+            api.replace_preview_service(crate::cluster_api::preview_service_update(
+                &service,
+                &projection,
+            ))
+            .await
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionKind {
     Stable,
@@ -136,6 +192,14 @@ async fn execute_change(
         }
         KubernetesChange::DeleteExactPod { pod_name, pod_uid } => {
             api.delete_exact_pod(observation, &pod_name, &pod_uid).await
+        }
+        KubernetesChange::DeleteExactService {
+            name,
+            uid,
+            resource_version,
+        } => {
+            api.delete_exact_service(observation, &name, &uid, &resource_version)
+                .await
         }
         KubernetesChange::EnsureWriteRoutingService => {
             api.ensure_write_routing_service(observation).await

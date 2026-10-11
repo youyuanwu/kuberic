@@ -3780,6 +3780,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                 image: "example:v1".into(),
                 failover_delay_seconds: 30,
                 switchover: None,
+                preview_lifecycle: None,
             },
             status: AcceptedStatus {
                 initialized: true,
@@ -3808,6 +3809,9 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                             image: Some("example:v1".into()),
                             pod_ready: true,
                             peer_endpoint_ready: true,
+                            endpoint_name: None,
+                            endpoint_uid: None,
+                            endpoint_resource_version: None,
                         }),
                         agent: AgentObservation::Report(Box::new(report(
                             fixture.primary.clone(),
@@ -3828,6 +3832,9 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                             image: Some("example:v1".into()),
                             pod_ready: true,
                             peer_endpoint_ready: true,
+                            endpoint_name: None,
+                            endpoint_uid: None,
+                            endpoint_resource_version: None,
                         }),
                         agent: AgentObservation::Report(Box::new(report(
                             secondary,
@@ -3851,6 +3858,9 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                             image: Some("example:v1".into()),
                             pod_ready: true,
                             peer_endpoint_ready: true,
+                            endpoint_name: None,
+                            endpoint_uid: None,
+                            endpoint_resource_version: None,
                         }),
                         agent: AgentObservation::Report(Box::new(candidate)),
                     },
@@ -3880,6 +3890,7 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                 service_present: true,
                 unresolved_write_target: false,
                 write_target: Some(fixture.primary.clone()),
+                ..Default::default()
             },
             observation_failures: Vec::new(),
             now_unix_seconds: 100,

@@ -30,8 +30,8 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,113 tests: 877 ordinary, one build-only,
-203 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test
+The consolidated validator accounts for 1,266 tests: 1,028 ordinary, one build-only,
+205 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test
 and 19 mapped parent-driven subprocess helpers.
 Use its generated counts as the inventory evolves.
 
@@ -85,6 +85,25 @@ coverage.
 Controller library tests verify that the checked-in CRD equals the generated
 schema. Runtime protocol tests guard representative status growth and reject quadratic
 evidence expansion.
+
+The dormant Service Fabric public-operation gate exercises runtime callback
+ownership/replay, controller service projection, fault planning and the real
+preview child-process boundary:
+
+```bash
+KUBERIC_WORKSPACE_TESTS=1 cargo nextest run -j 1 --profile ordinary \
+  -p kuberic-runtime --all-features \
+  -E 'test(public_operations) or test(public_operation_replay) or test(process_supervisor)'
+cargo nextest run -j 1 --profile ordinary \
+  -p kuberic-controller --all-features \
+  -E 'binary(public_operation_faults) or binary(public_operation_role_address)'
+```
+
+The supervisor cases use a true child executable and same data root. They cut
+after durable restart acceptance, predecessor containment and successor start;
+unproven containment must prevent re-exec. This path remains repository-only
+and does not activate preview commands in production controller or gRPC
+construction.
 
 ## Level-Triggered Live Validation
 
@@ -163,13 +182,13 @@ cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
 The smoke target is intended for routine local checks and covers representative
-real lifecycle paths. The full target remains the complete pre-push and CI
-validation.
+real lifecycle paths. Run the full target only when explicitly requested or in
+the dedicated CI validation that owns its resource budget.
 
 The matrix covers physical build/rewind, fencing, failover, switchover,
 replacement, scaling, quorum restoration, read-only secondaries and
 application/agent restart. The profile has one execution slot. Its complete
-205-test inventory is 203 directly partitioned tests plus two ignored
+207-test inventory is 205 directly partitioned tests plus two ignored
 subprocess helpers executed by mapped parent tests. PostgreSQL has no
 application-specific KinD test.
 
