@@ -1197,18 +1197,36 @@ fn validate_preview_cleanup(
         .status
         .as_ref()
         .ok_or(ControllerError::ObservationStale)?;
+    let clear = status
+        .authority
+        .public_service_clear
+        .as_ref()
+        .ok_or(ControllerError::ObservationStale)?;
     if status.authority.public_fault_action.as_ref() != Some(action)
-        || status
-            .authority
-            .public_service_clear
-            .as_ref()
-            .is_none_or(|clear| {
-                clear.action_id != action.action_id
-                    || clear.stage
-                        != kuberic_runtime::protocol::public_operations::PublicServiceClearStage::PublishedAbsent
-            })
+        || clear.action_id != action.action_id
+        || clear.stage
+            != kuberic_runtime::protocol::public_operations::PublicServiceClearStage::PublishedAbsent
     {
         return Err(ControllerError::ObservationStale);
+    }
+    match observation
+        .services
+        .iter()
+        .find(|service| service.name_any().ends_with("-write"))
+    {
+        Some(service)
+            if service.uid() == clear.service_uid
+                && service.resource_version() == clear.service_resource_version
+                && service.spec.as_ref().is_some_and(|spec| {
+                    spec.selector.as_ref().is_some_and(|selector| {
+                        selector.get(INSTANCE_LABEL).map(String::as_str) == Some("disabled")
+                    })
+                })
+                && !service
+                    .annotations()
+                    .contains_key(PREVIEW_SERVICE_LOCATION_ANNOTATION) => {}
+        None if clear.service_uid.is_none() && clear.service_resource_version.is_none() => {}
+        _ => return Err(ControllerError::ObservationStale),
     }
     let key =
         ReplicaObservationKey::new(action.target.replica_id, action.target.instance_id.clone());

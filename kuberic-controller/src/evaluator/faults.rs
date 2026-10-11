@@ -96,9 +96,6 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                 config,
             ));
         }
-        if let Some(plan) = service_clear_plan(snapshot, action) {
-            return Some(plan);
-        }
         if snapshot.replicas.values().any(|replica| {
             matches!(
                 &replica.agent,
@@ -119,6 +116,9 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                 "predecessor-bound cleanup cannot target a successor process",
                 config,
             ));
+        }
+        if let Some(plan) = service_clear_plan(snapshot, action) {
+            return Some(plan);
         }
         return Some(evaluate_drop(snapshot, action));
     }

@@ -205,14 +205,31 @@ impl ReplicaProcessSupervisor {
                         "cannot read child process identity".into(),
                     )
                 })?);
-            let temporary = owner_path.with_extension("child.tmp");
-            std::fs::write(
-                &temporary,
-                serde_json::to_vec(&owner)
-                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
-            )?;
-            std::fs::rename(temporary, owner_path)?;
-            Ok(())
+            write_json_atomic(owner_path, "child", &owner)
+        })
+    }
+
+    pub(crate) fn publish_current_child_evidence(
+        owner_path: &Path,
+        launch_nonce: &str,
+        supervisor_id: &str,
+        evidence_path: &Path,
+        evidence: &PreviewChildEvidence,
+    ) -> Result<()> {
+        with_launch_owner_lock(owner_path, || {
+            let owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            if owner.nonce != launch_nonce
+                || owner.supervisor_id != supervisor_id
+                || owner.child_pid != Some(std::process::id())
+                || owner.child_start_time.as_deref()
+                    != process_start_time(std::process::id()).as_deref()
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "child lost launch ownership before readiness".into(),
+                ));
+            }
+            write_json_atomic(evidence_path, "evidence", evidence)
         })
     }
 
@@ -407,75 +424,41 @@ impl ReplicaProcessSupervisor {
             child_pid: None,
             child_start_time: None,
         };
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    file.write_all(
-                        &serde_json::to_vec(&current)
-                            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
-                    )?;
-                    file.sync_all()?;
-                    return Ok((nonce, true));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(&path)?)
-                        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-                    if owner.nonce != nonce {
-                        return Err(crate::host::HostError::DurableEffectConflict(
-                            "successor launch nonce changed".into(),
-                        ));
-                    }
-                    let identity = PreviewSupervisorIdentity {
-                        pid: owner.pid,
-                        start_time: owner.start_time.clone(),
-                    };
-                    if let (Some(child_pid), Some(child_start_time)) =
-                        (owner.child_pid, owner.child_start_time.as_ref())
-                        && process_start_time(child_pid).as_deref()
-                            == Some(child_start_time.as_str())
-                    {
-                        return Ok((nonce, false));
-                    }
-                    if process_identity_is_alive(&identity) {
-                        return Ok((nonce, owner.supervisor_id == current.supervisor_id));
-                    }
-                    let age = current
-                        .claimed_at_unix_millis
-                        .saturating_sub(owner.claimed_at_unix_millis);
-                    if owner.child_pid.is_none() && age < 5_000 {
-                        return Ok((nonce, false));
-                    }
-                    let unchanged = with_launch_owner_lock(&path, || {
-                        let latest: PreviewLaunchOwner =
-                            serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
-                                crate::host::HostError::Corrupt(error.to_string())
-                            })?;
-                        let unchanged = latest.nonce == owner.nonce
-                            && latest.supervisor_id == owner.supervisor_id
-                            && latest.pid == owner.pid
-                            && latest.start_time == owner.start_time
-                            && latest.child_pid == owner.child_pid
-                            && latest.child_start_time == owner.child_start_time;
-                        if unchanged {
-                            std::fs::remove_file(&path)?;
-                        }
-                        Ok(unchanged)
-                    })?;
-                    if !unchanged {
-                        return Ok((nonce, false));
-                    }
-                }
-                Err(error) => return Err(error.into()),
+        with_launch_owner_lock(&path, || {
+            let owner = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PreviewLaunchOwner>(&bytes).ok());
+            let Some(owner) = owner else {
+                write_json_atomic(&path, "owner", &current)?;
+                return Ok((nonce, true));
+            };
+            if owner.nonce != nonce {
+                return Err(crate::host::HostError::DurableEffectConflict(
+                    "successor launch nonce changed".into(),
+                ));
             }
-        }
-        Err(crate::host::HostError::CommandRejected(
-            "cannot claim successor launch".into(),
-        ))
+            if let (Some(child_pid), Some(child_start_time)) =
+                (owner.child_pid, owner.child_start_time.as_ref())
+                && process_start_time(child_pid).as_deref() == Some(child_start_time.as_str())
+            {
+                return Ok((nonce, false));
+            }
+            let identity = PreviewSupervisorIdentity {
+                pid: owner.pid,
+                start_time: owner.start_time.clone(),
+            };
+            if process_identity_is_alive(&identity) {
+                return Ok((nonce, owner.supervisor_id == current.supervisor_id));
+            }
+            let age = current
+                .claimed_at_unix_millis
+                .saturating_sub(owner.claimed_at_unix_millis);
+            if owner.child_pid.is_none() && age < 5_000 {
+                return Ok((nonce, false));
+            }
+            write_json_atomic(&path, "owner", &current)?;
+            Ok((nonce, true))
+        })
     }
 
     fn read_successor_evidence(&self, action: &PublicFaultAction) -> Result<PreviewChildEvidence> {
@@ -493,17 +476,23 @@ impl ReplicaProcessSupervisor {
         may_spawn: bool,
     ) -> Result<PreviewChildEvidence> {
         let evidence_path = self.evidence_path(action);
-        if evidence_path.exists() {
-            let evidence: PreviewChildEvidence =
-                serde_json::from_slice(&std::fs::read(&evidence_path)?)
-                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-            if process_start_time(evidence.child_pid).as_deref()
-                == Some(evidence.child_start_time.as_str())
-            {
-                self.validate_successor(action, &evidence)?;
-                return Ok(evidence);
+        let existing = with_launch_owner_lock(&self.launch_owner_path(action), || {
+            if evidence_path.exists() {
+                let evidence: PreviewChildEvidence =
+                    serde_json::from_slice(&std::fs::read(&evidence_path)?)
+                        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+                if process_start_time(evidence.child_pid).as_deref()
+                    == Some(evidence.child_start_time.as_str())
+                {
+                    self.validate_successor(action, &evidence)?;
+                    return Ok(Some(evidence));
+                }
+                std::fs::remove_file(&evidence_path)?;
             }
-            std::fs::remove_file(&evidence_path)?;
+            Ok(None)
+        })?;
+        if let Some(evidence) = existing {
+            return Ok(evidence);
         }
         if self.active_child.lock().await.is_some() {
             return self.await_successor_evidence(action, launch_nonce).await;
@@ -566,14 +555,7 @@ impl ReplicaProcessSupervisor {
             }
             owner.child_pid = Some(child_pid);
             owner.child_start_time = Some(child_start_time.into());
-            let temporary = path.with_extension("tmp");
-            std::fs::write(
-                &temporary,
-                serde_json::to_vec(&owner)
-                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
-            )?;
-            std::fs::rename(temporary, &path)?;
-            Ok(())
+            write_json_atomic(&path, "parent", &owner)
         })
     }
 
@@ -695,55 +677,36 @@ fn with_launch_owner_lock<T>(
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let lock = owner_path.with_extension("lock");
-    let identity_path = lock.join("owner.json");
-    for _ in 0..500 {
-        match std::fs::create_dir(&lock) {
-            Ok(()) => {
-                let identity = PreviewSupervisorIdentity {
-                    pid: std::process::id(),
-                    start_time: process_start_time(std::process::id()).ok_or_else(|| {
-                        crate::host::HostError::CommandRejected(
-                            "cannot read launch-lock owner identity".into(),
-                        )
-                    })?,
-                };
-                std::fs::write(
-                    &identity_path,
-                    serde_json::to_vec(&identity)
-                        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
-                )?;
-                let result = operation();
-                std::fs::remove_dir_all(&lock)?;
-                return result;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let identity = std::fs::read(&identity_path).ok().and_then(|bytes| {
-                    serde_json::from_slice::<PreviewSupervisorIdentity>(&bytes).ok()
-                });
-                let stale = identity
-                    .as_ref()
-                    .is_some_and(|identity| !process_identity_is_alive(identity))
-                    || (identity.is_none()
-                        && std::fs::metadata(&lock)
-                            .and_then(|metadata| metadata.modified())
-                            .ok()
-                            .and_then(|modified| modified.elapsed().ok())
-                            .is_some_and(|age| age >= Duration::from_secs(5)));
-                if stale {
-                    match std::fs::remove_dir_all(&lock) {
-                        Ok(()) => continue,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(crate::host::HostError::CommandRejected(
-        "launch-owner lock timed out".into(),
-    ))
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock)?;
+    file.lock()?;
+    let result = operation();
+    file.unlock()?;
+    result
+}
+
+#[cfg(all(feature = "testing", kuberic_workspace_tests))]
+fn write_json_atomic(path: &Path, tag: &str, value: &impl serde::Serialize) -> Result<()> {
+    let temporary = path.with_extension(format!(
+        "{tag}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]

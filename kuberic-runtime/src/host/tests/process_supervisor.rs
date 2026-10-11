@@ -158,7 +158,7 @@ fn preview_process_child_entrypoint() {
     let Ok(output) = std::env::var(CHILD_OUTPUT) else {
         return;
     };
-    if let (Ok(owner), Ok(nonce), Ok(supervisor_id)) = (
+    let launch_context = if let (Ok(owner), Ok(nonce), Ok(supervisor_id)) = (
         std::env::var("KUBERIC_PREVIEW_LAUNCH_OWNER"),
         std::env::var("KUBERIC_PREVIEW_LAUNCH_NONCE"),
         std::env::var("KUBERIC_PREVIEW_SUPERVISOR_ID"),
@@ -169,7 +169,10 @@ fn preview_process_child_entrypoint() {
             &supervisor_id,
         )
         .unwrap();
-    }
+        Some((PathBuf::from(owner), nonce, supervisor_id))
+    } else {
+        None
+    };
     let data_root = PathBuf::from(std::env::var("KUBERIC_PREVIEW_DATA_ROOT").unwrap());
     let provider = data_root.join("provider.sentinel");
     let sentinel = if provider.exists() {
@@ -245,7 +248,18 @@ fn preview_process_child_entrypoint() {
     if let Some(parent) = Path::new(&output).parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
-    std::fs::write(output, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    if let Some((owner, nonce, supervisor_id)) = launch_context {
+        ReplicaProcessSupervisor::publish_current_child_evidence(
+            &owner,
+            &nonce,
+            &supervisor_id,
+            Path::new(&output),
+            &evidence,
+        )
+        .unwrap();
+    } else {
+        std::fs::write(output, serde_json::to_vec(&evidence).unwrap()).unwrap();
+    }
     if std::env::var("KUBERIC_PREVIEW_CHILD_MODE").unwrap() == "predecessor" {
         let release = PathBuf::from(std::env::var("KUBERIC_PREVIEW_RELEASE").unwrap());
         while !release.exists() {

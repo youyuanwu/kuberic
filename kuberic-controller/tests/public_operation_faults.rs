@@ -877,6 +877,29 @@ async fn accepted_drop_never_targets_a_successor_on_the_same_storage() {
         kuberic_controller::normalize::normalize(planned_raw.clone(), BTreeMap::new()).unwrap();
     let stale_plan = kuberic_controller::evaluate(&planned_snapshot, &config());
     let effects_before = api.effects().await.len();
+    let mut republished = planned_raw.clone();
+    let service = republished
+        .services
+        .iter_mut()
+        .find(|service| service.name_any().ends_with("-write"))
+        .unwrap();
+    service.spec.get_or_insert_default().selector =
+        Some(BTreeMap::from([(INSTANCE_LABEL.into(), POD_UID.into())]));
+    service.metadata.annotations.get_or_insert_default().insert(
+        "operator.kuberic.io/preview-service-location".into(),
+        "opaque://republished".into(),
+    );
+    api.set_observation(republished).await;
+    assert!(matches!(
+        kuberic_controller::executor::execute_plan(
+            api.as_ref(),
+            &planned_raw,
+            &planned_snapshot,
+            stale_plan.clone(),
+        )
+        .await,
+        Err(kuberic_controller::ControllerError::ObservationStale)
+    ));
     let mut observation = api.observation().await;
     let RawAgentObservation::PreviewReport(report) =
         observation.agents.values_mut().next().unwrap()
