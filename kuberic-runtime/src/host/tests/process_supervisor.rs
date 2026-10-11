@@ -158,11 +158,17 @@ fn preview_process_child_entrypoint() {
     let Ok(output) = std::env::var(CHILD_OUTPUT) else {
         return;
     };
-    if let (Ok(owner), Ok(nonce)) = (
+    if let (Ok(owner), Ok(nonce), Ok(supervisor_id)) = (
         std::env::var("KUBERIC_PREVIEW_LAUNCH_OWNER"),
         std::env::var("KUBERIC_PREVIEW_LAUNCH_NONCE"),
+        std::env::var("KUBERIC_PREVIEW_SUPERVISOR_ID"),
     ) {
-        ReplicaProcessSupervisor::record_current_child_launch(Path::new(&owner), &nonce).unwrap();
+        ReplicaProcessSupervisor::record_current_child_launch(
+            Path::new(&owner),
+            &nonce,
+            &supervisor_id,
+        )
+        .unwrap();
     }
     let data_root = PathBuf::from(std::env::var("KUBERIC_PREVIEW_DATA_ROOT").unwrap());
     let provider = data_root.join("provider.sentinel");

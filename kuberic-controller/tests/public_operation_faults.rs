@@ -410,7 +410,6 @@ async fn persisted_primary_and_secondary_faults_use_one_restart_action_across_re
         report.reported_fault = Some(FaultType::Transient);
         report.healthy = false;
         report.report_sequence += 1;
-        report.restart_action = None;
         let lifecycle = report.public_lifecycle_report.as_mut().unwrap();
         lifecycle.revision += 1;
         lifecycle.operation_id = Some(OperationId::new(format!("fault-next-{replica_id}")));

@@ -383,7 +383,12 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
     Some(match action.kind {
         PublicFaultActionKind::Restart => {
             if let Some(record) = report.restart_action.as_deref() {
-                if record.action != action {
+                let historical = snapshot.status.last_public_fault_action.as_ref()
+                    == Some(&record.action)
+                    && record.stage == RestartActionStage::SuccessorStarted
+                    && record.successor_session.as_ref() == Some(&action.predecessor_session)
+                    && record.successor_process_id == Some(action.predecessor_process_id);
+                if record.action != action && !historical {
                     return Some(reject(
                         snapshot,
                         "RestartHandshakeMismatch",
@@ -391,7 +396,7 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                         config,
                     ));
                 }
-                if record.stage == RestartActionStage::SuccessorStarted {
+                if record.action == action && record.stage == RestartActionStage::SuccessorStarted {
                     return Some(reject(
                         snapshot,
                         "RestartSuccessorNotObserved",
