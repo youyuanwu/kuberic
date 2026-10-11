@@ -635,7 +635,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
             Program::Configuration(configuration(4)),
         )
         .await;
-    let build = fixture.intent(
+    let historical_build = fixture.intent(
         "historical-target-build",
         5,
         Program::Build(build("historical-target-build")),
@@ -643,10 +643,40 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
     assert!(
         fixture
             .store
-            .begin_public_operation(&build, &[], &[])
+            .begin_public_operation(&historical_build, &[], &[])
             .await
             .is_ok(),
         "superseded historical topology must not poison a future build"
+    );
+    fixture.owner.shutdown().await.unwrap();
+
+    let fixture = Fixture::new().await;
+    fixture
+        .run(
+            "topology-before-progress",
+            3,
+            Program::Configuration(configuration_with_target(3)),
+        )
+        .await;
+    fixture
+        .run(
+            "topology-neutral-progress",
+            4,
+            Program::Progress { capability: false },
+        )
+        .await;
+    let active_build = fixture.intent(
+        "active-target-after-progress",
+        5,
+        Program::Build(build("active-target-after-progress")),
+    );
+    assert!(
+        fixture
+            .store
+            .begin_public_operation(&active_build, &[], &[])
+            .await
+            .is_err(),
+        "topology-neutral authority must not hide installed configuration"
     );
     fixture.owner.shutdown().await.unwrap();
 }

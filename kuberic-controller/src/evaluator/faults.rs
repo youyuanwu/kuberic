@@ -62,6 +62,18 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
         }
         Some(_) => {}
     }
+    if !snapshot.observation_failures.is_empty() {
+        return Some(Plan::Wait {
+            reason: crate::plan::WaitReason::AgentUnavailable,
+            status: snapshot.status.clone().with_condition(StatusCondition {
+                type_: "Ready".into(),
+                status: ConditionStatus::False,
+                reason: "FaultReobservationRequired".into(),
+                message: "fault cleanup waits for complete resource observation".into(),
+            }),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        });
+    }
     if let Err(message) = validate_present_preview_reports(snapshot, preview, &binding) {
         return Some(reject(
             snapshot,
@@ -380,17 +392,12 @@ pub(super) fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig
                     ));
                 }
                 if record.stage == RestartActionStage::SuccessorStarted {
-                    if record.successor_session.as_ref().is_none_or(|session| {
-                        session.is_empty() || session == &action.predecessor_session
-                    }) {
-                        return Some(reject(
-                            snapshot,
-                            "RestartSuccessorInvalid",
-                            "successor-started evidence does not name a fresh session",
-                            config,
-                        ));
-                    }
-                    return Some(complete_fault_plan(snapshot, &action));
+                    return Some(reject(
+                        snapshot,
+                        "RestartSuccessorNotObserved",
+                        "faulted predecessor report cannot complete successor startup",
+                        config,
+                    ));
                 }
             }
             Plan::Execute {

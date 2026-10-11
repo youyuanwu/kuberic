@@ -13,7 +13,7 @@ use kuberic_controller::crd::{
     REPLICA_ID_LABEL, SET_UID_LABEL,
 };
 use kuberic_controller::evaluator::EvaluationConfig;
-use kuberic_controller::observation::{RawAgentObservation, RawObservation};
+use kuberic_controller::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
 use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
 use kuberic_runtime::protocol::command::{KubernetesChange, ProtocolCommand};
 use kuberic_runtime::protocol::observation::{AgentReport, ReplicaObservationKey};
@@ -515,6 +515,16 @@ async fn permanent_fault_supersedes_transient_action_without_retargeting() {
         .authority
         .public_fault_action
         .unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            reconciler
+                .reconcile("tests", "fault-db")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+    }
 
     let original = api.observation().await;
     let stale = ProtocolCommand::RestartReplicaProcess(Box::new(
@@ -538,6 +548,24 @@ async fn permanent_fault_supersedes_transient_action_without_retargeting() {
     };
     report.public_lifecycle_report.as_mut().unwrap().revision += 1;
     api.set_observation(changed_revision).await;
+    assert!(matches!(
+        api.execute_command(&api.observation().await, &stale).await,
+        Err(kuberic_controller::ControllerError::ObservationStale)
+    ));
+
+    let mut rerouted = original.clone();
+    let service = rerouted
+        .services
+        .iter_mut()
+        .find(|service| service.name_any().ends_with("-write"))
+        .unwrap();
+    service.spec.get_or_insert_default().selector =
+        Some(BTreeMap::from([(INSTANCE_LABEL.into(), POD_UID.into())]));
+    service.metadata.annotations.get_or_insert_default().insert(
+        "operator.kuberic.io/preview-service-location".into(),
+        "opaque://resurrected".into(),
+    );
+    api.set_observation(rerouted).await;
     assert!(matches!(
         api.execute_command(&api.observation().await, &stale).await,
         Err(kuberic_controller::ControllerError::ObservationStale)
@@ -792,6 +820,42 @@ async fn accepted_drop_rejects_invalid_normalized_predecessor_evidence() {
             effect,
             EffectRecord::Execute(_)
                 | EffectRecord::DeleteExactService { .. }
+                | EffectRecord::DeleteScaffolding { .. }
+                | EffectRecord::EnsureReplacement(_)
+        )
+    }));
+}
+
+#[tokio::test]
+async fn accepted_drop_waits_for_failed_resource_observation() {
+    let api = Arc::new(InMemoryClusterApi::new(raw_fault(
+        Some(StatePersistence::Volatile),
+        FaultType::Transient,
+        1,
+    )));
+    let reconciler = Reconciler::new(api.clone(), config());
+    for _ in 0..5 {
+        reconciler.reconcile("tests", "fault-db").await.unwrap();
+    }
+    let effects_before = api.effects().await.len();
+    let mut observation = api.observation().await;
+    observation.failures.push(RawObservationFailure {
+        source: "services".into(),
+        message: "injected observation failure".into(),
+    });
+    api.set_observation(observation).await;
+    assert_eq!(
+        reconciler
+            .reconcile("tests", "fault-db")
+            .await
+            .unwrap()
+            .kind,
+        ReconcileKind::Waiting
+    );
+    assert!(!api.effects().await[effects_before..].iter().any(|effect| {
+        matches!(
+            effect,
+            EffectRecord::DeleteExactService { .. }
                 | EffectRecord::DeleteScaffolding { .. }
                 | EffectRecord::EnsureReplacement(_)
         )

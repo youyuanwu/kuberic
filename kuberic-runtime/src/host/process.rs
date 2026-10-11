@@ -71,6 +71,7 @@ pub(crate) struct PreviewChildCommand {
 pub(crate) struct PreviewChildEvidence {
     pub(crate) process_session: ProcessSessionId,
     pub(crate) child_pid: u32,
+    pub(crate) child_start_time: String,
     pub(crate) data_root: PathBuf,
     pub(crate) pod_uid: PodUid,
     pub(crate) pvc_uid: PvcUid,
@@ -121,6 +122,9 @@ struct PreviewLaunchOwner {
     supervisor_id: String,
     pid: u32,
     start_time: String,
+    claimed_at_unix_millis: u128,
+    child_pid: Option<u32>,
+    child_start_time: Option<String>,
 }
 
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
@@ -178,6 +182,28 @@ impl ReplicaProcessSupervisor {
             serde_json::to_vec(&identity)
                 .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_current_child_launch(owner_path: &Path, launch_nonce: &str) -> Result<()> {
+        let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        if owner.nonce != launch_nonce {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "child launch nonce differs from durable owner".into(),
+            ));
+        }
+        owner.child_pid = Some(std::process::id());
+        owner.child_start_time = Some(process_start_time(std::process::id()).ok_or_else(|| {
+            crate::host::HostError::CommandRejected("cannot read child process identity".into())
+        })?);
+        let temporary = owner_path.with_extension("child.tmp");
+        std::fs::write(
+            &temporary,
+            serde_json::to_vec(&owner)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+        )?;
+        std::fs::rename(temporary, owner_path)?;
         Ok(())
     }
 
@@ -365,6 +391,12 @@ impl ReplicaProcessSupervisor {
                     "cannot read launch-owner process identity".into(),
                 )
             })?,
+            claimed_at_unix_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
+                .as_millis(),
+            child_pid: None,
+            child_start_time: None,
         };
         for _ in 0..2 {
             match std::fs::OpenOptions::new()
@@ -393,8 +425,21 @@ impl ReplicaProcessSupervisor {
                         pid: owner.pid,
                         start_time: owner.start_time.clone(),
                     };
+                    if let (Some(child_pid), Some(child_start_time)) =
+                        (owner.child_pid, owner.child_start_time.as_ref())
+                        && process_start_time(child_pid).as_deref()
+                            == Some(child_start_time.as_str())
+                    {
+                        return Ok((nonce, false));
+                    }
                     if process_identity_is_alive(&identity) {
                         return Ok((nonce, owner.supervisor_id == current.supervisor_id));
+                    }
+                    let age = current
+                        .claimed_at_unix_millis
+                        .saturating_sub(owner.claimed_at_unix_millis);
+                    if owner.child_pid.is_none() && age < 5_000 {
+                        return Ok((nonce, false));
                     }
                     std::fs::remove_file(&path)?;
                 }
@@ -451,10 +496,50 @@ impl ReplicaProcessSupervisor {
             .env("KUBERIC_PREVIEW_SHUTDOWN", &shutdown_path)
             .env("KUBERIC_PREVIEW_POD_UID", action.resources.pod_uid.as_str())
             .env("KUBERIC_PREVIEW_PVC_UID", action.resources.pvc_uid.as_str())
-            .env("KUBERIC_PREVIEW_LAUNCH_NONCE", launch_nonce);
+            .env("KUBERIC_PREVIEW_LAUNCH_NONCE", launch_nonce)
+            .env(
+                "KUBERIC_PREVIEW_LAUNCH_OWNER",
+                self.launch_owner_path(action),
+            );
         let child = command.spawn()?;
+        let child_pid = child.id().ok_or_else(|| {
+            crate::host::HostError::CommandRejected("successor child has no PID".into())
+        })?;
+        let child_start_time = process_start_time(child_pid).ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "cannot read successor child process identity".into(),
+            )
+        })?;
+        self.record_launched_child(action, launch_nonce, child_pid, &child_start_time)?;
         *self.active_child.lock().await = Some(child);
         self.await_successor_evidence(action, launch_nonce).await
+    }
+
+    fn record_launched_child(
+        &self,
+        action: &PublicFaultAction,
+        launch_nonce: &str,
+        child_pid: u32,
+        child_start_time: &str,
+    ) -> Result<()> {
+        let path = self.launch_owner_path(action);
+        let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(&path)?)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        if owner.nonce != launch_nonce {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "launch owner nonce changed before child publication".into(),
+            ));
+        }
+        owner.child_pid = Some(child_pid);
+        owner.child_start_time = Some(child_start_time.into());
+        let temporary = path.with_extension("tmp");
+        std::fs::write(
+            &temporary,
+            serde_json::to_vec(&owner)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
+        )?;
+        std::fs::rename(temporary, path)?;
+        Ok(())
     }
 
     async fn await_successor_evidence(
@@ -533,6 +618,8 @@ impl ReplicaProcessSupervisor {
         if evidence.process_session.is_empty()
             || evidence.process_session == action.predecessor_session
             || evidence.child_pid == 0
+            || process_start_time(evidence.child_pid).as_deref()
+                != Some(evidence.child_start_time.as_str())
             || evidence.data_root != self.data_root
             || evidence.pod_uid != action.resources.pod_uid
             || evidence.pvc_uid != action.resources.pvc_uid

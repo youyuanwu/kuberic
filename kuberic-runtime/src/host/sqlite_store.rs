@@ -1718,8 +1718,24 @@ impl AgentStore for SqliteStore {
                 Some(PublicOperationProgram::Build(build)) => {
                     if preview.active_builds.contains_key(&build.replica.replica_id)
                         || preview.operations.values().filter(|record| {
-                            preview.current_operation.as_ref()
-                                == Some(&record.intent.operation_id)
+                            preview.current_topology_operation.as_ref().map_or_else(
+                                || {
+                                    preview.current_operation.as_ref()
+                                        == Some(&record.intent.operation_id)
+                                        && (record.intent.lifecycle.is_some()
+                                            || matches!(
+                                                record.intent.program,
+                                                Some(
+                                                    PublicOperationProgram::Configuration(_)
+                                                        | PublicOperationProgram::CatchUp {
+                                                            ..
+                                                        }
+                                                        | PublicOperationProgram::Swap { .. }
+                                                )
+                                            ))
+                                },
+                                |operation_id| operation_id == &record.intent.operation_id,
+                            )
                                 || (matches!(
                                     record.intent.program,
                                     Some(PublicOperationProgram::Swap { .. })
@@ -1845,6 +1861,17 @@ impl AgentStore for SqliteStore {
             ) || intent.class.is_terminal()
             {
                 preview.current_operation = Some(intent.operation_id.clone());
+            }
+            if intent.lifecycle.is_some()
+                || matches!(
+                    intent.program,
+                    Some(
+                        PublicOperationProgram::Configuration(_)
+                            | PublicOperationProgram::CatchUp { .. }
+                    )
+                )
+            {
+                preview.current_topology_operation = Some(intent.operation_id.clone());
             }
             retire_history_barriers(preview, intent);
             if intent.class.is_terminal() {
@@ -2109,6 +2136,23 @@ impl AgentStore for SqliteStore {
             };
             retire_history_barriers(preview, intent);
             preview.current_operation = Some(intent.operation_id.clone());
+            if matches!(
+                intent.class,
+                crate::protocol::public_operations::PublicOperationClass::TransientFault
+                    | crate::protocol::public_operations::PublicOperationClass::PermanentFault
+            ) {
+                preview.writes_revoked = true;
+                preview.terminal = true;
+                state.reported_fault = Some(match intent.class {
+                    crate::protocol::public_operations::PublicOperationClass::TransientFault => {
+                        state.reported_fault.unwrap_or(FaultType::Transient)
+                    }
+                    crate::protocol::public_operations::PublicOperationClass::PermanentFault => {
+                        FaultType::Permanent
+                    }
+                    _ => unreachable!(),
+                });
+            }
             preview
                 .operations
                 .insert(intent.operation_id.clone(), record.clone());
@@ -2231,6 +2275,7 @@ impl AgentStore for SqliteStore {
                     }
                     if instruction == PublicInstruction::Revoke {
                         preview.current_operation = Some(intent.operation_id.clone());
+                        preview.current_topology_operation = Some(intent.operation_id.clone());
                     }
                 }
                 Some(outcome) if record.lifecycle.in_flight == Some(instruction) => {
@@ -2385,18 +2430,25 @@ impl AgentStore for SqliteStore {
                 if existing.action == *action {
                     return Ok(existing.clone());
                 }
-                if existing.action.target == action.target
-                    && existing.action.predecessor_session == action.predecessor_session
-                    && existing.action.fault == FaultType::Transient
-                    && action.fault == FaultType::Permanent
+                if existing.stage == RestartActionStage::SuccessorStarted
+                    && existing.successor_session.as_ref() == Some(&action.predecessor_session)
+                    && existing.successor_process_id == Some(action.predecessor_process_id)
                 {
-                    return Err(crate::host::HostError::CommandRejected(
-                        "permanent fault requires controller drop/replacement".into(),
+                    preview.restart_action = None;
+                } else {
+                    if existing.action.target == action.target
+                        && existing.action.predecessor_session == action.predecessor_session
+                        && existing.action.fault == FaultType::Transient
+                        && action.fault == FaultType::Permanent
+                    {
+                        return Err(crate::host::HostError::CommandRejected(
+                            "permanent fault requires controller drop/replacement".into(),
+                        ));
+                    }
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "restart action changed after durable acceptance".into(),
                     ));
                 }
-                return Err(crate::host::HostError::DurableEffectConflict(
-                    "restart action changed after durable acceptance".into(),
-                ));
             }
             preview.writes_revoked = true;
             preview.terminal = true;

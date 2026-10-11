@@ -207,6 +207,8 @@ pub(crate) struct PublicOperationPreviewState {
     #[serde(default)]
     pub(crate) current_operation: Option<OperationId>,
     #[serde(default)]
+    pub(crate) current_topology_operation: Option<OperationId>,
+    #[serde(default)]
     pub(crate) active_builds: BTreeMap<
         crate::protocol::types::ReplicaId,
         crate::protocol::public_operations::PublicBuildInput,
@@ -229,6 +231,7 @@ impl PublicOperationPreviewState {
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
             current_operation: None,
+            current_topology_operation: None,
             active_builds: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
             writes_revoked: false,
@@ -244,6 +247,7 @@ impl PublicOperationPreviewState {
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
             current_operation: None,
+            current_topology_operation: None,
             active_builds: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
             writes_revoked: false,

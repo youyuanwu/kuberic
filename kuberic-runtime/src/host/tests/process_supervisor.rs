@@ -158,6 +158,12 @@ fn preview_process_child_entrypoint() {
     let Ok(output) = std::env::var(CHILD_OUTPUT) else {
         return;
     };
+    if let (Ok(owner), Ok(nonce)) = (
+        std::env::var("KUBERIC_PREVIEW_LAUNCH_OWNER"),
+        std::env::var("KUBERIC_PREVIEW_LAUNCH_NONCE"),
+    ) {
+        ReplicaProcessSupervisor::record_current_child_launch(Path::new(&owner), &nonce).unwrap();
+    }
     let data_root = PathBuf::from(std::env::var("KUBERIC_PREVIEW_DATA_ROOT").unwrap());
     let provider = data_root.join("provider.sentinel");
     let sentinel = if provider.exists() {
@@ -200,6 +206,15 @@ fn preview_process_child_entrypoint() {
     let evidence = PreviewChildEvidence {
         process_session,
         child_pid: std::process::id(),
+        child_start_time: std::fs::read_to_string(format!("/proc/{}/stat", std::process::id()))
+            .unwrap()
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .into(),
         data_root: data_root.clone(),
         pod_uid: PodUid::new(std::env::var("KUBERIC_PREVIEW_POD_UID").unwrap()),
         pvc_uid: PvcUid::new(std::env::var("KUBERIC_PREVIEW_PVC_UID").unwrap()),
@@ -291,6 +306,7 @@ async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
     assert_eq!(state.write_status, AccessStatus::NotPrimary);
     assert!(state.previous_configuration.is_none());
     assert!(state.current_configuration.is_none());
+    let completed_record = result.record.clone();
     drop(state);
     drop(result);
     let database = SqliteStore::metadata_database_path(&fixture.data_root);
@@ -306,6 +322,39 @@ async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
         .shutdown_successor(&action)
         .await
         .unwrap();
+    let mut next = action.clone();
+    next.fault_operation_id = OperationId::new("fault-operation-next");
+    next.fault_revision += 1;
+    next.predecessor_session = completed_record.successor_session.unwrap();
+    next.predecessor_process_id = completed_record.successor_process_id.unwrap();
+    next.action_id = next.expected_id();
+    fixture
+        .store
+        .begin_public_operation(
+            &crate::protocol::public_operations::PublicOperationIntent {
+                preview: fixture.binding.preview.clone(),
+                operation_id: next.fault_operation_id.clone(),
+                revision: next.fault_revision,
+                process_session_id: next.predecessor_session.clone(),
+                class: crate::protocol::public_operations::PublicOperationClass::TransientFault,
+                input_digest: "next-fault".into(),
+                lifecycle: None,
+                program: None,
+            },
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .begin_restart_action(&next)
+            .await
+            .unwrap()
+            .stage,
+        RestartActionStage::Accepted
+    );
 }
 
 #[tokio::test]
