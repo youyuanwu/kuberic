@@ -1045,7 +1045,7 @@ impl PgInstanceManager {
                                     port,
                                     "PostgreSQL unresponsive (3 consecutive pg_isready failures)"
                                 );
-                                health_fault_reporter(PgProcessFault::Permanent);
+                                health_fault_reporter(PgProcessFault::Transient);
                                 *health_generation.state.lock().unwrap() = PgProcessState::Faulted;
                             }
                             break;

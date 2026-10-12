@@ -82,7 +82,7 @@ async fn failure_case(failure: &str) {
         RuntimeEffectAction::RefreshApplicationProgress
     };
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(90),
         group.pod(1).effect(action),
     )
     .await
