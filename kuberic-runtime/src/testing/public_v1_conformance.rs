@@ -257,19 +257,25 @@ fn scenario_filter() -> String {
 fn run_strict_scenarios() {
     let root = workspace_root();
     let filter = scenario_filter();
-    let list = Command::new("cargo")
-        .current_dir(&root)
-        .args([
-            "nextest",
-            "list",
-            "-p",
-            "kuberic-runtime",
-            "--all-features",
-            "--profile",
-            "ordinary",
-            "-E",
-            &filter,
-        ])
+    let archive = std::env::var_os("NEXTEST_ARCHIVE")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
+        .filter(|path| path.is_file());
+    let mut list = Command::new("cargo");
+    list.current_dir(&root).args(["nextest", "list"]);
+    if let Some(archive) = &archive {
+        list.arg("--archive-file").arg(archive);
+    } else {
+        list.args(["-p", "kuberic-runtime", "--all-features"]);
+    }
+    let list = list
+        .args(["--profile", "ordinary", "-E", &filter])
         .output()
         .expect("list strict Public V1 conformance scenarios");
     assert!(
@@ -289,23 +295,33 @@ fn run_strict_scenarios() {
         }
     }
 
-    let run = Command::new("cargo")
-        .current_dir(root)
-        .args([
-            "nextest",
-            "run",
-            "-j",
-            "1",
-            "-p",
-            "kuberic-runtime",
-            "--all-features",
-            "--profile",
-            "ordinary",
-            "-E",
-            &filter,
-        ])
+    let mut run = Command::new("cargo");
+    run.current_dir(&root).args(["nextest", "run", "-j", "1"]);
+    let extract = archive.as_ref().map(|archive| {
+        let path = std::env::temp_dir().join(format!(
+            "kuberic-public-v1-conformance-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create Public V1 conformance extraction directory");
+        run.arg("--archive-file")
+            .arg(archive)
+            .arg("--extract-to")
+            .arg(&path)
+            .arg("--workspace-remap")
+            .arg(&root);
+        path
+    });
+    if archive.is_none() {
+        run.args(["-p", "kuberic-runtime", "--all-features"]);
+    }
+    let run = run
+        .args(["--profile", "ordinary", "-E", &filter])
         .output()
         .expect("run strict Public V1 conformance scenarios");
+    if let Some(extract) = extract {
+        let _ = std::fs::remove_dir_all(extract);
+    }
     assert!(
         run.status.success(),
         "strict Public V1 conformance scenarios failed:\n{}\n{}",

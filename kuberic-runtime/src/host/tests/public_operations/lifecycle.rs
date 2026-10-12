@@ -911,11 +911,11 @@ async fn public_operation_role_address_runtime_to_controller_publish_replace_cle
     let fixture = Fixture::new(ReplicaRole::None).await;
     let mut status = PreviewAcceptedStatus::default();
     let mut service = service();
-    for (revision, address) in [
-        (2, Some("opaque://one")),
-        (3, Some("")),
-        (4, Some("opaque://two")),
-        (5, None),
+    for (revision, address, expected) in [
+        (2, Some("opaque://one"), Some("opaque://one")),
+        (3, Some(""), None),
+        (4, Some("opaque://two"), Some("opaque://two")),
+        (5, None, None),
     ] {
         *fixture.trace.service_address.lock().unwrap() = address.map(str::to_string);
         let command = fixture.command(
@@ -930,7 +930,7 @@ async fn public_operation_role_address_runtime_to_controller_publish_replace_cle
                 .service_location
                 .as_ref()
                 .map(|location| location.address.as_str()),
-            address
+            expected
         );
         // The bridge consumes a serialized runtime report, not a manually invented address.
         let wire = serde_json::to_vec(&report).unwrap();
@@ -947,7 +947,7 @@ async fn public_operation_role_address_runtime_to_controller_publish_replace_cle
                 .location
                 .as_ref()
                 .map(|location| location.address.as_str()),
-            address
+            expected
         );
         assert_eq!(
             service.metadata.annotations.as_ref().unwrap()["unrelated"],
