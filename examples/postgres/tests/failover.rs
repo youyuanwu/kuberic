@@ -10,7 +10,16 @@ macro_rules! host_test {
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(scenarios::$name());
+                        .block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(240),
+                                scenarios::$name(),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!("{} exceeded its 240-second test bound", stringify!($name))
+                            });
+                        });
                 })
                 .unwrap()
                 .join()
