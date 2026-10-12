@@ -9,12 +9,24 @@ use crate::protocol::command::{
 use crate::protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, UninitializedAgentObservation,
 };
+use crate::protocol::public_operations::{
+    CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
+    CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
+    DataLossReplay, ProcessAttemptContext, ProviderProgressReset, ProviderReplicaIdentity,
+    PublicBuildAttemptReference, PublicCatchUpMode, PublicDataLossRecoveryStage,
+    PublicDataLossRecoveryStatus, PublicOperationPreviewIdentity, PublicOperationReplayDisposition,
+    PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1CallKind,
+    PublicV1ExtensionSlot, PublicV1Extensions, PublicV1OperationCompletion,
+    PublicV1OperationResult, ReplicaRebuildReason, ServiceLocation,
+};
 use crate::protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
-    ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId,
-    PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningKind, ProvisioningPurpose, PvcUid,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
-    SwitchoverRequestId, TransitionKind, derive_agent_generation,
+    ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, HistoryContext, HistoryId,
+    InitializationId, OperationId, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningKind,
+    ProvisioningPurpose, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity, ReplicaStorageIncarnationContext,
+    ReplicatorCreationId, ResourceUid, StorageGeneration, SwitchoverHandoff, SwitchoverRequestId,
+    TransitionKind, derive_agent_generation,
 };
 use crate::protocol::validation::{
     validate_configuration, validate_scale_up_provisioning, validate_transition_relationship,
@@ -109,6 +121,7 @@ pub fn configuration_command_to_proto(
         TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
         TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
         TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
+        TransitionKind::DataLossRecovery => proto::TransitionKind::DataLossRecovery,
     };
     let primary_write_status = match command.primary_write_status {
         AccessStatus::Granted => proto::AccessStatus::Granted,
@@ -169,11 +182,1138 @@ pub fn validate_agent_status_report(report: &proto::AgentStatusReport) -> Result
     normalize_agent_status_report(report.clone()).map(|_| ())
 }
 
+/// Normalizes the dormant protocol-11 report branch without making it a
+/// production report accepted by `normalize_agent_status_report`.
+pub fn normalize_public_v1_agent_status_report(
+    report: proto::AgentStatusReport,
+) -> Result<PublicV1AgentReport, WireError> {
+    if report.protocol_version
+        != crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+    {
+        return Err(WireError::UnsupportedProtocolVersion {
+            expected: crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            observed: report.protocol_version,
+        });
+    }
+    if legacy_status_fields_present(&report) {
+        return Err(WireError::InvalidAuthority(
+            "public-v1 status cannot carry legacy or native evidence".into(),
+        ));
+    }
+    let public = report
+        .public_v1
+        .ok_or(WireError::MissingField("agent_status.public_v1"))?;
+    if public.protocol_version
+        != crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+        || public.generation == 0
+    {
+        return Err(WireError::InvalidAuthority(
+            "public-v1 report identity is invalid".into(),
+        ));
+    }
+    let identity = public
+        .identity
+        .ok_or(WireError::MissingField("public_v1.identity"))?
+        .try_into()?;
+    let role = proto::ReplicaRole::try_from(public.role)
+        .map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.role",
+            value: public.role,
+        })
+        .and_then(role_from_proto)?;
+    let read_status = proto::AccessStatus::try_from(public.read_status)
+        .map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.read_status",
+            value: public.read_status,
+        })
+        .and_then(access_status_from_proto)?;
+    let write_status = proto::AccessStatus::try_from(public.write_status)
+        .map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.write_status",
+            value: public.write_status,
+        })
+        .and_then(access_status_from_proto)?;
+    let progress_role =
+        proto::PublicV1ProgressRole::try_from(public.progress_role).map_err(|_| {
+            WireError::InvalidEnum {
+                field: "public_v1.progress_role",
+                value: public.progress_role,
+            }
+        })?;
+    let progress_role = match progress_role {
+        proto::PublicV1ProgressRole::Primary => PublicProgressRole::Primary,
+        proto::PublicV1ProgressRole::Secondary => PublicProgressRole::Secondary,
+        proto::PublicV1ProgressRole::Recovery => PublicProgressRole::Recovery,
+        proto::PublicV1ProgressRole::Unknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.progress_role",
+                value: public.progress_role,
+            });
+        }
+    };
+    let completed_operations = public
+        .completed_operations
+        .into_iter()
+        .map(public_v1_completion_from_proto)
+        .collect::<Result<Vec<_>, _>>()?;
+    let extensions = PublicV1Extensions {
+        history_recovery: public
+            .history_recovery_extension_version
+            .map(extension_slot)
+            .transpose()?,
+        public_build_evidence: public
+            .public_build_evidence_extension_version
+            .map(extension_slot)
+            .transpose()?,
+    };
+    let history = public_v1_history_from_proto(
+        public
+            .history
+            .ok_or(WireError::MissingField("public_v1.history"))?,
+    )?;
+    let storage_incarnation = public_v1_storage_from_proto(
+        public
+            .storage_incarnation
+            .ok_or(WireError::MissingField("public_v1.storage_incarnation"))?,
+    )?;
+    let data_loss_recovery = public
+        .data_loss_recovery
+        .map(public_v1_recovery_from_proto)
+        .transpose()?;
+    let service_location = public
+        .service_location
+        .map(|location| {
+            Ok(ServiceLocation {
+                preview: PublicOperationPreviewIdentity {
+                    protocol_version: location.protocol_version,
+                    generation: location.generation,
+                },
+                resource_uid: ResourceUid::new(location.resource_uid),
+                operation_id: OperationId::new(location.operation_id),
+                replica: location
+                    .replica
+                    .ok_or(WireError::MissingField(
+                        "public_v1.service_location.replica",
+                    ))?
+                    .try_into()?,
+                process_session_id: ProcessSessionId::new(location.process_session_id),
+                epoch: location
+                    .epoch
+                    .ok_or(WireError::MissingField("public_v1.service_location.epoch"))?
+                    .into(),
+                revision: location.revision,
+                address: location.address,
+            })
+        })
+        .transpose()?;
+    let report = PublicV1AgentReport {
+        identity: PublicOperationPreviewIdentity {
+            protocol_version: public.protocol_version,
+            generation: public.generation,
+        },
+        resource_uid: ResourceUid::new(public.resource_uid),
+        replica: identity,
+        process_session_id: ProcessSessionId::new(public.process_session_id),
+        report_sequence: public.report_sequence,
+        role,
+        read_status,
+        write_status,
+        history,
+        storage_incarnation,
+        progress: PublicProgress {
+            role: progress_role,
+            first: public.first_progress,
+            last: public.last_progress,
+        },
+        service_location,
+        data_loss_recovery,
+        completed_operations,
+        extensions,
+    };
+    report
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(report)
+}
+
+/// Encodes only the structurally public protocol-11 branch. All legacy/native
+/// fields in the outer envelope remain at their protobuf defaults.
+pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::AgentStatusReport {
+    proto::AgentStatusReport {
+        protocol_version: crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+        public_v1: Some(proto::PublicV1AgentStatus {
+            protocol_version: report.identity.protocol_version,
+            generation: report.identity.generation,
+            resource_uid: report.resource_uid.as_str().to_string(),
+            identity: Some(report.replica.clone().into()),
+            process_session_id: report.process_session_id.as_str().to_string(),
+            report_sequence: report.report_sequence,
+            role: role_to_proto(report.role) as i32,
+            read_status: access_status_to_proto(report.read_status) as i32,
+            write_status: access_status_to_proto(report.write_status) as i32,
+            progress_role: match report.progress.role {
+                PublicProgressRole::Primary => proto::PublicV1ProgressRole::Primary as i32,
+                PublicProgressRole::Secondary => proto::PublicV1ProgressRole::Secondary as i32,
+                PublicProgressRole::Recovery => proto::PublicV1ProgressRole::Recovery as i32,
+            },
+            first_progress: report.progress.first,
+            last_progress: report.progress.last,
+            completed_operations: report
+                .completed_operations
+                .iter()
+                .map(public_v1_completion_to_proto)
+                .collect(),
+            history_recovery_extension_version: report
+                .extensions
+                .history_recovery
+                .as_ref()
+                .map(|slot| u32::from(slot.version)),
+            public_build_evidence_extension_version: report
+                .extensions
+                .public_build_evidence
+                .as_ref()
+                .map(|slot| u32::from(slot.version)),
+            history: Some(public_v1_history_to_proto(&report.history)),
+            storage_incarnation: Some(public_v1_storage_to_proto(&report.storage_incarnation)),
+            data_loss_recovery: report
+                .data_loss_recovery
+                .as_ref()
+                .map(public_v1_recovery_to_proto),
+            service_location: report.service_location.as_ref().map(|location| {
+                proto::PublicV1ServiceLocation {
+                    protocol_version: location.preview.protocol_version,
+                    generation: location.preview.generation,
+                    resource_uid: location.resource_uid.as_str().to_string(),
+                    operation_id: location.operation_id.as_str().to_string(),
+                    replica: Some(location.replica.clone().into()),
+                    process_session_id: location.process_session_id.as_str().to_string(),
+                    epoch: Some(location.epoch.into()),
+                    revision: location.revision,
+                    address: location.address.clone(),
+                }
+            }),
+        }),
+        ..Default::default()
+    }
+}
+
+fn extension_slot(version: u32) -> Result<PublicV1ExtensionSlot, WireError> {
+    Ok(PublicV1ExtensionSlot {
+        version: u16::try_from(version).map_err(|_| {
+            WireError::InvalidAuthority("public-v1 extension version exceeds u16".into())
+        })?,
+    })
+}
+
+fn public_v1_history_from_proto(
+    value: proto::PublicV1HistoryContext,
+) -> Result<HistoryContext, WireError> {
+    let history = HistoryContext {
+        resource_uid: ResourceUid::new(value.resource_uid),
+        protocol_generation: PublicProtocolGeneration::new(value.protocol_generation),
+        history_id: HistoryId::new(value.history_id),
+        data_loss_number: value.data_loss_number,
+    };
+    history
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(history)
+}
+
+fn public_v1_history_to_proto(value: &HistoryContext) -> proto::PublicV1HistoryContext {
+    proto::PublicV1HistoryContext {
+        resource_uid: value.resource_uid.as_str().to_string(),
+        protocol_generation: value.protocol_generation.value(),
+        history_id: value.history_id.as_str().to_string(),
+        data_loss_number: value.data_loss_number,
+    }
+}
+
+fn public_v1_storage_from_proto(
+    value: proto::PublicV1StorageIncarnation,
+) -> Result<ReplicaStorageIncarnationContext, WireError> {
+    let kind =
+        proto::PublicV1StorageKind::try_from(value.kind).map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.storage.kind",
+            value: value.kind,
+        })?;
+    let storage = match kind {
+        proto::PublicV1StorageKind::Persistent => {
+            if !value.volatile_identity.is_empty() {
+                return Err(WireError::InvalidAuthority(
+                    "persistent public-v1 storage carries volatile identity".into(),
+                ));
+            }
+            ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new(value.pod_uid),
+                pvc_uid: PvcUid::new(value.pvc_uid),
+            }
+        }
+        proto::PublicV1StorageKind::Volatile => {
+            if !value.pod_uid.is_empty() || !value.pvc_uid.is_empty() {
+                return Err(WireError::InvalidAuthority(
+                    "volatile public-v1 storage carries persistent identity".into(),
+                ));
+            }
+            ReplicaStorageIdentity::Volatile {
+                identity: value.volatile_identity,
+            }
+        }
+        proto::PublicV1StorageKind::Unknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.storage.kind",
+                value: value.kind,
+            });
+        }
+    };
+    let incarnation = ReplicaStorageIncarnationContext {
+        replica: value
+            .replica
+            .ok_or(WireError::MissingField("public_v1.storage.replica"))?
+            .try_into()?,
+        storage,
+        storage_generation: StorageGeneration::new(value.storage_generation),
+    };
+    incarnation
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(incarnation)
+}
+
+fn public_v1_storage_to_proto(
+    value: &ReplicaStorageIncarnationContext,
+) -> proto::PublicV1StorageIncarnation {
+    let (kind, pod_uid, pvc_uid, volatile_identity) = match &value.storage {
+        ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } => (
+            proto::PublicV1StorageKind::Persistent,
+            pod_uid.as_str().to_string(),
+            pvc_uid.as_str().to_string(),
+            String::new(),
+        ),
+        ReplicaStorageIdentity::Volatile { identity } => (
+            proto::PublicV1StorageKind::Volatile,
+            String::new(),
+            String::new(),
+            identity.clone(),
+        ),
+    };
+    proto::PublicV1StorageIncarnation {
+        replica: Some(value.replica.clone().into()),
+        kind: kind as i32,
+        pod_uid,
+        pvc_uid,
+        volatile_identity,
+        storage_generation: value.storage_generation.as_str().to_string(),
+    }
+}
+
+fn public_v1_attempt_from_proto(
+    value: proto::PublicV1DataLossAttempt,
+) -> Result<DataLossAttempt, WireError> {
+    let replay = replay_from_proto(value.data_loss_replay)?;
+    let PublicOperationReplayDisposition::DataLoss(data_loss_replay) = replay else {
+        return Err(WireError::InvalidAuthority(
+            "data-loss attempt carries a non-data-loss replay disposition".into(),
+        ));
+    };
+    Ok(DataLossAttempt {
+        authorization_id: OperationId::new(value.authorization_id),
+        attempt_id: OperationId::new(value.attempt_id),
+        process: ProcessAttemptContext {
+            process_session_id: ProcessSessionId::new(value.process_session_id),
+            replicator_creation_id: ReplicatorCreationId::new(value.replicator_creation_id),
+            catch_up_specific_quorum: value.catch_up_specific_quorum,
+            data_loss_replay,
+            epoch: value
+                .epoch
+                .ok_or(WireError::MissingField("public_v1.recovery.attempt.epoch"))?
+                .into(),
+            attempt_revision: value.attempt_revision,
+        },
+    })
+}
+
+fn public_v1_attempt_to_proto(value: &DataLossAttempt) -> proto::PublicV1DataLossAttempt {
+    proto::PublicV1DataLossAttempt {
+        authorization_id: value.authorization_id.as_str().to_string(),
+        attempt_id: value.attempt_id.as_str().to_string(),
+        process_session_id: value.process.process_session_id.as_str().to_string(),
+        replicator_creation_id: value.process.replicator_creation_id.as_str().to_string(),
+        catch_up_specific_quorum: value.process.catch_up_specific_quorum,
+        data_loss_replay: replay_to_proto(PublicOperationReplayDisposition::DataLoss(
+            value.process.data_loss_replay,
+        )) as i32,
+        epoch: Some(value.process.epoch.into()),
+        attempt_revision: value.process.attempt_revision,
+    }
+}
+
+fn public_v1_recovery_from_proto(
+    value: proto::PublicV1DataLossRecoveryStatus,
+) -> Result<PublicDataLossRecoveryStatus, WireError> {
+    let reset_kind = proto::PublicV1ProviderProgressResetKind::try_from(value.reset_scope_kind)
+        .map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.recovery.reset_scope_kind",
+            value: value.reset_scope_kind,
+        })?;
+    let reset_scope = match (reset_kind, value.retired_storage) {
+        (proto::PublicV1ProviderProgressResetKind::Preserve, None) => {
+            ProviderProgressReset::Preserve
+        }
+        (proto::PublicV1ProviderProgressResetKind::ResetToEmpty, None) => {
+            ProviderProgressReset::ResetToEmpty
+        }
+        (proto::PublicV1ProviderProgressResetKind::ReplaceIncarnation, Some(retired)) => {
+            ProviderProgressReset::ReplaceIncarnation {
+                retired: public_v1_storage_from_proto(retired)?,
+            }
+        }
+        (proto::PublicV1ProviderProgressResetKind::Unknown, _) => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.recovery.reset_scope_kind",
+                value: value.reset_scope_kind,
+            });
+        }
+        _ => {
+            return Err(WireError::InvalidAuthority(
+                "public-v1 recovery reset scope is noncanonical".into(),
+            ));
+        }
+    };
+    let replay = replay_from_proto(value.authorization_replay)?;
+    let PublicOperationReplayDisposition::DataLoss(replay_disposition) = replay else {
+        return Err(WireError::InvalidAuthority(
+            "public-v1 recovery authorization has a non-data-loss replay disposition".into(),
+        ));
+    };
+    let stage = proto::PublicV1DataLossRecoveryStage::try_from(value.stage).map_err(|_| {
+        WireError::InvalidEnum {
+            field: "public_v1.recovery.stage",
+            value: value.stage,
+        }
+    })?;
+    let stage = match stage {
+        proto::PublicV1DataLossRecoveryStage::Authorized => PublicDataLossRecoveryStage::Authorized,
+        proto::PublicV1DataLossRecoveryStage::Invalidated => {
+            PublicDataLossRecoveryStage::Invalidated
+        }
+        proto::PublicV1DataLossRecoveryStage::CallbackProcessing => {
+            PublicDataLossRecoveryStage::CallbackProcessing
+        }
+        proto::PublicV1DataLossRecoveryStage::HistoryPending => {
+            PublicDataLossRecoveryStage::HistoryPending
+        }
+        proto::PublicV1DataLossRecoveryStage::ConfigurationPending => {
+            PublicDataLossRecoveryStage::ConfigurationPending
+        }
+        proto::PublicV1DataLossRecoveryStage::Admitted => PublicDataLossRecoveryStage::Admitted,
+        proto::PublicV1DataLossRecoveryStage::Failed => PublicDataLossRecoveryStage::Failed,
+        proto::PublicV1DataLossRecoveryStage::ReplacementRequired => {
+            PublicDataLossRecoveryStage::ReplacementRequired
+        }
+        proto::PublicV1DataLossRecoveryStage::Retired => PublicDataLossRecoveryStage::Retired,
+        proto::PublicV1DataLossRecoveryStage::Unknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.recovery.stage",
+                value: value.stage,
+            });
+        }
+    };
+    let observed_progress = value
+        .observed_progress
+        .map(|progress| {
+            let role = proto::PublicV1ProgressRole::try_from(progress.role).map_err(|_| {
+                WireError::InvalidEnum {
+                    field: "public_v1.recovery.progress.role",
+                    value: progress.role,
+                }
+            })?;
+            let role = match role {
+                proto::PublicV1ProgressRole::Primary => PublicProgressRole::Primary,
+                proto::PublicV1ProgressRole::Secondary => PublicProgressRole::Secondary,
+                proto::PublicV1ProgressRole::Recovery => PublicProgressRole::Recovery,
+                proto::PublicV1ProgressRole::Unknown => {
+                    return Err(WireError::InvalidEnum {
+                        field: "public_v1.recovery.progress.role",
+                        value: progress.role,
+                    });
+                }
+            };
+            Ok(PublicProgress {
+                role,
+                first: progress.first,
+                last: progress.last,
+            })
+        })
+        .transpose()?;
+    Ok(PublicDataLossRecoveryStatus {
+        authorization_id: OperationId::new(value.authorization_id),
+        attempt: public_v1_attempt_from_proto(
+            value
+                .attempt
+                .ok_or(WireError::MissingField("public_v1.recovery.attempt"))?,
+        )?,
+        predecessor_history: public_v1_history_from_proto(value.predecessor_history.ok_or(
+            WireError::MissingField("public_v1.recovery.predecessor_history"),
+        )?)?,
+        proposed_history: public_v1_history_from_proto(value.proposed_history.ok_or(
+            WireError::MissingField("public_v1.recovery.proposed_history"),
+        )?)?,
+        provisional_primary: public_v1_storage_from_proto(value.provisional_primary.ok_or(
+            WireError::MissingField("public_v1.recovery.provisional_primary"),
+        )?)?,
+        reset_scope,
+        replay_disposition,
+        stage,
+        observed_progress,
+    })
+}
+
+fn public_v1_recovery_to_proto(
+    value: &PublicDataLossRecoveryStatus,
+) -> proto::PublicV1DataLossRecoveryStatus {
+    let (reset_scope_kind, retired_storage) = match &value.reset_scope {
+        ProviderProgressReset::Preserve => {
+            (proto::PublicV1ProviderProgressResetKind::Preserve, None)
+        }
+        ProviderProgressReset::ResetToEmpty => {
+            (proto::PublicV1ProviderProgressResetKind::ResetToEmpty, None)
+        }
+        ProviderProgressReset::ReplaceIncarnation { retired } => (
+            proto::PublicV1ProviderProgressResetKind::ReplaceIncarnation,
+            Some(public_v1_storage_to_proto(retired)),
+        ),
+    };
+    proto::PublicV1DataLossRecoveryStatus {
+        authorization_id: value.authorization_id.as_str().to_string(),
+        attempt: Some(public_v1_attempt_to_proto(&value.attempt)),
+        predecessor_history: Some(public_v1_history_to_proto(&value.predecessor_history)),
+        proposed_history: Some(public_v1_history_to_proto(&value.proposed_history)),
+        provisional_primary: Some(public_v1_storage_to_proto(&value.provisional_primary)),
+        reset_scope_kind: reset_scope_kind as i32,
+        retired_storage,
+        authorization_replay: replay_to_proto(PublicOperationReplayDisposition::DataLoss(
+            value.replay_disposition,
+        )) as i32,
+        stage: match value.stage {
+            PublicDataLossRecoveryStage::Authorized => {
+                proto::PublicV1DataLossRecoveryStage::Authorized
+            }
+            PublicDataLossRecoveryStage::Invalidated => {
+                proto::PublicV1DataLossRecoveryStage::Invalidated
+            }
+            PublicDataLossRecoveryStage::CallbackProcessing => {
+                proto::PublicV1DataLossRecoveryStage::CallbackProcessing
+            }
+            PublicDataLossRecoveryStage::HistoryPending => {
+                proto::PublicV1DataLossRecoveryStage::HistoryPending
+            }
+            PublicDataLossRecoveryStage::ConfigurationPending => {
+                proto::PublicV1DataLossRecoveryStage::ConfigurationPending
+            }
+            PublicDataLossRecoveryStage::Admitted => proto::PublicV1DataLossRecoveryStage::Admitted,
+            PublicDataLossRecoveryStage::Failed => proto::PublicV1DataLossRecoveryStage::Failed,
+            PublicDataLossRecoveryStage::ReplacementRequired => {
+                proto::PublicV1DataLossRecoveryStage::ReplacementRequired
+            }
+            PublicDataLossRecoveryStage::Retired => proto::PublicV1DataLossRecoveryStage::Retired,
+        } as i32,
+        observed_progress: value.observed_progress.as_ref().map(|progress| {
+            proto::PublicV1RecoveryProgress {
+                role: match progress.role {
+                    PublicProgressRole::Primary => proto::PublicV1ProgressRole::Primary,
+                    PublicProgressRole::Secondary => proto::PublicV1ProgressRole::Secondary,
+                    PublicProgressRole::Recovery => proto::PublicV1ProgressRole::Recovery,
+                } as i32,
+                first: progress.first,
+                last: progress.last,
+            }
+        }),
+    }
+}
+
+fn legacy_status_fields_present(report: &proto::AgentStatusReport) -> bool {
+    !report.resource_uid.is_empty()
+        || report.identity.is_some()
+        || !report.process_session_id.is_empty()
+        || report.report_sequence != 0
+        || report.role != proto::ReplicaRole::Unknown as i32
+        || report.write_status != proto::AccessStatus::Unknown as i32
+        || report.epoch.is_some()
+        || report.previous_configuration.is_some()
+        || report.current_configuration.is_some()
+        || report.current_progress != 0
+        || report.committed_lsn != 0
+        || report.catch_up_capability.is_some()
+        || report.storage_state != proto::AgentStorageState::Unknown as i32
+        || !report.pod_uid.is_empty()
+        || !report.pvc_uid.is_empty()
+        || !report.storage_error.is_empty()
+        || report.healthy
+        || report.replica_id != 0
+        || report.read_status != proto::AccessStatus::Unknown as i32
+        || report.current_configuration_quorum_progress != 0
+        || report.catch_up_boundary.is_some()
+        || report.catch_up_complete
+        || report.deactivated_lsn.is_some()
+        || !report.load_metrics.is_empty()
+        || report.reported_fault != proto::FaultType::Unknown as i32
+        || !report.pending_operation_id.is_empty()
+        || !report.retained_operation_id.is_empty()
+        || !report.builds.is_empty()
+        || report.deactivation_epoch.is_some()
+        || report.verified_replication_lsn.is_some()
+        || report.prepared_switchover.is_some()
+        || report.prepared_secondary_removal.is_some()
+        || report.secondary_removal_evidence.is_some()
+        || report.retired_replica.is_some()
+        || report.accepted_secondary_removal.is_some()
+        || report.scale_up_intent.is_some()
+        || report.pending_configuration.is_some()
+        || !report.replication_address.is_empty()
+}
+
+fn replay_from_proto(value: i32) -> Result<PublicOperationReplayDisposition, WireError> {
+    let value =
+        proto::PublicV1ReplayDisposition::try_from(value).map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.completion.replay_disposition",
+            value,
+        })?;
+    Ok(match value {
+        proto::PublicV1ReplayDisposition::Convergent => {
+            PublicOperationReplayDisposition::Convergent
+        }
+        proto::PublicV1ReplayDisposition::RepeatableRead => {
+            PublicOperationReplayDisposition::RepeatableRead
+        }
+        proto::PublicV1ReplayDisposition::ReevaluateCatchUp => {
+            PublicOperationReplayDisposition::ReevaluateCatchUp
+        }
+        proto::PublicV1ReplayDisposition::RetainBuildSuccessRetireAmbiguity => {
+            PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
+        }
+        proto::PublicV1ReplayDisposition::DataLossConvergent => {
+            PublicOperationReplayDisposition::DataLoss(DataLossReplay::Convergent)
+        }
+        proto::PublicV1ReplayDisposition::DataLossReplaceOnAmbiguity => {
+            PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity)
+        }
+        proto::PublicV1ReplayDisposition::ExactRemoval => {
+            PublicOperationReplayDisposition::ExactRemoval
+        }
+        proto::PublicV1ReplayDisposition::Containment => {
+            PublicOperationReplayDisposition::Containment
+        }
+        proto::PublicV1ReplayDisposition::Unknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.completion.replay_disposition",
+                value: value as i32,
+            });
+        }
+    })
+}
+
+fn replay_to_proto(
+    disposition: PublicOperationReplayDisposition,
+) -> proto::PublicV1ReplayDisposition {
+    match disposition {
+        PublicOperationReplayDisposition::Convergent => {
+            proto::PublicV1ReplayDisposition::Convergent
+        }
+        PublicOperationReplayDisposition::RepeatableRead => {
+            proto::PublicV1ReplayDisposition::RepeatableRead
+        }
+        PublicOperationReplayDisposition::ReevaluateCatchUp => {
+            proto::PublicV1ReplayDisposition::ReevaluateCatchUp
+        }
+        PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity => {
+            proto::PublicV1ReplayDisposition::RetainBuildSuccessRetireAmbiguity
+        }
+        PublicOperationReplayDisposition::DataLoss(DataLossReplay::Convergent) => {
+            proto::PublicV1ReplayDisposition::DataLossConvergent
+        }
+        PublicOperationReplayDisposition::DataLoss(DataLossReplay::ReplaceOnAmbiguity) => {
+            proto::PublicV1ReplayDisposition::DataLossReplaceOnAmbiguity
+        }
+        PublicOperationReplayDisposition::ExactRemoval => {
+            proto::PublicV1ReplayDisposition::ExactRemoval
+        }
+        PublicOperationReplayDisposition::Containment => {
+            proto::PublicV1ReplayDisposition::Containment
+        }
+    }
+}
+
+fn rebuild_reason_from_proto(value: i32) -> Result<ReplicaRebuildReason, WireError> {
+    let value =
+        proto::PublicV1RebuildReason::try_from(value).map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.rebuild.reason",
+            value,
+        })?;
+    Ok(match value {
+        proto::PublicV1RebuildReason::IncompatibleRetainedHistory => {
+            ReplicaRebuildReason::IncompatibleRetainedHistory
+        }
+        proto::PublicV1RebuildReason::ProviderMismatch => ReplicaRebuildReason::ProviderMismatch,
+        proto::PublicV1RebuildReason::RemoteCopyConflict => {
+            ReplicaRebuildReason::RemoteCopyConflict
+        }
+        proto::PublicV1RebuildReason::Unknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.rebuild.reason",
+                value: value as i32,
+            });
+        }
+    })
+}
+
+fn rebuild_reason_to_proto(reason: ReplicaRebuildReason) -> proto::PublicV1RebuildReason {
+    match reason {
+        ReplicaRebuildReason::IncompatibleRetainedHistory => {
+            proto::PublicV1RebuildReason::IncompatibleRetainedHistory
+        }
+        ReplicaRebuildReason::ProviderMismatch => proto::PublicV1RebuildReason::ProviderMismatch,
+        ReplicaRebuildReason::RemoteCopyConflict => {
+            proto::PublicV1RebuildReason::RemoteCopyConflict
+        }
+    }
+}
+
+fn captured_operation_from_proto(
+    value: proto::PublicV1CapturedOperationIdentity,
+) -> Result<CapturedPublicOperationIdentity, WireError> {
+    let epoch = value
+        .epoch
+        .ok_or(WireError::MissingField("public_v1.rebuild.operation.epoch"))?
+        .into();
+    let identity = CapturedPublicOperationIdentity {
+        resource_uid: ResourceUid::new(value.resource_uid),
+        preview: PublicOperationPreviewIdentity {
+            protocol_version: value.protocol_version,
+            generation: value.generation,
+        },
+        epoch,
+        operation_id: OperationId::new(value.operation_id),
+        revision: value.revision,
+        detecting_session: ProcessSessionId::new(value.detecting_session),
+    };
+    identity
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(identity)
+}
+
+fn captured_operation_to_proto(
+    value: &CapturedPublicOperationIdentity,
+) -> proto::PublicV1CapturedOperationIdentity {
+    proto::PublicV1CapturedOperationIdentity {
+        resource_uid: value.resource_uid.as_str().to_string(),
+        protocol_version: value.preview.protocol_version,
+        generation: value.preview.generation,
+        epoch: Some(value.epoch.into()),
+        operation_id: value.operation_id.as_str().to_string(),
+        revision: value.revision,
+        detecting_session: value.detecting_session.as_str().to_string(),
+    }
+}
+
+fn build_attempt_from_proto(
+    value: proto::PublicV1BuildAttemptReference,
+) -> Result<PublicBuildAttemptReference, WireError> {
+    let authorization = PublicBuildAttemptReference {
+        resource_uid: ResourceUid::new(value.resource_uid),
+        epoch: value
+            .epoch
+            .ok_or(WireError::MissingField(
+                "public_v1.rebuild.authorization.epoch",
+            ))?
+            .into(),
+        build_id: OperationId::new(value.build_id),
+        source: value
+            .source
+            .ok_or(WireError::MissingField(
+                "public_v1.rebuild.authorization.source",
+            ))?
+            .try_into()?,
+        source_storage: public_v1_storage_from_proto(value.source_storage.ok_or(
+            WireError::MissingField("public_v1.rebuild.authorization.source_storage"),
+        )?)?,
+        source_session: ProcessSessionId::new(value.source_session),
+        target: value
+            .target
+            .ok_or(WireError::MissingField(
+                "public_v1.rebuild.authorization.target",
+            ))?
+            .try_into()?,
+        target_storage: public_v1_storage_from_proto(value.target_storage.ok_or(
+            WireError::MissingField("public_v1.rebuild.authorization.target_storage"),
+        )?)?,
+        target_session: ProcessSessionId::new(value.target_session),
+    };
+    authorization
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(authorization)
+}
+
+fn build_attempt_to_proto(
+    value: &PublicBuildAttemptReference,
+) -> proto::PublicV1BuildAttemptReference {
+    proto::PublicV1BuildAttemptReference {
+        resource_uid: value.resource_uid.as_str().to_string(),
+        epoch: Some(value.epoch.into()),
+        build_id: value.build_id.as_str().to_string(),
+        source: Some(value.source.clone().into()),
+        source_storage: Some(public_v1_storage_to_proto(&value.source_storage)),
+        source_session: value.source_session.as_str().to_string(),
+        target: Some(value.target.clone().into()),
+        target_storage: Some(public_v1_storage_to_proto(&value.target_storage)),
+        target_session: value.target_session.as_str().to_string(),
+    }
+}
+
+fn rebuild_from_proto(
+    value: proto::PublicV1ReplicaRebuildRequired,
+) -> Result<CanonicalReplicaRebuildRequired, WireError> {
+    let kind =
+        proto::PublicV1RebuildKind::try_from(value.kind).map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.rebuild.kind",
+            value: value.kind,
+        })?;
+    let reason = rebuild_reason_from_proto(value.reason)?;
+    let operation = captured_operation_from_proto(
+        value
+            .operation
+            .ok_or(WireError::MissingField("public_v1.rebuild.operation"))?,
+    )?;
+    let rebuild = match kind {
+        proto::PublicV1RebuildKind::LocalProvider => {
+            if value.build.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "local rebuild failure contains remote authorization".into(),
+                ));
+            }
+            CanonicalReplicaRebuildRequired::LocalProvider {
+                reason,
+                provider: ProviderReplicaIdentity {
+                    replica: value
+                        .provider_replica
+                        .ok_or(WireError::MissingField(
+                            "public_v1.rebuild.provider_replica",
+                        ))?
+                        .try_into()?,
+                },
+                operation,
+                local_replica: value
+                    .local_replica
+                    .ok_or(WireError::MissingField("public_v1.rebuild.local_replica"))?
+                    .try_into()?,
+                local_storage: PvcUid::new(value.local_storage),
+            }
+        }
+        proto::PublicV1RebuildKind::RemoteBuildTarget => {
+            if value.provider_replica.is_some()
+                || value.local_replica.is_some()
+                || !value.local_storage.is_empty()
+            {
+                return Err(WireError::InvalidAuthority(
+                    "remote rebuild failure contains local-provider identity".into(),
+                ));
+            }
+            CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+                reason,
+                operation,
+                build: Box::new(build_attempt_from_proto(
+                    value
+                        .build
+                        .ok_or(WireError::MissingField("public_v1.rebuild.build"))?,
+                )?),
+            }
+        }
+        proto::PublicV1RebuildKind::Unknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.rebuild.kind",
+                value: value.kind,
+            });
+        }
+    };
+    rebuild
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(rebuild)
+}
+
+fn rebuild_to_proto(
+    value: &CanonicalReplicaRebuildRequired,
+) -> proto::PublicV1ReplicaRebuildRequired {
+    match value {
+        CanonicalReplicaRebuildRequired::LocalProvider {
+            reason,
+            provider,
+            operation,
+            local_replica,
+            local_storage,
+        } => proto::PublicV1ReplicaRebuildRequired {
+            kind: proto::PublicV1RebuildKind::LocalProvider as i32,
+            reason: rebuild_reason_to_proto(*reason) as i32,
+            operation: Some(captured_operation_to_proto(operation)),
+            provider_replica: Some(provider.replica.clone().into()),
+            local_replica: Some(local_replica.clone().into()),
+            local_storage: local_storage.as_str().to_string(),
+            build: None,
+        },
+        CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+            reason,
+            operation,
+            build,
+        } => proto::PublicV1ReplicaRebuildRequired {
+            kind: proto::PublicV1RebuildKind::RemoteBuildTarget as i32,
+            reason: rebuild_reason_to_proto(*reason) as i32,
+            operation: Some(captured_operation_to_proto(operation)),
+            provider_replica: None,
+            local_replica: None,
+            local_storage: String::new(),
+            build: Some(build_attempt_to_proto(build)),
+        },
+    }
+}
+
+fn public_v1_call_kind_from_proto(value: i32) -> Result<PublicV1CallKind, WireError> {
+    Ok(
+        match proto::PublicV1CallKind::try_from(value).map_err(|_| WireError::InvalidEnum {
+            field: "public_v1.completion.call_kind",
+            value,
+        })? {
+            proto::PublicV1CallKind::InitialPrimary => PublicV1CallKind::InitialPrimary,
+            proto::PublicV1CallKind::FailoverPromotion => PublicV1CallKind::FailoverPromotion,
+            proto::PublicV1CallKind::SecondaryEpochAdvance => {
+                PublicV1CallKind::SecondaryEpochAdvance
+            }
+            proto::PublicV1CallKind::Open => PublicV1CallKind::Open,
+            proto::PublicV1CallKind::Role => PublicV1CallKind::Role,
+            proto::PublicV1CallKind::Epoch => PublicV1CallKind::Epoch,
+            proto::PublicV1CallKind::Configuration => PublicV1CallKind::Configuration,
+            proto::PublicV1CallKind::CatchUp => PublicV1CallKind::CatchUp,
+            proto::PublicV1CallKind::Progress => PublicV1CallKind::Progress,
+            proto::PublicV1CallKind::Swap => PublicV1CallKind::Swap,
+            proto::PublicV1CallKind::Build => PublicV1CallKind::Build,
+            proto::PublicV1CallKind::Remove => PublicV1CallKind::Remove,
+            proto::PublicV1CallKind::Close => PublicV1CallKind::Close,
+            proto::PublicV1CallKind::Abort => PublicV1CallKind::Abort,
+            proto::PublicV1CallKind::Unknown => {
+                return Err(WireError::InvalidEnum {
+                    field: "public_v1.completion.call_kind",
+                    value,
+                });
+            }
+        },
+    )
+}
+
+fn public_v1_call_kind_to_proto(value: PublicV1CallKind) -> proto::PublicV1CallKind {
+    match value {
+        PublicV1CallKind::InitialPrimary => proto::PublicV1CallKind::InitialPrimary,
+        PublicV1CallKind::FailoverPromotion => proto::PublicV1CallKind::FailoverPromotion,
+        PublicV1CallKind::SecondaryEpochAdvance => proto::PublicV1CallKind::SecondaryEpochAdvance,
+        PublicV1CallKind::Open => proto::PublicV1CallKind::Open,
+        PublicV1CallKind::Role => proto::PublicV1CallKind::Role,
+        PublicV1CallKind::Epoch => proto::PublicV1CallKind::Epoch,
+        PublicV1CallKind::Configuration => proto::PublicV1CallKind::Configuration,
+        PublicV1CallKind::CatchUp => proto::PublicV1CallKind::CatchUp,
+        PublicV1CallKind::Progress => proto::PublicV1CallKind::Progress,
+        PublicV1CallKind::Swap => proto::PublicV1CallKind::Swap,
+        PublicV1CallKind::Build => proto::PublicV1CallKind::Build,
+        PublicV1CallKind::Remove => proto::PublicV1CallKind::Remove,
+        PublicV1CallKind::Close => proto::PublicV1CallKind::Close,
+        PublicV1CallKind::Abort => proto::PublicV1CallKind::Abort,
+    }
+}
+
+fn public_v1_catch_up_mode_from_proto(value: i32) -> Result<PublicCatchUpMode, WireError> {
+    match proto::PublicV1CatchUpMode::try_from(value).map_err(|_| WireError::InvalidEnum {
+        field: "public_v1.completion.catch_up_mode",
+        value,
+    })? {
+        proto::PublicV1CatchUpMode::WriteQuorum => Ok(PublicCatchUpMode::WriteQuorum),
+        proto::PublicV1CatchUpMode::All => Ok(PublicCatchUpMode::All),
+        proto::PublicV1CatchUpMode::Unknown => Err(WireError::InvalidEnum {
+            field: "public_v1.completion.catch_up_mode",
+            value,
+        }),
+    }
+}
+
+fn public_v1_catch_up_mode_to_proto(value: PublicCatchUpMode) -> proto::PublicV1CatchUpMode {
+    match value {
+        PublicCatchUpMode::WriteQuorum => proto::PublicV1CatchUpMode::WriteQuorum,
+        PublicCatchUpMode::All => proto::PublicV1CatchUpMode::All,
+    }
+}
+
+fn public_v1_completion_from_proto(
+    value: proto::PublicV1OperationCompletion,
+) -> Result<PublicV1OperationCompletion, WireError> {
+    if value.input_digest_version != 1 {
+        return Err(WireError::InvalidAuthority(
+            "unsupported public-v1 operation-input digest version".into(),
+        ));
+    }
+    let result_kind = proto::PublicV1OperationResultKind::try_from(value.result).map_err(|_| {
+        WireError::InvalidEnum {
+            field: "public_v1.completion.result",
+            value: value.result,
+        }
+    })?;
+    let result = match result_kind {
+        proto::PublicV1OperationResultKind::PublicV1OperationResultSucceeded => {
+            if !value.detail.is_empty() || value.rebuild_required.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "successful public-v1 completion contains failure detail".into(),
+                ));
+            }
+            PublicV1OperationResult::Succeeded
+        }
+        proto::PublicV1OperationResultKind::PublicV1OperationResultFailed => {
+            if value.detail.is_empty() || value.rebuild_required.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "failed public-v1 completion has a noncanonical payload".into(),
+                ));
+            }
+            PublicV1OperationResult::Failed(value.detail)
+        }
+        proto::PublicV1OperationResultKind::PublicV1OperationResultAmbiguous => {
+            if value.detail.is_empty() || value.rebuild_required.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "ambiguous public-v1 completion has a noncanonical payload".into(),
+                ));
+            }
+            PublicV1OperationResult::Ambiguous(value.detail)
+        }
+        proto::PublicV1OperationResultKind::PublicV1OperationResultCancelled => {
+            if !value.detail.is_empty() || value.rebuild_required.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "cancelled public-v1 completion contains failure detail".into(),
+                ));
+            }
+            PublicV1OperationResult::Cancelled
+        }
+        proto::PublicV1OperationResultKind::PublicV1OperationResultRebuildRequired => {
+            if !value.detail.is_empty() {
+                return Err(WireError::InvalidAuthority(
+                    "typed rebuild completion also contains text detail".into(),
+                ));
+            }
+            PublicV1OperationResult::RebuildRequired(Box::new(rebuild_from_proto(
+                value.rebuild_required.ok_or(WireError::MissingField(
+                    "public_v1.completion.rebuild_required",
+                ))?,
+            )?))
+        }
+        proto::PublicV1OperationResultKind::PublicV1OperationResultUnknown => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.completion.result",
+                value: value.result,
+            });
+        }
+    };
+    Ok(PublicV1OperationCompletion {
+        operation_id: OperationId::new(value.operation_id),
+        revision: value.revision,
+        call_kind: public_v1_call_kind_from_proto(value.call_kind)?,
+        process_session_id: ProcessSessionId::new(value.process_session_id),
+        input_digest: CanonicalOperationInputDigest::V1(CanonicalOperationInputDigestV1 {
+            sha256: value.input_digest_sha256,
+        }),
+        replay_disposition: replay_from_proto(value.replay_disposition)?,
+        history: public_v1_history_from_proto(
+            value
+                .history
+                .ok_or(WireError::MissingField("public_v1.completion.history"))?,
+        )?,
+        storage_incarnation: public_v1_storage_from_proto(value.storage_incarnation.ok_or(
+            WireError::MissingField("public_v1.completion.storage_incarnation"),
+        )?)?,
+        previous_configuration_id: (!value.previous_configuration_id.is_empty())
+            .then(|| ConfigurationId::new(value.previous_configuration_id)),
+        current_configuration_id: (!value.current_configuration_id.is_empty())
+            .then(|| ConfigurationId::new(value.current_configuration_id)),
+        catch_up_mode: value
+            .catch_up_mode
+            .map(public_v1_catch_up_mode_from_proto)
+            .transpose()?,
+        catch_up_specific_quorum: value.catch_up_specific_quorum,
+        result,
+    })
+}
+
+fn public_v1_completion_to_proto(
+    value: &PublicV1OperationCompletion,
+) -> proto::PublicV1OperationCompletion {
+    let (result, detail, rebuild_required) = match &value.result {
+        PublicV1OperationResult::Succeeded => (
+            proto::PublicV1OperationResultKind::PublicV1OperationResultSucceeded,
+            String::new(),
+            None,
+        ),
+        PublicV1OperationResult::Failed(detail) => (
+            proto::PublicV1OperationResultKind::PublicV1OperationResultFailed,
+            detail.clone(),
+            None,
+        ),
+        PublicV1OperationResult::Ambiguous(detail) => (
+            proto::PublicV1OperationResultKind::PublicV1OperationResultAmbiguous,
+            detail.clone(),
+            None,
+        ),
+        PublicV1OperationResult::Cancelled => (
+            proto::PublicV1OperationResultKind::PublicV1OperationResultCancelled,
+            String::new(),
+            None,
+        ),
+        PublicV1OperationResult::RebuildRequired(rebuild) => (
+            proto::PublicV1OperationResultKind::PublicV1OperationResultRebuildRequired,
+            String::new(),
+            Some(rebuild_to_proto(rebuild)),
+        ),
+    };
+    proto::PublicV1OperationCompletion {
+        operation_id: value.operation_id.as_str().to_string(),
+        revision: value.revision,
+        call_kind: public_v1_call_kind_to_proto(value.call_kind) as i32,
+        process_session_id: value.process_session_id.to_string(),
+        input_digest_version: u32::from(value.input_digest.version()),
+        input_digest_sha256: value.input_digest.sha256().to_string(),
+        replay_disposition: replay_to_proto(value.replay_disposition) as i32,
+        history: Some(public_v1_history_to_proto(&value.history)),
+        storage_incarnation: Some(public_v1_storage_to_proto(&value.storage_incarnation)),
+        previous_configuration_id: value
+            .previous_configuration_id
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string),
+        current_configuration_id: value
+            .current_configuration_id
+            .as_ref()
+            .map_or_else(String::new, ToString::to_string),
+        catch_up_mode: value
+            .catch_up_mode
+            .map(|mode| public_v1_catch_up_mode_to_proto(mode) as i32),
+        catch_up_specific_quorum: value.catch_up_specific_quorum,
+        result: result as i32,
+        detail,
+        rebuild_required,
+    }
+}
+
 /// Converts a fully validated wire report into canonical observation evidence.
 pub fn normalize_agent_status_report(
     report: proto::AgentStatusReport,
 ) -> Result<AgentObservation, WireError> {
     ensure_supported_version(report.protocol_version)?;
+    if report.public_v1.is_some() {
+        return Err(WireError::InvalidAuthority(
+            "legacy status cannot carry a public-v1 report branch".into(),
+        ));
+    }
     if report.resource_uid.is_empty() {
         return Err(WireError::MissingField("agent_status.resource_uid"));
     }
@@ -510,6 +1650,10 @@ pub fn normalize_agent_status_report(
 /// Validates command fencing, policy, and PC/CC relationships.
 pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Result<(), WireError> {
     ensure_supported_version(request.protocol_version)?;
+    let command = request
+        .command
+        .as_ref()
+        .ok_or(WireError::MissingField("execute.command"))?;
     if request.resource_uid.is_empty() {
         return Err(WireError::MissingField("execute.resource_uid"));
     }
@@ -519,10 +1663,6 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
         ));
     }
 
-    let command = request
-        .command
-        .as_ref()
-        .ok_or(WireError::MissingField("execute.command"))?;
     match command {
         proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(command) => {
             let command: crate::protocol::command::AcceptSecondaryRemovalCommit =
@@ -1855,6 +2995,7 @@ fn transition_kind_from_proto(kind: proto::TransitionKind) -> Result<TransitionK
         proto::TransitionKind::PlannedSwitchover => Ok(TransitionKind::PlannedSwitchover),
         proto::TransitionKind::SecondaryScaleDown => Ok(TransitionKind::SecondaryScaleDown),
         proto::TransitionKind::ScaleUp => Ok(TransitionKind::ScaleUp),
+        proto::TransitionKind::DataLossRecovery => Ok(TransitionKind::DataLossRecovery),
     }
 }
 

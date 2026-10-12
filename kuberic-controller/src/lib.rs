@@ -24,6 +24,8 @@ pub mod executor;
 pub mod normalize;
 pub mod observation;
 pub mod plan;
+#[cfg(feature = "runtime-test-bridge")]
+mod public_v1_reconciliation;
 pub mod reconciler;
 
 pub use error::{ControllerError, Result};

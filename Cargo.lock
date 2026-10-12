@@ -1348,6 +1348,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "tempfile",
  "thiserror",
  "tokio",
  "tonic",
@@ -1393,6 +1394,7 @@ name = "kuberic-runtime"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "futures",
  "k8s-openapi",

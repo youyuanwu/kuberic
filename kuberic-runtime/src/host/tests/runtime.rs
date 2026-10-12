@@ -54,8 +54,9 @@ use crate::replicator::stream::{OperationMetadata, OperationStream};
 use crate::replicator::{
     DefaultReplicatorFactory, ManagedReplicatorDataPlane, ManagedReplicatorLifecycle,
     PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator,
-    ReplicatorCreationReservation, ReplicatorFactory, ReplicatorFactoryContext,
-    ReplicatorInterfaces, ReplicatorSettings, StateReplicator, StatefulServicePartition,
+    ReplicatorCapabilities, ReplicatorCreationReservation, ReplicatorFactory,
+    ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorSettings, StateReplicator,
+    StatefulServicePartition,
 };
 use crate::runtime::{
     PendingReplication as RuntimePendingReplication, PendingWrite as RuntimePendingWrite,
@@ -6414,7 +6415,11 @@ impl ReplicatorFactory for CustomRoleService {
         _: Option<Arc<dyn StateProvider>>,
         _: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        Ok(ReplicatorInterfaces::primary(self.0.clone(), None))
+        Ok(ReplicatorInterfaces::primary(
+            self.0.clone(),
+            None,
+            ReplicatorCapabilities::conservative(),
+        ))
     }
 }
 
@@ -8176,6 +8181,7 @@ impl ReplicatorFactory for StateCapableCustomService {
         Ok(ReplicatorInterfaces::primary(
             self.replicator.clone(),
             Some(self.replicator.clone()),
+            ReplicatorCapabilities::conservative(),
         ))
     }
 }
@@ -10066,6 +10072,7 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     let primary_app = Arc::new(TestApplication::default());
     *primary_app.settings.lock().unwrap() = Some(ReplicatorSettings {
         replication_address: "replication://primary".into(),
+        public_v1: false,
     });
     let source = open_primary(primary_app.clone(), members.clone()).await;
     assert_eq!(
@@ -10101,6 +10108,7 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     state
         .update_replicator_settings(ReplicatorSettings {
             replication_address: "replication://updated".into(),
+            public_v1: false,
         })
         .await
         .unwrap();
@@ -13027,6 +13035,7 @@ async fn replicator_creation_failure_matrix_releases_all_state() {
         reservation.identity(RuntimeHostToken::new()),
         capability.clone(),
         None,
+        ReplicatorCapabilities::conservative(),
         capability.clone(),
     );
     let attachment = interfaces
@@ -13060,6 +13069,7 @@ async fn replicator_creation_failure_matrix_releases_all_state() {
         source_reservation.identity(RuntimeHostToken::new()),
         mismatched.clone(),
         None,
+        ReplicatorCapabilities::conservative(),
         mismatched.clone(),
     );
     assert!(
@@ -13083,9 +13093,14 @@ fn reconstructing_a_managed_bundle_abandons_its_original_creation() {
         reservation.identity(RuntimeHostToken::new()),
         capability.clone(),
         None,
+        ReplicatorCapabilities::conservative(),
         capability.clone(),
     );
-    let replacement = ReplicatorInterfaces::primary(capability.clone(), None);
+    let replacement = ReplicatorInterfaces::primary(
+        capability.clone(),
+        None,
+        ReplicatorCapabilities::conservative(),
+    );
 
     drop(original);
     assert_eq!(capability.aborts.load(Ordering::SeqCst), 3);
@@ -13115,6 +13130,7 @@ async fn cancelled_interface_attachment_aborts_all_managed_capabilities() {
         reservation.identity(RuntimeHostToken::new()),
         capability.clone(),
         None,
+        ReplicatorCapabilities::conservative(),
         capability.clone(),
     );
     let attachment = interfaces
@@ -13165,6 +13181,7 @@ async fn stale_attachment_cannot_consume_a_retry_reservation() {
         reservation.identity(RuntimeHostToken::new()),
         capability.clone(),
         None,
+        ReplicatorCapabilities::conservative(),
         capability.clone(),
     );
     let attachment = interfaces
@@ -13198,6 +13215,7 @@ async fn stale_attachment_cannot_consume_a_retry_reservation() {
         retry.identity(RuntimeHostToken::new()),
         replacement.clone(),
         None,
+        ReplicatorCapabilities::conservative(),
         replacement,
     );
     let replacement_attachment = replacement_interfaces
@@ -14466,6 +14484,7 @@ impl ReplicatorFactory for ExternalFactory {
         Ok(ReplicatorInterfaces::secondary(
             replicator.clone(),
             Some(replicator),
+            ReplicatorCapabilities::conservative(),
         ))
     }
 }

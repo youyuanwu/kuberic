@@ -730,8 +730,9 @@ error and ambiguous execution. An in-flight marker is committed before
 successful history repair. Every outcome stays access-closed. A rejected newer
 authority request may cancel/drain the old root but does not acquire authority
 or remove the barrier. Close, Abort and faults retain it as retired historical
-evidence. Phase 5 still owns authorized history reconciliation/admission;
-neither boolean changes progress, configurations, builds or serving permission.
+evidence. The dormant Phase 5 Public V1 path now owns authorized history
+reconciliation/admission; neither boolean changes progress, configurations,
+builds or serving permission.
 
 Exact optional application addresses are retained in role outcomes, including
 `None` and the empty string. `PublicLifecycleReport.service_location` contains
@@ -778,8 +779,8 @@ Close, and Abort. Planned swap follows:
 Interrupted waits reinstall the corresponding frozen configuration before
 reevaluation. Tests deliberately seed a different installed configuration and
 cut before/after the first install, proving stale topology cannot satisfy the
-first wait. The mode is retained as caller input only; Phase 5 still owns the
-capability-dependent value policy.
+first wait. The mode is retained as caller input only; the dormant Phase 5
+Public V1 contract owns the capability-dependent value policy.
 
 Build admission retains one exact attempt per target. Removal names that exact
 attempt, cancels and joins its build callback and provider descendant, then
@@ -835,8 +836,8 @@ successor launch is serialized and recovered rather than replaced on
 redelivery. An action-specific durable launch nonce plus owner PID/start-time
 precedes child construction. Quarantine clears predecessor role, PC/CC
 configuration, access and peer/build authority; the fresh application and
-Replicator session remains unassigned and access-closed because Phase 5 owns
-renewal. The accepted, contained and successor-started crash cuts converge to
+Replicator session remains unassigned and access-closed until the dormant
+Phase 5 renewal path applies. The accepted, contained and successor-started crash cuts converge to
 one successor session, and unproven descendant containment prevents re-exec.
 The runtime supervisor, rather than the controller, constructs the quarantined
 successor report consumed by the next reconciliation.
@@ -1107,6 +1108,11 @@ authoritative.
 **Required conformance property:** Select one endpoint owner before binding;
 the public Replicator lifecycle must control its replication transport.
 
+Phase 5 now proves this property in the dormant strict custom fixture: its
+Replicator-owned endpoint exists only after `open` and is released by `close`
+or `abort`. PostgreSQL and the production agent still use externally owned
+listeners, so they remain inapplicable/negative Phase 7 evidence.
+
 ### KSF-11: Application Role-Change Addresses Are Discarded
 
 **Severity:** Medium
@@ -1124,6 +1130,12 @@ the return value is observationally dead.
 
 **Required conformance property:** Retain, clear and publish the returned
 address as part of exact role completion.
+
+Protocol 11 now carries the exact role address with operation, revision,
+epoch, replica and process-session authority. The controller normalization
+path accepts only the matching successful role completion, replaces it under
+newer authority and clears it when the role/access closes. Production protocol
+9 remains unchanged.
 
 ### KSF-12: Supersession Does Not Contain Arbitrary Public Callbacks
 
@@ -1233,6 +1245,24 @@ public-only correctness boundary.
 **Required conformance property:** Treat this as a legacy extension and remove
 it during the fresh-state stateless-default cutover rather than presenting it
 as V1 parity.
+
+### Phase 5 Conformance Status
+
+The dormant protocol-11/schema-11 implementation now owns one executable
+catalog with exactly KSF-01 through KSF-16. The strict custom fixture and real
+PostgreSQL scenarios execute row-keyed shared catalog assertions. KSF-09,
+KSF-10 and KSF-16 intentionally retain negative eligibility checks that
+inventory the current managed attachment, agent-owned production replication
+listener and legacy continuation stores. KSF-10 additionally proves the strict
+custom fixture's Replicator-owned endpoint lifecycle. Passing the negative
+checks keeps Phase 7 cutover ineligible; it does not claim that the replacement
+engine or replacement-only artifact exists.
+
+PostgreSQL does not claim KSF-02's complete data-loss outcome matrix, KSF-10's
+Replicator-owned endpoint lifecycle, KSF-11's application-owned
+service-address surface, or KSF-15's full replay matrix. Those properties
+remain strict-custom obligations and PostgreSQL asserts the absence of an
+applicable row mapping.
 
 ## Unimplemented or Deliberately Different Surface
 

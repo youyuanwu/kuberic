@@ -2,11 +2,21 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "testing")]
+use crate::protocol::public_operations::{
+    PublicOperationIntent, PublicOperationPreviewIdentity, PublicSessionEpochBarrierStage,
+    PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1SessionRenewalStatus,
+};
 use crate::protocol::types::{
     AgentGeneration, BuildAuthority, ConfigurationDescriptor, EffectivePolicy, Epoch,
     InitializationId, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverPreparationId,
     SwitchoverRequestId,
+};
+#[cfg(feature = "testing")]
+use crate::protocol::types::{
+    HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
+    derive_bootstrap_history,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +178,229 @@ pub struct DropReplicaIncarnation {
     pub action: crate::protocol::public_operations::PublicFaultAction,
 }
 
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum PublicV1HistoryCommand {
+    Initialize {
+        preview: PublicOperationPreviewIdentity,
+        accepted: PublicV1AcceptedStatus,
+        storage: ReplicaStorageIncarnationContext,
+    },
+    Recover {
+        accepted: PublicV1AcceptedStatus,
+        intent: Box<PublicOperationIntent>,
+    },
+    SessionRenewal(Box<PublicV1SessionRenewalCommand>),
+}
+
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum PublicV1SessionRenewalCommand {
+    CloseAccessAndIngress {
+        accepted: PublicV1SessionRenewalStatus,
+    },
+    UpdateEpochBarrier {
+        accepted: PublicV1SessionRenewalStatus,
+        survivor: crate::protocol::types::ProcessSessionEndpoint,
+        epoch: Epoch,
+    },
+    ReplayReplacementRole {
+        accepted: PublicV1SessionRenewalStatus,
+        process_session_id: crate::protocol::types::ProcessSessionId,
+        epoch: Epoch,
+        role: crate::protocol::types::ReplicaRole,
+    },
+    InstallFreshConfiguration {
+        accepted: PublicV1SessionRenewalStatus,
+        configuration: ConfigurationDescriptor,
+    },
+}
+
+#[cfg(feature = "testing")]
+impl PublicV1SessionRenewalCommand {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.accepted().validate()?;
+        match self {
+            Self::CloseAccessAndIngress { accepted }
+                if accepted.stage != PublicSessionRenewalStage::Required =>
+            {
+                Err("session-renewal access closure is not the accepted next barrier")
+            }
+            Self::UpdateEpochBarrier {
+                accepted,
+                survivor,
+                epoch,
+            } if accepted.stage != PublicSessionRenewalStage::EpochBarriersPending
+                || epoch != &accepted.required.renewal_epoch
+                || !accepted.barriers.iter().any(|barrier| {
+                    barrier.survivor == *survivor
+                        && barrier.stage == PublicSessionEpochBarrierStage::Pending
+                }) =>
+            {
+                Err("session-renewal update_epoch command differs from a pending barrier")
+            }
+            Self::ReplayReplacementRole {
+                accepted,
+                process_session_id,
+                epoch,
+                role,
+            } => {
+                let replacement = accepted
+                    .required
+                    .replacement
+                    .as_ref()
+                    .ok_or("session-renewal role replay has no replacement")?;
+                if accepted.stage != PublicSessionRenewalStage::ReplacementRolePending
+                    || process_session_id != &replacement.process_session_id
+                    || epoch != &accepted.required.renewal_epoch
+                    || role != &accepted.required.predecessor.role
+                {
+                    return Err("session-renewal role replay differs from accepted authority");
+                }
+                Ok(())
+            }
+            Self::InstallFreshConfiguration {
+                accepted,
+                configuration,
+            } if accepted.stage != PublicSessionRenewalStage::ConfigurationPending
+                || configuration != &accepted.required.fresh_configuration =>
+            {
+                Err("session-renewal configuration differs from accepted authority")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn accepted(&self) -> &PublicV1SessionRenewalStatus {
+        match self {
+            Self::CloseAccessAndIngress { accepted }
+            | Self::UpdateEpochBarrier { accepted, .. }
+            | Self::ReplayReplacementRole { accepted, .. }
+            | Self::InstallFreshConfiguration { accepted, .. } => accepted,
+        }
+    }
+
+    pub fn target(&self) -> &ReplicaIdentity {
+        match self {
+            Self::CloseAccessAndIngress { accepted } => &accepted.required.predecessor.identity,
+            Self::UpdateEpochBarrier { survivor, .. } => &survivor.identity,
+            Self::ReplayReplacementRole { accepted, .. } => {
+                &accepted
+                    .required
+                    .replacement
+                    .as_ref()
+                    .expect("validated session-renewal replacement")
+                    .identity
+            }
+            Self::InstallFreshConfiguration {
+                accepted: _,
+                configuration,
+            } => {
+                &configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == configuration.primary_id)
+                    .expect("validated fresh configuration primary")
+                    .identity
+            }
+        }
+    }
+}
+
+#[cfg(feature = "testing")]
+impl PublicV1HistoryCommand {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Initialize {
+                preview,
+                accepted,
+                storage,
+            } => {
+                storage.validate()?;
+                if !preview.is_public_v1()
+                    || accepted.identity != *preview
+                    || accepted.data_loss_recovery.is_some()
+                    || accepted.history.resource_uid.is_empty()
+                    || accepted.history.protocol_generation.value() != preview.generation
+                    || accepted.history
+                        != derive_bootstrap_history(
+                            &accepted.history.resource_uid,
+                            accepted.history.protocol_generation,
+                            &accepted.history_initialization_id,
+                        )
+                {
+                    return Err("public-v1 initialization command changed accepted history");
+                }
+            }
+            Self::Recover { accepted, intent } => {
+                intent.validate()?;
+                let recovery = accepted
+                    .data_loss_recovery
+                    .as_ref()
+                    .ok_or("public-v1 recovery command lacks accepted recovery authority")?;
+                let input = intent
+                    .lifecycle
+                    .as_ref()
+                    .and_then(|input| input.data_loss_recovery.as_ref())
+                    .ok_or("public-v1 recovery command lacks typed lifecycle recovery")?;
+                if accepted.identity != intent.preview
+                    || recovery.stage
+                        != crate::protocol::public_operations::PublicDataLossRecoveryStage::Invalidated
+                    || recovery.logical_authorization() != input.authorization
+                    || recovery.attempt != input.attempt
+                {
+                    return Err("public-v1 recovery command differs from accepted authority");
+                }
+            }
+            Self::SessionRenewal(command) => command.validate()?,
+        }
+        Ok(())
+    }
+
+    pub fn accepted(&self) -> Option<&PublicV1AcceptedStatus> {
+        match self {
+            Self::Initialize { accepted, .. } | Self::Recover { accepted, .. } => Some(accepted),
+            Self::SessionRenewal(_) => None,
+        }
+    }
+
+    pub fn target(&self) -> &ReplicaIdentity {
+        match self {
+            Self::Initialize { storage, .. } => &storage.replica,
+            Self::Recover { accepted, .. } => {
+                &accepted
+                    .data_loss_recovery
+                    .as_ref()
+                    .expect("validated public-v1 recovery command")
+                    .provisional_primary
+                    .replica
+            }
+            Self::SessionRenewal(command) => command.target(),
+        }
+    }
+
+    pub fn initialization(
+        &self,
+    ) -> Option<(
+        &HistoryInitializationId,
+        &HistoryContext,
+        &ReplicaStorageIncarnationContext,
+    )> {
+        match self {
+            Self::Initialize {
+                accepted, storage, ..
+            } => Some((
+                &accepted.history_initialization_id,
+                &accepted.history,
+                storage,
+            )),
+            Self::Recover { .. } | Self::SessionRenewal(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// One fenced, idempotent authority command issued after a full observation.
@@ -183,6 +416,8 @@ pub enum ProtocolCommand {
     RestartReplicaProcess(Box<RestartReplicaProcess>),
     #[cfg(feature = "testing")]
     DropReplicaIncarnation(Box<DropReplicaIncarnation>),
+    #[cfg(feature = "testing")]
+    PublicV1History(Box<PublicV1HistoryCommand>),
 }
 
 impl ProtocolCommand {
@@ -196,9 +431,9 @@ impl ProtocolCommand {
             | Self::EnsureConfiguration(_)
             | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
             #[cfg(feature = "testing")]
-            Self::RestartReplicaProcess(_) | Self::DropReplicaIncarnation(_) => {
-                EffectClass::ReconfigurationAction
-            }
+            Self::RestartReplicaProcess(_)
+            | Self::DropReplicaIncarnation(_)
+            | Self::PublicV1History(_) => EffectClass::ReconfigurationAction,
         }
     }
 }

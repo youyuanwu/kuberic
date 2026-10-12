@@ -15,6 +15,11 @@ use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+#[path = "public_transport.rs"]
+mod public_transport;
+#[path = "public_v1.rs"]
+pub(crate) mod public_v1;
+
 use crate::access::{PgAccessController, initialize_application_role, stop_fence};
 use crate::build::{
     BUILD_PROTOCOL_VERSION, MAX_BUILDS, PgBuildMethod, PgBuildProgress, PgBuildRequest,
@@ -84,6 +89,7 @@ struct PgConfiguration {
 }
 
 pub struct PgReplicator {
+    public_v1: std::sync::OnceLock<public_v1::PublicPg>,
     instance: Arc<PgInstanceManager>,
     durable: Arc<PgDurableStore>,
     observer: PgNativeObserver,
@@ -184,6 +190,7 @@ impl PgReplicator {
         initializing: bool,
     ) -> Self {
         Self {
+            public_v1: std::sync::OnceLock::new(),
             observer: PgNativeObserver::with_store(instance.clone(), durable.clone()).await,
             instance,
             durable,
@@ -1223,6 +1230,9 @@ impl PgReplicator {
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_close().await;
+        }
         let mut state = self.state.lock().await;
         if state.opened {
             if self.cancellation.is_cancelled() {
@@ -1964,13 +1974,23 @@ impl PgReplicator {
 #[async_trait]
 impl Replicator for PgReplicator {
     async fn open(&self) -> Result<String> {
+        if self.is_public_v1() {
+            self.public_open().await?;
+            return Ok(self.coordination.local_endpoint.clone());
+        }
         PgReplicator::open(self).await?;
         Ok(self.coordination.local_endpoint.clone())
     }
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_change_role(epoch, role).await;
+        }
         PgReplicator::change_role(self, epoch, role).await
     }
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_update_epoch(epoch).await;
+        }
         self.cancel_catch_up();
         self.build_cancellation.lock().unwrap().cancel();
         PgReplicator::update_epoch(self, epoch).await
@@ -1982,6 +2002,9 @@ impl Replicator for PgReplicator {
         PgReplicator::abort(self);
     }
     async fn current_progress(&self) -> Result<i64> {
+        if self.is_public_v1() {
+            return self.public_progress().await;
+        }
         let access_generation = self.instance.access_generation();
         {
             // Access regrant may retire a delayed reader's generation; role
@@ -2032,6 +2055,9 @@ impl Replicator for PgReplicator {
             }))
     }
     async fn catch_up_capability(&self) -> Result<i64> {
+        if self.is_public_v1() {
+            return self.public_capability().await;
+        }
         let _state = self.state.lock().await;
         self.pg_result(self.instance.retained_wal_boundary().await)
             .await
@@ -2041,6 +2067,9 @@ impl Replicator for PgReplicator {
 #[async_trait]
 impl PrimaryReplicator for PgReplicator {
     async fn on_data_loss(&self) -> Result<bool> {
+        if self.is_public_v1() {
+            return self.public_data_loss().await;
+        }
         PgReplicator::on_data_loss(self).await
     }
     async fn update_catch_up_replica_set_configuration(
@@ -2048,6 +2077,9 @@ impl PrimaryReplicator for PgReplicator {
         current: ReplicaSetConfiguration,
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_configuration(current, Some(previous)).await;
+        }
         self.install_configuration_pair(current, Some(previous.configuration))
             .await
     }
@@ -2055,15 +2087,27 @@ impl PrimaryReplicator for PgReplicator {
         &self,
         current: ReplicaSetConfiguration,
     ) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_configuration(current, None).await;
+        }
         self.install_configuration(current).await
     }
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_wait(mode).await;
+        }
         PgReplicator::wait_for_catch_up_quorum(self, mode).await
     }
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_build(replica).await;
+        }
         self.execute_build(replica).await
     }
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
+        if self.is_public_v1() {
+            return self.public_remove(replica_id).await;
+        }
         if self.cancellation.is_cancelled() {
             return Err(RuntimeError::Closed);
         }

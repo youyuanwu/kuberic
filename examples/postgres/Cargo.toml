@@ -30,7 +30,7 @@ whoami.workspace = true
 tonic.workspace = true
 prost.workspace = true
 tonic-prost.workspace = true
-rustix = { version = "1", features = ["process", "event"] }
+rustix = { version = "1", features = ["process", "event", "rand"] }
 
 [dev-dependencies]
 test-log.workspace = true

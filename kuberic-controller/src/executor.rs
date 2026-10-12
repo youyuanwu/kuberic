@@ -64,6 +64,147 @@ pub async fn execute_preview_service_location(
     }
 }
 
+#[cfg(feature = "runtime-test-bridge")]
+pub async fn execute_public_v1_history(
+    api: &dyn crate::cluster_api::PublicV1HistoryApi,
+    plan: crate::evaluator::test_bridge::PublicV1HistoryPlan,
+) -> std::result::Result<(), String> {
+    use crate::evaluator::test_bridge::PublicV1HistoryPlan;
+    match plan {
+        PublicV1HistoryPlan::Stable => Ok(()),
+        PublicV1HistoryPlan::PersistStatus { expected, next } => {
+            if api.observe_public_v1_status().await? != expected {
+                return Err("stale public-v1 accepted status".into());
+            }
+            api.persist_public_v1_status(expected.as_ref(), &next).await
+        }
+        PublicV1HistoryPlan::Dispatch { expected, command } => {
+            if api.observe_public_v1_status().await?.as_ref() != Some(&expected) {
+                return Err("stale public-v1 dispatch authority".into());
+            }
+            let kuberic_runtime::protocol::command::ProtocolCommand::PublicV1History(
+                public_command,
+            ) = &command
+            else {
+                return Err("public-v1 history executor received another command".into());
+            };
+            if public_command.accepted() != Some(&expected) {
+                return Err("public-v1 command differs from accepted status".into());
+            }
+            api.dispatch_public_v1_history(&expected, &command).await
+        }
+    }
+}
+
+#[cfg(feature = "runtime-test-bridge")]
+pub async fn execute_public_v1_session_renewal(
+    api: &dyn crate::cluster_api::PublicV1SessionRenewalApi,
+    plan: crate::evaluator::test_bridge::PublicV1SessionRenewalPlan,
+) -> std::result::Result<(), String> {
+    use crate::evaluator::test_bridge::PublicV1SessionRenewalPlan;
+    match plan {
+        PublicV1SessionRenewalPlan::Stable | PublicV1SessionRenewalPlan::WaitForSurvivor { .. } => {
+            Ok(())
+        }
+        PublicV1SessionRenewalPlan::PersistStatus { expected, next } => {
+            if api.observe_public_v1_session_renewal().await?.as_ref() != expected.as_deref() {
+                return Err("stale public-v1 session-renewal status".into());
+            }
+            api.persist_public_v1_session_renewal(expected.as_deref(), &next)
+                .await
+        }
+        PublicV1SessionRenewalPlan::Dispatch { expected, command } => {
+            if api.observe_public_v1_session_renewal().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 session-renewal dispatch authority".into());
+            }
+            let kuberic_runtime::protocol::command::ProtocolCommand::PublicV1History(
+                public_command,
+            ) = &command
+            else {
+                return Err("public-v1 session-renewal executor received another command".into());
+            };
+            let kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal(
+                renewal_command,
+            ) = public_command.as_ref()
+            else {
+                return Err("public-v1 session-renewal executor received a history command".into());
+            };
+            renewal_command.validate().map_err(str::to_owned)?;
+            if renewal_command.accepted() != expected.as_ref() {
+                return Err(
+                    "public-v1 session-renewal command differs from accepted status".into(),
+                );
+            }
+            api.dispatch_public_v1_session_renewal(&expected, &command)
+                .await
+        }
+    }
+}
+
+#[cfg(feature = "runtime-test-bridge")]
+pub async fn execute_public_v1_evidence(
+    api: &dyn crate::cluster_api::PublicV1EvidenceApi,
+    plan: crate::evaluator::test_bridge::PublicV1EvidencePlan,
+) -> std::result::Result<(), String> {
+    use crate::evaluator::test_bridge::PublicV1EvidencePlan;
+    match plan {
+        PublicV1EvidencePlan::PersistStatus { expected, next } => {
+            let observed = api.observe_public_v1_evidence_status().await?;
+            if observed.as_ref() != Some(expected.as_ref())
+                && observed.as_ref().is_none_or(|observed| {
+                    observed.evidence != *next || observed.intent != expected.intent
+                })
+            {
+                return Err("stale public-v1 evidence status".into());
+            }
+            if observed.as_ref().is_some_and(|observed| {
+                observed.evidence == *next && observed.intent == expected.intent
+            }) {
+                return Ok(());
+            }
+            if !next.is_evidence_successor_of(&expected.evidence) {
+                return Err("public-v1 evidence status transition is not monotonic".into());
+            }
+            api.persist_public_v1_evidence_status(&expected, &next)
+                .await
+        }
+        PublicV1EvidencePlan::Accept {
+            expected,
+            completion,
+        } => {
+            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 completion acceptance".into());
+            }
+            api.accept_public_v1_completion(&expected, &completion)
+                .await
+        }
+        PublicV1EvidencePlan::RetireExactIncarnation {
+            expected,
+            completion,
+            target,
+        } => {
+            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 retirement authority".into());
+            }
+            api.retire_public_v1_incarnation(&expected, &completion, &target)
+                .await
+        }
+        PublicV1EvidencePlan::ProvisionReplacement {
+            expected,
+            completion,
+            target,
+            rebuild,
+        } => {
+            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+                return Err("stale public-v1 replacement authority".into());
+            }
+            api.provision_public_v1_replacement(&expected, &completion, &target, &rebuild)
+                .await
+        }
+        PublicV1EvidencePlan::Wait => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionKind {
     Stable,

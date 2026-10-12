@@ -357,7 +357,13 @@ async fn persisted_restart_uses_fresh_child_on_the_same_storage() {
                 revision: next.fault_revision,
                 process_session_id: next.predecessor_session.clone(),
                 class: crate::protocol::public_operations::PublicOperationClass::TransientFault,
-                input_digest: "next-fault".into(),
+                input_digest: crate::protocol::public_operations::
+                    CanonicalOperationInputDigest::opaque_v1(
+                        "kuberic-process-supervisor-fault-v1",
+                        b"next-fault",
+                    ),
+                replay_disposition: crate::protocol::public_operations::
+                    PublicOperationReplayDisposition::Containment,
                 lifecycle: None,
                 program: None,
             },
@@ -988,7 +994,13 @@ impl Fixture {
                     revision: 3,
                     process_session_id: predecessor_session.clone(),
                     class: crate::protocol::public_operations::PublicOperationClass::TransientFault,
-                    input_digest: "fault-operation-digest".into(),
+                    input_digest: crate::protocol::public_operations::
+                        CanonicalOperationInputDigest::opaque_v1(
+                            "kuberic-process-supervisor-fault-v1",
+                            b"fault-operation-digest",
+                        ),
+                    replay_disposition: crate::protocol::public_operations::
+                        PublicOperationReplayDisposition::Containment,
                     lifecycle: None,
                     program: None,
                 },

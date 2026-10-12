@@ -2942,6 +2942,963 @@
                     ],
                     "type": "object"
                   },
+                  "publicV1Authority": {
+                    "nullable": true,
+                    "properties": {
+                      "completedOperations": {
+                        "default": [],
+                        "items": {
+                          "properties": {
+                            "callKind": {
+                              "enum": [
+                                "initialPrimary",
+                                "failoverPromotion",
+                                "secondaryEpochAdvance",
+                                "open",
+                                "role",
+                                "epoch",
+                                "configuration",
+                                "catchUp",
+                                "progress",
+                                "swap",
+                                "build",
+                                "remove",
+                                "close",
+                                "abort"
+                              ],
+                              "type": "string"
+                            },
+                            "catchUpMode": {
+                              "description": "Captures the caller's selection, not the predicate or value policy.",
+                              "enum": [
+                                "WriteQuorum",
+                                "All",
+                                null
+                              ],
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "catchUpSpecificQuorum": {
+                              "nullable": true,
+                              "type": "boolean"
+                            },
+                            "currentConfigurationId": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "failureDetail": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "history": {
+                              "properties": {
+                                "dataLossNumber": {
+                                  "format": "int64",
+                                  "type": "integer"
+                                },
+                                "historyId": {
+                                  "type": "string"
+                                },
+                                "protocolGeneration": {
+                                  "format": "uint64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                },
+                                "resourceUid": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "dataLossNumber",
+                                "historyId",
+                                "protocolGeneration",
+                                "resourceUid"
+                              ],
+                              "type": "object"
+                            },
+                            "inputDigestSha256": {
+                              "type": "string"
+                            },
+                            "inputDigestVersion": {
+                              "format": "uint16",
+                              "maximum": 65535.0,
+                              "minimum": 0.0,
+                              "type": "integer"
+                            },
+                            "operationId": {
+                              "type": "string"
+                            },
+                            "previousConfigurationId": {
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "processSessionId": {
+                              "type": "string"
+                            },
+                            "rebuildRequired": {
+                              "nullable": true,
+                              "properties": {
+                                "build": {
+                                  "nullable": true,
+                                  "properties": {
+                                    "buildId": {
+                                      "type": "string"
+                                    },
+                                    "epoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "resourceUid": {
+                                      "type": "string"
+                                    },
+                                    "source": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "sourceSession": {
+                                      "type": "string"
+                                    },
+                                    "sourceStorage": {
+                                      "properties": {
+                                        "replica": {
+                                          "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                          "properties": {
+                                            "agentGeneration": {
+                                              "type": "string"
+                                            },
+                                            "instanceId": {
+                                              "type": "string"
+                                            },
+                                            "replicaId": {
+                                              "format": "int64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "agentGeneration",
+                                            "instanceId",
+                                            "replicaId"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storage": {
+                                          "properties": {
+                                            "identity": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "kind": {
+                                              "type": "string"
+                                            },
+                                            "podUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "pvcUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "kind"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storageGeneration": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "replica",
+                                        "storage",
+                                        "storageGeneration"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "target": {
+                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                      "properties": {
+                                        "agentGeneration": {
+                                          "type": "string"
+                                        },
+                                        "instanceId": {
+                                          "type": "string"
+                                        },
+                                        "replicaId": {
+                                          "format": "int64",
+                                          "minimum": 1.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "agentGeneration",
+                                        "instanceId",
+                                        "replicaId"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "targetSession": {
+                                      "type": "string"
+                                    },
+                                    "targetStorage": {
+                                      "properties": {
+                                        "replica": {
+                                          "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                          "properties": {
+                                            "agentGeneration": {
+                                              "type": "string"
+                                            },
+                                            "instanceId": {
+                                              "type": "string"
+                                            },
+                                            "replicaId": {
+                                              "format": "int64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "agentGeneration",
+                                            "instanceId",
+                                            "replicaId"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storage": {
+                                          "properties": {
+                                            "identity": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "kind": {
+                                              "type": "string"
+                                            },
+                                            "podUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "pvcUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "kind"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storageGeneration": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "replica",
+                                        "storage",
+                                        "storageGeneration"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "buildId",
+                                    "epoch",
+                                    "resourceUid",
+                                    "source",
+                                    "sourceSession",
+                                    "sourceStorage",
+                                    "target",
+                                    "targetSession",
+                                    "targetStorage"
+                                  ],
+                                  "type": "object"
+                                },
+                                "kind": {
+                                  "enum": [
+                                    "localProvider",
+                                    "remoteBuildTarget"
+                                  ],
+                                  "type": "string"
+                                },
+                                "localReplica": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "nullable": true,
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "localStorage": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "operation": {
+                                  "properties": {
+                                    "detectingSession": {
+                                      "type": "string"
+                                    },
+                                    "epoch": {
+                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "properties": {
+                                        "configurationNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "dataLossNumber": {
+                                          "format": "int64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "configurationNumber",
+                                        "dataLossNumber"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "operationId": {
+                                      "type": "string"
+                                    },
+                                    "preview": {
+                                      "properties": {
+                                        "generation": {
+                                          "format": "uint64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "protocolVersion": {
+                                          "format": "uint32",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "generation",
+                                        "protocolVersion"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "resourceUid": {
+                                      "type": "string"
+                                    },
+                                    "revision": {
+                                      "format": "uint64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "detectingSession",
+                                    "epoch",
+                                    "operationId",
+                                    "preview",
+                                    "resourceUid",
+                                    "revision"
+                                  ],
+                                  "type": "object"
+                                },
+                                "providerReplica": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "nullable": true,
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "reason": {
+                                  "enum": [
+                                    "incompatibleRetainedHistory",
+                                    "providerMismatch",
+                                    "remoteCopyConflict"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "operation",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            "replayDisposition": {
+                              "enum": [
+                                "convergent",
+                                "repeatableRead",
+                                "reevaluateCatchUp",
+                                "retainBuildSuccessRetireAmbiguity",
+                                "dataLossConvergent",
+                                "dataLossReplaceOnAmbiguity",
+                                "exactRemoval",
+                                "containment"
+                              ],
+                              "type": "string"
+                            },
+                            "result": {
+                              "enum": [
+                                "succeeded",
+                                "failed",
+                                "ambiguous",
+                                "cancelled",
+                                "rebuildRequired"
+                              ],
+                              "type": "string"
+                            },
+                            "revision": {
+                              "format": "uint64",
+                              "minimum": 0.0,
+                              "type": "integer"
+                            },
+                            "storageIncarnation": {
+                              "properties": {
+                                "replica": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "storage": {
+                                  "properties": {
+                                    "identity": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "kind": {
+                                      "type": "string"
+                                    },
+                                    "podUid": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "pvcUid": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "type": "object"
+                                },
+                                "storageGeneration": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "replica",
+                                "storage",
+                                "storageGeneration"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "callKind",
+                            "history",
+                            "inputDigestSha256",
+                            "inputDigestVersion",
+                            "operationId",
+                            "processSessionId",
+                            "replayDisposition",
+                            "result",
+                            "revision",
+                            "storageIncarnation"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "dataLossRecovery": {
+                        "nullable": true,
+                        "properties": {
+                          "attempt": {
+                            "properties": {
+                              "attemptId": {
+                                "type": "string"
+                              },
+                              "authorizationId": {
+                                "type": "string"
+                              },
+                              "process": {
+                                "properties": {
+                                  "attemptRevision": {
+                                    "format": "uint64",
+                                    "minimum": 0.0,
+                                    "type": "integer"
+                                  },
+                                  "catchUpSpecificQuorum": {
+                                    "type": "boolean"
+                                  },
+                                  "dataLossReplay": {
+                                    "enum": [
+                                      "convergent",
+                                      "replaceOnAmbiguity"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "epoch": {
+                                    "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                    "properties": {
+                                      "configurationNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      },
+                                      "dataLossNumber": {
+                                        "format": "int64",
+                                        "minimum": 0.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "configurationNumber",
+                                      "dataLossNumber"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "processSessionId": {
+                                    "type": "string"
+                                  },
+                                  "replicatorCreationId": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "attemptRevision",
+                                  "catchUpSpecificQuorum",
+                                  "dataLossReplay",
+                                  "epoch",
+                                  "processSessionId",
+                                  "replicatorCreationId"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "attemptId",
+                              "authorizationId",
+                              "process"
+                            ],
+                            "type": "object"
+                          },
+                          "authorizationId": {
+                            "type": "string"
+                          },
+                          "observedProgress": {
+                            "nullable": true,
+                            "properties": {
+                              "first": {
+                                "format": "int64",
+                                "type": "integer"
+                              },
+                              "last": {
+                                "format": "int64",
+                                "type": "integer"
+                              },
+                              "role": {
+                                "enum": [
+                                  "primary",
+                                  "secondary",
+                                  "recovery"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "first",
+                              "last",
+                              "role"
+                            ],
+                            "type": "object"
+                          },
+                          "predecessorHistory": {
+                            "properties": {
+                              "dataLossNumber": {
+                                "format": "int64",
+                                "type": "integer"
+                              },
+                              "historyId": {
+                                "type": "string"
+                              },
+                              "protocolGeneration": {
+                                "format": "uint64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "resourceUid": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "dataLossNumber",
+                              "historyId",
+                              "protocolGeneration",
+                              "resourceUid"
+                            ],
+                            "type": "object"
+                          },
+                          "proposedHistory": {
+                            "properties": {
+                              "dataLossNumber": {
+                                "format": "int64",
+                                "type": "integer"
+                              },
+                              "historyId": {
+                                "type": "string"
+                              },
+                              "protocolGeneration": {
+                                "format": "uint64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
+                              "resourceUid": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "dataLossNumber",
+                              "historyId",
+                              "protocolGeneration",
+                              "resourceUid"
+                            ],
+                            "type": "object"
+                          },
+                          "provisionalPrimary": {
+                            "properties": {
+                              "replica": {
+                                "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                "properties": {
+                                  "agentGeneration": {
+                                    "type": "string"
+                                  },
+                                  "instanceId": {
+                                    "type": "string"
+                                  },
+                                  "replicaId": {
+                                    "format": "int64",
+                                    "minimum": 1.0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "agentGeneration",
+                                  "instanceId",
+                                  "replicaId"
+                                ],
+                                "type": "object"
+                              },
+                              "storage": {
+                                "properties": {
+                                  "identity": {
+                                    "nullable": true,
+                                    "type": "string"
+                                  },
+                                  "kind": {
+                                    "type": "string"
+                                  },
+                                  "podUid": {
+                                    "nullable": true,
+                                    "type": "string"
+                                  },
+                                  "pvcUid": {
+                                    "nullable": true,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "kind"
+                                ],
+                                "type": "object"
+                              },
+                              "storageGeneration": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "replica",
+                              "storage",
+                              "storageGeneration"
+                            ],
+                            "type": "object"
+                          },
+                          "replayDisposition": {
+                            "enum": [
+                              "convergent",
+                              "replaceOnAmbiguity"
+                            ],
+                            "type": "string"
+                          },
+                          "resetScope": {
+                            "properties": {
+                              "kind": {
+                                "type": "string"
+                              },
+                              "retired": {
+                                "nullable": true,
+                                "properties": {
+                                  "replica": {
+                                    "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                    "properties": {
+                                      "agentGeneration": {
+                                        "type": "string"
+                                      },
+                                      "instanceId": {
+                                        "type": "string"
+                                      },
+                                      "replicaId": {
+                                        "format": "int64",
+                                        "minimum": 1.0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "agentGeneration",
+                                      "instanceId",
+                                      "replicaId"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "storage": {
+                                    "properties": {
+                                      "identity": {
+                                        "nullable": true,
+                                        "type": "string"
+                                      },
+                                      "kind": {
+                                        "type": "string"
+                                      },
+                                      "podUid": {
+                                        "nullable": true,
+                                        "type": "string"
+                                      },
+                                      "pvcUid": {
+                                        "nullable": true,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "storageGeneration": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "replica",
+                                  "storage",
+                                  "storageGeneration"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ],
+                            "type": "object"
+                          },
+                          "stage": {
+                            "enum": [
+                              "authorized",
+                              "invalidated",
+                              "callbackProcessing",
+                              "historyPending",
+                              "configurationPending",
+                              "admitted",
+                              "failed",
+                              "replacementRequired",
+                              "retired"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "attempt",
+                          "authorizationId",
+                          "predecessorHistory",
+                          "proposedHistory",
+                          "provisionalPrimary",
+                          "replayDisposition",
+                          "resetScope",
+                          "stage"
+                        ],
+                        "type": "object"
+                      },
+                      "extensions": {
+                        "default": {},
+                        "properties": {
+                          "historyRecovery": {
+                            "nullable": true,
+                            "properties": {
+                              "version": {
+                                "format": "uint16",
+                                "maximum": 65535.0,
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "version"
+                            ],
+                            "type": "object"
+                          },
+                          "publicBuildEvidence": {
+                            "nullable": true,
+                            "properties": {
+                              "version": {
+                                "format": "uint16",
+                                "maximum": 65535.0,
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "version"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "history": {
+                        "properties": {
+                          "dataLossNumber": {
+                            "format": "int64",
+                            "type": "integer"
+                          },
+                          "historyId": {
+                            "type": "string"
+                          },
+                          "protocolGeneration": {
+                            "format": "uint64",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          },
+                          "resourceUid": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "dataLossNumber",
+                          "historyId",
+                          "protocolGeneration",
+                          "resourceUid"
+                        ],
+                        "type": "object"
+                      },
+                      "historyInitializationId": {
+                        "type": "string"
+                      },
+                      "identity": {
+                        "properties": {
+                          "generation": {
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "protocolVersion": {
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "generation",
+                          "protocolVersion"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "history",
+                      "historyInitializationId",
+                      "identity"
+                    ],
+                    "type": "object"
+                  },
                   "quorumLoss": {
                     "nullable": true,
                     "properties": {
@@ -5006,7 +5963,8 @@
                           "failover",
                           "plannedSwitchover",
                           "secondaryScaleDown",
-                          "scaleUp"
+                          "scaleUp",
+                          "dataLossRecovery"
                         ],
                         "type": "string"
                       },

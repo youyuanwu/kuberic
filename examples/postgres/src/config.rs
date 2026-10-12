@@ -202,6 +202,49 @@ max_replication_slots = 32
             .map_err(|e| PgError::Process(format!("repair {}: {e}", path.display())))
     }
 
+    pub(crate) async fn public_replication_fence(data_dir: &Path) -> Result<(), PgError> {
+        let path = data_dir.join("pg_hba.conf");
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|error| PgError::Configuration(error.to_string()))?;
+        let content = format!("# kuberic public-v1 native gateway\n{content}");
+        Self::replace_config(
+            &path,
+            &replace_managed_hba(&content, false, "kuberic_app", "kuberic"),
+        )
+        .await
+    }
+
+    pub(crate) async fn public_receiver(
+        &self,
+        data_dir: &Path,
+        conninfo: &str,
+        slot: &str,
+        lineage: &crate::build::PgLineage,
+    ) -> Result<(), PgError> {
+        self.configure_standby(data_dir, "127.0.0.1", 1, "public_v1", slot, lineage)
+            .await?;
+        let path = data_dir.join("postgresql.auto.conf");
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|error| PgError::Configuration(error.to_string()))?;
+        let mut lines = content
+            .lines()
+            .filter(|line| {
+                !line
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.trim() == "primary_conninfo")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        lines.push(format!(
+            "primary_conninfo = '{}'",
+            encode_postgres_setting(conninfo)
+        ));
+        Self::replace_config(&path, &(lines.join("\n") + "\n")).await?;
+        Self::public_replication_fence(data_dir).await
+    }
+
     fn replace_config_file(path: &Path, content: &str) -> std::io::Result<()> {
         use std::io::Write;
 
@@ -458,6 +501,19 @@ fn replace_managed_hba(
         }
     }
     let internal_user = whoami::username().unwrap_or_else(|_| "postgres".into());
+    let replication = if existing.contains("# kuberic public-v1 native gateway") {
+        "host replication all 0.0.0.0/0 reject\nhost replication all ::0/0 reject\n"
+    } else {
+        "host replication all 127.0.0.1/32 trust\n\
+         host replication all ::1/128 trust\n\
+         host replication all 0.0.0.0/0 trust\n"
+    };
+    let rewind = if existing.contains("# kuberic public-v1 native gateway") {
+        ""
+    } else {
+        "host postgres kuberic_rewind 127.0.0.1/32 trust\n\
+         host postgres kuberic_rewind ::1/128 trust\n"
+    };
     let application = if granted {
         format!(
             "local   {application_database}   {application_role}                 trust\n\
@@ -470,14 +526,11 @@ fn replace_managed_hba(
     format!(
         "{HBA_BEGIN}\n\
          local   replication     all                                trust\n\
-         host    replication     all              127.0.0.1/32      trust\n\
-         host    replication     all              ::1/128           trust\n\
-         host    replication     all              0.0.0.0/0         trust\n\
+         {replication}\
          local   all             {internal_user}                    trust\n\
          {application}\
          local   all             all                                reject\n\
-         host    postgres        kuberic_rewind   127.0.0.1/32      trust\n\
-         host    postgres        kuberic_rewind   ::1/128           trust\n\
+         {rewind}\
          host    all             all              0.0.0.0/0         reject\n\
          host    all             all              ::0/0             reject\n\
          {HBA_END}\n{}\n",

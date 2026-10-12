@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,8 +34,8 @@ use crate::protocol::types::{
 };
 use crate::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
-    Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
-    ReplicatorSettings, StateReplicator,
+    Replicator, ReplicatorCapabilities, ReplicatorFactory, ReplicatorFactoryContext,
+    ReplicatorInterfaces, ReplicatorSettings, StateReplicator,
 };
 
 use super::tempdir;
@@ -64,6 +65,83 @@ fn storage_identity() -> StorageIdentity {
     }
 }
 
+fn public_v1_storage_incarnation() -> crate::protocol::types::ReplicaStorageIncarnationContext {
+    crate::protocol::types::ReplicaStorageIncarnationContext {
+        replica: replica_identity(),
+        storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+        },
+        storage_generation: crate::protocol::types::StorageGeneration::new("storage-generation-1"),
+    }
+}
+
+fn public_v1_history(
+    preview: &PublicOperationPreviewIdentity,
+) -> (
+    crate::protocol::types::HistoryInitializationId,
+    crate::protocol::types::HistoryContext,
+) {
+    let generation = crate::protocol::types::PublicProtocolGeneration::new(preview.generation);
+    let initialization_id = crate::protocol::types::derive_history_initialization_id(
+        &ResourceUid::new("resource-1"),
+        generation,
+    );
+    let history = crate::protocol::types::derive_bootstrap_history(
+        &ResourceUid::new("resource-1"),
+        generation,
+        &initialization_id,
+    );
+    (initialization_id, history)
+}
+
+fn public_v1_data_loss_recovery(
+    preview: &PublicOperationPreviewIdentity,
+    attempt_id: &str,
+    revision: u64,
+    epoch: Epoch,
+    replay_disposition: crate::protocol::public_operations::DataLossReplay,
+) -> crate::protocol::public_operations::PublicDataLossRecoveryInput {
+    use crate::protocol::public_operations::{
+        DataLossAttempt, DataLossAuthorization, ProcessAttemptContext, ProviderProgressReset,
+        PublicDataLossRecoveryInput,
+    };
+    let (_, predecessor) = public_v1_history(preview);
+    let provisional_primary = public_v1_storage_incarnation();
+    let authorization_id = OperationId::new(format!("{attempt_id}-authorization"));
+    let proposed = crate::protocol::types::derive_data_loss_history(
+        &authorization_id,
+        &predecessor,
+        predecessor.data_loss_number + 1,
+        &provisional_primary,
+    )
+    .unwrap();
+    PublicDataLossRecoveryInput {
+        authorization: DataLossAuthorization {
+            authorization_id: authorization_id.clone(),
+            predecessor,
+            proposed,
+            provisional_primary,
+            reset_scope: ProviderProgressReset::ResetToEmpty,
+            replay_disposition,
+        },
+        attempt: DataLossAttempt {
+            authorization_id,
+            attempt_id: OperationId::new(attempt_id),
+            process: ProcessAttemptContext {
+                process_session_id: ProcessSessionId::new("session-1"),
+                replicator_creation_id: crate::protocol::types::ReplicatorCreationId::new(
+                    "creation-1",
+                ),
+                catch_up_specific_quorum: true,
+                data_loss_replay: replay_disposition,
+                epoch,
+                attempt_revision: revision,
+            },
+        },
+    }
+}
+
 fn intent(
     preview: &PublicOperationPreviewIdentity,
     operation_id: &str,
@@ -77,7 +155,12 @@ fn intent(
         revision,
         process_session_id: ProcessSessionId::new(session),
         class,
-        input_digest: format!("digest-{operation_id}-{revision}"),
+        input_digest: crate::protocol::public_operations::CanonicalOperationInputDigest::opaque_v1(
+            "kuberic-public-operation-test-v1",
+            format!("digest-{operation_id}-{revision}").as_bytes(),
+        ),
+        replay_disposition:
+            crate::protocol::public_operations::PublicOperationReplayDisposition::Convergent,
         lifecycle: None,
         program: None,
     }
@@ -100,7 +183,17 @@ fn preview_store(
     )
     .unwrap();
     store.relax_durability_for_tests();
-    (directory, path, Arc::new(store))
+    let store = Arc::new(store);
+    if preview.is_public_v1() {
+        let (initialization_id, history) = public_v1_history(preview);
+        futures::executor::block_on(store.initialize_public_v1_history(
+            &initialization_id,
+            &history,
+            &public_v1_storage_incarnation(),
+        ))
+        .unwrap();
+    }
+    (directory, path, store)
 }
 
 fn durable_preview_store(
@@ -119,14 +212,24 @@ fn durable_preview_store(
         },
     )
     .unwrap();
-    (directory, path, Arc::new(store))
+    let store = Arc::new(store);
+    if preview.is_public_v1() {
+        let (initialization_id, history) = public_v1_history(preview);
+        futures::executor::block_on(store.initialize_public_v1_history(
+            &initialization_id,
+            &history,
+            &public_v1_storage_incarnation(),
+        ))
+        .unwrap();
+    }
+    (directory, path, store)
 }
 
 async fn wait_for_stage(
     operation: &Arc<crate::host::operation::PartitionOperation>,
     expected: PublicOperationStage,
 ) -> crate::host::state::PublicOperationRecord {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let record = operation.snapshot();
             if record.stage == expected {
@@ -135,8 +238,13 @@ async fn wait_for_stage(
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap()
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "operation did not reach {expected:?}; current record: {:?}",
+            operation.snapshot()
+        )
+    })
 }
 
 #[tokio::test]
@@ -182,6 +290,137 @@ async fn preview_store_rejects_legacy_and_mixed_openers() {
         Err(crate::host::HostError::SchemaMismatch {
             expected: crate::host::state::PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
             observed: SCHEMA_VERSION,
+        })
+    ));
+}
+
+#[test]
+fn public_v1_values_distinguishes_invalid_lsn() {
+    use crate::application::INVALID_LSN;
+    use crate::protocol::public_operations::{
+        PublicProgress, PublicProgressRole, PublicV1AgentReport,
+    };
+
+    assert_eq!(INVALID_LSN, -1);
+    let idle = ReplicaInformation::idle_build(
+        OperationId::new("idle-build"),
+        replica_identity(),
+        "trace://idle".into(),
+    );
+    assert_eq!(idle.current_progress, INVALID_LSN);
+    assert_eq!(idle.catch_up_capability, INVALID_LSN);
+    idle.validate_public_progress().unwrap();
+
+    let active = ReplicaInformation::active_peer(
+        replica_identity(),
+        "trace://active".into(),
+        ProcessSessionId::new("active-session"),
+        0,
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(active.current_progress, 0);
+    let unknown = ReplicaInformation::active_peer(
+        replica_identity(),
+        "trace://unknown".into(),
+        ProcessSessionId::new("unknown-session"),
+        INVALID_LSN,
+        INVALID_LSN,
+        false,
+    )
+    .unwrap();
+    assert_eq!(unknown.current_progress, INVALID_LSN);
+    let mut invalid = active;
+    invalid.current_progress = -2;
+    assert!(invalid.validate_public_progress().is_err());
+
+    let recovery = PublicV1AgentReport {
+        identity: PublicOperationPreviewIdentity::public_v1(1),
+        resource_uid: ResourceUid::new("resource-1"),
+        replica: replica_identity(),
+        process_session_id: ProcessSessionId::new("session-1"),
+        report_sequence: 1,
+        role: ReplicaRole::Primary,
+        read_status: AccessStatus::NotPrimary,
+        write_status: AccessStatus::NotPrimary,
+        history: public_v1_history(&PublicOperationPreviewIdentity::public_v1(1)).1,
+        storage_incarnation: public_v1_storage_incarnation(),
+        progress: PublicProgress {
+            role: PublicProgressRole::Recovery,
+            first: 0,
+            last: 0,
+        },
+        service_location: None,
+        data_loss_recovery: None,
+        completed_operations: Vec::new(),
+        extensions: Default::default(),
+    };
+    assert!(recovery.validate().is_err());
+    let mut ordinary = recovery.clone();
+    ordinary.progress.role = PublicProgressRole::Primary;
+    ordinary.validate().unwrap();
+    let wire = crate::control::public_v1_agent_status_to_proto(&ordinary);
+    assert!(wire.verified_replication_lsn.is_none());
+    assert!(wire.builds.is_empty());
+    assert!(crate::control::normalize_agent_status_report(wire.clone()).is_err());
+    assert_eq!(
+        crate::control::normalize_public_v1_agent_status_report(wire).unwrap(),
+        ordinary
+    );
+
+    let mut serving_recovery = recovery;
+    serving_recovery.write_status = AccessStatus::Granted;
+    assert!(serving_recovery.validate().is_err());
+
+    let mut wrong_primary_progress = serving_recovery;
+    wrong_primary_progress.write_status = AccessStatus::NotPrimary;
+    wrong_primary_progress.role = ReplicaRole::ActiveSecondary;
+    wrong_primary_progress.progress.role = PublicProgressRole::Primary;
+    assert!(wrong_primary_progress.validate().is_err());
+
+    wrong_primary_progress.role = ReplicaRole::Primary;
+    wrong_primary_progress.progress.role = PublicProgressRole::Secondary;
+    assert!(wrong_primary_progress.validate().is_err());
+}
+
+#[tokio::test]
+async fn public_v1_current_schema_requires_a_fresh_exact_store() {
+    let preview = PublicOperationPreviewIdentity::public_v1(9);
+    let (_directory, path, store) = durable_preview_store(&preview);
+    let original = store.load_state().await.unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version,
+        crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION
+    );
+    drop(connection);
+
+    let reopened = SqliteStore::open_preview_existing(&path, None, &preview).unwrap();
+    assert_eq!(reopened.load_state().await.unwrap(), original);
+    drop(reopened);
+
+    assert!(matches!(
+        SqliteStore::open_existing(&path, None),
+        Err(crate::host::HostError::SchemaMismatch {
+            expected: crate::host::state::SCHEMA_VERSION,
+            observed: crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION,
+        })
+    ));
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.pragma_update(None, "user_version", 8).unwrap();
+    drop(connection);
+    assert!(matches!(
+        SqliteStore::open_preview_existing(&path, None, &preview),
+        Err(crate::host::HostError::SchemaMismatch {
+            expected: crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION,
+            observed: 8,
         })
     ));
 }
@@ -341,7 +580,11 @@ async fn changed_duplicate_and_stale_revision_are_rejected() {
     ));
 
     let mut changed = operation.intent();
-    changed.input_digest = "changed".into();
+    changed.input_digest =
+        crate::protocol::public_operations::CanonicalOperationInputDigest::opaque_v1(
+            "kuberic-public-operation-test-v1",
+            b"changed",
+        );
     assert!(matches!(
         registry.admit(changed).await,
         Err(crate::host::HostError::DurableEffectConflict(_))
@@ -693,6 +936,8 @@ async fn repeatable_redelivery_reaps_a_finished_root_after_completion_persistenc
         process_session_id: ProcessSessionId::new("session-1"),
         class: PublicOperationClass::Authority,
         input_digest: program.digest(),
+        replay_disposition:
+            crate::protocol::public_operations::PublicOperationReplayDisposition::Convergent,
         lifecycle: None,
         program: Some(program),
     };
@@ -1629,9 +1874,12 @@ struct Trace {
     arguments: Mutex<Vec<String>>,
     service_address: Mutex<Option<String>>,
     data_loss: Mutex<Option<std::result::Result<bool, String>>>,
+    rebuild: Mutex<Option<crate::protocol::public_operations::ReplicaRebuildRequired>>,
+    role_rebuild: Mutex<Option<crate::protocol::public_operations::ReplicaRebuildRequired>>,
     fail_role: AtomicBool,
     fail_close: Mutex<Vec<&'static str>>,
     configurations: Mutex<Vec<crate::protocol::public_operations::PublicConfiguration>>,
+    catch_up_configurations: Mutex<Vec<(ReplicaSetConfiguration, ReplicaSetConfiguration)>>,
     installed: Mutex<Option<crate::protocol::public_operations::PublicConfiguration>>,
     waits: Mutex<
         Vec<(
@@ -1737,6 +1985,11 @@ impl StateProvider for TraceProvider {
 
     async fn on_data_loss(&self) -> crate::Result<bool> {
         self.trace.callback("provider.on_data_loss").await;
+        if let Some(rebuild) = self.trace.rebuild.lock().unwrap().clone() {
+            return Err(crate::RuntimeError::ReplicaRebuildRequired(Box::new(
+                rebuild,
+            )));
+        }
         self.trace
             .data_loss
             .lock()
@@ -1820,6 +2073,7 @@ impl ReplicatorFactory for TraceReplicatorFactory {
         Ok(ReplicatorInterfaces::primary(
             self.replicator.clone(),
             Some(self.state_replicator.clone()),
+            ReplicatorCapabilities::conservative(),
         ))
     }
 }
@@ -1895,6 +2149,7 @@ struct TraceReplicator {
     lifecycle_closed: Arc<AtomicBool>,
     containment: watch::Sender<bool>,
     cancel_descendant_with_root: AtomicBool,
+    endpoint: Mutex<Option<TcpListener>>,
 }
 
 impl TraceReplicator {
@@ -1928,7 +2183,14 @@ impl TraceReplicator {
 impl Replicator for TraceReplicator {
     async fn open(&self) -> crate::Result<String> {
         self.trace.callback("replicator.open").await;
-        Ok("trace://replicator".into())
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| crate::RuntimeError::Application(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| crate::RuntimeError::Application(error.to_string()))?;
+        *self.endpoint.lock().unwrap() = Some(listener);
+        self.lifecycle_closed.store(false, Ordering::Release);
+        Ok(address.to_string())
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> crate::Result<()> {
@@ -1938,6 +2200,11 @@ impl Replicator for TraceReplicator {
             .unwrap()
             .push(format!("replicator.role:{epoch:?}:{role:?}"));
         self.trace.callback("replicator.change_role").await;
+        if let Some(rebuild) = self.trace.role_rebuild.lock().unwrap().clone() {
+            return Err(crate::RuntimeError::ReplicaRebuildRequired(Box::new(
+                rebuild,
+            )));
+        }
         self.primary
             .store(role == ReplicaRole::Primary, Ordering::Release);
         Ok(())
@@ -1966,12 +2233,14 @@ impl Replicator for TraceReplicator {
                 "replicator close failed".into(),
             ));
         }
+        self.endpoint.lock().unwrap().take();
         self.lifecycle_closed.store(true, Ordering::Release);
         Ok(())
     }
 
     fn abort(&self) {
         self.trace.record("replicator.abort");
+        self.endpoint.lock().unwrap().take();
         self.lifecycle_closed.store(true, Ordering::Release);
         if let Some(stop) = self.descendant_stop.lock().unwrap().take() {
             stop.send_replace(true);
@@ -2006,9 +2275,30 @@ impl PrimaryReplicator for TraceReplicator {
         self.trace
             .callback("primary.update_catch_up_configuration")
             .await;
+        self.trace
+            .catch_up_configurations
+            .lock()
+            .unwrap()
+            .push((current.clone(), previous.clone()));
         let configuration = crate::protocol::public_operations::PublicConfiguration {
             current: current.configuration,
             previous: Some(previous.configuration),
+            replicas: current
+                .replicas
+                .into_iter()
+                .map(
+                    |replica| crate::protocol::public_operations::PublicReplicaDescriptor {
+                        build_id: replica.build_id,
+                        identity: replica.identity,
+                        replication_address: replica.replication_address,
+                        process_session_id: replica.process_session_id,
+                        role: replica.role,
+                        current_progress: replica.current_progress,
+                        catch_up_capability: replica.catch_up_capability,
+                        must_catchup: replica.must_catchup,
+                    },
+                )
+                .collect(),
         };
         self.trace
             .configurations
@@ -2039,6 +2329,22 @@ impl PrimaryReplicator for TraceReplicator {
         let configuration = crate::protocol::public_operations::PublicConfiguration {
             current: current.configuration,
             previous: None,
+            replicas: current
+                .replicas
+                .into_iter()
+                .map(
+                    |replica| crate::protocol::public_operations::PublicReplicaDescriptor {
+                        build_id: replica.build_id,
+                        identity: replica.identity,
+                        replication_address: replica.replication_address,
+                        process_session_id: replica.process_session_id,
+                        role: replica.role,
+                        current_progress: replica.current_progress,
+                        catch_up_capability: replica.catch_up_capability,
+                        must_catchup: replica.must_catchup,
+                    },
+                )
+                .collect(),
         };
         self.trace
             .configurations
@@ -2110,6 +2416,7 @@ fn trace_fixture() -> (
         lifecycle_closed: lifecycle_closed.clone(),
         containment: watch::channel(true).0,
         cancel_descendant_with_root: AtomicBool::new(false),
+        endpoint: Mutex::new(None),
     });
     let state_replicator = Arc::new(TraceStateReplicator {
         trace: trace.clone(),

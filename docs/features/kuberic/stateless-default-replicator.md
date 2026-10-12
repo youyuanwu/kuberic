@@ -124,7 +124,7 @@ engine to treat parts of that database as its own durable state.
 | Replica/PVC identity and incarnation fencing | Agent SQLite | Reload and validate before opening the service |
 | Previous/current configuration, epoch and role intent | Agent SQLite | Replay into a new replicator instance |
 | Reconfiguration effect intent and completion | Agent SQLite | Reissue or observe through the normal effect protocol |
-| Build requirement, exact source/target/session authorization and terminal public completion | Agent public build store | Reload and reissue the public build operation |
+| Build requirement, exact source/target/session identity and terminal public completion | Agent public build store | Reload and reissue the public build operation |
 | Application data, applied tail and committed LSN | State provider / `DurableState` | Query during replicator reconstruction |
 | Retained replication operations | `DurableState` | Enumerate when peer catch-up requires them |
 | Copy snapshot bytes | `StateProvider` | Regenerate from a frozen committed boundary |
@@ -148,10 +148,10 @@ The public boundary includes both construction and runtime interfaces:
 
 The protected method sets of `Replicator`, `PrimaryReplicator`,
 `StateReplicator`, `StateProvider` and `DurableState` remain unchanged.
-Public construction and value types may gain immutable transport/security
-configuration, capability metadata and signed operation values, but they must
-not carry runtime callbacks, agent-store handles or host-only lifecycle
-capabilities. `ReplicatorInterfaces` returns only the standard public handles
+Public construction and value types may gain immutable transport configuration
+and capability metadata, but they must not carry runtime callbacks,
+agent-store handles or host-only lifecycle capabilities.
+`ReplicatorInterfaces` returns only the standard public handles
 plus immutable `ReplicatorCapabilities` bound to the same creation identity.
 
 `ReplicatorCapabilities` initially contains:
@@ -174,37 +174,30 @@ disposition: a replacement creation must support that disposition or take the
 stricter retirement path; it can never upgrade `ReplaceOnAmbiguity` to
 `Convergent`.
 
-`ReplicaInformation` may carry an optional signed `BuildAuthorization` only
-for the exact `build_replica` call. It is a control-plane-signed transport
-capability, not configuration membership and not a private callback. It is
+`ReplicaInformation` carries the exact build ID, target identity, process
+session and address for the one `build_replica` call. This is build-attempt
+identity, not configuration membership and not a private callback. It is
 absent from active PC/CC descriptions.
 
-Active remote entries instead carry a signed `PeerSessionAuthorization`.
-It binds `HistoryContext`, epoch, current/previous configuration IDs, primary
-identity/session, secondary identity/session, addresses and protocol
-generation. The primary receives it through its public configuration
-description and presents it during the authenticated peer handshake. A
-secondary validates the signature plus its local role, epoch, identity and
-process session; it does not receive a primary-only configuration callback.
-Thus public primary configuration remains the membership source while the
-signed value is the target-side proof of that membership.
+Active remote entries carry exact peer identity, process session, address and
+progress. Public primary configuration remains the membership source. A
+secondary still does not receive a primary-only configuration callback; its
+local role and epoch barriers fence predecessor traffic.
 
 Primary process-session replacement is never authorized within the same epoch.
-Any primary session change or peer-authorization withdrawal creates a newer
+Any primary session change or peer withdrawal creates a newer
 configuration epoch. The runtime first closes affected access/peer ingress,
 delivers the public `update_epoch` barrier to every surviving secondary and
 only then enters replacement primary role. Fresh primary configuration follows
-role and carries the newly signed peer authorizations before connection.
-`update_epoch` invalidates all predecessor peer sessions/tokens. There is no
+role and carries the new exact peer descriptors before connection.
+`update_epoch` invalidates all predecessor peer sessions. There is no
 same-epoch source-session substitution.
 
-Both authorization types use a canonical, versioned encoding and a
-per-resource asymmetric signing key created for the fresh protocol generation.
-Only the controller holds the private key in a Kubernetes Secret. The
-verification key and key ID are immutable `ReplicatorSettings`; agents verify
-signed commands before retaining/delivering them and persist only the exact
-authorization plus its digest for audit. Key rotation creates a new protocol
-generation while access is closed; it is not an online mixed-key operation.
+Public V1 does not currently authenticate these transport descriptors. Exact
+identity/session checks provide lifecycle correctness but are not proof of the
+remote process. TLS identity, workload identity or token authentication may be
+added later; this document records the gap without defining an activation
+policy.
 
 The public value contract defines `INVALID_LSN = -1`; zero remains a valid
 empty-history boundary. Build descriptors and "Replicator already owns this
@@ -259,7 +252,7 @@ does not promise universal exactly-once external mutation.
 | Open, role, epoch, configuration and settings | Exact duplicate input must be convergent. A new process reconstructs a new object and replays current state. |
 | Progress queries | Read-only and repeatable; fresh values replace no durable completion evidence. |
 | Catch-up wait | Re-evaluate the exact captured configuration, mode and capability. Completion is retained only for the exact operation/revision. |
-| Build | A terminal retained success is not reinvoked. An ambiguous live attempt is cancelled by retiring its source/target process sessions and reissued with a new build ID, target generation and signed capability. |
+| Build | A terminal retained success is not reinvoked. An ambiguous live attempt is cancelled by retiring its source/target process sessions and reissued with a new build ID and target generation. |
 | Remove | Repeated removal of the exact retired identity must converge to resources absent. It never races a live build. |
 | Application role/address | Replayed role must converge; publication uses only the latest exact completion and clears stale addresses. |
 | Close/abort/fault containment | Repeated containment is idempotent. Child close failure is normalized after abort cleanup while diagnostics retain the child error. |
@@ -358,11 +351,10 @@ A default-replicator restart follows this order:
 6. Start unassigned/access-closed and publish a
    `ProcessSessionRenewalRequired` observation containing provider-derived
    election progress. Do not replay predecessor serving role, PC/CC
-   configuration or peer authorizations.
+   configuration or peer sessions.
 7. The controller admits a newer configuration epoch bound to the new process
-   session and creates new signed peer authorizations, but does not yet apply
-   primary configuration. A restarted former primary is not permitted to
-   resume primary under its predecessor epoch.
+   session, but does not yet apply primary configuration. A restarted former
+   primary is not permitted to resume primary under its predecessor epoch.
 8. Close affected ingress and complete the newer `update_epoch` barrier on
    every already-running surviving secondary.
 9. Replay the replacement process role under the newer epoch. For primary
@@ -371,7 +363,7 @@ A default-replicator restart follows this order:
 10. If no data-loss operation is pending, install the newly authorized
     agent-owned PC/CC configuration.
 11. Recreate peer sessions only from that new public configuration and its
-    current addresses, process sessions and signed authorizations.
+    current addresses and process sessions.
 12. Reconcile application progress with peer progress.
 13. Grant read or write access only after the reconstructed configuration,
     epoch, quorum and application progress satisfy the normal activation
@@ -380,7 +372,7 @@ A default-replicator restart follows this order:
 The engine session and generation remain process-local fences. A restarted
 engine always has a new session and cannot complete work prepared by its
 predecessor. Durable old authority remains recovery input for controller
-planning, not executable peer authorization for the new process.
+planning, not an executable peer session for the new process.
 
 ### Progress Reconstruction
 
@@ -478,20 +470,16 @@ Corrective rebuild uses the existing public build/copy interfaces:
    authorizes a new build ID, source and target process session;
 5. the replacement opens with empty provider storage in repair-only
    `IdleSecondary` state;
-6. the source receives a control-plane-signed public `BuildAuthorization` in the
-   `ReplicaInformation` build descriptor. The signed capability binds resource
-   UID, `HistoryContext`, epoch, source/target identities and process sessions,
-   target storage generation, build ID and protocol generation;
-7. the source presents that capability in the authenticated copy handshake.
-   The target validates its signature against immutable public trust settings
-   plus its local identity, process session, storage generation, idle role,
-   epoch and empty-provider state. The target does not require a primary
-   configuration callback and the idle target remains outside PC/CC;
-8. authorization withdrawal aborts and retires the exact target process
-   session. A replacement attempt always uses a new target process/storage
-   generation and a new capability; same-session reauthorization is not
-   supported. This uses existing public close/abort fencing instead of a
-   private target callback;
+6. the source receives the exact target identity, process session, address and
+   build ID in the `ReplicaInformation` build descriptor;
+7. the target checks its local identity, process session, idle role, epoch and
+   empty-provider state. The target does not require a primary configuration
+   callback and remains outside PC/CC. These checks do not authenticate the
+   network peer;
+8. build withdrawal aborts and retires the exact target process session. A
+   replacement attempt always uses a new target process/storage generation and
+   build ID. This uses existing public close/abort fencing instead of a private
+   target callback;
 9. `DurableState::finish_copy` promotes the copy in the replacement storage;
 10. retained catch-up and public build completion settle the new history before
    the replacement can join PC/CC.
@@ -659,26 +647,21 @@ peer-session replacement, send windows, ACK processing and copy delivery.
 - `ReplicatorSettings` supplies public bind/publish, security and
   build-capability verification configuration.
 - `ReplicatorFactoryContext` supplies public replica and partition identity.
-- `ReplicaInformation` supplies peer address, replica identity, build identity,
-  process session and the applicable signed authorization. Active PC/CC
-  descriptions carry `PeerSessionAuthorization` and omit build authorization;
-  only the exact source-side `build_replica` descriptor carries
-  `BuildAuthorization`.
+- `ReplicaInformation` supplies peer address, replica identity, build identity
+  and process session. Active PC/CC descriptions carry exact remote peer
+  descriptors; only the source-side `build_replica` descriptor carries the
+  build attempt identity.
 - `Replicator::open` binds the listener and returns the published address.
 - `Replicator::close` and `abort` stop the listener and all descendant work.
 
 The agent retains its control and peer-discovery endpoints, but no longer
 serves or dispatches replication/copy RPCs for the default Replicator. Public
 configuration is the only source of peer membership; exact process-session
-checks reject predecessor connections and ACKs. The primary presents the
-configuration-derived peer authorization in its handshake, allowing a
-restarted/same-role secondary to reject a predecessor primary without a
-private host callback. A new primary or secondary process session requires a
-newer configuration epoch, completed secondary `update_epoch` barriers and a
-new signed authorization delivered through a fresh primary configuration
-completion before traffic. Build authorization is not peer membership: it is a
-one-attempt transport capability presented by the source and validated by the
-idle target.
+checks reject predecessor connections and ACKs. A new primary or secondary
+process session requires a newer configuration epoch, completed secondary
+`update_epoch` barriers and a fresh primary configuration completion before
+traffic. Build attempt identity is not peer membership and the idle target
+remains outside PC/CC.
 
 ## Write and Acknowledgement Contract
 
@@ -805,7 +788,7 @@ For every deployment, including SQLite, KVStore2 and PostgreSQL:
    signing/command credential;
 7. initialize fresh agent and provider storage;
 8. bootstrap new authority from the empty deployment;
-9. build the remaining replicas through the signed public build path;
+9. build the remaining replicas through the public build path;
 10. enable application traffic only after all required public recovery
    operations complete.
 
@@ -913,6 +896,13 @@ This phase is the implementation breakdown for alignment Phase 5. It changes
 the runtime/controller contract under a new protocol version that is not
 activated against the legacy production engine.
 
+This phase is implemented as the dormant protocol-11/schema-11 Public V1
+contract. Its shared test-only catalog executes exactly KSF-01 through KSF-16
+for the strict custom fixture and applicable PostgreSQL scenarios. KSF-09,
+KSF-10 and KSF-16 remain executable negative activation guards; the Phase 6
+replacement engine and Phase 7 replacement-only artifact are not implemented
+by this phase.
+
 - add the public configuration value required to identify `must_catchup`
   without changing protected method sets;
 - add immutable `ReplicatorCapabilities` to the coherent public bundle with
@@ -921,20 +911,15 @@ activated against the legacy production engine.
   `TransitionKind::DataLossRecovery`, controller command/effect stages, durable
   agent state and validation; permit data-loss-number change or progress reset
   only under that authorization;
-- add signed `BuildAuthorization` to the exact source-side build descriptor;
-  validate it at the target transport handshake using immutable public trust
-  configuration and local role/epoch/identity/session/storage state;
-- add signed `PeerSessionAuthorization` to active remote configuration entries;
-  require the primary to present it during handshake and the same-role/restarted
-  secondary to validate it from local lifecycle state, without a
-  primary-only callback on the secondary;
+- add exact build ID, target identity, process session and address to the
+  source-side build descriptor; validate local role/epoch/identity/session and
+  storage state at the target;
+- add exact peer identity, process session and address to active remote
+  configuration entries, without a primary-only callback on the secondary;
 - prohibit same-epoch primary process-session substitution. Every replacement
   primary session requires a newer configuration epoch, access/peer-ingress
-  closure, completed secondary `update_epoch` barriers and newly signed peer
-  authorizations before traffic;
-- define canonical token encoding, controller-only per-resource signing-key
-  ownership, immutable verification-key provisioning, digest auditing and
-  fresh-protocol-generation key rotation;
+  closure, completed secondary `update_epoch` barriers and fresh peer
+  configuration before traffic;
 - retire the exact target process/storage generation to revoke or replace a
   build; do not install primary configuration on the idle target;
 - project only up, ready remote secondaries into current/previous
@@ -959,13 +944,13 @@ activated against the legacy production engine.
   semantics;
 - define `ReplicaRebuildRequired` propagation through public errors, durable
   operation failure and public partition fault reporting;
-- add a new agent-owned public build store containing exact authorization and
-  terminal public completion but no engine continuation cursor;
+- add a new agent-owned public build store containing exact attempt identity
+  and terminal public completion but no engine continuation cursor;
 - update PostgreSQL and other custom replicators to satisfy the new public
-  role/epoch, progress, build authorization, error and data-loss replay
+  role/epoch, progress, build identity, error and data-loss replay
   semantics. PostgreSQL must accept primary role before configuration, accept
   epoch barriers without requiring preinstalled configuration, replace
-  configuration-membership build validation with signed target authorization,
+  configuration-membership build validation with exact target identity,
   and replace its current unsupported data-loss callback with either exact
   timeline/history validation or a typed rebuild-required result;
 - bump the report/protocol/store versions and reject every old persisted
@@ -977,25 +962,25 @@ Controller work:
 
 - update `kuberic-runtime/src/protocol/types.rs`, `protocol/command.rs` and
   `protocol/validation.rs` for protocol/history generations,
-  `DataLossRecovery`, session renewal and signed authorization;
+  `DataLossRecovery` and session renewal;
 - update `kuberic-controller/src/evaluator.rs` and transition modules to compare
   only compatible histories, select provisional rather than serving-ready
   primaries, advance epoch for process replacement, decide data-loss recovery
-  versus rebuild and mint exact peer/build authorization;
+  versus rebuild and retain exact peer/build identity;
 - update `kuberic-controller/src/executor.rs`, `reconciler.rs` and
-  `cluster_api.rs` to deliver fenced typed commands, manage signing/verification
-  material and reject stale protocol/resource/session identities;
+  `cluster_api.rs` to deliver fenced typed commands and reject stale
+  protocol/resource/session identities;
 - update `kuberic-controller/src/crd.rs`, normalization and runtime reporting so
   status contains public progress, history/incarnation identity and exact
   public-operation completion but no private verified/quorum/committed/build
   boundary;
 - extend controller protocol/model/integration tests to cover delayed reports,
-  incomparable histories, replacement session renewal, data-loss authorization,
-  signed build/peer values and corrective replacement.
+  incomparable histories, replacement session renewal, data-loss
+  authorization, exact build/peer identity and corrective replacement.
 
 Exit criteria:
 
-- capability, history, data-loss and build-authorization values have one public
+- capability, history, data-loss and build-attempt values have one public
   representation and deterministic durable replay rule;
 - ordinary failover still rejects a data-loss-number change, while a typed
   controller authorization invalidates old history/election/build/replay
@@ -1004,11 +989,11 @@ Exit criteria:
   capabilities cannot weaken the logical authorization's captured replay
   disposition;
 - public configuration excludes local and idle targets, build input carries
-  invalid target progress plus signed authorization, and swap mode selection
+  invalid target progress plus exact attempt identity, and swap mode selection
   follows the captured capability;
 - predecessor-first connections after secondary restart and primary
-  replacement are rejected before and after successor authorization; the old
-  token's epoch is invalid after the mandatory secondary barrier;
+  replacement are rejected before and after successor admission; the old
+  session's epoch is invalid after the mandatory secondary barrier;
 - exact build completion admits a new storage incarnation into the source
   history while the retired incarnation's identity/progress remains fenced;
 - PostgreSQL passes the strict public oracle through the new role/epoch/build
@@ -1128,8 +1113,8 @@ yet.
 - remove `LegacyManaged` selection and every fallback/crossed-selection path;
 - build the deployment artifact with only the stateless factory and
   Replicator-owned transport;
-- include the replacement controller, protocol/CRD schema, signing-key
-  provisioning, cutover Lease and namespace-scoped RBAC in the same release;
+- include the replacement controller, protocol/CRD schema, cutover Lease and
+  namespace-scoped RBAC in the same release;
 - run all fresh-state conformance/live suites against the exact artifact and
   record its immutable image digest with the KSF gate results.
 
@@ -1160,10 +1145,10 @@ This phase is the offline activation portion of alignment Phase 7.
   so already-accepted delayed mutations cannot affect the replacement;
 - deploy only the Phase 5 replacement-only controller/runtime/Replicator and
   provider artifact; the new controller uses a fresh protocol generation,
-  signing key, command credential and namespace-scoped mutation RBAC and must
-  acquire the Lease before reconciling;
+  command credential and namespace-scoped mutation RBAC and must acquire the
+  Lease before reconciling;
 - initialize fresh controller, authority and provider state;
-- build the remaining replicas through signed public build authorization;
+- build the remaining replicas through exact public build attempts;
 - start custom-replicator applications from fresh identity and storage under
   the new public contract;
 - reject mixed-version participation and enable application traffic only after
@@ -1217,8 +1202,8 @@ unit tests. The canonical behavior and KSF finding identifiers come from
   replication completion remains pending until both PC and CC quorums commit;
 - verify specific-quorum swap ordering, successor inclusion and the `All`
   fallback;
-- pass invalid target progress plus exact signed authorization to build,
-  validate it at the idle target and exclude every in-build target from
+- pass invalid target progress plus exact target/build/session identity to
+  build, validate local target state and exclude every in-build target from
   configuration;
 - withdraw a build by retiring its exact target process/storage generation;
   reject the old capability after restart and require a new capability for a
@@ -1242,7 +1227,7 @@ unit tests. The canonical behavior and KSF finding identifiers come from
 
 - crash before and after replicator creation;
 - restart a primary process without changing logical membership, prove it
-  remains unassigned/access-closed, rejects predecessor PC/CC and peer tokens,
+  remains unassigned/access-closed, rejects predecessor PC/CC and peer sessions,
   then resumes only after controller-issued higher-epoch session renewal and
   completed secondary barriers;
 - crash after role replay but before epoch completion;

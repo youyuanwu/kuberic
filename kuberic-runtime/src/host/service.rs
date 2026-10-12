@@ -1109,9 +1109,10 @@ where
             }
             #[cfg(feature = "testing")]
             ProtocolCommand::RestartReplicaProcess(_)
-            | ProtocolCommand::DropReplicaIncarnation(_) => {
+            | ProtocolCommand::DropReplicaIncarnation(_)
+            | ProtocolCommand::PublicV1History(_) => {
                 return Err(Status::failed_precondition(
-                    "preview fault commands require the repository-only supervisor path",
+                    "preview commands require a repository-only dispatch path",
                 ));
             }
         }

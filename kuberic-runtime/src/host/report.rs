@@ -219,6 +219,7 @@ fn build_report(
         scale_up_intent: state
             .scale_up_evidence
             .map(|evidence| evidence.intent().clone().into()),
+        public_v1: None,
     }
 }
 

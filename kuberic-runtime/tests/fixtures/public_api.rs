@@ -8,10 +8,16 @@ use kuberic_runtime::host::{
     ReplicaHandle, ReplicaHost, ReplicaProcessConfig, RunningReplica,
 };
 use kuberic_runtime::protocol::types::{Epoch, OperationId, ReplicaRole};
-use kuberic_runtime::replicator::{PrimaryReplicator, Replicator, ReplicatorInterfaces};
+use kuberic_runtime::replicator::{
+    PrimaryReplicator, Replicator, ReplicatorCapabilities, ReplicatorInterfaces,
+};
 
 fn ordinary_application(control: Arc<dyn Replicator>, primary: Arc<dyn PrimaryReplicator>) {
-    let _ = ReplicatorInterfaces::secondary(control, None);
+    let _ = ReplicatorInterfaces::secondary(
+        control,
+        None,
+        ReplicatorCapabilities::conservative(),
+    );
     let _ = primary.change_role(Epoch::new(1, 2), ReplicaRole::Primary);
     let _ = ClientWrite {
         operation_id: OperationId::new("external-write"),

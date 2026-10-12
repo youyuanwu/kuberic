@@ -335,7 +335,7 @@ where
             &endpoint.identity,
             &target_session,
             target_command,
-        ));
+        )?);
         add_bearer_token(&mut request, &self.bearer_token)?;
         let response = tokio::time::timeout(self.deadline, control.execute(request))
             .await
@@ -630,8 +630,8 @@ fn build_target_admission_request(
     target: &ReplicaIdentity,
     target_session: &ProcessSessionId,
     command: EnsureReplicaBuild,
-) -> proto::ExecuteCommandRequest {
-    proto::ExecuteCommandRequest {
+) -> Result<proto::ExecuteCommandRequest> {
+    Ok(proto::ExecuteCommandRequest {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         resource_uid: resource_uid.to_string(),
         target: Some(target.clone().into()),
@@ -639,7 +639,7 @@ fn build_target_admission_request(
         command: Some(proto::execute_command_request::Command::EnsureReplicaBuild(
             ensure_build_to_proto(command),
         )),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -669,7 +669,8 @@ mod build_request_tests {
                 source_session_id: None,
                 retire: false,
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(request.expected_process_session_id, "session-2");
         assert_eq!(
@@ -876,7 +877,7 @@ async fn deliver_outbound_with_runtime<D: OutboundDispatcher>(
             (sender.queue(outbound.clone()), sender.retry_delay())
         };
         match queued {
-            Ok(queued) => break sender_outbound_to_queued(queued),
+            Ok(queued) => break sender_outbound_to_queued(queued)?,
             Err(RuntimeError::ReconfigurationPending) => {
                 if let Some(receiver) = domain_outbound_receiver(&outbound) {
                     let _ = dispatcher.refresh_peer(receiver).await;
@@ -1112,8 +1113,8 @@ async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
-fn sender_outbound_to_queued(outbound: SenderOutbound) -> QueuedOutbound {
-    match outbound {
+fn sender_outbound_to_queued(outbound: SenderOutbound) -> Result<QueuedOutbound> {
+    Ok(match outbound {
         SenderOutbound::Replication {
             receiver,
             sender_session,
@@ -1145,7 +1146,7 @@ fn sender_outbound_to_queued(outbound: SenderOutbound) -> QueuedOutbound {
         SenderOutbound::Build(endpoint) => QueuedOutbound::Build(endpoint),
         SenderOutbound::Remove(replica_id) => QueuedOutbound::Remove(replica_id),
         SenderOutbound::Evict(identity) => QueuedOutbound::Evict(identity),
-    }
+    })
 }
 
 fn domain_outbound_receiver(outbound: &OutboundOperation) -> Option<&ReplicaIdentity> {
@@ -1576,6 +1577,7 @@ mod tests {
                 .await
                 .queue(outbound(identity(2)))
                 .map(sender_outbound_to_queued)
+                .unwrap()
                 .unwrap();
             blocked.send(queued).unwrap();
         }
@@ -1584,6 +1586,7 @@ mod tests {
             .await
             .queue(outbound(identity(3)))
             .map(sender_outbound_to_queued)
+            .unwrap()
             .unwrap();
         healthy.send(queued).unwrap();
 

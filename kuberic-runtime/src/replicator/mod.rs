@@ -17,20 +17,21 @@ use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, LoadMetric,
     OperationId, PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
-    SecondaryRemovalWitness, SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
-    SwitchoverRequestId,
+    ReplicaStorageIncarnationContext, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
+    SecondaryScaleDownIntent, SwitchoverRequestId,
 };
 use crate::receipts::{NativeProgressStatus, NativeTopologyStatus};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
-use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
+use crate::application::{ClientWrite, INVALID_LSN, Lsn, OperationData, StateProvider};
 use crate::authority::{
     BuildAuthority, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
     ReplicaAuthorityStore, ReplicationProgressStore, RetiredAuthority,
 };
 use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
+use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -48,7 +49,12 @@ pub trait Replicator: Send + Sync {
     async fn update_epoch(&self, epoch: Epoch) -> Result<()>;
     async fn close(&self) -> Result<()>;
     fn abort(&self);
+    /// Primary: locally durable quorum-committed progress. Secondary: highest
+    /// contiguous durably accepted progress. Recovery: election-only progress
+    /// while read/write access remains closed.
     async fn current_progress(&self) -> Result<Lsn>;
+    /// Earliest retained public progress that can catch up an admitted peer.
+    /// `INVALID_LSN` means the capability is not currently known or applicable.
     async fn catch_up_capability(&self) -> Result<Lsn>;
 }
 
@@ -375,10 +381,22 @@ pub struct ReplicaInformation {
     pub role: ReplicaRole,
     pub current_progress: Lsn,
     pub catch_up_capability: Lsn,
+    pub must_catchup: bool,
+    pub storage_incarnation: Option<ReplicaStorageIncarnationContext>,
 }
 
 impl ReplicaInformation {
+    /// Compatibility constructor for an idle build target. New code should use
+    /// `idle_build` to make the invalid-progress choice explicit.
     pub fn new(
+        build_id: OperationId,
+        identity: ReplicaIdentity,
+        replication_address: String,
+    ) -> Self {
+        Self::idle_build(build_id, identity, replication_address)
+    }
+
+    pub fn idle_build(
         build_id: OperationId,
         identity: ReplicaIdentity,
         replication_address: String,
@@ -389,8 +407,71 @@ impl ReplicaInformation {
             replication_address,
             process_session_id: ProcessSessionId::default(),
             role: ReplicaRole::IdleSecondary,
-            current_progress: 0,
-            catch_up_capability: 0,
+            current_progress: INVALID_LSN,
+            catch_up_capability: INVALID_LSN,
+            must_catchup: false,
+            storage_incarnation: None,
+        }
+    }
+
+    pub fn active_peer(
+        identity: ReplicaIdentity,
+        replication_address: String,
+        process_session_id: ProcessSessionId,
+        current_progress: Lsn,
+        catch_up_capability: Lsn,
+        must_catchup: bool,
+    ) -> Result<Self> {
+        let information = Self {
+            build_id: OperationId::default(),
+            identity,
+            replication_address,
+            process_session_id,
+            role: ReplicaRole::ActiveSecondary,
+            current_progress,
+            catch_up_capability,
+            must_catchup,
+            storage_incarnation: None,
+        };
+        information.validate_public_progress()?;
+        Ok(information)
+    }
+
+    pub fn validate_public_progress(&self) -> Result<()> {
+        self.validate_progress_values()?;
+        if self.role == ReplicaRole::IdleSecondary
+            && (self.current_progress != INVALID_LSN
+                || self.catch_up_capability != INVALID_LSN
+                || self.must_catchup)
+        {
+            return Err(RuntimeError::Application(
+                "idle public build target must use INVALID_LSN".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_progress_values(&self) -> Result<()> {
+        crate::protocol::public_operations::validate_progress_value(self.current_progress)
+            .map_err(|message| RuntimeError::Application(message.into()))?;
+        crate::protocol::public_operations::validate_progress_value(self.catch_up_capability)
+            .map_err(|message| RuntimeError::Application(message.into()))?;
+        Ok(())
+    }
+}
+
+impl From<PublicReplicaDescriptor> for ReplicaInformation {
+    fn from(replica: PublicReplicaDescriptor) -> Self {
+        Self {
+            build_id: replica.build_id,
+            identity: replica.identity,
+            replication_address: replica.replication_address,
+            process_session_id: replica.process_session_id,
+            role: replica.role,
+            current_progress: replica.current_progress,
+            catch_up_capability: replica.catch_up_capability,
+            must_catchup: replica.must_catchup,
+            storage_incarnation: None,
         }
     }
 }
@@ -415,6 +496,13 @@ impl From<ConfigurationDescriptor> for ReplicaSetConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplicatorSettings {
     pub replication_address: String,
+    pub public_v1: bool,
+}
+
+impl ReplicatorSettings {
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Rust's explicit counterpart of obtaining coherent interfaces from CreateReplicator.
@@ -425,16 +513,40 @@ pub struct ReplicatorInterfaces {
     creation: Arc<ReplicatorCreation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicatorCapabilities {
+    pub catch_up_specific_quorum: bool,
+    pub data_loss_replay: DataLossReplay,
+}
+
+impl ReplicatorCapabilities {
+    pub const fn conservative() -> Self {
+        Self {
+            catch_up_specific_quorum: false,
+            data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ManagedReplicatorCapabilities {
     lifecycle: Arc<dyn ManagedReplicatorLifecycle>,
     data_plane: Arc<dyn ManagedReplicatorDataPlane>,
 }
 
+#[derive(Clone)]
+struct BoundReplicatorSettings {
+    identity: ReplicaIdentity,
+    owner: ReplicatorCreationIdentity,
+    settings: ReplicatorSettings,
+}
+
 struct ReplicatorCreation {
     identity: OnceLock<ReplicatorCreationIdentity>,
     guarded_control: StdMutex<Arc<dyn Replicator>>,
+    capabilities: ReplicatorCapabilities,
     managed: Option<ManagedReplicatorCapabilities>,
+    settings: StdMutex<Option<BoundReplicatorSettings>>,
     armed: AtomicBool,
 }
 
@@ -442,6 +554,7 @@ impl ReplicatorCreation {
     fn new(
         guarded_control: Arc<dyn Replicator>,
         identity: Option<ReplicatorCreationIdentity>,
+        capabilities: ReplicatorCapabilities,
         managed: Option<ManagedReplicatorCapabilities>,
     ) -> Self {
         let creation_identity = OnceLock::new();
@@ -453,7 +566,9 @@ impl ReplicatorCreation {
         Self {
             identity: creation_identity,
             guarded_control: StdMutex::new(guarded_control),
+            capabilities,
             managed,
+            settings: StdMutex::new(None),
             armed: AtomicBool::new(true),
         }
     }
@@ -481,6 +596,64 @@ impl ReplicatorCreation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guarded = control;
     }
+
+    fn bind_settings(&self, identity: ReplicaIdentity, settings: ReplicatorSettings) -> Result<()> {
+        settings.validate()?;
+        let owner = *self
+            .identity
+            .get()
+            .ok_or_else(|| RuntimeError::Application("replicator identity is not bound".into()))?;
+        let mut bound = self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = bound.as_ref() {
+            if existing.identity != identity
+                || existing.owner != owner
+                || existing.settings.public_v1 != settings.public_v1
+            {
+                return Err(RuntimeError::Application(
+                    "replicator registration cannot change identity or public protocol".into(),
+                ));
+            }
+            return Ok(());
+        }
+        *bound = Some(BoundReplicatorSettings {
+            identity,
+            owner,
+            settings,
+        });
+        Ok(())
+    }
+
+    fn prepare_settings_update(&self, settings: ReplicatorSettings) -> Result<ReplicatorSettings> {
+        let bound = self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing = bound.as_ref().ok_or_else(|| {
+            RuntimeError::Application("replicator settings are not registration-bound".into())
+        })?;
+        settings.validate()?;
+        if existing.settings.public_v1 != settings.public_v1 {
+            return Err(RuntimeError::Application(
+                "replicator settings cannot change the public protocol".into(),
+            ));
+        }
+        Ok(settings)
+    }
+
+    fn complete_settings_update(&self, settings: ReplicatorSettings) -> Result<()> {
+        let mut bound = self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing = bound.as_mut().ok_or_else(|| {
+            RuntimeError::Application("replicator settings are not registration-bound".into())
+        })?;
+        existing.settings = settings;
+        Ok(())
+    }
 }
 
 impl Drop for ReplicatorCreation {
@@ -499,6 +672,46 @@ impl Drop for ReplicatorCreation {
             managed.data_plane.abort();
         }
     }
+}
+
+struct ProtectedStateReplicator {
+    inner: Arc<dyn StateReplicator>,
+    creation: Arc<ReplicatorCreation>,
+}
+
+#[async_trait]
+impl StateReplicator for ProtectedStateReplicator {
+    async fn replicate(&self, data: OperationData) -> Result<Lsn> {
+        self.inner.replicate(data).await
+    }
+
+    async fn get_replication_stream(&self) -> Result<OperationStream> {
+        self.inner.get_replication_stream().await
+    }
+
+    async fn get_copy_stream(&self) -> Result<OperationStream> {
+        self.inner.get_copy_stream().await
+    }
+
+    async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()> {
+        let settings = self.creation.prepare_settings_update(settings)?;
+        self.inner
+            .update_replicator_settings(settings.clone())
+            .await?;
+        self.creation.complete_settings_update(settings)
+    }
+}
+
+fn protect_state_replicator(
+    state_replicator: Option<Arc<dyn StateReplicator>>,
+    creation: &Arc<ReplicatorCreation>,
+) -> Option<Arc<dyn StateReplicator>> {
+    state_replicator.map(|inner| {
+        Arc::new(ProtectedStateReplicator {
+            inner,
+            creation: creation.clone(),
+        }) as Arc<dyn StateReplicator>
+    })
 }
 
 #[doc(hidden)]
@@ -549,6 +762,10 @@ impl ReplicatorAttachment {
         self.primary_replicator.clone()
     }
 
+    pub(crate) fn capabilities(&self, _token: RuntimeHostToken) -> ReplicatorCapabilities {
+        self.creation.capabilities
+    }
+
     fn disarm(&self) {
         self.creation.armed.store(false, Ordering::Release);
     }
@@ -563,8 +780,15 @@ impl ReplicatorInterfaces {
     pub fn secondary(
         replicator: Arc<dyn Replicator>,
         state_replicator: Option<Arc<dyn StateReplicator>>,
+        capabilities: ReplicatorCapabilities,
     ) -> Self {
-        let creation = Arc::new(ReplicatorCreation::new(replicator.clone(), None, None));
+        let creation = Arc::new(ReplicatorCreation::new(
+            replicator.clone(),
+            None,
+            capabilities,
+            None,
+        ));
+        let state_replicator = protect_state_replicator(state_replicator, &creation);
         Self {
             replicator,
             state_replicator,
@@ -576,13 +800,20 @@ impl ReplicatorInterfaces {
     pub fn primary<T>(
         primary_replicator: Arc<T>,
         state_replicator: Option<Arc<dyn StateReplicator>>,
+        capabilities: ReplicatorCapabilities,
     ) -> Self
     where
         T: PrimaryReplicator + 'static,
     {
         let replicator: Arc<dyn Replicator> = primary_replicator.clone();
         let primary_replicator: Arc<dyn PrimaryReplicator> = primary_replicator;
-        let creation = Arc::new(ReplicatorCreation::new(replicator.clone(), None, None));
+        let creation = Arc::new(ReplicatorCreation::new(
+            replicator.clone(),
+            None,
+            capabilities,
+            None,
+        ));
+        let state_replicator = protect_state_replicator(state_replicator, &creation);
         Self {
             replicator,
             state_replicator,
@@ -595,6 +826,7 @@ impl ReplicatorInterfaces {
         identity: ReplicatorCreationIdentity,
         primary_replicator: Arc<T>,
         state_replicator: Option<Arc<dyn StateReplicator>>,
+        capabilities: ReplicatorCapabilities,
         managed: Arc<M>,
     ) -> Self
     where
@@ -608,11 +840,13 @@ impl ReplicatorInterfaces {
         let creation = Arc::new(ReplicatorCreation::new(
             replicator.clone(),
             Some(identity),
+            capabilities,
             Some(ManagedReplicatorCapabilities {
                 lifecycle,
                 data_plane,
             }),
         ));
+        let state_replicator = protect_state_replicator(state_replicator, &creation);
         Self {
             replicator,
             state_replicator,
@@ -628,13 +862,20 @@ impl ReplicatorInterfaces {
         identity: ReplicatorCreationIdentity,
         primary_replicator: Arc<T>,
         state_replicator: Option<Arc<dyn StateReplicator>>,
+        capabilities: ReplicatorCapabilities,
         managed: Arc<M>,
     ) -> Self
     where
         T: PrimaryReplicator + 'static,
         M: ManagedReplicatorLifecycle + ManagedReplicatorDataPlane + 'static,
     {
-        Self::managed_primary(identity, primary_replicator, state_replicator, managed)
+        Self::managed_primary(
+            identity,
+            primary_replicator,
+            state_replicator,
+            capabilities,
+            managed,
+        )
     }
 
     /// Replaces the public primary interfaces while preserving this bundle's
@@ -650,6 +891,7 @@ impl ReplicatorInterfaces {
         let replicator: Arc<dyn Replicator> = primary_replicator.clone();
         let primary_replicator: Arc<dyn PrimaryReplicator> = primary_replicator;
         self.creation.replace_guarded_control(replicator.clone());
+        let state_replicator = protect_state_replicator(state_replicator, &self.creation);
         Self {
             replicator,
             state_replicator,
@@ -668,6 +910,10 @@ impl ReplicatorInterfaces {
 
     pub fn primary_replicator(&self) -> Option<Arc<dyn PrimaryReplicator>> {
         self.primary_replicator.clone()
+    }
+
+    pub fn capabilities(&self) -> ReplicatorCapabilities {
+        self.creation.capabilities
     }
 
     fn prepare_attachment(
@@ -697,6 +943,7 @@ impl ReplicatorInterfaces {
 #[derive(Clone)]
 pub struct ReplicatorFactoryContext {
     identity: ReplicaIdentity,
+    process_session_id: ProcessSessionId,
     access: Arc<dyn PartitionAccessView>,
     reservation: Option<ReplicatorCreationReservation>,
     pub(crate) default_dependencies: Option<DefaultReplicatorDependencies>,
@@ -707,11 +954,13 @@ impl ReplicatorFactoryContext {
     pub(crate) fn new(
         _token: RuntimeHostToken,
         identity: ReplicaIdentity,
+        process_session_id: ProcessSessionId,
         access: Arc<dyn PartitionAccessView>,
         default_dependencies: DefaultReplicatorDependencies,
     ) -> Self {
         Self {
             identity,
+            process_session_id,
             access,
             reservation: None,
             default_dependencies: Some(default_dependencies),
@@ -720,6 +969,13 @@ impl ReplicatorFactoryContext {
 
     pub fn identity(&self) -> Result<ReplicaIdentity> {
         Ok(self.identity.clone())
+    }
+
+    pub fn process_session_id(&self) -> Result<ProcessSessionId> {
+        if self.process_session_id.is_empty() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(self.process_session_id.clone())
     }
 
     pub async fn write_status(&self) -> Result<AccessStatus> {
@@ -879,12 +1135,9 @@ impl StatefulServicePartition {
         })?;
         let reservation = self.registration.reserve_replicator_creation()?;
         let context = self.context.for_creation(reservation);
+        let settings = settings.unwrap_or_default();
         let interfaces = match factory
-            .create_replicator(
-                context,
-                state_provider.clone(),
-                settings.unwrap_or_default(),
-            )
+            .create_replicator(context, state_provider.clone(), settings.clone())
             .await
         {
             Ok(interfaces) => interfaces,
@@ -900,6 +1153,13 @@ impl StatefulServicePartition {
                 return Err(error);
             }
         };
+        if let Err(error) = interfaces
+            .creation
+            .bind_settings(self.context.identity.clone(), settings)
+        {
+            self.registration.cancel_replicator_creation(reservation);
+            return Err(error);
+        }
         if let Err(error) = self
             .registration
             .register_interfaces(&attachment, state_provider, reservation)
@@ -975,6 +1235,10 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
             context.creation_identity()?,
             replicator,
             Some(state_replicator),
+            ReplicatorCapabilities {
+                catch_up_specific_quorum: true,
+                data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
+            },
             engine,
         ))
     }
@@ -1045,6 +1309,9 @@ impl PrimaryReplicator for DefaultReplicator {
         current: ReplicaSetConfiguration,
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
+        for replica in current.replicas.iter().chain(&previous.replicas) {
+            replica.validate_progress_values()?;
+        }
         self.engine
             .configure_replicas(current.configuration, Some(previous.configuration))
             .await
@@ -1058,12 +1325,16 @@ impl PrimaryReplicator for DefaultReplicator {
         &self,
         current: ReplicaSetConfiguration,
     ) -> Result<()> {
+        for replica in &current.replicas {
+            replica.validate_progress_values()?;
+        }
         self.engine
             .configure_replicas(current.configuration, None)
             .await
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        replica.validate_progress_values()?;
         self.engine.wait_for_build(replica).await
     }
 

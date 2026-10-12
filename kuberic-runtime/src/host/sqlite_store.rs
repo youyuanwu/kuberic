@@ -15,9 +15,11 @@ use crate::effects::{
 use crate::error::{ContractError, ContractResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use crate::protocol::public_operations::PreviewLifecycleBinding;
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::public_operations::PublicOperationIntent;
 use crate::protocol::public_operations::PublicOperationPreviewIdentity;
+#[cfg(any(test, feature = "testing"))]
+use crate::protocol::public_operations::{
+    DataLossRenewalDecision, PossibleDataLossIntent, PublicOperationIntent,
+};
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 use crate::protocol::public_operations::{
     PublicFaultAction, RestartActionRecord, RestartActionStage,
@@ -31,19 +33,20 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::host::Result;
 use crate::host::command::is_access_only_configuration;
+#[cfg(any(test, feature = "testing"))]
+use crate::host::public_build_store::{PublicV1BuildRecord, PublicV1BuildRetirement};
+#[cfg(any(test, feature = "testing"))]
+use crate::host::state::PublicOperationContainment;
 use crate::host::state::{
     AgentState, CoordinatorStage, DeactivationState, EffectStage,
-    PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, PendingEffect, PublicOperationPreviewState,
-    ReconfigurationRecord, RetainedCommandResult, RetainedResult, SCHEMA_VERSION, StorageIdentity,
+    PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PendingEffect,
+    PublicInstructionOutcome, PublicOperationDisposition, PublicOperationPreviewState,
+    PublicOperationRecord, PublicOperationStage, ReconfigurationRecord, RetainedCommandResult,
+    RetainedResult, SCHEMA_VERSION, StorageIdentity,
 };
-#[cfg(any(test, feature = "testing"))]
-use crate::host::state::{
-    PublicOperationContainment, PublicOperationDisposition, PublicOperationRecord,
-    PublicOperationStage,
-};
-#[cfg(any(test, feature = "testing"))]
-use crate::host::store::BeginPublicOperation;
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
+#[cfg(any(test, feature = "testing"))]
+use crate::host::store::{BeginPublicOperation, RenewPublicDataLossAttempt};
 
 fn switchover_receipt_matches(
     receipt: &crate::receipts::SwitchoverReceipt,
@@ -153,6 +156,143 @@ fn apply_process_completion(
 
 const DATABASE_FILE: &str = "agent.sqlite3";
 
+fn preview_schema_version(preview: &PublicOperationPreviewIdentity) -> u32 {
+    if preview.is_public_v1() {
+        PUBLIC_V1_PREVIEW_SCHEMA_VERSION
+    } else {
+        PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION
+    }
+}
+
+fn validate_public_v1_state(state: &AgentState) -> Result<()> {
+    let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+        crate::host::HostError::Corrupt("schema-11 store lacks public-v1 preview state".into())
+    })?;
+    if !preview.identity.is_public_v1() {
+        return Err(crate::host::HostError::Corrupt(
+            "schema-11 store contains another preview identity".into(),
+        ));
+    }
+    for (operation_id, operation) in &preview.operations {
+        operation.intent.validate().map_err(|message| {
+            crate::host::HostError::Corrupt(format!(
+                "invalid schema-11 operation {operation_id}: {message}"
+            ))
+        })?;
+        if operation_id != &operation.intent.operation_id {
+            return Err(crate::host::HostError::Corrupt(
+                "schema-11 operation key differs from its intent".into(),
+            ));
+        }
+        operation
+            .accepted_history
+            .as_ref()
+            .ok_or_else(|| {
+                crate::host::HostError::Corrupt("schema-11 operation lacks accepted history".into())
+            })?
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+        operation
+            .accepted_storage
+            .as_ref()
+            .ok_or_else(|| {
+                crate::host::HostError::Corrupt(
+                    "schema-11 operation lacks accepted storage incarnation".into(),
+                )
+            })?
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+    }
+    for (operation_id, build_record) in &preview.build_records {
+        build_record
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+        if operation_id != &build_record.operation_id {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record key differs from its operation".into(),
+            ));
+        }
+        let operation = preview.operations.get(operation_id).ok_or_else(|| {
+            crate::host::HostError::Corrupt(
+                "public-v1 build record lacks its durable operation".into(),
+            )
+        })?;
+        let Some(crate::protocol::public_operations::PublicOperationProgram::Build(build)) =
+            operation.intent.program.as_ref()
+        else {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record operation has another call kind".into(),
+            ));
+        };
+        if operation.intent.revision != build_record.admission_revision
+            || operation.accepted_history.as_ref() != Some(&build_record.history)
+            || operation.accepted_storage.as_ref() != Some(&build_record.source_storage)
+            || build.attempt != build_record.build_id
+            || build.epoch != build_record.epoch
+            || build.history.as_ref() != Some(&build_record.history)
+            || build.replica != build_record.target
+            || build.target_storage != build_record.target_storage
+            || build.process_session_id != build_record.target_session
+            || build.replication_address != build_record.target_address
+            || operation.intent.process_session_id != build_record.source_session
+        {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record differs from its accepted intent".into(),
+            ));
+        }
+        let expected_result = public_v1_build_result(operation);
+        if build_record.result != expected_result
+            || (operation.stage == PublicOperationStage::Completed && build_record.result.is_none())
+        {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record terminal result differs from its operation".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn public_v1_build_result(
+    operation: &PublicOperationRecord,
+) -> Option<crate::protocol::public_operations::PublicV1OperationResult> {
+    if let Some(PublicInstructionOutcome::RebuildRequired(rebuild)) = operation
+        .lifecycle
+        .outcomes
+        .iter()
+        .find(|outcome| matches!(outcome, PublicInstructionOutcome::RebuildRequired(_)))
+    {
+        return Some(
+            crate::protocol::public_operations::PublicV1OperationResult::RebuildRequired(
+                rebuild.clone(),
+            ),
+        );
+    }
+    operation
+        .disposition
+        .as_ref()
+        .map(|disposition| match disposition {
+            PublicOperationDisposition::Succeeded => {
+                crate::protocol::public_operations::PublicV1OperationResult::Succeeded
+            }
+            PublicOperationDisposition::Failed(message) => {
+                crate::protocol::public_operations::PublicV1OperationResult::Failed(message.clone())
+            }
+            PublicOperationDisposition::Ambiguous(message) => {
+                crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                    message.clone(),
+                )
+            }
+            PublicOperationDisposition::Cancelled => {
+                crate::protocol::public_operations::PublicV1OperationResult::Cancelled
+            }
+            PublicOperationDisposition::Attached(owner) => {
+                crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(format!(
+                    "attached to {owner}"
+                ))
+            }
+        })
+}
+
 pub(crate) struct SqliteStore {
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     path: PathBuf,
@@ -195,7 +335,7 @@ impl SqliteStore {
                 "public-operation preview state is already initialized".into(),
             ));
         }
-        state.identity.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+        state.identity.schema_version = preview_schema_version(&preview);
         state.public_operation_preview = Some(PublicOperationPreviewState::new(preview));
         Self::create_store(path, state)
     }
@@ -219,18 +359,18 @@ impl SqliteStore {
                 "public-operation preview state is already initialized".into(),
             ));
         }
-        state.identity.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+        state.identity.schema_version = preview_schema_version(&binding.preview);
         state.public_operation_preview = Some(PublicOperationPreviewState::new_bound(binding));
         Self::create_store(path, state)
     }
 
     fn create_store(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let expected_version = if state.public_operation_preview.is_some() {
-            PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION
-        } else {
-            SCHEMA_VERSION
-        };
+        let expected_version = state
+            .public_operation_preview
+            .as_ref()
+            .map(|preview| preview_schema_version(&preview.identity))
+            .unwrap_or(SCHEMA_VERSION);
         if state.identity.schema_version != expected_version {
             return Err(crate::host::HostError::SchemaMismatch {
                 expected: expected_version,
@@ -345,9 +485,10 @@ impl SqliteStore {
         validate_integrity(&connection)
             .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION {
+        let expected_version = preview_schema_version(expected_preview);
+        if version != expected_version {
             return Err(crate::host::HostError::SchemaMismatch {
-                expected: PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION,
+                expected: expected_version,
                 observed: version,
             });
         }
@@ -360,7 +501,7 @@ impl SqliteStore {
         }
         if let Some(expected) = expected_identity {
             let mut expected = expected.clone();
-            expected.schema_version = PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION;
+            expected.schema_version = expected_version;
             if state.identity != expected {
                 return Err(crate::host::HostError::IdentityMismatch(
                     "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
@@ -377,6 +518,9 @@ impl SqliteStore {
             return Err(crate::host::HostError::IdentityMismatch(
                 "public-operation preview identity changed".into(),
             ));
+        }
+        if expected_preview.is_public_v1() {
+            validate_public_v1_state(&state)?;
         }
         Ok(Self {
             #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -1655,6 +1799,144 @@ impl AgentStore for SqliteStore {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    async fn initialize_public_v1_history(
+        &self,
+        initialization_id: &crate::protocol::types::HistoryInitializationId,
+        history: &crate::protocol::types::HistoryContext,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<()> {
+        history
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        storage
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("public-v1 preview store required".into())
+            })?;
+            if !preview.identity.is_public_v1()
+                || initialization_id.is_empty()
+                || history.resource_uid != state.identity.resource_uid
+                || history.protocol_generation.value() != preview.identity.generation
+                || storage.replica != state.identity.local_identity
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 history initialization differs from store identity".into(),
+                ));
+            }
+            if let crate::protocol::types::ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } =
+                &storage.storage
+                && (pod_uid != &state.identity.pod_uid || pvc_uid != &state.identity.pvc_uid)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 storage incarnation differs from local storage".into(),
+                ));
+            }
+            let expected = crate::protocol::types::derive_bootstrap_history(
+                &state.identity.resource_uid,
+                crate::protocol::types::PublicProtocolGeneration::new(preview.identity.generation),
+                initialization_id,
+            );
+            if history != &expected {
+                return Err(crate::host::HostError::CommandRejected(
+                    "public-v1 bootstrap history differs from accepted initialization".into(),
+                ));
+            }
+            let existing = (
+                preview.history_initialization_id.as_ref(),
+                preview.history.as_ref(),
+                preview.storage_incarnation.as_ref(),
+            );
+            if existing.0.is_some() || existing.1.is_some() || existing.2.is_some() {
+                if existing != (Some(initialization_id), Some(history), Some(storage)) {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "public-v1 history initialization changed".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            preview.history_initialization_id = Some(initialization_id.clone());
+            preview.history = Some(history.clone());
+            preview.storage_incarnation = Some(storage.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn persist_public_v1_session_renewal(
+        &self,
+        expected: Option<&crate::protocol::public_operations::PublicV1SessionRenewalStatus>,
+        next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    ) -> Result<()> {
+        next.validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("public-v1 preview store required".into())
+            })?;
+            if !preview.identity.is_public_v1()
+                || preview.history.as_ref() != Some(&next.required.history)
+                || next.required.resource_uid != state.identity.resource_uid
+                || !std::iter::once(&next.required.predecessor)
+                    .chain(next.required.replacement.iter())
+                    .chain(next.required.surviving_sessions.iter())
+                    .any(|endpoint| endpoint.identity == state.identity.local_identity)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 session renewal differs from local durable authority".into(),
+                ));
+            }
+            if next.required.predecessor.identity == state.identity.local_identity
+                && preview.storage_incarnation.as_ref()
+                    != Some(&next.required.predecessor.storage_incarnation)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 session renewal changed predecessor storage".into(),
+                ));
+            }
+            if let Some(data_loss) = &next.required.data_loss
+                && (preview.data_loss_authorization.as_ref() != Some(&data_loss.authorization)
+                    || preview.data_loss_recovery.as_ref().is_none_or(|recovery| {
+                        recovery.logical_authorization() != data_loss.authorization
+                            || recovery.attempt != data_loss.predecessor_attempt
+                    }))
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-v1 session renewal changed durable data-loss authority".into(),
+                ));
+            }
+            match (&preview.session_renewal, expected) {
+                (Some(current), Some(expected)) if current == expected => {
+                    if current == next {
+                        return Ok(());
+                    }
+                    if !next.is_successor_of(current) {
+                        return Err(crate::host::HostError::StaleEffectCompletion(
+                            "public-v1 session renewal transition is out of order".into(),
+                        ));
+                    }
+                }
+                (None, None)
+                    if next.stage
+                        == crate::protocol::public_operations::PublicSessionRenewalStage::Required =>
+                {
+                }
+                _ => {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "public-v1 session renewal changed accepted state".into(),
+                    ));
+                }
+            }
+            preview.session_renewal = Some(next.clone());
+            preview.writes_revoked = true;
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     async fn begin_public_operation(
         &self,
         intent: &PublicOperationIntent,
@@ -1666,6 +1948,7 @@ impl AgentStore for SqliteStore {
             .map_err(|message| crate::host::HostError::CommandRejected(message.to_string()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
+            let local_identity = state.identity.local_identity.clone();
             let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
@@ -1714,8 +1997,46 @@ impl AgentStore for SqliteStore {
                 ));
             }
             use crate::protocol::public_operations::PublicOperationProgram;
+            if intent.preview.is_public_v1() {
+                let history = preview.history.as_ref().ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "public-v1 operation requires initialized history".into(),
+                    )
+                })?;
+                if let Some(input) = &intent.lifecycle
+                    && input.possible_data_loss
+                        == crate::protocol::public_operations::PossibleDataLossIntent::NotPossible
+                        && (input.current.epoch.data_loss_number != history.data_loss_number
+                            || input
+                                .previous
+                                .as_ref()
+                                .is_some_and(|previous| {
+                                    previous.epoch.data_loss_number != history.data_loss_number
+                                }))
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "ordinary public-v1 lifecycle changed the history data-loss number".into(),
+                    ));
+                }
+                if let Some(program) = &intent.program {
+                    program
+                        .validate_history(history)
+                        .map_err(|message| {
+                            crate::host::HostError::CommandRejected(message.into())
+                        })?;
+                }
+            }
             match &intent.program {
                 Some(PublicOperationProgram::Build(build)) => {
+                    let source_storage = if intent.preview.is_public_v1() {
+                        Some(preview.storage_incarnation.clone().ok_or_else(|| {
+                            crate::host::HostError::CommandRejected(
+                                "public-v1 build lacks source storage incarnation".into(),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
                     if preview.active_builds.contains_key(&build.replica.replica_id)
                         || preview.operations.values().filter(|record| {
                             preview.current_topology_operation.as_ref().map_or_else(
@@ -1778,9 +2099,42 @@ impl AgentStore for SqliteStore {
                     preview
                         .active_builds
                         .insert(build.replica.replica_id, build.clone());
+                    if intent.preview.is_public_v1() {
+                        let build_record = PublicV1BuildRecord {
+                            operation_id: intent.operation_id.clone(),
+                            build_id: build.attempt.clone(),
+                            admission_revision: intent.revision,
+                            history: build.history.clone().ok_or_else(|| {
+                                crate::host::HostError::CommandRejected(
+                                    "public-v1 build lacks exact history".into(),
+                                )
+                            })?,
+                            epoch: build.epoch,
+                            source: local_identity.clone(),
+                            source_storage: source_storage
+                                .expect("public-v1 source storage validated"),
+                            source_session: intent.process_session_id.clone(),
+                            target: build.replica.clone(),
+                            target_storage: build.target_storage.clone(),
+                            target_session: build.process_session_id.clone(),
+                            target_address: build.replication_address.clone(),
+                            retirement: PublicV1BuildRetirement::Retain,
+                            result: None,
+                        };
+                        build_record.validate().map_err(|message| {
+                            crate::host::HostError::CommandRejected(message.into())
+                        })?;
+                        preview
+                            .build_records
+                            .insert(intent.operation_id.clone(), build_record);
+                    }
                 }
                 Some(PublicOperationProgram::Remove(build)) => {
-                    if preview.active_builds.get(&build.replica.replica_id) != Some(build) {
+                    if !preview
+                        .active_builds
+                        .get(&build.replica.replica_id)
+                        .is_some_and(|active| active.same_attempt_as(build))
+                    {
                         return Err(crate::host::HostError::CommandRejected(
                             "removal does not name the exact active attempt".into(),
                         ));
@@ -1819,6 +2173,15 @@ impl AgentStore for SqliteStore {
                 _ => {}
             }
             if let Some(input) = &intent.lifecycle {
+                if intent.preview.is_public_v1()
+                    && (preview.history_initialization_id.is_none()
+                        || preview.history.is_none()
+                        || preview.storage_incarnation.is_none())
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "public-v1 lifecycle requires initialized history and storage".into(),
+                    ));
+                }
                 if input.replica != state.identity.local_identity {
                     return Err(crate::host::HostError::IdentityMismatch(
                         "lifecycle target does not match local replica".into(),
@@ -1845,6 +2208,59 @@ impl AgentStore for SqliteStore {
                 if input.possible_data_loss
                     == crate::protocol::public_operations::PossibleDataLossIntent::Possible
                 {
+                    if intent.preview.is_public_v1() {
+                        let recovery = input.data_loss_recovery.as_ref().ok_or_else(|| {
+                            crate::host::HostError::CommandRejected(
+                                "public-v1 data loss requires typed recovery".into(),
+                            )
+                        })?;
+                        if recovery.attempt.process.data_loss_replay
+                            != recovery.authorization.replay_disposition
+                        {
+                            return Err(crate::host::HostError::CommandRejected(
+                                "initial data-loss attempt lacks exact captured replay capability"
+                                    .into(),
+                            ));
+                        }
+                        if preview.history.as_ref() != Some(&recovery.authorization.predecessor)
+                            || preview.storage_incarnation.as_ref()
+                                != Some(&recovery.authorization.provisional_primary)
+                        {
+                            return Err(crate::host::HostError::IdentityMismatch(
+                                "data-loss authorization differs from current history or storage"
+                                    .into(),
+                            ));
+                        }
+                        preview.writes_revoked = true;
+                        preview.active_builds.clear();
+                        preview.build_records.clear();
+                        preview.absent_builds.clear();
+                        preview.operations.clear();
+                        preview.current_topology_operation = None;
+                        preview.current_operation = None;
+                        preview.data_loss_authorization =
+                            Some(recovery.authorization.clone());
+                        preview.data_loss_recovery = Some(
+                            crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                                authorization_id: recovery
+                                    .authorization
+                                    .authorization_id
+                                    .clone(),
+                                attempt: recovery.attempt.clone(),
+                                predecessor_history: recovery.authorization.predecessor.clone(),
+                                proposed_history: recovery.authorization.proposed.clone(),
+                                provisional_primary: recovery
+                                    .authorization
+                                    .provisional_primary
+                                    .clone(),
+                                reset_scope: recovery.authorization.reset_scope.clone(),
+                                replay_disposition: recovery.authorization.replay_disposition,
+                                stage: crate::protocol::public_operations::
+                                    PublicDataLossRecoveryStage::Invalidated,
+                                observed_progress: None,
+                            },
+                        );
+                    }
                     preview.history_barriers.insert(
                         intent.operation_id.clone(),
                         crate::host::state::HistoryAdmissionBarrier {
@@ -1928,6 +2344,8 @@ impl AgentStore for SqliteStore {
             };
             let record = PublicOperationRecord {
                 intent: intent.clone(),
+                accepted_history: preview.history.clone(),
+                accepted_storage: preview.storage_incarnation.clone(),
                 stage,
                 disposition: None,
                 containment: PublicOperationContainment::NotRequired,
@@ -1943,6 +2361,258 @@ impl AgentStore for SqliteStore {
                 BeginPublicOperation::Ready(record)
             } else {
                 BeginPublicOperation::Waiting(record)
+            })
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn renew_public_v1_data_loss_attempt(
+        &self,
+        intent: &PublicOperationIntent,
+    ) -> Result<RenewPublicDataLossAttempt> {
+        intent
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.to_string()))?;
+        let input = intent.lifecycle.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "public-v1 data-loss renewal requires lifecycle input".into(),
+            )
+        })?;
+        let candidate = input.data_loss_recovery.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "public-v1 data-loss renewal requires typed recovery".into(),
+            )
+        })?;
+        if !intent.preview.is_public_v1()
+            || input.possible_data_loss != PossibleDataLossIntent::Possible
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "public-v1 data-loss renewal requires protocol 11 possible-loss authority".into(),
+            ));
+        }
+
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("preview store required".into())
+            })?;
+            if preview.identity != intent.preview {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "public-operation preview identity changed".into(),
+                ));
+            }
+            if preview.operations.contains_key(&intent.operation_id) {
+                return Err(crate::host::HostError::DurableEffectConflict(
+                    "data-loss renewal attempt already exists".into(),
+                ));
+            }
+            let authorization = preview.data_loss_authorization.as_ref().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "data-loss renewal lacks durable authorization".into(),
+                )
+            })?;
+            let recovery = preview.data_loss_recovery.as_ref().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "data-loss renewal lacks durable recovery state".into(),
+                )
+            })?;
+            if let Some(session_renewal) = &preview.session_renewal {
+                let required = &session_renewal.required;
+                let Some(data_loss) = &required.data_loss else {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "data-loss attempt differs from durable session renewal".into(),
+                    ));
+                };
+                let expected_stage = match required
+                    .data_loss_decision()
+                    .expect("validated data-loss renewal")
+                {
+                    DataLossRenewalDecision::InvokeCallback => {
+                        crate::protocol::public_operations::PublicSessionRenewalStage::Authorized
+                    }
+                    DataLossRenewalDecision::RetireWithoutCallback => {
+                        crate::protocol::public_operations::PublicSessionRenewalStage::Retired
+                    }
+                    DataLossRenewalDecision::Terminal => {
+                        return Err(crate::host::HostError::Corrupt(
+                            "terminal data-loss session renewal was persisted".into(),
+                        ));
+                    }
+                };
+                if session_renewal.stage != expected_stage
+                    || data_loss.authorization != candidate.authorization
+                    || data_loss.predecessor_attempt != recovery.attempt
+                    || data_loss.replacement_attempt != candidate.attempt
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "data-loss callback renewal has not crossed exact session barriers".into(),
+                    ));
+                }
+            }
+            if authorization != &candidate.authorization
+                || recovery.authorization_id != authorization.authorization_id
+                || recovery.predecessor_history != authorization.predecessor
+                || recovery.proposed_history != authorization.proposed
+                || recovery.provisional_primary != authorization.provisional_primary
+                || recovery.reset_scope != authorization.reset_scope
+                || recovery.replay_disposition != authorization.replay_disposition
+                || recovery.stage
+                    != crate::protocol::public_operations::PublicDataLossRecoveryStage::
+                        CallbackProcessing
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "data-loss renewal differs from durable logical authorization".into(),
+                ));
+            }
+
+            let predecessor_id = recovery.attempt.attempt_id.clone();
+            let predecessor = preview
+                .operations
+                .get(&predecessor_id)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::host::HostError::Corrupt(
+                        "data-loss renewal predecessor operation is absent".into(),
+                    )
+                })?;
+            let predecessor_barrier =
+                preview
+                    .history_barriers
+                    .get(&predecessor_id)
+                    .ok_or_else(|| {
+                        crate::host::HostError::Corrupt(
+                            "data-loss renewal predecessor barrier is absent".into(),
+                        )
+                    })?;
+            if predecessor.stage != PublicOperationStage::ContainmentPending
+                || predecessor.containment != PublicOperationContainment::Pending
+                || !matches!(
+                    predecessor.disposition,
+                    Some(PublicOperationDisposition::Ambiguous(_))
+                )
+                || predecessor_barrier.outcome != crate::host::state::DataLossOutcome::Ambiguous
+                || predecessor_barrier.retired_by.is_some()
+                || predecessor.intent.lifecycle.as_ref().and_then(|input| {
+                    input
+                        .data_loss_recovery
+                        .as_ref()
+                        .map(|recovery| &recovery.attempt)
+                }) != Some(&recovery.attempt)
+            {
+                return Err(crate::host::HostError::CommandRejected(
+                    "data-loss renewal predecessor is not durably contained".into(),
+                ));
+            }
+
+            if candidate
+                .attempt
+                .validate_for(
+                    authorization,
+                    recovery.attempt.process.epoch.configuration_number,
+                )
+                .is_err()
+                || candidate.attempt.attempt_id == recovery.attempt.attempt_id
+                || candidate.attempt.process.process_session_id
+                    == recovery.attempt.process.process_session_id
+            {
+                return Ok(RenewPublicDataLossAttempt {
+                    decision: DataLossRenewalDecision::Terminal,
+                    predecessor,
+                    successor: None,
+                });
+            }
+
+            let decision = crate::protocol::public_operations::DataLossAttempt::renewal_decision(
+                authorization,
+                &recovery.attempt,
+                &candidate.attempt,
+                true,
+            );
+            let successor = PublicOperationRecord {
+                intent: intent.clone(),
+                accepted_history: preview.history.clone(),
+                accepted_storage: preview.storage_incarnation.clone(),
+                stage: if decision == DataLossRenewalDecision::InvokeCallback {
+                    PublicOperationStage::Ready
+                } else {
+                    PublicOperationStage::Completed
+                },
+                disposition: (decision != DataLossRenewalDecision::InvokeCallback)
+                    .then_some(PublicOperationDisposition::Cancelled),
+                containment: if decision == DataLossRenewalDecision::InvokeCallback {
+                    PublicOperationContainment::NotRequired
+                } else {
+                    PublicOperationContainment::Complete
+                },
+                superseded_by: None,
+                blockers: Default::default(),
+                lifecycle: Default::default(),
+            };
+
+            let predecessor = preview
+                .operations
+                .get_mut(&predecessor_id)
+                .expect("validated predecessor operation");
+            predecessor.stage = PublicOperationStage::Completed;
+            predecessor.containment = PublicOperationContainment::Complete;
+            predecessor.superseded_by = Some(intent.operation_id.clone());
+            let predecessor = predecessor.clone();
+
+            if decision == DataLossRenewalDecision::InvokeCallback {
+                preview.history_barriers.remove(&predecessor_id);
+                preview.history_barriers.insert(
+                    intent.operation_id.clone(),
+                    crate::host::state::HistoryAdmissionBarrier {
+                        intent: intent.clone(),
+                        outcome: crate::host::state::DataLossOutcome::NotInvoked,
+                        retired_by: None,
+                    },
+                );
+                preview.data_loss_recovery = Some(
+                    crate::protocol::public_operations::PublicDataLossRecoveryStatus {
+                        authorization_id: authorization.authorization_id.clone(),
+                        attempt: candidate.attempt.clone(),
+                        predecessor_history: authorization.predecessor.clone(),
+                        proposed_history: authorization.proposed.clone(),
+                        provisional_primary: authorization.provisional_primary.clone(),
+                        reset_scope: authorization.reset_scope.clone(),
+                        replay_disposition: authorization.replay_disposition,
+                        stage: crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::Invalidated,
+                        observed_progress: None,
+                    },
+                );
+            } else {
+                preview
+                    .history_barriers
+                    .get_mut(&predecessor_id)
+                    .expect("validated predecessor barrier")
+                    .retired_by = Some(intent.operation_id.clone());
+                let recovery = preview
+                    .data_loss_recovery
+                    .as_mut()
+                    .expect("validated durable recovery");
+                recovery.attempt = candidate.attempt.clone();
+                recovery.stage = match decision {
+                    DataLossRenewalDecision::RetireWithoutCallback => {
+                        crate::protocol::public_operations::PublicDataLossRecoveryStage::Retired
+                    }
+                    DataLossRenewalDecision::Terminal => crate::protocol::public_operations::
+                        PublicDataLossRecoveryStage::ReplacementRequired,
+                    DataLossRenewalDecision::InvokeCallback => unreachable!(),
+                };
+                recovery.observed_progress = None;
+            }
+            preview.current_operation = Some(intent.operation_id.clone());
+            preview.current_topology_operation = Some(intent.operation_id.clone());
+            preview
+                .operations
+                .insert(intent.operation_id.clone(), successor.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(RenewPublicDataLossAttempt {
+                decision,
+                predecessor,
+                successor: Some(successor),
             })
         })
     }
@@ -2049,6 +2719,32 @@ impl AgentStore for SqliteStore {
                 record.lifecycle.in_flight = None;
             }
             let result = record.clone();
+            if let Some(build_record) = preview.build_records.get_mut(operation_id)
+                && matches!(
+                    result.intent.program,
+                    Some(crate::protocol::public_operations::PublicOperationProgram::Build(_))
+                )
+            {
+                build_record.result = public_v1_build_result(&result);
+                if matches!(
+                    build_record.result,
+                    Some(
+                        crate::protocol::public_operations::PublicV1OperationResult::Failed(_)
+                            | crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                                _
+                            )
+                            | crate::protocol::public_operations::PublicV1OperationResult::Cancelled
+                            | crate::protocol::public_operations::PublicV1OperationResult::RebuildRequired(
+                                _
+                            )
+                    )
+                ) {
+                    build_record.retirement = PublicV1BuildRetirement::Required;
+                }
+                build_record.validate().map_err(|message| {
+                    crate::host::HostError::DurableEffectConflict(message.into())
+                })?;
+            }
             write_agent_state(transaction, &state)?;
             Ok(result)
         })
@@ -2115,6 +2811,8 @@ impl AgentStore for SqliteStore {
             let owner_completed = owner_record.stage == PublicOperationStage::Completed;
             let record = PublicOperationRecord {
                 intent: intent.clone(),
+                accepted_history: owner_record.accepted_history.clone(),
+                accepted_storage: owner_record.accepted_storage.clone(),
                 stage: if owner_completed {
                     PublicOperationStage::Completed
                 } else {
@@ -2234,9 +2932,7 @@ impl AgentStore for SqliteStore {
             }
             if matches!(
                 instruction,
-                PublicInstruction::CurrentConfiguration
-                    | PublicInstruction::CatchUpConfiguration
-                    | PublicInstruction::CatchUp
+                PublicInstruction::CatchUpConfiguration
                     | PublicInstruction::Access
                     | PublicInstruction::Configuration
                     | PublicInstruction::StartingConfiguration
@@ -2264,6 +2960,10 @@ impl AgentStore for SqliteStore {
                                 crate::host::HostError::Corrupt("missing history barrier".into())
                             })?
                             .outcome = DataLossOutcome::Ambiguous;
+                        if let Some(recovery) = preview.data_loss_recovery.as_mut() {
+                            recovery.stage = crate::protocol::public_operations::
+                                PublicDataLossRecoveryStage::CallbackProcessing;
+                        }
                     }
                     if matches!(
                         instruction,
@@ -2315,6 +3015,27 @@ impl AgentStore for SqliteStore {
                             ),
                         ) => true,
                         (
+                            PublicInstruction::ReplicatorRole
+                            | PublicInstruction::ApplicationRole
+                            | PublicInstruction::ProgramEpoch
+                            | PublicInstruction::Configuration
+                            | PublicInstruction::StartingConfiguration
+                            | PublicInstruction::RefreshedConfiguration
+                            | PublicInstruction::FirstCatchUp
+                            | PublicInstruction::SecondCatchUp
+                            | PublicInstruction::ReplicatorPrimary
+                            | PublicInstruction::Epoch
+                            | PublicInstruction::ApplicationPrimary
+                            | PublicInstruction::DataLoss
+                            | PublicInstruction::Progress
+                            | PublicInstruction::CurrentConfiguration
+                            | PublicInstruction::CatchUpConfiguration
+                            | PublicInstruction::CatchUp
+                            | PublicInstruction::Access
+                            | PublicInstruction::Build,
+                            PublicInstructionOutcome::RebuildRequired(_),
+                        ) => true,
+                        (
                             PublicInstruction::ApplicationPrimary
                             | PublicInstruction::ApplicationRole
                             | PublicInstruction::DataLoss
@@ -2330,6 +3051,101 @@ impl AgentStore for SqliteStore {
                             "public instruction outcome does not match callback".into(),
                         ));
                     }
+                    if intent.preview.is_public_v1()
+                        && matches!(outcome, PublicInstructionOutcome::Done)
+                    {
+                        match instruction {
+                            PublicInstruction::ReplicatorRole => {
+                                let (epoch, role) = match intent.program.as_ref() {
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Role {
+                                            epoch,
+                                            role,
+                                        },
+                                    ) => (*epoch, *role),
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            epoch,
+                                            handoff,
+                                            ..
+                                        },
+                                    ) => (*epoch, *handoff),
+                                    _ => {
+                                        return Err(crate::host::HostError::Corrupt(
+                                            "public-v1 role completion lacks typed program".into(),
+                                        ));
+                                    }
+                                };
+                                state.highest_epoch = epoch;
+                                state.role = role;
+                            }
+                            PublicInstruction::ProgramEpoch => {
+                                state.highest_epoch = match intent.program.as_ref() {
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Epoch {
+                                            epoch,
+                                        }
+                                        | crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            epoch,
+                                            ..
+                                        },
+                                    ) => *epoch,
+                                    _ => {
+                                        return Err(crate::host::HostError::Corrupt(
+                                            "public-v1 epoch completion lacks typed program".into(),
+                                        ));
+                                    }
+                                };
+                            }
+                            PublicInstruction::Configuration
+                            | PublicInstruction::StartingConfiguration
+                            | PublicInstruction::RefreshedConfiguration => {
+                                let configuration = match intent.program.as_ref() {
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Configuration(
+                                            configuration,
+                                        )
+                                        | crate::protocol::public_operations::PublicOperationProgram::CatchUp {
+                                            configuration,
+                                            ..
+                                        },
+                                    ) => configuration,
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            starting,
+                                            refreshed,
+                                            ..
+                                        },
+                                    ) if matches!(
+                                        instruction,
+                                        PublicInstruction::StartingConfiguration
+                                    ) => starting,
+                                    Some(
+                                        crate::protocol::public_operations::PublicOperationProgram::Swap {
+                                            refreshed,
+                                            ..
+                                        },
+                                    ) => refreshed,
+                                    _ => {
+                                        return Err(crate::host::HostError::Corrupt(
+                                            "public-v1 configuration completion lacks typed program"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                state.highest_epoch = configuration.current.epoch;
+                                state.previous_configuration = configuration.previous.clone();
+                                state.current_configuration =
+                                    Some(configuration.current.clone());
+                            }
+                            PublicInstruction::ReplicatorClose | PublicInstruction::Abort => {
+                                state.role = crate::protocol::types::ReplicaRole::None;
+                                state.previous_configuration = None;
+                                state.current_configuration = None;
+                            }
+                            _ => {}
+                        }
+                    }
                     if let PublicInstructionOutcome::DataLoss(result) = &outcome {
                         preview
                             .history_barriers
@@ -2338,6 +3154,86 @@ impl AgentStore for SqliteStore {
                                 crate::host::HostError::Corrupt("missing history barrier".into())
                             })?
                             .outcome = result.clone();
+                        if let Some(recovery) = preview.data_loss_recovery.as_mut() {
+                            recovery.stage = match result {
+                                DataLossOutcome::False | DataLossOutcome::True => {
+                                    crate::protocol::public_operations::
+                                        PublicDataLossRecoveryStage::HistoryPending
+                                }
+                                DataLossOutcome::Error(_) => {
+                                    crate::protocol::public_operations::
+                                        PublicDataLossRecoveryStage::Failed
+                                }
+                                DataLossOutcome::NotInvoked | DataLossOutcome::Ambiguous => {
+                                    return Err(crate::host::HostError::DurableEffectConflict(
+                                        "invalid completed data-loss outcome".into(),
+                                    ));
+                                }
+                            };
+                        }
+                    }
+                    if let PublicInstructionOutcome::RebuildRequired(_) = &outcome
+                        && instruction == PublicInstruction::DataLoss
+                        && let Some(recovery) = preview.data_loss_recovery.as_mut()
+                    {
+                        recovery.stage = crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::ReplacementRequired;
+                    }
+                    if let PublicInstructionOutcome::Progress(progress) = &outcome
+                        && instruction == PublicInstruction::Progress
+                        && let Some(recovery) = preview.data_loss_recovery.as_mut()
+                    {
+                        recovery.observed_progress =
+                            Some(crate::protocol::public_operations::PublicProgress {
+                                role: crate::protocol::public_operations::PublicProgressRole::
+                                    Recovery,
+                                first: *progress,
+                                last: *progress,
+                            });
+                    }
+                    if matches!(
+                        instruction,
+                        PublicInstruction::CurrentConfiguration | PublicInstruction::CatchUp
+                    ) && let Some(recovery) = preview.data_loss_recovery.as_mut()
+                    {
+                        recovery.stage = crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::ConfigurationPending;
+                    }
+                    if instruction == PublicInstruction::HistoryAdmission {
+                        let recovery_input = intent
+                            .lifecycle
+                            .as_ref()
+                            .and_then(|input| input.data_loss_recovery.as_ref())
+                            .ok_or_else(|| {
+                                crate::host::HostError::Corrupt(
+                                    "history admission lacks typed recovery".into(),
+                                )
+                            })?;
+                        let recovery = preview.data_loss_recovery.as_mut().ok_or_else(|| {
+                            crate::host::HostError::Corrupt(
+                                "history admission lacks durable recovery state".into(),
+                            )
+                        })?;
+                        if recovery.authorization_id
+                            != recovery_input.authorization.authorization_id
+                            || preview.data_loss_authorization.as_ref()
+                                != Some(&recovery_input.authorization)
+                            || recovery.attempt != recovery_input.attempt
+                            || recovery.proposed_history != recovery_input.authorization.proposed
+                            || !matches!(
+                                recovery.stage,
+                                crate::protocol::public_operations::
+                                    PublicDataLossRecoveryStage::ConfigurationPending
+                            )
+                        {
+                            return Err(crate::host::HostError::StaleEffectCompletion(
+                                "history admission differs from durable recovery".into(),
+                            ));
+                        }
+                        preview.history = Some(recovery.proposed_history.clone());
+                        recovery.stage = crate::protocol::public_operations::
+                            PublicDataLossRecoveryStage::Admitted;
+                        preview.history_barriers.remove(&intent.operation_id);
                     }
                     if instruction == PublicInstruction::Access && !preview.terminal {
                         preview.writes_revoked = false;
@@ -2349,13 +3245,61 @@ impl AgentStore for SqliteStore {
                             ),
                         ) = &intent.program
                     {
-                        if preview.active_builds.get(&build.replica.replica_id) != Some(build) {
+                        if !preview
+                            .active_builds
+                            .get(&build.replica.replica_id)
+                            .is_some_and(|active| active.same_attempt_as(build))
+                        {
                             return Err(crate::host::HostError::StaleEffectCompletion(
                                 "removal attempt changed".into(),
                             ));
                         }
                         preview.active_builds.remove(&build.replica.replica_id);
                         preview.absent_builds.insert(build.attempt.clone());
+                        if let Some(build_record) =
+                            preview.build_records.get_mut(&build.attempt)
+                        {
+                            if build_record.target != build.replica
+                                || build_record.target_storage != build.target_storage
+                                || build_record.target_session != build.process_session_id
+                            {
+                                return Err(crate::host::HostError::StaleEffectCompletion(
+                                    "build retirement differs from the exact build record".into(),
+                                ));
+                            }
+                            build_record.retirement = PublicV1BuildRetirement::Retired;
+                            build_record.validate().map_err(|message| {
+                                crate::host::HostError::DurableEffectConflict(message.into())
+                            })?;
+                        }
+                    }
+                    if intent.preview.is_public_v1()
+                        && matches!(
+                            intent.program,
+                            Some(
+                                crate::protocol::public_operations::PublicOperationProgram::Build(
+                                    _
+                                )
+                            )
+                        )
+                        && let PublicInstructionOutcome::RebuildRequired(rebuild) = &outcome
+                    {
+                        let build_record = preview
+                            .build_records
+                            .get_mut(&intent.operation_id)
+                            .ok_or_else(|| {
+                                crate::host::HostError::Corrupt(
+                                    "public-v1 rebuild outcome lacks its build record".into(),
+                                )
+                            })?;
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::
+                                RebuildRequired(rebuild.clone()),
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                        build_record.validate().map_err(|message| {
+                            crate::host::HostError::DurableEffectConflict(message.into())
+                        })?;
                     }
                     record.lifecycle.outcomes.push(outcome);
                     record.lifecycle.in_flight = None;
@@ -2536,6 +3480,30 @@ impl AgentStore for SqliteStore {
                 state.secondary_removal_evidence = None;
                 state.prepared_switchover = None;
                 preview.current_operation = None;
+                for (operation_id, build_record) in &mut preview.build_records {
+                    if build_record.result.is_none() {
+                        let detail = "predecessor process exited during public-v1 build";
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                                detail.into(),
+                            ),
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                        build_record.validate().map_err(|message| {
+                            crate::host::HostError::DurableEffectConflict(message.into())
+                        })?;
+                        let operation =
+                            preview.operations.get_mut(operation_id).ok_or_else(|| {
+                                crate::host::HostError::Corrupt(
+                                    "public-v1 restart build lacks its operation".into(),
+                                )
+                            })?;
+                        operation.stage = PublicOperationStage::ContainmentPending;
+                        operation.containment = PublicOperationContainment::Pending;
+                        operation.disposition =
+                            Some(PublicOperationDisposition::Ambiguous(detail.into()));
+                    }
+                }
                 preview.active_builds.clear();
             }
             if next == RestartActionStage::SuccessorLaunching {

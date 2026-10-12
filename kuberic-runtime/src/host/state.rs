@@ -2,14 +2,19 @@
 
 use crate::authority::{DurableBuildProgress, RetiredAuthority};
 use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
+use crate::host::public_build_store::PublicV1BuildRecord;
 use crate::protocol::command::EnsureConfiguration;
 use crate::protocol::command::EnsureReplicaBuild;
+use crate::protocol::public_operations::{
+    DataLossAuthorization, PublicDataLossRecoveryStatus, PublicOperationIntent,
+    PublicOperationPreviewIdentity, PublicV1SessionRenewalStatus,
+};
 use crate::protocol::public_operations::{PreviewLifecycleBinding, RestartActionRecord};
-use crate::protocol::public_operations::{PublicOperationIntent, PublicOperationPreviewIdentity};
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
-    InitializationId, LoadMetric, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaIdentity,
-    ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence, SecondaryRemovalEvidence,
+    HistoryContext, HistoryInitializationId, InitializationId, LoadMetric, OperationId, PodUid,
+    ProvisioningIntent, PvcUid, ReplicaIdentity, ReplicaRole, ReplicaStorageIncarnationContext,
+    ResourceUid, ScaleUpConfigurationEvidence, SecondaryRemovalEvidence,
     SecondaryRemovalPreparation, SecondaryScaleDownCleanup, SwitchoverHandoff,
 };
 use serde::{Deserialize, Serialize};
@@ -19,6 +24,7 @@ use std::path::PathBuf;
 // Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
+pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +116,10 @@ pub(crate) enum PublicOperationContainment {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicOperationRecord {
     pub(crate) intent: PublicOperationIntent,
+    #[serde(default)]
+    pub(crate) accepted_history: Option<HistoryContext>,
+    #[serde(default)]
+    pub(crate) accepted_storage: Option<ReplicaStorageIncarnationContext>,
     pub(crate) stage: PublicOperationStage,
     pub(crate) disposition: Option<PublicOperationDisposition>,
     #[serde(default)]
@@ -149,6 +159,7 @@ pub(crate) enum PublicInstruction {
     CurrentConfiguration,
     CatchUpConfiguration,
     CatchUp,
+    HistoryAdmission,
     Access,
 }
 
@@ -163,6 +174,7 @@ pub(crate) enum PublicInstructionOutcome {
         child: PublicCloseChild,
         error: String,
     },
+    RebuildRequired(Box<crate::protocol::public_operations::CanonicalReplicaRebuildRequired>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +217,17 @@ pub(crate) struct PublicOperationPreviewState {
     #[serde(default)]
     pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
     #[serde(default)]
+    pub(crate) history_initialization_id: Option<HistoryInitializationId>,
+    #[serde(default)]
+    pub(crate) history: Option<HistoryContext>,
+    #[serde(default)]
+    pub(crate) storage_incarnation: Option<ReplicaStorageIncarnationContext>,
+    #[serde(default)]
+    pub(crate) data_loss_authorization: Option<DataLossAuthorization>,
+    #[serde(default)]
+    pub(crate) data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
+    pub(crate) session_renewal: Option<PublicV1SessionRenewalStatus>,
+    #[serde(default)]
     pub(crate) current_operation: Option<OperationId>,
     #[serde(default)]
     pub(crate) current_topology_operation: Option<OperationId>,
@@ -213,6 +236,8 @@ pub(crate) struct PublicOperationPreviewState {
         crate::protocol::types::ReplicaId,
         crate::protocol::public_operations::PublicBuildInput,
     >,
+    #[serde(default)]
+    pub(crate) build_records: BTreeMap<OperationId, PublicV1BuildRecord>,
     #[serde(default)]
     pub(crate) absent_builds: BTreeSet<OperationId>,
     #[serde(default)]
@@ -230,9 +255,16 @@ impl PublicOperationPreviewState {
             restart_action: None,
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
+            history_initialization_id: None,
+            history: None,
+            storage_incarnation: None,
+            data_loss_authorization: None,
+            data_loss_recovery: None,
+            session_renewal: None,
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),
+            build_records: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
             writes_revoked: false,
             terminal: false,
@@ -246,9 +278,16 @@ impl PublicOperationPreviewState {
             restart_action: None,
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
+            history_initialization_id: None,
+            history: None,
+            storage_incarnation: None,
+            data_loss_authorization: None,
+            data_loss_recovery: None,
+            session_renewal: None,
             current_operation: None,
             current_topology_operation: None,
             active_builds: BTreeMap::new(),
+            build_records: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
             writes_revoked: false,
             terminal: false,

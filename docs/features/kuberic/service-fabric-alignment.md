@@ -527,7 +527,7 @@ will delete:
 |---|---|---|
 | Public operation semantics | Give every public call exact task ownership, cancellation and SF lifecycle ordering | Phase 4 |
 | Public V1 values and evidence | Define SF-shaped configuration/build/progress values and remove private evidence dependencies | Phase 5 |
-| Controller protocol and policy | Own transient-fault restart/drop, history transitions, election comparability, signed authorization, rebuild decisions and cutover fencing | Phases 4-7 |
+| Controller protocol and policy | Own transient-fault restart/drop, history transitions, election comparability, session renewal, rebuild decisions and cutover fencing | Phases 4-7 |
 | V1 replacement | Build the stateless engine beside the legacy engine, then cut over and delete the legacy path | Phases 6-7 |
 | Deferred maintainability | Decompose the remaining custom host only after the managed path is gone | After Phase 7 |
 | Optional V2 storage | Add a deliberate transactional log and provider protocol above V1 | Phase 8 |
@@ -556,9 +556,9 @@ post-cutover cleanup, not in the engine that will be removed.
   are transitional implementation details and must be removed.
 - Implementation-private types may organize the default replicator internally,
   but the runtime must not call or receive them.
-- Public construction and value types may carry immutable endpoint/security
-  configuration, capability metadata and signed operation values, but must not
-  carry callbacks, agent-store handles or host-only capabilities.
+- Public construction and value types may carry immutable endpoint
+  configuration and capability metadata, but must not carry callbacks,
+  agent-store handles or host-only capabilities.
 - Backward compatibility for persisted runtime data is not required. A phase
   that changes durable formats may bump the schema and reject old stores
   explicitly rather than adding migration code.
@@ -574,15 +574,15 @@ authorization while the runtime/Replicator owns execution.
 | Phase | Controller responsibility | Primary components |
 |---|---|---|
 | Phase 4 | Consume a transient public fault as lifecycle control, close access and plan/execute restart for persisted state or drop/replacement for volatile state using the exact faulted incarnation | `kuberic-controller/src/evaluator.rs`, `executor.rs`, fault/report protocol and controller fault tests |
-| Phase 5 | Define the new protocol/status vocabulary, compare only compatible histories, authorize data-loss recovery, issue higher-epoch session renewal, mint signed peer/build authorization and decide fresh-incarnation rebuild | `kuberic-runtime/src/protocol/types.rs`, `protocol/command.rs`, `protocol/validation.rs`, `kuberic-controller/src/evaluator.rs` and its transition modules, `kuberic-controller/src/plan.rs` |
+| Phase 5 | Define the new protocol/status vocabulary, compare only compatible histories, authorize data-loss recovery, issue higher-epoch session renewal and decide fresh-incarnation rebuild | `kuberic-runtime/src/protocol/types.rs`, `protocol/command.rs`, `protocol/validation.rs`, `kuberic-controller/src/evaluator.rs` and its transition modules, `kuberic-controller/src/plan.rs` |
 | Phase 6 | Drive the real preview through evaluator, executor and reconciler; consume only public progress/completion; prove failover, swap, build, replacement and restart without direct test-only runtime commands | `kuberic-controller/src/evaluator.rs`, `executor.rs`, `reconciler.rs`, `cluster_api.rs`, controller protocol/model/integration tests |
-| Phase 7 | Build and validate the replacement-only controller artifact, own signing keys and cutover Lease, revoke legacy command/signing/RBAC authority and activate in a fresh namespace/resource UID | `kuberic-controller/src/crd.rs`, `cluster_api.rs`, deployment/RBAC manifests and cutover/live tests |
+| Phase 7 | Build and validate the replacement-only controller artifact, own the cutover Lease, revoke legacy command/signing/RBAC authority and activate in a fresh namespace/resource UID | `kuberic-controller/src/crd.rs`, `cluster_api.rs`, deployment/RBAC manifests and cutover/live tests |
 
 The controller must not learn Replicator-private ACK sets, copy boundaries or
 queue positions. Its new state is limited to agent/controller policy:
 `HistoryContext`, data-loss authorization, process/incarnation identity,
-configuration/epoch lineage, signed authorization, durable public-operation
-completion and cutover generation.
+configuration/epoch lineage, durable public-operation completion and cutover
+generation.
 
 ### Phase 0: Extract Custom-Authority Operation Ownership
 
@@ -844,7 +844,11 @@ sets.
 consumed by the Phase 4 orchestrator, runtime and controller before the
 replacement engine exists.
 
-Planned work:
+**Status:** delivered as a dormant protocol-11/schema-11 contract. Production
+remains on protocol 9/schema 6; Phase 6 replacement-engine and Phase 7 cutover
+obligations remain prospective.
+
+Delivered work:
 
 - add the public configuration data needed to identify `must_catchup` without
   changing the protected `Replicator` or `PrimaryReplicator` method sets;
@@ -864,23 +868,18 @@ Planned work:
   agent state and transition validation; explicitly authorized
   data-loss-number changes are accepted only there, while ordinary failover
   continues to reject them;
-- add a control-plane-signed `BuildAuthorization` to the exact source-side
-  `build_replica` descriptor. The idle target validates it from immutable
-  public trust configuration and local role/epoch/identity/session/storage
-  state; withdrawing authorization retires that target process/session rather
-  than calling a private target API;
-- add control-plane-signed `PeerSessionAuthorization` to active remote entries.
-  It derives from the primary's public configuration and is presented by the
-  primary during the transport handshake so a restarted/same-role secondary
-  can reject predecessor primaries without receiving a primary-only callback;
+- carry the exact source/target identity, process session, address and build ID
+  through the source-side `build_replica` descriptor. The idle target remains
+  outside configuration and replacement retires the exact target
+  process/session rather than calling a private target API;
+- carry exact active-peer identity, process session and address in public
+  configuration so restarted or same-role secondaries can fence predecessor
+  sessions without receiving a primary-only callback;
 - prohibit same-epoch primary process-session substitution. Replacement of the
   primary session requires access/peer-ingress closure, a newer configuration
   epoch and completed `update_epoch` barriers on surviving secondaries before
-  replacement primary role. Fresh peer authorizations are then installed
-  through primary configuration after role and before traffic;
-- define canonical authorization encoding, controller-only per-resource
-  signing-key ownership, immutable verification-key provisioning, digest
-  auditing and fresh-protocol-generation key rotation;
+  replacement primary role. Fresh peer descriptors are then installed through
+  primary configuration after role and before traffic;
 - project only up, ready remote secondaries into public current/previous
   configurations; exclude the local primary and every idle/in-build target;
 - use invalid/unknown progress for build targets and for remote progress
@@ -909,9 +908,9 @@ Planned work:
 - define public completion recipes for catch-up, switchover, build, removal,
   data loss, retirement and rebuild-required failure;
 - bump the report/protocol version and reject mixed evidence formats;
-- introduce one new agent-owned public build store containing only build
-  authorization, exact source/target/session identity and terminal public-call
-  completion; do not carry engine copy cursors or native progress;
+- introduce one new agent-owned public build store containing only exact
+  source/target/session identity and terminal public-call completion; do not
+  carry transport credentials, engine copy cursors or native progress;
 - update PostgreSQL and every custom replicator to satisfy the new public
   progress, build and error semantics;
 - turn the Phase 4 strict trace harness into one table-driven public
@@ -921,30 +920,31 @@ Planned work:
   disposition matrix, adding cases without deferring ownership or activation
   gates.
 
-Controller deliverables:
+Delivered controller work:
 
 - protocol and CRD/status schemas carry protocol generation,
   `HistoryContext`, typed `DataLossRecovery`, process/incarnation identity,
-  signed-authorization digests and exact public-operation completion;
+  and exact public-operation completion;
 - evaluator policy rejects incomparable histories, selects provisional
   primaries without granting serving readiness, requires higher-epoch renewal
   for every replacement process session, and chooses rebuild versus authorized
   data-loss recovery explicitly;
-- executor/reconciler deliver exact fenced commands and signed values, never
-  infer success from Kubernetes object existence, and retain no dependency on
+- executor/reconciler deliver exact fenced commands, never infer success from
+  Kubernetes object existence, and retain no dependency on
   verified/quorum/committed/build-boundary report fields;
 - controller tests exercise evaluator-to-executor behavior for failover,
   switchover, scale, build, data loss, replacement, delayed reports and
   predecessor sessions using the new protocol types.
 
-Exit criteria:
+Delivered Phase 5 result:
 
 - the runtime and controller require no evidence unavailable through public
   interfaces;
 - public configuration and build descriptors carry exact SF membership,
-  `must_catchup`, signed target authorization and progress meanings;
-- active peer handshakes carry signed configuration-derived authorization, and
-  predecessor-first connections after either endpoint restarts are rejected;
+  `must_catchup`, exact target identity/session and progress meanings;
+- active peer establishment uses exact configuration-derived endpoint/session
+  identity, and predecessor-first connections after either endpoint restarts
+  are rejected;
   a primary session is never replaced within one epoch;
 - data-loss-number changes are possible only through the typed authorization,
   and old history/election/build/replay evidence is invalidated atomically;
@@ -962,9 +962,9 @@ Exit criteria:
 - public-only test implementations and new-protocol controller/runtime tests
   pass without engine-private observations;
 - PostgreSQL no longer requires preinstalled primary authority/configuration
-  before public role/epoch calls, validates signed build authorization instead
-  of idle-target configuration membership, and declares a supported data-loss
-  replay disposition before it is eligible for cutover;
+  before public role/epoch calls, keeps idle build targets outside
+  configuration, and declares a supported data-loss replay disposition before
+  it is eligible for cutover;
 - controller evaluator/executor tests prove incompatible histories are never
   ranked, private progress fields are neither read nor emitted, and every
   rebuild/data-loss/session-renewal decision produces the exact typed command
@@ -1061,9 +1061,8 @@ Planned work:
 - validate the exact replacement-only artifact from empty controller, agent
   and application state before deployment; record its immutable digest with
   every KSF gate result and pin that digest in the cutover manifest;
-- include the replacement controller, protocol/CRD schema, signing-key
-  provisioning, RBAC and Lease manifests in that same digest-pinned release
-  evidence;
+- include the replacement controller, protocol/CRD schema, RBAC and Lease
+  manifests in that same digest-pinned release evidence;
 - require an explicit irreversible-cutover approval recording that required
   application-level exports completed or that no old data is retained;
 - disable every application, acquire an exclusive cutover Lease, terminate all
@@ -1209,16 +1208,19 @@ Exit criteria:
 
 ## Semantic Finding Disposition and Activation Gates
 
-This mapping is part of the plan, not a Phase 5 deliverable. Phase 5 may add
-more cases but cannot weaken or defer these gates.
+This mapping is also the executable Phase 5 conformance catalog. The strict
+custom fixture and real PostgreSQL parent share the same sixteen-row catalog.
+KSF-09, KSF-10 and KSF-16 execute as negative eligibility guards: they pass
+only by inventorying the current legacy-bearing artifact and retaining the
+stated Phase 7 cutover obligations.
 
 | Finding | Owning phase(s) | Component owner(s) | Named public-observable gate | Required result before activation |
 |---|---|---|---|---|
 | KSF-01 | 4 | Agent/Runtime | `primary_configuration_follows_primary_role` | Strict Replicator never observes primary configuration before successful primary role |
 | KSF-02 | 4-6 | Controller, Agent/Runtime, Replicator, Provider | `authorized_data_loss_false_true_error_ambiguity` | Logical authorization drives callback before configuration/access; crash renewal is session-fenced and cannot weaken the captured replay disposition |
 | KSF-03 | 4 | Controller, Agent/Runtime, Replicator | `same_role_secondary_receives_new_epoch` | Secondary fences the predecessor epoch without requiring a role change |
-| KSF-04 | 5 | Controller, Agent/Runtime, Replicator | `configuration_contains_only_remote_active_members` | Local/idle targets absent, progress meanings exact, successor designated and active peer handshake carries signed configuration-derived proof |
-| KSF-05 | 5 | Controller, Agent/Runtime, Replicator | `build_uses_invalid_target_progress_and_signed_authorization` | Empty target receives unknown progress and validates the exact signed attempt |
+| KSF-04 | 5 | Controller, Agent/Runtime, Replicator | `configuration_contains_only_remote_active_members` | Local/idle targets absent, progress meanings exact, successor designated and active peer identity/session comes from configuration |
+| KSF-05 | 5 | Controller, Agent/Runtime, Replicator | `build_uses_invalid_target_progress_and_exact_attempt` | Empty target receives invalid progress, remains outside PC/CC and retains the exact build attempt identity |
 | KSF-06 | 4 | Agent/Runtime, Replicator | `build_is_cancelled_and_drained_before_remove` | Exact build future terminates before removal and cannot recreate resources |
 | KSF-07 | 4-6 | Controller, Agent/Runtime, Replicator | `swap_uses_captured_specific_quorum_capability` | Ordering is wait/revoke/epoch/config/wait; Write includes successor when supported, otherwise explicit All |
 | KSF-08 | 5-6 | Controller, Agent/Runtime, Replicator, Provider | `progress_is_role_correct_and_history_scoped` | Primary exposes committed progress; incomparable histories are never ranked; exact build admits a new PVC incarnation into the source lineage |
@@ -1253,8 +1255,8 @@ Alignment must not weaken:
   no replay-capability upgrade;
 - `must_catchup`, invalid build progress and build-outside-configuration
   semantics;
-- signed configuration-derived peer authorization and signed one-attempt build
-  authorization without a private target callback;
+- exact configuration-derived peer identity and one-attempt build identity
+  without a private target callback;
 - predecessor authority is never executable in a replacement process; a new
   process session requires controller-issued higher-epoch renewal before role,
   PC/CC or peer traffic;

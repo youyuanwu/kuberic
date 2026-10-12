@@ -918,6 +918,7 @@ where
         let mut set = observation.set.clone();
         set.status = Some(KubericSetStatus {
             authority: status.clone(),
+            public_v1_authority: None,
         });
         sets.replace_status(&set.name_any(), &PostParams::default(), &set)
             .await
@@ -1636,6 +1637,7 @@ fn replica_pod_named(
             ..Default::default()
         },
         spec: Some(PodSpec {
+            automount_service_account_token: Some(false),
             hostname: Some(pod_name.to_string()),
             subdomain: Some(format!("{}-peer", set.name_any())),
             security_context: Some(PodSecurityContext {
@@ -2247,6 +2249,10 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
             command.action.target.clone(),
             command.action.target.replica_id,
         ),
+        #[cfg(feature = "runtime-test-bridge")]
+        ProtocolCommand::PublicV1History(command) => {
+            (command.target().clone(), command.target().replica_id)
+        }
     }
 }
 
@@ -2291,9 +2297,11 @@ fn command_request(
             ))
         }
         #[cfg(feature = "runtime-test-bridge")]
-        ProtocolCommand::RestartReplicaProcess(_) | ProtocolCommand::DropReplicaIncarnation(_) => {
+        ProtocolCommand::RestartReplicaProcess(_)
+        | ProtocolCommand::DropReplicaIncarnation(_)
+        | ProtocolCommand::PublicV1History(_) => {
             return Err(ControllerError::Effect(
-                "preview fault commands cannot use the production gRPC dispatcher".into(),
+                "preview commands cannot use the production gRPC dispatcher".into(),
             ));
         }
     };
@@ -2443,6 +2451,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
         TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
         TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
+        TransitionKind::DataLossRecovery => proto::TransitionKind::DataLossRecovery,
     }
 }
 
@@ -3331,6 +3340,7 @@ impl ClusterApi for InMemoryClusterApi {
         }
         state.observation.set.status = Some(KubericSetStatus {
             authority: status.clone(),
+            public_v1_authority: None,
         });
         let next = state
             .observation
@@ -3737,7 +3747,17 @@ mod scale_down_fixture;
 mod public_lifecycle;
 #[cfg(feature = "runtime-test-bridge")]
 pub use public_lifecycle::{PreviewServiceApi, preview_service_matches, preview_service_update};
-
+#[cfg(feature = "runtime-test-bridge")]
+mod public_v1_history;
+#[cfg(feature = "runtime-test-bridge")]
+pub use public_v1_history::{PublicV1HistoryApi, PublicV1SessionRenewalApi};
+#[cfg(feature = "runtime-test-bridge")]
+mod public_v1_evidence;
+#[cfg(feature = "runtime-test-bridge")]
+pub use public_v1_evidence::{
+    PublicV1EvidenceApi, PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState,
+    PublicV1ResourceDisposition, PublicV1ResourceProof,
+};
 #[cfg(test)]
 mod tests {
     use super::*;

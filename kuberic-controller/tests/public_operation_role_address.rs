@@ -134,6 +134,8 @@ fn fixture(
                 1,
             ),
             previous: None,
+            replicas: Vec::new(),
+            data_loss_recovery: None,
         },
         PreviewTransition::Ordinary,
     )
@@ -609,7 +611,14 @@ async fn public_operation_role_address_rejects_inconsistent_persisted_location_f
                     revision: 2,
                     process_session_id: authority.process_session_id.clone(),
                     class: PublicOperationClass::Abort,
-                    input_digest: "terminal".into(),
+                    input_digest: kuberic_runtime::protocol::public_operations::
+                        CanonicalOperationInputDigest::opaque_v1(
+                            "kuberic-public-operation-test-v1",
+                            b"terminal",
+                        ),
+                    replay_disposition:
+                        kuberic_runtime::protocol::public_operations::
+                            PublicOperationReplayDisposition::Containment,
                     lifecycle: None,
                     program: None,
                 };

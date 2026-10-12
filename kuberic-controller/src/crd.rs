@@ -1,5 +1,5 @@
 use kube::CustomResource;
-use kuberic_runtime::protocol::public_operations::StatePersistence;
+use kuberic_runtime::protocol::public_operations::{PublicV1AcceptedStatus, StatePersistence};
 use kuberic_runtime::protocol::types::AcceptedStatus;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,8 @@ pub struct PlannedSwitchoverRequestSpec {
 pub struct KubericSetStatus {
     #[serde(flatten)]
     pub authority: AcceptedStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_v1_authority: Option<PublicV1AcceptedStatus>,
 }
 
 const fn default_failover_delay_seconds() -> u64 {
@@ -312,13 +314,13 @@ mod tests {
 
         let generated = serde_json::to_string_pretty(&KubericSet::crd()).unwrap();
         assert!(
-            generated.len() < 370_000,
+            generated.len() < 465_000,
             "generated CRD unexpectedly grew to {} bytes",
             generated.len()
         );
         assert!(
-            generated.len() <= 365_000,
-            "compact final-election schema lost its reviewed headroom at {} bytes",
+            generated.len() <= 460_000,
+            "typed dormant Public V1 authorization schema lost its reviewed headroom at {} bytes",
             generated.len()
         );
     }

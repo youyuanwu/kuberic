@@ -1,3 +1,6 @@
+#[cfg(feature = "testing")]
+use crate::protocol::types::ReplicatorCreationId;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RuntimeHostToken {
     _private: (),
@@ -16,5 +19,10 @@ pub(crate) struct ReplicatorCreationIdentity(uuid::Uuid);
 impl ReplicatorCreationIdentity {
     pub(crate) fn new(_token: RuntimeHostToken) -> Self {
         Self(uuid::Uuid::new_v4())
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn to_public_id(self) -> ReplicatorCreationId {
+        ReplicatorCreationId::new(self.0.to_string())
     }
 }

@@ -21,7 +21,7 @@ HELPER_BINARIES = {
     "postgres-replicated::native_durable",
     "postgres-replicated::validation_oracles",
 }
-EXPECTED_KIND_LIVE_COUNT = 12
+EXPECTED_KIND_LIVE_COUNT = 19
 
 
 @dataclass(frozen=True, order=True)

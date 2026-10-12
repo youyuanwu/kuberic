@@ -24,6 +24,12 @@ use kuberic_runtime::protocol::validation::{
 mod faults;
 #[cfg(feature = "runtime-test-bridge")]
 pub(crate) mod public_lifecycle;
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) mod public_v1_evidence;
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) mod public_v1_history;
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) mod public_v1_session_renewal;
 mod replacement_cleanup;
 mod scale_up;
 mod secondary_scale_down;

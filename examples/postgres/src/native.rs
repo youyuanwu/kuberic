@@ -581,7 +581,7 @@ impl PgNativeObserver {
     async fn snapshot_locked(&self) -> Result<PgObservation, PgError> {
         let generation = self.instance.generation_id();
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             self.instance.generation_operation(self.snapshot_inner()),
         )
         .await
@@ -961,7 +961,7 @@ fn requirement(
     ))
 }
 
-async fn certify_primary_progress(
+pub(crate) async fn certify_primary_progress(
     client: &tokio_postgres::Client,
     local_flush_lsn: i64,
     synchronous: Option<&AcknowledgementPolicy>,

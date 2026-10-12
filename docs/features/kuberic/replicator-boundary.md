@@ -145,6 +145,177 @@ controller-owned: endpoint, Pod and PVC identities are frozen before deletion,
 and replacement scaffolding does not imply history/build/serving completion.
 Production construction and dispatch cannot select either preview action.
 
+Phase 5.1 introduces a second, incompatible dormant preview identity for the
+Public V1 contract. Protocol 11 uses schema 8 while production remains on
+protocol 9/schema 6 and the Phase 4 preview remains on protocol 10/schema 7.
+The preview has no storage-migration contract: legacy and Phase 4 readers
+reject schema 8, the Public V1 opener rejects older schemas, and later dormant
+schema changes may require a fresh preview store. No production or application
+data is migrated through this boundary.
+
+Public V1 operation inputs use versioned, domain-separated canonical binary
+digests rather than Rust diagnostic formatting. The digest version remains
+part of the retained operation evidence. Protocol 11 also has a structurally
+separate report and accepted-status branch containing only public identity,
+role/access, first/last progress, and exact public-operation completion. It
+cannot carry the managed engine's verified, committed, quorum, ACK,
+copy-boundary, topology, or build-cursor evidence. Production normalization
+and evaluation reject this branch.
+
+`ReplicaInformation` now distinguishes an idle build target from an active
+remote peer. Unknown or inapplicable progress is `INVALID_LSN` (`-1`); zero
+remains a valid empty-history position. Active public configuration entries
+are exact remote, ready secondaries and may identify one `must_catchup`
+successor. Immutable `ReplicatorCapabilities` are bound to the coherent
+`ReplicatorInterfaces` creation identity, survive wrapping and attachment, and
+cannot manufacture managed provenance. They freeze specific-quorum support
+and the data-loss replay disposition used by durable operations.
+
+Typed rebuild-required results preserve the public/provider-visible reason
+without exposing agent workflow state through a callback. The operation owner
+enriches a local result from the exact captured operation, storage, epoch,
+revision, and process session; delayed completion is never enriched from
+current state. Remote build failures retain the target identity, target
+session, epoch and reason; the operation owner enriches them with the captured
+resource, operation and source session. This two-level construction
+does not change the protected Replicator, PrimaryReplicator, StateReplicator,
+StateProvider, or DurableState method sets and adds no host-only callback.
+
+The Public V1 replay table is operation-specific: lifecycle, configuration,
+settings, and exact removal converge; progress is a repeatable read; catch-up
+reevaluates its captured predicate; terminal build success is retained while
+ambiguity retires the attempt; data-loss ambiguity follows the creation's
+frozen disposition; and Close, Abort, and fault containment are idempotent.
+All of this remains repository-only and dormant. Phase 5 has not selected a
+replacement Replicator or changed the legacy production path.
+
+Phase 5.2 replaces the disposable Public V1 schema-8 store with a fresh,
+incompatible schema-9 store. There is no conversion or absent-field fallback:
+production schema 6, the Phase 4 schema-7 preview, and the earlier Public V1
+schema are rejected before state decoding. The controller owns one
+partition-wide `HistoryInitializationId` per resource and Public V1 protocol
+generation. Every initial replica receives that accepted value and derives the
+same domain-separated bootstrap history; local initialization, Pod/PVC
+identity, process session, epoch and LSN do not define partition history.
+
+History, storage and process identity remain separate. `HistoryContext` binds
+resource, Public V1 generation, opaque history and data-loss number.
+`ReplicaStorageIncarnationContext` binds the exact logical replica and
+persistent or volatile storage generation without a process session.
+`ProcessAttemptContext` binds one process session and Replicator creation to an
+epoch and attempt revision. Numeric progress is comparable only within the
+same resource, Public V1 generation, history and data-loss number. Recovery
+progress may identify an access-closed provisional primary, but it is not
+health, routing, quorum, catch-up or serving evidence.
+
+One immutable `DataLossAuthorization` names the predecessor and deterministic
+successor history, provisional primary storage, progress-reset scope and
+captured replay disposition. Renewable `DataLossAttempt` values bind that
+logical decision to process-local creation capabilities. A convergent
+successor requires durable predecessor containment, a different process
+session and a strictly higher configuration number while preserving the same
+authorization and storage. If the replacement creation declares
+`ReplaceOnAmbiguity`, a captured convergent authorization retires without
+callback invocation; a captured `ReplaceOnAmbiguity` authorization is
+terminal and cannot be upgraded by a convergent replacement. These outcomes
+remain distinct in durable/report state as `Retired` versus
+`ReplacementRequired`. Every ordinary Public V1 lifecycle/program epoch is
+fenced to the current history data-loss number; only the exact recovery
+authorization may admit the one specified increment. Public V1 build/removal
+inputs carry the exact current `HistoryContext`, so build attempts cannot
+escape the history fence.
+
+After ambiguous predecessor containment, the controller conditionally replaces
+the accepted process attempt with the exact higher-epoch successor before
+dispatch. Subsequent command and report acceptance require that successor
+attempt byte-for-byte; a predecessor attempt cannot resume through the new
+process.
+
+Recovery begins with two separately fenced owner-local commits. The controller
+conditionally persists bootstrap or invalidated accepted status before a
+feature-gated `PublicV1History` command can dispatch. The agent command journal
+then atomically revokes executable access, clears prior operation completions
+and old-history build/configuration state, and records the full logical
+authorization plus exact process attempt before callback execution. This is
+not a distributed transaction: every command and report revalidates resource,
+operation, history, storage, reset scope, replay disposition, creation
+capabilities and process identity. The attempt's public creation ID is derived
+from the actually attached `ReplicatorAttachment` identity and must match it
+exactly before admission.
+
+The agent then orders Replicator primary role, explicit epoch, application
+primary role, `on_data_loss`, fresh progress, proposed-history configuration
+and catch-up, explicit history admission, and finally access. Callback
+`false`, `true`, typed failure, rebuild-required and lost-result ambiguity
+remain distinct; none is itself a history certificate. Pending reports carry
+the exact predecessor history and immutable authorization fields, while
+admitted reports carry the exact proposed history. Recovery progress is valid
+only with nonterminal recovery authority; failed, replacement-required and
+retired state is election-ineligible. Production normalization, gRPC dispatch
+and evaluation still reject the feature-gated protocol-11 path.
+
+Phase 5.3 replaces the disposable schema-9 store with a fresh exact schema-10
+store. Schemas 6, 7, 8 and 9 are rejected before decoding; there is no
+migration, absent-field fallback or retained database fixture. Schema 10 adds
+process-session renewal barriers while protocol 11 remains repository-only.
+
+Build and peer descriptors carry exact replica identities, process sessions,
+addresses, epochs and current/previous configuration IDs. These values support
+lifecycle fencing and stale-result rejection, but they are not credentials and
+do not authenticate the remote process. Primary/secondary replacement or peer
+withdrawal advances the configuration epoch, closes affected access, freezes
+the survivor set, completes or explicitly excludes every survivor epoch
+barrier, replays the replacement role when applicable, and only then installs
+fresh configuration. An unreachable survivor is waited for or retired;
+same-epoch primary-session substitution is invalid. Data-loss replacement
+preserves the Phase 5.2 logical authorization and still enforces exact captured
+replay capability before any callback.
+
+Public V1 currently has no transport authentication contract. The PostgreSQL
+oracle uses an unauthenticated lifecycle-owned gateway and the public
+coordination RPC accepts no Public V1 token. TLS identity, workload identity or
+an explicit token protocol may be designed later. Until then the exact
+descriptor and session checks are correctness fences, not proof of the peer's
+identity. This is a documented future gap; this phase does not define a
+production-activation policy for it.
+
+Phase 5.4 replaces the disposable schema-10 store with the final fresh
+schema-11 Public V1 store. Schemas 8, 9 and 10 are rejected before record
+decoding. Each completed protocol-11 call reports its exact call kind,
+canonical input digest, replay disposition, accepted history/storage/process
+session, applicable PC/CC IDs, and catch-up mode/capability without native
+committed/quorum/ACK/copy evidence.
+
+Schema 11 owns one public build record per admitted attempt. The record retains
+the source and target identities, process sessions and address, history, epoch,
+admission revision, terminal public result and retirement disposition. It
+never stores a transport credential, engine cursor, copy sequence, snapshot or
+catch-up boundary, durable target LSN, ACK/quorum state, or a Replicator store
+handle. Callback ambiguity requires retirement, successful removal retires the
+exact record, and malformed or incompletely bound current-schema records fail
+on reopen.
+
+The dormant controller stores a structural, lossless shadow of each exact
+public completion before using it. The shadow preserves call kind, canonical
+input identity, replay disposition, accepted history/storage/process session,
+PC/CC IDs, capability/mode, typed failure detail and typed local/remote rebuild
+identity. Failover, switchover, repair/replacement, scale-up/down, removal,
+data loss and session renewal all use the same conditional evidence gate.
+Missing completion waits; changed history/session/incarnation/configuration
+fails closed; typed failure retires the exact incarnation and typed rebuild
+identity provisions only the captured replacement.
+
+The final Public V1 conformance catalog contains exactly KSF-01 through
+KSF-16. The strict custom fixture and four bounded real PostgreSQL scenarios
+execute row-keyed assertions from the same catalog. KSF-09, KSF-10 and KSF-16
+retain negative activation checks: the current managed attachment,
+agent-owned production replication listener and legacy continuation stores
+remain inventoried and therefore keep production cutover ineligible. KSF-10
+also proves Replicator-owned endpoint lifetime in the dormant strict custom
+fixture; PostgreSQL explicitly remains inapplicable because its test transport
+listener is externally owned. Passing the negative checks does not claim that
+the Phase 6 engine or Phase 7 replacement-only artifact exists.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

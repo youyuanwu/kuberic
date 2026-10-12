@@ -35,8 +35,8 @@ use crate::replicator::copy::{
 use crate::replicator::{
     DefaultReplicatorDependencies, ManagedReplicaStore, ManagedReplicatorDataPlane,
     PartitionAccessView, PrimaryReplicator, Replicator, ReplicatorAttachment,
-    ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorRegistration,
-    StatefulServicePartition,
+    ReplicatorCapabilities, ReplicatorCreationReservation, ReplicatorFactoryContext,
+    ReplicatorRegistration, StatefulServicePartition,
 };
 use crate::runtime::PendingReplication as RuntimePendingReplication;
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -383,6 +383,10 @@ struct HostState {
 struct RegisteredReplicator {
     control: Arc<dyn Replicator>,
     primary: Option<Arc<dyn PrimaryReplicator>>,
+    #[cfg(feature = "testing")]
+    identity: ReplicatorCreationIdentity,
+    #[allow(dead_code)]
+    capabilities: ReplicatorCapabilities,
     provider: Option<Arc<dyn StateProvider>>,
     process_lifecycle: Option<lifecycle::ProcessRuntime>,
     authority_lifecycle: Option<lifecycle::AuthorityRuntime>,
@@ -1000,6 +1004,11 @@ impl PodRuntime {
         let context = ReplicatorFactoryContext::new(
             RuntimeHostToken::new(),
             self.host.identity.clone(),
+            self.host
+                .replica_session
+                .get()
+                .map(|(_, session)| session.clone())
+                .unwrap_or_default(),
             Arc::new(HostAccessView {
                 host: Arc::downgrade(&self.host),
                 partition_information: self.host.state.read().await.partition_information.clone(),
@@ -1026,6 +1035,8 @@ impl PodRuntime {
             application: self.host.application.clone(),
             replicator: registered.control.clone(),
             primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
+            capabilities: registered.capabilities,
+            replicator_creation_id: registered.identity.to_public_id(),
             open_context: None,
             containment: None,
             aborted: Arc::new(std::sync::Mutex::new(false)),
@@ -2563,7 +2574,13 @@ impl PreviewFaultBridge {
             revision,
             process_session_id: self.process_session.clone(),
             class,
-            input_digest: format!("fault:{fault:?}:{revision}"),
+            input_digest:
+                crate::protocol::public_operations::CanonicalOperationInputDigest::opaque_v1(
+                    "kuberic-public-fault-input-v1",
+                    format!("{fault:?}:{revision}").as_bytes(),
+                ),
+            replay_disposition:
+                crate::protocol::public_operations::PublicOperationReplayDisposition::Containment,
             lifecycle: None,
             program: None,
         };
@@ -2737,10 +2754,13 @@ impl ReplicatorRegistration for RuntimeHost {
                 ));
             }
         }
+        #[cfg(feature = "testing")]
+        let identity = attachment.identity(RuntimeHostToken::new());
         let managed_lifecycle = attachment.managed_lifecycle(RuntimeHostToken::new());
         let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
         let control = attachment.replicator(RuntimeHostToken::new());
         let primary = attachment.primary_replicator(RuntimeHostToken::new());
+        let capabilities = attachment.capabilities(RuntimeHostToken::new());
         if let Some(lifecycle) = managed_lifecycle.as_ref() {
             lifecycle
                 .attach_interfaces(control.clone(), primary.clone())
@@ -2820,6 +2840,9 @@ impl ReplicatorRegistration for RuntimeHost {
             .set(RegisteredReplicator {
                 control,
                 primary,
+                #[cfg(feature = "testing")]
+                identity,
+                capabilities,
                 provider,
                 process_lifecycle,
                 authority_lifecycle,
@@ -3611,6 +3634,10 @@ impl RuntimeHost {
         let context = ReplicatorFactoryContext::new(
             RuntimeHostToken::new(),
             self.identity.clone(),
+            self.replica_session
+                .get()
+                .map(|(_, session)| session.clone())
+                .unwrap_or_default(),
             Arc::new(HostAccessView {
                 host: self.weak_self.clone(),
                 partition_information: self.state.read().await.partition_information.clone(),

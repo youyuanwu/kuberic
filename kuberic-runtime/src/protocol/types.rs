@@ -68,8 +68,28 @@ string_id!(ProcessSessionId);
 string_id!(ConfigurationId);
 string_id!(TransitionId);
 string_id!(InitializationId);
+string_id!(HistoryInitializationId);
+string_id!(HistoryId);
+string_id!(StorageGeneration);
+string_id!(ReplicatorCreationId);
 string_id!(OperationId);
 string_id!(SwitchoverRequestId);
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct PublicProtocolGeneration(#[schemars(range(min = 1))] u64);
+
+impl PublicProtocolGeneration {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(
     Debug,
@@ -185,6 +205,136 @@ pub struct ReplicaIdentity {
     pub replica_id: ReplicaId,
     pub instance_id: ReplicaInstanceId,
     pub agent_generation: AgentGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ReplicaStorageIdentity {
+    Persistent { pod_uid: PodUid, pvc_uid: PvcUid },
+    Volatile { identity: String },
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReplicaStorageIdentitySchema {
+    kind: String,
+    pod_uid: Option<PodUid>,
+    pvc_uid: Option<PvcUid>,
+    identity: Option<String>,
+}
+
+impl ReplicaStorageIdentity {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Persistent { pod_uid, pvc_uid } if pod_uid.is_empty() || pvc_uid.is_empty() => {
+                Err("persistent storage identity is incomplete")
+            }
+            Self::Volatile { identity } if identity.is_empty() => {
+                Err("volatile storage identity is empty")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaStorageIncarnationContext {
+    pub replica: ReplicaIdentity,
+    #[schemars(with = "ReplicaStorageIdentitySchema")]
+    pub storage: ReplicaStorageIdentity,
+    pub storage_generation: StorageGeneration,
+}
+
+impl ReplicaStorageIncarnationContext {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.replica.replica_id.value() <= 0
+            || self.replica.instance_id.is_empty()
+            || self.replica.agent_generation.is_empty()
+            || self.storage_generation.is_empty()
+        {
+            return Err("replica storage incarnation is incomplete");
+        }
+        self.storage.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessSessionRenewalReason {
+    PrimaryReplacement,
+    ActiveSecondaryReplacement,
+    PeerWithdrawal,
+    DataLossAttempt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessSessionEndpoint {
+    pub identity: ReplicaIdentity,
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    pub process_session_id: ProcessSessionId,
+    pub replicator_creation_id: ReplicatorCreationId,
+    pub role: ReplicaRole,
+}
+
+impl ProcessSessionEndpoint {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.identity.replica_id.value() <= 0
+            || self.identity.instance_id.is_empty()
+            || self.identity.agent_generation.is_empty()
+        {
+            return Err("process-session endpoint identity is incomplete");
+        }
+        self.storage_incarnation.validate()?;
+        if self.storage_incarnation.replica != self.identity
+            || self.process_session_id.is_empty()
+            || self.replicator_creation_id.is_empty()
+        {
+            return Err("process-session endpoint is incomplete or inconsistent");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryContext {
+    pub resource_uid: ResourceUid,
+    pub protocol_generation: PublicProtocolGeneration,
+    pub history_id: HistoryId,
+    pub data_loss_number: i64,
+}
+
+impl HistoryContext {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.resource_uid.is_empty()
+            || self.protocol_generation.value() == 0
+            || self.history_id.is_empty()
+            || self.data_loss_number < 0
+        {
+            return Err("history context is incomplete");
+        }
+        Ok(())
+    }
+
+    pub fn is_comparable_with(&self, other: &Self) -> bool {
+        self.resource_uid == other.resource_uid
+            && self.protocol_generation == other.protocol_generation
+            && self.history_id == other.history_id
+            && self.data_loss_number == other.data_loss_number
+    }
+
+    pub fn compare_progress(
+        &self,
+        progress: i64,
+        other: &Self,
+        other_progress: i64,
+    ) -> Option<std::cmp::Ordering> {
+        (progress >= 0 && other_progress >= 0 && self.is_comparable_with(other))
+            .then(|| progress.cmp(&other_progress))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
@@ -682,6 +832,7 @@ pub enum TransitionKind {
     PlannedSwitchover,
     SecondaryScaleDown,
     ScaleUp,
+    DataLossRecovery,
 }
 
 impl TransitionKind {
@@ -693,6 +844,7 @@ impl TransitionKind {
             Self::PlannedSwitchover => "planned-switchover",
             Self::SecondaryScaleDown => "secondary-scale-down",
             Self::ScaleUp => "scale-up",
+            Self::DataLossRecovery => "data-loss-recovery",
         }
     }
 }
@@ -1496,6 +1648,87 @@ pub fn derive_initialization_id(
 
 pub fn derive_agent_generation(initialization_id: &InitializationId) -> AgentGeneration {
     AgentGeneration::new(digest_parts(&["agent", initialization_id.as_str()]))
+}
+
+pub fn derive_history_initialization_id(
+    resource_uid: &ResourceUid,
+    protocol_generation: PublicProtocolGeneration,
+) -> HistoryInitializationId {
+    let mut hasher = Sha256::new();
+    update_digest_string(&mut hasher, "kuberic-history-initialization-v1");
+    update_digest_string(&mut hasher, resource_uid.as_str());
+    hasher.update(protocol_generation.value().to_be_bytes());
+    HistoryInitializationId::new(format!("history-init-{}", format_digest(hasher.finalize())))
+}
+
+pub fn derive_bootstrap_history(
+    resource_uid: &ResourceUid,
+    protocol_generation: PublicProtocolGeneration,
+    initialization_id: &HistoryInitializationId,
+) -> HistoryContext {
+    let mut hasher = Sha256::new();
+    update_digest_string(&mut hasher, "kuberic-history-bootstrap-v1");
+    update_digest_string(&mut hasher, resource_uid.as_str());
+    hasher.update(protocol_generation.value().to_be_bytes());
+    update_digest_string(&mut hasher, initialization_id.as_str());
+    HistoryContext {
+        resource_uid: resource_uid.clone(),
+        protocol_generation,
+        history_id: HistoryId::new(format!("history-{}", format_digest(hasher.finalize()))),
+        data_loss_number: 0,
+    }
+}
+
+pub fn derive_data_loss_history(
+    authorization_id: &OperationId,
+    predecessor: &HistoryContext,
+    next_data_loss_number: i64,
+    provisional_primary: &ReplicaStorageIncarnationContext,
+) -> Result<HistoryContext, &'static str> {
+    predecessor.validate()?;
+    provisional_primary.validate()?;
+    if authorization_id.is_empty()
+        || predecessor
+            .data_loss_number
+            .checked_add(1)
+            .is_none_or(|expected| expected != next_data_loss_number)
+    {
+        return Err("data-loss history requires the exact next data-loss number");
+    }
+    let mut hasher = Sha256::new();
+    update_digest_string(&mut hasher, "kuberic-history-data-loss-v1");
+    update_digest_string(&mut hasher, authorization_id.as_str());
+    update_digest_string(&mut hasher, predecessor.resource_uid.as_str());
+    hasher.update(predecessor.protocol_generation.value().to_be_bytes());
+    update_digest_string(&mut hasher, predecessor.history_id.as_str());
+    hasher.update(next_data_loss_number.to_be_bytes());
+    hasher.update(provisional_primary.replica.replica_id.value().to_be_bytes());
+    update_digest_string(
+        &mut hasher,
+        provisional_primary.replica.instance_id.as_str(),
+    );
+    update_digest_string(
+        &mut hasher,
+        provisional_primary.replica.agent_generation.as_str(),
+    );
+    match &provisional_primary.storage {
+        ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } => {
+            hasher.update([1]);
+            update_digest_string(&mut hasher, pod_uid.as_str());
+            update_digest_string(&mut hasher, pvc_uid.as_str());
+        }
+        ReplicaStorageIdentity::Volatile { identity } => {
+            hasher.update([2]);
+            update_digest_string(&mut hasher, identity);
+        }
+    }
+    update_digest_string(&mut hasher, provisional_primary.storage_generation.as_str());
+    Ok(HistoryContext {
+        resource_uid: predecessor.resource_uid.clone(),
+        protocol_generation: predecessor.protocol_generation,
+        history_id: HistoryId::new(format!("history-{}", format_digest(hasher.finalize()))),
+        data_loss_number: next_data_loss_number,
+    })
 }
 
 pub fn derive_transition_id(

@@ -48,6 +48,23 @@ impl PgDataServiceImpl {
 
 #[tonic::async_trait]
 impl PgDataService for PgDataServiceImpl {
+    async fn public_v1(
+        &self,
+        request: Request<crate::proto::RecoveryRequest>,
+    ) -> Result<Response<crate::proto::RecoveryResponse>, Status> {
+        let request =
+            decode(&request.into_inner().envelope_json).map_err(Status::invalid_argument)?;
+        let response = self
+            .service
+            .driver()?
+            .public_request(request)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(crate::proto::RecoveryResponse {
+            envelope_json: encode(&response).map_err(Status::internal)?,
+        }))
+    }
+
     async fn recover(
         &self,
         request: Request<crate::proto::RecoveryRequest>,

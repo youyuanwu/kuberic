@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use kuberic_runtime::application::{OpenContext, OpenMode, RoleChange, StateProvider};
 use kuberic_runtime::host::ApplicationStorageState;
 use kuberic_runtime::protocol::types::{FaultType, ReplicaRole, ResourceUid};
-use kuberic_runtime::replicator::{ReplicatorFactoryContext, ReplicatorSettings};
+use kuberic_runtime::replicator::{
+    ReplicatorCapabilities, ReplicatorFactoryContext, ReplicatorSettings,
+};
 use kuberic_runtime::{
     Replicator, ReplicatorFactory, ReplicatorInterfaces, Result, RuntimeError,
     StatefulServiceReplica,
@@ -33,6 +35,7 @@ pub struct PgService {
     driver: OnceLock<Arc<PgReplicator>>,
     cancellation: CancellationToken,
     coordination_token: String,
+    public_v1: bool,
 }
 
 impl PgService {
@@ -48,6 +51,7 @@ impl PgService {
             driver: OnceLock::new(),
             cancellation: CancellationToken::new(),
             coordination_token: String::new(),
+            public_v1: false,
         }
     }
 
@@ -75,6 +79,12 @@ impl PgService {
 
     pub fn with_coordination_token(mut self, token: String) -> Self {
         self.coordination_token = token;
+        self
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn with_public_v1(mut self) -> Self {
+        self.public_v1 = true;
         self
     }
 
@@ -187,13 +197,24 @@ impl StatefulServiceReplica for PgService {
         let interfaces = context
             .partition
             .with_factory(Arc::new(PgReplicatorFactory(driver)))
-            .create_replicator(None, None)
+            .create_replicator(
+                None,
+                self.public_v1.then(|| ReplicatorSettings {
+                    replication_address: self.config.replication_address.clone(),
+                    public_v1: true,
+                }),
+            )
             .await?;
         debug_assert!(interfaces.state_replicator().is_none());
         Ok(interfaces.replicator())
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        if let Some(driver) = self.driver.get()
+            && driver.is_public_v1()
+        {
+            driver.public_application_role(role).await?;
+        }
         Ok(RoleChange {
             service_address: matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
                 .then(|| format!("{}:{}", self.instance.listen_host(), self.instance.port())),
@@ -235,7 +256,7 @@ struct PgReplicatorFactory(Arc<PgReplicator>);
 
 impl PgReplicatorFactory {
     fn interfaces(&self) -> ReplicatorInterfaces {
-        ReplicatorInterfaces::primary(self.0.clone(), None)
+        ReplicatorInterfaces::primary(self.0.clone(), None, ReplicatorCapabilities::conservative())
     }
 }
 
@@ -265,15 +286,17 @@ mod tests {
 impl ReplicatorFactory for PgReplicatorFactory {
     async fn create_replicator(
         &self,
-        _context: ReplicatorFactoryContext,
+        context: ReplicatorFactoryContext,
         state_provider: Option<Arc<dyn StateProvider>>,
-        _settings: ReplicatorSettings,
+        settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         if state_provider.is_some() {
             return Err(application_error(
                 "PostgreSQL owns its replication and copy state",
             ));
         }
+        self.0
+            .configure_public_v1(settings, context.identity()?, context.process_session_id()?)?;
         Ok(self.interfaces())
     }
 }

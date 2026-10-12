@@ -77,6 +77,7 @@ unprivileged Linux account with compatible server/client binaries, pidfds,
 subreapers and readable `/proc`. PostgreSQL 16 is the validated major.
 
 ```bash
+just nextest-postgres-smoke-inventory
 just nextest-postgres-smoke
 just nextest-postgres
 # Or run one deterministic isolated-runner shard:
@@ -84,10 +85,13 @@ just nextest-postgres 1/4
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
-Use the smoke target for routine local checks. It covers real bootstrap and
-fencing, native build, failover, planned switchover, scale-up recovery and an
-explicit storage-failure oracle. Run the full target before pushing PostgreSQL
-changes.
+Use the smoke target for routine local checks. Its inventory prerequisite
+requires the exact Public V1 PostgreSQL conformance parent before starting
+PostgreSQL. The smoke covers that oracle plus real bootstrap and fencing,
+native build, failover, planned switchover, scale-up recovery and an explicit
+storage-failure oracle. CI-derived nextest profiles terminate an individual
+test at five minutes. Run the full target only in the dedicated validation
+path or when explicitly requested.
 
 See the [PostgreSQL validation guide](features/kuberic/testing.md#postgresql-v2-host-local-validation)
 and [design](features/postgres/design.md).

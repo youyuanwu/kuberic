@@ -34,6 +34,7 @@ fn scale_down_commit_boundary_rejects_generated_primary_evidence_corruption() {
                 6 => primary.identity.agent_generation = AgentGeneration::new("substitute"),
                 _ => primary.epoch.data_loss_number += 1,
             }
+
             let plan = broken.plan();
             assert!(
                 matches!(plan, Plan::Wait { .. } | Plan::Unsafe { .. }),
@@ -45,6 +46,57 @@ fn scale_down_commit_boundary_rejects_generated_primary_evidence_corruption() {
         baseline.finish();
         assert_eq!(baseline.removed.len(), 1);
     }
+}
+
+#[test]
+#[cfg(feature = "runtime-test-bridge")]
+fn public_v1_history_command_is_typed_and_production_dormant() {
+    use kuberic_runtime::protocol::command::{
+        EffectClass, ProtocolCommand, PublicV1HistoryCommand,
+    };
+    use kuberic_runtime::protocol::public_operations::{
+        PublicOperationPreviewIdentity, PublicV1AcceptedStatus,
+    };
+    use kuberic_runtime::protocol::types::{
+        AgentGeneration, PodUid, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity,
+        ReplicaInstanceId, ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid,
+        StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
+    };
+
+    let resource_uid = ResourceUid::new("resource-1");
+    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let generation = PublicProtocolGeneration::new(preview.generation);
+    let initialization = derive_history_initialization_id(&resource_uid, generation);
+    let accepted = PublicV1AcceptedStatus {
+        identity: preview.clone(),
+        history_initialization_id: initialization.clone(),
+        history: derive_bootstrap_history(&resource_uid, generation, &initialization),
+        data_loss_recovery: None,
+        completed_operations: Vec::new(),
+        extensions: Default::default(),
+    };
+    let storage = ReplicaStorageIncarnationContext {
+        replica: ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-1"),
+            agent_generation: AgentGeneration::new("generation-1"),
+        },
+        storage: ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+        },
+        storage_generation: StorageGeneration::new("storage-1"),
+    };
+    let command = PublicV1HistoryCommand::Initialize {
+        preview,
+        accepted,
+        storage,
+    };
+    command.validate().unwrap();
+    assert_eq!(
+        ProtocolCommand::PublicV1History(Box::new(command)).effect_class(),
+        EffectClass::ReconfigurationAction
+    );
 }
 
 #[test]

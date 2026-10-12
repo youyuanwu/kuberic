@@ -38,6 +38,7 @@ enum TransitionKind {
   TRANSITION_KIND_PLANNED_SWITCHOVER = 4;
   TRANSITION_KIND_SECONDARY_SCALE_DOWN = 5;
   TRANSITION_KIND_SCALE_UP = 6;
+  TRANSITION_KIND_DATA_LOSS_RECOVERY = 7;
 }
 
 enum FaultType {
@@ -150,6 +151,234 @@ message AgentStatusReport {
   ScaleUpIntent scale_up_intent = 37;
   EnsureConfigurationCommand pending_configuration = 38;
   string replication_address = 39;
+  PublicV1AgentStatus public_v1 = 40;
+}
+
+message PublicV1AgentStatus {
+  uint32 protocol_version = 1;
+  uint64 generation = 2;
+  string resource_uid = 3;
+  ReplicaIdentity identity = 4;
+  string process_session_id = 5;
+  uint64 report_sequence = 6;
+  ReplicaRole role = 7;
+  AccessStatus read_status = 8;
+  AccessStatus write_status = 9;
+  PublicV1ProgressRole progress_role = 10;
+  int64 first_progress = 11;
+  int64 last_progress = 12;
+  repeated PublicV1OperationCompletion completed_operations = 13;
+  optional uint32 history_recovery_extension_version = 14;
+  reserved 15;
+  optional uint32 public_build_evidence_extension_version = 16;
+  PublicV1HistoryContext history = 17;
+  PublicV1StorageIncarnation storage_incarnation = 18;
+  PublicV1DataLossRecoveryStatus data_loss_recovery = 19;
+  PublicV1ServiceLocation service_location = 20;
+}
+
+message PublicV1ServiceLocation {
+  uint32 protocol_version = 1;
+  uint64 generation = 2;
+  string resource_uid = 3;
+  string operation_id = 4;
+  ReplicaIdentity replica = 5;
+  string process_session_id = 6;
+  Epoch epoch = 7;
+  uint64 revision = 8;
+  string address = 9;
+}
+
+message PublicV1HistoryContext {
+  string resource_uid = 1;
+  uint64 protocol_generation = 2;
+  string history_id = 3;
+  int64 data_loss_number = 4;
+}
+
+enum PublicV1StorageKind {
+  PUBLIC_V1_STORAGE_KIND_UNKNOWN = 0;
+  PUBLIC_V1_STORAGE_KIND_PERSISTENT = 1;
+  PUBLIC_V1_STORAGE_KIND_VOLATILE = 2;
+}
+
+message PublicV1StorageIncarnation {
+  ReplicaIdentity replica = 1;
+  PublicV1StorageKind kind = 2;
+  string pod_uid = 3;
+  string pvc_uid = 4;
+  string volatile_identity = 5;
+  string storage_generation = 6;
+}
+
+message PublicV1DataLossAttempt {
+  string authorization_id = 1;
+  string attempt_id = 2;
+  string process_session_id = 3;
+  string replicator_creation_id = 4;
+  bool catch_up_specific_quorum = 5;
+  PublicV1ReplayDisposition data_loss_replay = 6;
+  Epoch epoch = 7;
+  uint64 attempt_revision = 8;
+}
+
+enum PublicV1DataLossRecoveryStage {
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_UNKNOWN = 0;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_AUTHORIZED = 1;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_INVALIDATED = 2;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_CALLBACK_PROCESSING = 3;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_HISTORY_PENDING = 4;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_CONFIGURATION_PENDING = 5;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_ADMITTED = 6;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_FAILED = 7;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_REPLACEMENT_REQUIRED = 8;
+  PUBLIC_V1_DATA_LOSS_RECOVERY_STAGE_RETIRED = 9;
+}
+
+message PublicV1RecoveryProgress {
+  PublicV1ProgressRole role = 1;
+  int64 first = 2;
+  int64 last = 3;
+}
+
+message PublicV1DataLossRecoveryStatus {
+  string authorization_id = 1;
+  PublicV1DataLossAttempt attempt = 2;
+  PublicV1HistoryContext proposed_history = 3;
+  PublicV1StorageIncarnation provisional_primary = 4;
+  PublicV1DataLossRecoveryStage stage = 5;
+  PublicV1RecoveryProgress observed_progress = 6;
+  PublicV1HistoryContext predecessor_history = 7;
+  PublicV1ProviderProgressResetKind reset_scope_kind = 8;
+  PublicV1StorageIncarnation retired_storage = 9;
+  PublicV1ReplayDisposition authorization_replay = 10;
+}
+
+enum PublicV1ProviderProgressResetKind {
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_UNKNOWN = 0;
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_PRESERVE = 1;
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_RESET_TO_EMPTY = 2;
+  PUBLIC_V1_PROVIDER_PROGRESS_RESET_KIND_REPLACE_INCARNATION = 3;
+}
+
+enum PublicV1ProgressRole {
+  PUBLIC_V1_PROGRESS_ROLE_UNKNOWN = 0;
+  PUBLIC_V1_PROGRESS_ROLE_PRIMARY = 1;
+  PUBLIC_V1_PROGRESS_ROLE_SECONDARY = 2;
+  PUBLIC_V1_PROGRESS_ROLE_RECOVERY = 3;
+}
+
+enum PublicV1ReplayDisposition {
+  PUBLIC_V1_REPLAY_DISPOSITION_UNKNOWN = 0;
+  PUBLIC_V1_REPLAY_DISPOSITION_CONVERGENT = 1;
+  PUBLIC_V1_REPLAY_DISPOSITION_REPEATABLE_READ = 2;
+  PUBLIC_V1_REPLAY_DISPOSITION_REEVALUATE_CATCH_UP = 3;
+  PUBLIC_V1_REPLAY_DISPOSITION_RETAIN_BUILD_SUCCESS_RETIRE_AMBIGUITY = 4;
+  PUBLIC_V1_REPLAY_DISPOSITION_DATA_LOSS_CONVERGENT = 5;
+  PUBLIC_V1_REPLAY_DISPOSITION_DATA_LOSS_REPLACE_ON_AMBIGUITY = 6;
+  PUBLIC_V1_REPLAY_DISPOSITION_EXACT_REMOVAL = 7;
+  PUBLIC_V1_REPLAY_DISPOSITION_CONTAINMENT = 8;
+}
+
+enum PublicV1OperationResultKind {
+  PUBLIC_V1_OPERATION_RESULT_UNKNOWN = 0;
+  PUBLIC_V1_OPERATION_RESULT_SUCCEEDED = 1;
+  PUBLIC_V1_OPERATION_RESULT_FAILED = 2;
+  PUBLIC_V1_OPERATION_RESULT_AMBIGUOUS = 3;
+  PUBLIC_V1_OPERATION_RESULT_CANCELLED = 4;
+  PUBLIC_V1_OPERATION_RESULT_REBUILD_REQUIRED = 5;
+}
+
+enum PublicV1RebuildKind {
+  PUBLIC_V1_REBUILD_KIND_UNKNOWN = 0;
+  PUBLIC_V1_REBUILD_KIND_LOCAL_PROVIDER = 1;
+  PUBLIC_V1_REBUILD_KIND_REMOTE_BUILD_TARGET = 2;
+}
+
+enum PublicV1RebuildReason {
+  PUBLIC_V1_REBUILD_REASON_UNKNOWN = 0;
+  PUBLIC_V1_REBUILD_REASON_INCOMPATIBLE_RETAINED_HISTORY = 1;
+  PUBLIC_V1_REBUILD_REASON_PROVIDER_MISMATCH = 2;
+  PUBLIC_V1_REBUILD_REASON_REMOTE_COPY_CONFLICT = 3;
+}
+
+message PublicV1CapturedOperationIdentity {
+  string resource_uid = 1;
+  uint32 protocol_version = 2;
+  uint64 generation = 3;
+  Epoch epoch = 4;
+  string operation_id = 5;
+  uint64 revision = 6;
+  string detecting_session = 7;
+}
+
+message PublicV1BuildAttemptReference {
+  string resource_uid = 1;
+  Epoch epoch = 2;
+  string build_id = 3;
+  ReplicaIdentity source = 4;
+  reserved 5;
+  string source_session = 6;
+  ReplicaIdentity target = 7;
+  reserved 8;
+  string target_session = 9;
+  reserved 10;
+  PublicV1StorageIncarnation source_storage = 11;
+  PublicV1StorageIncarnation target_storage = 12;
+}
+
+message PublicV1ReplicaRebuildRequired {
+  PublicV1RebuildKind kind = 1;
+  PublicV1RebuildReason reason = 2;
+  PublicV1CapturedOperationIdentity operation = 3;
+  ReplicaIdentity provider_replica = 4;
+  ReplicaIdentity local_replica = 5;
+  string local_storage = 6;
+  PublicV1BuildAttemptReference build = 7;
+}
+
+message PublicV1OperationCompletion {
+  string operation_id = 1;
+  uint64 revision = 2;
+  uint32 input_digest_version = 3;
+  string input_digest_sha256 = 4;
+  PublicV1ReplayDisposition replay_disposition = 5;
+  PublicV1OperationResultKind result = 6;
+  string detail = 7;
+  PublicV1ReplicaRebuildRequired rebuild_required = 8;
+  PublicV1CallKind call_kind = 9;
+  string process_session_id = 10;
+  PublicV1HistoryContext history = 11;
+  PublicV1StorageIncarnation storage_incarnation = 12;
+  string previous_configuration_id = 13;
+  string current_configuration_id = 14;
+  optional PublicV1CatchUpMode catch_up_mode = 15;
+  optional bool catch_up_specific_quorum = 16;
+  reserved 17, 18;
+}
+
+enum PublicV1CallKind {
+  PUBLIC_V1_CALL_KIND_UNKNOWN = 0;
+  PUBLIC_V1_CALL_KIND_INITIAL_PRIMARY = 1;
+  PUBLIC_V1_CALL_KIND_FAILOVER_PROMOTION = 2;
+  PUBLIC_V1_CALL_KIND_SECONDARY_EPOCH_ADVANCE = 3;
+  PUBLIC_V1_CALL_KIND_OPEN = 4;
+  PUBLIC_V1_CALL_KIND_ROLE = 5;
+  PUBLIC_V1_CALL_KIND_EPOCH = 6;
+  PUBLIC_V1_CALL_KIND_CONFIGURATION = 7;
+  PUBLIC_V1_CALL_KIND_CATCH_UP = 8;
+  PUBLIC_V1_CALL_KIND_PROGRESS = 9;
+  PUBLIC_V1_CALL_KIND_SWAP = 10;
+  PUBLIC_V1_CALL_KIND_BUILD = 11;
+  PUBLIC_V1_CALL_KIND_REMOVE = 12;
+  PUBLIC_V1_CALL_KIND_CLOSE = 13;
+  PUBLIC_V1_CALL_KIND_ABORT = 14;
+}
+
+enum PublicV1CatchUpMode {
+  PUBLIC_V1_CATCH_UP_MODE_UNKNOWN = 0;
+  PUBLIC_V1_CATCH_UP_MODE_WRITE_QUORUM = 1;
+  PUBLIC_V1_CATCH_UP_MODE_ALL = 2;
 }
 
 message InitializeAgentStoreCommand {
@@ -430,6 +659,7 @@ message EnsureReplicaBuildCommand {
   BuildAuthority authority = 6;
   string source_session_id = 7;
   bool retire = 8;
+  reserved 9;
 }
 
 message ExecuteCommandRequest {

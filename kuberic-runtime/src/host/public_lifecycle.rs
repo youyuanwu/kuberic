@@ -12,11 +12,18 @@ use crate::host::state::{
 use crate::host::store::AgentStore;
 use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
-    PossibleDataLossIntent, PublicLifecycleInput, PublicLifecycleRecipe, PublicLifecycleReport,
-    PublicOperationIntent, PublicOperationPreviewIdentity, ServiceLocation,
+    CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
+    PublicBuildInput, PublicCatchUpMode, PublicLifecycleInput, PublicLifecycleRecipe,
+    PublicLifecycleReport, PublicOperationIntent, PublicOperationPreviewIdentity,
+    PublicOperationProgram, PublicProgress, PublicV1AgentReport, PublicV1CallKind,
+    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildRequired, ServiceLocation,
 };
-use crate::protocol::types::{ProcessSessionId, ReplicaRole};
-use crate::replicator::{PrimaryReplicator, ReplicaSetQuorumMode, Replicator};
+use crate::protocol::types::{
+    AccessStatus, ConfigurationId, ProcessSessionId, ReplicaRole, ReplicatorCreationId,
+};
+use crate::replicator::{
+    PrimaryReplicator, ReplicaSetQuorumMode, Replicator, ReplicatorCapabilities,
+};
 
 #[path = "public_lifecycle_program.rs"]
 mod program;
@@ -28,6 +35,8 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) application: Arc<dyn StatefulServiceReplica>,
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
+    pub(crate) capabilities: ReplicatorCapabilities,
+    pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) aborted: Arc<std::sync::Mutex<bool>>,
@@ -72,6 +81,37 @@ impl PublicLifecycleCallbacks {
             self.application.abort();
         }
     }
+
+    fn validate_intent_capabilities(&self, intent: &PublicOperationIntent) -> Result<()> {
+        if !intent.preview.is_public_v1() {
+            return Ok(());
+        }
+        if let Some(PublicOperationProgram::Swap {
+            catch_up_specific_quorum,
+            ..
+        }) = &intent.program
+            && *catch_up_specific_quorum != self.capabilities.catch_up_specific_quorum
+        {
+            return Err(HostError::CommandRejected(
+                "captured swap capability differs from attached Replicator creation".into(),
+            ));
+        }
+        if let Some(recovery) = intent
+            .lifecycle
+            .as_ref()
+            .filter(|input| input.possible_data_loss == PossibleDataLossIntent::Possible)
+            .and_then(|input| input.data_loss_recovery.as_ref())
+            && (recovery.attempt.process.replicator_creation_id != self.replicator_creation_id
+                || recovery.attempt.process.data_loss_replay != self.capabilities.data_loss_replay
+                || recovery.attempt.process.catch_up_specific_quorum
+                    != self.capabilities.catch_up_specific_quorum)
+        {
+            return Err(HostError::CommandRejected(
+                "data-loss attempt capabilities differ from attached Replicator creation".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn instructions(input: &PublicLifecycleInput) -> Vec<PublicInstruction> {
@@ -80,12 +120,23 @@ pub(crate) fn instructions(input: &PublicLifecycleInput) -> Vec<PublicInstructio
         return vec![Epoch];
     }
     let mut result = vec![ReplicatorPrimary];
-    if input.recipe == PublicLifecycleRecipe::FailoverPromotion {
+    if input.recipe == PublicLifecycleRecipe::FailoverPromotion
+        || input.data_loss_recovery.is_some()
+    {
         result.push(Epoch);
     }
     result.push(ApplicationPrimary);
     if input.possible_data_loss == PossibleDataLossIntent::Possible {
         result.push(DataLoss);
+        if input.data_loss_recovery.is_some() {
+            result.extend([
+                Progress,
+                CurrentConfiguration,
+                CatchUp,
+                HistoryAdmission,
+                Access,
+            ]);
+        }
         return result;
     }
     match input.recipe {
@@ -108,6 +159,7 @@ pub(crate) async fn launch(
     intent
         .validate()
         .map_err(|message| HostError::CommandRejected(message.into()))?;
+    callbacks.validate_intent_capabilities(&intent)?;
     callbacks.aborted = registry.abort_guard();
     if intent.lifecycle.is_none() && intent.program.is_none() {
         return Err(HostError::CommandRejected(
@@ -172,6 +224,15 @@ async fn execute(
     {
         return Err(HostError::CommandRejected(error.clone()));
     }
+    if matches!(
+        record.lifecycle.outcomes.last(),
+        Some(PublicInstructionOutcome::RebuildRequired(_))
+    ) {
+        return Err(HostError::CommandRejected(
+            "retained replica rebuild requirement".into(),
+        ));
+    }
+    let captured_state = store.load_state().await?;
     let start = record.lifecycle.outcomes.len();
     for (index, instruction) in instructions(&input).into_iter().enumerate().skip(start) {
         #[cfg(all(test, feature = "testing"))]
@@ -183,73 +244,163 @@ async fn execute(
             .await?;
         let outcome = match instruction {
             ReplicatorPrimary => {
-                callbacks
-                    .replicator
-                    .change_role(input.epoch, ReplicaRole::Primary)
-                    .await?;
+                local_callback(
+                    callbacks
+                        .replicator
+                        .change_role(input.epoch, ReplicaRole::Primary)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             Epoch => {
-                callbacks.replicator.update_epoch(input.epoch).await?;
+                local_callback(
+                    callbacks.replicator.update_epoch(input.epoch).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             ApplicationPrimary => {
-                let role = callbacks
-                    .application
-                    .change_role(ReplicaRole::Primary)
-                    .await?;
+                let role = local_callback(
+                    callbacks
+                        .application
+                        .change_role(ReplicaRole::Primary)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::ApplicationRole(role.service_address)
             }
             DataLoss => {
                 let outcome = match callbacks.primary.on_data_loss().await {
                     Ok(false) => DataLossOutcome::False,
                     Ok(true) => DataLossOutcome::True,
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
+                        if matches!(failure.as_ref(), ReplicaRebuildRequired::LocalProvider(_)) =>
+                    {
+                        let canonical = enrich_local_rebuild(
+                            &captured_state.identity,
+                            &intent,
+                            &input,
+                            *failure,
+                        )?;
+                        store
+                            .public_instruction(
+                                &intent,
+                                index,
+                                instruction,
+                                Some(PublicInstructionOutcome::RebuildRequired(Box::new(
+                                    canonical,
+                                ))),
+                            )
+                            .await?;
+                        return Err(HostError::CommandRejected(
+                            "local provider requires replica rebuild".into(),
+                        ));
+                    }
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => {
+                        return Err(HostError::CommandRejected(
+                            "remote build failure substituted for local-provider failure".into(),
+                        ));
+                    }
                     Err(error) => DataLossOutcome::Error(error.to_string()),
                 };
                 PublicInstructionOutcome::DataLoss(outcome)
             }
+            Progress => PublicInstructionOutcome::Progress(
+                local_callback(
+                    callbacks.replicator.current_progress().await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?,
+            ),
             CurrentConfiguration => {
-                callbacks
-                    .primary
-                    .update_current_replica_set_configuration(input.current.clone().into())
-                    .await?;
+                let configuration = input.configuration();
+                local_callback(
+                    program::install_current(&callbacks, &configuration).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             CatchUpConfiguration => {
-                callbacks
-                    .primary
-                    .update_catch_up_replica_set_configuration(
-                        input.current.clone().into(),
-                        input
-                            .previous
-                            .clone()
-                            .expect("validated failover previous configuration")
-                            .into(),
-                    )
-                    .await?;
+                let configuration = input.configuration();
+                local_callback(
+                    program::install(&callbacks, &configuration).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             CatchUp => {
                 if index == start && start > 0 {
+                    let configuration = input.configuration();
+                    local_callback(
+                        program::install(&callbacks, &configuration).await,
+                        store.as_ref(),
+                        &intent,
+                        index,
+                        instruction,
+                        input.epoch,
+                    )
+                    .await?;
+                }
+                local_callback(
                     callbacks
                         .primary
-                        .update_catch_up_replica_set_configuration(
-                            input.current.clone().into(),
-                            input
-                                .previous
-                                .clone()
-                                .expect("validated previous configuration")
-                                .into(),
-                        )
-                        .await?;
-                }
-                callbacks
-                    .primary
-                    .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
-                    .await?;
+                        .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
-            Access => PublicInstructionOutcome::Done,
+            HistoryAdmission => PublicInstructionOutcome::Done,
+            Access => {
+                local_callback(
+                    callbacks
+                        .application
+                        .change_role(ReplicaRole::Primary)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
+                PublicInstructionOutcome::Done
+            }
             _ => unreachable!("program instruction in role recipe"),
         };
         #[cfg(all(test, feature = "testing"))]
@@ -269,6 +420,141 @@ async fn execute(
         }
     }
     Ok(())
+}
+
+fn captured_operation(
+    identity: &crate::host::state::StorageIdentity,
+    intent: &PublicOperationIntent,
+    epoch: crate::protocol::types::Epoch,
+) -> CapturedPublicOperationIdentity {
+    CapturedPublicOperationIdentity {
+        resource_uid: identity.resource_uid.clone(),
+        preview: intent.preview.clone(),
+        epoch,
+        operation_id: intent.operation_id.clone(),
+        revision: intent.revision,
+        detecting_session: intent.process_session_id.clone(),
+    }
+}
+
+pub(super) fn enrich_local_rebuild(
+    identity: &crate::host::state::StorageIdentity,
+    intent: &PublicOperationIntent,
+    input: &PublicLifecycleInput,
+    failure: ReplicaRebuildRequired,
+) -> Result<CanonicalReplicaRebuildRequired> {
+    enrich_local_rebuild_at_epoch(identity, intent, input.epoch, &input.replica, failure)
+}
+
+fn enrich_local_rebuild_at_epoch(
+    identity: &crate::host::state::StorageIdentity,
+    intent: &PublicOperationIntent,
+    epoch: crate::protocol::types::Epoch,
+    local_replica: &crate::protocol::types::ReplicaIdentity,
+    failure: ReplicaRebuildRequired,
+) -> Result<CanonicalReplicaRebuildRequired> {
+    let ReplicaRebuildRequired::LocalProvider(failure) = failure else {
+        return Err(HostError::CommandRejected(
+            "remote failure cannot be enriched as a local provider failure".into(),
+        ));
+    };
+    if failure.provider.replica != *local_replica
+        || identity.local_identity != *local_replica
+        || identity.resource_uid.is_empty()
+    {
+        return Err(HostError::StaleEffectCompletion(
+            "provider-visible identity differs from captured local operation".into(),
+        ));
+    }
+    Ok(CanonicalReplicaRebuildRequired::LocalProvider {
+        reason: failure.reason,
+        provider: failure.provider,
+        operation: captured_operation(identity, intent, epoch),
+        local_replica: identity.local_identity.clone(),
+        local_storage: identity.pvc_uid.clone(),
+    })
+}
+
+async fn local_callback<T>(
+    result: crate::Result<T>,
+    store: &dyn AgentStore,
+    intent: &PublicOperationIntent,
+    index: usize,
+    instruction: PublicInstruction,
+    epoch: crate::protocol::types::Epoch,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
+            if matches!(failure.as_ref(), ReplicaRebuildRequired::LocalProvider(_)) =>
+        {
+            let state = store.load_state().await?;
+            let canonical = enrich_local_rebuild_at_epoch(
+                &state.identity,
+                intent,
+                epoch,
+                &state.identity.local_identity,
+                *failure,
+            )?;
+            store
+                .public_instruction(
+                    intent,
+                    index,
+                    instruction,
+                    Some(PublicInstructionOutcome::RebuildRequired(Box::new(
+                        canonical,
+                    ))),
+                )
+                .await?;
+            Err(HostError::CommandRejected(
+                "local provider requires replica rebuild".into(),
+            ))
+        }
+        Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => Err(HostError::CommandRejected(
+            "remote build failure substituted for local-provider failure".into(),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn enrich_remote_rebuild(
+    identity: &crate::host::state::StorageIdentity,
+    source_storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    intent: &PublicOperationIntent,
+    build: &PublicBuildInput,
+    failure: ReplicaRebuildRequired,
+) -> Result<CanonicalReplicaRebuildRequired> {
+    let ReplicaRebuildRequired::RemoteBuildTarget(failure) = failure else {
+        return Err(HostError::CommandRejected(
+            "local failure cannot be enriched as a remote build failure".into(),
+        ));
+    };
+    let failure = *failure;
+    if failure.epoch != build.epoch
+        || failure.target != build.replica
+        || failure.target_session != build.process_session_id
+        || source_storage.replica != identity.local_identity
+    {
+        return Err(HostError::StaleEffectCompletion(
+            "remote rebuild failure differs from the captured build attempt".into(),
+        ));
+    }
+    let build = crate::protocol::public_operations::PublicBuildAttemptReference {
+        resource_uid: identity.resource_uid.clone(),
+        epoch: build.epoch,
+        build_id: intent.operation_id.clone(),
+        source: identity.local_identity.clone(),
+        source_storage: source_storage.clone(),
+        source_session: intent.process_session_id.clone(),
+        target: build.replica.clone(),
+        target_storage: build.target_storage.clone(),
+        target_session: build.process_session_id.clone(),
+    };
+    Ok(CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+        reason: failure.reason,
+        operation: captured_operation(identity, intent, build.epoch),
+        build: Box::new(build),
+    })
 }
 
 pub(crate) async fn report(
@@ -334,7 +620,7 @@ pub(crate) async fn report(
     if report.write_access {
         report.service_location = record.lifecycle.outcomes.iter().rev().find_map(|outcome| {
             if let PublicInstructionOutcome::ApplicationRole(Some(address)) = outcome {
-                Some(ServiceLocation {
+                (!address.is_empty()).then(|| ServiceLocation {
                     preview: identity.clone(),
                     resource_uid: state.identity.resource_uid.clone(),
                     operation_id: record.intent.operation_id.clone(),
@@ -349,6 +635,271 @@ pub(crate) async fn report(
             }
         });
     }
+    Ok(report)
+}
+
+pub(crate) struct PublicV1ReportProjection {
+    pub(crate) process_session_id: ProcessSessionId,
+    pub(crate) report_sequence: u64,
+    pub(crate) role: ReplicaRole,
+    pub(crate) read_status: AccessStatus,
+    pub(crate) write_status: AccessStatus,
+    pub(crate) progress: PublicProgress,
+}
+
+fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind> {
+    if let Some(lifecycle) = &intent.lifecycle {
+        return Ok(match lifecycle.recipe {
+            PublicLifecycleRecipe::InitialPrimary => PublicV1CallKind::InitialPrimary,
+            PublicLifecycleRecipe::FailoverPromotion => PublicV1CallKind::FailoverPromotion,
+            PublicLifecycleRecipe::SecondaryEpochAdvance => PublicV1CallKind::SecondaryEpochAdvance,
+        });
+    }
+    match intent.program.as_ref() {
+        Some(PublicOperationProgram::Open { .. }) => Ok(PublicV1CallKind::Open),
+        Some(PublicOperationProgram::Role { .. }) => Ok(PublicV1CallKind::Role),
+        Some(PublicOperationProgram::Epoch { .. }) => Ok(PublicV1CallKind::Epoch),
+        Some(PublicOperationProgram::Configuration(_)) => Ok(PublicV1CallKind::Configuration),
+        Some(PublicOperationProgram::CatchUp { .. }) => Ok(PublicV1CallKind::CatchUp),
+        Some(PublicOperationProgram::Progress { .. }) => Ok(PublicV1CallKind::Progress),
+        Some(PublicOperationProgram::Swap { .. }) => Ok(PublicV1CallKind::Swap),
+        Some(PublicOperationProgram::Build(_)) => Ok(PublicV1CallKind::Build),
+        Some(PublicOperationProgram::Remove(_)) => Ok(PublicV1CallKind::Remove),
+        Some(PublicOperationProgram::Close) => Ok(PublicV1CallKind::Close),
+        Some(PublicOperationProgram::Abort) => Ok(PublicV1CallKind::Abort),
+        None => Err(HostError::Corrupt(
+            "schema-11 completion lacks a public call kind".into(),
+        )),
+    }
+}
+
+fn public_v1_role_epoch(intent: &PublicOperationIntent) -> Option<crate::protocol::types::Epoch> {
+    intent
+        .lifecycle
+        .as_ref()
+        .map(|lifecycle| lifecycle.epoch)
+        .or(match intent.program.as_ref() {
+            Some(PublicOperationProgram::Role { epoch, .. })
+            | Some(PublicOperationProgram::Swap { epoch, .. }) => Some(*epoch),
+            _ => None,
+        })
+}
+
+#[allow(clippy::type_complexity)]
+fn public_v1_completion_authority(
+    intent: &PublicOperationIntent,
+) -> Result<(
+    Option<ConfigurationId>,
+    Option<ConfigurationId>,
+    Option<PublicCatchUpMode>,
+    Option<bool>,
+)> {
+    let configuration_ids =
+        |configuration: &crate::protocol::public_operations::PublicConfiguration| {
+            (
+                configuration
+                    .previous
+                    .as_ref()
+                    .map(|configuration| configuration.configuration_id.clone()),
+                Some(configuration.current.configuration_id.clone()),
+            )
+        };
+    if let Some(lifecycle) = &intent.lifecycle {
+        return Ok((
+            lifecycle
+                .previous
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            Some(lifecycle.current.configuration_id.clone()),
+            None,
+            None,
+        ));
+    }
+    let Some(program) = intent.program.as_ref() else {
+        return Err(HostError::Corrupt(
+            "schema-11 completion lacks public authority".into(),
+        ));
+    };
+    Ok(match program {
+        PublicOperationProgram::Configuration(configuration) => {
+            let (previous, current) = configuration_ids(configuration);
+            (previous, current, None, None)
+        }
+        PublicOperationProgram::CatchUp {
+            configuration,
+            mode,
+        } => {
+            let (previous, current) = configuration_ids(configuration);
+            (previous, current, Some(*mode), None)
+        }
+        PublicOperationProgram::Swap {
+            refreshed,
+            mode,
+            catch_up_specific_quorum,
+            ..
+        } => {
+            let (previous, current) = configuration_ids(refreshed);
+            (
+                previous,
+                current,
+                Some(*mode),
+                Some(*catch_up_specific_quorum),
+            )
+        }
+        PublicOperationProgram::Open { .. }
+        | PublicOperationProgram::Role { .. }
+        | PublicOperationProgram::Epoch { .. }
+        | PublicOperationProgram::Progress { .. }
+        | PublicOperationProgram::Build(_)
+        | PublicOperationProgram::Remove(_)
+        | PublicOperationProgram::Close
+        | PublicOperationProgram::Abort => (None, None, None, None),
+    })
+}
+
+pub(crate) async fn public_v1_report(
+    store: &dyn AgentStore,
+    identity: &PublicOperationPreviewIdentity,
+    projection: PublicV1ReportProjection,
+) -> Result<PublicV1AgentReport> {
+    if !identity.is_public_v1() {
+        return Err(HostError::IdentityMismatch(
+            "public-v1 report requires protocol 11".into(),
+        ));
+    }
+    let state = store.load_state().await?;
+    let preview = state.public_operation_preview.ok_or_else(|| {
+        HostError::CommandRejected("public-v1 report requires preview store".into())
+    })?;
+    if &preview.identity != identity {
+        return Err(HostError::IdentityMismatch(
+            "public-v1 report identity changed".into(),
+        ));
+    }
+    let history = preview.history.clone().ok_or_else(|| {
+        HostError::CommandRejected("public-v1 report requires initialized history".into())
+    })?;
+    let storage_incarnation = preview.storage_incarnation.clone().ok_or_else(|| {
+        HostError::CommandRejected("public-v1 report requires storage incarnation".into())
+    })?;
+    let data_loss_recovery = preview.data_loss_recovery.clone();
+    let completed_operations = preview
+        .operations
+        .values()
+        .filter(|record| record.stage == PublicOperationStage::Completed)
+        .filter(|record| record.intent.process_session_id == projection.process_session_id)
+        .map(|record| {
+            let rebuild = record.lifecycle.outcomes.iter().find_map(|outcome| {
+                if let PublicInstructionOutcome::RebuildRequired(failure) = outcome {
+                    Some(failure.clone())
+                } else {
+                    None
+                }
+            });
+            let result = if let Some(rebuild) = rebuild {
+                PublicV1OperationResult::RebuildRequired(rebuild)
+            } else {
+                match record.disposition.as_ref().ok_or_else(|| {
+                    HostError::Corrupt("schema-11 completed operation lacks a disposition".into())
+                })? {
+                    PublicOperationDisposition::Succeeded => PublicV1OperationResult::Succeeded,
+                    PublicOperationDisposition::Failed(message) => {
+                        PublicV1OperationResult::Failed(message.clone())
+                    }
+                    PublicOperationDisposition::Ambiguous(message) => {
+                        PublicV1OperationResult::Ambiguous(message.clone())
+                    }
+                    PublicOperationDisposition::Cancelled => PublicV1OperationResult::Cancelled,
+                    PublicOperationDisposition::Attached(owner) => {
+                        PublicV1OperationResult::Ambiguous(format!("attached to {owner}"))
+                    }
+                }
+            };
+            let history = record.accepted_history.clone().ok_or_else(|| {
+                HostError::Corrupt("schema-11 completion lacks accepted history".into())
+            })?;
+            let storage_incarnation = record.accepted_storage.clone().ok_or_else(|| {
+                HostError::Corrupt("schema-11 completion lacks accepted storage".into())
+            })?;
+            let (
+                previous_configuration_id,
+                current_configuration_id,
+                catch_up_mode,
+                catch_up_specific_quorum,
+            ) = public_v1_completion_authority(&record.intent)?;
+            Ok(PublicV1OperationCompletion {
+                operation_id: record.intent.operation_id.clone(),
+                revision: record.intent.revision,
+                call_kind: public_v1_call_kind(&record.intent)?,
+                process_session_id: record.intent.process_session_id.clone(),
+                input_digest: record.intent.input_digest.clone(),
+                replay_disposition: record.intent.replay_disposition,
+                history,
+                storage_incarnation,
+                previous_configuration_id,
+                current_configuration_id,
+                catch_up_mode,
+                catch_up_specific_quorum,
+                result,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let service_location = if projection.role == ReplicaRole::Primary
+        && projection.write_status == AccessStatus::Granted
+    {
+        preview
+            .operations
+            .values()
+            .filter(|record| {
+                record.stage == PublicOperationStage::Completed
+                    && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                    && record.intent.process_session_id == projection.process_session_id
+                    && public_v1_role_epoch(&record.intent).is_some()
+            })
+            .max_by_key(|record| record.intent.revision)
+            .and_then(|record| {
+                let address = record.lifecycle.outcomes.iter().rev().find_map(|outcome| {
+                    if let PublicInstructionOutcome::ApplicationRole(address) = outcome {
+                        address.clone().filter(|address| !address.is_empty())
+                    } else {
+                        None
+                    }
+                })?;
+                Some(ServiceLocation {
+                    preview: identity.clone(),
+                    resource_uid: state.identity.resource_uid.clone(),
+                    operation_id: record.intent.operation_id.clone(),
+                    replica: state.identity.local_identity.clone(),
+                    process_session_id: projection.process_session_id.clone(),
+                    epoch: public_v1_role_epoch(&record.intent)
+                        .expect("role operation epoch was filtered"),
+                    revision: record.intent.revision,
+                    address,
+                })
+            })
+    } else {
+        None
+    };
+    let report = PublicV1AgentReport {
+        identity: identity.clone(),
+        resource_uid: state.identity.resource_uid,
+        replica: state.identity.local_identity,
+        process_session_id: projection.process_session_id,
+        report_sequence: projection.report_sequence,
+        role: projection.role,
+        read_status: projection.read_status,
+        write_status: projection.write_status,
+        history,
+        storage_incarnation,
+        progress: projection.progress,
+        service_location,
+        data_loss_recovery,
+        completed_operations,
+        extensions: Default::default(),
+    };
+    report
+        .validate()
+        .map_err(|message| HostError::CommandRejected(message.into()))?;
     Ok(report)
 }
 
