@@ -35,6 +35,7 @@ pub struct PgService {
     driver: OnceLock<Arc<PgReplicator>>,
     cancellation: CancellationToken,
     coordination_token: String,
+    public_authorization: Option<kuberic_runtime::replicator::PublicAuthorizationTrust>,
 }
 
 impl PgService {
@@ -50,6 +51,7 @@ impl PgService {
             driver: OnceLock::new(),
             cancellation: CancellationToken::new(),
             coordination_token: String::new(),
+            public_authorization: None,
         }
     }
 
@@ -77,6 +79,15 @@ impl PgService {
 
     pub fn with_coordination_token(mut self, token: String) -> Self {
         self.coordination_token = token;
+        self
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn with_public_v1_authorization(
+        mut self,
+        trust: kuberic_runtime::replicator::PublicAuthorizationTrust,
+    ) -> Self {
+        self.public_authorization = Some(trust);
         self
     }
 
@@ -189,13 +200,27 @@ impl StatefulServiceReplica for PgService {
         let interfaces = context
             .partition
             .with_factory(Arc::new(PgReplicatorFactory(driver)))
-            .create_replicator(None, None)
+            .create_replicator(
+                None,
+                self.public_authorization
+                    .clone()
+                    .map(|trust| ReplicatorSettings {
+                        replication_address: self.config.replication_address.clone(),
+                        public_authorization: Some(trust),
+                        public_authorization_admission: None,
+                    }),
+            )
             .await?;
         debug_assert!(interfaces.state_replicator().is_none());
         Ok(interfaces.replicator())
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        if let Some(driver) = self.driver.get()
+            && driver.is_public_v1()
+        {
+            driver.public_application_role(role).await?;
+        }
         Ok(RoleChange {
             service_address: matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
                 .then(|| format!("{}:{}", self.instance.listen_host(), self.instance.port())),
@@ -269,13 +294,14 @@ impl ReplicatorFactory for PgReplicatorFactory {
         &self,
         _context: ReplicatorFactoryContext,
         state_provider: Option<Arc<dyn StateProvider>>,
-        _settings: ReplicatorSettings,
+        settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         if state_provider.is_some() {
             return Err(application_error(
                 "PostgreSQL owns its replication and copy state",
             ));
         }
+        self.0.configure_public_v1(settings)?;
         Ok(self.interfaces())
     }
 }

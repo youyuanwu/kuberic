@@ -352,6 +352,8 @@ page:replicator/stream/struct.OperationStream.html
 page:replicator/stream/struct.StreamOperation.html
 page:replicator/struct.DefaultReplicator.html
 page:replicator/struct.DefaultReplicatorFactory.html
+page:replicator/struct.PublicAuthorizationAdmission.html
+page:replicator/struct.PublicAuthorizationContext.html
 page:replicator/struct.PublicAuthorizationTrust.html
 page:replicator/struct.ReplicaInformation.html
 page:replicator/struct.ReplicaSetConfiguration.html

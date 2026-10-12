@@ -1104,9 +1104,10 @@ impl PgInstanceManager {
 
     /// Wait for PG to accept connections.
     async fn wait_ready(&self, generation: &Arc<ProcessGeneration>) -> Result<(), PgError> {
-        for i in 0..60 {
+        let mut last_probe_error = None;
+        for i in 0..240 {
             let output = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(10),
                 generation
                     .helpers
                     .output(Command::new(self.pg_bin.join("pg_isready")).args([
@@ -1124,30 +1125,51 @@ impl PgInstanceManager {
             if output.status.success() {
                 // Readiness must belong to our launch, not another server using
                 // this socket. Keep the backend alive while validating its parent.
-                let timeout = std::time::Duration::from_secs(2);
-                let (client, connection) =
-                    tokio::time::timeout(timeout, self.connect())
-                        .await
-                        .map_err(|_| PgError::Process("postmaster connection timeout".into()))??;
-                let backend =
-                    tokio::time::timeout(timeout, client.query_one("SELECT pg_backend_pid()", &[]))
-                        .await
-                        .map_err(|_| PgError::Process("postmaster identity timeout".into()))
-                        .and_then(|result| {
-                            result.map_err(|error| {
-                                PgError::Process(format!("identify postmaster: {error}"))
-                            })
-                        });
-                let bound = backend.and_then(|row| {
-                    let backend: i32 = row.get(0);
-                    generation
-                        .child
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .ok_or_else(|| PgError::Process("PostgreSQL ownership lost".into()))?
-                        .bind_postmaster(backend as u32)
-                });
+                let timeout = std::time::Duration::from_secs(10);
+                let (client, connection) = match tokio::time::timeout(timeout, self.connect()).await
+                {
+                    Ok(Ok(connection)) => connection,
+                    Ok(Err(error)) => {
+                        last_probe_error = Some(error.to_string());
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        last_probe_error = Some("postmaster connection timeout".into());
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                };
+                let backend = match tokio::time::timeout(
+                    timeout,
+                    client.query_one("SELECT pg_backend_pid()", &[]),
+                )
+                .await
+                {
+                    Ok(Ok(row)) => row,
+                    Ok(Err(error)) => {
+                        last_probe_error = Some(format!("identify postmaster: {error}"));
+                        drop(client);
+                        connection.abort();
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        last_probe_error = Some("postmaster identity timeout".into());
+                        drop(client);
+                        connection.abort();
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                };
+                let backend: i32 = backend.get(0);
+                let bound = generation
+                    .child
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .ok_or_else(|| PgError::Process("PostgreSQL ownership lost".into()))?
+                    .bind_postmaster(backend as u32);
                 drop(client);
                 connection.abort();
                 bound?;
@@ -1161,7 +1183,13 @@ impl PgInstanceManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        Err(PgError::Process("pg_isready timeout (15s)".into()))
+        Err(PgError::Process(format!(
+            "pg_isready timeout (60s){}",
+            last_probe_error
+                .as_deref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        )))
     }
 
     /// Stop PostgreSQL (fast mode).
@@ -1244,6 +1272,41 @@ impl PgInstanceManager {
             source = format!("{source_host}:{source_port}"),
             "pg_basebackup complete"
         );
+        Ok(())
+    }
+
+    pub(crate) async fn public_base_backup(&self, conninfo: &str) -> Result<(), PgError> {
+        let generation = self.generation();
+        let output = self
+            .command_output(
+                &generation,
+                Command::new(self.pg_bin.join("pg_basebackup")).args([
+                    "-D",
+                    &self.data_dir.to_string_lossy(),
+                    "-d",
+                    conninfo,
+                    "-Fp",
+                    "-Xs",
+                    "-c",
+                    "fast",
+                    "-R",
+                    "-w",
+                ]),
+                Some((std::time::Duration::from_secs(60), "signed pg_basebackup")),
+            )
+            .await?;
+        if !output.status.success() {
+            // Connection credentials must never appear in command diagnostics.
+            let secret = conninfo
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("password="))
+                .unwrap_or(conninfo);
+            let diagnostic = String::from_utf8_lossy(&output.stderr).replace(secret, "[redacted]");
+            return Err(
+                PgError::Process(format!("signed pg_basebackup failed: {diagnostic}"))
+                    .with_generation(generation.id),
+            );
+        }
         Ok(())
     }
 

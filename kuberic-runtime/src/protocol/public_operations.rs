@@ -3233,9 +3233,6 @@ impl PublicV1AgentReport {
         }
         let mut operations = std::collections::BTreeSet::new();
         for completion in &self.completed_operations {
-            if completion.history != self.history {
-                return Err("public-v1 completion history differs from its report");
-            }
             completion.validate(
                 &self.identity,
                 &self.resource_uid,

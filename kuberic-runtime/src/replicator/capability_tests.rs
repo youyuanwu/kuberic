@@ -240,6 +240,7 @@ async fn public_authorization_trust_is_creation_bound_and_update_immutable() {
     let settings = ReplicatorSettings {
         replication_address: "https://10.0.0.41:7000".into(),
         public_authorization: Some(trust.clone()),
+        public_authorization_admission: None,
     };
     let control = Arc::new(Control::default());
     let state = Arc::new(SettingsControl::default());
@@ -250,6 +251,10 @@ async fn public_authorization_trust_is_creation_bound_and_update_immutable() {
     );
     let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
     interfaces.prepare_attachment(reservation).unwrap();
+    let settings = settings.with_public_authorization_admission(
+        reservation.identity(RuntimeHostToken::new()),
+        identity.clone(),
+    );
     interfaces
         .creation
         .bind_settings(identity.clone(), settings.clone())
@@ -261,6 +266,7 @@ async fn public_authorization_trust_is_creation_bound_and_update_immutable() {
         .update_replicator_settings(ReplicatorSettings {
             replication_address: "https://10.0.0.41:7001".into(),
             public_authorization: Some(trust.clone()),
+            public_authorization_admission: None,
         })
         .await
         .unwrap();
@@ -328,6 +334,7 @@ fn public_authorization_registry_is_creation_scoped_and_conversion_is_pure() {
             ReplicatorSettings {
                 replication_address: "https://10.0.0.51:7000".into(),
                 public_authorization: Some(trust),
+                public_authorization_admission: None,
             },
         )
         .unwrap();
@@ -378,4 +385,81 @@ fn public_authorization_registry_is_creation_scoped_and_conversion_is_pure() {
             .all(|settings| settings.identity != identity),
         "dropping the creation must remove its trust and all scoped authority"
     );
+}
+
+#[test]
+fn public_authorization_admission_is_creation_bound_and_lifecycle_current() {
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(61),
+        instance_id: crate::protocol::types::ReplicaInstanceId::new("admission-instance"),
+        agent_generation: crate::protocol::types::AgentGeneration::new("admission-generation"),
+    };
+    let signing_key = AuthorizationSigningKey::from_seed([61; 32]);
+    let trust = PublicAuthorizationTrust {
+        resource_uid: ResourceUid::new("admission-resource"),
+        protocol_generation: PublicProtocolGeneration::new(11),
+        verification_key: signing_key.verification_key(),
+        key_id: signing_key.key_id(),
+    };
+    let interfaces = ReplicatorInterfaces::secondary(
+        Arc::new(Control::default()),
+        None,
+        ReplicatorCapabilities::conservative(),
+    );
+    let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+    let owner = reservation.identity(RuntimeHostToken::new());
+    let settings = ReplicatorSettings {
+        replication_address: "https://10.0.0.61:7000".into(),
+        public_authorization: Some(trust),
+        public_authorization_admission: None,
+    }
+    .with_public_authorization_admission(owner, identity.clone());
+    let admission = settings.public_authorization_admission.clone().unwrap();
+    let attachment = interfaces.prepare_attachment(reservation).unwrap();
+    interfaces
+        .creation
+        .bind_settings(identity.clone(), settings)
+        .unwrap();
+    let history = HistoryContext {
+        resource_uid: ResourceUid::new("admission-resource"),
+        protocol_generation: PublicProtocolGeneration::new(11),
+        history_id: crate::protocol::types::HistoryId::new("admission-history"),
+        data_loss_number: 0,
+    };
+    let storage = ReplicaStorageIncarnationContext {
+        replica: identity.clone(),
+        storage: crate::protocol::types::ReplicaStorageIdentity::Volatile {
+            identity: "admission-storage".into(),
+        },
+        storage_generation: crate::protocol::types::StorageGeneration::new("admission-generation"),
+    };
+    bind_public_authorization_context(PublicAuthorizationRuntimeContext {
+        identity: identity.clone(),
+        history: history.clone(),
+        storage_incarnation: storage.clone(),
+        process_session_id: ProcessSessionId::new("admission-session"),
+        role: ReplicaRole::Primary,
+        epoch: Epoch::new(0, 7),
+        previous_configuration_id: Some(ConfigurationId::new("admission-previous")),
+        current_configuration_id: Some(ConfigurationId::new("admission-current")),
+    })
+    .unwrap();
+    assert_eq!(
+        admission.current_context().unwrap(),
+        PublicAuthorizationContext {
+            identity: identity.clone(),
+            history,
+            storage_incarnation: storage,
+            process_session_id: ProcessSessionId::new("admission-session"),
+            role: ReplicaRole::Primary,
+            epoch: Epoch::new(0, 7),
+            previous_configuration_id: Some(ConfigurationId::new("admission-previous")),
+            current_configuration_id: Some(ConfigurationId::new("admission-current")),
+        }
+    );
+
+    attachment.disarm();
+    drop(attachment);
+    drop(interfaces);
+    assert!(admission.current_context().is_err());
 }

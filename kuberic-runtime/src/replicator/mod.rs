@@ -624,10 +624,151 @@ impl PublicAuthorizationTrust {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicAuthorizationContext {
+    pub identity: ReplicaIdentity,
+    pub history: HistoryContext,
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    pub process_session_id: ProcessSessionId,
+    pub role: ReplicaRole,
+    pub epoch: Epoch,
+    pub previous_configuration_id: Option<ConfigurationId>,
+    pub current_configuration_id: Option<ConfigurationId>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PublicAuthorizationAdmission {
+    owner: ReplicatorCreationIdentity,
+    identity: ReplicaIdentity,
+}
+
+impl std::fmt::Debug for PublicAuthorizationAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublicAuthorizationAdmission")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublicAuthorizationAdmission {
+    pub fn current_context(&self) -> Result<PublicAuthorizationContext> {
+        let settings = registered_public_authorization_settings(&self.identity)
+            .filter(|settings| settings.owner == self.owner)
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "public authorization admission is stale or unregistered".into(),
+                )
+            })?;
+        let context = settings.context.ok_or_else(|| {
+            RuntimeError::Application(
+                "public authorization admission lacks current lifecycle authority".into(),
+            )
+        })?;
+        Ok(PublicAuthorizationContext {
+            identity: context.identity,
+            history: context.history,
+            storage_incarnation: context.storage_incarnation,
+            process_session_id: context.process_session_id,
+            role: context.role,
+            epoch: context.epoch,
+            previous_configuration_id: context.previous_configuration_id,
+            current_configuration_id: context.current_configuration_id,
+        })
+    }
+
+    pub fn verify_build_authorization(
+        &self,
+        authorization: &BuildAuthorizationV1,
+    ) -> Result<PublicAuthorizationContext> {
+        let settings = registered_public_authorization_settings(&self.identity)
+            .filter(|settings| settings.owner == self.owner)
+            .ok_or_else(|| {
+                RuntimeError::Application("public build admission is stale or unregistered".into())
+            })?;
+        settings
+            .trust
+            .verification_key
+            .verify_build_authorization(authorization)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let context = self.current_context()?;
+        let claims = &authorization.claims;
+        let local = if claims.source.storage_incarnation.replica == context.identity {
+            &claims.source
+        } else if claims.target.storage_incarnation.replica == context.identity {
+            &claims.target
+        } else {
+            return Err(RuntimeError::Application(
+                "signed build authorization does not contain this creation".into(),
+            ));
+        };
+        if claims.resource_uid != settings.trust.resource_uid
+            || claims.protocol_generation != settings.trust.protocol_generation
+            || claims.key_id != settings.trust.key_id
+            || claims.history != context.history
+            || claims.epoch != context.epoch
+            || local.storage_incarnation != context.storage_incarnation
+            || local.process_session_id != context.process_session_id
+            || local.replication_address != settings.replication_address
+            || local.role != context.role
+        {
+            return Err(RuntimeError::Application(
+                "signed build authorization differs from current creation authority".into(),
+            ));
+        }
+        Ok(context)
+    }
+
+    pub fn verify_peer_session_authorization(
+        &self,
+        authorization: &PeerSessionAuthorizationV1,
+    ) -> Result<PublicAuthorizationContext> {
+        let settings = registered_public_authorization_settings(&self.identity)
+            .filter(|settings| settings.owner == self.owner)
+            .ok_or_else(|| {
+                RuntimeError::Application("public peer admission is stale or unregistered".into())
+            })?;
+        settings
+            .trust
+            .verification_key
+            .verify_peer_session_authorization(authorization)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let context = self.current_context()?;
+        let claims = &authorization.claims;
+        let local = if claims.primary.replica == context.identity {
+            &claims.primary
+        } else if claims.secondary.replica == context.identity {
+            &claims.secondary
+        } else {
+            return Err(RuntimeError::Application(
+                "signed peer authorization does not contain this creation".into(),
+            ));
+        };
+        if claims.resource_uid != settings.trust.resource_uid
+            || claims.protocol_generation != settings.trust.protocol_generation
+            || claims.key_id != settings.trust.key_id
+            || claims.history != context.history
+            || claims.epoch != context.epoch
+            || claims.previous_configuration_id != context.previous_configuration_id
+            || Some(&claims.current_configuration_id) != context.current_configuration_id.as_ref()
+            || local.process_session_id != context.process_session_id
+            || local.replication_address != settings.replication_address
+            || local.role != context.role
+        {
+            return Err(RuntimeError::Application(
+                "signed peer authorization differs from current creation authority".into(),
+            ));
+        }
+        Ok(context)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplicatorSettings {
     pub replication_address: String,
     pub public_authorization: Option<PublicAuthorizationTrust>,
+    #[doc(hidden)]
+    pub public_authorization_admission: Option<PublicAuthorizationAdmission>,
 }
 
 impl ReplicatorSettings {
@@ -639,8 +780,24 @@ impl ReplicatorSettings {
                     "signed public authorization requires an exact replication address".into(),
                 ));
             }
+        } else if self.public_authorization_admission.is_some() {
+            return Err(RuntimeError::Application(
+                "public authorization admission requires immutable trust".into(),
+            ));
         }
         Ok(())
+    }
+
+    fn with_public_authorization_admission(
+        mut self,
+        owner: ReplicatorCreationIdentity,
+        identity: ReplicaIdentity,
+    ) -> Self {
+        self.public_authorization_admission = self
+            .public_authorization
+            .as_ref()
+            .map(|_| PublicAuthorizationAdmission { owner, identity });
+        self
     }
 }
 
@@ -896,9 +1053,10 @@ pub(crate) fn admit_public_peer_configuration(
     };
     if context.role != ReplicaRole::Primary
         || configuration.current.primary_id != context.identity.replica_id
+        || configuration.current.epoch != context.epoch
     {
         return Err(RuntimeError::Application(
-            "only the exact local primary can admit peer authorization".into(),
+            "only the exact current-epoch local primary can admit peer authorization".into(),
         ));
     }
     let previous_configuration_id = configuration
@@ -1544,6 +1702,7 @@ pub(crate) fn testing_register_public_authorization(
         &ReplicatorSettings {
             replication_address,
             public_authorization: Some(trust),
+            public_authorization_admission: None,
         },
     )?;
     if let Some(context) = context {
@@ -1658,6 +1817,8 @@ impl ReplicatorCreation {
             if existing.identity != identity
                 || existing.owner != owner
                 || existing.settings.public_authorization != settings.public_authorization
+                || existing.settings.public_authorization_admission
+                    != settings.public_authorization_admission
             {
                 return Err(RuntimeError::Application(
                     "replicator registration cannot change identity or public trust".into(),
@@ -1674,8 +1835,7 @@ impl ReplicatorCreation {
         Ok(())
     }
 
-    fn validate_settings_update(&self, settings: &ReplicatorSettings) -> Result<()> {
-        settings.validate()?;
+    fn prepare_settings_update(&self, settings: ReplicatorSettings) -> Result<ReplicatorSettings> {
         let bound = self
             .settings
             .lock()
@@ -1683,12 +1843,18 @@ impl ReplicatorCreation {
         let existing = bound.as_ref().ok_or_else(|| {
             RuntimeError::Application("replicator settings are not registration-bound".into())
         })?;
-        if existing.settings.public_authorization != settings.public_authorization {
+        let settings =
+            settings.with_public_authorization_admission(existing.owner, existing.identity.clone());
+        settings.validate()?;
+        if existing.settings.public_authorization != settings.public_authorization
+            || existing.settings.public_authorization_admission
+                != settings.public_authorization_admission
+        {
             return Err(RuntimeError::Application(
                 "replicator settings cannot change trust or protocol generation".into(),
             ));
         }
-        Ok(())
+        Ok(settings)
     }
 
     fn complete_settings_update(&self, settings: ReplicatorSettings) -> Result<()> {
@@ -1750,7 +1916,7 @@ impl StateReplicator for ProtectedStateReplicator {
     }
 
     async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()> {
-        self.creation.validate_settings_update(&settings)?;
+        let settings = self.creation.prepare_settings_update(settings)?;
         self.inner
             .update_replicator_settings(settings.clone())
             .await?;
@@ -2181,7 +2347,12 @@ impl StatefulServicePartition {
         })?;
         let reservation = self.registration.reserve_replicator_creation()?;
         let context = self.context.for_creation(reservation);
-        let settings = settings.unwrap_or_default();
+        let settings = settings
+            .unwrap_or_default()
+            .with_public_authorization_admission(
+                reservation.identity(RuntimeHostToken::new()),
+                self.context.identity.clone(),
+            );
         let interfaces = match factory
             .create_replicator(context, state_provider.clone(), settings.clone())
             .await

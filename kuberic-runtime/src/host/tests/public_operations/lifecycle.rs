@@ -198,6 +198,7 @@ async fn exact_initial_failover_and_secondary_recipes() {
                 "replicator.change_role.begin",
                 "application.change_role.begin",
                 "primary.update_current_configuration.begin",
+                "application.change_role.begin",
             ],
         ),
         (
@@ -209,6 +210,7 @@ async fn exact_initial_failover_and_secondary_recipes() {
                 "application.change_role.begin",
                 "primary.update_catch_up_configuration.begin",
                 "primary.wait_for_catch_up.begin",
+                "application.change_role.begin",
             ],
         ),
         (

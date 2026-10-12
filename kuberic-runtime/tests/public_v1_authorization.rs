@@ -293,6 +293,7 @@ fn public_v1_authorization_rejects_tampering_before_mutation() {
     let settings = ReplicatorSettings {
         replication_address: authorization.claims.source.replication_address.clone(),
         public_authorization: Some(trust.clone()),
+        public_authorization_admission: None,
     };
     assert!(settings.public_authorization.is_some());
     let mut tampered = authorization.clone();
@@ -350,6 +351,7 @@ fn public_v1_authorization_runtime_never_receives_private_seed() {
     let settings = ReplicatorSettings {
         replication_address: authorization.claims.source.replication_address.clone(),
         public_authorization: Some(trust),
+        public_authorization_admission: None,
     };
     let mut descriptor = ReplicaInformation::idle_build(
         authorization.claims.build_id.clone(),

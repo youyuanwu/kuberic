@@ -233,6 +233,37 @@ async fn execute(
         ));
     }
     let captured_state = store.load_state().await?;
+    let mut authorization_context = if intent.preview.is_public_v1() {
+        let preview = captured_state
+            .public_operation_preview
+            .as_ref()
+            .ok_or_else(|| HostError::Corrupt("missing public-v1 preview state".into()))?;
+        let context = crate::replicator::PublicAuthorizationRuntimeContext {
+            identity: captured_state.identity.local_identity.clone(),
+            history: preview
+                .history
+                .clone()
+                .ok_or_else(|| HostError::Corrupt("missing public-v1 history".into()))?,
+            storage_incarnation: preview.storage_incarnation.clone().ok_or_else(|| {
+                HostError::Corrupt("missing public-v1 storage incarnation".into())
+            })?,
+            process_session_id: intent.process_session_id.clone(),
+            role: captured_state.role,
+            epoch: captured_state.highest_epoch,
+            previous_configuration_id: captured_state
+                .previous_configuration
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            current_configuration_id: captured_state
+                .current_configuration
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+        };
+        crate::replicator::bind_public_authorization_context(context.clone())?;
+        Some(context)
+    } else {
+        None
+    };
     let start = record.lifecycle.outcomes.len();
     for (index, instruction) in instructions(&input).into_iter().enumerate().skip(start) {
         #[cfg(all(test, feature = "testing"))]
@@ -248,10 +279,19 @@ async fn execute(
                     .replicator
                     .change_role(input.epoch, ReplicaRole::Primary)
                     .await?;
+                if let Some(context) = authorization_context.as_mut() {
+                    context.epoch = input.epoch;
+                    context.role = ReplicaRole::Primary;
+                    crate::replicator::advance_public_authorization_context(context.clone())?;
+                }
                 PublicInstructionOutcome::Done
             }
             Epoch => {
                 callbacks.replicator.update_epoch(input.epoch).await?;
+                if let Some(context) = authorization_context.as_mut() {
+                    context.epoch = input.epoch;
+                    crate::replicator::advance_public_authorization_context(context.clone())?;
+                }
                 PublicInstructionOutcome::Done
             }
             ApplicationPrimary => {
@@ -302,47 +342,24 @@ async fn execute(
             }
             CurrentConfiguration => {
                 let configuration = input.configuration();
-                callbacks
-                    .primary
-                    .update_current_replica_set_configuration(program::replica_set(
-                        &configuration,
-                        &configuration.current,
-                    ))
-                    .await?;
+                program::install_current(
+                    &callbacks,
+                    &configuration,
+                    authorization_context.as_mut(),
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             CatchUpConfiguration => {
                 let configuration = input.configuration();
-                callbacks
-                    .primary
-                    .update_catch_up_replica_set_configuration(
-                        program::replica_set(&configuration, &configuration.current),
-                        program::replica_set(
-                            &configuration,
-                            configuration
-                                .previous
-                                .as_ref()
-                                .expect("validated failover previous configuration"),
-                        ),
-                    )
+                program::install(&callbacks, &configuration, authorization_context.as_mut())
                     .await?;
                 PublicInstructionOutcome::Done
             }
             CatchUp => {
                 if index == start && start > 0 {
                     let configuration = input.configuration();
-                    callbacks
-                        .primary
-                        .update_catch_up_replica_set_configuration(
-                            program::replica_set(&configuration, &configuration.current),
-                            program::replica_set(
-                                &configuration,
-                                configuration
-                                    .previous
-                                    .as_ref()
-                                    .expect("validated previous configuration"),
-                            ),
-                        )
+                    program::install(&callbacks, &configuration, authorization_context.as_mut())
                         .await?;
                 }
                 callbacks
@@ -352,7 +369,13 @@ async fn execute(
                 PublicInstructionOutcome::Done
             }
             HistoryAdmission => PublicInstructionOutcome::Done,
-            Access => PublicInstructionOutcome::Done,
+            Access => {
+                callbacks
+                    .application
+                    .change_role(ReplicaRole::Primary)
+                    .await?;
+                PublicInstructionOutcome::Done
+            }
             _ => unreachable!("program instruction in role recipe"),
         };
         #[cfg(all(test, feature = "testing"))]
@@ -362,6 +385,13 @@ async fn execute(
         store
             .public_instruction(&intent, index, instruction, Some(outcome.clone()))
             .await?;
+        if instruction == HistoryAdmission
+            && let Some(context) = authorization_context.as_mut()
+            && let Some(recovery) = input.data_loss_recovery.as_ref()
+        {
+            context.history = recovery.authorization.proposed.clone();
+            crate::replicator::advance_public_authorization_context(context.clone())?;
+        }
         #[cfg(all(test, feature = "testing"))]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::InstructionApplied, index)

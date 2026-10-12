@@ -232,6 +232,7 @@ impl StatefulServiceReplica for SqliteService {
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
                     public_authorization: None,
+                    public_authorization_admission: None,
                 }),
             )
             .await?;

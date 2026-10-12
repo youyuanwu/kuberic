@@ -87,6 +87,7 @@ impl StatefulServiceReplica for KvService {
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
                     public_authorization: None,
+                    public_authorization_admission: None,
                 }),
             )
             .await?;

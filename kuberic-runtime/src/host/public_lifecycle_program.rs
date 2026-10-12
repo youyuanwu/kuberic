@@ -105,7 +105,7 @@ pub(super) fn replica_set(
     }
 }
 
-async fn install(
+pub(super) async fn install(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
     authorization_context: Option<&mut crate::replicator::PublicAuthorizationRuntimeContext>,
@@ -137,6 +137,45 @@ async fn install(
             .update_current_replica_set_configuration(replica_set(input, &input.current))
             .await
     };
+    if let Err(error) = result {
+        if let Some(snapshot) = authorization_snapshot {
+            crate::replicator::restore_public_peer_authorization(snapshot)?;
+        }
+        return Err(error.into());
+    }
+    if let Some(context) = authorization_context {
+        context.epoch = input.current.epoch;
+        context.previous_configuration_id = input
+            .previous
+            .as_ref()
+            .map(|configuration| configuration.configuration_id.clone());
+        context.current_configuration_id = Some(input.current.configuration_id.clone());
+    }
+    Ok(())
+}
+
+pub(super) async fn install_current(
+    callbacks: &PublicLifecycleCallbacks,
+    input: &PublicConfiguration,
+    authorization_context: Option<&mut crate::replicator::PublicAuthorizationRuntimeContext>,
+) -> Result<()> {
+    let authorization_snapshot = if let Some(context) = authorization_context.as_deref() {
+        crate::replicator::admit_public_peer_configuration(context, input)?
+    } else if input
+        .replicas
+        .iter()
+        .any(|replica| replica.peer_authorization.is_some())
+    {
+        return Err(HostError::CommandRejected(
+            "signed peer authorization requires public-v1 runtime context".into(),
+        ));
+    } else {
+        None
+    };
+    let result = callbacks
+        .primary
+        .update_current_replica_set_configuration(replica_set(input, &input.current))
+        .await;
     if let Err(error) = result {
         if let Some(snapshot) = authorization_snapshot {
             crate::replicator::restore_public_peer_authorization(snapshot)?;
@@ -506,7 +545,10 @@ pub(super) async fn execute(
                 }
                 O::Done
             }
-            Revoke => O::Done,
+            Revoke => {
+                callbacks.application.change_role(ReplicaRole::None).await?;
+                O::Done
+            }
             _ => unreachable!("role instruction in public program"),
         };
         #[cfg(all(test, feature = "testing"))]

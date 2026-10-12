@@ -22,3 +22,11 @@ pub mod proto {
 
 #[cfg(feature = "testing")]
 pub mod testing;
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_conformance_oracle() {
+        crate::adapter::public_v1::tests::oracle().await;
+    }
+}

@@ -427,6 +427,8 @@ async fn swap_installs_exact_starting_configuration_before_both_captured_mode_wa
                 "primary.update_catch_up_configuration.end",
                 "primary.wait_for_catch_up.begin",
                 "primary.wait_for_catch_up.end",
+                "application.change_role.begin",
+                "application.change_role.end",
                 "replicator.update_epoch.begin",
                 "replicator.update_epoch.end",
                 "provider.update_epoch.begin",
@@ -2395,7 +2397,12 @@ async fn contained_close_failures_preserve_typed_diagnostics_and_order() {
                 .collect::<Vec<_>>(),
             expected_diagnostics
         );
-        let mut expected = vec!["replicator.close.begin", "replicator.close.end"];
+        let mut expected = vec![
+            "application.change_role.begin",
+            "application.change_role.end",
+            "replicator.close.begin",
+            "replicator.close.end",
+        ];
         if failures.contains(&"replicator") {
             expected.extend(["replicator.abort", "application.abort"]);
         }
@@ -2674,10 +2681,15 @@ async fn callback_cancellation_cross_product_has_exact_root_end_and_descendant_d
                 events.contains(&format!("{callback}.cancel")),
                 "{callback}/{terminal_kind}: {events:?}"
             );
-            assert!(
-                !events.contains(&format!("{callback}.end")),
-                "{callback}/{terminal_kind}"
-            );
+            let callback_ends = events
+                .iter()
+                .filter(|event| *event == &format!("{callback}.end"))
+                .count();
+            if callback == "application.change_role" && terminal_kind != 0 {
+                assert_eq!(callback_ends, 1, "{callback}/{terminal_kind}: {events:?}");
+            } else {
+                assert_eq!(callback_ends, 0, "{callback}/{terminal_kind}");
+            }
             assert_ne!(
                 blocked.snapshot().disposition,
                 Some(PublicOperationDisposition::Succeeded)
