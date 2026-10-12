@@ -120,7 +120,7 @@ nextest-postgres-smoke: nextest-postgres-smoke-inventory
     public_v1_filter='test(/^(tests::public_v1_postgres_primary_lifecycle_and_joint_configuration|tests::public_v1_postgres_data_loss_history_and_replay|tests::public_v1_postgres_build_cancellation_and_retirement|tests::public_v1_postgres_contained_close)$/)'
     KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$public_v1_tmp" TMPDIR="$scratch" cargo nextest run -j 1 \
       -p postgres-replicated --all-features --profile postgres -E "$public_v1_filter"
-    filter='test(/^(tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|tests::three_public_custom_hosts_reopen_same_roots_with_fresh_sessions|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|stalled_failover_scenario_times_out_and_reaps_postgres|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
+    filter='test(/^(tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|tests::three_public_custom_hosts_reopen_same_roots_with_fresh_sessions|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|stalled_failover_scenario_times_out_and_reaps_postgres|outer_timeout_reaps_stalled_probe_process_tree|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
     TMPDIR="$scratch" cargo nextest run \
       --workspace --all-features --profile postgres -E "$filter"
 

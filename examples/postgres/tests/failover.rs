@@ -1,4 +1,7 @@
 const FAILOVER_SCENARIO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+const TIMEOUT_PROBE_CHILD_ENV: &str = "KUBERIC_STALLED_FAILOVER_PROBE_CHILD";
+const TIMEOUT_PROBE_FORCE_OUTER_ENV: &str = "KUBERIC_STALLED_FAILOVER_FORCE_OUTER";
+const TIMEOUT_PROBE_READY_ENV: &str = "KUBERIC_STALLED_FAILOVER_READY_MARKER";
 
 async fn completes_within<F>(timeout: std::time::Duration, scenario: F) -> bool
 where
@@ -37,37 +40,86 @@ macro_rules! host_test {
 
 #[test_log::test]
 fn stalled_failover_scenario_times_out_and_reaps_postgres() {
-    const CHILD_ENV: &str = "KUBERIC_STALLED_FAILOVER_PROBE_CHILD";
-
-    if std::env::var_os(CHILD_ENV).is_some() {
+    if std::env::var_os(TIMEOUT_PROBE_CHILD_ENV).is_some() {
         run_stalled_failover_timeout_probe();
         return;
     }
+    assert!(run_timeout_probe_subprocess(false));
+}
 
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+#[test_log::test]
+fn outer_timeout_reaps_stalled_probe_process_tree() {
+    assert!(!run_timeout_probe_subprocess(true));
+}
+
+fn run_timeout_probe_subprocess(force_outer_timeout: bool) -> bool {
+    use postgres_replicated::testing::ProcessProbe;
+
+    struct SubreaperReset;
+    impl Drop for SubreaperReset {
+        fn drop(&mut self) {
+            rustix::process::set_child_subreaper(None).unwrap();
+        }
+    }
+
+    rustix::process::set_child_subreaper(Some(rustix::process::getpid())).unwrap();
+    let _subreaper_reset = SubreaperReset;
+    let marker = std::env::temp_dir().join(format!(
+        "kuberic-stalled-failover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
             "stalled_failover_scenario_times_out_and_reaps_postgres",
             "--nocapture",
         ])
-        .env(CHILD_ENV, "1")
+        .env(TIMEOUT_PROBE_CHILD_ENV, "1")
+        .env(TIMEOUT_PROBE_READY_ENV, &marker)
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::inherit());
+    if force_outer_timeout {
+        command.env(TIMEOUT_PROBE_FORCE_OUTER_ENV, "1");
+    }
+    let mut child = command.spawn().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut forced_deadline = None;
     loop {
         if let Some(status) = child.try_wait().unwrap() {
+            let _ = std::fs::remove_file(&marker);
             assert!(
                 status.success(),
                 "controlled timeout probe failed: {status}"
             );
-            return;
+            return true;
         }
-        if std::time::Instant::now() >= deadline {
+        if force_outer_timeout && forced_deadline.is_none() && marker.exists() {
+            forced_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        }
+        let now = std::time::Instant::now();
+        if forced_deadline.is_some_and(|forced| now >= forced) || now >= deadline {
+            if force_outer_timeout && forced_deadline.is_none() {
+                child.kill().unwrap();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&marker);
+                panic!("controlled timeout probe did not start PostgreSQL within 30 seconds");
+            }
+            let descendants = ProcessProbe::descendants(child.id());
+            assert!(
+                !descendants.is_empty(),
+                "controlled timeout probe had no owned descendants"
+            );
             child.kill().unwrap();
             let _ = child.wait();
-            panic!("controlled timeout probe exceeded its 30-second outer bound");
+            descendants.reap_adopted().unwrap();
+            descendants.assert_reaped();
+            let _ = std::fs::remove_file(&marker);
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -90,6 +142,13 @@ fn run_stalled_failover_timeout_probe() {
                     let pod =
                         PgPod::new(root.path().join("pod"), native_identity(91, "timeout")).await;
                     pod.singleton().await;
+                    if let Some(marker) = std::env::var_os(TIMEOUT_PROBE_READY_ENV) {
+                        std::fs::write(marker, b"ready").unwrap();
+                    }
+                    if std::env::var_os(TIMEOUT_PROBE_FORCE_OUTER_ENV).is_some() {
+                        let _held = (&root, &pod);
+                        std::future::pending::<()>().await;
+                    }
                     probe_sender
                         .send(ProcessProbe::postgres(
                             pod.application.instance().data_dir(),
