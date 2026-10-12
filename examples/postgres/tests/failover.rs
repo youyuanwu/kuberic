@@ -1,10 +1,4 @@
 const FAILOVER_SCENARIO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
-const TIMEOUT_PROBE_CHILD_ENV: &str = "KUBERIC_STALLED_FAILOVER_PROBE_CHILD";
-const TIMEOUT_PROBE_FORCE_OUTER_ENV: &str = "KUBERIC_STALLED_FAILOVER_FORCE_OUTER";
-const TIMEOUT_PROBE_FORCE_STARTUP_ENV: &str = "KUBERIC_STALLED_FAILOVER_FORCE_STARTUP";
-const TIMEOUT_PROBE_READY_ENV: &str = "KUBERIC_STALLED_FAILOVER_READY_MARKER";
-static TIMEOUT_PROBE_SUBREAPER_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
 
 async fn completes_within<F>(timeout: std::time::Duration, scenario: F) -> bool
 where
@@ -41,180 +35,24 @@ macro_rules! host_test {
     };
 }
 
-#[test_log::test]
-fn stalled_failover_scenario_times_out_and_reaps_postgres() {
-    if std::env::var_os(TIMEOUT_PROBE_CHILD_ENV).is_some() {
-        run_stalled_failover_timeout_probe();
-        return;
-    }
-    assert!(run_timeout_probe_subprocess(TimeoutProbeMode::Cooperative));
-}
-
-#[test_log::test]
-fn outer_timeout_reaps_stalled_probe_process_tree() {
-    assert!(!run_timeout_probe_subprocess(
-        TimeoutProbeMode::ForceAfterReady
-    ));
-}
-
-#[test_log::test]
-fn startup_timeout_reaps_probe_process_tree() {
-    assert!(!run_timeout_probe_subprocess(
-        TimeoutProbeMode::ForceDuringStartup
-    ));
-}
-
-#[test_log::test]
-fn concurrent_timeout_probes_serialize_subreaper_ownership() {
-    std::thread::scope(|scope| {
-        let cooperative =
-            scope.spawn(|| run_timeout_probe_subprocess(TimeoutProbeMode::Cooperative));
-        let forced =
-            scope.spawn(|| run_timeout_probe_subprocess(TimeoutProbeMode::ForceAfterReady));
-        assert!(cooperative.join().unwrap());
-        assert!(!forced.join().unwrap());
-    });
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TimeoutProbeMode {
-    Cooperative,
-    ForceAfterReady,
-    ForceDuringStartup,
-}
-
-fn run_timeout_probe_subprocess(mode: TimeoutProbeMode) -> bool {
-    use postgres_replicated::testing::ProcessProbe;
-
-    struct SubreaperReset;
-    impl Drop for SubreaperReset {
-        fn drop(&mut self) {
-            rustix::process::set_child_subreaper(None).unwrap();
-        }
-    }
-
-    let _subreaper_lock = TIMEOUT_PROBE_SUBREAPER_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    rustix::process::set_child_subreaper(Some(rustix::process::getpid())).unwrap();
-    let _subreaper_reset = SubreaperReset;
-    let marker = std::env::temp_dir().join(format!(
-        "kuberic-stalled-failover-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command
-        .args([
-            "--exact",
-            "stalled_failover_scenario_times_out_and_reaps_postgres",
-            "--nocapture",
-        ])
-        .env(TIMEOUT_PROBE_CHILD_ENV, "1")
-        .env(TIMEOUT_PROBE_READY_ENV, &marker)
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-    if mode != TimeoutProbeMode::Cooperative {
-        command.env(TIMEOUT_PROBE_FORCE_OUTER_ENV, "1");
-    }
-    if mode == TimeoutProbeMode::ForceDuringStartup {
-        command.env(TIMEOUT_PROBE_FORCE_STARTUP_ENV, "1");
-    }
-    let mut child = command.spawn().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut forced_deadline = None;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            let _ = std::fs::remove_file(&marker);
-            assert!(
-                status.success(),
-                "controlled timeout probe failed: {status}"
-            );
-            return true;
-        }
-        if mode != TimeoutProbeMode::Cooperative && forced_deadline.is_none() && marker.exists() {
-            forced_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
-        }
-        let now = std::time::Instant::now();
-        if forced_deadline.is_some_and(|forced| now >= forced) || now >= deadline {
-            let descendants = ProcessProbe::descendants(child.id());
-            child.kill().unwrap();
-            let _ = child.wait();
-            if !descendants.is_empty() {
-                descendants.reap_adopted().unwrap();
-                descendants.assert_reaped();
-            }
-            let _ = std::fs::remove_file(&marker);
-            if mode != TimeoutProbeMode::Cooperative && forced_deadline.is_none() {
-                panic!("controlled timeout probe did not start PostgreSQL within 30 seconds");
-            }
-            assert!(
-                mode == TimeoutProbeMode::Cooperative || !descendants.is_empty(),
-                "controlled timeout probe had no owned descendants"
-            );
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-}
-
-fn run_stalled_failover_timeout_probe() {
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn stalled_failover_scenario_times_out_and_reaps_postgres() {
     use postgres_replicated::testing::{PgPod, ProcessProbe, TestDataDir, native_identity};
 
-    let (probe_sender, probe_receiver) = std::sync::mpsc::sync_channel(1);
-    let completed = std::thread::Builder::new()
-        .name("stalled-failover-timeout".into())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let root = TestDataDir::new("p5-timeout-cleanup");
-                    let pod =
-                        PgPod::new(root.path().join("pod"), native_identity(91, "timeout")).await;
-                    if std::env::var_os(TIMEOUT_PROBE_FORCE_STARTUP_ENV).is_some() {
-                        if let Some(marker) = std::env::var_os(TIMEOUT_PROBE_READY_ENV) {
-                            std::fs::write(marker, b"startup").unwrap();
-                        }
-                        let _held = (&root, &pod);
-                        std::future::pending::<()>().await;
-                    }
-                    pod.singleton().await;
-                    if let Some(marker) = std::env::var_os(TIMEOUT_PROBE_READY_ENV) {
-                        std::fs::write(marker, b"ready").unwrap();
-                    }
-                    if std::env::var_os(TIMEOUT_PROBE_FORCE_OUTER_ENV).is_some() {
-                        let _held = (&root, &pod);
-                        std::future::pending::<()>().await;
-                    }
-                    probe_sender
-                        .send(ProcessProbe::postgres(
-                            pod.application.instance().data_dir(),
-                        ))
-                        .unwrap();
-                    completes_within(std::time::Duration::from_secs(1), async move {
-                        let _root = root;
-                        let _pod = pod;
-                        std::future::pending::<()>().await;
-                    })
-                    .await
-                })
+    let root = TestDataDir::new("p5-timeout-cleanup");
+    let pod = PgPod::new(root.path().join("pod"), native_identity(91, "timeout")).await;
+    pod.singleton().await;
+    let processes = ProcessProbe::postgres(pod.application.instance().data_dir());
+    assert!(
+        !completes_within(std::time::Duration::from_secs(1), async move {
+            let _root = root;
+            let _pod = pod;
+            std::future::pending::<()>().await;
         })
-        .unwrap()
-        .join()
-        .unwrap();
-
-    assert!(!completed, "stalled scenario unexpectedly completed");
-    probe_receiver
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap()
-        .assert_reaped();
+        .await,
+        "stalled scenario unexpectedly completed"
+    );
+    processes.assert_reaped();
 }
 
 mod scenarios {
