@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kuberic_runtime::protocol::command::{PublicV1HistoryCommand, PublicV1SessionRenewalCommand};
 use kuberic_runtime::protocol::public_operations::{
@@ -10,7 +11,7 @@ use kuberic_runtime::protocol::public_operations::{
     PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
     PublicOperationPreviewIdentity, PublicOperationProgram, PublicOperationReplayDisposition,
     PublicProgress, PublicProgressRole, PublicSessionRenewalStage, PublicV1AcceptedStatus,
-    PublicV1AgentReport, PublicV1SessionRenewalStatus,
+    PublicV1AgentReport, PublicV1OperationResult, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -23,11 +24,64 @@ use kuberic_runtime::protocol::types::{
 use kuberic_runtime::testing::sqlite_store::{
     PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PublicV1BuildRetirementSnapshot,
     PublicV1OperationSnapshotDisposition, PublicV1OperationSnapshotStage, PublicV1ReportProjection,
-    SqliteStore,
+    PublicV1SessionRenewalExecutor, SqliteStore,
 };
 use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Default)]
+struct RenewalExecutor {
+    events: Mutex<Vec<&'static str>>,
+    fail_next: AtomicBool,
+}
+
+impl RenewalExecutor {
+    fn fail_next(&self) {
+        self.fail_next.store(true, Ordering::Release);
+    }
+
+    fn record(&self, event: &'static str) -> kuberic_runtime::Result<()> {
+        if self.fail_next.swap(false, Ordering::AcqRel) {
+            return Err(kuberic_runtime::RuntimeError::Application(format!(
+                "{event} failed"
+            )));
+        }
+        self.events.lock().unwrap().push(event);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PublicV1SessionRenewalExecutor for RenewalExecutor {
+    async fn close_access_and_ingress(&self) -> kuberic_runtime::Result<()> {
+        self.record("close")
+    }
+
+    async fn update_epoch_barrier(
+        &self,
+        _survivor: &ProcessSessionEndpoint,
+        _epoch: Epoch,
+    ) -> kuberic_runtime::Result<()> {
+        self.record("epoch")
+    }
+
+    async fn replay_replacement_role(
+        &self,
+        _process_session_id: &ProcessSessionId,
+        _epoch: Epoch,
+        _role: ReplicaRole,
+    ) -> kuberic_runtime::Result<()> {
+        self.record("role")
+    }
+
+    async fn install_fresh_configuration(
+        &self,
+        _configuration: &ConfigurationDescriptor,
+    ) -> kuberic_runtime::Result<()> {
+        self.record("configuration")
+    }
+}
 
 fn test_root(name: &str) -> PathBuf {
     let root = std::env::current_dir()
@@ -75,6 +129,7 @@ fn build_intent(
         attempt: operation_id.clone(),
         epoch: Epoch::new(history.data_loss_number, 7),
         replica: target.replica.clone(),
+        target_storage: target.clone(),
         process_session_id: target_session,
         replication_address: "https://10.0.0.2:7000".into(),
         history: Some(history.clone()),
@@ -168,9 +223,27 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
             first: 7,
             last: 7,
         },
+        service_location: None,
         data_loss_recovery: None,
         completed_operations: Vec::new(),
         extensions: Default::default(),
+    }
+}
+
+fn replacement_data_loss_status(
+    required: &ProcessSessionRenewalRequired,
+) -> PublicDataLossRecoveryStatus {
+    let renewal = required.data_loss.as_ref().unwrap();
+    PublicDataLossRecoveryStatus {
+        authorization_id: renewal.authorization.authorization_id.clone(),
+        attempt: renewal.replacement_attempt.clone(),
+        predecessor_history: renewal.authorization.predecessor.clone(),
+        proposed_history: renewal.authorization.proposed.clone(),
+        provisional_primary: renewal.authorization.provisional_primary.clone(),
+        reset_scope: renewal.authorization.reset_scope.clone(),
+        replay_disposition: renewal.authorization.replay_disposition,
+        stage: PublicDataLossRecoveryStage::Invalidated,
+        observed_progress: None,
     }
 }
 
@@ -382,15 +455,37 @@ async fn public_v1_session_renewal_requires_higher_epoch() {
         .unwrap();
 
     let accepted = PublicV1SessionRenewalStatus::required(required.clone()).unwrap();
+    let executor = RenewalExecutor::default();
     store
         .persist_public_v1_session_renewal(None, &accepted)
         .await
         .unwrap();
+    executor.fail_next();
+    assert!(
+        store
+            .apply_public_v1_session_renewal_command(
+                &PublicV1SessionRenewalCommand::CloseAccessAndIngress {
+                    accepted: accepted.clone(),
+                },
+                &executor,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .public_v1_history_snapshot()
+            .await
+            .unwrap()
+            .session_renewal,
+        Some(accepted.clone())
+    );
     let closed = store
         .apply_public_v1_session_renewal_command(
             &PublicV1SessionRenewalCommand::CloseAccessAndIngress {
                 accepted: accepted.clone(),
             },
+            &executor,
         )
         .await
         .unwrap();
@@ -420,6 +515,7 @@ async fn public_v1_session_renewal_requires_higher_epoch() {
                 survivor: required.surviving_sessions[0].clone(),
                 epoch: required.renewal_epoch,
             },
+            &executor,
         )
         .await
         .unwrap();
@@ -441,6 +537,7 @@ async fn public_v1_session_renewal_requires_higher_epoch() {
                 epoch: required.renewal_epoch,
                 role: ReplicaRole::Primary,
             },
+            &executor,
         )
         .await
         .unwrap();
@@ -450,10 +547,15 @@ async fn public_v1_session_renewal_requires_higher_epoch() {
                 accepted: configuration_pending,
                 configuration: required.fresh_configuration.clone(),
             },
+            &executor,
         )
         .await
         .unwrap();
     assert_eq!(authorized.stage, PublicSessionRenewalStage::Authorized);
+    assert_eq!(
+        executor.events.lock().unwrap().as_slice(),
+        ["close", "epoch", "role", "configuration"]
+    );
     drop(store);
 
     let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
@@ -467,6 +569,61 @@ async fn public_v1_session_renewal_requires_higher_epoch() {
     );
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ordinary_replacement_report_validates_and_round_trips_without_data_loss_authority() {
+    let required = ordinary_required(Epoch::new(0, 10), Epoch::new(0, 11));
+    let report = replacement_report(&required);
+
+    report.validate().unwrap();
+    required.validate_replacement_report(&report).unwrap();
+    assert_eq!(
+        kuberic_runtime::control::normalize_public_v1_agent_status_report(
+            kuberic_runtime::control::public_v1_agent_status_to_proto(&report),
+        )
+        .unwrap(),
+        report
+    );
+
+    let mut assigned_recovery = report.clone();
+    assigned_recovery.role = ReplicaRole::ActiveSecondary;
+    assert!(assigned_recovery.validate().is_err());
+    assert!(
+        kuberic_runtime::control::normalize_public_v1_agent_status_report(
+            kuberic_runtime::control::public_v1_agent_status_to_proto(&assigned_recovery),
+        )
+        .is_err()
+    );
+
+    let mut serving_recovery = report.clone();
+    serving_recovery.read_status = AccessStatus::Granted;
+    assert!(serving_recovery.validate().is_err());
+
+    let data_loss_required =
+        data_loss_required(DataLossReplay::Convergent, DataLossReplay::Convergent);
+    let mut data_loss_observation = report.clone();
+    data_loss_observation.data_loss_recovery =
+        Some(replacement_data_loss_status(&data_loss_required));
+    data_loss_observation.validate().unwrap();
+    assert!(
+        required
+            .validate_replacement_report(&data_loss_observation)
+            .is_err()
+    );
+
+    data_loss_observation
+        .data_loss_recovery
+        .as_mut()
+        .unwrap()
+        .authorization_id = OperationId::new("wrong-authorization");
+    assert!(data_loss_observation.validate().is_err());
+    assert!(
+        kuberic_runtime::control::normalize_public_v1_agent_status_report(
+            kuberic_runtime::control::public_v1_agent_status_to_proto(&data_loss_observation),
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -750,6 +907,8 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
         panic!("expected public-v1 build program");
     };
     assert_eq!(active_builds[0].target, build.replica);
+    assert_eq!(active_builds[0].source_storage, storage(replica(1)));
+    assert_eq!(active_builds[0].target_storage, build.target_storage);
     assert_eq!(active_builds[0].target_session, build.process_session_id);
     assert_eq!(active_builds[0].target_address, build.replication_address);
     assert_eq!(
@@ -1006,6 +1165,57 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
         )
         .unwrap();
 
+    for (field, value) in [
+        (
+            "epoch",
+            serde_json::json!({"dataLossNumber": 0, "configurationNumber": 99}),
+        ),
+        ("result", serde_json::Value::Null),
+    ] {
+        let mut changed = original_state.clone();
+        *changed
+            .get_mut("publicOperationPreview")
+            .and_then(|preview| preview.get_mut("buildRecords"))
+            .and_then(|records| records.get_mut("schema11-build"))
+            .and_then(|record| record.get_mut(field))
+            .unwrap() = value;
+        connection
+            .execute(
+                "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                [serde_json::to_string(&changed).unwrap()],
+            )
+            .unwrap();
+        assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+    }
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&original_state).unwrap()],
+        )
+        .unwrap();
+
+    let mut changed_storage = original_state.clone();
+    *changed_storage
+        .get_mut("publicOperationPreview")
+        .and_then(|preview| preview.get_mut("buildRecords"))
+        .and_then(|records| records.get_mut("schema11-build"))
+        .and_then(|record| record.get_mut("targetStorage"))
+        .and_then(|storage| storage.get_mut("storageGeneration"))
+        .unwrap() = serde_json::json!("substituted-storage-generation");
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&changed_storage).unwrap()],
+        )
+        .unwrap();
+    assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&original_state).unwrap()],
+        )
+        .unwrap();
+
     let mut state = original_state;
     let operations = state
         .get_mut("publicOperationPreview")
@@ -1078,6 +1288,175 @@ async fn public_v1_schema11_build_ambiguity_requires_retirement() {
         records[0].result,
         Some(kuberic_runtime::protocol::public_operations::PublicV1OperationResult::Ambiguous(_))
     ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn public_v1_schema11_failed_build_containment_survives_reopen() {
+    let root = test_root("schema11-build-failed-pending");
+    let path = SqliteStore::metadata_database_path(&root);
+    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let local = replica(1);
+    let local_storage = storage(local.clone());
+    let store = SqliteStore::create_public_v1(
+        &path,
+        preview.clone(),
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource-1"),
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+            initialization_id: InitializationId::new("local-initialization"),
+            local_identity: local,
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        },
+    )
+    .unwrap();
+    let generation = PublicProtocolGeneration::new(42);
+    let initialization =
+        derive_history_initialization_id(&ResourceUid::new("resource-1"), generation);
+    let history =
+        derive_bootstrap_history(&ResourceUid::new("resource-1"), generation, &initialization);
+    store
+        .initialize_public_v1_history(&initialization, &history, &local_storage)
+        .await
+        .unwrap();
+    let intent = build_intent(&preview, &history, storage(replica(2)));
+    store.begin_public_v1_operation(&intent).await.unwrap();
+    store
+        .mark_public_v1_build_failed_pending(&intent, "build callback failed")
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let record = reopened
+        .public_v1_operation_snapshot(&intent.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        record.stage,
+        PublicV1OperationSnapshotStage::ContainmentPending
+    );
+    assert_eq!(
+        record.disposition,
+        Some(PublicV1OperationSnapshotDisposition::Failed(
+            "build callback failed".into()
+        ))
+    );
+    assert!(matches!(
+        reopened.public_v1_build_records().await.unwrap()[0].result,
+        Some(PublicV1OperationResult::Failed(ref detail))
+            if detail == "build callback failed"
+    ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn public_v1_schema11_rebuild_then_cancellation_survives_reopen() {
+    use kuberic_runtime::protocol::public_operations::{
+        CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity,
+        PublicBuildAttemptReference, ReplicaRebuildReason,
+    };
+
+    let root = test_root("schema11-build-rebuild-cancelled");
+    let path = SqliteStore::metadata_database_path(&root);
+    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let local = replica(1);
+    let local_storage = storage(local.clone());
+    let target_storage = storage(replica(2));
+    let store = SqliteStore::create_public_v1(
+        &path,
+        preview.clone(),
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource-1"),
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+            initialization_id: InitializationId::new("local-initialization"),
+            local_identity: local.clone(),
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        },
+    )
+    .unwrap();
+    let generation = PublicProtocolGeneration::new(42);
+    let initialization =
+        derive_history_initialization_id(&ResourceUid::new("resource-1"), generation);
+    let history =
+        derive_bootstrap_history(&ResourceUid::new("resource-1"), generation, &initialization);
+    store
+        .initialize_public_v1_history(&initialization, &history, &local_storage)
+        .await
+        .unwrap();
+    let intent = build_intent(&preview, &history, target_storage.clone());
+    let PublicOperationProgram::Build(build) = intent.program.as_ref().unwrap() else {
+        panic!("expected build program");
+    };
+    let rebuild = CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+        reason: ReplicaRebuildReason::RemoteCopyConflict,
+        operation: CapturedPublicOperationIdentity {
+            resource_uid: ResourceUid::new("resource-1"),
+            preview: preview.clone(),
+            epoch: build.epoch,
+            operation_id: intent.operation_id.clone(),
+            revision: intent.revision,
+            detecting_session: intent.process_session_id.clone(),
+        },
+        build: Box::new(PublicBuildAttemptReference {
+            resource_uid: ResourceUid::new("resource-1"),
+            epoch: build.epoch,
+            build_id: intent.operation_id.clone(),
+            source: local,
+            source_storage: local_storage,
+            source_session: intent.process_session_id.clone(),
+            target: build.replica.clone(),
+            target_storage,
+            target_session: build.process_session_id.clone(),
+        }),
+    };
+    store.begin_public_v1_operation(&intent).await.unwrap();
+    store
+        .mark_public_v1_build_rebuild_pending(&intent, rebuild.clone())
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let pending = reopened
+        .public_v1_operation_snapshot(&intent.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(pending.stage, PublicV1OperationSnapshotStage::Running);
+    assert_eq!(pending.disposition, None);
+    assert_eq!(
+        reopened.public_v1_build_records().await.unwrap()[0].result,
+        Some(PublicV1OperationResult::RebuildRequired(Box::new(
+            rebuild.clone()
+        )))
+    );
+    reopened
+        .cancel_public_v1_build_rebuild_pending(&intent)
+        .await
+        .unwrap();
+    drop(reopened);
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let record = reopened
+        .public_v1_operation_snapshot(&intent.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        record.stage,
+        PublicV1OperationSnapshotStage::ContainmentPending
+    );
+    assert_eq!(
+        record.disposition,
+        Some(PublicV1OperationSnapshotDisposition::Cancelled)
+    );
+    assert_eq!(
+        reopened.public_v1_build_records().await.unwrap()[0].result,
+        Some(PublicV1OperationResult::RebuildRequired(Box::new(rebuild)))
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

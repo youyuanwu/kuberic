@@ -61,6 +61,63 @@ pub(crate) fn normalize_public_service_location(
     Ok(Some(location.clone()))
 }
 
+#[cfg(feature = "runtime-test-bridge")]
+pub fn normalize_public_v1_service_location(
+    config: &crate::evaluator::test_bridge::PublicOperationPreviewEvaluationConfig,
+    authority: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
+    report: Option<&kuberic_runtime::protocol::public_operations::PublicV1AgentReport>,
+) -> std::result::Result<
+    Option<kuberic_runtime::protocol::public_operations::ServiceLocation>,
+    String,
+> {
+    use kuberic_runtime::protocol::public_operations::{
+        PublicOperationProgram, PublicV1OperationResult,
+    };
+    use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
+
+    let Some(report) = report else {
+        return Ok(None);
+    };
+    report.validate().map_err(str::to_owned)?;
+    config.validate_identity(&report.identity)?;
+    if authority.preview != report.identity
+        || authority.process_session_id != report.process_session_id
+        || report.role != ReplicaRole::Primary
+        || report.write_status != AccessStatus::Granted
+    {
+        return Ok(None);
+    }
+    let Some(location) = &report.service_location else {
+        return Ok(None);
+    };
+    let expected_epoch = authority
+        .lifecycle
+        .as_ref()
+        .map(|lifecycle| lifecycle.epoch)
+        .or(match authority.program.as_ref() {
+            Some(PublicOperationProgram::Role { epoch, .. })
+            | Some(PublicOperationProgram::Swap { epoch, .. }) => Some(*epoch),
+            _ => None,
+        });
+    let exact_completion = report.completed_operations.iter().any(|completion| {
+        completion.operation_id == authority.operation_id
+            && completion.revision == authority.revision
+            && completion.process_session_id == authority.process_session_id
+            && completion.input_digest == authority.input_digest
+            && completion.replay_disposition == authority.replay_disposition
+            && completion.result == PublicV1OperationResult::Succeeded
+    });
+    if !exact_completion
+        || location.operation_id != authority.operation_id
+        || location.revision != authority.revision
+        || location.process_session_id != authority.process_session_id
+        || Some(location.epoch) != expected_epoch
+    {
+        return Ok(None);
+    }
+    Ok(Some(location.clone()))
+}
+
 pub fn normalize(
     raw: RawObservation,
     previous_report_watermarks: BTreeMap<ReplicaObservationKey, ReportWatermark>,

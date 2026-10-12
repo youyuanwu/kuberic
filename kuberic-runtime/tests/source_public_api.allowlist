@@ -144,6 +144,7 @@ public-path documented impl crate::replicator::ReplicatorFactoryContext::async f
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn write_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::fn identity (& self) -> Result < ReplicaIdentity >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::fn partition_information (& self) -> PartitionInformation
+public-path documented impl crate::replicator::ReplicatorFactoryContext::fn process_session_id (& self) -> Result < ProcessSessionId >
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn capabilities (& self) -> ReplicatorCapabilities
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn primary < T > (primary_replicator : Arc < T > , state_replicator : Option < Arc < dyn StateReplicator > > , capabilities : ReplicatorCapabilities ,) -> Self where T : PrimaryReplicator + 'static ,
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn primary_replicator (& self) -> Option < Arc < dyn PrimaryReplicator > >

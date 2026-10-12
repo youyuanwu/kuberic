@@ -112,6 +112,7 @@ page:control/proto/struct.PublicV1HistoryContext.html
 page:control/proto/struct.PublicV1OperationCompletion.html
 page:control/proto/struct.PublicV1RecoveryProgress.html
 page:control/proto/struct.PublicV1ReplicaRebuildRequired.html
+page:control/proto/struct.PublicV1ServiceLocation.html
 page:control/proto/struct.PublicV1StorageIncarnation.html
 page:control/proto/struct.ReplicaCleanupIdentity.html
 page:control/proto/struct.ReplicaIdentity.html

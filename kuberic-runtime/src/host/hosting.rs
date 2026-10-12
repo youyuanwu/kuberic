@@ -1004,6 +1004,11 @@ impl PodRuntime {
         let context = ReplicatorFactoryContext::new(
             RuntimeHostToken::new(),
             self.host.identity.clone(),
+            self.host
+                .replica_session
+                .get()
+                .map(|(_, session)| session.clone())
+                .unwrap_or_default(),
             Arc::new(HostAccessView {
                 host: Arc::downgrade(&self.host),
                 partition_information: self.host.state.read().await.partition_information.clone(),
@@ -3629,6 +3634,10 @@ impl RuntimeHost {
         let context = ReplicatorFactoryContext::new(
             RuntimeHostToken::new(),
             self.identity.clone(),
+            self.replica_session
+                .get()
+                .map(|(_, session)| session.clone())
+                .unwrap_or_default(),
             Arc::new(HostAccessView {
                 host: self.weak_self.clone(),
                 partition_information: self.state.read().await.partition_information.clone(),

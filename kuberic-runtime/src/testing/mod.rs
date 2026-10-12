@@ -25,7 +25,10 @@ fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> U {
         .expect("fixture record matches the durable host format")
 }
 
-pub use public_v1_conformance::assert_public_v1_conformance_subject;
+pub use public_v1_conformance::{
+    assert_public_v1_conformance_gate, assert_public_v1_conformance_not_applicable,
+    assert_public_v1_conformance_subject, public_v1_postgres_conformance_scenarios,
+};
 pub use transport::{
     ControlOutput, DeliveryId, InProcessTransport, Message, PumpReport, TransportError,
     TransportEvent,

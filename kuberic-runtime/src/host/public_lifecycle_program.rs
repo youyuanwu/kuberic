@@ -94,10 +94,10 @@ pub(super) fn replica_set(
             .replicas
             .iter()
             .filter(|replica| {
-                configuration
-                    .members
-                    .iter()
-                    .any(|member| member.identity == replica.identity)
+                configuration.members.iter().any(|member| {
+                    member.identity == replica.identity
+                        && member.role == crate::protocol::types::ReplicaRole::ActiveSecondary
+                })
             })
             .cloned()
             .map(Into::into)
@@ -108,7 +108,7 @@ pub(super) fn replica_set(
 pub(super) async fn install(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
-) -> Result<()> {
+) -> crate::Result<()> {
     if let Some(previous) = &input.previous {
         callbacks
             .primary
@@ -129,7 +129,7 @@ pub(super) async fn install(
 pub(super) async fn install_current(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
-) -> Result<()> {
+) -> crate::Result<()> {
     callbacks
         .primary
         .update_current_replica_set_configuration(replica_set(input, &input.current))
@@ -272,15 +272,28 @@ pub(super) async fn execute(
                     _ => unreachable!(),
                 };
                 if instruction == ReplicatorRole {
-                    callbacks.replicator.change_role(epoch, role).await?;
+                    super::local_callback(
+                        callbacks.replicator.change_role(epoch, role).await,
+                        store.as_ref(),
+                        &intent,
+                        index,
+                        instruction,
+                        epoch,
+                    )
+                    .await?;
                     O::Done
                 } else {
                     O::ApplicationRole(
-                        callbacks
-                            .application
-                            .change_role(role)
-                            .await?
-                            .service_address,
+                        super::local_callback(
+                            callbacks.application.change_role(role).await,
+                            store.as_ref(),
+                            &intent,
+                            index,
+                            instruction,
+                            epoch,
+                        )
+                        .await?
+                        .service_address,
                     )
                 }
             }
@@ -288,27 +301,62 @@ pub(super) async fn execute(
                 let (P::Epoch { epoch } | P::Swap { epoch, .. }) = program else {
                     unreachable!()
                 };
-                callbacks.replicator.update_epoch(*epoch).await?;
+                super::local_callback(
+                    callbacks.replicator.update_epoch(*epoch).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    *epoch,
+                )
+                .await?;
                 O::Done
             }
             Configuration | StartingConfiguration | RefreshedConfiguration => {
-                install(&callbacks, configuration(program, instruction)).await?;
+                let configuration = configuration(program, instruction);
+                super::local_callback(
+                    install(&callbacks, configuration).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    configuration.current.epoch,
+                )
+                .await?;
                 O::Done
             }
             FirstCatchUp | SecondCatchUp => {
                 // At a recovery cut, the persisted install result is historical.
                 // Reinstall the exact input before reevaluating the wait.
                 if index == start && start > 0 {
-                    install(&callbacks, configuration(program, instruction)).await?;
+                    let configuration = configuration(program, instruction);
+                    super::local_callback(
+                        install(&callbacks, configuration).await,
+                        store.as_ref(),
+                        &intent,
+                        index,
+                        instruction,
+                        configuration.current.epoch,
+                    )
+                    .await?;
                 }
                 let (P::CatchUp { mode: selected, .. } | P::Swap { mode: selected, .. }) = program
                 else {
                     unreachable!()
                 };
-                callbacks
-                    .primary
-                    .wait_for_catch_up_quorum(mode(*selected))
-                    .await?;
+                let configuration = configuration(program, instruction);
+                super::local_callback(
+                    callbacks
+                        .primary
+                        .wait_for_catch_up_quorum(mode(*selected))
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    configuration.current.epoch,
+                )
+                .await?;
                 O::Done
             }
             Progress => {
@@ -331,6 +379,7 @@ pub(super) async fn execute(
                     build.replication_address.clone(),
                 );
                 replica.process_session_id = build.process_session_id.clone();
+                replica.storage_incarnation = Some(build.target_storage.clone());
                 match callbacks.primary.build_replica(replica).await {
                     Ok(()) => O::Done,
                     Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
@@ -340,8 +389,18 @@ pub(super) async fn execute(
                         ) =>
                     {
                         let state = store.load_state().await?;
+                        let source_storage = state
+                            .public_operation_preview
+                            .as_ref()
+                            .and_then(|preview| preview.storage_incarnation.as_ref())
+                            .ok_or_else(|| {
+                                HostError::CommandRejected(
+                                    "public-v1 build lacks source storage incarnation".into(),
+                                )
+                            })?;
                         let canonical = super::enrich_remote_rebuild(
                             &state.identity,
+                            source_storage,
                             &intent,
                             build,
                             *failure,

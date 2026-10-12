@@ -907,14 +907,17 @@ public-path hidden field crate::protocol::public_operations::PublicBuildAttemptR
 public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::source: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::source_session: ProcessSessionId
+public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::source_storage: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target_session: ProcessSessionId
+public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target_storage: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::attempt: OperationId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::epoch: Epoch
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::history: Option < HistoryContext >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replication_address: String
+public-path hidden field crate::protocol::public_operations::PublicBuildInput::target_storage: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicConfiguration::current: ConfigurationDescriptor
 public-path hidden field crate::protocol::public_operations::PublicConfiguration::previous: Option < ConfigurationDescriptor >
 public-path hidden field crate::protocol::public_operations::PublicConfiguration::replicas: Vec < PublicReplicaDescriptor >
@@ -1032,6 +1035,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::report_sequence: u64
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::role: ReplicaRole
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::service_location: Option < ServiceLocation >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::storage_incarnation: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::write_status: AccessStatus
 public-path hidden field crate::protocol::public_operations::PublicV1ExtensionSlot::version: u16
@@ -1160,7 +1164,7 @@ public-path hidden struct crate::protocol::public_operations::RestartActionRecor
 public-path hidden struct crate::protocol::public_operations::ServiceLocation
 public-path hidden variant crate::protocol::public_operations::CanonicalOperationInputDigest::V1((CanonicalOperationInputDigestV1))
 public-path hidden variant crate::protocol::public_operations::CanonicalReplicaRebuildRequired::LocalProvider { { reason : ReplicaRebuildReason , provider : ProviderReplicaIdentity , operation : CapturedPublicOperationIdentity , local_replica : ReplicaIdentity , local_storage : PvcUid , } }
-public-path hidden variant crate::protocol::public_operations::CanonicalReplicaRebuildRequired::RemoteBuildTarget { { reason : ReplicaRebuildReason , operation : CapturedPublicOperationIdentity , build : PublicBuildAttemptReference , } }
+public-path hidden variant crate::protocol::public_operations::CanonicalReplicaRebuildRequired::RemoteBuildTarget { { reason : ReplicaRebuildReason , operation : CapturedPublicOperationIdentity , build : Box < PublicBuildAttemptReference > , } }
 public-path hidden variant crate::protocol::public_operations::DataLossRenewalDecision::InvokeCallback
 public-path hidden variant crate::protocol::public_operations::DataLossRenewalDecision::RetireWithoutCallback
 public-path hidden variant crate::protocol::public_operations::DataLossRenewalDecision::Terminal

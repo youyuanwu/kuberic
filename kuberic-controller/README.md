@@ -23,9 +23,14 @@ quorum credit, application durability, or a workflow phase journal.
 A feature-gated dormant Public V1 evaluator path consumes protocol-11 public
 history, role-correct progress and exact durable callback completion. It
 rejects stale revisions, predecessor sessions, substituted storage or
-configuration identity and proof-free Kubernetes scaffolding. Production
-evaluation remains protocol 9; the Phase 6 replacement engine and Phase 7
-cutover artifact do not exist yet.
+configuration identity and proof-free Kubernetes scaffolding. Consumer-specific
+accepted intent derives the frozen requirement for failover, switchover,
+repair/replacement, scale, removal, data loss and session renewal. Conditional
+effects are atomically deduplicated, and build retirement/replacement targets
+the captured target storage incarnation rather than the reporting source.
+Protocol-11 role locations are normalized only from the exact successful role
+completion. Production evaluation remains protocol 9; the Phase 6 replacement
+engine and Phase 7 cutover artifact do not exist yet.
 
 Planned switchover uses `spec.switchover.requestId` and
 `spec.switchover.targetReplicaId` (a committed logical secondary ID). Acceptance

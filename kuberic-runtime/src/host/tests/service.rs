@@ -1039,13 +1039,20 @@ impl DurableState for ResumableCopyApplication {
 struct NoopReplicator {
     replication: Mutex<Option<OperationStream>>,
     copy: Mutex<Option<OperationStream>>,
+    endpoint: Mutex<Option<TcpListener>>,
     _senders: Vec<crate::replicator::stream::OperationSender>,
 }
 
 #[async_trait]
 impl Replicator for NoopReplicator {
     async fn open(&self) -> RuntimeResult<String> {
-        Ok("127.0.0.1:0".into())
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        *self.endpoint.lock().unwrap() = Some(listener);
+        Ok(address.to_string())
     }
 
     async fn change_role(
@@ -1061,10 +1068,13 @@ impl Replicator for NoopReplicator {
     }
 
     async fn close(&self) -> RuntimeResult<()> {
+        self.endpoint.lock().unwrap().take();
         Ok(())
     }
 
-    fn abort(&self) {}
+    fn abort(&self) {
+        self.endpoint.lock().unwrap().take();
+    }
 
     async fn current_progress(&self) -> RuntimeResult<i64> {
         Ok(0)
@@ -1111,6 +1121,7 @@ impl ReplicatorFactory for NoopFactory {
         let replicator = Arc::new(NoopReplicator {
             replication: Mutex::new(Some(replication)),
             copy: Mutex::new(Some(copy)),
+            endpoint: Mutex::new(None),
             _senders: vec![replication_sender, copy_sender],
         });
         Ok(ReplicatorInterfaces::secondary(
@@ -1119,6 +1130,33 @@ impl ReplicatorFactory for NoopFactory {
             ReplicatorCapabilities::conservative(),
         ))
     }
+}
+
+#[tokio::test]
+async fn replicator_endpoint_follows_open_close_and_abort() {
+    let (replication_sender, replication) = OperationStream::channel(1);
+    let (copy_sender, copy) = OperationStream::channel(1);
+    let replicator = NoopReplicator {
+        replication: Mutex::new(Some(replication)),
+        copy: Mutex::new(Some(copy)),
+        endpoint: Mutex::new(None),
+        _senders: vec![replication_sender, copy_sender],
+    };
+
+    let opened = replicator.open().await.unwrap();
+    let opened: SocketAddr = opened.parse().unwrap();
+    tokio::net::TcpStream::connect(opened).await.unwrap();
+    assert_eq!(
+        TcpListener::bind(opened).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+
+    replicator.close().await.unwrap();
+    TcpListener::bind(opened).unwrap();
+
+    let reopened: SocketAddr = replicator.open().await.unwrap().parse().unwrap();
+    replicator.abort();
+    TcpListener::bind(reopened).unwrap();
 }
 
 #[async_trait]

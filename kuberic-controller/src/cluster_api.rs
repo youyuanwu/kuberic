@@ -3754,7 +3754,10 @@ pub use public_v1_history::{PublicV1HistoryApi, PublicV1SessionRenewalApi};
 #[cfg(feature = "runtime-test-bridge")]
 mod public_v1_evidence;
 #[cfg(feature = "runtime-test-bridge")]
-pub use public_v1_evidence::{PublicV1EvidenceApi, PublicV1EvidenceEffect, PublicV1EvidenceState};
+pub use public_v1_evidence::{
+    PublicV1EvidenceApi, PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState,
+    PublicV1ResourceDisposition, PublicV1ResourceProof,
+};
 #[cfg(test)]
 mod tests {
     use super::*;

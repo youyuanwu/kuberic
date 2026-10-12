@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -350,6 +351,7 @@ fn public_v1_values_distinguishes_invalid_lsn() {
             first: 0,
             last: 0,
         },
+        service_location: None,
         data_loss_recovery: None,
         completed_operations: Vec::new(),
         extensions: Default::default(),
@@ -1873,9 +1875,11 @@ struct Trace {
     service_address: Mutex<Option<String>>,
     data_loss: Mutex<Option<std::result::Result<bool, String>>>,
     rebuild: Mutex<Option<crate::protocol::public_operations::ReplicaRebuildRequired>>,
+    role_rebuild: Mutex<Option<crate::protocol::public_operations::ReplicaRebuildRequired>>,
     fail_role: AtomicBool,
     fail_close: Mutex<Vec<&'static str>>,
     configurations: Mutex<Vec<crate::protocol::public_operations::PublicConfiguration>>,
+    catch_up_configurations: Mutex<Vec<(ReplicaSetConfiguration, ReplicaSetConfiguration)>>,
     installed: Mutex<Option<crate::protocol::public_operations::PublicConfiguration>>,
     waits: Mutex<
         Vec<(
@@ -2145,6 +2149,7 @@ struct TraceReplicator {
     lifecycle_closed: Arc<AtomicBool>,
     containment: watch::Sender<bool>,
     cancel_descendant_with_root: AtomicBool,
+    endpoint: Mutex<Option<TcpListener>>,
 }
 
 impl TraceReplicator {
@@ -2178,7 +2183,14 @@ impl TraceReplicator {
 impl Replicator for TraceReplicator {
     async fn open(&self) -> crate::Result<String> {
         self.trace.callback("replicator.open").await;
-        Ok("trace://replicator".into())
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| crate::RuntimeError::Application(error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| crate::RuntimeError::Application(error.to_string()))?;
+        *self.endpoint.lock().unwrap() = Some(listener);
+        self.lifecycle_closed.store(false, Ordering::Release);
+        Ok(address.to_string())
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> crate::Result<()> {
@@ -2188,6 +2200,11 @@ impl Replicator for TraceReplicator {
             .unwrap()
             .push(format!("replicator.role:{epoch:?}:{role:?}"));
         self.trace.callback("replicator.change_role").await;
+        if let Some(rebuild) = self.trace.role_rebuild.lock().unwrap().clone() {
+            return Err(crate::RuntimeError::ReplicaRebuildRequired(Box::new(
+                rebuild,
+            )));
+        }
         self.primary
             .store(role == ReplicaRole::Primary, Ordering::Release);
         Ok(())
@@ -2216,12 +2233,14 @@ impl Replicator for TraceReplicator {
                 "replicator close failed".into(),
             ));
         }
+        self.endpoint.lock().unwrap().take();
         self.lifecycle_closed.store(true, Ordering::Release);
         Ok(())
     }
 
     fn abort(&self) {
         self.trace.record("replicator.abort");
+        self.endpoint.lock().unwrap().take();
         self.lifecycle_closed.store(true, Ordering::Release);
         if let Some(stop) = self.descendant_stop.lock().unwrap().take() {
             stop.send_replace(true);
@@ -2256,6 +2275,11 @@ impl PrimaryReplicator for TraceReplicator {
         self.trace
             .callback("primary.update_catch_up_configuration")
             .await;
+        self.trace
+            .catch_up_configurations
+            .lock()
+            .unwrap()
+            .push((current.clone(), previous.clone()));
         let configuration = crate::protocol::public_operations::PublicConfiguration {
             current: current.configuration,
             previous: Some(previous.configuration),
@@ -2392,6 +2416,7 @@ fn trace_fixture() -> (
         lifecycle_closed: lifecycle_closed.clone(),
         containment: watch::channel(true).0,
         cancel_descendant_with_root: AtomicBool::new(false),
+        endpoint: Mutex::new(None),
     });
     let state_replicator = Arc::new(TraceStateReplicator {
         trace: trace.clone(),

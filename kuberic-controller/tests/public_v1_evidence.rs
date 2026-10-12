@@ -1,16 +1,20 @@
-use std::sync::{Arc, Mutex};
+#![cfg(feature = "runtime-test-bridge")]
+
+use std::sync::Arc;
 
 use kuberic_controller::evaluator::test_bridge::{
-    PublicV1CompletionRequirement, PublicV1EvidenceApi, PublicV1EvidenceConsumer,
-    PublicV1EvidenceEffect, PublicV1EvidencePlan, PublicV1EvidenceState,
-    execute_public_v1_evidence, plan_public_v1_evidence,
+    PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
+    PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState,
+    PublicV1ReconciliationOutcome, PublicV1ResourceAuthority, PublicV1ResourceDisposition,
+    PublicV1ResourceProof, reconcile_public_v1_consumer,
 };
 use kuberic_runtime::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, ProviderReplicaIdentity,
     PublicOperationPreviewIdentity, PublicOperationReplayDisposition, PublicProgress,
-    PublicProgressRole, PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind,
-    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
+    PublicProgressRole, PublicV1AcceptedOperationCompletion, PublicV1AcceptedStatus,
+    PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
+    ReplicaRebuildReason,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationId, Epoch, OperationId, PodUid, ProcessSessionId,
@@ -19,93 +23,22 @@ use kuberic_runtime::protocol::types::{
     derive_bootstrap_history, derive_history_initialization_id,
 };
 
-#[derive(Default)]
-struct FakeApi {
-    status: Mutex<Option<PublicV1AcceptedStatus>>,
-    accepted: Mutex<Vec<(PublicV1EvidenceConsumer, OperationId)>>,
-    retired: Mutex<Vec<(PublicV1EvidenceConsumer, OperationId)>>,
-    replacements: Mutex<Vec<(PublicV1EvidenceConsumer, OperationId)>>,
-}
-
-#[async_trait::async_trait]
-impl PublicV1EvidenceApi for FakeApi {
-    async fn observe_public_v1_evidence_status(
-        &self,
-    ) -> Result<Option<PublicV1AcceptedStatus>, String> {
-        Ok(self.status.lock().unwrap().clone())
-    }
-
-    async fn persist_public_v1_evidence_status(
-        &self,
-        expected: &PublicV1AcceptedStatus,
-        next: &PublicV1AcceptedStatus,
-    ) -> Result<(), String> {
-        let mut status = self.status.lock().unwrap();
-        if status.as_ref() != Some(expected) {
-            return Err("stale public-v1 evidence persistence".into());
-        }
-        *status = Some(next.clone());
-        Ok(())
-    }
-
-    async fn accept_public_v1_completion(
-        &self,
-        _expected: &PublicV1AcceptedStatus,
-        consumer: PublicV1EvidenceConsumer,
-        completion: &PublicV1OperationCompletion,
-    ) -> Result<(), String> {
-        self.accepted
-            .lock()
-            .unwrap()
-            .push((consumer, completion.operation_id.clone()));
-        Ok(())
-    }
-
-    async fn retire_public_v1_incarnation(
-        &self,
-        _expected: &PublicV1AcceptedStatus,
-        consumer: PublicV1EvidenceConsumer,
-        completion: &PublicV1OperationCompletion,
-        _storage: &ReplicaStorageIncarnationContext,
-    ) -> Result<(), String> {
-        self.retired
-            .lock()
-            .unwrap()
-            .push((consumer, completion.operation_id.clone()));
-        Ok(())
-    }
-
-    async fn provision_public_v1_replacement(
-        &self,
-        _expected: &PublicV1AcceptedStatus,
-        consumer: PublicV1EvidenceConsumer,
-        completion: &PublicV1OperationCompletion,
-        _rebuild: &CanonicalReplicaRebuildRequired,
-    ) -> Result<(), String> {
-        self.replacements
-            .lock()
-            .unwrap()
-            .push((consumer, completion.operation_id.clone()));
-        Ok(())
-    }
-}
-
-fn replica() -> ReplicaIdentity {
+fn replica(id: i64) -> ReplicaIdentity {
     ReplicaIdentity {
-        replica_id: ReplicaId::new(1),
-        instance_id: ReplicaInstanceId::new("pod-1"),
-        agent_generation: AgentGeneration::new("generation-1"),
+        replica_id: ReplicaId::new(id),
+        instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+        agent_generation: AgentGeneration::new(format!("generation-{id}")),
     }
 }
 
-fn storage() -> ReplicaStorageIncarnationContext {
+fn storage(id: i64) -> ReplicaStorageIncarnationContext {
     ReplicaStorageIncarnationContext {
-        replica: replica(),
+        replica: replica(id),
         storage: ReplicaStorageIdentity::Persistent {
-            pod_uid: PodUid::new("pod-1"),
-            pvc_uid: PvcUid::new("pvc-1"),
+            pod_uid: PodUid::new(format!("pod-{id}")),
+            pvc_uid: PvcUid::new(format!("pvc-{id}")),
         },
-        storage_generation: StorageGeneration::new("storage-1"),
+        storage_generation: StorageGeneration::new(format!("storage-{id}")),
     }
 }
 
@@ -145,7 +78,7 @@ fn completion(
             _ => PublicOperationReplayDisposition::Convergent,
         },
         history: accepted.history.clone(),
-        storage_incarnation: storage(),
+        storage_incarnation: storage(1),
         previous_configuration_id: Some(ConfigurationId::new("previous")),
         current_configuration_id: Some(ConfigurationId::new("current")),
         catch_up_mode: None,
@@ -161,117 +94,117 @@ fn report(
     PublicV1AgentReport {
         identity: accepted.identity.clone(),
         resource_uid: accepted.history.resource_uid.clone(),
-        replica: replica(),
+        replica: replica(1),
         process_session_id: ProcessSessionId::new("session-1"),
         report_sequence: 1,
         role: ReplicaRole::Primary,
         read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,
         history: accepted.history.clone(),
-        storage_incarnation: storage(),
+        storage_incarnation: storage(1),
         progress: PublicProgress {
             role: PublicProgressRole::Primary,
             first: 1,
             last: 1,
         },
+        service_location: None,
         data_loss_recovery: None,
         completed_operations: vec![completion],
         extensions: Default::default(),
     }
 }
 
-fn requirement(
+fn transition(
+    accepted: PublicV1AcceptedStatus,
     consumer: PublicV1EvidenceConsumer,
     completion: &PublicV1OperationCompletion,
-) -> PublicV1CompletionRequirement {
-    PublicV1CompletionRequirement {
-        consumer,
-        operation_id: completion.operation_id.clone(),
-        revision: completion.revision,
-        call_kind: completion.call_kind,
-        history: completion.history.clone(),
-        storage_incarnation: completion.storage_incarnation.clone(),
-        process_session_id: completion.process_session_id.clone(),
-        input_digest: completion.input_digest.clone(),
-        replay_disposition: completion.replay_disposition,
-        previous_configuration_id: completion.previous_configuration_id.clone(),
-        current_configuration_id: completion.current_configuration_id.clone(),
-        catch_up_mode: completion.catch_up_mode,
-        catch_up_specific_quorum: completion.catch_up_specific_quorum,
+    target: Option<PublicV1ResourceAuthority>,
+) -> PublicV1AcceptedTransitionStatus {
+    PublicV1AcceptedTransitionStatus {
+        resource_version: "status-rv-1".into(),
+        intent: PublicV1AcceptedTransitionIntent {
+            consumer,
+            operation_id: completion.operation_id.clone(),
+            revision: completion.revision,
+            call_kind: completion.call_kind,
+            history: completion.history.clone(),
+            source: PublicV1ResourceAuthority {
+                storage_incarnation: completion.storage_incarnation.clone(),
+                resource_version: "source-rv-1".into(),
+            },
+            target,
+            process_session_id: completion.process_session_id.clone(),
+            input_digest: completion.input_digest.clone(),
+            replay_disposition: completion.replay_disposition,
+            previous_configuration_id: completion.previous_configuration_id.clone(),
+            current_configuration_id: completion.current_configuration_id.clone(),
+            catch_up_mode: completion.catch_up_mode,
+            catch_up_specific_quorum: completion.catch_up_specific_quorum,
+        },
+        evidence: accepted,
+    }
+}
+
+fn resource(accepted: &PublicV1AcceptedStatus, id: i64, version: &str) -> PublicV1EvidenceResource {
+    let storage_incarnation = storage(id);
+    PublicV1EvidenceResource {
+        proof: Some(PublicV1ResourceProof {
+            history: accepted.history.clone(),
+            storage_incarnation: storage_incarnation.clone(),
+        }),
+        storage_incarnation,
+        resource_version: version.into(),
+        disposition: PublicV1ResourceDisposition::Active,
+    }
+}
+
+fn state(
+    accepted: &PublicV1AcceptedStatus,
+    transition: PublicV1AcceptedTransitionStatus,
+) -> PublicV1EvidenceState {
+    PublicV1EvidenceState::new(
+        transition,
+        vec![
+            resource(accepted, 1, "source-rv-1"),
+            resource(accepted, 2, "target-rv-1"),
+        ],
+    )
+    .unwrap()
+}
+
+async fn reconcile_to_effect(
+    state: &PublicV1EvidenceState,
+    report: &PublicV1AgentReport,
+) -> Result<(), String> {
+    assert_eq!(
+        reconcile_public_v1_consumer(state, report).await?,
+        PublicV1ReconciliationOutcome::EvidencePersisted
+    );
+    assert_eq!(
+        reconcile_public_v1_consumer(state, report).await?,
+        PublicV1ReconciliationOutcome::EffectApplied
+    );
+    Ok(())
+}
+
+fn call_for(consumer: PublicV1EvidenceConsumer) -> PublicV1CallKind {
+    match consumer {
+        PublicV1EvidenceConsumer::Failover | PublicV1EvidenceConsumer::DataLoss => {
+            PublicV1CallKind::FailoverPromotion
+        }
+        PublicV1EvidenceConsumer::Switchover => PublicV1CallKind::Swap,
+        PublicV1EvidenceConsumer::RepairReplacement | PublicV1EvidenceConsumer::ScaleUp => {
+            PublicV1CallKind::Build
+        }
+        PublicV1EvidenceConsumer::ScaleDown | PublicV1EvidenceConsumer::Removal => {
+            PublicV1CallKind::Remove
+        }
+        PublicV1EvidenceConsumer::SessionRenewal => PublicV1CallKind::Epoch,
     }
 }
 
 #[tokio::test]
-async fn public_v1_evidence_consumers_persist_and_use_exact_public_completion() {
-    let cases = [
-        (
-            PublicV1EvidenceConsumer::Failover,
-            PublicV1CallKind::FailoverPromotion,
-        ),
-        (PublicV1EvidenceConsumer::Switchover, PublicV1CallKind::Swap),
-        (
-            PublicV1EvidenceConsumer::RepairReplacement,
-            PublicV1CallKind::Build,
-        ),
-        (PublicV1EvidenceConsumer::ScaleUp, PublicV1CallKind::Build),
-        (
-            PublicV1EvidenceConsumer::ScaleDown,
-            PublicV1CallKind::Remove,
-        ),
-        (PublicV1EvidenceConsumer::Removal, PublicV1CallKind::Remove),
-        (
-            PublicV1EvidenceConsumer::DataLoss,
-            PublicV1CallKind::InitialPrimary,
-        ),
-        (
-            PublicV1EvidenceConsumer::SessionRenewal,
-            PublicV1CallKind::Epoch,
-        ),
-    ];
-    for (index, (consumer, call_kind)) in cases.into_iter().enumerate() {
-        let accepted = accepted();
-        let completion = completion(
-            &accepted,
-            &format!("operation-{index}"),
-            call_kind,
-            PublicV1OperationResult::Succeeded,
-        );
-        let report = report(&accepted, completion.clone());
-        let requirement = requirement(consumer, &completion);
-        let api = FakeApi {
-            status: Mutex::new(Some(accepted.clone())),
-            ..Default::default()
-        };
-        let persist = plan_public_v1_evidence(&accepted, &report, &requirement).unwrap();
-        assert!(matches!(
-            persist,
-            PublicV1EvidencePlan::PersistStatus { .. }
-        ));
-        execute_public_v1_evidence(&api, persist).await.unwrap();
-        let persisted = api.status.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            persisted.completed_operations,
-            vec![
-                kuberic_runtime::protocol::public_operations::
-                    PublicV1AcceptedOperationCompletion::from_completion(&completion)
-            ]
-        );
-        let accept = plan_public_v1_evidence(&persisted, &report, &requirement).unwrap();
-        assert!(matches!(accept, PublicV1EvidencePlan::Accept { .. }));
-        execute_public_v1_evidence(&api, accept).await.unwrap();
-        assert_eq!(
-            api.accepted.lock().unwrap().as_slice(),
-            &[(consumer, completion.operation_id.clone())]
-        );
-
-        let mut changed = requirement.clone();
-        changed.process_session_id = ProcessSessionId::new("predecessor-session");
-        assert!(plan_public_v1_evidence(&persisted, &report, &changed).is_err());
-    }
-}
-
-#[tokio::test]
-async fn public_v1_concrete_evidence_state_executes_consumer_specific_effects() {
+async fn consumer_reconciliation_derives_frozen_requirements_for_every_consumer() {
     for (index, consumer) in [
         PublicV1EvidenceConsumer::Failover,
         PublicV1EvidenceConsumer::Switchover,
@@ -285,278 +218,397 @@ async fn public_v1_concrete_evidence_state_executes_consumer_specific_effects() 
     .into_iter()
     .enumerate()
     {
-        let call_kind = match consumer {
-            PublicV1EvidenceConsumer::Failover | PublicV1EvidenceConsumer::DataLoss => {
-                PublicV1CallKind::FailoverPromotion
-            }
-            PublicV1EvidenceConsumer::Switchover => PublicV1CallKind::Swap,
-            PublicV1EvidenceConsumer::RepairReplacement | PublicV1EvidenceConsumer::ScaleUp => {
-                PublicV1CallKind::Build
-            }
-            PublicV1EvidenceConsumer::ScaleDown | PublicV1EvidenceConsumer::Removal => {
-                PublicV1CallKind::Remove
-            }
-            PublicV1EvidenceConsumer::SessionRenewal => PublicV1CallKind::Epoch,
-        };
-        let base = accepted();
+        let accepted = accepted();
         let completion = completion(
-            &base,
-            &format!("concrete-{index}"),
-            call_kind,
+            &accepted,
+            &format!("consumer-{index}"),
+            call_for(consumer),
             PublicV1OperationResult::Succeeded,
         );
-        let mut persisted = base.clone();
-        persisted.completed_operations.push(
-            kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
-                from_completion(&completion),
+        let report = report(&accepted, completion.clone());
+        let state = state(
+            &accepted,
+            transition(accepted.clone(), consumer, &completion, None),
         );
-        let api = PublicV1EvidenceState::new(Some(persisted.clone()));
-        let plan = plan_public_v1_evidence(
-            &persisted,
-            &report(&base, completion.clone()),
-            &requirement(consumer, &completion),
-        )
-        .unwrap();
-        execute_public_v1_evidence(&api, plan).await.unwrap();
+
+        reconcile_to_effect(&state, &report).await.unwrap();
+
         assert_eq!(
-            api.effects(),
+            state.effects(),
             vec![PublicV1EvidenceEffect::Accepted {
                 consumer,
                 operation_id: completion.operation_id,
+                revision: completion.revision,
             }]
         );
     }
 }
 
 #[tokio::test]
-async fn public_v1_concrete_evidence_state_atomically_fences_stale_writers_and_effects() {
-    let base = accepted();
-    let first = completion(
-        &base,
-        "concurrent-first",
-        PublicV1CallKind::Build,
+async fn lost_accept_response_is_atomically_idempotent() {
+    let accepted = accepted();
+    let completion = completion(
+        &accepted,
+        "accept-once",
+        PublicV1CallKind::Swap,
         PublicV1OperationResult::Succeeded,
     );
-    let second = completion(
-        &base,
-        "concurrent-second",
-        PublicV1CallKind::Build,
-        PublicV1OperationResult::Succeeded,
+    let report = report(&accepted, completion.clone());
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::Switchover,
+            &completion,
+            None,
+        ),
     );
-    let mut first_status = base.clone();
-    first_status.completed_operations.push(
-        kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
-            from_completion(&first),
-    );
-    let mut second_status = base.clone();
-    second_status.completed_operations.push(
-        kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
-            from_completion(&second),
-    );
-    let api = Arc::new(PublicV1EvidenceState::new(Some(base.clone())));
-    let (first_write, second_write) = tokio::join!(
-        api.persist_public_v1_evidence_status(&base, &first_status),
-        api.persist_public_v1_evidence_status(&base, &second_status),
-    );
-    assert_ne!(first_write.is_ok(), second_write.is_ok());
-    assert!(api.status() == Some(first_status) || api.status() == Some(second_status));
 
-    assert!(
-        api.accept_public_v1_completion(&base, PublicV1EvidenceConsumer::ScaleUp, &first)
-            .await
-            .is_err()
+    reconcile_to_effect(&state, &report).await.unwrap();
+    assert_eq!(
+        reconcile_public_v1_consumer(&state, &report).await.unwrap(),
+        PublicV1ReconciliationOutcome::EffectApplied
     );
-    assert!(api.effects().is_empty());
+    assert_eq!(state.effects().len(), 1);
 }
 
 #[tokio::test]
-async fn public_v1_evidence_failure_and_rebuild_are_exact_incarnation_actions() {
+async fn concurrent_accept_reconciliation_commits_one_exact_effect() {
     let accepted = accepted();
-    let failed = completion(
+    let completion = completion(
         &accepted,
-        "failed-build",
-        PublicV1CallKind::Build,
-        PublicV1OperationResult::Failed("provider rejected build".into()),
+        "concurrent-accept-once",
+        PublicV1CallKind::Swap,
+        PublicV1OperationResult::Succeeded,
     );
-    let mut accepted_failed = accepted.clone();
-    accepted_failed.completed_operations.push(
-        kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
-            from_completion(&failed),
-    );
-    let failed_plan = plan_public_v1_evidence(
-        &accepted_failed,
-        &report(&accepted, failed.clone()),
-        &requirement(PublicV1EvidenceConsumer::RepairReplacement, &failed),
-    )
-    .unwrap();
-    assert!(matches!(
-        &failed_plan,
-        PublicV1EvidencePlan::RetireExactIncarnation {
-            storage: retired,
-            ..
-        } if **retired == storage()
+    let report = Arc::new(report(&accepted, completion.clone()));
+    let state = Arc::new(state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::Switchover,
+            &completion,
+            None,
+        ),
     ));
-    let failed_api = PublicV1EvidenceState::new(Some(accepted_failed));
-    execute_public_v1_evidence(&failed_api, failed_plan)
-        .await
-        .unwrap();
-    assert_eq!(failed_api.retired_incarnations(), vec![storage()]);
+    assert_eq!(
+        reconcile_public_v1_consumer(state.as_ref(), report.as_ref())
+            .await
+            .unwrap(),
+        PublicV1ReconciliationOutcome::EvidencePersisted
+    );
 
-    let rebuild = CanonicalReplicaRebuildRequired::LocalProvider {
+    let (first, second) = tokio::join!(
+        reconcile_public_v1_consumer(state.as_ref(), report.as_ref()),
+        reconcile_public_v1_consumer(state.as_ref(), report.as_ref()),
+    );
+    assert_eq!(first.unwrap(), PublicV1ReconciliationOutcome::EffectApplied);
+    assert_eq!(
+        second.unwrap(),
+        PublicV1ReconciliationOutcome::EffectApplied
+    );
+    assert_eq!(state.effects().len(), 1);
+}
+
+#[tokio::test]
+async fn lost_retirement_response_is_idempotent_and_retires_exact_target() {
+    let accepted = accepted();
+    let completion = completion(
+        &accepted,
+        "retire-target-once",
+        PublicV1CallKind::Build,
+        PublicV1OperationResult::Failed("target build failed".into()),
+    );
+    let report = report(&accepted, completion.clone());
+    let target = PublicV1ResourceAuthority {
+        storage_incarnation: storage(2),
+        resource_version: "target-rv-1".into(),
+    };
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::RepairReplacement,
+            &completion,
+            Some(target),
+        ),
+    );
+
+    reconcile_to_effect(&state, &report).await.unwrap();
+    reconcile_public_v1_consumer(&state, &report).await.unwrap();
+
+    assert_eq!(state.effects().len(), 1);
+    assert!(matches!(
+        &state.effects()[0],
+        PublicV1EvidenceEffect::Retired { storage: retired, .. }
+            if **retired == storage(2)
+    ));
+    let resources = state.resources();
+    assert_eq!(
+        resources
+            .iter()
+            .find(|resource| resource.storage_incarnation == storage(1))
+            .unwrap()
+            .disposition,
+        PublicV1ResourceDisposition::Active
+    );
+    assert_eq!(
+        resources
+            .iter()
+            .find(|resource| resource.storage_incarnation == storage(2))
+            .unwrap()
+            .disposition,
+        PublicV1ResourceDisposition::Retired
+    );
+}
+
+fn rebuild(
+    accepted: &PublicV1AcceptedStatus,
+    operation_id: &str,
+) -> CanonicalReplicaRebuildRequired {
+    CanonicalReplicaRebuildRequired::LocalProvider {
         reason: ReplicaRebuildReason::ProviderMismatch,
-        provider: ProviderReplicaIdentity { replica: replica() },
+        provider: ProviderReplicaIdentity {
+            replica: replica(1),
+        },
         operation: CapturedPublicOperationIdentity {
             resource_uid: accepted.history.resource_uid.clone(),
             preview: accepted.identity.clone(),
             epoch: Epoch::new(0, 7),
-            operation_id: OperationId::new("rebuild-build"),
+            operation_id: OperationId::new(operation_id),
             revision: 3,
             detecting_session: ProcessSessionId::new("session-1"),
         },
-        local_replica: replica(),
+        local_replica: replica(1),
         local_storage: PvcUid::new("pvc-1"),
-    };
-    let rebuilt = completion(
+    }
+}
+
+#[tokio::test]
+async fn lost_replacement_response_is_idempotent_and_replaces_exact_target() {
+    let accepted = accepted();
+    let rebuild = rebuild(&accepted, "replace-target-once");
+    let completion = completion(
         &accepted,
-        "rebuild-build",
+        "replace-target-once",
         PublicV1CallKind::Build,
         PublicV1OperationResult::RebuildRequired(Box::new(rebuild.clone())),
     );
-    let mut accepted_rebuild = accepted.clone();
-    accepted_rebuild.completed_operations.push(
-        kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
-            from_completion(&rebuilt),
+    let report = report(&accepted, completion.clone());
+    let target = PublicV1ResourceAuthority {
+        storage_incarnation: storage(2),
+        resource_version: "target-rv-1".into(),
+    };
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::RepairReplacement,
+            &completion,
+            Some(target),
+        ),
     );
-    let rebuild_plan = plan_public_v1_evidence(
-        &accepted_rebuild,
-        &report(&accepted, rebuilt.clone()),
-        &requirement(PublicV1EvidenceConsumer::RepairReplacement, &rebuilt),
-    )
-    .unwrap();
+
+    reconcile_to_effect(&state, &report).await.unwrap();
+    reconcile_public_v1_consumer(&state, &report).await.unwrap();
+
+    assert_eq!(state.effects().len(), 1);
     assert!(matches!(
-        &rebuild_plan,
-        PublicV1EvidencePlan::ProvisionReplacement {
+        &state.effects()[0],
+        PublicV1EvidenceEffect::Replacement {
+            storage: replaced,
             rebuild: observed,
             ..
-        } if **observed == rebuild
+        } if **replaced == storage(2) && **observed == rebuild
     ));
-    let rebuild_api = PublicV1EvidenceState::new(Some(accepted_rebuild));
-    execute_public_v1_evidence(&rebuild_api, rebuild_plan)
-        .await
-        .unwrap();
-    assert_eq!(rebuild_api.replacements(), vec![rebuild]);
+    let resources = state.resources();
+    assert_eq!(
+        resources
+            .iter()
+            .find(|resource| resource.storage_incarnation == storage(1))
+            .unwrap()
+            .disposition,
+        PublicV1ResourceDisposition::Active
+    );
+    assert_eq!(
+        resources
+            .iter()
+            .find(|resource| resource.storage_incarnation == storage(2))
+            .unwrap()
+            .disposition,
+        PublicV1ResourceDisposition::ReplacementRequested
+    );
 }
 
-#[test]
-fn public_v1_evidence_rejects_incompatible_history_and_proof_free_scaffolding() {
+#[tokio::test]
+async fn consumer_reconciliation_rejects_stale_resource_versions_and_proof_free_resources() {
     let accepted = accepted();
-    let observed_completion = completion(
+    let completion = completion(
         &accepted,
-        "history-fence",
+        "conditional-target",
+        PublicV1CallKind::Build,
+        PublicV1OperationResult::Failed("target build failed".into()),
+    );
+    let report = report(&accepted, completion.clone());
+    let stale_target = PublicV1ResourceAuthority {
+        storage_incarnation: storage(2),
+        resource_version: "stale-target-rv".into(),
+    };
+    let stale = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::RepairReplacement,
+            &completion,
+            Some(stale_target),
+        ),
+    );
+    assert_eq!(
+        reconcile_public_v1_consumer(&stale, &report).await.unwrap(),
+        PublicV1ReconciliationOutcome::EvidencePersisted
+    );
+    assert!(
+        reconcile_public_v1_consumer(&stale, &report)
+            .await
+            .unwrap_err()
+            .contains("stale public-v1 evidence resource version")
+    );
+    assert!(stale.effects().is_empty());
+
+    let target = PublicV1ResourceAuthority {
+        storage_incarnation: storage(2),
+        resource_version: "target-rv-1".into(),
+    };
+    let proof_free_transition = transition(
+        accepted.clone(),
+        PublicV1EvidenceConsumer::RepairReplacement,
+        &completion,
+        Some(target),
+    );
+    let proof_free = PublicV1EvidenceState::new(
+        proof_free_transition,
+        vec![
+            resource(&accepted, 1, "source-rv-1"),
+            PublicV1EvidenceResource {
+                proof: None,
+                ..resource(&accepted, 2, "target-rv-1")
+            },
+        ],
+    )
+    .unwrap();
+    reconcile_public_v1_consumer(&proof_free, &report)
+        .await
+        .unwrap();
+    assert!(
+        reconcile_public_v1_consumer(&proof_free, &report)
+            .await
+            .unwrap_err()
+            .contains("lacks accepted proof")
+    );
+    assert!(proof_free.effects().is_empty());
+}
+
+#[tokio::test]
+async fn consumer_reconciliation_rejects_predecessor_reports_and_substituted_authority() {
+    let accepted = accepted();
+    let completion = completion(
+        &accepted,
+        "fenced-report",
         PublicV1CallKind::FailoverPromotion,
         PublicV1OperationResult::Succeeded,
     );
-    let requirement = requirement(PublicV1EvidenceConsumer::Failover, &observed_completion);
-    let mut incompatible = report(&accepted, observed_completion);
-    incompatible.history.history_id =
-        kuberic_runtime::protocol::types::HistoryId::new("other-history");
-    assert!(plan_public_v1_evidence(&accepted, &incompatible, &requirement).is_err());
+    let mut predecessor = report(&accepted, completion.clone());
+    predecessor.process_session_id = ProcessSessionId::new("predecessor-session");
+    predecessor.completed_operations[0].process_session_id =
+        ProcessSessionId::new("predecessor-session");
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::Failover,
+            &completion,
+            None,
+        ),
+    );
+    assert!(
+        reconcile_public_v1_consumer(&state, &predecessor)
+            .await
+            .unwrap_err()
+            .contains("accepted transition authority")
+    );
 
-    assert!(matches!(
-        plan_public_v1_evidence(
-            &accepted,
-            &PublicV1AgentReport {
-                completed_operations: Vec::new(),
-                ..report(
-                    &accepted,
-                    completion(
-                        &accepted,
-                        "unobserved",
-                        PublicV1CallKind::FailoverPromotion,
-                        PublicV1OperationResult::Succeeded,
-                    ),
-                )
-            },
-            &requirement,
-        )
-        .unwrap(),
-        PublicV1EvidencePlan::Wait
-    ));
+    let mut substituted = report(&accepted, completion);
+    substituted.completed_operations[0].current_configuration_id =
+        Some(ConfigurationId::new("substituted"));
+    assert!(
+        reconcile_public_v1_consumer(&state, &substituted)
+            .await
+            .unwrap_err()
+            .contains("frozen accepted transition authority")
+    );
 }
 
-#[test]
-fn public_v1_controller_conformance_rejects_stale_or_substituted_completion() {
+#[tokio::test]
+async fn consumer_reconciliation_waits_without_manufacturing_proof() {
     let accepted = accepted();
-    let observed = completion(
+    let completion = completion(
         &accepted,
-        "exact-build",
-        PublicV1CallKind::Build,
+        "not-yet-reported",
+        PublicV1CallKind::Epoch,
         PublicV1OperationResult::Succeeded,
     );
-    let report = report(&accepted, observed.clone());
-    let requirement = requirement(PublicV1EvidenceConsumer::ScaleUp, &observed);
+    let mut empty_report = report(&accepted, completion.clone());
+    empty_report.completed_operations.clear();
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::SessionRenewal,
+            &completion,
+            None,
+        ),
+    );
 
-    let mut stale_revision = requirement.clone();
-    stale_revision.revision += 1;
-    assert!(plan_public_v1_evidence(&accepted, &report, &stale_revision).is_err());
-
-    let mut predecessor = requirement.clone();
-    predecessor.process_session_id = ProcessSessionId::new("predecessor");
-    assert!(plan_public_v1_evidence(&accepted, &report, &predecessor).is_err());
-
-    let mut substituted_storage = requirement.clone();
-    substituted_storage.storage_incarnation.storage_generation =
-        StorageGeneration::new("replacement-storage");
-    assert!(plan_public_v1_evidence(&accepted, &report, &substituted_storage).is_err());
-
-    let mut substituted_configuration = requirement;
-    substituted_configuration.current_configuration_id = Some(ConfigurationId::new("other"));
-    assert!(plan_public_v1_evidence(&accepted, &report, &substituted_configuration).is_err());
+    assert_eq!(
+        reconcile_public_v1_consumer(&state, &empty_report)
+            .await
+            .unwrap(),
+        PublicV1ReconciliationOutcome::Waiting
+    );
+    assert!(state.effects().is_empty());
+    assert!(state.transition().evidence.completed_operations.is_empty());
 }
 
-#[test]
-fn public_v1_first_completion_rejects_substituted_input_and_policy() {
-    let accepted = accepted();
-    let observed = completion(
+#[tokio::test]
+async fn persisted_completion_must_remain_exact_on_later_reconciliation() {
+    let mut accepted = accepted();
+    let completion = completion(
         &accepted,
-        "frozen-swap",
-        PublicV1CallKind::Swap,
+        "persisted-exact",
+        PublicV1CallKind::Remove,
         PublicV1OperationResult::Succeeded,
     );
-    let requirement = requirement(PublicV1EvidenceConsumer::Switchover, &observed);
+    accepted
+        .completed_operations
+        .push(PublicV1AcceptedOperationCompletion::from_completion(
+            &completion,
+        ));
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::Removal,
+            &completion,
+            None,
+        ),
+    );
+    let mut changed = completion.clone();
+    changed.revision += 1;
 
-    let mut changed_digest = observed.clone();
-    changed_digest.input_digest =
-        CanonicalOperationInputDigest::V1(CanonicalOperationInputDigestV1 {
-            sha256: "06".repeat(32),
-        });
     assert!(
-        plan_public_v1_evidence(&accepted, &report(&accepted, changed_digest), &requirement)
+        reconcile_public_v1_consumer(&state, &report(&accepted, changed))
+            .await
             .is_err()
     );
-
-    let mut changed_replay = observed.clone();
-    changed_replay.replay_disposition = PublicOperationReplayDisposition::ReevaluateCatchUp;
-    assert!(
-        plan_public_v1_evidence(&accepted, &report(&accepted, changed_replay), &requirement)
-            .is_err()
-    );
-
-    let mut changed_mode = observed.clone();
-    changed_mode.catch_up_mode =
-        Some(kuberic_runtime::protocol::public_operations::PublicCatchUpMode::All);
-    assert!(
-        plan_public_v1_evidence(&accepted, &report(&accepted, changed_mode), &requirement).is_err()
-    );
-
-    let mut changed_capability = observed;
-    changed_capability.catch_up_specific_quorum = Some(true);
-    assert!(
-        plan_public_v1_evidence(
-            &accepted,
-            &report(&accepted, changed_capability),
-            &requirement
-        )
-        .is_err()
-    );
+    assert!(state.effects().is_empty());
 }

@@ -295,7 +295,8 @@ impl ReplicatorFactory for PgReplicatorFactory {
                 "PostgreSQL owns its replication and copy state",
             ));
         }
-        self.0.configure_public_v1(settings, context.identity()?)?;
+        self.0
+            .configure_public_v1(settings, context.identity()?, context.process_session_id()?)?;
         Ok(self.interfaces())
     }
 }

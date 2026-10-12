@@ -149,10 +149,20 @@ pub async fn execute_public_v1_evidence(
     use crate::evaluator::test_bridge::PublicV1EvidencePlan;
     match plan {
         PublicV1EvidencePlan::PersistStatus { expected, next } => {
-            if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
+            let observed = api.observe_public_v1_evidence_status().await?;
+            if observed.as_ref() != Some(expected.as_ref())
+                && observed.as_ref().is_none_or(|observed| {
+                    observed.evidence != *next || observed.intent != expected.intent
+                })
+            {
                 return Err("stale public-v1 evidence status".into());
             }
-            if !next.is_evidence_successor_of(&expected) {
+            if observed.as_ref().is_some_and(|observed| {
+                observed.evidence == *next && observed.intent == expected.intent
+            }) {
+                return Ok(());
+            }
+            if !next.is_evidence_successor_of(&expected.evidence) {
                 return Err("public-v1 evidence status transition is not monotonic".into());
             }
             api.persist_public_v1_evidence_status(&expected, &next)
@@ -160,37 +170,35 @@ pub async fn execute_public_v1_evidence(
         }
         PublicV1EvidencePlan::Accept {
             expected,
-            consumer,
             completion,
         } => {
             if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
                 return Err("stale public-v1 completion acceptance".into());
             }
-            api.accept_public_v1_completion(&expected, consumer, &completion)
+            api.accept_public_v1_completion(&expected, &completion)
                 .await
         }
         PublicV1EvidencePlan::RetireExactIncarnation {
             expected,
-            consumer,
             completion,
-            storage,
+            target,
         } => {
             if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
                 return Err("stale public-v1 retirement authority".into());
             }
-            api.retire_public_v1_incarnation(&expected, consumer, &completion, &storage)
+            api.retire_public_v1_incarnation(&expected, &completion, &target)
                 .await
         }
         PublicV1EvidencePlan::ProvisionReplacement {
             expected,
-            consumer,
             completion,
+            target,
             rebuild,
         } => {
             if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
                 return Err("stale public-v1 replacement authority".into());
             }
-            api.provision_public_v1_replacement(&expected, consumer, &completion, &rebuild)
+            api.provision_public_v1_replacement(&expected, &completion, &target, &rebuild)
                 .await
         }
         PublicV1EvidencePlan::Wait => Ok(()),

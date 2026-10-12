@@ -26,8 +26,51 @@ pub mod testing;
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     #[test_log::test(tokio::test)]
-    async fn public_v1_postgres_conformance_oracle() {
-        crate::adapter::public_v1::tests::oracle().await;
-        kuberic_runtime::testing::assert_public_v1_conformance_subject("postgresql");
+    async fn public_v1_postgres_primary_lifecycle_and_joint_configuration() {
+        const SCENARIO: &str = "public_v1_postgres_primary_lifecycle_and_joint_configuration";
+        crate::adapter::public_v1::tests::
+            public_v1_postgres_primary_lifecycle_and_joint_configuration()
+            .await;
+        for id in ["KSF-01", "KSF-03", "KSF-04"] {
+            kuberic_runtime::testing::assert_public_v1_conformance_gate("postgresql", id, SCENARIO);
+        }
+        for id in ["KSF-10", "KSF-11"] {
+            kuberic_runtime::testing::assert_public_v1_conformance_not_applicable("postgresql", id);
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_build_cancellation_and_retirement() {
+        const SCENARIO: &str = "public_v1_postgres_build_cancellation_and_retirement";
+        crate::adapter::public_v1::tests::public_v1_postgres_build_cancellation_and_retirement()
+            .await;
+        for id in ["KSF-05", "KSF-06", "KSF-12"] {
+            kuberic_runtime::testing::assert_public_v1_conformance_gate("postgresql", id, SCENARIO);
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_data_loss_history_and_replay() {
+        const SCENARIO: &str = "public_v1_postgres_data_loss_history_and_replay";
+        crate::adapter::public_v1::tests::public_v1_postgres_data_loss_history_and_replay().await;
+        kuberic_runtime::testing::assert_public_v1_conformance_gate(
+            "postgresql",
+            "KSF-08",
+            SCENARIO,
+        );
+        for id in ["KSF-02", "KSF-15"] {
+            kuberic_runtime::testing::assert_public_v1_conformance_not_applicable("postgresql", id);
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_contained_close() {
+        const SCENARIO: &str = "public_v1_postgres_contained_close";
+        crate::adapter::public_v1::tests::public_v1_postgres_contained_close().await;
+        kuberic_runtime::testing::assert_public_v1_conformance_gate(
+            "postgresql",
+            "KSF-14",
+            SCENARIO,
+        );
     }
 }

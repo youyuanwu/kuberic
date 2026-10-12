@@ -21,13 +21,30 @@ pub enum PublicV1EvidenceConsumer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicV1CompletionRequirement {
+pub struct PublicV1ResourceAuthority {
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    pub resource_version: String,
+}
+
+impl PublicV1ResourceAuthority {
+    fn validate(&self) -> Result<(), String> {
+        self.storage_incarnation.validate().map_err(str::to_owned)?;
+        if self.resource_version.is_empty() {
+            return Err("public-v1 resource authority lacks a resource version".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicV1AcceptedTransitionIntent {
     pub consumer: PublicV1EvidenceConsumer,
     pub operation_id: OperationId,
     pub revision: u64,
     pub call_kind: PublicV1CallKind,
     pub history: HistoryContext,
-    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    pub source: PublicV1ResourceAuthority,
+    pub target: Option<PublicV1ResourceAuthority>,
     pub process_session_id: ProcessSessionId,
     pub input_digest: CanonicalOperationInputDigest,
     pub replay_disposition: PublicOperationReplayDisposition,
@@ -37,26 +54,29 @@ pub struct PublicV1CompletionRequirement {
     pub catch_up_specific_quorum: Option<bool>,
 }
 
-impl PublicV1CompletionRequirement {
+impl PublicV1AcceptedTransitionIntent {
     pub fn validate(&self) -> Result<(), String> {
         if self.operation_id.is_empty() || self.revision == 0 || self.process_session_id.is_empty()
         {
-            return Err("public-v1 completion requirement is incomplete".into());
+            return Err("public-v1 accepted transition intent is incomplete".into());
         }
         self.history.validate().map_err(str::to_owned)?;
-        self.storage_incarnation.validate().map_err(str::to_owned)?;
+        self.source.validate()?;
+        if let Some(target) = &self.target {
+            target.validate()?;
+        }
         if !consumer_accepts_call(self.consumer, self.call_kind) {
             return Err("public-v1 consumer cannot accept this call kind".into());
         }
         Ok(())
     }
 
-    fn matches(&self, completion: &PublicV1OperationCompletion) -> bool {
+    pub(crate) fn matches(&self, completion: &PublicV1OperationCompletion) -> bool {
         completion.operation_id == self.operation_id
             && completion.revision == self.revision
             && completion.call_kind == self.call_kind
             && completion.history == self.history
-            && completion.storage_incarnation == self.storage_incarnation
+            && completion.storage_incarnation == self.source.storage_incarnation
             && completion.process_session_id == self.process_session_id
             && completion.input_digest == self.input_digest
             && completion.replay_disposition == self.replay_disposition
@@ -65,62 +85,89 @@ impl PublicV1CompletionRequirement {
             && completion.catch_up_mode == self.catch_up_mode
             && completion.catch_up_specific_quorum == self.catch_up_specific_quorum
     }
+
+    pub(crate) fn effect_target(&self) -> &PublicV1ResourceAuthority {
+        self.target.as_ref().unwrap_or(&self.source)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicV1AcceptedTransitionStatus {
+    pub resource_version: String,
+    pub evidence: PublicV1AcceptedStatus,
+    pub intent: PublicV1AcceptedTransitionIntent,
+}
+
+impl PublicV1AcceptedTransitionStatus {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.resource_version.is_empty() {
+            return Err("public-v1 accepted transition status lacks a resource version".into());
+        }
+        self.evidence.validate_evidence().map_err(str::to_owned)?;
+        self.intent.validate()?;
+        if self.intent.history != self.evidence.history {
+            return Err(
+                "public-v1 accepted transition intent differs from accepted history".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicV1EvidencePlan {
     PersistStatus {
-        expected: Box<PublicV1AcceptedStatus>,
+        expected: Box<PublicV1AcceptedTransitionStatus>,
         next: Box<PublicV1AcceptedStatus>,
     },
     Accept {
-        expected: Box<PublicV1AcceptedStatus>,
-        consumer: PublicV1EvidenceConsumer,
+        expected: Box<PublicV1AcceptedTransitionStatus>,
         completion: Box<PublicV1OperationCompletion>,
     },
     RetireExactIncarnation {
-        expected: Box<PublicV1AcceptedStatus>,
-        consumer: PublicV1EvidenceConsumer,
+        expected: Box<PublicV1AcceptedTransitionStatus>,
         completion: Box<PublicV1OperationCompletion>,
-        storage: Box<ReplicaStorageIncarnationContext>,
+        target: Box<PublicV1ResourceAuthority>,
     },
     ProvisionReplacement {
-        expected: Box<PublicV1AcceptedStatus>,
-        consumer: PublicV1EvidenceConsumer,
+        expected: Box<PublicV1AcceptedTransitionStatus>,
         completion: Box<PublicV1OperationCompletion>,
+        target: Box<PublicV1ResourceAuthority>,
         rebuild: Box<CanonicalReplicaRebuildRequired>,
     },
     Wait,
 }
 
 pub fn plan_public_v1_evidence(
-    accepted: &PublicV1AcceptedStatus,
+    accepted: &PublicV1AcceptedTransitionStatus,
     report: &PublicV1AgentReport,
-    requirement: &PublicV1CompletionRequirement,
 ) -> Result<PublicV1EvidencePlan, String> {
-    accepted.validate_evidence().map_err(str::to_owned)?;
+    accepted.validate()?;
     report.validate().map_err(str::to_owned)?;
-    requirement.validate()?;
-    if report.identity != accepted.identity
-        || report.resource_uid != accepted.history.resource_uid
-        || report.history != accepted.history
-        || requirement.history != accepted.history
-        || report.storage_incarnation != requirement.storage_incarnation
-        || report.process_session_id != requirement.process_session_id
+    let intent = &accepted.intent;
+    if report.identity != accepted.evidence.identity
+        || report.resource_uid != accepted.evidence.history.resource_uid
+        || report.history != accepted.evidence.history
+        || report.history != intent.history
+        || report.storage_incarnation != intent.source.storage_incarnation
+        || report.process_session_id != intent.process_session_id
     {
-        return Err("public-v1 report or requirement differs from accepted authority".into());
+        return Err("public-v1 report differs from accepted transition authority".into());
     }
     let Some(completion) = report
         .completed_operations
         .iter()
-        .find(|completion| completion.operation_id == requirement.operation_id)
+        .find(|completion| completion.operation_id == intent.operation_id)
     else {
         return Ok(PublicV1EvidencePlan::Wait);
     };
-    if !requirement.matches(completion) {
-        return Err("public-v1 completion differs from frozen consumer authority".into());
+    if !intent.matches(completion) {
+        return Err(
+            "public-v1 completion differs from frozen accepted transition authority".into(),
+        );
     }
     if let Some(existing) = accepted
+        .evidence
         .completed_operations
         .iter()
         .find(|existing| existing.operation_id == completion.operation_id)
@@ -131,15 +178,15 @@ pub fn plan_public_v1_evidence(
         {
             return Err("accepted public-v1 completion changed after persistence".into());
         }
-        return Ok(decide(accepted, requirement.consumer, completion));
+        return Ok(decide(accepted, completion));
     }
-    let mut next = accepted.clone();
+    let mut next = accepted.evidence.clone();
     next.completed_operations.push(
         kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
             from_completion(completion),
     );
     next.validate_evidence().map_err(str::to_owned)?;
-    if !next.is_evidence_successor_of(accepted) {
+    if !next.is_evidence_successor_of(&accepted.evidence) {
         return Err("public-v1 completion persistence is not monotonic".into());
     }
     Ok(PublicV1EvidencePlan::PersistStatus {
@@ -149,21 +196,19 @@ pub fn plan_public_v1_evidence(
 }
 
 fn decide(
-    accepted: &PublicV1AcceptedStatus,
-    consumer: PublicV1EvidenceConsumer,
+    accepted: &PublicV1AcceptedTransitionStatus,
     completion: &PublicV1OperationCompletion,
 ) -> PublicV1EvidencePlan {
     match &completion.result {
         PublicV1OperationResult::Succeeded => PublicV1EvidencePlan::Accept {
             expected: Box::new(accepted.clone()),
-            consumer,
             completion: Box::new(completion.clone()),
         },
         PublicV1OperationResult::RebuildRequired(rebuild) => {
             PublicV1EvidencePlan::ProvisionReplacement {
                 expected: Box::new(accepted.clone()),
-                consumer,
                 completion: Box::new(completion.clone()),
+                target: Box::new(accepted.intent.effect_target().clone()),
                 rebuild: rebuild.clone(),
             }
         }
@@ -171,9 +216,8 @@ fn decide(
         | PublicV1OperationResult::Ambiguous(_)
         | PublicV1OperationResult::Cancelled => PublicV1EvidencePlan::RetireExactIncarnation {
             expected: Box::new(accepted.clone()),
-            consumer,
             completion: Box::new(completion.clone()),
-            storage: Box::new(completion.storage_incarnation.clone()),
+            target: Box::new(accepted.intent.effect_target().clone()),
         },
     }
 }

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::public_operations::PublicV1OperationResult;
 use crate::protocol::types::{
     Epoch, HistoryContext, OperationId, ProcessSessionId, ReplicaIdentity,
+    ReplicaStorageIncarnationContext,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,8 +23,10 @@ pub(crate) struct PublicV1BuildRecord {
     pub(crate) history: HistoryContext,
     pub(crate) epoch: Epoch,
     pub(crate) source: ReplicaIdentity,
+    pub(crate) source_storage: ReplicaStorageIncarnationContext,
     pub(crate) source_session: ProcessSessionId,
     pub(crate) target: ReplicaIdentity,
+    pub(crate) target_storage: ReplicaStorageIncarnationContext,
     pub(crate) target_session: ProcessSessionId,
     pub(crate) target_address: String,
     pub(crate) retirement: PublicV1BuildRetirement,
@@ -44,6 +47,12 @@ impl PublicV1BuildRecord {
             return Err("public-v1 build record has incomplete exact attempt identity");
         }
         self.history.validate()?;
+        self.source_storage.validate()?;
+        self.target_storage.validate()?;
+        if self.source_storage.replica != self.source || self.target_storage.replica != self.target
+        {
+            return Err("public-v1 build storage differs from its replica");
+        }
         match self.result.as_ref() {
             Some(
                 PublicV1OperationResult::Failed(detail)

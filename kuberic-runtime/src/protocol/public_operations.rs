@@ -505,6 +505,15 @@ impl PublicConfiguration {
 
     pub fn validate_for_local(&self, local_replica_id: ReplicaId) -> Result<(), &'static str> {
         self.validate_descriptors()?;
+        let expected_ready_secondaries = std::iter::once(&self.current)
+            .chain(self.previous.iter())
+            .flat_map(|configuration| configuration.members.iter())
+            .filter(|member| {
+                member.role == ReplicaRole::ActiveSecondary
+                    && member.identity.replica_id != local_replica_id
+            })
+            .map(|member| &member.identity)
+            .collect::<std::collections::BTreeSet<_>>();
         let mut identities = std::collections::BTreeSet::new();
         let mut successor = None;
         for replica in &self.replicas {
@@ -513,10 +522,7 @@ impl PublicConfiguration {
                 || replica.identity.replica_id == local_replica_id
                 || replica.role != ReplicaRole::ActiveSecondary
                 || replica.build_id != OperationId::default()
-                || !self.current.members.iter().any(|member| {
-                    member.identity == replica.identity
-                        && member.role == ReplicaRole::ActiveSecondary
-                })
+                || !expected_ready_secondaries.contains(&replica.identity)
             {
                 return Err(
                     "public configuration contains a local, idle, build, or duplicate peer",
@@ -526,16 +532,7 @@ impl PublicConfiguration {
                 return Err("public configuration contains multiple must-catchup successors");
             }
         }
-        let expected_ready_secondaries = self
-            .current
-            .members
-            .iter()
-            .filter(|member| {
-                member.role == ReplicaRole::ActiveSecondary
-                    && member.identity.replica_id != local_replica_id
-            })
-            .count();
-        if self.replicas.len() != expected_ready_secondaries {
+        if identities != expected_ready_secondaries {
             return Err("public configuration lacks an exact ready remote-secondary descriptor");
         }
         Ok(())
@@ -586,8 +583,18 @@ impl PublicReplicaDescriptor {
         previous: Option<&ConfigurationDescriptor>,
     ) -> Result<(), &'static str> {
         self.validate()?;
-        let _ = (current, previous);
-        Ok(())
+        if std::iter::once(current)
+            .chain(previous)
+            .any(|configuration| {
+                configuration.members.iter().any(|member| {
+                    member.identity == self.identity && member.role == ReplicaRole::ActiveSecondary
+                })
+            })
+        {
+            Ok(())
+        } else {
+            Err("public replica descriptor is not an active secondary in PC or CC")
+        }
     }
 }
 
@@ -616,8 +623,10 @@ pub struct PublicBuildAttemptReference {
     pub epoch: Epoch,
     pub build_id: OperationId,
     pub source: ReplicaIdentity,
+    pub source_storage: ReplicaStorageIncarnationContext,
     pub source_session: ProcessSessionId,
     pub target: ReplicaIdentity,
+    pub target_storage: ReplicaStorageIncarnationContext,
     pub target_session: ProcessSessionId,
 }
 
@@ -633,7 +642,14 @@ impl PublicBuildAttemptReference {
             return Err("public build attempt reference is incomplete");
         }
         validate_exact_replica_identity(&self.source)?;
-        validate_exact_replica_identity(&self.target)
+        validate_exact_replica_identity(&self.target)?;
+        self.source_storage.validate()?;
+        self.target_storage.validate()?;
+        if self.source_storage.replica != self.source || self.target_storage.replica != self.target
+        {
+            return Err("public build storage differs from its replica identity");
+        }
+        Ok(())
     }
 }
 
@@ -642,6 +658,7 @@ pub struct PublicBuildInput {
     pub attempt: OperationId,
     pub epoch: Epoch,
     pub replica: ReplicaIdentity,
+    pub target_storage: ReplicaStorageIncarnationContext,
     pub process_session_id: ProcessSessionId,
     pub replication_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -654,6 +671,7 @@ impl PublicBuildInput {
         self.attempt == other.attempt
             && self.epoch == other.epoch
             && self.replica == other.replica
+            && self.target_storage == other.target_storage
             && self.process_session_id == other.process_session_id
             && self.replication_address == other.replication_address
             && self.history == other.history
@@ -812,6 +830,10 @@ impl PublicOperationProgram {
                     || build.replication_address.is_empty()
                 {
                     return Err("incomplete exact build identity");
+                }
+                build.target_storage.validate()?;
+                if build.target_storage.replica != build.replica {
+                    return Err("build target storage differs from target replica");
                 }
                 if public_v1 {
                     let history = build
@@ -1274,15 +1296,11 @@ impl ProcessSessionRenewalRequired {
         report: &PublicV1AgentReport,
     ) -> Result<(), &'static str> {
         self.validate()?;
+        report.validate()?;
         let replacement = self
             .replacement
             .as_ref()
             .ok_or("peer withdrawal has no replacement session")?;
-        report.history.validate()?;
-        report.storage_incarnation.validate()?;
-        report
-            .progress
-            .validate(report.role, report.read_status, report.write_status)?;
         if !report.identity.is_public_v1()
             || report.resource_uid != self.resource_uid
             || report.report_sequence == 0
@@ -2011,7 +2029,7 @@ pub enum CanonicalReplicaRebuildRequired {
     RemoteBuildTarget {
         reason: ReplicaRebuildReason,
         operation: CapturedPublicOperationIdentity,
-        build: PublicBuildAttemptReference,
+        build: Box<PublicBuildAttemptReference>,
     },
 }
 
@@ -2299,6 +2317,8 @@ pub struct PublicV1AgentReport {
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub progress: PublicProgress,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_location: Option<ServiceLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
     #[serde(default)]
     pub completed_operations: Vec<PublicV1OperationCompletion>,
@@ -2307,6 +2327,13 @@ pub struct PublicV1AgentReport {
 }
 
 impl PublicV1AgentReport {
+    fn is_access_closed_replacement_observation(&self) -> bool {
+        self.role == ReplicaRole::None
+            && self.read_status != AccessStatus::Granted
+            && self.write_status != AccessStatus::Granted
+            && self.data_loss_recovery.is_none()
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.identity.is_public_v1()
             || self.resource_uid.is_empty()
@@ -2353,8 +2380,11 @@ impl PublicV1AgentReport {
                         | PublicDataLossRecoveryStage::ConfigurationPending
                 )
             })
+            && !self.is_access_closed_replacement_observation()
         {
-            return Err("recovery progress requires nonterminal recovery authority");
+            return Err(
+                "recovery progress requires nonterminal recovery authority or an access-closed replacement observation",
+            );
         }
         let mut operations = std::collections::BTreeSet::new();
         for completion in &self.completed_operations {
@@ -2367,6 +2397,32 @@ impl PublicV1AgentReport {
             if !operations.insert(&completion.operation_id) {
                 return Err("public-v1 operation completion is incomplete or duplicated");
             }
+        }
+        if let Some(location) = &self.service_location
+            && (self.role != ReplicaRole::Primary
+                || self.write_status != AccessStatus::Granted
+                || location.preview != self.identity
+                || location.resource_uid != self.resource_uid
+                || location.replica != self.replica
+                || location.process_session_id != self.process_session_id
+                || location.operation_id.is_empty()
+                || location.revision == 0
+                || location.address.is_empty()
+                || !self.completed_operations.iter().any(|completion| {
+                    completion.operation_id == location.operation_id
+                        && completion.revision == location.revision
+                        && completion.process_session_id == location.process_session_id
+                        && matches!(
+                            completion.call_kind,
+                            PublicV1CallKind::InitialPrimary
+                                | PublicV1CallKind::FailoverPromotion
+                                | PublicV1CallKind::Role
+                                | PublicV1CallKind::Swap
+                        )
+                        && completion.result == PublicV1OperationResult::Succeeded
+                }))
+        {
+            return Err("public-v1 service location lacks exact role authority");
         }
         for extension in [
             self.extensions.history_recovery.as_ref(),
@@ -2477,7 +2533,7 @@ impl PublicV1AcceptedRebuildRequired {
                 provider_replica: None,
                 local_replica: None,
                 local_storage: None,
-                build: Some(build.clone()),
+                build: Some(build.as_ref().clone()),
             },
         }
     }
@@ -2848,6 +2904,7 @@ impl CanonicalEncoder {
         self.string(build.attempt.as_str());
         self.epoch(build.epoch);
         self.replica_identity(&build.replica);
+        self.storage_incarnation(&build.target_storage);
         self.string(build.process_session_id.as_str());
         self.string(&build.replication_address);
         self.option(build.history.as_ref(), |encoder, history| {

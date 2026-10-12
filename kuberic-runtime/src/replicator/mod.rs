@@ -943,6 +943,7 @@ impl ReplicatorInterfaces {
 #[derive(Clone)]
 pub struct ReplicatorFactoryContext {
     identity: ReplicaIdentity,
+    process_session_id: ProcessSessionId,
     access: Arc<dyn PartitionAccessView>,
     reservation: Option<ReplicatorCreationReservation>,
     pub(crate) default_dependencies: Option<DefaultReplicatorDependencies>,
@@ -953,11 +954,13 @@ impl ReplicatorFactoryContext {
     pub(crate) fn new(
         _token: RuntimeHostToken,
         identity: ReplicaIdentity,
+        process_session_id: ProcessSessionId,
         access: Arc<dyn PartitionAccessView>,
         default_dependencies: DefaultReplicatorDependencies,
     ) -> Self {
         Self {
             identity,
+            process_session_id,
             access,
             reservation: None,
             default_dependencies: Some(default_dependencies),
@@ -966,6 +969,13 @@ impl ReplicatorFactoryContext {
 
     pub fn identity(&self) -> Result<ReplicaIdentity> {
         Ok(self.identity.clone())
+    }
+
+    pub fn process_session_id(&self) -> Result<ProcessSessionId> {
+        if self.process_session_id.is_empty() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(self.process_session_id.clone())
     }
 
     pub async fn write_status(&self) -> Result<AccessStatus> {

@@ -1108,6 +1108,11 @@ authoritative.
 **Required conformance property:** Select one endpoint owner before binding;
 the public Replicator lifecycle must control its replication transport.
 
+Phase 5 now proves this property in the dormant strict custom fixture: its
+Replicator-owned endpoint exists only after `open` and is released by `close`
+or `abort`. PostgreSQL and the production agent still use externally owned
+listeners, so they remain inapplicable/negative Phase 7 evidence.
+
 ### KSF-11: Application Role-Change Addresses Are Discarded
 
 **Severity:** Medium
@@ -1125,6 +1130,12 @@ the return value is observationally dead.
 
 **Required conformance property:** Retain, clear and publish the returned
 address as part of exact role completion.
+
+Protocol 11 now carries the exact role address with operation, revision,
+epoch, replica and process-session authority. The controller normalization
+path accepts only the matching successful role completion, replaces it under
+newer authority and clears it when the role/access closes. Production protocol
+9 remains unchanged.
 
 ### KSF-12: Supersession Does Not Contain Arbitrary Public Callbacks
 
@@ -1239,11 +1250,19 @@ as V1 parity.
 
 The dormant protocol-11/schema-11 implementation now owns one executable
 catalog with exactly KSF-01 through KSF-16. The strict custom fixture and real
-PostgreSQL parent execute the shared catalog assertion. KSF-09, KSF-10 and
-KSF-16 intentionally remain negative eligibility guards that inventory the
-current managed attachment, agent-owned replication listener and legacy
-continuation stores. Their passing result keeps Phase 7 cutover ineligible; it
-does not claim that the replacement engine or replacement-only artifact exists.
+PostgreSQL scenarios execute row-keyed shared catalog assertions. KSF-09,
+KSF-10 and KSF-16 intentionally retain negative eligibility checks that
+inventory the current managed attachment, agent-owned production replication
+listener and legacy continuation stores. KSF-10 additionally proves the strict
+custom fixture's Replicator-owned endpoint lifecycle. Passing the negative
+checks keeps Phase 7 cutover ineligible; it does not claim that the replacement
+engine or replacement-only artifact exists.
+
+PostgreSQL does not claim KSF-02's complete data-loss outcome matrix, KSF-10's
+Replicator-owned endpoint lifecycle, KSF-11's application-owned
+service-address surface, or KSF-15's full replay matrix. Those properties
+remain strict-custom obligations and PostgreSQL asserts the absence of an
+applicable row mapping.
 
 ## Unimplemented or Deliberately Different Surface
 

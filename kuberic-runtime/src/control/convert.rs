@@ -17,7 +17,7 @@ use crate::protocol::public_operations::{
     PublicDataLossRecoveryStatus, PublicOperationPreviewIdentity, PublicOperationReplayDisposition,
     PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1CallKind,
     PublicV1ExtensionSlot, PublicV1Extensions, PublicV1OperationCompletion,
-    PublicV1OperationResult, ReplicaRebuildReason,
+    PublicV1OperationResult, ReplicaRebuildReason, ServiceLocation,
 };
 use crate::protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
@@ -280,6 +280,32 @@ pub fn normalize_public_v1_agent_status_report(
         .data_loss_recovery
         .map(public_v1_recovery_from_proto)
         .transpose()?;
+    let service_location = public
+        .service_location
+        .map(|location| {
+            Ok(ServiceLocation {
+                preview: PublicOperationPreviewIdentity {
+                    protocol_version: location.protocol_version,
+                    generation: location.generation,
+                },
+                resource_uid: ResourceUid::new(location.resource_uid),
+                operation_id: OperationId::new(location.operation_id),
+                replica: location
+                    .replica
+                    .ok_or(WireError::MissingField(
+                        "public_v1.service_location.replica",
+                    ))?
+                    .try_into()?,
+                process_session_id: ProcessSessionId::new(location.process_session_id),
+                epoch: location
+                    .epoch
+                    .ok_or(WireError::MissingField("public_v1.service_location.epoch"))?
+                    .into(),
+                revision: location.revision,
+                address: location.address,
+            })
+        })
+        .transpose()?;
     let report = PublicV1AgentReport {
         identity: PublicOperationPreviewIdentity {
             protocol_version: public.protocol_version,
@@ -299,6 +325,7 @@ pub fn normalize_public_v1_agent_status_report(
             first: public.first_progress,
             last: public.last_progress,
         },
+        service_location,
         data_loss_recovery,
         completed_operations,
         extensions,
@@ -352,6 +379,19 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
                 .data_loss_recovery
                 .as_ref()
                 .map(public_v1_recovery_to_proto),
+            service_location: report.service_location.as_ref().map(|location| {
+                proto::PublicV1ServiceLocation {
+                    protocol_version: location.preview.protocol_version,
+                    generation: location.preview.generation,
+                    resource_uid: location.resource_uid.as_str().to_string(),
+                    operation_id: location.operation_id.as_str().to_string(),
+                    replica: Some(location.replica.clone().into()),
+                    process_session_id: location.process_session_id.as_str().to_string(),
+                    epoch: Some(location.epoch.into()),
+                    revision: location.revision,
+                    address: location.address.clone(),
+                }
+            }),
         }),
         ..Default::default()
     }
@@ -895,6 +935,9 @@ fn build_attempt_from_proto(
                 "public_v1.rebuild.authorization.source",
             ))?
             .try_into()?,
+        source_storage: public_v1_storage_from_proto(value.source_storage.ok_or(
+            WireError::MissingField("public_v1.rebuild.authorization.source_storage"),
+        )?)?,
         source_session: ProcessSessionId::new(value.source_session),
         target: value
             .target
@@ -902,6 +945,9 @@ fn build_attempt_from_proto(
                 "public_v1.rebuild.authorization.target",
             ))?
             .try_into()?,
+        target_storage: public_v1_storage_from_proto(value.target_storage.ok_or(
+            WireError::MissingField("public_v1.rebuild.authorization.target_storage"),
+        )?)?,
         target_session: ProcessSessionId::new(value.target_session),
     };
     authorization
@@ -918,8 +964,10 @@ fn build_attempt_to_proto(
         epoch: Some(value.epoch.into()),
         build_id: value.build_id.as_str().to_string(),
         source: Some(value.source.clone().into()),
+        source_storage: Some(public_v1_storage_to_proto(&value.source_storage)),
         source_session: value.source_session.as_str().to_string(),
         target: Some(value.target.clone().into()),
+        target_storage: Some(public_v1_storage_to_proto(&value.target_storage)),
         target_session: value.target_session.as_str().to_string(),
     }
 }
@@ -975,11 +1023,11 @@ fn rebuild_from_proto(
             CanonicalReplicaRebuildRequired::RemoteBuildTarget {
                 reason,
                 operation,
-                build: build_attempt_from_proto(
+                build: Box::new(build_attempt_from_proto(
                     value
                         .build
                         .ok_or(WireError::MissingField("public_v1.rebuild.build"))?,
-                )?,
+                )?),
             }
         }
         proto::PublicV1RebuildKind::Unknown => {

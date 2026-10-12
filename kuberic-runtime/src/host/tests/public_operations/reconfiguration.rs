@@ -57,10 +57,21 @@ fn configuration_with_data_loss(
 fn build(attempt: &str) -> PublicBuildInput {
     let mut replica = replica_identity();
     replica.replica_id = ReplicaId::new(2);
+    let target_storage = crate::protocol::types::ReplicaStorageIncarnationContext {
+        replica: replica.clone(),
+        storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("target-pod"),
+            pvc_uid: PvcUid::new("target-pvc"),
+        },
+        storage_generation: crate::protocol::types::StorageGeneration::new(
+            "target-storage-generation",
+        ),
+    };
     PublicBuildInput {
         attempt: OperationId::new(attempt),
         epoch: Epoch::new(0, 1),
         replica,
+        target_storage,
         process_session_id: ProcessSessionId::new("target-session"),
         replication_address: "trace://target".into(),
         history: None,
@@ -113,6 +124,52 @@ fn configuration_with_target(epoch: i64) -> PublicConfiguration {
         )),
         current: ConfigurationDescriptor::new(Epoch::new(0, epoch), ReplicaId::new(1), members, 1),
         replicas: vec![replica],
+    }
+}
+
+fn configuration_with_previous_only_secondary(epoch: i64) -> PublicConfiguration {
+    let primary = replica_identity();
+    let mut previous_only = replica_identity();
+    previous_only.replica_id = ReplicaId::new(2);
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, epoch - 1),
+        primary.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: previous_only.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        1,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, epoch),
+        primary.replica_id,
+        vec![ConfigurationMember {
+            identity: primary,
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    PublicConfiguration {
+        current,
+        previous: Some(previous),
+        replicas: vec![
+            crate::protocol::public_operations::PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: previous_only,
+                replication_address: "trace://previous-only-secondary".into(),
+                process_session_id: ProcessSessionId::new("previous-only-session"),
+                role: ReplicaRole::ActiveSecondary,
+                current_progress: 0,
+                catch_up_capability: 0,
+                must_catchup: false,
+            },
+        ],
     }
 }
 
@@ -360,6 +417,246 @@ async fn public_v1_role_and_epoch_transitions_persist_current_authority() {
     let state = fixture.store.load_state().await.unwrap();
     assert_eq!(state.role, ReplicaRole::Primary);
     assert_eq!(state.highest_epoch, Epoch::new(0, 4));
+}
+
+#[tokio::test]
+async fn public_v1_role_address_runtime_to_controller_publish_replace_clear() {
+    use crate::protocol::public_operations::{PublicProgress, PublicProgressRole};
+    use kuberic_controller::evaluator::test_bridge::{
+        PublicOperationPreviewEvaluationConfig, normalize_public_v1_service_location,
+    };
+
+    let fixture = Fixture::public_v1().await;
+    *fixture.trace.service_address.lock().unwrap() = Some("https://primary-1".into());
+    let first = fixture
+        .run(
+            "public-v1-role-address-1",
+            3,
+            Program::Role {
+                epoch: Epoch::new(0, 3),
+                role: ReplicaRole::Primary,
+            },
+        )
+        .await;
+    let projection =
+        |role, write_status, report_sequence| public_lifecycle::PublicV1ReportProjection {
+            process_session_id: ProcessSessionId::new("session-1"),
+            report_sequence,
+            role,
+            read_status: write_status,
+            write_status,
+            progress: PublicProgress {
+                role: if role == ReplicaRole::None {
+                    PublicProgressRole::Recovery
+                } else {
+                    PublicProgressRole::Primary
+                },
+                first: 0,
+                last: 0,
+            },
+        };
+    let config = PublicOperationPreviewEvaluationConfig::new(
+        serde_json::from_slice(&serde_json::to_vec(&fixture.preview).unwrap()).unwrap(),
+        Default::default(),
+    );
+    let first_report = public_lifecycle::public_v1_report(
+        fixture.store.as_ref(),
+        &fixture.preview,
+        projection(ReplicaRole::Primary, AccessStatus::Granted, 1),
+    )
+    .await
+    .unwrap();
+    let first_authority =
+        serde_json::from_slice(&serde_json::to_vec(&first.intent).unwrap()).unwrap();
+    let first_controller_report =
+        serde_json::from_slice(&serde_json::to_vec(&first_report).unwrap()).unwrap();
+    let first_location = normalize_public_v1_service_location(
+        &config,
+        &first_authority,
+        Some(&first_controller_report),
+    )
+    .unwrap()
+    .expect("first public-v1 role address");
+    assert_eq!(first_location.address, "https://primary-1");
+    assert_eq!(
+        crate::control::normalize_public_v1_agent_status_report(
+            crate::control::public_v1_agent_status_to_proto(&first_report)
+        )
+        .unwrap(),
+        first_report
+    );
+
+    *fixture.trace.service_address.lock().unwrap() = Some("https://primary-2".into());
+    let second = fixture
+        .run(
+            "public-v1-role-address-2",
+            4,
+            Program::Role {
+                epoch: Epoch::new(0, 4),
+                role: ReplicaRole::Primary,
+            },
+        )
+        .await;
+    let second_report = public_lifecycle::public_v1_report(
+        fixture.store.as_ref(),
+        &fixture.preview,
+        projection(ReplicaRole::Primary, AccessStatus::Granted, 2),
+    )
+    .await
+    .unwrap();
+    let second_authority =
+        serde_json::from_slice(&serde_json::to_vec(&second.intent).unwrap()).unwrap();
+    let second_controller_report =
+        serde_json::from_slice(&serde_json::to_vec(&second_report).unwrap()).unwrap();
+    assert_eq!(
+        normalize_public_v1_service_location(
+            &config,
+            &second_authority,
+            Some(&second_controller_report),
+        )
+        .unwrap()
+        .unwrap()
+        .address,
+        "https://primary-2"
+    );
+    assert!(
+        normalize_public_v1_service_location(
+            &config,
+            &first_authority,
+            Some(&second_controller_report),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let closed = fixture
+        .run(
+            "public-v1-role-address-clear",
+            5,
+            Program::Role {
+                epoch: Epoch::new(0, 5),
+                role: ReplicaRole::None,
+            },
+        )
+        .await;
+    let closed_report = public_lifecycle::public_v1_report(
+        fixture.store.as_ref(),
+        &fixture.preview,
+        projection(ReplicaRole::None, AccessStatus::NotPrimary, 3),
+    )
+    .await
+    .unwrap();
+    assert!(closed_report.service_location.is_none());
+    let closed_authority =
+        serde_json::from_slice(&serde_json::to_vec(&closed.intent).unwrap()).unwrap();
+    let closed_controller_report =
+        serde_json::from_slice(&serde_json::to_vec(&closed_report).unwrap()).unwrap();
+    assert!(
+        normalize_public_v1_service_location(
+            &config,
+            &closed_authority,
+            Some(&closed_controller_report),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    *fixture.trace.service_address.lock().unwrap() = Some(String::new());
+    fixture
+        .run(
+            "public-v1-empty-role-address",
+            6,
+            Program::Role {
+                epoch: Epoch::new(0, 6),
+                role: ReplicaRole::Primary,
+            },
+        )
+        .await;
+    let empty_report = public_lifecycle::public_v1_report(
+        fixture.store.as_ref(),
+        &fixture.preview,
+        projection(ReplicaRole::Primary, AccessStatus::Granted, 4),
+    )
+    .await
+    .unwrap();
+    assert!(empty_report.service_location.is_none());
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_lifecycle_owns_replicator_endpoint_until_close_and_abort() {
+    async fn opened_address(fixture: &Fixture) -> SocketAddr {
+        fixture
+            .store
+            .public_operation_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.intent.operation_id == OperationId::new("open"))
+            .and_then(|record| {
+                record.lifecycle.outcomes.into_iter().find_map(|outcome| {
+                    if let PublicInstructionOutcome::Endpoint(address) = outcome {
+                        Some(address.parse().unwrap())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .expect("public open recorded its Replicator endpoint")
+    }
+
+    let close_fixture = Fixture::public_v1().await;
+    let close_address = opened_address(&close_fixture).await;
+    tokio::net::TcpStream::connect(close_address).await.unwrap();
+    assert_eq!(
+        TcpListener::bind(close_address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    close_fixture.run("endpoint-close", 3, Program::Close).await;
+    TcpListener::bind(close_address).unwrap();
+    close_fixture.owner.shutdown().await.unwrap();
+
+    let abort_fixture = Fixture::public_v1().await;
+    let abort_address = opened_address(&abort_fixture).await;
+    tokio::net::TcpStream::connect(abort_address).await.unwrap();
+    assert_eq!(
+        TcpListener::bind(abort_address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    abort_fixture.run("endpoint-abort", 3, Program::Abort).await;
+    TcpListener::bind(abort_address).unwrap();
+    abort_fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_v1_lifecycle_projects_previous_only_secondary_only_into_pc() {
+    let fixture = Fixture::public_v1().await;
+    let configuration = configuration_with_previous_only_secondary(3);
+    fixture
+        .run(
+            "previous-only-secondary",
+            3,
+            Program::Configuration(configuration.clone()),
+        )
+        .await;
+
+    {
+        let projected = fixture.trace.catch_up_configurations.lock().unwrap();
+        assert_eq!(projected.len(), 1);
+        let (current, previous) = &projected[0];
+        assert_eq!(current.configuration, configuration.current);
+        assert!(current.replicas.is_empty());
+        assert_eq!(
+            previous.configuration,
+            configuration.previous.clone().unwrap()
+        );
+        assert_eq!(previous.replicas.len(), 1);
+        assert_eq!(
+            previous.replicas[0].identity,
+            configuration.replicas[0].identity
+        );
+    }
+    fixture.owner.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1581,6 +1878,82 @@ async fn public_v1_history_admission_gates_all_data_loss_outcomes() {
 }
 
 #[tokio::test]
+async fn public_v1_rebuild_owner_enriches_role_failure_before_data_loss() {
+    use crate::protocol::public_operations::{
+        LocalProviderRebuildRequired, ProviderReplicaIdentity, ReplicaRebuildReason,
+        ReplicaRebuildRequired,
+    };
+
+    let fixture = Fixture::public_v1().await;
+    *fixture.trace.role_rebuild.lock().unwrap() = Some(ReplicaRebuildRequired::LocalProvider(
+        LocalProviderRebuildRequired {
+            reason: ReplicaRebuildReason::IncompatibleRetainedHistory,
+            provider: ProviderReplicaIdentity {
+                replica: replica_identity(),
+            },
+        },
+    ));
+    let configuration = configuration(3);
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica_identity(),
+        epoch: configuration.current.epoch,
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: configuration.current,
+        previous: configuration.previous,
+        replicas: Vec::new(),
+        data_loss_recovery: None,
+    };
+    let mut operation_intent = intent(
+        &fixture.preview,
+        "public-v1-role-rebuild",
+        3,
+        PublicOperationClass::Authority,
+        "session-1",
+    );
+    operation_intent.input_digest = lifecycle.digest();
+    operation_intent.lifecycle = Some(lifecycle);
+
+    let operation = fixture.launch(operation_intent.clone(), None).await;
+    let record = tokio::time::timeout(Duration::from_secs(2), operation.wait_for_terminal())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.stage, PublicOperationStage::Completed);
+    assert!(
+        matches!(
+            record.disposition,
+            Some(PublicOperationDisposition::Failed(ref message))
+                if message.contains("local provider requires replica rebuild")
+        ),
+        "{record:?}"
+    );
+    let canonical = record
+        .lifecycle
+        .outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            PublicInstructionOutcome::RebuildRequired(failure) => Some(failure.as_ref()),
+            _ => None,
+        })
+        .expect("typed role rebuild outcome");
+    let crate::protocol::public_operations::CanonicalReplicaRebuildRequired::LocalProvider {
+        operation,
+        local_replica,
+        local_storage,
+        ..
+    } = canonical
+    else {
+        panic!("role failure changed rebuild variant");
+    };
+    assert_eq!(operation.operation_id, operation_intent.operation_id);
+    assert_eq!(operation.revision, operation_intent.revision);
+    assert_eq!(local_replica, &replica_identity());
+    assert_eq!(local_storage, &PvcUid::new("pvc-1"));
+    fixture.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
     use crate::protocol::public_operations::{
         DataLossReplay, LocalProviderRebuildRequired, ProviderReplicaIdentity,
@@ -1817,10 +2190,21 @@ async fn public_v1_remote_rebuild_attempt_is_exact_and_fail_closed() {
     target.replica_id = ReplicaId::new(2);
     let operation_id = OperationId::new("public-v1-remote-build");
     let target_session = ProcessSessionId::new("target-session");
+    let target_storage = crate::protocol::types::ReplicaStorageIncarnationContext {
+        replica: target.clone(),
+        storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("target-pod"),
+            pvc_uid: PvcUid::new("target-pvc"),
+        },
+        storage_generation: crate::protocol::types::StorageGeneration::new(
+            "target-storage-generation",
+        ),
+    };
     let input = PublicBuildInput {
         attempt: operation_id.clone(),
         epoch: Epoch::new(0, 9),
         replica: target.clone(),
+        target_storage: target_storage.clone(),
         process_session_id: target_session.clone(),
         replication_address: "trace://target".into(),
         history: Some(public_v1_history(&preview).1),
@@ -1841,6 +2225,11 @@ async fn public_v1_remote_rebuild_attempt_is_exact_and_fail_closed() {
     let state = store.load_state().await.unwrap();
     let canonical = public_lifecycle::enrich_remote_rebuild(
         &state.identity,
+        state
+            .public_operation_preview
+            .as_ref()
+            .and_then(|preview| preview.storage_incarnation.as_ref())
+            .unwrap(),
         &operation,
         &input,
         ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
@@ -1856,13 +2245,27 @@ async fn public_v1_remote_rebuild_attempt_is_exact_and_fail_closed() {
         panic!("expected remote build target");
     };
     assert_eq!(build.source, state.identity.local_identity);
+    assert_eq!(
+        build.source_storage,
+        state
+            .public_operation_preview
+            .as_ref()
+            .and_then(|preview| preview.storage_incarnation.clone())
+            .unwrap()
+    );
     assert_eq!(build.source_session, operation.process_session_id);
     assert_eq!(build.target, target);
+    assert_eq!(build.target_storage, target_storage);
     assert_eq!(build.target_session, target_session);
 
     assert!(
         public_lifecycle::enrich_remote_rebuild(
             &state.identity,
+            state
+                .public_operation_preview
+                .as_ref()
+                .and_then(|preview| preview.storage_incarnation.as_ref())
+                .unwrap(),
             &operation,
             &input,
             ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
@@ -1877,6 +2280,11 @@ async fn public_v1_remote_rebuild_attempt_is_exact_and_fail_closed() {
     assert!(
         public_lifecycle::enrich_remote_rebuild(
             &state.identity,
+            state
+                .public_operation_preview
+                .as_ref()
+                .and_then(|preview| preview.storage_incarnation.as_ref())
+                .unwrap(),
             &operation,
             &input,
             ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
@@ -1905,6 +2313,7 @@ async fn public_v1_remote_rebuild_attempt_is_exact_and_fail_closed() {
             first: 0,
             last: 0,
         },
+        service_location: None,
         data_loss_recovery: None,
         completed_operations: vec![PublicV1OperationCompletion {
             operation_id: operation.operation_id,

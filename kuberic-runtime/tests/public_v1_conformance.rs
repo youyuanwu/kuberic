@@ -3,6 +3,15 @@ use std::path::PathBuf;
 #[test]
 fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
     kuberic_runtime::testing::assert_public_v1_conformance_subject("strict-custom");
+    assert_eq!(
+        kuberic_runtime::testing::public_v1_postgres_conformance_scenarios(),
+        vec![
+            "public_v1_postgres_build_cancellation_and_retirement",
+            "public_v1_postgres_contained_close",
+            "public_v1_postgres_data_loss_history_and_replay",
+            "public_v1_postgres_primary_lifecycle_and_joint_configuration",
+        ]
+    );
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let replicator = std::fs::read_to_string(manifest.join("src/replicator/mod.rs")).unwrap();

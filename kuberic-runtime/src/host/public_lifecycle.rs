@@ -244,21 +244,45 @@ async fn execute(
             .await?;
         let outcome = match instruction {
             ReplicatorPrimary => {
-                callbacks
-                    .replicator
-                    .change_role(input.epoch, ReplicaRole::Primary)
-                    .await?;
+                local_callback(
+                    callbacks
+                        .replicator
+                        .change_role(input.epoch, ReplicaRole::Primary)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             Epoch => {
-                callbacks.replicator.update_epoch(input.epoch).await?;
+                local_callback(
+                    callbacks.replicator.update_epoch(input.epoch).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             ApplicationPrimary => {
-                let role = callbacks
-                    .application
-                    .change_role(ReplicaRole::Primary)
-                    .await?;
+                let role = local_callback(
+                    callbacks
+                        .application
+                        .change_role(ReplicaRole::Primary)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::ApplicationRole(role.service_address)
             }
             DataLoss => {
@@ -297,36 +321,84 @@ async fn execute(
                 };
                 PublicInstructionOutcome::DataLoss(outcome)
             }
-            Progress => {
-                PublicInstructionOutcome::Progress(callbacks.replicator.current_progress().await?)
-            }
+            Progress => PublicInstructionOutcome::Progress(
+                local_callback(
+                    callbacks.replicator.current_progress().await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?,
+            ),
             CurrentConfiguration => {
                 let configuration = input.configuration();
-                program::install_current(&callbacks, &configuration).await?;
+                local_callback(
+                    program::install_current(&callbacks, &configuration).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             CatchUpConfiguration => {
                 let configuration = input.configuration();
-                program::install(&callbacks, &configuration).await?;
+                local_callback(
+                    program::install(&callbacks, &configuration).await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             CatchUp => {
                 if index == start && start > 0 {
                     let configuration = input.configuration();
-                    program::install(&callbacks, &configuration).await?;
-                }
-                callbacks
-                    .primary
-                    .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
+                    local_callback(
+                        program::install(&callbacks, &configuration).await,
+                        store.as_ref(),
+                        &intent,
+                        index,
+                        instruction,
+                        input.epoch,
+                    )
                     .await?;
+                }
+                local_callback(
+                    callbacks
+                        .primary
+                        .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             HistoryAdmission => PublicInstructionOutcome::Done,
             Access => {
-                callbacks
-                    .application
-                    .change_role(ReplicaRole::Primary)
-                    .await?;
+                local_callback(
+                    callbacks
+                        .application
+                        .change_role(ReplicaRole::Primary)
+                        .await,
+                    store.as_ref(),
+                    &intent,
+                    index,
+                    instruction,
+                    input.epoch,
+                )
+                .await?;
                 PublicInstructionOutcome::Done
             }
             _ => unreachable!("program instruction in role recipe"),
@@ -371,13 +443,23 @@ pub(super) fn enrich_local_rebuild(
     input: &PublicLifecycleInput,
     failure: ReplicaRebuildRequired,
 ) -> Result<CanonicalReplicaRebuildRequired> {
+    enrich_local_rebuild_at_epoch(identity, intent, input.epoch, &input.replica, failure)
+}
+
+fn enrich_local_rebuild_at_epoch(
+    identity: &crate::host::state::StorageIdentity,
+    intent: &PublicOperationIntent,
+    epoch: crate::protocol::types::Epoch,
+    local_replica: &crate::protocol::types::ReplicaIdentity,
+    failure: ReplicaRebuildRequired,
+) -> Result<CanonicalReplicaRebuildRequired> {
     let ReplicaRebuildRequired::LocalProvider(failure) = failure else {
         return Err(HostError::CommandRejected(
             "remote failure cannot be enriched as a local provider failure".into(),
         ));
     };
-    if failure.provider.replica != input.replica
-        || identity.local_identity != input.replica
+    if failure.provider.replica != *local_replica
+        || identity.local_identity != *local_replica
         || identity.resource_uid.is_empty()
     {
         return Err(HostError::StaleEffectCompletion(
@@ -387,14 +469,57 @@ pub(super) fn enrich_local_rebuild(
     Ok(CanonicalReplicaRebuildRequired::LocalProvider {
         reason: failure.reason,
         provider: failure.provider,
-        operation: captured_operation(identity, intent, input.epoch),
+        operation: captured_operation(identity, intent, epoch),
         local_replica: identity.local_identity.clone(),
         local_storage: identity.pvc_uid.clone(),
     })
 }
 
+async fn local_callback<T>(
+    result: crate::Result<T>,
+    store: &dyn AgentStore,
+    intent: &PublicOperationIntent,
+    index: usize,
+    instruction: PublicInstruction,
+    epoch: crate::protocol::types::Epoch,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
+            if matches!(failure.as_ref(), ReplicaRebuildRequired::LocalProvider(_)) =>
+        {
+            let state = store.load_state().await?;
+            let canonical = enrich_local_rebuild_at_epoch(
+                &state.identity,
+                intent,
+                epoch,
+                &state.identity.local_identity,
+                *failure,
+            )?;
+            store
+                .public_instruction(
+                    intent,
+                    index,
+                    instruction,
+                    Some(PublicInstructionOutcome::RebuildRequired(Box::new(
+                        canonical,
+                    ))),
+                )
+                .await?;
+            Err(HostError::CommandRejected(
+                "local provider requires replica rebuild".into(),
+            ))
+        }
+        Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => Err(HostError::CommandRejected(
+            "remote build failure substituted for local-provider failure".into(),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(super) fn enrich_remote_rebuild(
     identity: &crate::host::state::StorageIdentity,
+    source_storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
     intent: &PublicOperationIntent,
     build: &PublicBuildInput,
     failure: ReplicaRebuildRequired,
@@ -408,6 +533,7 @@ pub(super) fn enrich_remote_rebuild(
     if failure.epoch != build.epoch
         || failure.target != build.replica
         || failure.target_session != build.process_session_id
+        || source_storage.replica != identity.local_identity
     {
         return Err(HostError::StaleEffectCompletion(
             "remote rebuild failure differs from the captured build attempt".into(),
@@ -418,14 +544,16 @@ pub(super) fn enrich_remote_rebuild(
         epoch: build.epoch,
         build_id: intent.operation_id.clone(),
         source: identity.local_identity.clone(),
+        source_storage: source_storage.clone(),
         source_session: intent.process_session_id.clone(),
         target: build.replica.clone(),
+        target_storage: build.target_storage.clone(),
         target_session: build.process_session_id.clone(),
     };
     Ok(CanonicalReplicaRebuildRequired::RemoteBuildTarget {
         reason: failure.reason,
         operation: captured_operation(identity, intent, build.epoch),
-        build,
+        build: Box::new(build),
     })
 }
 
@@ -492,7 +620,7 @@ pub(crate) async fn report(
     if report.write_access {
         report.service_location = record.lifecycle.outcomes.iter().rev().find_map(|outcome| {
             if let PublicInstructionOutcome::ApplicationRole(Some(address)) = outcome {
-                Some(ServiceLocation {
+                (!address.is_empty()).then(|| ServiceLocation {
                     preview: identity.clone(),
                     resource_uid: state.identity.resource_uid.clone(),
                     operation_id: record.intent.operation_id.clone(),
@@ -543,6 +671,18 @@ fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKin
             "schema-11 completion lacks a public call kind".into(),
         )),
     }
+}
+
+fn public_v1_role_epoch(intent: &PublicOperationIntent) -> Option<crate::protocol::types::Epoch> {
+    intent
+        .lifecycle
+        .as_ref()
+        .map(|lifecycle| lifecycle.epoch)
+        .or(match intent.program.as_ref() {
+            Some(PublicOperationProgram::Role { epoch, .. })
+            | Some(PublicOperationProgram::Swap { epoch, .. }) => Some(*epoch),
+            _ => None,
+        })
 }
 
 #[allow(clippy::type_complexity)]
@@ -704,6 +844,42 @@ pub(crate) async fn public_v1_report(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let service_location = if projection.role == ReplicaRole::Primary
+        && projection.write_status == AccessStatus::Granted
+    {
+        preview
+            .operations
+            .values()
+            .filter(|record| {
+                record.stage == PublicOperationStage::Completed
+                    && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                    && record.intent.process_session_id == projection.process_session_id
+                    && public_v1_role_epoch(&record.intent).is_some()
+            })
+            .max_by_key(|record| record.intent.revision)
+            .and_then(|record| {
+                let address = record.lifecycle.outcomes.iter().rev().find_map(|outcome| {
+                    if let PublicInstructionOutcome::ApplicationRole(address) = outcome {
+                        address.clone().filter(|address| !address.is_empty())
+                    } else {
+                        None
+                    }
+                })?;
+                Some(ServiceLocation {
+                    preview: identity.clone(),
+                    resource_uid: state.identity.resource_uid.clone(),
+                    operation_id: record.intent.operation_id.clone(),
+                    replica: state.identity.local_identity.clone(),
+                    process_session_id: projection.process_session_id.clone(),
+                    epoch: public_v1_role_epoch(&record.intent)
+                        .expect("role operation epoch was filtered"),
+                    revision: record.intent.revision,
+                    address,
+                })
+            })
+    } else {
+        None
+    };
     let report = PublicV1AgentReport {
         identity: identity.clone(),
         resource_uid: state.identity.resource_uid,
@@ -716,6 +892,7 @@ pub(crate) async fn public_v1_report(
         history,
         storage_incarnation,
         progress: projection.progress,
+        service_location,
         data_loss_recovery,
         completed_operations,
         extensions: Default::default(),

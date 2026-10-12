@@ -16,8 +16,8 @@ pub use super::public_lifecycle::{
     PreviewTransition, ServiceLocationProjection, evaluate_service_location, plan_public_lifecycle,
 };
 pub use super::public_v1_evidence::{
-    PublicV1CompletionRequirement, PublicV1EvidenceConsumer, PublicV1EvidencePlan,
-    plan_public_v1_evidence,
+    PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
+    PublicV1EvidencePlan, PublicV1ResourceAuthority, plan_public_v1_evidence,
 };
 pub use super::public_v1_history::{
     PublicV1ElectionStatus, PublicV1HistoryPlan,
@@ -42,12 +42,17 @@ pub use super::public_v1_session_renewal::{
     plan_session_renewal as plan_public_v1_session_renewal,
 };
 pub use crate::cluster_api::{
-    PreviewServiceApi, PublicV1EvidenceApi, PublicV1EvidenceEffect, PublicV1EvidenceState,
-    PublicV1HistoryApi, PublicV1SessionRenewalApi, preview_service_matches, preview_service_update,
+    PreviewServiceApi, PublicV1EvidenceApi, PublicV1EvidenceEffect, PublicV1EvidenceResource,
+    PublicV1EvidenceState, PublicV1HistoryApi, PublicV1ResourceDisposition, PublicV1ResourceProof,
+    PublicV1SessionRenewalApi, preview_service_matches, preview_service_update,
 };
 pub use crate::executor::{
     execute_preview_service_location, execute_public_v1_evidence, execute_public_v1_history,
     execute_public_v1_session_renewal,
+};
+pub use crate::normalize::normalize_public_v1_service_location;
+pub use crate::public_v1_reconciliation::{
+    PublicV1ReconciliationOutcome, reconcile_public_v1_consumer,
 };
 pub use k8s_openapi::api::core::v1::Service as PreviewWriteService;
 

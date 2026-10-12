@@ -88,10 +88,13 @@ nextest-postgres-smoke-inventory:
     TMPDIR="$scratch" scripts/assert_nextest_selection.sh \
       --label postgres-smoke \
       --require-binary postgres-replicated \
-      --require-test tests::public_v1_postgres_conformance_oracle -- \
+      --require-test tests::public_v1_postgres_primary_lifecycle_and_joint_configuration \
+      --require-test tests::public_v1_postgres_data_loss_history_and_replay \
+      --require-test tests::public_v1_postgres_build_cancellation_and_retirement \
+      --require-test tests::public_v1_postgres_contained_close -- \
       cargo nextest list -p postgres-replicated --all-features \
         --profile postgres \
-        -E 'test(tests::public_v1_postgres_conformance_oracle)'
+        -E 'test(/^(tests::public_v1_postgres_primary_lifecycle_and_joint_configuration|tests::public_v1_postgres_data_loss_history_and_replay|tests::public_v1_postgres_build_cancellation_and_retirement|tests::public_v1_postgres_contained_close)$/)'
 
 # Run a representative real-PostgreSQL smoke selection for routine local checks.
 nextest-postgres-smoke: nextest-postgres-smoke-inventory
@@ -105,7 +108,19 @@ nextest-postgres-smoke: nextest-postgres-smoke-inventory
     scratch="${TMPDIR:-$PWD/target/paw-tmp}"
     mkdir -p "$scratch"
     TMPDIR="$scratch" scripts/install_nextest.sh
-    filter='test(/^(tests::public_v1_postgres_conformance_oracle|tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|tests::three_public_custom_hosts_reopen_same_roots_with_fresh_sessions|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
+    public_v1_tmp="${KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR:-}"
+    if [[ -z "$public_v1_tmp" ]]; then
+      public_v1_tmp="/tmp"
+      if [[ -d /dev/shm && -w /dev/shm ]] \
+        && [[ "$(df --output=avail -B1 /dev/shm | tail -1)" -ge 2147483648 ]]; then
+        public_v1_tmp="/dev/shm"
+      fi
+    fi
+    mkdir -p "$public_v1_tmp"
+    public_v1_filter='test(/^(tests::public_v1_postgres_primary_lifecycle_and_joint_configuration|tests::public_v1_postgres_data_loss_history_and_replay|tests::public_v1_postgres_build_cancellation_and_retirement|tests::public_v1_postgres_contained_close)$/)'
+    KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$public_v1_tmp" TMPDIR="$scratch" cargo nextest run -j 1 \
+      -p postgres-replicated --all-features --profile postgres -E "$public_v1_filter"
+    filter='test(/^(tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|tests::three_public_custom_hosts_reopen_same_roots_with_fresh_sessions|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
     TMPDIR="$scratch" cargo nextest run \
       --workspace --all-features --profile postgres -E "$filter"
 

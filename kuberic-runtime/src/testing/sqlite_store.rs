@@ -12,7 +12,8 @@ use crate::protocol::public_operations::{
     PublicV1SessionRenewalStatus, StatePersistence,
 };
 use crate::protocol::types::{
-    AccessStatus, BuildAuthority, OperationId, ProcessSessionId, ReplicaRole,
+    AccessStatus, BuildAuthority, ConfigurationDescriptor, Epoch, OperationId,
+    ProcessSessionEndpoint, ProcessSessionId, ReplicaRole,
 };
 use crate::protocol::types::{
     HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
@@ -90,12 +91,37 @@ pub struct PublicV1BuildSnapshot {
     pub history: HistoryContext,
     pub epoch: crate::protocol::types::Epoch,
     pub source: crate::protocol::types::ReplicaIdentity,
+    pub source_storage: ReplicaStorageIncarnationContext,
     pub source_session: ProcessSessionId,
     pub target: crate::protocol::types::ReplicaIdentity,
+    pub target_storage: ReplicaStorageIncarnationContext,
     pub target_session: ProcessSessionId,
     pub target_address: String,
     pub retirement: PublicV1BuildRetirementSnapshot,
     pub result: Option<PublicV1OperationResult>,
+}
+
+#[async_trait::async_trait]
+pub trait PublicV1SessionRenewalExecutor: Send + Sync {
+    async fn close_access_and_ingress(&self) -> crate::Result<()>;
+
+    async fn update_epoch_barrier(
+        &self,
+        survivor: &ProcessSessionEndpoint,
+        epoch: Epoch,
+    ) -> crate::Result<()>;
+
+    async fn replay_replacement_role(
+        &self,
+        process_session_id: &ProcessSessionId,
+        epoch: Epoch,
+        role: ReplicaRole,
+    ) -> crate::Result<()>;
+
+    async fn install_fresh_configuration(
+        &self,
+        configuration: &ConfigurationDescriptor,
+    ) -> crate::Result<()>;
 }
 
 impl SqliteStore {
@@ -250,10 +276,11 @@ impl SqliteStore {
                 }
                 Ok(())
             }
-            PublicV1HistoryCommand::SessionRenewal(command) => self
-                .apply_public_v1_session_renewal_command(command)
-                .await
-                .map(|_| ()),
+            PublicV1HistoryCommand::SessionRenewal(_) => {
+                Err(crate::host::HostError::CommandRejected(
+                    "session-renewal commands require an attached public executor".into(),
+                ))
+            }
         }
     }
 
@@ -439,6 +466,119 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub async fn mark_public_v1_build_failed_pending(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+        detail: &str,
+    ) -> crate::host::Result<()> {
+        let record = self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| record.intent == *intent)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected("public-v1 build is not journaled".into())
+            })?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                record.stage,
+                crate::host::state::PublicOperationStage::Running,
+                None,
+            )
+            .await?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                crate::host::state::PublicOperationStage::Running,
+                crate::host::state::PublicOperationStage::ContainmentPending,
+                Some(crate::host::state::PublicOperationDisposition::Failed(
+                    detail.into(),
+                )),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_public_v1_build_rebuild_cancelled(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+        rebuild: crate::protocol::public_operations::CanonicalReplicaRebuildRequired,
+    ) -> crate::host::Result<()> {
+        self.mark_public_v1_build_rebuild_pending(intent, rebuild)
+            .await?;
+        self.cancel_public_v1_build_rebuild_pending(intent).await
+    }
+
+    pub async fn cancel_public_v1_build_rebuild_pending(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+    ) -> crate::host::Result<()> {
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                crate::host::state::PublicOperationStage::Running,
+                crate::host::state::PublicOperationStage::ContainmentPending,
+                Some(crate::host::state::PublicOperationDisposition::Cancelled),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_public_v1_build_rebuild_pending(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+        rebuild: crate::protocol::public_operations::CanonicalReplicaRebuildRequired,
+    ) -> crate::host::Result<()> {
+        let record = self
+            .inner
+            .public_operation_records()
+            .await?
+            .into_iter()
+            .find(|record| record.intent == *intent)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected("public-v1 build is not journaled".into())
+            })?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                record.stage,
+                crate::host::state::PublicOperationStage::Running,
+                None,
+            )
+            .await?;
+        self.inner
+            .public_instruction(
+                intent,
+                0,
+                crate::host::state::PublicInstruction::Build,
+                None,
+            )
+            .await?;
+        self.inner
+            .public_instruction(
+                intent,
+                0,
+                crate::host::state::PublicInstruction::Build,
+                Some(
+                    crate::host::state::PublicInstructionOutcome::RebuildRequired(Box::new(
+                        rebuild,
+                    )),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn public_v1_operation_snapshot(
         &self,
         operation_id: &OperationId,
@@ -515,8 +655,10 @@ impl SqliteStore {
                 history: record.history,
                 epoch: record.epoch,
                 source: record.source,
+                source_storage: record.source_storage,
                 source_session: record.source_session,
                 target: record.target,
+                target_storage: record.target_storage,
                 target_session: record.target_session,
                 target_address: record.target_address,
                 retirement: match record.retirement {
@@ -538,6 +680,7 @@ impl SqliteStore {
     pub async fn apply_public_v1_session_renewal_command(
         &self,
         command: &PublicV1SessionRenewalCommand,
+        executor: &dyn PublicV1SessionRenewalExecutor,
     ) -> crate::host::Result<PublicV1SessionRenewalStatus> {
         command
             .validate()
@@ -558,6 +701,29 @@ impl SqliteStore {
             return Err(crate::host::HostError::StaleEffectCompletion(
                 "public-v1 session renewal command changed accepted state".into(),
             ));
+        }
+        match command {
+            PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. } => {
+                executor.close_access_and_ingress().await?;
+            }
+            PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+                survivor, epoch, ..
+            } => {
+                executor.update_epoch_barrier(survivor, *epoch).await?;
+            }
+            PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                process_session_id,
+                epoch,
+                role,
+                ..
+            } => {
+                executor
+                    .replay_replacement_role(process_session_id, *epoch, *role)
+                    .await?;
+            }
+            PublicV1SessionRenewalCommand::InstallFreshConfiguration { configuration, .. } => {
+                executor.install_fresh_configuration(configuration).await?;
+            }
         }
         let next = match command {
             PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. } => accepted.close_access(),

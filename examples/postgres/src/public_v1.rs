@@ -24,14 +24,31 @@ struct LifecycleContext {
     current_configuration_id: Option<ConfigurationId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalProcessBinding {
+    identity: ReplicaIdentity,
+    process_session_id: ProcessSessionId,
+    replication_address: String,
+}
+
 #[derive(Clone)]
 struct LifecycleFence {
+    local: Arc<LocalProcessBinding>,
     current: Arc<std::sync::Mutex<LifecycleContext>>,
 }
 
 impl LifecycleFence {
-    fn new(identity: ReplicaIdentity) -> Self {
+    fn new(
+        identity: ReplicaIdentity,
+        process_session_id: ProcessSessionId,
+        replication_address: String,
+    ) -> Self {
         Self {
+            local: Arc::new(LocalProcessBinding {
+                identity: identity.clone(),
+                process_session_id,
+                replication_address,
+            }),
             current: Arc::new(std::sync::Mutex::new(LifecycleContext {
                 identity,
                 role: ReplicaRole::None,
@@ -52,7 +69,7 @@ impl LifecycleFence {
         Ok(context.clone())
     }
 
-    fn validate_binding(&self, binding: &TransportBinding) -> Result<LifecycleContext> {
+    fn validate_process_binding(&self, binding: &TransportBinding) -> Result<LifecycleContext> {
         let context = self.context()?;
         let local = if binding.source() == &context.identity {
             binding.source_endpoint()
@@ -61,9 +78,24 @@ impl LifecycleFence {
         } else {
             return Err(RuntimeError::AuthorityNotAdmitted);
         };
-        if local.role != context.role || binding.epoch() != context.epoch {
+        if local.replica != self.local.identity
+            || local.process_session_id != self.local.process_session_id
+            || local.replication_address != self.local.replication_address
+            || local.role != context.role
+            || binding.epoch() != context.epoch
+            || binding.source() == binding.target()
+            || binding.source_endpoint().process_session_id.is_empty()
+            || binding.target_endpoint().process_session_id.is_empty()
+            || binding.source_address().is_empty()
+            || binding.target_address().is_empty()
+        {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
+        Ok(context)
+    }
+
+    fn validate_binding(&self, binding: &TransportBinding) -> Result<LifecycleContext> {
+        let context = self.validate_process_binding(binding)?;
         if let TransportBinding::Peer(peer) = binding
             && (Some(&peer.current_configuration_id) != context.current_configuration_id.as_ref()
                 || peer.previous_configuration_id != context.previous_configuration_id)
@@ -71,6 +103,48 @@ impl LifecycleFence {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         Ok(context)
+    }
+
+    fn admit_peer(&self, binding: &PeerBinding) -> Result<LifecycleContext> {
+        let transport = TransportBinding::Peer(binding.clone());
+        let mut context = self.current.lock().map_err(application_error)?;
+        let local = if transport.target() == &context.identity {
+            transport.target_endpoint()
+        } else {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        };
+        if local.replica != self.local.identity
+            || local.process_session_id != self.local.process_session_id
+            || local.replication_address != self.local.replication_address
+            || local.role != context.role
+            || context.role != ReplicaRole::ActiveSecondary
+            || binding.epoch != context.epoch
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let transition_admitted = match (
+            context.current_configuration_id.as_ref(),
+            context.previous_configuration_id.as_ref(),
+        ) {
+            (None, None) => true,
+            (Some(current), None) => {
+                &binding.current_configuration_id == current
+                    || binding.previous_configuration_id.as_ref() == Some(current)
+            }
+            (Some(current), Some(previous)) => {
+                (&binding.current_configuration_id == current
+                    && (binding.previous_configuration_id.as_ref() == Some(previous)
+                        || binding.previous_configuration_id.is_none()))
+                    || binding.previous_configuration_id.as_ref() == Some(current)
+            }
+            (None, Some(_)) => false,
+        };
+        if !transition_admitted {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        context.previous_configuration_id = binding.previous_configuration_id.clone();
+        context.current_configuration_id = Some(binding.current_configuration_id.clone());
+        Ok(context.clone())
     }
 }
 
@@ -168,9 +242,13 @@ pub(super) struct PublicPg {
 }
 
 impl PublicPg {
-    fn new(identity: ReplicaIdentity) -> Self {
+    fn new(
+        identity: ReplicaIdentity,
+        process_session_id: ProcessSessionId,
+        replication_address: String,
+    ) -> Self {
         Self {
-            fence: LifecycleFence::new(identity),
+            fence: LifecycleFence::new(identity, process_session_id, replication_address),
             state: Mutex::new(PublicState {
                 opened: false,
                 role: ReplicaRole::None,
@@ -269,6 +347,7 @@ impl PgReplicator {
         self: &Arc<Self>,
         settings: ReplicatorSettings,
         identity: ReplicaIdentity,
+        process_session_id: ProcessSessionId,
     ) -> Result<()> {
         if !settings.public_v1 {
             if self.is_public_v1() {
@@ -282,7 +361,11 @@ impl PgReplicator {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         self.public_v1
-            .set(PublicPg::new(identity))
+            .set(PublicPg::new(
+                identity,
+                process_session_id,
+                settings.replication_address,
+            ))
             .map_err(|_| application_error("PostgreSQL construction is immutable"))?;
         self.start_public_owner();
         Ok(())
@@ -366,7 +449,7 @@ impl PgReplicator {
             biased;
             _ = self.cancellation.cancelled() => Err(RuntimeError::Closed),
             _ = cancellation.cancelled() => Err(RuntimeError::OperationCancelled),
-            result = tokio::time::timeout(Duration::from_secs(180), work) =>
+            result = tokio::time::timeout(Duration::from_secs(240), work) =>
                 result.unwrap_or(Err(RuntimeError::OperationCancelled)),
         };
         if result.is_err() {
@@ -772,7 +855,7 @@ impl PgReplicator {
     }
 
     fn public_process_session(&self) -> ProcessSessionId {
-        ProcessSessionId::new(format!("postgres-{}", self.instance.generation_id()))
+        self.public_owner().fence.local.process_session_id.clone()
     }
 
     fn public_peer_binding(
@@ -1241,6 +1324,16 @@ impl PgReplicator {
         binding: &TransportBinding,
     ) -> Result<(NativeCredential, PgLineage, i64)> {
         self.public_owner().fence.validate_binding(binding)?;
+        self.public_source_for_admission(binding).await
+    }
+
+    async fn public_source_for_admission(
+        &self,
+        binding: &TransportBinding,
+    ) -> Result<(NativeCredential, PgLineage, i64)> {
+        self.public_owner()
+            .fence
+            .validate_process_binding(binding)?;
         match self
             .public_rpc(binding.source_address(), &Request::Inspect(binding.clone()))
             .await?
@@ -1251,7 +1344,9 @@ impl PgReplicator {
                 lineage,
                 boundary,
             } if &observed == binding && boundary >= 0 => {
-                self.public_owner().fence.validate_binding(binding)?;
+                self.public_owner()
+                    .fence
+                    .validate_process_binding(binding)?;
                 lineage.validate().map_err(application_error)?;
                 credential.conninfo()?;
                 Ok((credential, lineage, boundary))
@@ -1421,27 +1516,21 @@ impl PgReplicator {
 
     async fn public_receive_peer(&self, binding: PeerBinding) -> Result<()> {
         let transport = TransportBinding::Peer(binding.clone());
-        let context = self.public_owner().fence.context()?;
+        let context = self
+            .public_owner()
+            .fence
+            .validate_process_binding(&transport)?;
         if &context.identity != transport.target()
             || context.role != ReplicaRole::ActiveSecondary
             || context.epoch != binding.epoch
-            || context
-                .current_configuration_id
-                .as_ref()
-                .is_some_and(|current| current != &binding.current_configuration_id)
-            || context.previous_configuration_id.is_none()
-                && binding.previous_configuration_id.is_some()
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        let context = self.public_owner().fence.update(|context| {
-            context.previous_configuration_id = binding.previous_configuration_id.clone();
-            context.current_configuration_id = Some(binding.current_configuration_id.clone());
-        })?;
+        let (credential, lineage, _) = self.public_source_for_admission(&transport).await?;
+        let context = self.public_owner().fence.admit_peer(&binding)?;
         self.public_owner().fence.validate_binding(&transport)?;
         self.public_owner().cancel();
         self.public_owned(async {
-            let (credential, lineage, _) = self.public_source(&transport).await?;
             let mut state = self.public_owner().state.lock().await;
             if state.role != ReplicaRole::ActiveSecondary
                 || state.role_epoch != context.epoch
@@ -1467,6 +1556,7 @@ impl PgReplicator {
                 .await
                 .map_err(application_error)?;
             self.public_owner().fence.validate_binding(&transport)?;
+            self.public_source(&transport).await?;
             self.public_start().await?;
             let snapshot = self.public_snapshot_and_persist().await?;
             if snapshot.evidence.as_ref().is_none_or(|evidence| {

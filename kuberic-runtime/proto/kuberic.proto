@@ -174,6 +174,19 @@ message PublicV1AgentStatus {
   PublicV1HistoryContext history = 17;
   PublicV1StorageIncarnation storage_incarnation = 18;
   PublicV1DataLossRecoveryStatus data_loss_recovery = 19;
+  PublicV1ServiceLocation service_location = 20;
+}
+
+message PublicV1ServiceLocation {
+  uint32 protocol_version = 1;
+  uint64 generation = 2;
+  string resource_uid = 3;
+  string operation_id = 4;
+  ReplicaIdentity replica = 5;
+  string process_session_id = 6;
+  Epoch epoch = 7;
+  uint64 revision = 8;
+  string address = 9;
 }
 
 message PublicV1HistoryContext {
@@ -310,6 +323,8 @@ message PublicV1BuildAttemptReference {
   reserved 8;
   string target_session = 9;
   reserved 10;
+  PublicV1StorageIncarnation source_storage = 11;
+  PublicV1StorageIncarnation target_storage = 12;
 }
 
 message PublicV1ReplicaRebuildRequired {

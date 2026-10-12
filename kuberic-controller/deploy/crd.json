@@ -3092,6 +3092,64 @@
                                     "sourceSession": {
                                       "type": "string"
                                     },
+                                    "sourceStorage": {
+                                      "properties": {
+                                        "replica": {
+                                          "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                          "properties": {
+                                            "agentGeneration": {
+                                              "type": "string"
+                                            },
+                                            "instanceId": {
+                                              "type": "string"
+                                            },
+                                            "replicaId": {
+                                              "format": "int64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "agentGeneration",
+                                            "instanceId",
+                                            "replicaId"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storage": {
+                                          "properties": {
+                                            "identity": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "kind": {
+                                              "type": "string"
+                                            },
+                                            "podUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "pvcUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "kind"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storageGeneration": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "replica",
+                                        "storage",
+                                        "storageGeneration"
+                                      ],
+                                      "type": "object"
+                                    },
                                     "target": {
                                       "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
                                       "properties": {
@@ -3116,6 +3174,64 @@
                                     },
                                     "targetSession": {
                                       "type": "string"
+                                    },
+                                    "targetStorage": {
+                                      "properties": {
+                                        "replica": {
+                                          "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                          "properties": {
+                                            "agentGeneration": {
+                                              "type": "string"
+                                            },
+                                            "instanceId": {
+                                              "type": "string"
+                                            },
+                                            "replicaId": {
+                                              "format": "int64",
+                                              "minimum": 1.0,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "agentGeneration",
+                                            "instanceId",
+                                            "replicaId"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storage": {
+                                          "properties": {
+                                            "identity": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "kind": {
+                                              "type": "string"
+                                            },
+                                            "podUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            },
+                                            "pvcUid": {
+                                              "nullable": true,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "kind"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "storageGeneration": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "replica",
+                                        "storage",
+                                        "storageGeneration"
+                                      ],
+                                      "type": "object"
                                     }
                                   },
                                   "required": [
@@ -3124,8 +3240,10 @@
                                     "resourceUid",
                                     "source",
                                     "sourceSession",
+                                    "sourceStorage",
                                     "target",
-                                    "targetSession"
+                                    "targetSession",
+                                    "targetStorage"
                                   ],
                                   "type": "object"
                                 },

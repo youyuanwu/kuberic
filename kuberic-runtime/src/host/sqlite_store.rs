@@ -35,16 +35,14 @@ use crate::host::Result;
 use crate::host::command::is_access_only_configuration;
 #[cfg(any(test, feature = "testing"))]
 use crate::host::public_build_store::{PublicV1BuildRecord, PublicV1BuildRetirement};
+#[cfg(any(test, feature = "testing"))]
+use crate::host::state::PublicOperationContainment;
 use crate::host::state::{
     AgentState, CoordinatorStage, DeactivationState, EffectStage,
     PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION, PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PendingEffect,
-    PublicOperationPreviewState, ReconfigurationRecord, RetainedCommandResult, RetainedResult,
-    SCHEMA_VERSION, StorageIdentity,
-};
-#[cfg(any(test, feature = "testing"))]
-use crate::host::state::{
-    PublicOperationContainment, PublicOperationDisposition, PublicOperationRecord,
-    PublicOperationStage,
+    PublicInstructionOutcome, PublicOperationDisposition, PublicOperationPreviewState,
+    PublicOperationRecord, PublicOperationStage, ReconfigurationRecord, RetainedCommandResult,
+    RetainedResult, SCHEMA_VERSION, StorageIdentity,
 };
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
 #[cfg(any(test, feature = "testing"))]
@@ -228,13 +226,12 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
         };
         if operation.intent.revision != build_record.admission_revision
             || operation.accepted_history.as_ref() != Some(&build_record.history)
-            || operation
-                .accepted_storage
-                .as_ref()
-                .is_none_or(|storage| storage.replica != build_record.source)
+            || operation.accepted_storage.as_ref() != Some(&build_record.source_storage)
             || build.attempt != build_record.build_id
+            || build.epoch != build_record.epoch
             || build.history.as_ref() != Some(&build_record.history)
             || build.replica != build_record.target
+            || build.target_storage != build_record.target_storage
             || build.process_session_id != build_record.target_session
             || build.replication_address != build_record.target_address
             || operation.intent.process_session_id != build_record.source_session
@@ -243,8 +240,57 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                 "public-v1 build record differs from its accepted intent".into(),
             ));
         }
+        let expected_result = public_v1_build_result(operation);
+        if build_record.result != expected_result
+            || (operation.stage == PublicOperationStage::Completed && build_record.result.is_none())
+        {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 build record terminal result differs from its operation".into(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn public_v1_build_result(
+    operation: &PublicOperationRecord,
+) -> Option<crate::protocol::public_operations::PublicV1OperationResult> {
+    if let Some(PublicInstructionOutcome::RebuildRequired(rebuild)) = operation
+        .lifecycle
+        .outcomes
+        .iter()
+        .find(|outcome| matches!(outcome, PublicInstructionOutcome::RebuildRequired(_)))
+    {
+        return Some(
+            crate::protocol::public_operations::PublicV1OperationResult::RebuildRequired(
+                rebuild.clone(),
+            ),
+        );
+    }
+    operation
+        .disposition
+        .as_ref()
+        .map(|disposition| match disposition {
+            PublicOperationDisposition::Succeeded => {
+                crate::protocol::public_operations::PublicV1OperationResult::Succeeded
+            }
+            PublicOperationDisposition::Failed(message) => {
+                crate::protocol::public_operations::PublicV1OperationResult::Failed(message.clone())
+            }
+            PublicOperationDisposition::Ambiguous(message) => {
+                crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                    message.clone(),
+                )
+            }
+            PublicOperationDisposition::Cancelled => {
+                crate::protocol::public_operations::PublicV1OperationResult::Cancelled
+            }
+            PublicOperationDisposition::Attached(owner) => {
+                crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(format!(
+                    "attached to {owner}"
+                ))
+            }
+        })
 }
 
 pub(crate) struct SqliteStore {
@@ -1982,6 +2028,15 @@ impl AgentStore for SqliteStore {
             }
             match &intent.program {
                 Some(PublicOperationProgram::Build(build)) => {
+                    let source_storage = if intent.preview.is_public_v1() {
+                        Some(preview.storage_incarnation.clone().ok_or_else(|| {
+                            crate::host::HostError::CommandRejected(
+                                "public-v1 build lacks source storage incarnation".into(),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
                     if preview.active_builds.contains_key(&build.replica.replica_id)
                         || preview.operations.values().filter(|record| {
                             preview.current_topology_operation.as_ref().map_or_else(
@@ -2056,8 +2111,11 @@ impl AgentStore for SqliteStore {
                             })?,
                             epoch: build.epoch,
                             source: local_identity.clone(),
+                            source_storage: source_storage
+                                .expect("public-v1 source storage validated"),
                             source_session: intent.process_session_id.clone(),
                             target: build.replica.clone(),
+                            target_storage: build.target_storage.clone(),
                             target_session: build.process_session_id.clone(),
                             target_address: build.replication_address.clone(),
                             retirement: PublicV1BuildRetirement::Retain,
@@ -2667,43 +2725,21 @@ impl AgentStore for SqliteStore {
                     Some(crate::protocol::public_operations::PublicOperationProgram::Build(_))
                 )
             {
-                match result.disposition.as_ref() {
-                    Some(PublicOperationDisposition::Succeeded) => {
-                        build_record.result = Some(
-                            crate::protocol::public_operations::PublicV1OperationResult::Succeeded,
-                        );
-                    }
-                    Some(PublicOperationDisposition::Failed(message)) => {
-                        build_record.result = Some(
-                            crate::protocol::public_operations::PublicV1OperationResult::Failed(
-                                message.clone(),
-                            ),
-                        );
-                        build_record.retirement = PublicV1BuildRetirement::Required;
-                    }
-                    Some(PublicOperationDisposition::Ambiguous(message)) => {
-                        build_record.result = Some(
-                            crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
-                                message.clone(),
-                            ),
-                        );
-                        build_record.retirement = PublicV1BuildRetirement::Required;
-                    }
-                    Some(PublicOperationDisposition::Cancelled) => {
-                        build_record.result = Some(
-                            crate::protocol::public_operations::PublicV1OperationResult::Cancelled,
-                        );
-                        build_record.retirement = PublicV1BuildRetirement::Required;
-                    }
-                    Some(PublicOperationDisposition::Attached(owner)) => {
-                        build_record.result = Some(
-                            crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
-                                format!("attached to {owner}"),
-                            ),
-                        );
-                        build_record.retirement = PublicV1BuildRetirement::Required;
-                    }
-                    None => {}
+                build_record.result = public_v1_build_result(&result);
+                if matches!(
+                    build_record.result,
+                    Some(
+                        crate::protocol::public_operations::PublicV1OperationResult::Failed(_)
+                            | crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
+                                _
+                            )
+                            | crate::protocol::public_operations::PublicV1OperationResult::Cancelled
+                            | crate::protocol::public_operations::PublicV1OperationResult::RebuildRequired(
+                                _
+                            )
+                    )
+                ) {
+                    build_record.retirement = PublicV1BuildRetirement::Required;
                 }
                 build_record.validate().map_err(|message| {
                     crate::host::HostError::DurableEffectConflict(message.into())
@@ -2979,7 +3015,24 @@ impl AgentStore for SqliteStore {
                             ),
                         ) => true,
                         (
-                            PublicInstruction::DataLoss | PublicInstruction::Build,
+                            PublicInstruction::ReplicatorRole
+                            | PublicInstruction::ApplicationRole
+                            | PublicInstruction::ProgramEpoch
+                            | PublicInstruction::Configuration
+                            | PublicInstruction::StartingConfiguration
+                            | PublicInstruction::RefreshedConfiguration
+                            | PublicInstruction::FirstCatchUp
+                            | PublicInstruction::SecondCatchUp
+                            | PublicInstruction::ReplicatorPrimary
+                            | PublicInstruction::Epoch
+                            | PublicInstruction::ApplicationPrimary
+                            | PublicInstruction::DataLoss
+                            | PublicInstruction::Progress
+                            | PublicInstruction::CurrentConfiguration
+                            | PublicInstruction::CatchUpConfiguration
+                            | PublicInstruction::CatchUp
+                            | PublicInstruction::Access
+                            | PublicInstruction::Build,
                             PublicInstructionOutcome::RebuildRequired(_),
                         ) => true,
                         (
@@ -3207,6 +3260,7 @@ impl AgentStore for SqliteStore {
                             preview.build_records.get_mut(&build.attempt)
                         {
                             if build_record.target != build.replica
+                                || build_record.target_storage != build.target_storage
                                 || build_record.target_session != build.process_session_id
                             {
                                 return Err(crate::host::HostError::StaleEffectCompletion(
@@ -3218,6 +3272,34 @@ impl AgentStore for SqliteStore {
                                 crate::host::HostError::DurableEffectConflict(message.into())
                             })?;
                         }
+                    }
+                    if intent.preview.is_public_v1()
+                        && matches!(
+                            intent.program,
+                            Some(
+                                crate::protocol::public_operations::PublicOperationProgram::Build(
+                                    _
+                                )
+                            )
+                        )
+                        && let PublicInstructionOutcome::RebuildRequired(rebuild) = &outcome
+                    {
+                        let build_record = preview
+                            .build_records
+                            .get_mut(&intent.operation_id)
+                            .ok_or_else(|| {
+                                crate::host::HostError::Corrupt(
+                                    "public-v1 rebuild outcome lacks its build record".into(),
+                                )
+                            })?;
+                        build_record.result = Some(
+                            crate::protocol::public_operations::PublicV1OperationResult::
+                                RebuildRequired(rebuild.clone()),
+                        );
+                        build_record.retirement = PublicV1BuildRetirement::Required;
+                        build_record.validate().map_err(|message| {
+                            crate::host::HostError::DurableEffectConflict(message.into())
+                        })?;
                     }
                     record.lifecycle.outcomes.push(outcome);
                     record.lifecycle.in_flight = None;
@@ -3398,17 +3480,28 @@ impl AgentStore for SqliteStore {
                 state.secondary_removal_evidence = None;
                 state.prepared_switchover = None;
                 preview.current_operation = None;
-                for build_record in preview.build_records.values_mut() {
+                for (operation_id, build_record) in &mut preview.build_records {
                     if build_record.result.is_none() {
+                        let detail = "predecessor process exited during public-v1 build";
                         build_record.result = Some(
                             crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
-                                "predecessor process exited during public-v1 build".into(),
+                                detail.into(),
                             ),
                         );
                         build_record.retirement = PublicV1BuildRetirement::Required;
                         build_record.validate().map_err(|message| {
                             crate::host::HostError::DurableEffectConflict(message.into())
                         })?;
+                        let operation =
+                            preview.operations.get_mut(operation_id).ok_or_else(|| {
+                                crate::host::HostError::Corrupt(
+                                    "public-v1 restart build lacks its operation".into(),
+                                )
+                            })?;
+                        operation.stage = PublicOperationStage::ContainmentPending;
+                        operation.containment = PublicOperationContainment::Pending;
+                        operation.disposition =
+                            Some(PublicOperationDisposition::Ambiguous(detail.into()));
                     }
                 }
                 preview.active_builds.clear();

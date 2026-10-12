@@ -30,8 +30,8 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,323 tests: 1,076 ordinary, one
-build-only, 207 directly runnable PostgreSQL tests, 19 live KinD tests covering
+The consolidated validator accounts for 1,338 tests: 1,086 ordinary, one
+build-only, 212 directly runnable PostgreSQL tests, 19 live KinD tests covering
 12 scenario identities, one DEX live test and 19 mapped parent-driven
 subprocess helpers.
 Use its generated counts as the inventory evolves.
@@ -206,18 +206,23 @@ just nextest-postgres 1/4
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
-The inventory target proves the exact
-`tests::public_v1_postgres_conformance_oracle` parent is selected before any
-PostgreSQL process starts. The smoke target depends on it and covers the real
-Public V1 oracle plus representative lifecycle paths. CI-derived nextest
-profiles terminate an individual test at five minutes. Run the full target
-only when explicitly requested or in the dedicated CI validation that owns
-its resource budget.
+The inventory target proves all four exact PostgreSQL Public V1 scenario
+tests are selected before any PostgreSQL process starts. The scenarios cover
+primary lifecycle/joint configuration, build cancellation/retirement,
+data-loss history/replay and contained close, and each records the applicable
+KSF rows. The smoke target depends on that inventory and covers representative
+lifecycle paths. It runs the four Public V1 scenarios package-only before a
+separate seven-test workspace pass so compilation I/O cannot consume their
+runtime budget. Their data roots use `KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR`, or
+the smoke recipe selects sufficiently sized `/dev/shm` before falling back to
+`/tmp`. CI-derived nextest profiles terminate an individual test at five
+minutes. Run the full target only when explicitly requested or in the dedicated
+CI validation that owns its resource budget.
 
 The matrix covers physical build/rewind, fencing, failover, switchover,
 replacement, scaling, quorum restoration, read-only secondaries and
 application/agent restart. The profile has one execution slot. Its complete
-209-test inventory is 207 directly partitioned tests plus two ignored
+214-test inventory is 212 directly partitioned tests plus two ignored
 subprocess helpers executed by mapped parent tests. PostgreSQL has no
 application-specific KinD test.
 

@@ -313,14 +313,27 @@ cargo test -p postgres-replicated --all-features --test reconfiguration --test a
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
-The smoke inventory requires the exact
-`tests::public_v1_postgres_conformance_oracle` parent before PostgreSQL starts.
-The smoke target is the routine local gate and exercises that oracle plus
-representative real PostgreSQL bootstrap/fencing, native build, failover,
-planned switchover, scaling and explicit failure handling. CI-derived nextest
-profiles terminate an individual test at five minutes. The full target is
-reserved for the dedicated resource-owning validation path or explicit
-requests.
+The smoke inventory requires four exact Public V1 scenario tests before
+PostgreSQL starts: primary lifecycle/joint configuration, build
+cancellation/retirement, data-loss history/replay and contained close. Each
+scenario records its applicable KSF rows and remains independently bounded
+below the five-minute nextest limit. The smoke recipe runs those four tests in
+a package-only pass before compiling/running the seven broader workspace smoke
+tests, preventing workspace build I/O from consuming a scenario's runtime
+budget. Public V1 fixtures use
+`KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set; the smoke recipe otherwise uses
+`/dev/shm` when at least 2 GiB is available and falls back to `/tmp`. The
+second pass exercises representative real PostgreSQL
+bootstrap/fencing, native build, failover, planned switchover, scaling and
+explicit failure handling. The full target is reserved for the dedicated
+resource-owning validation path or explicit requests.
+
+PostgreSQL deliberately does not claim KSF-02's complete
+false/true/error/ambiguity matrix, KSF-10's Replicator-owned endpoint lifetime,
+KSF-11's application-owned service-address publication, or KSF-15's full
+callback replay matrix. Those rows remain executable in the strict custom
+fixture; the PostgreSQL scenarios assert their non-applicability rather than
+treating scenario execution as proof.
 
 Tests discover common PostgreSQL installation directories (16, 17, 15 in that
 order on Debian-style hosts), then `pg_config --bindir`. `--pg-bin` configures the

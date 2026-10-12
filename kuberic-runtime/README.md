@@ -53,9 +53,13 @@ The dormant Public V1 contract uses protocol 11 and a fresh exact schema-11
 store while production remains on protocol 9/schema 6. It exposes public
 history, role-correct progress, exact build/peer attempt identity and durable
 public callback completion without managed-engine ACK, quorum, copy cursor or
-build-boundary evidence. Its test-only conformance catalog contains exactly
-KSF-01 through KSF-16. Negative KSF-09, KSF-10 and KSF-16 guards keep the
-current legacy-bearing artifact ineligible for production cutover.
+build-boundary evidence. Build authority binds both source and target storage
+incarnations, and protocol-11 role evidence carries the exact application
+service location for fenced publication and clearing. Its test-only
+conformance catalog contains exactly KSF-01 through KSF-16. Negative KSF-09,
+KSF-10 and KSF-16 checks keep the current legacy-bearing artifact ineligible
+for production cutover while dormant custom/PostgreSQL fixtures exercise the
+replacement endpoint lifecycle.
 
 Successful public `PrimaryReplicator` catch-up, build, and ordinary removal
 completion is also the built-in engine's durable completion contract. The

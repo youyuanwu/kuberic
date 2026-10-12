@@ -50,7 +50,7 @@ impl Fixture {
         .await
         .unwrap();
         let opening = host.clone();
-        owner
+        let opening = owner
             .run_root(
                 intent(
                     &preview,
@@ -74,6 +74,11 @@ impl Fixture {
             )
             .await
             .unwrap();
+        assert_eq!(
+            opening.disposition,
+            Some(PublicOperationDisposition::Succeeded),
+            "{opening:?}"
+        );
         trace.events.lock().unwrap().clear();
         trace.arguments.lock().unwrap().clear();
         Self {
