@@ -438,10 +438,7 @@ impl ReplicaInformation {
     }
 
     pub fn validate_public_progress(&self) -> Result<()> {
-        crate::protocol::public_operations::validate_progress_value(self.current_progress)
-            .map_err(|message| RuntimeError::Application(message.into()))?;
-        crate::protocol::public_operations::validate_progress_value(self.catch_up_capability)
-            .map_err(|message| RuntimeError::Application(message.into()))?;
+        self.validate_progress_values()?;
         if self.role == ReplicaRole::IdleSecondary
             && (self.current_progress != INVALID_LSN
                 || self.catch_up_capability != INVALID_LSN
@@ -451,6 +448,14 @@ impl ReplicaInformation {
                 "idle public build target must use INVALID_LSN".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_progress_values(&self) -> Result<()> {
+        crate::protocol::public_operations::validate_progress_value(self.current_progress)
+            .map_err(|message| RuntimeError::Application(message.into()))?;
+        crate::protocol::public_operations::validate_progress_value(self.catch_up_capability)
+            .map_err(|message| RuntimeError::Application(message.into()))?;
         Ok(())
     }
 }
@@ -1295,7 +1300,7 @@ impl PrimaryReplicator for DefaultReplicator {
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
         for replica in current.replicas.iter().chain(&previous.replicas) {
-            replica.validate_public_progress()?;
+            replica.validate_progress_values()?;
         }
         self.engine
             .configure_replicas(current.configuration, Some(previous.configuration))
@@ -1311,7 +1316,7 @@ impl PrimaryReplicator for DefaultReplicator {
         current: ReplicaSetConfiguration,
     ) -> Result<()> {
         for replica in &current.replicas {
-            replica.validate_public_progress()?;
+            replica.validate_progress_values()?;
         }
         self.engine
             .configure_replicas(current.configuration, None)
@@ -1319,7 +1324,7 @@ impl PrimaryReplicator for DefaultReplicator {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        replica.validate_public_progress()?;
+        replica.validate_progress_values()?;
         self.engine.wait_for_build(replica).await
     }
 

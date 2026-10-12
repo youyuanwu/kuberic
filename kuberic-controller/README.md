@@ -20,6 +20,13 @@ replacement provisioning, status projection, and optimistic-concurrency
 acceptance. It does not own replica-local effect sequencing, replication
 quorum credit, application durability, or a workflow phase journal.
 
+A feature-gated dormant Public V1 evaluator path consumes protocol-11 public
+history, role-correct progress and exact durable callback completion. It
+rejects stale revisions, predecessor sessions, substituted storage or
+configuration identity and proof-free Kubernetes scaffolding. Production
+evaluation remains protocol 9; the Phase 6 replacement engine and Phase 7
+cutover artifact do not exist yet.
+
 Planned switchover uses `spec.switchover.requestId` and
 `spec.switchover.targetReplicaId` (a committed logical secondary ID). Acceptance
 freezes exact identities in `status.transition.switchover`; the active request

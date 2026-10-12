@@ -3,6 +3,7 @@
 set -euo pipefail
 
 label="nextest selection"
+required_binaries=()
 required_tests=()
 required_tokens=()
 
@@ -14,6 +15,10 @@ while (($#)); do
       ;;
     --require-test)
       required_tests+=("${2:?missing value for --require-test}")
+      shift 2
+      ;;
+    --require-binary)
+      required_binaries+=("${2:?missing value for --require-binary}")
       shift 2
       ;;
     --require-token)
@@ -45,6 +50,22 @@ if [[ ! -s "$output" ]]; then
   echo "$label: nextest selection is empty" >&2
   exit 1
 fi
+
+for required in "${required_binaries[@]}"; do
+  if ! awk -v required="$required" '
+    {
+      binary_name = $1
+      count = split(binary_name, components, "::")
+      if (binary_name == required || components[count] == required) {
+        found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$output"; then
+    echo "$label: required binary is not selected: $required" >&2
+    exit 1
+  fi
+done
 
 for required in "${required_tests[@]}"; do
   if ! awk -v required="$required" '

@@ -30,9 +30,10 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,266 tests: 1,028 ordinary, one build-only,
-205 directly runnable PostgreSQL tests, 12 live KinD scenarios, one DEX live test
-and 19 mapped parent-driven subprocess helpers.
+The consolidated validator accounts for 1,323 tests: 1,076 ordinary, one
+build-only, 207 directly runnable PostgreSQL tests, 19 live KinD tests covering
+12 scenario identities, one DEX live test and 19 mapped parent-driven
+subprocess helpers.
 Use its generated counts as the inventory evolves.
 
 The ignored runtime `public_api_privacy` binary belongs only to the `build-only`
@@ -91,25 +92,48 @@ ownership/replay, controller service projection, fault planning and the real
 preview child-process boundary:
 
 ```bash
+KUBERIC_WORKSPACE_TESTS=1 scripts/assert_nextest_selection.sh \
+  --label public-v1-phase4-runtime \
+  --require-binary public_v1_evidence \
+  --require-binary public_v1_conformance \
+  --require-test public_v1_evidence_report_is_structurally_public_only \
+  --require-test public_v1_schema11_rejects_prior_preview_stores \
+  --require-test public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16 -- \
+  cargo nextest list -p kuberic-runtime --all-features --profile ordinary \
+    -E 'binary(public_v1_evidence) or binary(public_v1_conformance) or test(public_operations) or test(public_operation_replay) or test(process_supervisor)'
 KUBERIC_WORKSPACE_TESTS=1 cargo nextest run -j 1 --profile ordinary \
   -p kuberic-runtime --all-features \
-  -E 'test(public_operations) or test(public_operation_replay) or test(process_supervisor)'
+  -E 'binary(public_v1_evidence) or binary(public_v1_conformance) or test(public_operations) or test(public_operation_replay) or test(process_supervisor)'
+scripts/assert_nextest_selection.sh \
+  --label public-v1-phase4-controller \
+  --require-binary public_v1_evidence \
+  --require-binary public_operation_faults \
+  --require-binary public_operation_role_address \
+  --require-binary protocol --require-binary model --require-binary controller -- \
+  cargo nextest list -p kuberic-controller --all-features --profile ordinary \
+    -E 'binary(public_v1_evidence) or binary(public_operation_faults) or binary(public_operation_role_address) or binary(protocol) or binary(model) or binary(controller)'
 cargo nextest run -j 1 --profile ordinary \
   -p kuberic-controller --all-features \
-  -E 'binary(public_operation_faults) or binary(public_operation_role_address)'
+  -E 'binary(public_v1_evidence) or binary(public_operation_faults) or binary(public_operation_role_address) or binary(protocol) or binary(model) or binary(controller)'
 ```
 
 The supervisor cases use a true child executable and same data root. They cut
 after durable restart acceptance, predecessor containment and successor start;
-unproven containment must prevent re-exec. This path remains repository-only
-and does not activate preview commands in production controller or gRPC
-construction.
+unproven containment must prevent re-exec. The Public V1 conformance binary
+owns exactly sixteen KSF rows and preserves Phase 6/7 obligations through
+negative KSF-09, KSF-10 and KSF-16 eligibility guards. This path remains
+repository-only and does not activate preview commands in production
+controller or gRPC construction.
 
 ## Level-Triggered Live Validation
 
 Live scenarios require Docker, KinD, kubectl, Just, the pinned Rust toolchain,
 the pinned nextest binary and `protoc`. The `kind` profile and `kind-live`
-group select exactly the 12 ignored live scenarios and use one execution slot.
+group select 19 ignored live tests covering 12 scenario identities and use one
+execution slot. The `scale-down` identity is split into two bounded tests, and
+the scale-down and scale-up adversarial identities are each split into four
+fault campaigns, so no executable combines more than five minutes of live
+work.
 Use a nondefault cluster, repository-local kubeconfig and exact matching
 context:
 
@@ -174,6 +198,7 @@ The `just` PostgreSQL recipes detect WSL and skip the tier because its kernel
 does not provide the pidfd reaping semantics required by the process supervisor.
 
 ```bash
+just nextest-postgres-smoke-inventory
 just nextest-postgres-smoke
 just nextest-postgres
 # Same deterministic four-way hash partition used by an isolated CI runner:
@@ -181,14 +206,18 @@ just nextest-postgres 1/4
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
-The smoke target is intended for routine local checks and covers representative
-real lifecycle paths. Run the full target only when explicitly requested or in
-the dedicated CI validation that owns its resource budget.
+The inventory target proves the exact
+`tests::public_v1_postgres_conformance_oracle` parent is selected before any
+PostgreSQL process starts. The smoke target depends on it and covers the real
+Public V1 oracle plus representative lifecycle paths. CI-derived nextest
+profiles terminate an individual test at five minutes. Run the full target
+only when explicitly requested or in the dedicated CI validation that owns
+its resource budget.
 
 The matrix covers physical build/rewind, fencing, failover, switchover,
 replacement, scaling, quorum restoration, read-only secondaries and
 application/agent restart. The profile has one execution slot. Its complete
-207-test inventory is 205 directly partitioned tests plus two ignored
+209-test inventory is 207 directly partitioned tests plus two ignored
 subprocess helpers executed by mapped parent tests. PostgreSQL has no
 application-specific KinD test.
 

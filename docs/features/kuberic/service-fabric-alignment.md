@@ -844,7 +844,11 @@ sets.
 consumed by the Phase 4 orchestrator, runtime and controller before the
 replacement engine exists.
 
-Planned work:
+**Status:** delivered as a dormant protocol-11/schema-11 contract. Production
+remains on protocol 9/schema 6; Phase 6 replacement-engine and Phase 7 cutover
+obligations remain prospective.
+
+Delivered work:
 
 - add the public configuration data needed to identify `must_catchup` without
   changing the protected `Replicator` or `PrimaryReplicator` method sets;
@@ -916,7 +920,7 @@ Planned work:
   disposition matrix, adding cases without deferring ownership or activation
   gates.
 
-Controller deliverables:
+Delivered controller work:
 
 - protocol and CRD/status schemas carry protocol generation,
   `HistoryContext`, typed `DataLossRecovery`, process/incarnation identity,
@@ -932,7 +936,7 @@ Controller deliverables:
   switchover, scale, build, data loss, replacement, delayed reports and
   predecessor sessions using the new protocol types.
 
-Exit criteria:
+Delivered Phase 5 result:
 
 - the runtime and controller require no evidence unavailable through public
   interfaces;
@@ -1204,8 +1208,11 @@ Exit criteria:
 
 ## Semantic Finding Disposition and Activation Gates
 
-This mapping is part of the plan, not a Phase 5 deliverable. Phase 5 may add
-more cases but cannot weaken or defer these gates.
+This mapping is also the executable Phase 5 conformance catalog. The strict
+custom fixture and real PostgreSQL parent share the same sixteen-row catalog.
+KSF-09, KSF-10 and KSF-16 execute as negative eligibility guards: they pass
+only by inventorying the current legacy-bearing artifact and retaining the
+stated Phase 7 cutover obligations.
 
 | Finding | Owning phase(s) | Component owner(s) | Named public-observable gate | Required result before activation |
 |---|---|---|---|---|
@@ -1213,7 +1220,7 @@ more cases but cannot weaken or defer these gates.
 | KSF-02 | 4-6 | Controller, Agent/Runtime, Replicator, Provider | `authorized_data_loss_false_true_error_ambiguity` | Logical authorization drives callback before configuration/access; crash renewal is session-fenced and cannot weaken the captured replay disposition |
 | KSF-03 | 4 | Controller, Agent/Runtime, Replicator | `same_role_secondary_receives_new_epoch` | Secondary fences the predecessor epoch without requiring a role change |
 | KSF-04 | 5 | Controller, Agent/Runtime, Replicator | `configuration_contains_only_remote_active_members` | Local/idle targets absent, progress meanings exact, successor designated and active peer identity/session comes from configuration |
-| KSF-05 | 5 | Controller, Agent/Runtime, Replicator | `build_uses_invalid_target_progress_and_exact_attempt` | Empty target receives unknown progress and retains the exact build attempt identity |
+| KSF-05 | 5 | Controller, Agent/Runtime, Replicator | `build_uses_invalid_target_progress_and_exact_attempt` | Empty target receives invalid progress, remains outside PC/CC and retains the exact build attempt identity |
 | KSF-06 | 4 | Agent/Runtime, Replicator | `build_is_cancelled_and_drained_before_remove` | Exact build future terminates before removal and cannot recreate resources |
 | KSF-07 | 4-6 | Controller, Agent/Runtime, Replicator | `swap_uses_captured_specific_quorum_capability` | Ordering is wait/revoke/epoch/config/wait; Write includes successor when supported, otherwise explicit All |
 | KSF-08 | 5-6 | Controller, Agent/Runtime, Replicator, Provider | `progress_is_role_correct_and_history_scoped` | Primary exposes committed progress; incomparable histories are never ranked; exact build admits a new PVC incarnation into the source lineage |

@@ -1105,7 +1105,7 @@ impl PgInstanceManager {
     /// Wait for PG to accept connections.
     async fn wait_ready(&self, generation: &Arc<ProcessGeneration>) -> Result<(), PgError> {
         let mut last_probe_error = None;
-        for i in 0..240 {
+        for i in 0..480 {
             let output = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 generation
@@ -1184,7 +1184,7 @@ impl PgInstanceManager {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         Err(PgError::Process(format!(
-            "pg_isready timeout (60s){}",
+            "pg_isready timeout (120s){}",
             last_probe_error
                 .as_deref()
                 .map(|error| format!(": {error}"))

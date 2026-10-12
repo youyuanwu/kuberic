@@ -305,6 +305,14 @@ Missing completion waits; changed history/session/incarnation/configuration
 fails closed; typed failure retires the exact incarnation and typed rebuild
 identity provisions only the captured replacement.
 
+The final Public V1 conformance catalog contains exactly KSF-01 through
+KSF-16. The strict custom fixture and real PostgreSQL parent execute the same
+catalog assertion. KSF-09, KSF-10 and KSF-16 are negative activation guards:
+the current managed attachment, agent-owned replication listener and legacy
+continuation stores remain inventoried and therefore keep production cutover
+ineligible. Passing these guards does not claim that the Phase 6 engine or
+Phase 7 replacement-only artifact exists.
+
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the
 built-in engine's durable completion contract. The agent validates that its

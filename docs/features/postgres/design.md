@@ -302,6 +302,7 @@ Configuration is implementation-owned, not a general PostgreSQL tuning API.
 ## Local Validation
 
 ```sh
+just nextest-postgres-smoke-inventory
 just nextest-postgres-smoke
 just nextest-postgres
 # One deterministic shard, normally run on its own isolated CI runner:
@@ -312,10 +313,14 @@ cargo test -p postgres-replicated --all-features --test reconfiguration --test a
 cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
-The smoke target is the routine local gate and exercises representative real
-PostgreSQL bootstrap/fencing, native build, failover, planned switchover,
-scaling and explicit failure handling. The full target remains the complete
-pre-push gate.
+The smoke inventory requires the exact
+`tests::public_v1_postgres_conformance_oracle` parent before PostgreSQL starts.
+The smoke target is the routine local gate and exercises that oracle plus
+representative real PostgreSQL bootstrap/fencing, native build, failover,
+planned switchover, scaling and explicit failure handling. CI-derived nextest
+profiles terminate an individual test at five minutes. The full target is
+reserved for the dedicated resource-owning validation path or explicit
+requests.
 
 Tests discover common PostgreSQL installation directories (16, 17, 15 in that
 order on Debian-style hosts), then `pg_config --bindir`. `--pg-bin` configures the

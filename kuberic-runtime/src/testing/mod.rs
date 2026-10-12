@@ -9,6 +9,7 @@ pub mod authority;
 pub mod copy;
 pub mod effects;
 pub mod hosting;
+mod public_v1_conformance;
 pub mod report;
 pub mod runtime_adapter;
 pub mod service;
@@ -24,6 +25,7 @@ fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> U {
         .expect("fixture record matches the durable host format")
 }
 
+pub use public_v1_conformance::assert_public_v1_conformance_subject;
 pub use transport::{
     ControlOutput, DeliveryId, InProcessTransport, Message, PumpReport, TransportError,
     TransportEvent,

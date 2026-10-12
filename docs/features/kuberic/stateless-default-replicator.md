@@ -896,6 +896,13 @@ This phase is the implementation breakdown for alignment Phase 5. It changes
 the runtime/controller contract under a new protocol version that is not
 activated against the legacy production engine.
 
+This phase is implemented as the dormant protocol-11/schema-11 Public V1
+contract. Its shared test-only catalog executes exactly KSF-01 through KSF-16
+for the strict custom fixture and applicable PostgreSQL scenarios. KSF-09,
+KSF-10 and KSF-16 remain executable negative activation guards; the Phase 6
+replacement engine and Phase 7 replacement-only artifact are not implemented
+by this phase.
+
 - add the public configuration value required to identify `must_catchup`
   without changing protected method sets;
 - add immutable `ReplicatorCapabilities` to the coherent public bundle with

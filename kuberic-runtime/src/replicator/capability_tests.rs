@@ -9,6 +9,25 @@ struct Control {
 }
 
 #[test]
+fn legacy_build_progress_does_not_weaken_public_v1_idle_validation() {
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: crate::protocol::types::ReplicaInstanceId::new("legacy-build"),
+        agent_generation: crate::protocol::types::AgentGeneration::new("legacy-generation"),
+    };
+    let mut legacy = ReplicaInformation::new(
+        OperationId::new("legacy-build"),
+        identity,
+        "legacy://target".into(),
+    );
+    legacy.current_progress = 0;
+    legacy.catch_up_capability = 0;
+
+    legacy.validate_progress_values().unwrap();
+    assert!(legacy.validate_public_progress().is_err());
+}
+
+#[test]
 fn dropped_configuration_preparation_invalidates_native_generation_synchronously() {
     let identity = ReplicaIdentity {
         replica_id: ReplicaId::new(1),

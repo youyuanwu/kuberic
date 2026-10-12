@@ -1,6 +1,7 @@
 use kuberic_runtime::protocol::public_operations::{
-    CanonicalReplicaRebuildRequired, PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind,
-    PublicV1OperationCompletion, PublicV1OperationResult,
+    CanonicalOperationInputDigest, CanonicalReplicaRebuildRequired, PublicCatchUpMode,
+    PublicOperationReplayDisposition, PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{
     ConfigurationId, HistoryContext, OperationId, ProcessSessionId,
@@ -28,8 +29,12 @@ pub struct PublicV1CompletionRequirement {
     pub history: HistoryContext,
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub process_session_id: ProcessSessionId,
+    pub input_digest: CanonicalOperationInputDigest,
+    pub replay_disposition: PublicOperationReplayDisposition,
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration_id: Option<ConfigurationId>,
+    pub catch_up_mode: Option<PublicCatchUpMode>,
+    pub catch_up_specific_quorum: Option<bool>,
 }
 
 impl PublicV1CompletionRequirement {
@@ -53,8 +58,12 @@ impl PublicV1CompletionRequirement {
             && completion.history == self.history
             && completion.storage_incarnation == self.storage_incarnation
             && completion.process_session_id == self.process_session_id
+            && completion.input_digest == self.input_digest
+            && completion.replay_disposition == self.replay_disposition
             && completion.previous_configuration_id == self.previous_configuration_id
             && completion.current_configuration_id == self.current_configuration_id
+            && completion.catch_up_mode == self.catch_up_mode
+            && completion.catch_up_specific_quorum == self.catch_up_specific_quorum
     }
 }
 
@@ -66,15 +75,18 @@ pub enum PublicV1EvidencePlan {
     },
     Accept {
         expected: Box<PublicV1AcceptedStatus>,
+        consumer: PublicV1EvidenceConsumer,
         completion: Box<PublicV1OperationCompletion>,
     },
     RetireExactIncarnation {
         expected: Box<PublicV1AcceptedStatus>,
+        consumer: PublicV1EvidenceConsumer,
         completion: Box<PublicV1OperationCompletion>,
         storage: Box<ReplicaStorageIncarnationContext>,
     },
     ProvisionReplacement {
         expected: Box<PublicV1AcceptedStatus>,
+        consumer: PublicV1EvidenceConsumer,
         completion: Box<PublicV1OperationCompletion>,
         rebuild: Box<CanonicalReplicaRebuildRequired>,
     },
@@ -119,7 +131,7 @@ pub fn plan_public_v1_evidence(
         {
             return Err("accepted public-v1 completion changed after persistence".into());
         }
-        return Ok(decide(accepted, completion));
+        return Ok(decide(accepted, requirement.consumer, completion));
     }
     let mut next = accepted.clone();
     next.completed_operations.push(
@@ -138,16 +150,19 @@ pub fn plan_public_v1_evidence(
 
 fn decide(
     accepted: &PublicV1AcceptedStatus,
+    consumer: PublicV1EvidenceConsumer,
     completion: &PublicV1OperationCompletion,
 ) -> PublicV1EvidencePlan {
     match &completion.result {
         PublicV1OperationResult::Succeeded => PublicV1EvidencePlan::Accept {
             expected: Box::new(accepted.clone()),
+            consumer,
             completion: Box::new(completion.clone()),
         },
         PublicV1OperationResult::RebuildRequired(rebuild) => {
             PublicV1EvidencePlan::ProvisionReplacement {
                 expected: Box::new(accepted.clone()),
+                consumer,
                 completion: Box::new(completion.clone()),
                 rebuild: rebuild.clone(),
             }
@@ -156,6 +171,7 @@ fn decide(
         | PublicV1OperationResult::Ambiguous(_)
         | PublicV1OperationResult::Cancelled => PublicV1EvidencePlan::RetireExactIncarnation {
             expected: Box::new(accepted.clone()),
+            consumer,
             completion: Box::new(completion.clone()),
             storage: Box::new(completion.storage_incarnation.clone()),
         },

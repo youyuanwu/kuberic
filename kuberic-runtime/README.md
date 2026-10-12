@@ -49,6 +49,14 @@ and write status, `CreateReplicator`, load reporting, and fault reporting.
 The agent owns the access and report source of truth rather than inferring it
 from the replica role.
 
+The dormant Public V1 contract uses protocol 11 and a fresh exact schema-11
+store while production remains on protocol 9/schema 6. It exposes public
+history, role-correct progress, exact build/peer attempt identity and durable
+public callback completion without managed-engine ACK, quorum, copy cursor or
+build-boundary evidence. Its test-only conformance catalog contains exactly
+KSF-01 through KSF-16. Negative KSF-09, KSF-10 and KSF-16 guards keep the
+current legacy-bearing artifact ineligible for production cutover.
+
 Successful public `PrimaryReplicator` catch-up, build, and ordinary removal
 completion is also the built-in engine's durable completion contract. The
 host-private capability does not expose duplicate receipts for those

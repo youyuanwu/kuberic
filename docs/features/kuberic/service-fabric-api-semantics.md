@@ -730,8 +730,9 @@ error and ambiguous execution. An in-flight marker is committed before
 successful history repair. Every outcome stays access-closed. A rejected newer
 authority request may cancel/drain the old root but does not acquire authority
 or remove the barrier. Close, Abort and faults retain it as retired historical
-evidence. Phase 5 still owns authorized history reconciliation/admission;
-neither boolean changes progress, configurations, builds or serving permission.
+evidence. The dormant Phase 5 Public V1 path now owns authorized history
+reconciliation/admission; neither boolean changes progress, configurations,
+builds or serving permission.
 
 Exact optional application addresses are retained in role outcomes, including
 `None` and the empty string. `PublicLifecycleReport.service_location` contains
@@ -778,8 +779,8 @@ Close, and Abort. Planned swap follows:
 Interrupted waits reinstall the corresponding frozen configuration before
 reevaluation. Tests deliberately seed a different installed configuration and
 cut before/after the first install, proving stale topology cannot satisfy the
-first wait. The mode is retained as caller input only; Phase 5 still owns the
-capability-dependent value policy.
+first wait. The mode is retained as caller input only; the dormant Phase 5
+Public V1 contract owns the capability-dependent value policy.
 
 Build admission retains one exact attempt per target. Removal names that exact
 attempt, cancels and joins its build callback and provider descendant, then
@@ -835,8 +836,8 @@ successor launch is serialized and recovered rather than replaced on
 redelivery. An action-specific durable launch nonce plus owner PID/start-time
 precedes child construction. Quarantine clears predecessor role, PC/CC
 configuration, access and peer/build authority; the fresh application and
-Replicator session remains unassigned and access-closed because Phase 5 owns
-renewal. The accepted, contained and successor-started crash cuts converge to
+Replicator session remains unassigned and access-closed until the dormant
+Phase 5 renewal path applies. The accepted, contained and successor-started crash cuts converge to
 one successor session, and unproven descendant containment prevents re-exec.
 The runtime supervisor, rather than the controller, constructs the quarantined
 successor report consumed by the next reconciliation.
@@ -1233,6 +1234,16 @@ public-only correctness boundary.
 **Required conformance property:** Treat this as a legacy extension and remove
 it during the fresh-state stateless-default cutover rather than presenting it
 as V1 parity.
+
+### Phase 5 Conformance Status
+
+The dormant protocol-11/schema-11 implementation now owns one executable
+catalog with exactly KSF-01 through KSF-16. The strict custom fixture and real
+PostgreSQL parent execute the shared catalog assertion. KSF-09, KSF-10 and
+KSF-16 intentionally remain negative eligibility guards that inventory the
+current managed attachment, agent-owned replication listener and legacy
+continuation stores. Their passing result keeps Phase 7 cutover ineligible; it
+does not claim that the replacement engine or replacement-only artifact exists.
 
 ## Unimplemented or Deliberately Different Surface
 

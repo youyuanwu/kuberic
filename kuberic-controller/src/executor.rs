@@ -160,34 +160,37 @@ pub async fn execute_public_v1_evidence(
         }
         PublicV1EvidencePlan::Accept {
             expected,
+            consumer,
             completion,
         } => {
             if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
                 return Err("stale public-v1 completion acceptance".into());
             }
-            api.accept_public_v1_completion(&expected, &completion)
+            api.accept_public_v1_completion(&expected, consumer, &completion)
                 .await
         }
         PublicV1EvidencePlan::RetireExactIncarnation {
             expected,
+            consumer,
             completion,
             storage,
         } => {
             if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
                 return Err("stale public-v1 retirement authority".into());
             }
-            api.retire_public_v1_incarnation(&expected, &completion, &storage)
+            api.retire_public_v1_incarnation(&expected, consumer, &completion, &storage)
                 .await
         }
         PublicV1EvidencePlan::ProvisionReplacement {
             expected,
+            consumer,
             completion,
             rebuild,
         } => {
             if api.observe_public_v1_evidence_status().await?.as_ref() != Some(expected.as_ref()) {
                 return Err("stale public-v1 replacement authority".into());
             }
-            api.provision_public_v1_replacement(&expected, &completion, &rebuild)
+            api.provision_public_v1_replacement(&expected, consumer, &completion, &rebuild)
                 .await
         }
         PublicV1EvidencePlan::Wait => Ok(()),
