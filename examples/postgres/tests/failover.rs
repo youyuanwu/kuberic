@@ -1,3 +1,12 @@
+const FAILOVER_SCENARIO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+async fn completes_within<F>(timeout: std::time::Duration, scenario: F) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::time::timeout(timeout, scenario).await.is_ok()
+}
+
 macro_rules! host_test {
     ($name:ident) => {
         #[test_log::test]
@@ -10,22 +19,99 @@ macro_rules! host_test {
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(async {
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(240),
-                                scenarios::$name(),
-                            )
-                            .await
-                            .unwrap_or_else(|_| {
-                                panic!("{} exceeded its 240-second test bound", stringify!($name))
-                            });
-                        });
+                        .block_on(completes_within(
+                            FAILOVER_SCENARIO_TIMEOUT,
+                            scenarios::$name(),
+                        ))
                 })
                 .unwrap()
                 .join()
-                .unwrap();
+                .unwrap()
+                .then_some(())
+                .unwrap_or_else(|| {
+                    panic!("{} exceeded its 240-second test bound", stringify!($name))
+                });
         }
     };
+}
+
+#[test_log::test]
+fn stalled_failover_scenario_times_out_and_reaps_postgres() {
+    const CHILD_ENV: &str = "KUBERIC_STALLED_FAILOVER_PROBE_CHILD";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        run_stalled_failover_timeout_probe();
+        return;
+    }
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "stalled_failover_scenario_times_out_and_reaps_postgres",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "controlled timeout probe failed: {status}"
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("controlled timeout probe exceeded its 30-second outer bound");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn run_stalled_failover_timeout_probe() {
+    use postgres_replicated::testing::{PgPod, ProcessProbe, TestDataDir, native_identity};
+
+    let (probe_sender, probe_receiver) = std::sync::mpsc::sync_channel(1);
+    let completed = std::thread::Builder::new()
+        .name("stalled-failover-timeout".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let root = TestDataDir::new("p5-timeout-cleanup");
+                    let pod =
+                        PgPod::new(root.path().join("pod"), native_identity(91, "timeout")).await;
+                    pod.singleton().await;
+                    probe_sender
+                        .send(ProcessProbe::postgres(
+                            pod.application.instance().data_dir(),
+                        ))
+                        .unwrap();
+                    completes_within(std::time::Duration::from_secs(1), async move {
+                        let _root = root;
+                        let _pod = pod;
+                        std::future::pending::<()>().await;
+                    })
+                    .await
+                })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+    assert!(!completed, "stalled scenario unexpectedly completed");
+    probe_receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .assert_reaped();
 }
 
 mod scenarios {
