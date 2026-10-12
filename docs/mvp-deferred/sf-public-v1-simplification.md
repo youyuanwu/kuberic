@@ -28,10 +28,11 @@
 
 ### PVS-04: Change schema-11 AgentState JSON layout or split Public V1 records into dedicated tables
 - Status: PROPOSED
-- Reason: The compatibility boundary for the serialized JSON layout is unresolved, and the generic tables intentionally coexist with legacy continuation stores. This is migration work rather than proven simplification.
-- MVP alternative: Treat the complete schema-11 serialized shape as fixed.
-- Revisit when: An explicit compatibility policy and migration authorization define which schema-11 internals may change.
+- Reason: The user confirmed that the schema-11 internal design is not fixed and compatibility is not required. A layout change is therefore allowed, but it still needs evidence that it reduces total implementation, verification, and operational complexity rather than merely moving it.
+- MVP alternative: Keep the current layout until a measured simplification candidate is identified.
+- Revisit when: Code research identifies a bounded layout change with a measurable reduction and explicit fresh-store or migration handling.
 - Evidence: `kuberic-runtime/src/host/state.rs` defines the serialized state and `kuberic-runtime/src/host/sqlite_store.rs` enforces schema-11 storage boundaries.
+- Decision update: On 2026-10-12, the user stated that the design is not fixed and compatibility is not required.
 
 ### PVS-05: Remove apparently test-only Public V1 controller or runtime surfaces
 - Status: PROPOSED
