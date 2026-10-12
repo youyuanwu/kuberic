@@ -225,7 +225,16 @@ impl OracleDataDir {
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::var_os("KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+            .unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    std::path::PathBuf::from("/tmp")
+                }
+                #[cfg(not(unix))]
+                {
+                    std::env::temp_dir()
+                }
+            });
         let path = base.join(format!(
             "kuberic-public-v1-postgres-{}-{sequence}",
             std::process::id()

@@ -287,7 +287,7 @@ fn run_strict_scenarios() {
     for gate in GATES.iter().filter(|gate| gate.id != "KSF-16") {
         for scenario in gate.strict_scenarios {
             assert!(
-                inventory.lines().any(|line| line.ends_with(scenario)),
+                inventory.contains(scenario),
                 "{} scenario is not selected: {}",
                 gate.id,
                 scenario
