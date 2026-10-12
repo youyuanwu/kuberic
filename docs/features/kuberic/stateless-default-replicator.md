@@ -193,11 +193,11 @@ role and carries the new exact peer descriptors before connection.
 `update_epoch` invalidates all predecessor peer sessions. There is no
 same-epoch source-session substitution.
 
-Public V1 does not currently authenticate these transport descriptors. Exact
+Public V1 does not authenticate or authorize transport peers by design. Exact
 identity/session checks provide lifecycle correctness but are not proof of the
 remote process. TLS identity, workload identity or token authentication may be
-added later; this document records the gap without defining an activation
-policy.
+added later as a separate transport-security feature; they are not an
+activation requirement for Public V1.
 
 The public value contract defines `INVALID_LSN = -1`; zero remains a valid
 empty-history boundary. Build descriptors and "Replicator already owns this
@@ -637,15 +637,15 @@ and no private native access proof.
 
 ## Transport Ownership
 
-The default Replicator owns its replication listener, inbound authentication,
-peer-session replacement, send windows, ACK processing and copy delivery.
+The default Replicator owns its replication listener, peer-session replacement,
+send windows, ACK processing and copy delivery.
 
 - immutable process launch configuration selects `LegacyManaged` or
   `StatelessPreview` before `AgentService` binds any replication listener;
 - the same selection is available through public factory construction, and a
   mismatch fails startup;
-- `ReplicatorSettings` supplies public bind/publish, security and
-  build-capability verification configuration.
+- `ReplicatorSettings` supplies public bind/publish and build-capability
+  verification configuration.
 - `ReplicatorFactoryContext` supplies public replica and partition identity.
 - `ReplicaInformation` supplies peer address, replica identity, build identity
   and process session. Active PC/CC descriptions carry exact remote peer
@@ -1020,7 +1020,7 @@ than removing persistence from `DefaultReplicatorInner` incrementally.
 - return only the public `ReplicatorInterfaces` bundle;
 - create the engine empty on every open and derive progress from
   `StateProvider`/`DurableState`;
-- own listener, authentication, peer sessions, ACK aggregation, copy,
+- own listener, peer sessions, ACK aggregation, copy,
   replication queues and cancellation internally;
 - require controller session renewal, complete surviving-secondary epoch
   barriers, then replay replacement role/primary epoch and finally PC/CC

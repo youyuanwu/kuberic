@@ -994,7 +994,7 @@ Planned work:
 - require exactly one selected engine and provider writer; replacement Open
   failure aborts startup and never falls back to legacy;
 - return only the standard public `ReplicatorInterfaces` bundle;
-- own listener, authentication, peer sessions, ACK aggregation, copy,
+- own listener, peer sessions, ACK aggregation, copy,
   replication queues, retry and cancellation internally;
 - initialize applied, committed and retained progress from
   `StateProvider`/`DurableState`;
@@ -1298,16 +1298,14 @@ and more visible, not to reproduce Service Fabric internally.
 
 ## Recommended Starting Point
 
-Phases 0-3 are complete. Continue with **Phase 4: Establish SF Public Operation
-Semantics**. Build the next-protocol operation owner and strict trace harness
-without partially activating the new lifecycle against legacy production.
+Phases 0-5 are complete. Continue with **Phase 6: Build the Stateless Default
+Replicator**. Add the new engine beside the legacy implementation and require it
+to pass the same public oracle as an independent custom Replicator rather than
+using built-in-only proof. Public V1 transport remains unauthenticated by
+design; identity, session, epoch, history and build checks are correctness
+fences rather than credentials.
 
-Then complete **Phase 5: Establish Public V1 Values, Evidence and
-Conformance**. Every KSF finding must have an owner and observable test before
-the replacement begins. **Phase 6** adds a new engine beside the legacy
-implementation and must pass the same public oracle as an independent custom
-Replicator rather than using built-in-only proof. After that complete suite
-passes, **Phase 7** performs the fresh-storage cutover and deletes the legacy
-managed path. Decompose the remaining custom host only if its post-cutover
-shape still warrants it. Phase 8 builds optional V2 durability on the
-completed public-only V1 replacement.
+After the complete Phase 6 suite passes, **Phase 7** performs the fresh-storage
+cutover and deletes the legacy managed path. Decompose the remaining custom
+host only if its post-cutover shape still warrants it. Phase 8 builds optional
+V2 durability on the completed public-only V1 replacement.
