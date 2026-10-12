@@ -35,7 +35,7 @@ pub struct PgService {
     driver: OnceLock<Arc<PgReplicator>>,
     cancellation: CancellationToken,
     coordination_token: String,
-    public_authorization: Option<kuberic_runtime::replicator::PublicAuthorizationTrust>,
+    public_v1: bool,
 }
 
 impl PgService {
@@ -51,7 +51,7 @@ impl PgService {
             driver: OnceLock::new(),
             cancellation: CancellationToken::new(),
             coordination_token: String::new(),
-            public_authorization: None,
+            public_v1: false,
         }
     }
 
@@ -83,11 +83,8 @@ impl PgService {
     }
 
     #[cfg(feature = "testing")]
-    pub fn with_public_v1_authorization(
-        mut self,
-        trust: kuberic_runtime::replicator::PublicAuthorizationTrust,
-    ) -> Self {
-        self.public_authorization = Some(trust);
+    pub fn with_public_v1(mut self) -> Self {
+        self.public_v1 = true;
         self
     }
 
@@ -202,13 +199,10 @@ impl StatefulServiceReplica for PgService {
             .with_factory(Arc::new(PgReplicatorFactory(driver)))
             .create_replicator(
                 None,
-                self.public_authorization
-                    .clone()
-                    .map(|trust| ReplicatorSettings {
-                        replication_address: self.config.replication_address.clone(),
-                        public_authorization: Some(trust),
-                        public_authorization_admission: None,
-                    }),
+                self.public_v1.then(|| ReplicatorSettings {
+                    replication_address: self.config.replication_address.clone(),
+                    public_v1: true,
+                }),
             )
             .await?;
         debug_assert!(interfaces.state_replicator().is_none());
@@ -292,7 +286,7 @@ mod tests {
 impl ReplicatorFactory for PgReplicatorFactory {
     async fn create_replicator(
         &self,
-        _context: ReplicatorFactoryContext,
+        context: ReplicatorFactoryContext,
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
@@ -301,7 +295,7 @@ impl ReplicatorFactory for PgReplicatorFactory {
                 "PostgreSQL owns its replication and copy state",
             ));
         }
-        self.0.configure_public_v1(settings)?;
+        self.0.configure_public_v1(settings, context.identity()?)?;
         Ok(self.interfaces())
     }
 }

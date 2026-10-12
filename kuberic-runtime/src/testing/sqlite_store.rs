@@ -3,10 +3,6 @@ use std::sync::Arc;
 
 use crate::authority::{BuildAuthorityStore, BuildProgressStore, LocalWriteJournal};
 use crate::host::store::AgentStore;
-use crate::protocol::authorization::{
-    AuthorizationAuditDigest, AuthorizationKeyId, AuthorizationVerificationKey,
-    BuildAuthorizationEndpointV1, BuildAuthorizationV1,
-};
 use crate::protocol::command::{
     EnsureReplicaBuild, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
 };
@@ -91,14 +87,13 @@ pub struct PublicV1BuildSnapshot {
     pub operation_id: OperationId,
     pub build_id: OperationId,
     pub admission_revision: u64,
-    pub verification_key: AuthorizationVerificationKey,
-    pub key_id: AuthorizationKeyId,
-    pub audit_digest: AuthorizationAuditDigest,
     pub history: HistoryContext,
     pub epoch: crate::protocol::types::Epoch,
-    pub source: BuildAuthorizationEndpointV1,
-    pub target: BuildAuthorizationEndpointV1,
-    pub authorization: BuildAuthorizationV1,
+    pub source: crate::protocol::types::ReplicaIdentity,
+    pub source_session: ProcessSessionId,
+    pub target: crate::protocol::types::ReplicaIdentity,
+    pub target_session: ProcessSessionId,
+    pub target_address: String,
     pub retirement: PublicV1BuildRetirementSnapshot,
     pub result: Option<PublicV1OperationResult>,
 }
@@ -303,9 +298,7 @@ impl SqliteStore {
             .into_iter()
             .find(|record| record.intent == *intent)
             .ok_or_else(|| {
-                crate::host::HostError::CommandRejected(
-                    "public-v1 signed build is not journaled".into(),
-                )
+                crate::host::HostError::CommandRejected("public-v1 build is not journaled".into())
             })?;
         self.inner
             .advance_public_operation(
@@ -358,7 +351,7 @@ impl SqliteStore {
             .find(|record| record.intent == *intent)
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "public-v1 signed build removal is not journaled".into(),
+                    "public-v1 build removal is not journaled".into(),
                 )
             })?;
         self.inner
@@ -411,9 +404,7 @@ impl SqliteStore {
             .into_iter()
             .find(|record| record.intent == *intent)
             .ok_or_else(|| {
-                crate::host::HostError::CommandRejected(
-                    "public-v1 signed build is not journaled".into(),
-                )
+                crate::host::HostError::CommandRejected("public-v1 build is not journaled".into())
             })?;
         self.inner
             .advance_public_operation(
@@ -441,7 +432,7 @@ impl SqliteStore {
                 crate::host::state::PublicOperationStage::Running,
                 crate::host::state::PublicOperationStage::ContainmentPending,
                 Some(crate::host::state::PublicOperationDisposition::Ambiguous(
-                    "signed build callback outcome was not durably observed".into(),
+                    "public-v1 build callback outcome was not durably observed".into(),
                 )),
             )
             .await?;
@@ -521,14 +512,13 @@ impl SqliteStore {
                 operation_id: record.operation_id,
                 build_id: record.build_id,
                 admission_revision: record.admission_revision,
-                verification_key: record.verification_key,
-                key_id: record.key_id,
-                audit_digest: record.audit_digest,
                 history: record.history,
                 epoch: record.epoch,
                 source: record.source,
+                source_session: record.source_session,
                 target: record.target,
-                authorization: record.authorization,
+                target_session: record.target_session,
+                target_address: record.target_address,
                 retirement: match record.retirement {
                     crate::host::public_build_store::PublicV1BuildRetirement::Retain => {
                         PublicV1BuildRetirementSnapshot::Retain

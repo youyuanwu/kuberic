@@ -99,8 +99,6 @@ fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
             current_configuration_id: None,
             catch_up_mode: None,
             catch_up_specific_quorum: None,
-            authorization_key_id: None,
-            authorization_audit_digest: None,
             result: PublicV1OperationResult::Succeeded,
         }),
     );

@@ -4,7 +4,6 @@ use kuberic_controller::evaluator::test_bridge::{
     PublicV1CompletionRequirement, PublicV1EvidenceApi, PublicV1EvidenceConsumer,
     PublicV1EvidencePlan, execute_public_v1_evidence, plan_public_v1_evidence,
 };
-use kuberic_runtime::protocol::authorization::{AuthorizationAuditDigest, AuthorizationKeyId};
 use kuberic_runtime::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, ProviderReplicaIdentity,
@@ -116,7 +115,6 @@ fn accepted() -> PublicV1AcceptedStatus {
         history: derive_bootstrap_history(&resource_uid, generation, &initialization),
         data_loss_recovery: None,
         completed_operations: Vec::new(),
-        authorization: None,
         extensions: Default::default(),
     }
 }
@@ -127,12 +125,6 @@ fn completion(
     call_kind: PublicV1CallKind,
     result: PublicV1OperationResult,
 ) -> PublicV1OperationCompletion {
-    let (authorization_key_id, authorization_audit_digest) = (call_kind == PublicV1CallKind::Build)
-        .then_some((
-            AuthorizationKeyId::from_bytes([7; 32]),
-            AuthorizationAuditDigest::from_bytes([9; 32]),
-        ))
-        .map_or((None, None), |(key, digest)| (Some(key), Some(digest)));
     PublicV1OperationCompletion {
         operation_id: OperationId::new(operation),
         revision: 3,
@@ -154,8 +146,6 @@ fn completion(
         current_configuration_id: Some(ConfigurationId::new("current")),
         catch_up_mode: None,
         catch_up_specific_quorum: None,
-        authorization_key_id,
-        authorization_audit_digest,
         result,
     }
 }
@@ -200,8 +190,6 @@ fn requirement(
         process_session_id: completion.process_session_id.clone(),
         previous_configuration_id: completion.previous_configuration_id.clone(),
         current_configuration_id: completion.current_configuration_id.clone(),
-        authorization_key_id: completion.authorization_key_id,
-        authorization_audit_digest: completion.authorization_audit_digest,
     }
 }
 

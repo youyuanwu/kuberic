@@ -138,7 +138,7 @@ fn requirement(reason: ProcessSessionRenewalReason) -> ProcessSessionRenewalRequ
                 ),
             )
         }
-        ProcessSessionRenewalReason::PeerAuthorizationWithdrawal => (
+        ProcessSessionRenewalReason::PeerWithdrawal => (
             secondary,
             None,
             vec![primary.clone()],
@@ -316,8 +316,8 @@ fn public_v1_session_renewal_waits_for_blocked_survivor() {
 }
 
 #[test]
-fn public_v1_peer_authorization_withdrawal_advances_epoch_without_role_replay() {
-    let required = requirement(ProcessSessionRenewalReason::PeerAuthorizationWithdrawal);
+fn public_v1_peer_withdrawal_advances_epoch_without_role_replay() {
+    let required = requirement(ProcessSessionRenewalReason::PeerWithdrawal);
     required.validate().unwrap();
     let pending = pending_barriers(required.clone());
     let updated = accept_public_v1_session_epoch_updated(

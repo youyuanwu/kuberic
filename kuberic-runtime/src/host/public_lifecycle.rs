@@ -233,37 +233,6 @@ async fn execute(
         ));
     }
     let captured_state = store.load_state().await?;
-    let mut authorization_context = if intent.preview.is_public_v1() {
-        let preview = captured_state
-            .public_operation_preview
-            .as_ref()
-            .ok_or_else(|| HostError::Corrupt("missing public-v1 preview state".into()))?;
-        let context = crate::replicator::PublicAuthorizationRuntimeContext {
-            identity: captured_state.identity.local_identity.clone(),
-            history: preview
-                .history
-                .clone()
-                .ok_or_else(|| HostError::Corrupt("missing public-v1 history".into()))?,
-            storage_incarnation: preview.storage_incarnation.clone().ok_or_else(|| {
-                HostError::Corrupt("missing public-v1 storage incarnation".into())
-            })?,
-            process_session_id: intent.process_session_id.clone(),
-            role: captured_state.role,
-            epoch: captured_state.highest_epoch,
-            previous_configuration_id: captured_state
-                .previous_configuration
-                .as_ref()
-                .map(|configuration| configuration.configuration_id.clone()),
-            current_configuration_id: captured_state
-                .current_configuration
-                .as_ref()
-                .map(|configuration| configuration.configuration_id.clone()),
-        };
-        crate::replicator::bind_public_authorization_context(context.clone())?;
-        Some(context)
-    } else {
-        None
-    };
     let start = record.lifecycle.outcomes.len();
     for (index, instruction) in instructions(&input).into_iter().enumerate().skip(start) {
         #[cfg(all(test, feature = "testing"))]
@@ -279,19 +248,10 @@ async fn execute(
                     .replicator
                     .change_role(input.epoch, ReplicaRole::Primary)
                     .await?;
-                if let Some(context) = authorization_context.as_mut() {
-                    context.epoch = input.epoch;
-                    context.role = ReplicaRole::Primary;
-                    crate::replicator::advance_public_authorization_context(context.clone())?;
-                }
                 PublicInstructionOutcome::Done
             }
             Epoch => {
                 callbacks.replicator.update_epoch(input.epoch).await?;
-                if let Some(context) = authorization_context.as_mut() {
-                    context.epoch = input.epoch;
-                    crate::replicator::advance_public_authorization_context(context.clone())?;
-                }
                 PublicInstructionOutcome::Done
             }
             ApplicationPrimary => {
@@ -342,25 +302,18 @@ async fn execute(
             }
             CurrentConfiguration => {
                 let configuration = input.configuration();
-                program::install_current(
-                    &callbacks,
-                    &configuration,
-                    authorization_context.as_mut(),
-                )
-                .await?;
+                program::install_current(&callbacks, &configuration).await?;
                 PublicInstructionOutcome::Done
             }
             CatchUpConfiguration => {
                 let configuration = input.configuration();
-                program::install(&callbacks, &configuration, authorization_context.as_mut())
-                    .await?;
+                program::install(&callbacks, &configuration).await?;
                 PublicInstructionOutcome::Done
             }
             CatchUp => {
                 if index == start && start > 0 {
                     let configuration = input.configuration();
-                    program::install(&callbacks, &configuration, authorization_context.as_mut())
-                        .await?;
+                    program::install(&callbacks, &configuration).await?;
                 }
                 callbacks
                     .primary
@@ -385,13 +338,6 @@ async fn execute(
         store
             .public_instruction(&intent, index, instruction, Some(outcome.clone()))
             .await?;
-        if instruction == HistoryAdmission
-            && let Some(context) = authorization_context.as_mut()
-            && let Some(recovery) = input.data_loss_recovery.as_ref()
-        {
-            context.history = recovery.authorization.proposed.clone();
-            crate::replicator::advance_public_authorization_context(context.clone())?;
-        }
         #[cfg(all(test, feature = "testing"))]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::InstructionApplied, index)
@@ -459,28 +405,27 @@ pub(super) fn enrich_remote_rebuild(
         ));
     };
     let failure = *failure;
-    let authorization = build.authorization.as_ref().ok_or_else(|| {
-        HostError::CommandRejected(
-            "remote rebuild failure lacks captured authorization claims".into(),
-        )
-    })?;
-    if &failure.authorization != authorization
-        || authorization.resource_uid != identity.resource_uid
-        || authorization.build_id != intent.operation_id
-        || authorization.source != identity.local_identity
-        || authorization.source_storage != identity.pvc_uid
-        || authorization.source_session != intent.process_session_id
-        || authorization.target != build.replica
-        || authorization.target_session != build.process_session_id
+    if failure.epoch != build.epoch
+        || failure.target != build.replica
+        || failure.target_session != build.process_session_id
     {
         return Err(HostError::StaleEffectCompletion(
-            "remote rebuild failure differs from captured signed claims".into(),
+            "remote rebuild failure differs from the captured build attempt".into(),
         ));
     }
+    let build = crate::protocol::public_operations::PublicBuildAttemptReference {
+        resource_uid: identity.resource_uid.clone(),
+        epoch: build.epoch,
+        build_id: intent.operation_id.clone(),
+        source: identity.local_identity.clone(),
+        source_session: intent.process_session_id.clone(),
+        target: build.replica.clone(),
+        target_session: build.process_session_id.clone(),
+    };
     Ok(CanonicalReplicaRebuildRequired::RemoteBuildTarget {
         reason: failure.reason,
-        operation: captured_operation(identity, intent, authorization.epoch),
-        authorization: failure.authorization,
+        operation: captured_operation(identity, intent, build.epoch),
+        build,
     })
 }
 
@@ -608,8 +553,6 @@ fn public_v1_completion_authority(
     Option<ConfigurationId>,
     Option<PublicCatchUpMode>,
     Option<bool>,
-    Option<crate::protocol::authorization::AuthorizationKeyId>,
-    Option<crate::protocol::authorization::AuthorizationAuditDigest>,
 )> {
     let configuration_ids =
         |configuration: &crate::protocol::public_operations::PublicConfiguration| {
@@ -630,8 +573,6 @@ fn public_v1_completion_authority(
             Some(lifecycle.current.configuration_id.clone()),
             None,
             None,
-            None,
-            None,
         ));
     }
     let Some(program) = intent.program.as_ref() else {
@@ -642,14 +583,14 @@ fn public_v1_completion_authority(
     Ok(match program {
         PublicOperationProgram::Configuration(configuration) => {
             let (previous, current) = configuration_ids(configuration);
-            (previous, current, None, None, None, None)
+            (previous, current, None, None)
         }
         PublicOperationProgram::CatchUp {
             configuration,
             mode,
         } => {
             let (previous, current) = configuration_ids(configuration);
-            (previous, current, Some(*mode), None, None, None)
+            (previous, current, Some(*mode), None)
         }
         PublicOperationProgram::Swap {
             refreshed,
@@ -663,33 +604,16 @@ fn public_v1_completion_authority(
                 current,
                 Some(*mode),
                 Some(*catch_up_specific_quorum),
-                None,
-                None,
             )
-        }
-        PublicOperationProgram::Build(build) => {
-            let (key_id, audit_digest) =
-                if let Some(authorization) = build.build_authorization.as_ref() {
-                    (
-                        Some(authorization.claims.key_id),
-                        Some(authorization.audit_digest().map_err(|_| {
-                            HostError::Corrupt(
-                                "schema-11 build completion has an invalid authorization".into(),
-                            )
-                        })?),
-                    )
-                } else {
-                    (None, None)
-                };
-            (None, None, None, None, key_id, audit_digest)
         }
         PublicOperationProgram::Open { .. }
         | PublicOperationProgram::Role { .. }
         | PublicOperationProgram::Epoch { .. }
         | PublicOperationProgram::Progress { .. }
+        | PublicOperationProgram::Build(_)
         | PublicOperationProgram::Remove(_)
         | PublicOperationProgram::Close
-        | PublicOperationProgram::Abort => (None, None, None, None, None, None),
+        | PublicOperationProgram::Abort => (None, None, None, None),
     })
 }
 
@@ -762,8 +686,6 @@ pub(crate) async fn public_v1_report(
                 current_configuration_id,
                 catch_up_mode,
                 catch_up_specific_quorum,
-                authorization_key_id,
-                authorization_audit_digest,
             ) = public_v1_completion_authority(&record.intent)?;
             Ok(PublicV1OperationCompletion {
                 operation_id: record.intent.operation_id.clone(),
@@ -778,8 +700,6 @@ pub(crate) async fn public_v1_report(
                 current_configuration_id,
                 catch_up_mode,
                 catch_up_specific_quorum,
-                authorization_key_id,
-                authorization_audit_digest,
                 result,
             })
         })

@@ -2,10 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use crate::protocol::authorization::{
-    AuthorizationAuditDigest as SignedAuthorizationAuditDigest, AuthorizationKeyId,
-    BuildAuthorizationV1, PeerSessionAuthorizationV1,
-};
 use crate::protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
     ProtocolCommand,
@@ -14,10 +10,10 @@ use crate::protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, UninitializedAgentObservation,
 };
 use crate::protocol::public_operations::{
-    AuthorizationAuditDigest, CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
+    CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
     DataLossReplay, ProcessAttemptContext, ProviderProgressReset, ProviderReplicaIdentity,
-    PublicBuildAuthorizationReference, PublicCatchUpMode, PublicDataLossRecoveryStage,
+    PublicBuildAttemptReference, PublicCatchUpMode, PublicDataLossRecoveryStage,
     PublicDataLossRecoveryStatus, PublicOperationPreviewIdentity, PublicOperationReplayDisposition,
     PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1CallKind,
     PublicV1ExtensionSlot, PublicV1Extensions, PublicV1OperationCompletion,
@@ -61,7 +57,6 @@ pub struct ReplicationEnvelope {
     pub lsn: i64,
     pub committed_lsn: i64,
     pub data: Vec<u8>,
-    pub peer_authorization: Option<PeerSessionAuthorizationV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +69,6 @@ pub struct ReplicationAcknowledgement {
     pub received_lsn: i64,
     pub applied_lsn: i64,
     pub committed_lsn: i64,
-    pub peer_authorization: Option<PeerSessionAuthorizationV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +86,6 @@ pub struct CopyEnvelope {
     pub final_item: bool,
     pub snapshot_chunk: bool,
     pub data: Vec<u8>,
-    pub build_authorization: Option<BuildAuthorizationV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +101,6 @@ pub struct CopyAcknowledgement {
     pub catch_up_boundary_lsn: Option<i64>,
     pub final_item: bool,
     pub snapshot_chunk: bool,
-    pub build_authorization: Option<BuildAuthorizationV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,55 +174,6 @@ pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
             expected: crate::protocol::PROTOCOL_VERSION,
             observed,
         })
-    }
-}
-
-fn ensure_signed_transport_version(
-    observed: u32,
-    authorization_present: bool,
-    context: &'static str,
-) -> Result<(), WireError> {
-    match observed {
-        crate::protocol::PROTOCOL_VERSION if !authorization_present => Ok(()),
-        crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
-            if authorization_present =>
-        {
-            Ok(())
-        }
-        crate::protocol::PROTOCOL_VERSION => Err(WireError::InvalidAuthority(format!(
-            "legacy {context} cannot carry public-v1 authorization"
-        ))),
-        crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION => {
-            Err(WireError::InvalidAuthority(format!(
-                "public-v1 {context} requires signed authorization"
-            )))
-        }
-        observed => Err(WireError::UnsupportedProtocolVersion {
-            expected: crate::protocol::PROTOCOL_VERSION,
-            observed,
-        }),
-    }
-}
-
-fn decode_peer_authorization(
-    bytes: Vec<u8>,
-) -> Result<Option<PeerSessionAuthorizationV1>, WireError> {
-    if bytes.is_empty() {
-        Ok(None)
-    } else {
-        PeerSessionAuthorizationV1::from_canonical_bytes(&bytes)
-            .map(Some)
-            .map_err(|error| WireError::InvalidAuthority(error.to_string()))
-    }
-}
-
-fn decode_build_authorization(bytes: Vec<u8>) -> Result<Option<BuildAuthorizationV1>, WireError> {
-    if bytes.is_empty() {
-        Ok(None)
-    } else {
-        BuildAuthorizationV1::from_canonical_bytes(&bytes)
-            .map(Some)
-            .map_err(|error| WireError::InvalidAuthority(error.to_string()))
     }
 }
 
@@ -318,10 +261,6 @@ pub fn normalize_public_v1_agent_status_report(
             .history_recovery_extension_version
             .map(extension_slot)
             .transpose()?,
-        signed_authorization: public
-            .signed_authorization_extension_version
-            .map(extension_slot)
-            .transpose()?,
         public_build_evidence: public
             .public_build_evidence_extension_version
             .map(extension_slot)
@@ -400,11 +339,6 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
             history_recovery_extension_version: report
                 .extensions
                 .history_recovery
-                .as_ref()
-                .map(|slot| u32::from(slot.version)),
-            signed_authorization_extension_version: report
-                .extensions
-                .signed_authorization
                 .as_ref()
                 .map(|slot| u32::from(slot.version)),
             public_build_evidence_extension_version: report
@@ -943,10 +877,10 @@ fn captured_operation_to_proto(
     }
 }
 
-fn build_authorization_from_proto(
-    value: proto::PublicV1BuildAuthorizationReference,
-) -> Result<PublicBuildAuthorizationReference, WireError> {
-    let authorization = PublicBuildAuthorizationReference {
+fn build_attempt_from_proto(
+    value: proto::PublicV1BuildAttemptReference,
+) -> Result<PublicBuildAttemptReference, WireError> {
+    let authorization = PublicBuildAttemptReference {
         resource_uid: ResourceUid::new(value.resource_uid),
         epoch: value
             .epoch
@@ -961,7 +895,6 @@ fn build_authorization_from_proto(
                 "public_v1.rebuild.authorization.source",
             ))?
             .try_into()?,
-        source_storage: PvcUid::new(value.source_storage),
         source_session: ProcessSessionId::new(value.source_session),
         target: value
             .target
@@ -969,9 +902,7 @@ fn build_authorization_from_proto(
                 "public_v1.rebuild.authorization.target",
             ))?
             .try_into()?,
-        target_storage: PvcUid::new(value.target_storage),
         target_session: ProcessSessionId::new(value.target_session),
-        audit_digest: AuthorizationAuditDigest(value.audit_digest_sha256),
     };
     authorization
         .validate()
@@ -979,20 +910,17 @@ fn build_authorization_from_proto(
     Ok(authorization)
 }
 
-fn build_authorization_to_proto(
-    value: &PublicBuildAuthorizationReference,
-) -> proto::PublicV1BuildAuthorizationReference {
-    proto::PublicV1BuildAuthorizationReference {
+fn build_attempt_to_proto(
+    value: &PublicBuildAttemptReference,
+) -> proto::PublicV1BuildAttemptReference {
+    proto::PublicV1BuildAttemptReference {
         resource_uid: value.resource_uid.as_str().to_string(),
         epoch: Some(value.epoch.into()),
         build_id: value.build_id.as_str().to_string(),
         source: Some(value.source.clone().into()),
-        source_storage: value.source_storage.as_str().to_string(),
         source_session: value.source_session.as_str().to_string(),
         target: Some(value.target.clone().into()),
-        target_storage: value.target_storage.as_str().to_string(),
         target_session: value.target_session.as_str().to_string(),
-        audit_digest_sha256: value.audit_digest.0.clone(),
     }
 }
 
@@ -1012,7 +940,7 @@ fn rebuild_from_proto(
     )?;
     let rebuild = match kind {
         proto::PublicV1RebuildKind::LocalProvider => {
-            if value.authorization.is_some() {
+            if value.build.is_some() {
                 return Err(WireError::InvalidAuthority(
                     "local rebuild failure contains remote authorization".into(),
                 ));
@@ -1047,10 +975,10 @@ fn rebuild_from_proto(
             CanonicalReplicaRebuildRequired::RemoteBuildTarget {
                 reason,
                 operation,
-                authorization: build_authorization_from_proto(
+                build: build_attempt_from_proto(
                     value
-                        .authorization
-                        .ok_or(WireError::MissingField("public_v1.rebuild.authorization"))?,
+                        .build
+                        .ok_or(WireError::MissingField("public_v1.rebuild.build"))?,
                 )?,
             }
         }
@@ -1084,12 +1012,12 @@ fn rebuild_to_proto(
             provider_replica: Some(provider.replica.clone().into()),
             local_replica: Some(local_replica.clone().into()),
             local_storage: local_storage.as_str().to_string(),
-            authorization: None,
+            build: None,
         },
         CanonicalReplicaRebuildRequired::RemoteBuildTarget {
             reason,
             operation,
-            authorization,
+            build,
         } => proto::PublicV1ReplicaRebuildRequired {
             kind: proto::PublicV1RebuildKind::RemoteBuildTarget as i32,
             reason: rebuild_reason_to_proto(*reason) as i32,
@@ -1097,7 +1025,7 @@ fn rebuild_to_proto(
             provider_replica: None,
             local_replica: None,
             local_storage: String::new(),
-            authorization: Some(build_authorization_to_proto(authorization)),
+            build: Some(build_attempt_to_proto(build)),
         },
     }
 }
@@ -1240,28 +1168,6 @@ fn public_v1_completion_from_proto(
             });
         }
     };
-    let (authorization_key_id, authorization_audit_digest) = match (
-        value.authorization_key_id.as_slice(),
-        value.authorization_audit_digest.as_slice(),
-    ) {
-        ([], []) => (None, None),
-        (key_id, audit_digest) => (
-            Some(AuthorizationKeyId::from_bytes(key_id.try_into().map_err(
-                |_| {
-                    WireError::InvalidAuthority(
-                        "public-v1 completion key ID must contain exactly 32 bytes".into(),
-                    )
-                },
-            )?)),
-            Some(SignedAuthorizationAuditDigest::from_bytes(
-                audit_digest.try_into().map_err(|_| {
-                    WireError::InvalidAuthority(
-                        "public-v1 completion audit digest must contain exactly 32 bytes".into(),
-                    )
-                })?,
-            )),
-        ),
-    };
     Ok(PublicV1OperationCompletion {
         operation_id: OperationId::new(value.operation_id),
         revision: value.revision,
@@ -1288,8 +1194,6 @@ fn public_v1_completion_from_proto(
             .map(public_v1_catch_up_mode_from_proto)
             .transpose()?,
         catch_up_specific_quorum: value.catch_up_specific_quorum,
-        authorization_key_id,
-        authorization_audit_digest,
         result,
     })
 }
@@ -1346,12 +1250,6 @@ fn public_v1_completion_to_proto(
             .catch_up_mode
             .map(|mode| public_v1_catch_up_mode_to_proto(mode) as i32),
         catch_up_specific_quorum: value.catch_up_specific_quorum,
-        authorization_key_id: value
-            .authorization_key_id
-            .map_or_else(Vec::new, |key_id| key_id.to_bytes().to_vec()),
-        authorization_audit_digest: value
-            .authorization_audit_digest
-            .map_or_else(Vec::new, |digest| digest.to_bytes().to_vec()),
         result: result as i32,
         detail,
         rebuild_required,
@@ -1703,22 +1601,11 @@ pub fn normalize_agent_status_report(
 
 /// Validates command fencing, policy, and PC/CC relationships.
 pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Result<(), WireError> {
-    if request.command.is_none() {
-        ensure_supported_version(request.protocol_version)?;
-    }
+    ensure_supported_version(request.protocol_version)?;
     let command = request
         .command
         .as_ref()
         .ok_or(WireError::MissingField("execute.command"))?;
-    if let proto::execute_command_request::Command::EnsureReplicaBuild(command) = command {
-        ensure_signed_transport_version(
-            request.protocol_version,
-            !command.build_authorization_v1.is_empty(),
-            "build command",
-        )?;
-    } else {
-        ensure_supported_version(request.protocol_version)?;
-    }
     if request.resource_uid.is_empty() {
         return Err(WireError::MissingField("execute.resource_uid"));
     }
@@ -2250,9 +2137,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 return Err(WireError::MissingField("ensure_build.fence"));
             }
             if command.retire
-                && (command.authority.is_some()
-                    || !command.source_session_id.is_empty()
-                    || !command.build_authorization_v1.is_empty())
+                && (command.authority.is_some() || !command.source_session_id.is_empty())
             {
                 return Err(WireError::InvalidAuthority(
                     "build retirement cannot carry delivery authority".to_string(),
@@ -2282,23 +2167,6 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         "target build command differs from durable build authority".to_string(),
                     ));
                 }
-                let build_authorization =
-                    decode_build_authorization(command.build_authorization_v1.clone())?;
-                #[cfg(feature = "host")]
-                crate::replicator::verify_inbound_build_authorization(
-                    &target,
-                    build_authorization,
-                    Some(&ResourceUid::new(request.resource_uid.clone())),
-                    &OperationId::new(command.operation_id.clone()),
-                    &authority.source,
-                    &target,
-                    authority.current_configuration.epoch,
-                    &ProcessSessionId::new(command.source_session_id.clone()),
-                    &ProcessSessionId::new(request.expected_process_session_id.clone()),
-                )
-                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
-                #[cfg(not(feature = "host"))]
-                let _ = build_authorization;
             } else {
                 if build_target == target {
                     return Err(WireError::InvalidAuthority(
@@ -2308,11 +2176,6 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 if !command.source_session_id.is_empty() {
                     return Err(WireError::InvalidAuthority(
                         "source build command cannot carry a peer session".to_string(),
-                    ));
-                }
-                if !command.build_authorization_v1.is_empty() {
-                    return Err(WireError::InvalidAuthority(
-                        "source build command cannot carry signed target authorization".into(),
                     ));
                 }
             }
@@ -2529,12 +2392,7 @@ pub fn validate_replication_ack(ack: &proto::ReplicationAck) -> Result<(), WireE
 pub fn normalize_replication_item(
     item: proto::ReplicationItem,
 ) -> Result<ReplicationEnvelope, WireError> {
-    let peer_authorization = decode_peer_authorization(item.peer_session_authorization_v1.clone())?;
-    ensure_signed_transport_version(
-        item.protocol_version,
-        peer_authorization.is_some(),
-        "replication item",
-    )?;
+    ensure_supported_version(item.protocol_version)?;
     let sender = item
         .sender
         .ok_or(WireError::MissingField("replication_item.sender"))?
@@ -2567,7 +2425,6 @@ pub fn normalize_replication_item(
         lsn: item.lsn,
         committed_lsn: item.committed_lsn,
         data: item.data,
-        peer_authorization,
     })
 }
 
@@ -2575,12 +2432,7 @@ pub fn normalize_replication_item(
 pub fn normalize_replication_ack(
     ack: proto::ReplicationAck,
 ) -> Result<ReplicationAcknowledgement, WireError> {
-    let peer_authorization = decode_peer_authorization(ack.peer_session_authorization_v1.clone())?;
-    ensure_signed_transport_version(
-        ack.protocol_version,
-        peer_authorization.is_some(),
-        "replication acknowledgement",
-    )?;
+    ensure_supported_version(ack.protocol_version)?;
     let sender = ack
         .sender
         .ok_or(WireError::MissingField("replication_ack.sender"))?
@@ -2618,7 +2470,6 @@ pub fn normalize_replication_ack(
         received_lsn: ack.received_lsn,
         applied_lsn: ack.applied_lsn,
         committed_lsn: ack.committed_lsn,
-        peer_authorization,
     })
 }
 
@@ -2631,12 +2482,7 @@ pub fn validate_copy_ack(ack: &proto::CopyAck) -> Result<(), WireError> {
 }
 
 pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireError> {
-    let build_authorization = decode_build_authorization(item.build_authorization_v1.clone())?;
-    ensure_signed_transport_version(
-        item.protocol_version,
-        build_authorization.is_some(),
-        "copy item",
-    )?;
+    ensure_supported_version(item.protocol_version)?;
     if item.build_id.is_empty() {
         return Err(WireError::MissingField("copy_item.build_id"));
     }
@@ -2693,17 +2539,11 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
         final_item: item.final_item,
         snapshot_chunk: item.snapshot_chunk,
         data: item.data,
-        build_authorization,
     })
 }
 
 pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, WireError> {
-    let build_authorization = decode_build_authorization(ack.build_authorization_v1.clone())?;
-    ensure_signed_transport_version(
-        ack.protocol_version,
-        build_authorization.is_some(),
-        "copy acknowledgement",
-    )?;
+    ensure_supported_version(ack.protocol_version)?;
     if ack.build_id.is_empty() {
         return Err(WireError::MissingField("copy_ack.build_id"));
     }
@@ -2749,7 +2589,6 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
         catch_up_boundary_lsn: ack.catch_up_boundary_lsn,
         final_item: ack.final_item,
         snapshot_chunk: ack.snapshot_chunk,
-        build_authorization,
     })
 }
 

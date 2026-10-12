@@ -25,28 +25,27 @@ pub(super) fn random_bytes() -> Result<[u8; 32]> {
 pub(crate) struct NativeCredential {
     pub host: String,
     pub port: u16,
+    pub user: String,
     pub name: String,
-    pub secret: String,
 }
 
 impl NativeCredential {
     pub fn conninfo(&self) -> Result<String> {
         if self.host.parse::<std::net::IpAddr>().is_err()
             || self.port == 0
+            || self.user.is_empty()
             || self.name.is_empty()
             || self.name.len() > 63
             || !self
                 .name
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            || self.secret.len() != 64
-            || !self.secret.bytes().all(|b| b.is_ascii_hexdigit())
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         {
-            return Err(application_error("invalid signed native connection"));
+            return Err(application_error("invalid public native connection"));
         }
         Ok(format!(
-            "host={} port={} user={} password={} application_name={} sslmode=disable connect_timeout=5",
-            self.host, self.port, self.name, self.secret, self.name
+            "host={} port={} user={} application_name={} sslmode=disable connect_timeout=5",
+            self.host, self.port, self.user, self.name
         ))
     }
 }
@@ -71,12 +70,11 @@ impl NativeGateway {
         build: bool,
         valid: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(Self, NativeCredential)> {
-        let random = random_bytes()?;
         let credential = NativeCredential {
             host: host.into(),
             port: 0,
+            user: whoami::username().unwrap_or_else(|_| "postgres".into()),
             name,
-            secret: random.iter().map(|byte| format!("{byte:02x}")).collect(),
         };
         let listener = TcpListener::bind((host, 0))
             .await
@@ -184,36 +182,20 @@ async fn connection(
                 return Err(io::Error::other("duplicate startup value"));
             }
         }
-        if fields.get("user") != Some(&expected.name.as_str())
+        if fields.get("user") != Some(&expected.user.as_str())
             || fields.get("application_name") != Some(&expected.name.as_str())
             || fields.get("replication") != Some(&"true")
         {
-            return Err(io::Error::other("native authorization binding differs"));
-        }
-        frame(&mut client, b'R', &3u32.to_be_bytes()).await?;
-        if client.read_u8().await? != b'p' {
-            return Err(io::Error::other("native credential required"));
-        }
-        let password = packet(&mut client, 128).await?;
-        let wanted = format!("{}\0", expected.secret);
-        if password.len() != wanted.len()
-            || password
-                .iter()
-                .zip(wanted.bytes())
-                .fold(0, |diff, (a, b)| diff | (a ^ b))
-                != 0
-        {
-            return Err(io::Error::other("invalid native credential"));
+            return Err(io::Error::other("native lifecycle binding differs"));
         }
         // Backend access is Unix-only. The peer never receives backend login
         // credentials or a socket capable of changing its ACK application name.
         let mut backend = UnixStream::connect(socket).await?;
-        let user = whoami::username().unwrap_or_else(|_| "postgres".into());
         let mut startup = 196608u32.to_be_bytes().to_vec();
         startup.extend_from_slice(
             format!(
-                "user\0{user}\0replication\0true\0application_name\0{}\0\0",
-                expected.name
+                "user\0{}\0replication\0true\0application_name\0{}\0\0",
+                expected.user, expected.name
             )
             .as_bytes(),
         );

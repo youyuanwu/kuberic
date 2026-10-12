@@ -2406,7 +2406,6 @@ fn ensure_build_command(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuil
             .source_session_id
             .map_or_else(String::new, |session| session.to_string()),
         retire: command.retire,
-        build_authorization_v1: Vec::new(),
     }
 }
 
@@ -3756,20 +3755,6 @@ pub use public_v1_history::{PublicV1HistoryApi, PublicV1SessionRenewalApi};
 mod public_v1_evidence;
 #[cfg(feature = "runtime-test-bridge")]
 pub use public_v1_evidence::PublicV1EvidenceApi;
-#[cfg(feature = "runtime-test-bridge")]
-mod public_v1_authorization;
-#[cfg(feature = "runtime-test-bridge")]
-pub use public_v1_authorization::{
-    PUBLIC_V1_AUTHORIZATION_GENERATION_LABEL, PUBLIC_V1_AUTHORIZATION_KEY_ID,
-    PUBLIC_V1_AUTHORIZATION_PUBLIC_KEY, PUBLIC_V1_AUTHORIZATION_RESOURCE_UID_LABEL,
-    PUBLIC_V1_AUTHORIZATION_SECRET_TYPE, PUBLIC_V1_AUTHORIZATION_SEED_KEY,
-    PublicV1AuthorizationApi, PublicV1AuthorizationDispatch, PublicV1AuthorizationSecretMaterial,
-    PublicV1AuthorizationSecretOwner, generate_public_v1_authorization_secret,
-    public_v1_authorization_secret_binding,
-    validate_pods_do_not_reference_public_v1_authorization_secret,
-    validate_public_v1_authorization_binding, validate_public_v1_authorization_secret,
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;

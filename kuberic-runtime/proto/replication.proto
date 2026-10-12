@@ -16,7 +16,7 @@ message ReplicationItem {
   ReplicaIdentity receiver = 9;
   string sender_session_id = 10;
   string receiver_session_id = 11;
-  bytes peer_session_authorization_v1 = 12;
+  reserved 12;
 }
 
 message ReplicationAck {
@@ -31,7 +31,7 @@ message ReplicationAck {
   int64 committed_lsn = 9;
   string sender_session_id = 10;
   string receiver_session_id = 11;
-  bytes peer_session_authorization_v1 = 12;
+  reserved 12;
 }
 
 message CopyItem {
@@ -51,7 +51,7 @@ message CopyItem {
   string sender_session_id = 14;
   string receiver_session_id = 15;
   optional int64 catch_up_boundary_lsn = 16;
-  bytes build_authorization_v1 = 17;
+  reserved 17;
 }
 
 message CopyAck {
@@ -69,7 +69,7 @@ message CopyAck {
   string sender_session_id = 12;
   string receiver_session_id = 13;
   optional int64 catch_up_boundary_lsn = 14;
-  bytes build_authorization_v1 = 15;
+  reserved 15;
 }
 
 service ReplicationData {

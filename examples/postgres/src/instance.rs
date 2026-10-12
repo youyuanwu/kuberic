@@ -1292,7 +1292,7 @@ impl PgInstanceManager {
                     "-R",
                     "-w",
                 ]),
-                Some((std::time::Duration::from_secs(60), "signed pg_basebackup")),
+                Some((std::time::Duration::from_secs(60), "public pg_basebackup")),
             )
             .await?;
         if !output.status.success() {
@@ -1303,7 +1303,7 @@ impl PgInstanceManager {
                 .unwrap_or(conninfo);
             let diagnostic = String::from_utf8_lossy(&output.stderr).replace(secret, "[redacted]");
             return Err(
-                PgError::Process(format!("signed pg_basebackup failed: {diagnostic}"))
+                PgError::Process(format!("public pg_basebackup failed: {diagnostic}"))
                     .with_generation(generation.id),
             );
         }

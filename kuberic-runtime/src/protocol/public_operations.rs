@@ -1,21 +1,13 @@
 //! Dormant public-operation preview identities and admission inputs.
 
-use base64::prelude::{BASE64_STANDARD, Engine as _};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
-use crate::protocol::authorization::{
-    AuthorizationAuditDigest as SignedAuthorizationAuditDigest, AuthorizationKeyId,
-    AuthorizationSignature, AuthorizationVerificationKey, BuildAuthorizationClaimsV1,
-    BuildAuthorizationV1, PeerSessionAuthorizationClaimsV1, PeerSessionAuthorizationV1,
-};
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, HistoryContext,
     OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
-    PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole,
-    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
-    derive_data_loss_history,
+    PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole, ReplicaStorageIdentity,
+    ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, derive_data_loss_history,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 pub const PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32 = 10;
 pub const PUBLIC_V1_PREVIEW_PROTOCOL_VERSION: u32 = 11;
@@ -395,7 +387,6 @@ impl PublicOperationIntent {
                 return Err("lifecycle input requires authority operation");
             }
             input.validate_for_preview(public_v1)?;
-            input.validate_authorization_revision(self.revision)?;
             if self.input_digest != input.digest() {
                 return Err("lifecycle digest does not match frozen input");
             }
@@ -434,7 +425,6 @@ impl PublicOperationIntent {
         }
         if let Some(program) = &self.program {
             program.validate(&self.class, &self.operation_id, public_v1)?;
-            program.validate_authorization_revision(self.revision)?;
             if self.input_digest != program.digest() {
                 return Err("program digest does not match frozen input");
             }
@@ -570,10 +560,6 @@ pub struct PublicReplicaDescriptor {
     pub current_progress: i64,
     pub catch_up_capability: i64,
     pub must_catchup: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_authorization: Option<PeerSessionAuthorizationV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configuration_revision: Option<u64>,
 }
 
 impl PublicReplicaDescriptor {
@@ -591,32 +577,6 @@ impl PublicReplicaDescriptor {
         {
             return Err("idle public build descriptor must use invalid progress");
         }
-        match (&self.peer_authorization, self.configuration_revision) {
-            (Some(authorization), Some(revision)) => {
-                authorization
-                    .claims
-                    .validate()
-                    .map_err(|_| "invalid peer-session authorization claims")?;
-                if revision == 0
-                    || authorization.claims.configuration_revision != revision
-                    || authorization.claims.secondary.replica != self.identity
-                    || authorization.claims.secondary.process_session_id != self.process_session_id
-                    || authorization.claims.secondary.replication_address
-                        != self.replication_address
-                    || authorization.claims.secondary.role != self.role
-                    || self.role != ReplicaRole::ActiveSecondary
-                    || !self.build_id.is_empty()
-                {
-                    return Err("peer authorization differs from the active remote descriptor");
-                }
-            }
-            (None, None) => {}
-            _ => {
-                return Err(
-                    "peer authorization and configuration revision must be present together",
-                );
-            }
-        }
         Ok(())
     }
 
@@ -626,26 +586,7 @@ impl PublicReplicaDescriptor {
         previous: Option<&ConfigurationDescriptor>,
     ) -> Result<(), &'static str> {
         self.validate()?;
-        let Some(authorization) = &self.peer_authorization else {
-            return Ok(());
-        };
-        let primary = current
-            .members
-            .iter()
-            .find(|member| {
-                member.identity.replica_id == current.primary_id
-                    && member.role == ReplicaRole::Primary
-            })
-            .ok_or("public configuration lacks its exact primary")?;
-        if authorization.claims.epoch != current.epoch
-            || authorization.claims.current_configuration_id != current.configuration_id
-            || authorization.claims.previous_configuration_id
-                != previous.map(|configuration| configuration.configuration_id.clone())
-            || authorization.claims.primary.replica != primary.identity
-            || authorization.claims.primary.role != ReplicaRole::Primary
-        {
-            return Err("peer authorization differs from the exact PC/CC descriptor");
-        }
+        let _ = (current, previous);
         Ok(())
     }
 }
@@ -668,122 +609,54 @@ pub fn validate_progress_value(progress: i64) -> Result<(), &'static str> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-pub struct AuthorizationAuditDigest(pub String);
-
-impl AuthorizationAuditDigest {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        CanonicalOperationInputDigestV1 {
-            sha256: self.0.clone(),
-        }
-        .validate()
-        .map_err(|_| "authorization audit digest is not lowercase SHA-256")
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct PublicBuildAuthorizationReference {
+pub struct PublicBuildAttemptReference {
     pub resource_uid: ResourceUid,
     pub epoch: Epoch,
     pub build_id: OperationId,
     pub source: ReplicaIdentity,
-    pub source_storage: PvcUid,
     pub source_session: ProcessSessionId,
     pub target: ReplicaIdentity,
-    pub target_storage: PvcUid,
     pub target_session: ProcessSessionId,
-    pub audit_digest: AuthorizationAuditDigest,
 }
 
-impl PublicBuildAuthorizationReference {
+impl PublicBuildAttemptReference {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.resource_uid.is_empty()
             || self.build_id.is_empty()
-            || self.source_storage.is_empty()
-            || self.target_storage.is_empty()
             || self.source_session.is_empty()
             || self.target_session.is_empty()
+            || self.epoch.data_loss_number < 0
+            || self.epoch.configuration_number < 0
         {
-            return Err("public build authorization reference is incomplete");
-        }
-        if self.epoch.data_loss_number < 0 || self.epoch.configuration_number < 0 {
-            return Err("public build authorization epoch is invalid");
+            return Err("public build attempt reference is incomplete");
         }
         validate_exact_replica_identity(&self.source)?;
-        validate_exact_replica_identity(&self.target)?;
-        self.audit_digest.validate()
+        validate_exact_replica_identity(&self.target)
     }
-}
-
-fn validate_signed_build_reference(
-    reference: &PublicBuildAuthorizationReference,
-    authorization: &BuildAuthorizationV1,
-) -> Result<(), &'static str> {
-    let claims = &authorization.claims;
-    let ReplicaStorageIdentity::Persistent {
-        pvc_uid: source_storage,
-        ..
-    } = &claims.source.storage_incarnation.storage
-    else {
-        return Err("signed build source storage is not persistent");
-    };
-    let ReplicaStorageIdentity::Persistent {
-        pvc_uid: target_storage,
-        ..
-    } = &claims.target.storage_incarnation.storage
-    else {
-        return Err("signed build target storage is not persistent");
-    };
-    let audit_digest = authorization
-        .audit_digest()
-        .map_err(|_| "invalid signed build authorization envelope")?
-        .to_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if reference.resource_uid != claims.resource_uid
-        || reference.epoch != claims.epoch
-        || reference.build_id != claims.build_id
-        || reference.source != claims.source.storage_incarnation.replica
-        || reference.source_storage != *source_storage
-        || reference.source_session != claims.source.process_session_id
-        || reference.target != claims.target.storage_incarnation.replica
-        || reference.target_storage != *target_storage
-        || reference.target_session != claims.target.process_session_id
-        || reference.audit_digest.0 != audit_digest
-    {
-        return Err("public build reference differs from the signed authorization");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PublicBuildInput {
     pub attempt: OperationId,
+    pub epoch: Epoch,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
     pub replication_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryContext>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization: Option<PublicBuildAuthorizationReference>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization_verification_key: Option<AuthorizationVerificationKey>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_authorization: Option<BuildAuthorizationV1>,
 }
 
 impl PublicBuildInput {
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn same_attempt_as(&self, other: &Self) -> bool {
         self.attempt == other.attempt
+            && self.epoch == other.epoch
             && self.replica == other.replica
             && self.process_session_id == other.process_session_id
             && self.replication_address == other.replication_address
             && self.history == other.history
-            && self.authorization == other.authorization
     }
 }
 
@@ -877,10 +750,6 @@ impl PublicOperationProgram {
             }
             Self::Build(build) | Self::Remove(build) => {
                 build.history.as_ref() == Some(expected_history)
-                    && build
-                        .authorization
-                        .as_ref()
-                        .is_none_or(|authorization| matches(authorization.epoch))
             }
             Self::Open { .. } | Self::Progress { .. } | Self::Close | Self::Abort => true,
         };
@@ -937,19 +806,12 @@ impl PublicOperationProgram {
             }
             Self::Build(build) | Self::Remove(build) => {
                 if build.attempt.is_empty()
+                    || build.epoch.data_loss_number < 0
+                    || build.epoch.configuration_number < 0
                     || build.process_session_id.is_empty()
                     || build.replication_address.is_empty()
                 {
                     return Err("incomplete exact build identity");
-                }
-                if !public_v1 && build.authorization.is_some() {
-                    return Err("protocol-10 build cannot carry public-v1 authorization");
-                }
-                if !public_v1 && build.build_authorization.is_some() {
-                    return Err("protocol-10 build cannot carry signed authorization");
-                }
-                if !public_v1 && build.authorization_verification_key.is_some() {
-                    return Err("protocol-10 build cannot carry authorization trust");
                 }
                 if public_v1 {
                     let history = build
@@ -957,52 +819,11 @@ impl PublicOperationProgram {
                         .as_ref()
                         .ok_or("public-v1 build lacks exact history")?;
                     history.validate()?;
+                    if build.epoch.data_loss_number != history.data_loss_number {
+                        return Err("public-v1 build epoch differs from exact history");
+                    }
                 } else if build.history.is_some() {
                     return Err("protocol-10 build cannot carry public-v1 history");
-                }
-                if let Some(authorization) = &build.authorization {
-                    authorization.validate()?;
-                    if authorization.build_id != build.attempt
-                        || authorization.target != build.replica
-                        || authorization.target_session != build.process_session_id
-                    {
-                        return Err("build input differs from captured authorization claims");
-                    }
-                }
-                if let Some(authorization) = &build.build_authorization {
-                    let verification_key = build
-                        .authorization_verification_key
-                        .as_ref()
-                        .ok_or("signed build authorization lacks its verification key")?;
-                    authorization
-                        .claims
-                        .validate()
-                        .map_err(|_| "invalid signed build authorization claims")?;
-                    verification_key
-                        .verify_build_authorization(authorization)
-                        .map_err(|_| "signed build authorization signature is invalid")?;
-                    if matches!(self, Self::Remove(_)) {
-                        return Err("remove operation cannot carry signed build authorization");
-                    }
-                    if authorization.claims.operation_id != *id
-                        || authorization.claims.build_id != build.attempt
-                        || authorization.claims.target.storage_incarnation.replica != build.replica
-                        || authorization.claims.target.process_session_id
-                            != build.process_session_id
-                        || authorization.claims.target.replication_address
-                            != build.replication_address
-                        || authorization.claims.target.role != ReplicaRole::IdleSecondary
-                        || build.history.as_ref() != Some(&authorization.claims.history)
-                    {
-                        return Err(
-                            "signed build authorization differs from the idle target input",
-                        );
-                    }
-                    if let Some(reference) = &build.authorization {
-                        validate_signed_build_reference(reference, authorization)?;
-                    }
-                } else if build.authorization_verification_key.is_some() {
-                    return Err("authorization verification key lacks a signed build envelope");
                 }
                 if matches!(self, Self::Build(_)) {
                     if &build.attempt != id {
@@ -1025,34 +846,6 @@ impl PublicOperationProgram {
             return Err("program does not match operation class");
         }
         Ok(())
-    }
-
-    fn validate_authorization_revision(&self, revision: u64) -> Result<(), &'static str> {
-        let validate = |configuration: &PublicConfiguration| {
-            configuration.replicas.iter().try_for_each(|replica| {
-                if replica.peer_authorization.is_some()
-                    && replica.configuration_revision != Some(revision)
-                {
-                    Err("peer authorization revision differs from the operation revision")
-                } else {
-                    Ok(())
-                }
-            })
-        };
-        match self {
-            Self::Configuration(configuration) | Self::CatchUp { configuration, .. } => {
-                validate(configuration)
-            }
-            Self::Swap {
-                starting,
-                refreshed,
-                ..
-            } => {
-                validate(starting)?;
-                validate(refreshed)
-            }
-            _ => Ok(()),
-        }
     }
 
     fn encode(&self, encoder: &mut CanonicalEncoder) {
@@ -1370,8 +1163,7 @@ impl ProcessSessionRenewalRequired {
             _ => {}
         }
 
-        let replacement_required =
-            self.reason != ProcessSessionRenewalReason::PeerAuthorizationWithdrawal;
+        let replacement_required = self.reason != ProcessSessionRenewalReason::PeerWithdrawal;
         if self.replacement.is_some() != replacement_required {
             return Err("process-session renewal replacement shape differs from its reason");
         }
@@ -2042,18 +1834,6 @@ impl PublicLifecycleInput {
         self.validate_for_preview(true)
     }
 
-    fn validate_authorization_revision(&self, revision: u64) -> Result<(), &'static str> {
-        self.replicas.iter().try_for_each(|replica| {
-            if replica.peer_authorization.is_some()
-                && replica.configuration_revision != Some(revision)
-            {
-                Err("peer authorization revision differs from the lifecycle revision")
-            } else {
-                Ok(())
-            }
-        })
-    }
-
     fn validate_for_preview(&self, public_v1: bool) -> Result<(), &'static str> {
         if self.current.epoch != self.epoch {
             return Err("lifecycle epoch does not match configuration");
@@ -2179,7 +1959,9 @@ pub struct LocalProviderRebuildRequired {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteBuildTargetRebuildRequired {
     pub reason: ReplicaRebuildReason,
-    pub authorization: PublicBuildAuthorizationReference,
+    pub epoch: Epoch,
+    pub target: ReplicaIdentity,
+    pub target_session: ProcessSessionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2229,7 +2011,7 @@ pub enum CanonicalReplicaRebuildRequired {
     RemoteBuildTarget {
         reason: ReplicaRebuildReason,
         operation: CapturedPublicOperationIdentity,
-        authorization: PublicBuildAuthorizationReference,
+        build: PublicBuildAttemptReference,
     },
 }
 
@@ -2251,17 +2033,15 @@ impl CanonicalReplicaRebuildRequired {
                 }
             }
             Self::RemoteBuildTarget {
-                operation,
-                authorization,
-                ..
+                operation, build, ..
             } => {
                 operation.validate()?;
-                authorization.validate()?;
-                if authorization.resource_uid != operation.resource_uid
-                    || authorization.epoch != operation.epoch
-                    || authorization.build_id != operation.operation_id
+                build.validate()?;
+                if build.resource_uid != operation.resource_uid
+                    || build.epoch != operation.epoch
+                    || build.build_id != operation.operation_id
                 {
-                    return Err("remote rebuild authorization differs from captured operation");
+                    return Err("remote rebuild attempt differs from captured operation");
                 }
             }
         }
@@ -2295,9 +2075,8 @@ impl CanonicalReplicaRebuildRequired {
             Self::LocalProvider { local_replica, .. } if local_replica != report_replica => {
                 Err("local rebuild evidence differs from the reporting replica")
             }
-            Self::RemoteBuildTarget { authorization, .. }
-                if &authorization.source != report_replica
-                    || &authorization.source_session != report_session =>
+            Self::RemoteBuildTarget { build, .. }
+                if &build.source != report_replica || &build.source_session != report_session =>
             {
                 Err("remote rebuild source differs from the reporting replica")
             }
@@ -2400,10 +2179,6 @@ pub struct PublicV1OperationCompletion {
     pub catch_up_mode: Option<PublicCatchUpMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catch_up_specific_quorum: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization_key_id: Option<AuthorizationKeyId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization_audit_digest: Option<SignedAuthorizationAuditDigest>,
     pub result: PublicV1OperationResult,
 }
 
@@ -2431,7 +2206,6 @@ impl PublicV1OperationCompletion {
                 .current_configuration_id
                 .as_ref()
                 .is_some_and(ConfigurationId::is_empty)
-            || self.authorization_key_id.is_some() != self.authorization_audit_digest.is_some()
         {
             return Err("public-v1 operation completion authority metadata is incomplete");
         }
@@ -2501,660 +2275,11 @@ impl PublicV1ExtensionSlot {
     }
 }
 
-pub const MAX_PUBLIC_V1_AUTHORIZATION_INTENTS: usize = 16;
-pub const MAX_PUBLIC_V1_BUILD_AUTHORIZATION_INTENTS: usize = 8;
-pub const MAX_PUBLIC_V1_PEER_AUTHORIZATION_INTENTS: usize = 8;
-const MAX_PUBLIC_V1_AUTHORIZATION_CANONICAL_BYTES: usize = 16 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PublicV1AuthorizationSecretBinding {
-    #[schemars(length(min = 1, max = 253))]
-    pub name: String,
-    #[schemars(length(min = 1, max = 256))]
-    pub uid: String,
-    #[schemars(length(min = 1, max = 256))]
-    pub resource_version: String,
-    pub resource_uid: ResourceUid,
-    pub generation: PublicProtocolGeneration,
-    pub key_id: AuthorizationKeyId,
-    pub verification_key: AuthorizationVerificationKey,
-}
-
-impl PublicV1AuthorizationSecretBinding {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.name.is_empty()
-            || self.name.len() > 253
-            || self.uid.is_empty()
-            || self.uid.len() > 256
-            || self.resource_version.is_empty()
-            || self.resource_version.len() > 256
-            || self.resource_uid.is_empty()
-            || self.generation.value() == 0
-        {
-            return Err("public-v1 authorization Secret binding is incomplete");
-        }
-        if self.key_id != self.verification_key.key_id() {
-            return Err("public-v1 authorization Secret binding key ID is invalid");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum PublicV1AuthorizationIntentKind {
-    Build,
-    Peer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum PublicV1AuthorizationIntentScope {
-    Build,
-    CurrentPeer,
-    PreviousPeer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum PublicV1AuthorizationIntentStage {
-    Prepared,
-    Signed,
-    Dispatched,
-    Observed,
-    Retired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum PublicV1AuthorizationCleanupDisposition {
-    RetainUntilSuperseded,
-    RetireAfterObservation,
-    Retired,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PublicV1AuthorizationClaims {
-    pub kind: PublicV1AuthorizationIntentKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<Box<BuildAuthorizationClaimsV1>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<Box<PeerSessionAuthorizationClaimsV1>>,
-}
-
-impl PublicV1AuthorizationClaims {
-    pub fn build(claims: BuildAuthorizationClaimsV1) -> Self {
-        Self {
-            kind: PublicV1AuthorizationIntentKind::Build,
-            build: Some(Box::new(claims)),
-            peer: None,
-        }
-    }
-
-    pub fn peer(claims: PeerSessionAuthorizationClaimsV1) -> Self {
-        Self {
-            kind: PublicV1AuthorizationIntentKind::Peer,
-            build: None,
-            peer: Some(Box::new(claims)),
-        }
-    }
-
-    pub const fn kind(&self) -> PublicV1AuthorizationIntentKind {
-        self.kind
-    }
-
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, &'static str> {
-        match (self.kind, self.build.as_deref(), self.peer.as_deref()) {
-            (PublicV1AuthorizationIntentKind::Build, Some(claims), None) => claims
-                .canonical_bytes()
-                .map_err(|_| "invalid public-v1 build authorization claims"),
-            (PublicV1AuthorizationIntentKind::Peer, None, Some(claims)) => claims
-                .canonical_bytes()
-                .map_err(|_| "invalid public-v1 peer authorization claims"),
-            _ => Err("public-v1 authorization claims kind is inconsistent"),
-        }
-    }
-
-    fn validate(&self) -> Result<(), &'static str> {
-        match (self.kind, self.build.as_deref(), self.peer.as_deref()) {
-            (PublicV1AuthorizationIntentKind::Build, Some(claims), None) => claims
-                .validate()
-                .map_err(|_| "invalid public-v1 build authorization claims"),
-            (PublicV1AuthorizationIntentKind::Peer, None, Some(claims)) => claims
-                .validate()
-                .map_err(|_| "invalid public-v1 peer authorization claims"),
-            _ => Err("public-v1 authorization claims kind is inconsistent"),
-        }
-    }
-
-    fn resource_uid(&self) -> &ResourceUid {
-        self.build
-            .as_deref()
-            .map(|claims| &claims.resource_uid)
-            .or_else(|| self.peer.as_deref().map(|claims| &claims.resource_uid))
-            .expect("validated public-v1 authorization claims")
-    }
-
-    fn generation(&self) -> PublicProtocolGeneration {
-        self.build
-            .as_deref()
-            .map(|claims| claims.protocol_generation)
-            .or_else(|| {
-                self.peer
-                    .as_deref()
-                    .map(|claims| claims.protocol_generation)
-            })
-            .expect("validated public-v1 authorization claims")
-    }
-
-    fn key_id(&self) -> AuthorizationKeyId {
-        self.build
-            .as_deref()
-            .map(|claims| claims.key_id)
-            .or_else(|| self.peer.as_deref().map(|claims| claims.key_id))
-            .expect("validated public-v1 authorization claims")
-    }
-
-    fn history(&self) -> &HistoryContext {
-        self.build
-            .as_deref()
-            .map(|claims| &claims.history)
-            .or_else(|| self.peer.as_deref().map(|claims| &claims.history))
-            .expect("validated public-v1 authorization claims")
-    }
-
-    pub fn build_target(&self) -> Option<&ReplicaIdentity> {
-        self.build.as_deref().map(|claims| claims.target.replica())
-    }
-
-    pub fn peer_secondary(&self) -> Option<&ReplicaIdentity> {
-        self.peer.as_deref().map(|claims| &claims.secondary.replica)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PublicV1AuthorizationEnvelope {
-    pub kind: PublicV1AuthorizationIntentKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<Box<BuildAuthorizationV1>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<Box<PeerSessionAuthorizationV1>>,
-}
-
-impl PublicV1AuthorizationEnvelope {
-    pub fn build(authorization: BuildAuthorizationV1) -> Self {
-        Self {
-            kind: PublicV1AuthorizationIntentKind::Build,
-            build: Some(Box::new(authorization)),
-            peer: None,
-        }
-    }
-
-    pub fn peer(authorization: PeerSessionAuthorizationV1) -> Self {
-        Self {
-            kind: PublicV1AuthorizationIntentKind::Peer,
-            build: None,
-            peer: Some(Box::new(authorization)),
-        }
-    }
-
-    pub const fn kind(&self) -> PublicV1AuthorizationIntentKind {
-        self.kind
-    }
-
-    fn validate_shape(&self) -> Result<(), &'static str> {
-        match (self.kind, self.build.as_ref(), self.peer.as_ref()) {
-            (PublicV1AuthorizationIntentKind::Build, Some(_), None)
-            | (PublicV1AuthorizationIntentKind::Peer, None, Some(_)) => Ok(()),
-            _ => Err("public-v1 authorization envelope kind is inconsistent"),
-        }
-    }
-
-    pub fn claims(&self) -> Result<PublicV1AuthorizationClaims, &'static str> {
-        match (self.kind, self.build.as_deref(), self.peer.as_deref()) {
-            (PublicV1AuthorizationIntentKind::Build, Some(authorization), None) => Ok(
-                PublicV1AuthorizationClaims::build(authorization.claims.clone()),
-            ),
-            (PublicV1AuthorizationIntentKind::Peer, None, Some(authorization)) => Ok(
-                PublicV1AuthorizationClaims::peer(authorization.claims.clone()),
-            ),
-            _ => Err("public-v1 authorization envelope kind is inconsistent"),
-        }
-    }
-
-    pub fn signature(&self) -> Result<AuthorizationSignature, &'static str> {
-        self.build
-            .as_deref()
-            .map(|authorization| authorization.signature)
-            .or_else(|| {
-                self.peer
-                    .as_deref()
-                    .map(|authorization| authorization.signature)
-            })
-            .ok_or("public-v1 authorization envelope kind is inconsistent")
-    }
-
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, &'static str> {
-        match (self.kind, self.build.as_deref(), self.peer.as_deref()) {
-            (PublicV1AuthorizationIntentKind::Build, Some(authorization), None) => authorization
-                .canonical_bytes()
-                .map_err(|_| "invalid public-v1 build authorization envelope"),
-            (PublicV1AuthorizationIntentKind::Peer, None, Some(authorization)) => authorization
-                .canonical_bytes()
-                .map_err(|_| "invalid public-v1 peer authorization envelope"),
-            _ => Err("public-v1 authorization envelope kind is inconsistent"),
-        }
-    }
-
-    pub fn audit_digest(&self) -> Result<SignedAuthorizationAuditDigest, &'static str> {
-        match (self.kind, self.build.as_deref(), self.peer.as_deref()) {
-            (PublicV1AuthorizationIntentKind::Build, Some(authorization), None) => authorization
-                .audit_digest()
-                .map_err(|_| "invalid public-v1 build authorization envelope"),
-            (PublicV1AuthorizationIntentKind::Peer, None, Some(authorization)) => authorization
-                .audit_digest()
-                .map_err(|_| "invalid public-v1 peer authorization envelope"),
-            _ => Err("public-v1 authorization envelope kind is inconsistent"),
-        }
-    }
-
-    fn verify(&self, verification_key: &AuthorizationVerificationKey) -> Result<(), &'static str> {
-        match (self.kind, self.build.as_deref(), self.peer.as_deref()) {
-            (PublicV1AuthorizationIntentKind::Build, Some(authorization), None) => authorization
-                .verify(verification_key)
-                .map_err(|_| "invalid public-v1 build authorization envelope"),
-            (PublicV1AuthorizationIntentKind::Peer, None, Some(authorization)) => authorization
-                .verify(verification_key)
-                .map_err(|_| "invalid public-v1 peer authorization envelope"),
-            _ => Err("public-v1 authorization envelope kind is inconsistent"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PublicV1AuthorizationIntent {
-    pub kind: PublicV1AuthorizationIntentKind,
-    pub scope: PublicV1AuthorizationIntentScope,
-    pub operation_id: OperationId,
-    pub revision: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claims: Option<PublicV1AuthorizationClaims>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(min = 1, max = 21848))]
-    pub canonical_claims_base64: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub envelope: Option<PublicV1AuthorizationEnvelope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<AuthorizationSignature>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audit_digest: Option<SignedAuthorizationAuditDigest>,
-    pub stage: PublicV1AuthorizationIntentStage,
-    pub cleanup_disposition: PublicV1AuthorizationCleanupDisposition,
-}
-
-impl PublicV1AuthorizationIntent {
-    pub fn prepared(
-        scope: PublicV1AuthorizationIntentScope,
-        operation_id: OperationId,
-        revision: u64,
-        claims: PublicV1AuthorizationClaims,
-        cleanup_disposition: PublicV1AuthorizationCleanupDisposition,
-    ) -> Result<Self, &'static str> {
-        if cleanup_disposition == PublicV1AuthorizationCleanupDisposition::Retired {
-            return Err("prepared public-v1 authorization cannot already be retired");
-        }
-        let canonical_claims = claims.canonical_bytes()?;
-        if canonical_claims.len() > MAX_PUBLIC_V1_AUTHORIZATION_CANONICAL_BYTES {
-            return Err("public-v1 authorization claims exceed the accepted bound");
-        }
-        let intent = Self {
-            kind: claims.kind(),
-            scope,
-            operation_id,
-            revision,
-            claims: Some(claims),
-            canonical_claims_base64: Some(BASE64_STANDARD.encode(canonical_claims)),
-            envelope: None,
-            signature: None,
-            audit_digest: None,
-            stage: PublicV1AuthorizationIntentStage::Prepared,
-            cleanup_disposition,
-        };
-        intent.validate(None)?;
-        Ok(intent)
-    }
-
-    pub fn validate(
-        &self,
-        binding: Option<&PublicV1AuthorizationSecretBinding>,
-    ) -> Result<(), &'static str> {
-        let valid_scope = matches!(
-            (self.kind, self.scope),
-            (
-                PublicV1AuthorizationIntentKind::Build,
-                PublicV1AuthorizationIntentScope::Build
-            ) | (
-                PublicV1AuthorizationIntentKind::Peer,
-                PublicV1AuthorizationIntentScope::CurrentPeer
-                    | PublicV1AuthorizationIntentScope::PreviousPeer
-            )
-        );
-        if self.operation_id.is_empty() || self.revision == 0 || !valid_scope {
-            return Err("public-v1 authorization intent identity is incomplete");
-        }
-        match self.stage {
-            PublicV1AuthorizationIntentStage::Prepared => {
-                self.validate_active_claims(binding)?;
-                if self.envelope.is_some()
-                    || self.signature.is_some()
-                    || self.audit_digest.is_some()
-                    || self.cleanup_disposition == PublicV1AuthorizationCleanupDisposition::Retired
-                {
-                    return Err("prepared public-v1 authorization contains signed authority");
-                }
-            }
-            PublicV1AuthorizationIntentStage::Signed
-            | PublicV1AuthorizationIntentStage::Dispatched
-            | PublicV1AuthorizationIntentStage::Observed => {
-                let claims = self.validate_active_claims(binding)?;
-                let binding =
-                    binding.ok_or("signed public-v1 authorization lacks its Secret binding")?;
-                let envelope = self
-                    .envelope
-                    .as_ref()
-                    .ok_or("signed public-v1 authorization lacks its envelope")?;
-                envelope.validate_shape()?;
-                if envelope.kind() != self.kind
-                    || envelope.claims()? != *claims
-                    || self.signature != Some(envelope.signature()?)
-                    || self.audit_digest != Some(envelope.audit_digest()?)
-                {
-                    return Err("signed public-v1 authorization differs from its exact envelope");
-                }
-                envelope.verify(&binding.verification_key)?;
-                if self.cleanup_disposition == PublicV1AuthorizationCleanupDisposition::Retired {
-                    return Err("active public-v1 authorization has a retired disposition");
-                }
-            }
-            PublicV1AuthorizationIntentStage::Retired => {
-                if self.cleanup_disposition != PublicV1AuthorizationCleanupDisposition::Retired {
-                    return Err("public-v1 authorization retirement disposition is inconsistent");
-                }
-                if self.claims.is_some()
-                    || self.canonical_claims_base64.is_some()
-                    || self.envelope.is_some()
-                    || self.signature.is_some()
-                {
-                    return Err("retired public-v1 authorization must retain audit identity only");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_active_claims(
-        &self,
-        binding: Option<&PublicV1AuthorizationSecretBinding>,
-    ) -> Result<&PublicV1AuthorizationClaims, &'static str> {
-        let claims = self
-            .claims
-            .as_ref()
-            .ok_or("active public-v1 authorization lacks typed claims")?;
-        let canonical_claims_base64 = self
-            .canonical_claims_base64
-            .as_ref()
-            .ok_or("active public-v1 authorization lacks canonical claims")?;
-        if self.kind != claims.kind() {
-            return Err("public-v1 authorization intent kind differs from its claims");
-        }
-        claims.validate()?;
-        let canonical_claims = BASE64_STANDARD
-            .decode(canonical_claims_base64)
-            .map_err(|_| "public-v1 authorization claims are not canonical base64")?;
-        if canonical_claims.len() > MAX_PUBLIC_V1_AUTHORIZATION_CANONICAL_BYTES
-            || BASE64_STANDARD.encode(&canonical_claims) != *canonical_claims_base64
-            || canonical_claims != claims.canonical_bytes()?
-        {
-            return Err("public-v1 authorization claims differ from their canonical bytes");
-        }
-        if let Some(binding) = binding
-            && (claims.resource_uid() != &binding.resource_uid
-                || claims.generation() != binding.generation
-                || claims.key_id() != binding.key_id)
-        {
-            return Err("public-v1 authorization claims differ from the Secret binding");
-        }
-        Ok(claims)
-    }
-
-    pub fn is_successor_of(&self, previous: &Self) -> bool {
-        let identity_matches = self.kind == previous.kind
-            && self.scope == previous.scope
-            && self.operation_id == previous.operation_id
-            && self.revision == previous.revision
-            && (self.cleanup_disposition == previous.cleanup_disposition
-                || self.stage == PublicV1AuthorizationIntentStage::Retired
-                    && self.cleanup_disposition
-                        == PublicV1AuthorizationCleanupDisposition::Retired);
-        if !identity_matches {
-            return false;
-        }
-        let valid_transition = matches!(
-            (previous.stage, self.stage),
-            (
-                PublicV1AuthorizationIntentStage::Prepared,
-                PublicV1AuthorizationIntentStage::Signed
-            ) | (
-                PublicV1AuthorizationIntentStage::Signed,
-                PublicV1AuthorizationIntentStage::Dispatched
-            ) | (
-                PublicV1AuthorizationIntentStage::Dispatched,
-                PublicV1AuthorizationIntentStage::Observed
-            ) | (
-                PublicV1AuthorizationIntentStage::Observed,
-                PublicV1AuthorizationIntentStage::Retired
-            ) | (
-                PublicV1AuthorizationIntentStage::Prepared
-                    | PublicV1AuthorizationIntentStage::Signed
-                    | PublicV1AuthorizationIntentStage::Dispatched,
-                PublicV1AuthorizationIntentStage::Retired
-            )
-        );
-        if !valid_transition {
-            return false;
-        }
-        if self.stage == PublicV1AuthorizationIntentStage::Retired {
-            self.claims.is_none()
-                && self.canonical_claims_base64.is_none()
-                && self.envelope.is_none()
-                && self.signature.is_none()
-                && self.audit_digest == previous.audit_digest
-        } else {
-            let claims_match = self.claims == previous.claims
-                && self.canonical_claims_base64 == previous.canonical_claims_base64;
-            claims_match
-                && (previous.stage == PublicV1AuthorizationIntentStage::Prepared
-                    && self.stage == PublicV1AuthorizationIntentStage::Signed
-                    || self.envelope == previous.envelope
-                        && self.signature == previous.signature
-                        && self.audit_digest == previous.audit_digest)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PublicV1AuthorizationStatus {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret_binding: Option<PublicV1AuthorizationSecretBinding>,
-    #[serde(default)]
-    #[schemars(length(max = 16))]
-    pub intents: Vec<PublicV1AuthorizationIntent>,
-}
-
-impl PublicV1AuthorizationStatus {
-    pub fn validate(
-        &self,
-        identity: &PublicOperationPreviewIdentity,
-        history: &HistoryContext,
-    ) -> Result<(), &'static str> {
-        if !identity.is_public_v1() {
-            return Err("public-v1 authorization requires protocol 11");
-        }
-        history.validate()?;
-        if self.intents.len() > MAX_PUBLIC_V1_AUTHORIZATION_INTENTS {
-            return Err("public-v1 authorization intent retention exceeds the accepted bound");
-        }
-        let Some(binding) = &self.secret_binding else {
-            if self.intents.is_empty() {
-                return Ok(());
-            }
-            return Err("public-v1 authorization intents lack a Secret binding");
-        };
-        binding.validate()?;
-        if binding.resource_uid != history.resource_uid
-            || binding.generation.value() != identity.generation
-            || binding.generation != history.protocol_generation
-        {
-            return Err("public-v1 authorization Secret binding differs from accepted history");
-        }
-
-        let mut operations = std::collections::BTreeSet::new();
-        let mut build_targets = std::collections::BTreeSet::new();
-        let mut current_peers = std::collections::BTreeSet::new();
-        let mut previous_peers = std::collections::BTreeSet::new();
-        let mut active_builds = 0;
-        let mut active_current_peers = 0;
-        let mut active_previous_peers = 0;
-        for intent in &self.intents {
-            intent.validate(Some(binding))?;
-            if !operations.insert(&intent.operation_id) {
-                return Err("retired public-v1 authorization intents are inconsistent");
-            }
-            if intent.stage == PublicV1AuthorizationIntentStage::Retired {
-                continue;
-            }
-            let claims = intent
-                .claims
-                .as_ref()
-                .ok_or("active public-v1 authorization lacks typed claims")?;
-            if claims.history() != history {
-                return Err("active public-v1 authorization history is stale");
-            }
-            match intent.scope {
-                PublicV1AuthorizationIntentScope::Build => {
-                    active_builds += 1;
-                    if !build_targets.insert(
-                        intent
-                            .claims
-                            .as_ref()
-                            .ok_or("build authorization lacks claims")?
-                            .build_target()
-                            .ok_or("build authorization lacks a target")?,
-                    ) {
-                        return Err(
-                            "public-v1 build authorization intents are duplicated or inconsistent",
-                        );
-                    }
-                }
-                PublicV1AuthorizationIntentScope::CurrentPeer => {
-                    active_current_peers += 1;
-                    if !current_peers.insert(
-                        intent
-                            .claims
-                            .as_ref()
-                            .ok_or("peer authorization lacks claims")?
-                            .peer_secondary()
-                            .ok_or("peer authorization lacks a secondary")?,
-                    ) {
-                        return Err(
-                            "public-v1 peer authorization intents are duplicated or inconsistent",
-                        );
-                    }
-                }
-                PublicV1AuthorizationIntentScope::PreviousPeer => {
-                    active_previous_peers += 1;
-                    if !previous_peers.insert(
-                        intent
-                            .claims
-                            .as_ref()
-                            .ok_or("peer authorization lacks claims")?
-                            .peer_secondary()
-                            .ok_or("peer authorization lacks a secondary")?,
-                    ) {
-                        return Err(
-                            "public-v1 peer authorization intents are duplicated or inconsistent",
-                        );
-                    }
-                }
-            }
-        }
-        if active_builds > MAX_PUBLIC_V1_BUILD_AUTHORIZATION_INTENTS
-            || active_current_peers > MAX_PUBLIC_V1_PEER_AUTHORIZATION_INTENTS
-            || active_previous_peers > MAX_PUBLIC_V1_PEER_AUTHORIZATION_INTENTS
-        {
-            return Err("active public-v1 authorization intents exceed their accepted bound");
-        }
-        Ok(())
-    }
-
-    pub fn find_intent(&self, operation_id: &OperationId) -> Option<&PublicV1AuthorizationIntent> {
-        self.intents
-            .iter()
-            .find(|intent| &intent.operation_id == operation_id)
-    }
-
-    pub fn is_successor_of(&self, previous: &Self) -> bool {
-        if self.secret_binding != previous.secret_binding {
-            return previous.secret_binding.is_none()
-                && self.secret_binding.is_some()
-                && previous.intent_count() == 0
-                && self.intent_count() == 0;
-        }
-        if self.intent_count() > previous.intent_count() + 1 {
-            return false;
-        }
-        for previous_intent in previous.intents() {
-            let Some(next_intent) = self.find_intent(&previous_intent.operation_id) else {
-                if previous_intent.stage == PublicV1AuthorizationIntentStage::Retired {
-                    continue;
-                }
-                return false;
-            };
-            if next_intent != previous_intent && !next_intent.is_successor_of(previous_intent) {
-                return false;
-            }
-        }
-        self.intents().all(|next_intent| {
-            previous
-                .find_intent(&next_intent.operation_id)
-                .is_some_and(|previous_intent| {
-                    next_intent == previous_intent || next_intent.is_successor_of(previous_intent)
-                })
-                || next_intent.stage == PublicV1AuthorizationIntentStage::Prepared
-        })
-    }
-
-    fn intent_count(&self) -> usize {
-        self.intents.len()
-    }
-
-    fn intents(&self) -> impl Iterator<Item = &PublicV1AuthorizationIntent> {
-        self.intents.iter()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1Extensions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_recovery: Option<PublicV1ExtensionSlot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signed_authorization: Option<PublicV1ExtensionSlot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_build_evidence: Option<PublicV1ExtensionSlot>,
 }
@@ -3245,7 +2370,6 @@ impl PublicV1AgentReport {
         }
         for extension in [
             self.extensions.history_recovery.as_ref(),
-            self.extensions.signed_authorization.as_ref(),
             self.extensions.public_build_evidence.as_ref(),
         ]
         .into_iter()
@@ -3321,7 +2445,7 @@ pub struct PublicV1AcceptedRebuildRequired {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_storage: Option<PvcUid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization: Option<PublicBuildAuthorizationReference>,
+    pub build: Option<PublicBuildAttemptReference>,
 }
 
 impl PublicV1AcceptedRebuildRequired {
@@ -3340,12 +2464,12 @@ impl PublicV1AcceptedRebuildRequired {
                 provider_replica: Some(provider.replica.clone()),
                 local_replica: Some(local_replica.clone()),
                 local_storage: Some(local_storage.clone()),
-                authorization: None,
+                build: None,
             },
             CanonicalReplicaRebuildRequired::RemoteBuildTarget {
                 reason,
                 operation,
-                authorization,
+                build,
             } => Self {
                 kind: PublicV1AcceptedRebuildKind::RemoteBuildTarget,
                 reason: *reason,
@@ -3353,7 +2477,7 @@ impl PublicV1AcceptedRebuildRequired {
                 provider_replica: None,
                 local_replica: None,
                 local_storage: None,
-                authorization: Some(authorization.clone()),
+                build: Some(build.clone()),
             },
         }
     }
@@ -3372,23 +2496,23 @@ impl PublicV1AcceptedRebuildRequired {
                     .ok_or("accepted local rebuild lacks local replica")?;
                 if provider != local
                     || self.local_storage.as_ref().is_none_or(PvcUid::is_empty)
-                    || self.authorization.is_some()
+                    || self.build.is_some()
                 {
                     return Err("accepted local rebuild shape is inconsistent");
                 }
             }
             PublicV1AcceptedRebuildKind::RemoteBuildTarget => {
-                let authorization = self
-                    .authorization
+                let build = self
+                    .build
                     .as_ref()
-                    .ok_or("accepted remote rebuild lacks authorization")?;
-                authorization.validate()?;
+                    .ok_or("accepted remote rebuild lacks exact build identity")?;
+                build.validate()?;
                 if self.provider_replica.is_some()
                     || self.local_replica.is_some()
                     || self.local_storage.is_some()
-                    || authorization.resource_uid != self.operation.resource_uid
-                    || authorization.epoch != self.operation.epoch
-                    || authorization.build_id != self.operation.operation_id
+                    || build.resource_uid != self.operation.resource_uid
+                    || build.epoch != self.operation.epoch
+                    || build.build_id != self.operation.operation_id
                 {
                     return Err("accepted remote rebuild shape is inconsistent");
                 }
@@ -3418,10 +2542,6 @@ pub struct PublicV1AcceptedOperationCompletion {
     pub catch_up_mode: Option<PublicCatchUpMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catch_up_specific_quorum: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization_key_id: Option<AuthorizationKeyId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization_audit_digest: Option<SignedAuthorizationAuditDigest>,
     pub result: PublicV1AcceptedResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_detail: Option<String>,
@@ -3462,8 +2582,6 @@ impl PublicV1AcceptedOperationCompletion {
             current_configuration_id: completion.current_configuration_id.clone(),
             catch_up_mode: completion.catch_up_mode,
             catch_up_specific_quorum: completion.catch_up_specific_quorum,
-            authorization_key_id: completion.authorization_key_id,
-            authorization_audit_digest: completion.authorization_audit_digest,
             result,
             failure_detail,
             rebuild_required,
@@ -3482,8 +2600,6 @@ pub struct PublicV1AcceptedStatus {
     #[serde(default)]
     #[schemars(length(max = 64))]
     pub completed_operations: Vec<PublicV1AcceptedOperationCompletion>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authorization: Option<PublicV1AuthorizationStatus>,
     #[serde(default)]
     pub extensions: PublicV1Extensions,
 }
@@ -3505,8 +2621,6 @@ impl PublicV1AcceptedStatus {
                 || completion.history != self.history
                 || completion.input_digest_version != 1
                 || completion.input_digest_sha256.len() != 64
-                || completion.authorization_key_id.is_some()
-                    != completion.authorization_audit_digest.is_some()
                 || completion.failure_detail.is_some()
                     != matches!(
                         completion.result,
@@ -3534,7 +2648,7 @@ impl PublicV1AcceptedStatus {
                 return Err("public-v1 accepted completions contain a duplicate operation");
             }
         }
-        self.validate_authorization()
+        Ok(())
     }
 
     pub fn is_evidence_successor_of(&self, previous: &Self) -> bool {
@@ -3542,7 +2656,6 @@ impl PublicV1AcceptedStatus {
             || self.history_initialization_id != previous.history_initialization_id
             || self.history != previous.history
             || self.data_loss_recovery != previous.data_loss_recovery
-            || self.authorization != previous.authorization
             || self.extensions != previous.extensions
             || self.completed_operations.len() > previous.completed_operations.len() + 1
         {
@@ -3553,40 +2666,6 @@ impl PublicV1AcceptedStatus {
                 .iter()
                 .any(|next| next == completion)
         })
-    }
-
-    pub fn authorization(&self) -> Option<&PublicV1AuthorizationStatus> {
-        self.authorization.as_ref()
-    }
-
-    pub fn authorization_mut(&mut self) -> &mut PublicV1AuthorizationStatus {
-        self.authorization
-            .get_or_insert_with(PublicV1AuthorizationStatus::default)
-    }
-
-    pub fn validate_authorization(&self) -> Result<(), &'static str> {
-        if let Some(authorization) = self.authorization() {
-            authorization.validate(&self.identity, &self.history)?;
-        }
-        Ok(())
-    }
-
-    pub fn is_authorization_successor_of(&self, previous: &Self) -> bool {
-        if self.identity != previous.identity
-            || self.history_initialization_id != previous.history_initialization_id
-            || self.history != previous.history
-            || self.data_loss_recovery != previous.data_loss_recovery
-            || self.completed_operations != previous.completed_operations
-            || self.extensions != previous.extensions
-        {
-            return false;
-        }
-        match (&previous.authorization, &self.authorization) {
-            (None, None) => true,
-            (None, Some(next)) => next.secret_binding.is_some() && next.intents.is_empty(),
-            (Some(previous), Some(next)) => next.is_successor_of(previous),
-            (Some(_), None) => false,
-        }
     }
 }
 
@@ -3750,20 +2829,6 @@ impl CanonicalEncoder {
         self.i64(replica.current_progress);
         self.i64(replica.catch_up_capability);
         self.bool(replica.must_catchup);
-        self.option(
-            replica.peer_authorization.as_ref(),
-            |encoder, authorization| {
-                encoder.bytes(
-                    &authorization
-                        .canonical_bytes()
-                        .expect("validated peer authorization is canonical"),
-                );
-            },
-        );
-        self.option(
-            replica.configuration_revision.as_ref(),
-            |encoder, revision| encoder.u64(*revision),
-        );
     }
 
     fn public_configuration(&mut self, configuration: &PublicConfiguration) {
@@ -3779,44 +2844,15 @@ impl CanonicalEncoder {
         }
     }
 
-    fn authorization(&mut self, authorization: &PublicBuildAuthorizationReference) {
-        self.string(authorization.resource_uid.as_str());
-        self.epoch(authorization.epoch);
-        self.string(authorization.build_id.as_str());
-        self.replica_identity(&authorization.source);
-        self.string(authorization.source_storage.as_str());
-        self.string(authorization.source_session.as_str());
-        self.replica_identity(&authorization.target);
-        self.string(authorization.target_storage.as_str());
-        self.string(authorization.target_session.as_str());
-        self.string(&authorization.audit_digest.0);
-    }
-
     fn public_build(&mut self, build: &PublicBuildInput) {
         self.string(build.attempt.as_str());
+        self.epoch(build.epoch);
         self.replica_identity(&build.replica);
         self.string(build.process_session_id.as_str());
         self.string(&build.replication_address);
         self.option(build.history.as_ref(), |encoder, history| {
             encoder.history(history);
         });
-        self.option(build.authorization.as_ref(), |encoder, authorization| {
-            encoder.authorization(authorization);
-        });
-        self.option(
-            build.authorization_verification_key.as_ref(),
-            |encoder, verification_key| encoder.bytes(verification_key.as_bytes()),
-        );
-        self.option(
-            build.build_authorization.as_ref(),
-            |encoder, authorization| {
-                encoder.bytes(
-                    &authorization
-                        .canonical_bytes()
-                        .expect("validated build authorization is canonical"),
-                );
-            },
-        );
     }
 
     fn history(&mut self, history: &HistoryContext) {

@@ -1722,7 +1722,6 @@ async fn scale_up_transport_cancellation_reissues_exact_build_and_resumes_partia
         authority: None,
         source_session_id: String::new(),
         retire: false,
-        build_authorization_v1: Vec::new(),
     };
     let first_request = authorized_request(
         "resource-1",
@@ -1900,7 +1899,6 @@ async fn scale_up_source_service_abandons_an_in_flight_copy_and_restarts_retired
         authority: None,
         source_session_id: String::new(),
         retire: false,
-        build_authorization_v1: Vec::new(),
     };
     let build_client =
         proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
@@ -2060,7 +2058,6 @@ async fn scale_up_retirement_replays_lost_runtime_cancellation_consumption_reply
         authority: None,
         source_session_id: String::new(),
         retire: false,
-        build_authorization_v1: Vec::new(),
     };
     let mut build_client =
         proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
@@ -2281,7 +2278,6 @@ async fn scale_up_source_service_retirement_survives_pre_admission_restart() {
                     authority: None,
                     source_session_id: String::new(),
                     retire: true,
-                    build_authorization_v1: Vec::new(),
                 },
             ),
         ))
@@ -2391,7 +2387,6 @@ async fn replica_host_scale_up_source_recovery_covers_pc_cc_and_abandoned_build_
                     authority: None,
                     source_session_id: String::new(),
                     retire: true,
-                    build_authorization_v1: Vec::new(),
                 },
             ),
         ))
@@ -3067,7 +3062,6 @@ async fn restarted_agent_rejects_old_session_commands_without_mutating_store() {
                 authority: None,
                 source_session_id: String::new(),
                 retire: false,
-                build_authorization_v1: Vec::new(),
             },
         ),
     ];
@@ -3989,7 +3983,6 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                 authority: None,
                 source_session_id: String::new(),
                 retire: false,
-                build_authorization_v1: Vec::new(),
             };
             let mut build_client = proto::agent_control_client::AgentControlClient::connect(
                 format!("http://{control}"),
@@ -4054,7 +4047,6 @@ async fn evaluator_cleanup_retires_real_incomplete_build_across_restart_cuts() {
                 authority: None,
                 source_session_id: String::new(),
                 retire: true,
-                build_authorization_v1: Vec::new(),
             };
             let mut retire_client = proto::agent_control_client::AgentControlClient::connect(
                 format!("http://{control}"),

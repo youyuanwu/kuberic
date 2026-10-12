@@ -59,13 +59,11 @@ fn build(attempt: &str) -> PublicBuildInput {
     replica.replica_id = ReplicaId::new(2);
     PublicBuildInput {
         attempt: OperationId::new(attempt),
+        epoch: Epoch::new(0, 1),
         replica,
         process_session_id: ProcessSessionId::new("target-session"),
         replication_address: "trace://target".into(),
         history: None,
-        authorization: None,
-        authorization_verification_key: None,
-        build_authorization: None,
     }
 }
 
@@ -105,8 +103,6 @@ fn configuration_with_target(epoch: i64) -> PublicConfiguration {
         current_progress: 0,
         catch_up_capability: 0,
         must_catchup: false,
-        peer_authorization: None,
-        configuration_revision: None,
     };
     PublicConfiguration {
         previous: Some(ConfigurationDescriptor::new(
@@ -576,10 +572,7 @@ async fn public_v1_swap_captures_specific_quorum_capability() {
 
 #[test]
 fn protocol_10_rejects_public_v1_command_shapes() {
-    use crate::protocol::public_operations::{
-        AuthorizationAuditDigest, PublicBuildAuthorizationReference,
-        PublicOperationReplayDisposition,
-    };
+    use crate::protocol::public_operations::PublicOperationReplayDisposition;
 
     let preview = PublicOperationPreviewIdentity::new(431);
     let program = specific_quorum_swap();
@@ -606,33 +599,6 @@ fn protocol_10_rejects_public_v1_command_shapes() {
     replay.replay_disposition = PublicOperationReplayDisposition::RepeatableRead;
     replay.program = Some(program);
     assert!(replay.validate().is_err());
-
-    let mut input = build("legacy-authorized-build");
-    input.authorization = Some(PublicBuildAuthorizationReference {
-        resource_uid: ResourceUid::new("resource-1"),
-        epoch: Epoch::new(0, 3),
-        build_id: input.attempt.clone(),
-        source: replica_identity(),
-        source_storage: PvcUid::new("pvc-1"),
-        source_session: ProcessSessionId::new("session-1"),
-        target: input.replica.clone(),
-        target_storage: PvcUid::new("pvc-2"),
-        target_session: input.process_session_id.clone(),
-        audit_digest: AuthorizationAuditDigest("ab".repeat(32)),
-    });
-    let program = Program::Build(input);
-    let mut authorized = intent(
-        &preview,
-        "legacy-authorized-build",
-        5,
-        PublicOperationClass::Build {
-            target: ReplicaId::new(2),
-        },
-        "session-1",
-    );
-    authorized.input_digest = program.digest();
-    authorized.program = Some(program);
-    assert!(authorized.validate().is_err());
 }
 
 #[tokio::test]
@@ -1838,44 +1804,31 @@ async fn public_v1_rebuild_owner_enriches_captured_local_failure() {
 }
 
 #[tokio::test]
-async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
+async fn public_v1_remote_rebuild_attempt_is_exact_and_fail_closed() {
     use crate::protocol::public_operations::{
-        AuthorizationAuditDigest, PublicBuildAuthorizationReference, PublicProgress,
-        PublicProgressRole, PublicV1AgentReport, PublicV1OperationCompletion,
-        PublicV1OperationResult, RemoteBuildTargetRebuildRequired, ReplicaRebuildReason,
-        ReplicaRebuildRequired,
+        CanonicalReplicaRebuildRequired, PublicProgress, PublicProgressRole, PublicV1AgentReport,
+        PublicV1OperationCompletion, PublicV1OperationResult, RemoteBuildTargetRebuildRequired,
+        ReplicaRebuildReason, ReplicaRebuildRequired,
     };
 
     let preview = PublicOperationPreviewIdentity::public_v1(902);
     let (_directory, _path, store) = durable_preview_store(&preview);
     let mut target = replica_identity();
     target.replica_id = ReplicaId::new(2);
-    let authorization = PublicBuildAuthorizationReference {
-        resource_uid: ResourceUid::new("resource-1"),
-        epoch: Epoch::new(0, 9),
-        build_id: OperationId::new("public-v1-remote-build"),
-        source: replica_identity(),
-        source_storage: PvcUid::new("pvc-1"),
-        source_session: ProcessSessionId::new("session-1"),
-        target: target.clone(),
-        target_storage: PvcUid::new("pvc-2"),
-        target_session: ProcessSessionId::new("target-session"),
-        audit_digest: AuthorizationAuditDigest("ab".repeat(32)),
-    };
+    let operation_id = OperationId::new("public-v1-remote-build");
+    let target_session = ProcessSessionId::new("target-session");
     let input = PublicBuildInput {
-        attempt: authorization.build_id.clone(),
-        replica: target,
-        process_session_id: authorization.target_session.clone(),
+        attempt: operation_id.clone(),
+        epoch: Epoch::new(0, 9),
+        replica: target.clone(),
+        process_session_id: target_session.clone(),
         replication_address: "trace://target".into(),
         history: Some(public_v1_history(&preview).1),
-        authorization: Some(authorization.clone()),
-        authorization_verification_key: None,
-        build_authorization: None,
     };
     let program = Program::Build(input.clone());
     let mut operation = intent(
         &preview,
-        authorization.build_id.as_str(),
+        operation_id.as_str(),
         4,
         PublicOperationClass::Build {
             target: input.replica.replica_id,
@@ -1892,13 +1845,21 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         &input,
         ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
             reason: ReplicaRebuildReason::RemoteCopyConflict,
-            authorization: authorization.clone(),
+            epoch: Epoch::new(0, 9),
+            target: target.clone(),
+            target_session: target_session.clone(),
         })),
     )
     .unwrap();
 
-    let mut changed = authorization.clone();
-    changed.source_session = ProcessSessionId::new("changed-source-session");
+    let CanonicalReplicaRebuildRequired::RemoteBuildTarget { build, .. } = &canonical else {
+        panic!("expected remote build target");
+    };
+    assert_eq!(build.source, state.identity.local_identity);
+    assert_eq!(build.source_session, operation.process_session_id);
+    assert_eq!(build.target, target);
+    assert_eq!(build.target_session, target_session);
+
     assert!(
         public_lifecycle::enrich_remote_rebuild(
             &state.identity,
@@ -1906,40 +1867,27 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
             &input,
             ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
                 reason: ReplicaRebuildReason::RemoteCopyConflict,
-                authorization: changed,
+                epoch: Epoch::new(0, 10),
+                target: input.replica.clone(),
+                target_session: input.process_session_id.clone(),
             },)),
         )
         .is_err()
     );
-
-    let reject_consistent_wrong_source =
-        |changed_authorization: PublicBuildAuthorizationReference| {
-            let mut changed_input = input.clone();
-            changed_input.authorization = Some(changed_authorization.clone());
-            assert!(
-                public_lifecycle::enrich_remote_rebuild(
-                    &state.identity,
-                    &operation,
-                    &changed_input,
-                    ReplicaRebuildRequired::RemoteBuildTarget(Box::new(
-                        RemoteBuildTargetRebuildRequired {
-                            reason: ReplicaRebuildReason::RemoteCopyConflict,
-                            authorization: changed_authorization,
-                        },
-                    )),
-                )
-                .is_err()
-            );
-        };
-    let mut wrong_source = authorization.clone();
-    wrong_source.source.replica_id = ReplicaId::new(9);
-    reject_consistent_wrong_source(wrong_source);
-    let mut wrong_storage = authorization.clone();
-    wrong_storage.source_storage = PvcUid::new("wrong-source-pvc");
-    reject_consistent_wrong_source(wrong_storage);
-    let mut wrong_session = authorization.clone();
-    wrong_session.source_session = ProcessSessionId::new("wrong-source-session");
-    reject_consistent_wrong_source(wrong_session);
+    assert!(
+        public_lifecycle::enrich_remote_rebuild(
+            &state.identity,
+            &operation,
+            &input,
+            ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
+                reason: ReplicaRebuildReason::RemoteCopyConflict,
+                epoch: Epoch::new(0, 9),
+                target,
+                target_session: ProcessSessionId::new("changed-target-session"),
+            },)),
+        )
+        .is_err()
+    );
 
     let report = PublicV1AgentReport {
         identity: preview.clone(),
@@ -1971,8 +1919,6 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
             current_configuration_id: None,
             catch_up_mode: None,
             catch_up_specific_quorum: None,
-            authorization_key_id: None,
-            authorization_audit_digest: None,
             result: PublicV1OperationResult::RebuildRequired(Box::new(canonical)),
         }],
         extensions: Default::default(),
@@ -2053,8 +1999,8 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         .process_session_id = "crossed-session".into();
     assert!(crate::control::normalize_public_v1_agent_status_report(crossed_session).is_err());
 
-    let mut invalid_authorization = wire;
-    invalid_authorization
+    let mut invalid_build = wire;
+    invalid_build
         .public_v1
         .as_mut()
         .unwrap()
@@ -2062,13 +2008,11 @@ async fn public_v1_remote_rebuild_claims_are_exact_and_fail_closed() {
         .rebuild_required
         .as_mut()
         .unwrap()
-        .authorization
+        .build
         .as_mut()
         .unwrap()
-        .audit_digest_sha256 = "invalid".into();
-    assert!(
-        crate::control::normalize_public_v1_agent_status_report(invalid_authorization).is_err()
-    );
+        .target_session = String::new();
+    assert!(crate::control::normalize_public_v1_agent_status_report(invalid_build).is_err());
 }
 
 #[tokio::test]
@@ -2806,9 +2750,7 @@ async fn public_operation_replay_matrix_converges_each_repeatable_program_family
 
 #[tokio::test]
 async fn public_v1_replay_preserves_declared_disposition() {
-    use crate::protocol::public_operations::{
-        AuthorizationAuditDigest, PublicOperationReplayDisposition,
-    };
+    use crate::protocol::public_operations::PublicOperationReplayDisposition;
 
     let preview = PublicOperationPreviewIdentity::public_v1(901);
     let (_directory, path, store) = durable_preview_store(&preview);
@@ -2888,12 +2830,6 @@ async fn public_v1_replay_preserves_declared_disposition() {
         crate::host::store::BeginPublicOperation::Completed(_)
     ));
     assert_eq!(exact.input_digest.version(), 1);
-    let audit_digest = AuthorizationAuditDigest(exact.input_digest.sha256().to_string());
-    assert_eq!(audit_digest.0, exact.input_digest.sha256());
-    assert_ne!(
-        std::any::TypeId::of::<AuthorizationAuditDigest>(),
-        std::any::TypeId::of::<crate::protocol::public_operations::CanonicalOperationInputDigest>()
-    );
 
     let changed_program = Program::Progress { capability: true };
     let mut changed = exact.clone();

@@ -228,14 +228,16 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
         };
         if operation.intent.revision != build_record.admission_revision
             || operation.accepted_history.as_ref() != Some(&build_record.history)
-            || operation.accepted_storage.as_ref() != Some(&build_record.source.storage_incarnation)
+            || operation
+                .accepted_storage
+                .as_ref()
+                .is_none_or(|storage| storage.replica != build_record.source)
             || build.attempt != build_record.build_id
-            || build.build_authorization.as_ref() != Some(&build_record.authorization)
-            || build.authorization_verification_key != Some(build_record.verification_key)
             || build.history.as_ref() != Some(&build_record.history)
-            || build.replica != build_record.target.storage_incarnation.replica
-            || build.process_session_id != build_record.target.process_session_id
-            || build.replication_address != build_record.target.replication_address
+            || build.replica != build_record.target
+            || build.process_session_id != build_record.target_session
+            || build.replication_address != build_record.target_address
+            || operation.intent.process_session_id != build_record.source_session
         {
             return Err(crate::host::HostError::Corrupt(
                 "public-v1 build record differs from its accepted intent".into(),
@@ -1900,6 +1902,7 @@ impl AgentStore for SqliteStore {
             .map_err(|message| crate::host::HostError::CommandRejected(message.to_string()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
+            let local_identity = state.identity.local_identity.clone();
             let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
@@ -2041,26 +2044,22 @@ impl AgentStore for SqliteStore {
                     preview
                         .active_builds
                         .insert(build.replica.replica_id, build.clone());
-                    if let (Some(authorization), Some(verification_key)) = (
-                        build.build_authorization.as_ref(),
-                        build.authorization_verification_key,
-                    ) {
+                    if intent.preview.is_public_v1() {
                         let build_record = PublicV1BuildRecord {
                             operation_id: intent.operation_id.clone(),
                             build_id: build.attempt.clone(),
                             admission_revision: intent.revision,
-                            verification_key,
-                            key_id: authorization.claims.key_id,
-                            audit_digest: authorization.audit_digest().map_err(|_| {
+                            history: build.history.clone().ok_or_else(|| {
                                 crate::host::HostError::CommandRejected(
-                                    "signed public-v1 build has an invalid audit digest".into(),
+                                    "public-v1 build lacks exact history".into(),
                                 )
                             })?,
-                            history: authorization.claims.history.clone(),
-                            epoch: authorization.claims.epoch,
-                            source: authorization.claims.source.clone(),
-                            target: authorization.claims.target.clone(),
-                            authorization: authorization.clone(),
+                            epoch: build.epoch,
+                            source: local_identity.clone(),
+                            source_session: intent.process_session_id.clone(),
+                            target: build.replica.clone(),
+                            target_session: build.process_session_id.clone(),
+                            target_address: build.replication_address.clone(),
                             retirement: PublicV1BuildRetirement::Retain,
                             result: None,
                         };
@@ -3207,12 +3206,11 @@ impl AgentStore for SqliteStore {
                         if let Some(build_record) =
                             preview.build_records.get_mut(&build.attempt)
                         {
-                            if build_record.target.storage_incarnation.replica != build.replica
-                                || build_record.target.process_session_id
-                                    != build.process_session_id
+                            if build_record.target != build.replica
+                                || build_record.target_session != build.process_session_id
                             {
                                 return Err(crate::host::HostError::StaleEffectCompletion(
-                                    "build retirement differs from signed build record".into(),
+                                    "build retirement differs from the exact build record".into(),
                                 ));
                             }
                             build_record.retirement = PublicV1BuildRetirement::Retired;
@@ -3404,7 +3402,7 @@ impl AgentStore for SqliteStore {
                     if build_record.result.is_none() {
                         build_record.result = Some(
                             crate::protocol::public_operations::PublicV1OperationResult::Ambiguous(
-                                "predecessor process exited during signed build".into(),
+                                "predecessor process exited during public-v1 build".into(),
                             ),
                         );
                         build_record.retirement = PublicV1BuildRetirement::Required;

@@ -2272,8 +2272,6 @@ impl PrimaryReplicator for TraceReplicator {
                         current_progress: replica.current_progress,
                         catch_up_capability: replica.catch_up_capability,
                         must_catchup: replica.must_catchup,
-                        peer_authorization: replica.peer_authorization,
-                        configuration_revision: replica.configuration_revision,
                     },
                 )
                 .collect(),
@@ -2320,8 +2318,6 @@ impl PrimaryReplicator for TraceReplicator {
                         current_progress: replica.current_progress,
                         catch_up_capability: replica.catch_up_capability,
                         must_catchup: replica.must_catchup,
-                        peer_authorization: replica.peer_authorization,
-                        configuration_revision: replica.configuration_revision,
                     },
                 )
                 .collect(),

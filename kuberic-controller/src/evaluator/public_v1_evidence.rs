@@ -30,17 +30,11 @@ pub struct PublicV1CompletionRequirement {
     pub process_session_id: ProcessSessionId,
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration_id: Option<ConfigurationId>,
-    pub authorization_key_id: Option<kuberic_runtime::protocol::authorization::AuthorizationKeyId>,
-    pub authorization_audit_digest:
-        Option<kuberic_runtime::protocol::authorization::AuthorizationAuditDigest>,
 }
 
 impl PublicV1CompletionRequirement {
     pub fn validate(&self) -> Result<(), String> {
-        if self.operation_id.is_empty()
-            || self.revision == 0
-            || self.process_session_id.is_empty()
-            || self.authorization_key_id.is_some() != self.authorization_audit_digest.is_some()
+        if self.operation_id.is_empty() || self.revision == 0 || self.process_session_id.is_empty()
         {
             return Err("public-v1 completion requirement is incomplete".into());
         }
@@ -61,8 +55,6 @@ impl PublicV1CompletionRequirement {
             && completion.process_session_id == self.process_session_id
             && completion.previous_configuration_id == self.previous_configuration_id
             && completion.current_configuration_id == self.current_configuration_id
-            && completion.authorization_key_id == self.authorization_key_id
-            && completion.authorization_audit_digest == self.authorization_audit_digest
     }
 }
 

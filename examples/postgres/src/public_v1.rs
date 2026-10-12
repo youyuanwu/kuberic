@@ -4,96 +4,173 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kuberic_runtime::protocol::authorization::{BuildAuthorizationV1, PeerSessionAuthorizationV1};
 use kuberic_runtime::protocol::public_operations::{
-    AuthorizationAuditDigest, LocalProviderRebuildRequired, ProviderReplicaIdentity,
-    PublicBuildAuthorizationReference, RemoteBuildTargetRebuildRequired, ReplicaRebuildReason,
-    ReplicaRebuildRequired,
+    LocalProviderRebuildRequired, ProviderReplicaIdentity, RemoteBuildTargetRebuildRequired,
+    ReplicaRebuildReason, ReplicaRebuildRequired,
 };
-use kuberic_runtime::protocol::types::{ProcessSessionId, ReplicaStorageIdentity};
-use kuberic_runtime::replicator::{
-    PublicAuthorizationAdmission, PublicAuthorizationContext, ReplicatorSettings,
-};
+use kuberic_runtime::protocol::types::{ConfigurationId, ProcessSessionId, ResourceUid};
+use kuberic_runtime::replicator::ReplicatorSettings;
 use serde::{Deserialize, Serialize};
 
 use super::public_transport::{NativeCredential, NativeGateway};
 use super::*;
 
-#[derive(Clone)]
-enum Admission {
-    Runtime(PublicAuthorizationAdmission),
-    #[cfg(all(test, feature = "testing"))]
-    Fixture(Arc<tests::FixtureAdmission>),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleContext {
+    identity: ReplicaIdentity,
+    role: ReplicaRole,
+    epoch: Epoch,
+    previous_configuration_id: Option<ConfigurationId>,
+    current_configuration_id: Option<ConfigurationId>,
 }
 
-impl Admission {
-    fn context(&self) -> Result<PublicAuthorizationContext> {
-        match self {
-            Self::Runtime(admission) => admission.current_context(),
-            #[cfg(all(test, feature = "testing"))]
-            Self::Fixture(admission) => admission.context(),
+#[derive(Clone)]
+struct LifecycleFence {
+    current: Arc<std::sync::Mutex<LifecycleContext>>,
+}
+
+impl LifecycleFence {
+    fn new(identity: ReplicaIdentity) -> Self {
+        Self {
+            current: Arc::new(std::sync::Mutex::new(LifecycleContext {
+                identity,
+                role: ReplicaRole::None,
+                epoch: Epoch::default(),
+                previous_configuration_id: None,
+                current_configuration_id: None,
+            })),
         }
     }
 
-    fn verify(&self, authorization: &Authorization) -> Result<PublicAuthorizationContext> {
-        match self {
-            Self::Runtime(admission) => match authorization {
-                Authorization::Build(build) => admission.verify_build_authorization(build),
-                Authorization::Peer(peer) => admission.verify_peer_session_authorization(peer),
-            },
-            #[cfg(all(test, feature = "testing"))]
-            Self::Fixture(admission) => admission.verify(authorization),
+    fn context(&self) -> Result<LifecycleContext> {
+        Ok(self.current.lock().map_err(application_error)?.clone())
+    }
+
+    fn update(&self, change: impl FnOnce(&mut LifecycleContext)) -> Result<LifecycleContext> {
+        let mut context = self.current.lock().map_err(application_error)?;
+        change(&mut context);
+        Ok(context.clone())
+    }
+
+    fn validate_binding(&self, binding: &TransportBinding) -> Result<LifecycleContext> {
+        let context = self.context()?;
+        let local = if binding.source() == &context.identity {
+            binding.source_endpoint()
+        } else if binding.target() == &context.identity {
+            binding.target_endpoint()
+        } else {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        };
+        if local.role != context.role || binding.epoch() != context.epoch {
+            return Err(RuntimeError::AuthorityNotAdmitted);
         }
+        if let TransportBinding::Peer(peer) = binding
+            && (Some(&peer.current_configuration_id) != context.current_configuration_id.as_ref()
+                || peer.previous_configuration_id != context.previous_configuration_id)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(context)
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "authorization", deny_unknown_fields)]
-pub(crate) enum Authorization {
-    Build(BuildAuthorizationV1),
-    Peer(PeerSessionAuthorizationV1),
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeEndpoint {
+    replica: ReplicaIdentity,
+    process_session_id: ProcessSessionId,
+    replication_address: String,
+    role: ReplicaRole,
 }
 
-impl Authorization {
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BuildBinding {
+    resource_uid: ResourceUid,
+    epoch: Epoch,
+    build_id: OperationId,
+    source: NativeEndpoint,
+    target: NativeEndpoint,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PeerBinding {
+    epoch: Epoch,
+    previous_configuration_id: Option<ConfigurationId>,
+    current_configuration_id: ConfigurationId,
+    primary: NativeEndpoint,
+    secondary: NativeEndpoint,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "binding", deny_unknown_fields)]
+pub(crate) enum TransportBinding {
+    Build(BuildBinding),
+    Peer(PeerBinding),
+}
+
+impl TransportBinding {
     fn source(&self) -> &ReplicaIdentity {
         match self {
-            Self::Build(value) => &value.claims.source.storage_incarnation.replica,
-            Self::Peer(value) => &value.claims.primary.replica,
+            Self::Build(value) => &value.source.replica,
+            Self::Peer(value) => &value.primary.replica,
         }
     }
 
     fn target(&self) -> &ReplicaIdentity {
         match self {
-            Self::Build(value) => &value.claims.target.storage_incarnation.replica,
-            Self::Peer(value) => &value.claims.secondary.replica,
+            Self::Build(value) => &value.target.replica,
+            Self::Peer(value) => &value.secondary.replica,
         }
     }
 
     fn source_address(&self) -> &str {
         match self {
-            Self::Build(value) => &value.claims.source.replication_address,
-            Self::Peer(value) => &value.claims.primary.replication_address,
+            Self::Build(value) => &value.source.replication_address,
+            Self::Peer(value) => &value.primary.replication_address,
         }
     }
 
     fn target_address(&self) -> &str {
         match self {
-            Self::Build(value) => &value.claims.target.replication_address,
-            Self::Peer(value) => &value.claims.secondary.replication_address,
+            Self::Build(value) => &value.target.replication_address,
+            Self::Peer(value) => &value.secondary.replication_address,
+        }
+    }
+
+    fn source_endpoint(&self) -> &NativeEndpoint {
+        match self {
+            Self::Build(value) => &value.source,
+            Self::Peer(value) => &value.primary,
+        }
+    }
+
+    fn target_endpoint(&self) -> &NativeEndpoint {
+        match self {
+            Self::Build(value) => &value.target,
+            Self::Peer(value) => &value.secondary,
+        }
+    }
+
+    fn epoch(&self) -> Epoch {
+        match self {
+            Self::Build(value) => value.epoch,
+            Self::Peer(value) => value.epoch,
         }
     }
 }
 
 pub(super) struct PublicPg {
-    admission: Admission,
+    fence: LifecycleFence,
     state: Mutex<PublicState>,
     work: std::sync::Mutex<CancellationToken>,
 }
 
 impl PublicPg {
-    fn new(admission: Admission) -> Self {
+    fn new(identity: ReplicaIdentity) -> Self {
         Self {
-            admission,
+            fence: LifecycleFence::new(identity),
             state: Mutex::new(PublicState {
                 opened: false,
                 role: ReplicaRole::None,
@@ -125,13 +202,13 @@ struct PublicState {
     configuration: Option<ReplicaSetConfiguration>,
     previous: Option<ConfigurationDescriptor>,
     grants: Vec<Grant>,
-    receiver: Option<Authorization>,
-    access: Option<PublicAuthorizationContext>,
+    receiver: Option<TransportBinding>,
+    access: Option<LifecycleContext>,
     built: Option<BuildCompletion>,
 }
 
 struct Grant {
-    authorization: Authorization,
+    binding: TransportBinding,
     credential: NativeCredential,
     gateway: NativeGateway,
     active: CancellationToken,
@@ -156,7 +233,7 @@ impl Drop for BuildGrantGuard {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BuildCompletion {
-    authorization: BuildAuthorizationV1,
+    binding: BuildBinding,
     lineage: PgLineage,
     boundary: i64,
 }
@@ -164,22 +241,22 @@ pub(crate) struct BuildCompletion {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(crate) enum Request {
-    Inspect(Authorization),
-    Build(BuildAuthorizationV1),
-    Peer(PeerSessionAuthorizationV1),
+    Inspect(TransportBinding),
+    Build(BuildBinding),
+    Peer(PeerBinding),
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(crate) enum Response {
     Source {
-        authorization: Authorization,
+        binding: TransportBinding,
         credential: NativeCredential,
         lineage: PgLineage,
         boundary: i64,
     },
     Built(BuildCompletion),
-    Peer(PeerSessionAuthorizationV1),
+    Peer(PeerBinding),
     Rebuild(ReplicaRebuildRequired),
 }
 
@@ -191,26 +268,21 @@ impl PgReplicator {
     pub(crate) fn configure_public_v1(
         self: &Arc<Self>,
         settings: ReplicatorSettings,
+        identity: ReplicaIdentity,
     ) -> Result<()> {
-        let Some(trust) = settings.public_authorization else {
+        if !settings.public_v1 {
             if self.is_public_v1() {
                 return Err(application_error(
                     "cannot downgrade immutable PostgreSQL construction",
                 ));
             }
             return Ok(());
-        };
-        trust.validate()?;
-        if trust.protocol_generation.value() != 11
-            || settings.replication_address != self.coordination.local_endpoint
-        {
+        }
+        if settings.replication_address != self.coordination.local_endpoint {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        let admission = settings
-            .public_authorization_admission
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
         self.public_v1
-            .set(PublicPg::new(Admission::Runtime(admission)))
+            .set(PublicPg::new(identity))
             .map_err(|_| application_error("PostgreSQL construction is immutable"))?;
         self.start_public_owner();
         Ok(())
@@ -230,30 +302,31 @@ impl PgReplicator {
                     break;
                 };
                 let public = driver.public_v1.get().expect("immutable owner");
-                let (invalid, cancelled) = {
-                    let mut state = public.state.lock().await;
-                    let invalid = state.access.as_ref().is_some_and(|context| {
-                        public
-                            .admission
-                            .context()
-                            .map_or(true, |current| &current != context)
-                    }) || state.receiver.as_ref().is_some_and(|authorization| {
-                        public.admission.verify(authorization).is_err()
-                    }) || state
-                        .grants
-                        .iter()
-                        .any(|grant| public.admission.verify(&grant.authorization).is_err());
-                    let mut cancelled = Vec::new();
-                    let mut index = 0;
-                    while index < state.grants.len() {
-                        if state.grants[index].active.is_cancelled() {
-                            cancelled.push(state.grants.remove(index));
-                        } else {
-                            index += 1;
+                let (invalid, cancelled) =
+                    {
+                        let mut state = public.state.lock().await;
+                        let invalid =
+                            state.access.as_ref().is_some_and(|context| {
+                                public
+                                    .fence
+                                    .context()
+                                    .map_or(true, |current| &current != context)
+                            }) || state.receiver.as_ref().is_some_and(|binding| {
+                                public.fence.validate_binding(binding).is_err()
+                            }) || state.grants.iter().any(|grant| {
+                                public.fence.validate_binding(&grant.binding).is_err()
+                            });
+                        let mut cancelled = Vec::new();
+                        let mut index = 0;
+                        while index < state.grants.len() {
+                            if state.grants[index].active.is_cancelled() {
+                                cancelled.push(state.grants.remove(index));
+                            } else {
+                                index += 1;
+                            }
                         }
-                    }
-                    (invalid, cancelled)
-                };
+                        (invalid, cancelled)
+                    };
                 for grant in cancelled {
                     if let Err(error) = grant.gateway.drain().await {
                         tracing::error!(%error, "cancelled public PostgreSQL grant drainage failed");
@@ -363,7 +436,7 @@ impl PgReplicator {
 
     async fn public_reconcile_access(&self) -> Result<bool> {
         let mut state = self.public_owner().state.lock().await;
-        let Ok(context) = self.public_owner().admission.context() else {
+        let Ok(context) = self.public_owner().fence.context() else {
             return Ok(false);
         };
         if state.access.as_ref() == Some(&context) {
@@ -395,8 +468,8 @@ impl PgReplicator {
             }
             ReplicaRole::ActiveSecondary => {
                 state.epoch == Some(context.epoch)
-                    && state.receiver.as_ref().is_some_and(|authorization| {
-                        self.public_owner().admission.verify(authorization).is_ok()
+                    && state.receiver.as_ref().is_some_and(|binding| {
+                        self.public_owner().fence.validate_binding(binding).is_ok()
                     })
                     && self.instance.is_running().await
             }
@@ -409,7 +482,7 @@ impl PgReplicator {
             .grant_role_access()
             .await
             .map_err(application_error)?;
-        if self.public_owner().admission.context()? != context {
+        if self.public_owner().fence.context()? != context {
             return Err(RuntimeError::OperationCancelled);
         }
         self.durable
@@ -553,7 +626,7 @@ impl PgReplicator {
     }
 
     pub(super) async fn public_change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
-        let context = self.public_owner().admission.context()?;
+        let context = self.public_owner().fence.context()?;
         if epoch < context.epoch || epoch < self.public_owner().state.lock().await.role_epoch {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -577,18 +650,6 @@ impl PgReplicator {
                                 .await);
                         }
                         self.instance.init_db().await.map_err(application_error)?;
-                        #[cfg(all(test, feature = "testing"))]
-                        if matches!(self.public_owner().admission, Admission::Fixture(_)) {
-                            use std::io::Write as _;
-                            writeln!(
-                                std::fs::OpenOptions::new()
-                                    .append(true)
-                                    .open(self.instance.data_dir().join("postgresql.conf"))
-                                    .map_err(application_error)?,
-                                "fsync = off"
-                            )
-                            .map_err(application_error)?;
-                        }
                     }
                     self.public_start().await?;
                     if self
@@ -627,13 +688,19 @@ impl PgReplicator {
             state.role = role;
             state.role_epoch = epoch;
             state.epoch = initial_primary.then_some(epoch);
+            self.public_owner().fence.update(|context| {
+                context.role = role;
+                context.epoch = epoch;
+                context.previous_configuration_id = None;
+                context.current_configuration_id = None;
+            })?;
             Ok(())
         })
         .await
     }
 
     pub(super) async fn public_update_epoch(&self, epoch: Epoch) -> Result<()> {
-        let context = self.public_owner().admission.context()?;
+        let context = self.public_owner().fence.context()?;
         let mut state = self.public_owner().state.lock().await;
         if !state.opened
             || epoch < context.epoch
@@ -647,6 +714,11 @@ impl PgReplicator {
         }
         state.role_epoch = epoch;
         state.epoch = Some(epoch);
+        self.public_owner().fence.update(|context| {
+            context.epoch = epoch;
+            context.previous_configuration_id = None;
+            context.current_configuration_id = None;
+        })?;
         Ok(())
     }
 
@@ -656,7 +728,7 @@ impl PgReplicator {
         }
         self.public_owned(async {
             let state = self.public_owner().state.lock().await;
-            let context = self.public_owner().admission.context()?;
+            let context = self.public_owner().fence.context()?;
             if role != state.role || context.role != role || context.epoch != state.role_epoch {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
@@ -673,7 +745,7 @@ impl PgReplicator {
     fn public_check_configuration(
         &self,
         state: &PublicState,
-        context: &PublicAuthorizationContext,
+        context: &LifecycleContext,
     ) -> Result<()> {
         let configuration = state
             .configuration
@@ -694,25 +766,78 @@ impl PgReplicator {
             if grant.active.is_cancelled() {
                 return Err(RuntimeError::OperationCancelled);
             }
-            self.public_owner().admission.verify(&grant.authorization)?;
+            self.public_owner().fence.validate_binding(&grant.binding)?;
         }
         Ok(())
+    }
+
+    fn public_process_session(&self) -> ProcessSessionId {
+        ProcessSessionId::new(format!("postgres-{}", self.instance.generation_id()))
+    }
+
+    fn public_peer_binding(
+        &self,
+        context: &LifecycleContext,
+        current: &ConfigurationDescriptor,
+        previous: Option<&ConfigurationDescriptor>,
+        replica: &ReplicaInformation,
+    ) -> PeerBinding {
+        PeerBinding {
+            epoch: current.epoch,
+            previous_configuration_id: previous
+                .map(|configuration| configuration.configuration_id.clone()),
+            current_configuration_id: current.configuration_id.clone(),
+            primary: NativeEndpoint {
+                replica: context.identity.clone(),
+                process_session_id: self.public_process_session(),
+                replication_address: self.coordination.local_endpoint.clone(),
+                role: ReplicaRole::Primary,
+            },
+            secondary: NativeEndpoint {
+                replica: replica.identity.clone(),
+                process_session_id: replica.process_session_id.clone(),
+                replication_address: replica.replication_address.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        }
+    }
+
+    async fn public_build_binding(&self, replica: &ReplicaInformation) -> Result<BuildBinding> {
+        let durable = self.durable.revalidate().await.map_err(application_error)?;
+        let state = self.public_owner().state.lock().await;
+        if state.role != ReplicaRole::Primary || state.role_epoch != state.epoch.unwrap_or_default()
+        {
+            return Err(RuntimeError::NotPrimary);
+        }
+        Ok(BuildBinding {
+            resource_uid: durable.identity.resource_uid,
+            epoch: state.role_epoch,
+            build_id: replica.build_id.clone(),
+            source: NativeEndpoint {
+                replica: durable.identity.replica,
+                process_session_id: self.public_process_session(),
+                replication_address: self.coordination.local_endpoint.clone(),
+                role: ReplicaRole::Primary,
+            },
+            target: NativeEndpoint {
+                replica: replica.identity.clone(),
+                process_session_id: replica.process_session_id.clone(),
+                replication_address: replica.replication_address.clone(),
+                role: ReplicaRole::IdleSecondary,
+            },
+        })
     }
 
     async fn public_grant(
         &self,
         state: &mut PublicState,
-        authorization: Authorization,
+        binding: TransportBinding,
     ) -> Result<(CancellationToken, bool)> {
-        let context = self.public_owner().admission.verify(&authorization)?;
-        if &context.identity != authorization.source() || state.role != ReplicaRole::Primary {
+        let context = self.public_owner().fence.validate_binding(&binding)?;
+        if &context.identity != binding.source() || state.role != ReplicaRole::Primary {
             return Err(RuntimeError::NotPrimary);
         }
-        if let Some(grant) = state
-            .grants
-            .iter()
-            .find(|grant| grant.authorization == authorization)
-        {
+        if let Some(grant) = state.grants.iter().find(|grant| grant.binding == binding) {
             return Ok((grant.active.clone(), false));
         }
         if state.grants.len() >= MAX_BUILDS {
@@ -721,8 +846,8 @@ impl PgReplicator {
         let nonce = super::public_transport::random_bytes()?;
         let session =
             ProcessSessionId::new(nonce.iter().map(|b| format!("{b:02x}")).collect::<String>());
-        let name = crate::native::replication_application_name(authorization.target(), &session);
-        let slot = crate::native::replication_slot_name(authorization.target());
+        let name = crate::native::replication_application_name(binding.target(), &session);
+        let slot = crate::native::replication_slot_name(binding.target());
         let (client, _connection) = self.instance.connect().await.map_err(application_error)?;
         client
             .query(
@@ -741,8 +866,8 @@ impl PgReplicator {
             .evidence
             .ok_or(RuntimeError::NotPrimary)?
             .flush_lsn;
-        let admission = self.public_owner().admission.clone();
-        let binding = authorization.clone();
+        let fence = self.public_owner().fence.clone();
+        let validity_binding = binding.clone();
         let instance = self.instance.clone();
         let generation = instance.generation_id();
         let active = CancellationToken::new();
@@ -750,8 +875,8 @@ impl PgReplicator {
         let valid = Arc::new(move || {
             !admitted.is_cancelled()
                 && instance.generation_id() == generation
-                && admission
-                    .verify(&binding)
+                && fence
+                    .validate_binding(&validity_binding)
                     .is_ok_and(|current| current == context)
         });
         let (gateway, credential) = NativeGateway::start(
@@ -761,12 +886,12 @@ impl PgReplicator {
                 .join(format!(".s.PGSQL.{}", self.instance.port())),
             name,
             slot,
-            matches!(authorization, Authorization::Build(_)),
+            matches!(binding, TransportBinding::Build(_)),
             valid,
         )
         .await?;
         state.grants.push(Grant {
-            authorization,
+            binding,
             credential,
             gateway,
             active: active.clone(),
@@ -794,24 +919,24 @@ impl PgReplicator {
         let previous_descriptor = previous
             .as_ref()
             .map(|configuration| configuration.configuration.clone());
-        let context = self.public_owner().admission.context()?;
+        let context = self.public_owner().fence.context()?;
         {
             let state = self.public_owner().state.lock().await;
             if state.role != ReplicaRole::Primary
                 || context.role != ReplicaRole::Primary
                 || state.epoch != Some(current.configuration.epoch)
                 || context.epoch != current.configuration.epoch
-                || context.current_configuration_id.as_ref()
-                    != Some(&current.configuration.configuration_id)
-                || context.previous_configuration_id
-                    != previous_descriptor
-                        .as_ref()
-                        .map(|configuration| configuration.configuration_id.clone())
                 || current.configuration.primary_id != context.identity.replica_id
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
         }
+        let context = self.public_owner().fence.update(|context| {
+            context.previous_configuration_id = previous_descriptor
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone());
+            context.current_configuration_id = Some(current.configuration.configuration_id.clone());
+        })?;
         let mut replicas = BTreeMap::new();
         for replica in current.replicas.iter().chain(
             previous
@@ -825,16 +950,23 @@ impl PgReplicator {
             }
         }
         let mut identities = BTreeSet::new();
+        let mut bindings = BTreeMap::new();
         for replica in replicas.values() {
             replica.validate_public_progress()?;
-            let authorization = replica
-                .peer_authorization
-                .clone()
-                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if replica.role != ReplicaRole::ActiveSecondary || replica.process_session_id.is_empty()
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let binding = self.public_peer_binding(
+                &context,
+                &current.configuration,
+                previous_descriptor.as_ref(),
+                replica,
+            );
             self.public_owner()
-                .admission
-                .verify(&Authorization::Peer(authorization.clone()))?;
-            if authorization.claims.primary.replica != context.identity
+                .fence
+                .validate_binding(&TransportBinding::Peer(binding.clone()))?;
+            if binding.primary.replica != context.identity
                 || !identities.insert(replica.identity.clone())
                 || !current
                     .configuration
@@ -852,6 +984,7 @@ impl PgReplicator {
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
+            bindings.insert(replica.identity.clone(), binding);
         }
         if current
             .configuration
@@ -887,20 +1020,17 @@ impl PgReplicator {
             }
             state.configuration = Some(current.clone());
             state.previous = previous_descriptor;
-            for replica in replicas.values() {
+            for binding in bindings.values() {
                 let _ = self
-                    .public_grant(
-                        &mut state,
-                        Authorization::Peer(replica.peer_authorization.clone().unwrap()),
-                    )
+                    .public_grant(&mut state, TransportBinding::Peer(binding.clone()))
                     .await?;
             }
             let sessions = state
                 .grants
                 .iter()
-                .filter_map(|grant| match &grant.authorization {
-                    Authorization::Peer(peer) => {
-                        Some((peer.claims.secondary.replica.clone(), grant.session.clone()))
+                .filter_map(|grant| match &grant.binding {
+                    TransportBinding::Peer(peer) => {
+                        Some((peer.secondary.replica.clone(), grant.session.clone()))
                     }
                     _ => None,
                 })
@@ -921,20 +1051,23 @@ impl PgReplicator {
         })
         .await?;
         for replica in replicas.values() {
-            let authorization = replica.peer_authorization.clone().unwrap();
+            let binding = bindings
+                .get(&replica.identity)
+                .expect("validated peer binding")
+                .clone();
             match self
                 .public_rpc(
                     &replica.replication_address,
-                    &Request::Peer(authorization.clone()),
+                    &Request::Peer(binding.clone()),
                 )
                 .await?
             {
-                Response::Peer(completed) if completed == authorization => {}
+                Response::Peer(completed) if completed == binding => {}
                 _ => return Err(RuntimeError::AuthorityNotAdmitted),
             }
         }
         let state = self.public_owner().state.lock().await;
-        self.public_check_configuration(&state, &self.public_owner().admission.context()?)
+        self.public_check_configuration(&state, &self.public_owner().fence.context()?)
     }
 
     async fn public_wait_inner(
@@ -942,7 +1075,7 @@ impl PgReplicator {
         state: &PublicState,
         mode: ReplicaSetQuorumMode,
     ) -> Result<()> {
-        self.public_check_configuration(state, &self.public_owner().admission.context()?)?;
+        self.public_check_configuration(state, &self.public_owner().fence.context()?)?;
         let (client, _connection) = self.instance.connect().await.map_err(application_error)?;
         let row = tokio::time::timeout(
             Duration::from_secs(10),
@@ -953,14 +1086,14 @@ impl PgReplicator {
         .map_err(application_error)?;
         let boundary = crate::monitor::parse_pg_lsn(row.get(0)).map_err(application_error)?;
         loop {
-            self.public_check_configuration(state, &self.public_owner().admission.context()?)?;
+            self.public_check_configuration(state, &self.public_owner().fence.context()?)?;
             let complete = if mode == ReplicaSetQuorumMode::All {
                 let sessions = state
                     .grants
                     .iter()
-                    .filter_map(|grant| match &grant.authorization {
-                        Authorization::Peer(peer) => {
-                            Some((peer.claims.secondary.replica.clone(), grant.session.clone()))
+                    .filter_map(|grant| match &grant.binding {
+                        TransportBinding::Peer(peer) => {
+                            Some((peer.secondary.replica.clone(), grant.session.clone()))
                         }
                         _ => None,
                     })
@@ -1087,18 +1220,9 @@ impl PgReplicator {
     }
 
     async fn public_rpc(&self, endpoint: &str, request: &Request) -> Result<Response> {
-        if self.coordination.bearer_token.is_empty() {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        let mut request = tonic::Request::new(crate::proto::RecoveryRequest {
+        let request = tonic::Request::new(crate::proto::RecoveryRequest {
             envelope_json: encode(request).map_err(application_error)?,
         });
-        request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {}", self.coordination.bearer_token)
-                .parse()
-                .map_err(application_error)?,
-        );
         let response = tokio::time::timeout(Duration::from_secs(120), async {
             let mut client = crate::proto::pg_data_service_client::PgDataServiceClient::connect(
                 endpoint.to_owned(),
@@ -1114,23 +1238,20 @@ impl PgReplicator {
 
     async fn public_source(
         &self,
-        authorization: &Authorization,
+        binding: &TransportBinding,
     ) -> Result<(NativeCredential, PgLineage, i64)> {
-        self.public_owner().admission.verify(authorization)?;
+        self.public_owner().fence.validate_binding(binding)?;
         match self
-            .public_rpc(
-                authorization.source_address(),
-                &Request::Inspect(authorization.clone()),
-            )
+            .public_rpc(binding.source_address(), &Request::Inspect(binding.clone()))
             .await?
         {
             Response::Source {
-                authorization: observed,
+                binding: observed,
                 credential,
                 lineage,
                 boundary,
-            } if &observed == authorization && boundary >= 0 => {
-                self.public_owner().admission.verify(authorization)?;
+            } if &observed == binding && boundary >= 0 => {
+                self.public_owner().fence.validate_binding(binding)?;
                 lineage.validate().map_err(application_error)?;
                 credential.conninfo()?;
                 Ok((credential, lineage, boundary))
@@ -1141,11 +1262,9 @@ impl PgReplicator {
 
     pub(super) async fn public_build(&self, replica: ReplicaInformation) -> Result<()> {
         replica.validate_public_progress()?;
-        let authorization = replica
-            .build_authorization
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        let binding = Authorization::Build(authorization.clone());
-        self.public_owner().admission.verify(&binding)?;
+        let build = self.public_build_binding(&replica).await?;
+        let binding = TransportBinding::Build(build.clone());
+        self.public_owner().fence.validate_binding(&binding)?;
         let mut grant = {
             let mut state = self.public_owner().state.lock().await;
             let (active, created) = self.public_grant(&mut state, binding.clone()).await?;
@@ -1155,19 +1274,16 @@ impl PgReplicator {
             }
         };
         let result = match self
-            .public_rpc(
-                binding.target_address(),
-                &Request::Build(authorization.clone()),
-            )
+            .public_rpc(binding.target_address(), &Request::Build(build.clone()))
             .await?
         {
-            Response::Built(completed) if completed.authorization == authorization => {
+            Response::Built(completed) if completed.binding == build => {
                 let state = self.public_owner().state.lock().await;
-                self.public_owner().admission.verify(&binding)?;
+                self.public_owner().fence.validate_binding(&binding)?;
                 let grant = state
                     .grants
                     .iter()
-                    .find(|g| g.authorization == binding)
+                    .find(|g| g.binding == binding)
                     .ok_or(RuntimeError::OperationCancelled)?;
                 if completed.lineage != grant.lineage || completed.boundary != grant.boundary {
                     return Err(RuntimeError::AuthorityNotAdmitted);
@@ -1175,9 +1291,11 @@ impl PgReplicator {
                 Ok(())
             }
             Response::Rebuild(ReplicaRebuildRequired::RemoteBuildTarget(failure))
-                if failure.authorization == build_reference(&authorization)? =>
+                if failure.epoch == build.epoch
+                    && failure.target == build.target.replica
+                    && failure.target_session == build.target.process_session_id =>
             {
-                self.public_owner().admission.verify(&binding)?;
+                self.public_owner().fence.validate_binding(&binding)?;
                 Err(RuntimeError::ReplicaRebuildRequired(Box::new(
                     ReplicaRebuildRequired::RemoteBuildTarget(failure),
                 )))
@@ -1190,12 +1308,9 @@ impl PgReplicator {
         result
     }
 
-    async fn public_receive_build(
-        &self,
-        authorization: BuildAuthorizationV1,
-    ) -> Result<BuildCompletion> {
-        let binding = Authorization::Build(authorization.clone());
-        let context = self.public_owner().admission.verify(&binding)?;
+    async fn public_receive_build(&self, build: BuildBinding) -> Result<BuildCompletion> {
+        let binding = TransportBinding::Build(build.clone());
+        let context = self.public_owner().fence.validate_binding(&binding)?;
         if context.identity != *binding.target() || context.role != ReplicaRole::IdleSecondary {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -1206,10 +1321,10 @@ impl PgReplicator {
             .await
             .built
             .as_ref()
-            .is_some_and(|completed| completed.authorization != authorization)
+            .is_some_and(|completed| completed.binding != build)
         {
             return Err(remote_rebuild(
-                &authorization,
+                &build,
                 ReplicaRebuildReason::RemoteCopyConflict,
             )?);
         }
@@ -1225,20 +1340,20 @@ impl PgReplicator {
                     let ReplicaRebuildRequired::LocalProvider(failure) = *failure else {
                         return Err(RuntimeError::AuthorityNotAdmitted);
                     };
-                    return Err(remote_rebuild(&authorization, failure.reason)?);
+                    return Err(remote_rebuild(&build, failure.reason)?);
                 }
                 Err(error) => return Err(error),
             };
             if let Some(completed) = &state.built {
-                if completed.authorization != authorization || completed.lineage != lineage {
+                if completed.binding != build || completed.lineage != lineage {
                     return Err(remote_rebuild(
-                        &authorization,
+                        &build,
                         ReplicaRebuildReason::RemoteCopyConflict,
                     )?);
                 }
             } else if durable.system_identifier.is_some() {
                 return Err(remote_rebuild(
-                    &authorization,
+                    &build,
                     ReplicaRebuildReason::IncompatibleRetainedHistory,
                 )?);
             } else {
@@ -1247,14 +1362,14 @@ impl PgReplicator {
                     .prepare_native_build()
                     .await
                     .map_err(application_error)?;
-                self.public_owner().admission.verify(&binding)?;
+                self.public_owner().fence.validate_binding(&binding)?;
                 self.instance
                     .public_base_backup(&credential.conninfo()?)
                     .await
                     .map_err(application_error)?;
                 if self.public_lineage().await? != lineage {
                     return Err(remote_rebuild(
-                        &authorization,
+                        &build,
                         ReplicaRebuildReason::RemoteCopyConflict,
                     )?);
                 }
@@ -1273,7 +1388,7 @@ impl PgReplicator {
             self.public_start().await?;
             state.receiver = Some(binding.clone());
             loop {
-                self.public_owner().admission.verify(&binding)?;
+                self.public_owner().fence.validate_binding(&binding)?;
                 let snapshot = self.observer.snapshot().await.map_err(application_error)?;
                 if snapshot.evidence.as_ref().is_some_and(|e| {
                     e.in_recovery
@@ -1291,7 +1406,7 @@ impl PgReplicator {
                     self.public_source(&binding).await?;
                     self.public_snapshot_and_persist().await?;
                     let completion = BuildCompletion {
-                        authorization,
+                        binding: build,
                         lineage,
                         boundary,
                     };
@@ -1304,15 +1419,29 @@ impl PgReplicator {
         .await
     }
 
-    async fn public_receive_peer(&self, authorization: PeerSessionAuthorizationV1) -> Result<()> {
-        let binding = Authorization::Peer(authorization.clone());
-        let context = self.public_owner().admission.verify(&binding)?;
-        if &context.identity != binding.target() || context.role != ReplicaRole::ActiveSecondary {
+    async fn public_receive_peer(&self, binding: PeerBinding) -> Result<()> {
+        let transport = TransportBinding::Peer(binding.clone());
+        let context = self.public_owner().fence.context()?;
+        if &context.identity != transport.target()
+            || context.role != ReplicaRole::ActiveSecondary
+            || context.epoch != binding.epoch
+            || context
+                .current_configuration_id
+                .as_ref()
+                .is_some_and(|current| current != &binding.current_configuration_id)
+            || context.previous_configuration_id.is_none()
+                && binding.previous_configuration_id.is_some()
+        {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
+        let context = self.public_owner().fence.update(|context| {
+            context.previous_configuration_id = binding.previous_configuration_id.clone();
+            context.current_configuration_id = Some(binding.current_configuration_id.clone());
+        })?;
+        self.public_owner().fence.validate_binding(&transport)?;
         self.public_owner().cancel();
         self.public_owned(async {
-            let (credential, lineage, _) = self.public_source(&binding).await?;
+            let (credential, lineage, _) = self.public_source(&transport).await?;
             let mut state = self.public_owner().state.lock().await;
             if state.role != ReplicaRole::ActiveSecondary
                 || state.role_epoch != context.epoch
@@ -1332,12 +1461,12 @@ impl PgReplicator {
                 .public_receiver(
                     self.instance.data_dir(),
                     &credential.conninfo()?,
-                    &crate::native::replication_slot_name(binding.target()),
+                    &crate::native::replication_slot_name(transport.target()),
                     &lineage,
                 )
                 .await
                 .map_err(application_error)?;
-            self.public_owner().admission.verify(&binding)?;
+            self.public_owner().fence.validate_binding(&transport)?;
             self.public_start().await?;
             let snapshot = self.public_snapshot_and_persist().await?;
             if snapshot.evidence.as_ref().is_none_or(|evidence| {
@@ -1349,7 +1478,7 @@ impl PgReplicator {
                     .public_local_rebuild(ReplicaRebuildReason::IncompatibleRetainedHistory)
                     .await);
             }
-            state.receiver = Some(binding);
+            state.receiver = Some(transport);
             Ok(())
         })
         .await
@@ -1360,37 +1489,37 @@ impl PgReplicator {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         match request {
-            Request::Inspect(authorization) => {
-                let context = self.public_owner().admission.verify(&authorization)?;
-                if &context.identity != authorization.source() {
+            Request::Inspect(binding) => {
+                let context = self.public_owner().fence.validate_binding(&binding)?;
+                if &context.identity != binding.source() {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
                 let state = self.public_owner().state.lock().await;
                 let grant = state
                     .grants
                     .iter()
-                    .find(|g| g.authorization == authorization)
+                    .find(|g| g.binding == binding)
                     .ok_or(RuntimeError::AuthorityNotAdmitted)?;
                 if self.public_lineage().await? != grant.lineage {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
                 Ok(Response::Source {
-                    authorization,
+                    binding,
                     credential: grant.credential.clone(),
                     lineage: grant.lineage.clone(),
                     boundary: grant.boundary,
                 })
             }
-            Request::Build(authorization) => match self.public_receive_build(authorization).await {
+            Request::Build(binding) => match self.public_receive_build(binding).await {
                 Ok(completed) => Ok(Response::Built(completed)),
                 Err(RuntimeError::ReplicaRebuildRequired(failure)) => {
                     Ok(Response::Rebuild(*failure))
                 }
                 Err(error) => Err(error),
             },
-            Request::Peer(authorization) => {
-                self.public_receive_peer(authorization.clone()).await?;
-                Ok(Response::Peer(authorization))
+            Request::Peer(binding) => {
+                self.public_receive_peer(binding.clone()).await?;
+                Ok(Response::Peer(binding))
             }
         }
     }
@@ -1400,7 +1529,7 @@ impl PgReplicator {
         if state
             .grants
             .iter()
-            .any(|g| g.authorization.target().replica_id == replica)
+            .any(|g| g.binding.target().replica_id == replica)
         {
             drop(state);
             self.public_revoke().await?;
@@ -1409,54 +1538,13 @@ impl PgReplicator {
     }
 }
 
-fn build_reference(
-    authorization: &BuildAuthorizationV1,
-) -> Result<PublicBuildAuthorizationReference> {
-    let claims = &authorization.claims;
-    let ReplicaStorageIdentity::Persistent {
-        pvc_uid: source_storage,
-        ..
-    } = &claims.source.storage_incarnation.storage
-    else {
-        return Err(RuntimeError::AuthorityNotAdmitted);
-    };
-    let ReplicaStorageIdentity::Persistent {
-        pvc_uid: target_storage,
-        ..
-    } = &claims.target.storage_incarnation.storage
-    else {
-        return Err(RuntimeError::AuthorityNotAdmitted);
-    };
-    Ok(PublicBuildAuthorizationReference {
-        resource_uid: claims.resource_uid.clone(),
-        epoch: claims.epoch,
-        build_id: claims.build_id.clone(),
-        source: claims.source.storage_incarnation.replica.clone(),
-        source_storage: source_storage.clone(),
-        source_session: claims.source.process_session_id.clone(),
-        target: claims.target.storage_incarnation.replica.clone(),
-        target_storage: target_storage.clone(),
-        target_session: claims.target.process_session_id.clone(),
-        audit_digest: AuthorizationAuditDigest(
-            authorization
-                .audit_digest()
-                .map_err(application_error)?
-                .to_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
-        ),
-    })
-}
-
-fn remote_rebuild(
-    authorization: &BuildAuthorizationV1,
-    reason: ReplicaRebuildReason,
-) -> Result<RuntimeError> {
+fn remote_rebuild(binding: &BuildBinding, reason: ReplicaRebuildReason) -> Result<RuntimeError> {
     Ok(RuntimeError::ReplicaRebuildRequired(Box::new(
         ReplicaRebuildRequired::RemoteBuildTarget(Box::new(RemoteBuildTargetRebuildRequired {
             reason,
-            authorization: build_reference(authorization)?,
+            epoch: binding.epoch,
+            target: binding.target.replica.clone(),
+            target_session: binding.target.process_session_id.clone(),
         })),
     )))
 }

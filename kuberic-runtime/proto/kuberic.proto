@@ -169,7 +169,7 @@ message PublicV1AgentStatus {
   int64 last_progress = 12;
   repeated PublicV1OperationCompletion completed_operations = 13;
   optional uint32 history_recovery_extension_version = 14;
-  optional uint32 signed_authorization_extension_version = 15;
+  reserved 15;
   optional uint32 public_build_evidence_extension_version = 16;
   PublicV1HistoryContext history = 17;
   PublicV1StorageIncarnation storage_incarnation = 18;
@@ -299,17 +299,17 @@ message PublicV1CapturedOperationIdentity {
   string detecting_session = 7;
 }
 
-message PublicV1BuildAuthorizationReference {
+message PublicV1BuildAttemptReference {
   string resource_uid = 1;
   Epoch epoch = 2;
   string build_id = 3;
   ReplicaIdentity source = 4;
-  string source_storage = 5;
+  reserved 5;
   string source_session = 6;
   ReplicaIdentity target = 7;
-  string target_storage = 8;
+  reserved 8;
   string target_session = 9;
-  string audit_digest_sha256 = 10;
+  reserved 10;
 }
 
 message PublicV1ReplicaRebuildRequired {
@@ -319,7 +319,7 @@ message PublicV1ReplicaRebuildRequired {
   ReplicaIdentity provider_replica = 4;
   ReplicaIdentity local_replica = 5;
   string local_storage = 6;
-  PublicV1BuildAuthorizationReference authorization = 7;
+  PublicV1BuildAttemptReference build = 7;
 }
 
 message PublicV1OperationCompletion {
@@ -339,8 +339,7 @@ message PublicV1OperationCompletion {
   string current_configuration_id = 14;
   optional PublicV1CatchUpMode catch_up_mode = 15;
   optional bool catch_up_specific_quorum = 16;
-  bytes authorization_key_id = 17;
-  bytes authorization_audit_digest = 18;
+  reserved 17, 18;
 }
 
 enum PublicV1CallKind {
@@ -645,7 +644,7 @@ message EnsureReplicaBuildCommand {
   BuildAuthority authority = 6;
   string source_session_id = 7;
   bool retire = 8;
-  bytes build_authorization_v1 = 9;
+  reserved 9;
 }
 
 message ExecuteCommandRequest {

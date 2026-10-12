@@ -265,7 +265,7 @@ impl ReplicaStorageIncarnationContext {
 pub enum ProcessSessionRenewalReason {
     PrimaryReplacement,
     ActiveSecondaryReplacement,
-    PeerAuthorizationWithdrawal,
+    PeerWithdrawal,
     DataLossAttempt,
 }
 

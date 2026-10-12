@@ -1,224 +1,64 @@
 use super::*;
 use crate::durable::{PgDurableIdentity, StorageMode};
 use crate::testing::{allocate_port, find_pg_bin, native_configuration, native_identity};
-use kuberic_runtime::protocol::authorization::{
-    AuthorizationSignature, AuthorizationVerificationKey, BuildAuthorizationClaimsV1,
-    BuildAuthorizationEndpointV1, PeerSessionAuthorizationClaimsV1, PeerSessionEndpointV1,
-};
-use kuberic_runtime::protocol::types::{
-    HistoryContext, HistoryId, PodUid, PublicProtocolGeneration, PvcUid,
-    ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration,
-};
-use kuberic_runtime::replicator::PublicAuthorizationTrust;
+use kuberic_runtime::protocol::types::ResourceUid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// The public host intentionally does not export a lifecycle-admission mutator.
-// This test-only owner models callback-boundary advancement; production always
-// delegates verification to the opaque, creation-bound runtime handle.
-pub(super) struct FixtureAdmission {
-    current: std::sync::Mutex<Option<PublicAuthorizationContext>>,
-    trust: PublicAuthorizationTrust,
-    address: String,
-}
+struct BindingFactory;
 
-impl FixtureAdmission {
-    pub(super) fn context(&self) -> Result<PublicAuthorizationContext> {
-        self.current
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)
+impl BindingFactory {
+    fn new() -> Self {
+        Self
     }
 
-    pub(super) fn verify(
-        &self,
-        authorization: &Authorization,
-    ) -> Result<PublicAuthorizationContext> {
-        let context = self.context()?;
-        let (history, epoch, resource, generation, key, identity, session, address, role) =
-            match authorization {
-                Authorization::Build(build) => {
-                    self.trust
-                        .verification_key
-                        .verify_build_authorization(build)
-                        .map_err(application_error)?;
-                    let c = &build.claims;
-                    let local = if c.source.storage_incarnation.replica == context.identity {
-                        &c.source
-                    } else {
-                        &c.target
-                    };
-                    if local.storage_incarnation != context.storage_incarnation {
-                        return Err(RuntimeError::AuthorityNotAdmitted);
-                    }
-                    (
-                        &c.history,
-                        c.epoch,
-                        &c.resource_uid,
-                        c.protocol_generation,
-                        c.key_id,
-                        &local.storage_incarnation.replica,
-                        &local.process_session_id,
-                        &local.replication_address,
-                        local.role,
-                    )
-                }
-                Authorization::Peer(peer) => {
-                    self.trust
-                        .verification_key
-                        .verify_peer_session_authorization(peer)
-                        .map_err(application_error)?;
-                    let c = &peer.claims;
-                    let local = if c.primary.replica == context.identity {
-                        &c.primary
-                    } else {
-                        &c.secondary
-                    };
-                    if context.current_configuration_id.as_ref()
-                        != Some(&c.current_configuration_id)
-                        || context.previous_configuration_id != c.previous_configuration_id
-                    {
-                        return Err(RuntimeError::AuthorityNotAdmitted);
-                    }
-                    (
-                        &c.history,
-                        c.epoch,
-                        &c.resource_uid,
-                        c.protocol_generation,
-                        c.key_id,
-                        &local.replica,
-                        &local.process_session_id,
-                        &local.replication_address,
-                        local.role,
-                    )
-                }
-            };
-        if history != &context.history
-            || epoch != context.epoch
-            || resource != &self.trust.resource_uid
-            || generation != self.trust.protocol_generation
-            || key != self.trust.key_id
-            || identity != &context.identity
-            || session != &context.process_session_id
-            || address != &self.address
-            || role != context.role
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        Ok(context)
-    }
-
-    fn advance(&self, change: impl FnOnce(&mut PublicAuthorizationContext)) {
-        change(self.current.lock().unwrap().as_mut().unwrap());
-    }
-}
-
-struct Signer {
-    root: std::path::PathBuf,
-    key: AuthorizationVerificationKey,
-}
-
-impl Signer {
-    fn new(root: &std::path::Path) -> Self {
-        let mut der = vec![
-            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
-            0x04, 0x20,
-        ];
-        der.extend([7; 32]);
-        std::fs::write(root.join("fixture-key.der"), der).unwrap();
-        let output = std::process::Command::new("openssl")
-            .args(["pkey", "-inform", "DER", "-in"])
-            .arg(root.join("fixture-key.der"))
-            .args(["-pubout", "-outform", "DER"])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "fixture signing tool failed");
-        Self {
-            root: root.to_owned(),
-            key: AuthorizationVerificationKey::from_bytes(output.stdout[12..].try_into().unwrap())
-                .unwrap(),
-        }
-    }
-
-    fn sign(&self, bytes: Vec<u8>) -> AuthorizationSignature {
-        std::fs::write(self.root.join("fixture-claims"), bytes).unwrap();
-        let output = std::process::Command::new("openssl")
-            .args(["pkeyutl", "-sign", "-rawin", "-keyform", "DER", "-inkey"])
-            .arg(self.root.join("fixture-key.der"))
-            .arg("-in")
-            .arg(self.root.join("fixture-claims"))
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "fixture signing failed");
-        AuthorizationSignature::from_bytes(output.stdout.try_into().unwrap())
-    }
-
-    fn build(&self, source: &Replica, target: &Replica, id: &str) -> BuildAuthorizationV1 {
-        let s = source.admission.context().unwrap();
-        let t = target.admission.context().unwrap();
-        let claims = BuildAuthorizationClaimsV1 {
-            resource_uid: s.history.resource_uid.clone(),
-            protocol_generation: s.history.protocol_generation,
-            key_id: self.key.key_id(),
-            history: s.history.clone(),
-            epoch: s.epoch,
-            operation_id: OperationId::new(format!("operation-{id}")),
+    fn build(&self, source: &Replica, target: &Replica, id: &str) -> BuildBinding {
+        let context = source.driver.public_owner().fence.context().unwrap();
+        BuildBinding {
+            resource_uid: ResourceUid::new("postgres-public-oracle"),
+            epoch: context.epoch,
             build_id: OperationId::new(id),
-            source: BuildAuthorizationEndpointV1 {
-                storage_incarnation: s.storage_incarnation,
-                process_session_id: s.process_session_id,
-                replication_address: source.admission.address.clone(),
+            source: NativeEndpoint {
+                replica: source.identity.clone(),
+                process_session_id: source.session.clone(),
+                replication_address: source.address.clone(),
                 role: ReplicaRole::Primary,
             },
-            target: BuildAuthorizationEndpointV1 {
-                storage_incarnation: t.storage_incarnation,
-                process_session_id: t.process_session_id,
-                replication_address: target.admission.address.clone(),
+            target: NativeEndpoint {
+                replica: target.identity.clone(),
+                process_session_id: target.session.clone(),
+                replication_address: target.address.clone(),
                 role: ReplicaRole::IdleSecondary,
             },
-        };
-        let signature = self.sign(claims.signing_bytes().unwrap());
-        BuildAuthorizationV1::from_signature(claims, signature).unwrap()
+        }
     }
 
-    fn peer(
-        &self,
-        source: &Replica,
-        target: &Replica,
-        revision: u64,
-    ) -> PeerSessionAuthorizationV1 {
-        let s = source.admission.context().unwrap();
-        let t = target.admission.context().unwrap();
-        let claims = PeerSessionAuthorizationClaimsV1 {
-            resource_uid: s.history.resource_uid.clone(),
-            protocol_generation: s.history.protocol_generation,
-            key_id: self.key.key_id(),
-            history: s.history.clone(),
-            epoch: s.epoch,
-            current_configuration_id: s.current_configuration_id.unwrap(),
-            previous_configuration_id: s.previous_configuration_id,
-            primary: PeerSessionEndpointV1 {
-                replica: s.identity,
-                process_session_id: s.process_session_id,
-                replication_address: source.admission.address.clone(),
+    fn peer(&self, source: &Replica, target: &Replica) -> PeerBinding {
+        let context = source.driver.public_owner().fence.context().unwrap();
+        PeerBinding {
+            epoch: context.epoch,
+            current_configuration_id: context.current_configuration_id.unwrap(),
+            previous_configuration_id: context.previous_configuration_id,
+            primary: NativeEndpoint {
+                replica: source.identity.clone(),
+                process_session_id: source.session.clone(),
+                replication_address: source.address.clone(),
                 role: ReplicaRole::Primary,
             },
-            secondary: PeerSessionEndpointV1 {
-                replica: t.identity,
-                process_session_id: t.process_session_id,
-                replication_address: target.admission.address.clone(),
+            secondary: NativeEndpoint {
+                replica: target.identity.clone(),
+                process_session_id: target.session.clone(),
+                replication_address: target.address.clone(),
                 role: ReplicaRole::ActiveSecondary,
             },
-            configuration_revision: revision,
-        };
-        let signature = self.sign(claims.signing_bytes().unwrap());
-        PeerSessionAuthorizationV1::from_signature(claims, signature).unwrap()
+        }
     }
 }
 
 struct Replica {
     driver: Arc<PgReplicator>,
-    admission: Arc<FixtureAdmission>,
+    identity: ReplicaIdentity,
+    address: String,
+    session: ProcessSessionId,
     server: tokio::task::JoinHandle<()>,
     root: std::path::PathBuf,
 }
@@ -248,49 +88,18 @@ impl Drop for OracleDataDir {
 }
 
 impl Replica {
-    async fn new(root: std::path::PathBuf, id: i64, signer: &Signer) -> Self {
+    async fn new(root: std::path::PathBuf, id: i64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let identity = native_identity(id, &format!("public-{id}"));
+        let session = ProcessSessionId::new(format!("session-{id}"));
         let resource = ResourceUid::new("postgres-public-oracle");
-        let trust = PublicAuthorizationTrust {
-            resource_uid: resource.clone(),
-            protocol_generation: PublicProtocolGeneration::new(11),
-            verification_key: signer.key,
-            key_id: signer.key.key_id(),
-        };
-        let admission = Arc::new(FixtureAdmission {
-            trust,
-            address: address.clone(),
-            current: std::sync::Mutex::new(Some(PublicAuthorizationContext {
-                identity: identity.clone(),
-                history: HistoryContext {
-                    resource_uid: resource.clone(),
-                    protocol_generation: PublicProtocolGeneration::new(11),
-                    history_id: HistoryId::new("postgres-public-history"),
-                    data_loss_number: 0,
-                },
-                storage_incarnation: ReplicaStorageIncarnationContext {
-                    replica: identity.clone(),
-                    storage: ReplicaStorageIdentity::Persistent {
-                        pod_uid: PodUid::new(format!("pod-{id}")),
-                        pvc_uid: PvcUid::new(format!("pvc-{id}")),
-                    },
-                    storage_generation: StorageGeneration::new(format!("storage-{id}")),
-                },
-                process_session_id: ProcessSessionId::new(format!("session-{id}")),
-                role: ReplicaRole::None,
-                epoch: Epoch::default(),
-                previous_configuration_id: None,
-                current_configuration_id: None,
-            })),
-        });
         let durable = Arc::new(
             PgDurableStore::open(
                 root.join("a"),
                 PgDurableIdentity {
                     resource_uid: resource,
-                    replica: identity,
+                    replica: identity.clone(),
                 },
                 StorageMode::Fresh,
             )
@@ -311,8 +120,8 @@ impl Replica {
                 Weak::new(),
                 CancellationToken::new(),
                 crate::data_service::PgCoordination {
-                    local_endpoint: address,
-                    bearer_token: "public-oracle".into(),
+                    local_endpoint: address.clone(),
+                    bearer_token: String::new(),
                 },
                 true,
             )
@@ -321,7 +130,7 @@ impl Replica {
         assert!(
             driver
                 .public_v1
-                .set(PublicPg::new(Admission::Fixture(admission.clone())))
+                .set(PublicPg::new(identity.clone()))
                 .is_ok()
         );
         driver.start_public_owner();
@@ -338,7 +147,9 @@ impl Replica {
         });
         Self {
             driver,
-            admission,
+            identity,
+            address,
+            session,
             server,
             root,
         }
@@ -349,10 +160,6 @@ impl Replica {
             .public_change_role(Epoch::new(0, epoch), role)
             .await
             .unwrap();
-        self.admission.advance(|c| {
-            c.role = role;
-            c.epoch = Epoch::new(0, epoch);
-        });
     }
 
     async fn role(&self, epoch: i64, role: ReplicaRole) {
@@ -368,10 +175,14 @@ impl Replica {
     }
 
     fn configuration(&self, configuration: &ConfigurationDescriptor) {
-        self.admission.advance(|c| {
-            c.current_configuration_id = Some(configuration.configuration_id.clone());
-            c.previous_configuration_id = None;
-        });
+        self.driver
+            .public_owner()
+            .fence
+            .update(|c| {
+                c.current_configuration_id = Some(configuration.configuration_id.clone());
+                c.previous_configuration_id = None;
+            })
+            .unwrap();
     }
 
     fn configuration_pair(
@@ -379,10 +190,14 @@ impl Replica {
         current: &ConfigurationDescriptor,
         previous: &ConfigurationDescriptor,
     ) {
-        self.admission.advance(|context| {
-            context.current_configuration_id = Some(current.configuration_id.clone());
-            context.previous_configuration_id = Some(previous.configuration_id.clone());
-        });
+        self.driver
+            .public_owner()
+            .fence
+            .update(|context| {
+                context.current_configuration_id = Some(current.configuration_id.clone());
+                context.previous_configuration_id = Some(previous.configuration_id.clone());
+            })
+            .unwrap();
     }
 
     async fn singleton(&self, epoch: i64) {
@@ -392,8 +207,7 @@ impl Replica {
             .await
             .unwrap();
         assert!(self.driver.instance.connect_application().await.is_err());
-        let identity = self.admission.context().unwrap().identity;
-        let config = native_configuration(&[identity], 0, epoch);
+        let config = native_configuration(std::slice::from_ref(&self.identity), 0, epoch);
         self.configuration(&config);
         self.driver
             .public_configuration(config.into(), None)
@@ -427,14 +241,6 @@ impl crate::proto::pg_data_service_server::PgDataService for TestService {
         &self,
         request: tonic::Request<crate::proto::RecoveryRequest>,
     ) -> std::result::Result<tonic::Response<crate::proto::RecoveryResponse>, tonic::Status> {
-        if request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            != Some("Bearer public-oracle")
-        {
-            return Err(tonic::Status::unauthenticated("fixture credential"));
-        }
         let request =
             decode(&request.into_inner().envelope_json).map_err(tonic::Status::invalid_argument)?;
         let response = self
@@ -468,22 +274,20 @@ impl crate::proto::pg_data_service_server::PgDataService for TestService {
     }
 }
 
-fn build_replica(authorization: &BuildAuthorizationV1) -> ReplicaInformation {
-    let target = &authorization.claims.target;
+fn build_replica(binding: &BuildBinding) -> ReplicaInformation {
+    let target = &binding.target;
     let mut replica = ReplicaInformation::idle_build(
-        authorization.claims.build_id.clone(),
-        target.storage_incarnation.replica.clone(),
+        binding.build_id.clone(),
+        target.replica.clone(),
         target.replication_address.clone(),
     );
     replica.process_session_id = target.process_session_id.clone();
-    replica.storage_incarnation = Some(target.storage_incarnation.clone());
-    replica.build_authorization = Some(authorization.clone());
     replica
 }
 
-fn peer_replica(authorization: &PeerSessionAuthorizationV1) -> ReplicaInformation {
-    let target = &authorization.claims.secondary;
-    let mut replica = ReplicaInformation::active_peer(
+fn peer_replica(binding: &PeerBinding) -> ReplicaInformation {
+    let target = &binding.secondary;
+    ReplicaInformation::active_peer(
         target.replica.clone(),
         target.replication_address.clone(),
         target.process_session_id.clone(),
@@ -491,10 +295,7 @@ fn peer_replica(authorization: &PeerSessionAuthorizationV1) -> ReplicaInformatio
         0,
         false,
     )
-    .unwrap();
-    replica.peer_authorization = Some(authorization.clone());
-    replica.configuration_revision = Some(authorization.claims.configuration_revision);
-    replica
+    .unwrap()
 }
 
 async fn frame(stream: &mut tokio::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
@@ -515,22 +316,15 @@ async fn native_socket(
     startup.extend(
         format!(
             "user\0{}\0application_name\0{name}\0replication\0true\0\0",
-            credential.name
+            credential.user
         )
         .as_bytes(),
     );
     stream.write_u32((startup.len() + 4) as u32).await?;
     stream.write_all(&startup).await?;
-    if frame(&mut stream).await? != (b'R', 3u32.to_be_bytes().to_vec()) {
-        return Err(std::io::Error::other("native gateway refused challenge"));
+    if frame(&mut stream).await? != (b'R', 0u32.to_be_bytes().to_vec()) {
+        return Err(std::io::Error::other("native gateway refused startup"));
     }
-    stream.write_u8(b'p').await?;
-    stream
-        .write_u32((credential.secret.len() + 5) as u32)
-        .await?;
-    stream
-        .write_all(format!("{}\0", credential.secret).as_bytes())
-        .await?;
     loop {
         match frame(&mut stream).await?.0 {
             b'Z' => return Ok(stream),
@@ -583,10 +377,10 @@ async fn stage<T>(name: &'static str, future: impl std::future::Future<Output = 
 
 pub(crate) async fn oracle() {
     let directory = OracleDataDir::new();
-    let signer = Signer::new(directory.path());
-    let source = Replica::new(directory.path().join("s"), 41, &signer).await;
-    let target = Replica::new(directory.path().join("t"), 42, &signer).await;
-    let identity = source.admission.context().unwrap().identity;
+    let bindings = BindingFactory::new();
+    let source = Replica::new(directory.path().join("s"), 41).await;
+    let target = Replica::new(directory.path().join("t"), 42).await;
+    let identity = source.identity.clone();
     let singleton = native_configuration(std::slice::from_ref(&identity), 0, 1);
     assert!(
         source
@@ -624,19 +418,10 @@ pub(crate) async fn oracle() {
     assert_eq!(source.driver.instance.access_generation(), access);
     target.role(1, ReplicaRole::IdleSecondary).await;
     assert_eq!(target.driver.current_progress().await.unwrap(), -1);
-    let build = signer.build(&source, &target, "signed-idle");
+    let build = bindings.build(&source, &target, "idle-build");
     let mut invalid = build_replica(&build);
     invalid.current_progress = 0;
     assert!(source.driver.build_replica(invalid).await.is_err());
-    let mut forged = build_replica(&build);
-    forged
-        .build_authorization
-        .as_mut()
-        .unwrap()
-        .claims
-        .target
-        .process_session_id = ProcessSessionId::new("forged");
-    assert!(source.driver.build_replica(forged).await.is_err());
     source
         .driver
         .build_replica(build_replica(&build))
@@ -664,12 +449,24 @@ pub(crate) async fn oracle() {
             .await
             .grants
             .iter()
-            .all(|g| matches!(g.authorization, Authorization::Build(_)))
+            .all(|g| matches!(g.binding, TransportBinding::Build(_)))
     );
 
-    // A fresh signed build ID cannot overwrite data retained by another exact
+    // A fresh build ID cannot overwrite data retained by another exact
     // build attempt, even while the target remains idle and outside PC/CC.
-    let conflict = signer.build(&source, &target, "signed-conflict");
+    let completed_binding = target
+        .driver
+        .public_owner()
+        .state
+        .lock()
+        .await
+        .built
+        .as_ref()
+        .unwrap()
+        .binding
+        .clone();
+    let mut conflict = completed_binding.clone();
+    conflict.build_id = OperationId::new("conflicting-build");
     target
         .driver
         .public_owner()
@@ -679,7 +476,7 @@ pub(crate) async fn oracle() {
         .built
         .as_mut()
         .unwrap()
-        .authorization = conflict;
+        .binding = conflict;
     let before = target.persisted();
     let error = source
         .driver
@@ -689,7 +486,9 @@ pub(crate) async fn oracle() {
     match error {
         RuntimeError::ReplicaRebuildRequired(failure) => match *failure {
             ReplicaRebuildRequired::RemoteBuildTarget(failure) => {
-                assert_eq!(failure.authorization, build_reference(&build).unwrap());
+                assert_eq!(failure.epoch, build.epoch);
+                assert_eq!(failure.target, build.target.replica);
+                assert_eq!(failure.target_session, build.target.process_session_id);
                 assert_eq!(failure.reason, ReplicaRebuildReason::RemoteCopyConflict);
             }
             _ => panic!("remote target failure lost its scope"),
@@ -706,7 +505,7 @@ pub(crate) async fn oracle() {
         .built
         .as_mut()
         .unwrap()
-        .authorization = build.clone();
+        .binding = completed_binding;
 
     let retained_digest = target
         .driver
@@ -729,13 +528,21 @@ pub(crate) async fn oracle() {
         .build_replica(build_replica(&build))
         .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        RuntimeError::ReplicaRebuildRequired(failure)
-            if matches!(&*failure, ReplicaRebuildRequired::RemoteBuildTarget(failure)
-                if failure.reason == ReplicaRebuildReason::IncompatibleRetainedHistory
-                    && failure.authorization == build_reference(&build).unwrap())
-    ));
+    match error {
+        RuntimeError::ReplicaRebuildRequired(failure) => match *failure {
+            ReplicaRebuildRequired::RemoteBuildTarget(failure) => {
+                assert_eq!(
+                    failure.reason,
+                    ReplicaRebuildReason::IncompatibleRetainedHistory
+                );
+                assert_eq!(failure.epoch, build.epoch);
+                assert_eq!(failure.target, build.target.replica);
+                assert_eq!(failure.target_session, build.target.process_session_id);
+            }
+            failure => panic!("unexpected rebuild scope: {failure:?}"),
+        },
+        error => panic!("typed remote rebuild was lost: {error:?}"),
+    }
     target
         .driver
         .durable
@@ -746,19 +553,19 @@ pub(crate) async fn oracle() {
         .await
         .unwrap();
 
-    let cancelled = signer.build(&source, &target, "cancelled-source-attempt");
+    let cancelled = bindings.build(&source, &target, "cancelled-build");
     let (cancelled_active, cancelled_credential) = {
         let mut state = source.driver.public_owner().state.lock().await;
         let (active, created) = source
             .driver
-            .public_grant(&mut state, Authorization::Build(cancelled.clone()))
+            .public_grant(&mut state, TransportBinding::Build(cancelled.clone()))
             .await
             .unwrap();
         assert!(created);
         let credential = state
             .grants
             .iter()
-            .find(|grant| grant.authorization == Authorization::Build(cancelled.clone()))
+            .find(|grant| grant.binding == TransportBinding::Build(cancelled.clone()))
             .unwrap()
             .credential
             .clone();
@@ -797,16 +604,13 @@ pub(crate) async fn oracle() {
         .await
         .unwrap();
     assert!(target.driver.instance.connect_application().await.is_err());
-    let members = [
-        identity.clone(),
-        target.admission.context().unwrap().identity,
-    ];
+    let members = [identity.clone(), target.identity.clone()];
     let current = native_configuration(&members, 0, 1);
     source.configuration(&current);
     target.configuration(&current);
-    let peer = signer.peer(&source, &target, 1);
+    let peer = bindings.peer(&source, &target);
     stage(
-        "signed peer configuration",
+        "peer configuration",
         source.driver.public_configuration(
             ReplicaSetConfiguration {
                 configuration: current.clone(),
@@ -920,9 +724,9 @@ pub(crate) async fn oracle() {
     let singleton = native_configuration(std::slice::from_ref(&identity), 0, 1);
     source.configuration_pair(&singleton, &current);
     target.configuration_pair(&singleton, &current);
-    let previous_only = signer.peer(&source, &target, 2);
+    let previous_only = bindings.peer(&source, &target);
     stage(
-        "previous-only signed peer configuration",
+        "previous-only peer configuration",
         source.driver.public_configuration(
             ReplicaSetConfiguration {
                 configuration: singleton,
@@ -979,23 +783,9 @@ pub(crate) async fn oracle() {
     assert!(writer.simple_query("SELECT 1").await.is_err());
     source.change_role(2, ReplicaRole::Primary).await;
     target.change_role(2, ReplicaRole::ActiveSecondary).await;
-    for replica in [&source, &target] {
-        replica.admission.advance(|c| {
-            c.process_session_id =
-                ProcessSessionId::new(format!("renewed-{}", c.identity.replica_id))
-        });
-    }
     let current = native_configuration(&members, 0, 2);
     source.configuration(&current);
     target.configuration(&current);
-    assert!(
-        source
-            .driver
-            .public_owner()
-            .admission
-            .verify(&Authorization::Peer(peer))
-            .is_err()
-    );
     assert!(
         target
             .driver
@@ -1003,7 +793,7 @@ pub(crate) async fn oracle() {
             .await
             .is_err()
     );
-    let renewed = signer.peer(&source, &target, 2);
+    let renewed = bindings.peer(&source, &target);
     assert!(
         source
             .driver
@@ -1039,21 +829,6 @@ pub(crate) async fn oracle() {
         .public_application_role(ReplicaRole::ActiveSecondary)
         .await
         .unwrap();
-    let mut bad_revision = peer_replica(&renewed);
-    bad_revision.configuration_revision = Some(1);
-    assert!(
-        source
-            .driver
-            .public_configuration(
-                ReplicaSetConfiguration {
-                    configuration: current.clone(),
-                    replicas: vec![bad_revision],
-                },
-                None
-            )
-            .await
-            .is_err()
-    );
     source
         .driver
         .public_configuration(
@@ -1082,11 +857,13 @@ pub(crate) async fn oracle() {
         .credential
         .clone();
     assert_ne!(peer_credential.name, next_credential.name);
-    assert_ne!(peer_credential.secret, next_credential.secret);
     // Native ownership advances without any progress/report poll.
     source
-        .admission
-        .advance(|c| c.process_session_id = ProcessSessionId::new("withdrawn-session"));
+        .driver
+        .public_owner()
+        .fence
+        .update(|context| context.role = ReplicaRole::None)
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while source.driver.instance.is_running().await {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1104,7 +881,6 @@ pub(crate) async fn oracle() {
         .public_change_role(Epoch::new(0, 2), ReplicaRole::None)
         .await
         .unwrap();
-    source.admission.advance(|c| c.role = ReplicaRole::None);
     assert_eq!(
         source.driver.current_progress().await.unwrap(),
         source.driver.durable.snapshot().await.flush_lsn

@@ -115,26 +115,11 @@ public-path documented field crate::application::Operation::lsn: Lsn
 public-path documented field crate::application::RoleChange::service_address: Option < String >
 public-path documented field crate::application::WriteReceipt::committed_lsn: Lsn
 public-path documented field crate::application::WriteReceipt::lsn: Lsn
-public-path documented field crate::replicator::PublicAuthorizationContext::current_configuration_id: Option < ConfigurationId >
-public-path documented field crate::replicator::PublicAuthorizationContext::epoch: Epoch
-public-path documented field crate::replicator::PublicAuthorizationContext::history: HistoryContext
-public-path documented field crate::replicator::PublicAuthorizationContext::identity: ReplicaIdentity
-public-path documented field crate::replicator::PublicAuthorizationContext::previous_configuration_id: Option < ConfigurationId >
-public-path documented field crate::replicator::PublicAuthorizationContext::process_session_id: ProcessSessionId
-public-path documented field crate::replicator::PublicAuthorizationContext::role: ReplicaRole
-public-path documented field crate::replicator::PublicAuthorizationContext::storage_incarnation: ReplicaStorageIncarnationContext
-public-path documented field crate::replicator::PublicAuthorizationTrust::key_id: AuthorizationKeyId
-public-path documented field crate::replicator::PublicAuthorizationTrust::protocol_generation: PublicProtocolGeneration
-public-path documented field crate::replicator::PublicAuthorizationTrust::resource_uid: ResourceUid
-public-path documented field crate::replicator::PublicAuthorizationTrust::verification_key: AuthorizationVerificationKey
-public-path documented field crate::replicator::ReplicaInformation::build_authorization: Option < BuildAuthorizationV1 >
 public-path documented field crate::replicator::ReplicaInformation::build_id: OperationId
 public-path documented field crate::replicator::ReplicaInformation::catch_up_capability: Lsn
-public-path documented field crate::replicator::ReplicaInformation::configuration_revision: Option < u64 >
 public-path documented field crate::replicator::ReplicaInformation::current_progress: Lsn
 public-path documented field crate::replicator::ReplicaInformation::identity: ReplicaIdentity
 public-path documented field crate::replicator::ReplicaInformation::must_catchup: bool
-public-path documented field crate::replicator::ReplicaInformation::peer_authorization: Option < PeerSessionAuthorizationV1 >
 public-path documented field crate::replicator::ReplicaInformation::process_session_id: ProcessSessionId
 public-path documented field crate::replicator::ReplicaInformation::replication_address: String
 public-path documented field crate::replicator::ReplicaInformation::role: ReplicaRole
@@ -143,20 +128,14 @@ public-path documented field crate::replicator::ReplicaSetConfiguration::configu
 public-path documented field crate::replicator::ReplicaSetConfiguration::replicas: Vec < ReplicaInformation >
 public-path documented field crate::replicator::ReplicatorCapabilities::catch_up_specific_quorum: bool
 public-path documented field crate::replicator::ReplicatorCapabilities::data_loss_replay: DataLossReplay
-public-path documented field crate::replicator::ReplicatorSettings::public_authorization: Option < PublicAuthorizationTrust >
+public-path documented field crate::replicator::ReplicatorSettings::public_v1: bool
 public-path documented field crate::replicator::ReplicatorSettings::replication_address: String
 public-path documented field crate::replicator::stream::StreamOperation::data: Bytes
 public-path documented field crate::replicator::stream::StreamOperation::metadata: OperationMetadata
 public-path documented impl crate::replicator::DefaultReplicatorFactory::fn new (storage : Arc < dyn DurableState >) -> Self
-public-path documented impl crate::replicator::PublicAuthorizationAdmission::fn current_context (& self) -> Result < PublicAuthorizationContext >
-public-path documented impl crate::replicator::PublicAuthorizationAdmission::fn verify_build_authorization (& self , authorization : & BuildAuthorizationV1 ,) -> Result < PublicAuthorizationContext >
-public-path documented impl crate::replicator::PublicAuthorizationAdmission::fn verify_peer_session_authorization (& self , authorization : & PeerSessionAuthorizationV1 ,) -> Result < PublicAuthorizationContext >
-public-path documented impl crate::replicator::PublicAuthorizationTrust::fn validate (& self) -> Result < () >
 public-path documented impl crate::replicator::ReplicaInformation::fn active_peer (identity : ReplicaIdentity , replication_address : String , process_session_id : ProcessSessionId , current_progress : Lsn , catch_up_capability : Lsn , must_catchup : bool ,) -> Result < Self >
 public-path documented impl crate::replicator::ReplicaInformation::fn idle_build (build_id : OperationId , identity : ReplicaIdentity , replication_address : String ,) -> Self
 public-path documented impl crate::replicator::ReplicaInformation::fn new (build_id : OperationId , identity : ReplicaIdentity , replication_address : String ,) -> Self
-public-path documented impl crate::replicator::ReplicaInformation::fn validate_authorization_shape (& self) -> Result < () >
-public-path documented impl crate::replicator::ReplicaInformation::fn validate_build_authorization (& self , trust : & PublicAuthorizationTrust , history : & HistoryContext , epoch : Epoch , operation_id : & OperationId , source : & BuildAuthorizationEndpointV1 ,) -> Result < () >
 public-path documented impl crate::replicator::ReplicaInformation::fn validate_public_progress (& self) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorCapabilities::const fn conservative () -> Self
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn read_status (& self) -> Result < AccessStatus >
@@ -199,9 +178,6 @@ public-path documented struct crate::application::RoleChange
 public-path documented struct crate::application::WriteReceipt
 public-path documented struct crate::replicator::DefaultReplicator
 public-path documented struct crate::replicator::DefaultReplicatorFactory
-public-path documented struct crate::replicator::PublicAuthorizationAdmission
-public-path documented struct crate::replicator::PublicAuthorizationContext
-public-path documented struct crate::replicator::PublicAuthorizationTrust
 public-path documented struct crate::replicator::ReplicaInformation
 public-path documented struct crate::replicator::ReplicaSetConfiguration
 public-path documented struct crate::replicator::ReplicatorCapabilities
@@ -272,4 +248,3 @@ public-path documented variant crate::replicator::ReplicaSetQuorumMode::WriteQuo
 public-path documented variant crate::replicator::stream::OperationMetadata::Copy { { build_id : OperationId , sequence : u64 , } }
 public-path documented variant crate::replicator::stream::OperationMetadata::CopyComplete { { build_id : OperationId , up_to_lsn : Lsn , committed_lsn : Lsn , } }
 public-path documented variant crate::replicator::stream::OperationMetadata::Replication { { lsn : Lsn , committed_lsn : Lsn , } }
-public-path hidden field crate::replicator::ReplicatorSettings::public_authorization_admission: Option < PublicAuthorizationAdmission >

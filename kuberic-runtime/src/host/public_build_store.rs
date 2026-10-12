@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::authorization::{
-    AuthorizationAuditDigest, AuthorizationKeyId, AuthorizationVerificationKey,
-    BuildAuthorizationEndpointV1, BuildAuthorizationV1,
-};
 use crate::protocol::public_operations::PublicV1OperationResult;
-use crate::protocol::types::{Epoch, HistoryContext, OperationId};
+use crate::protocol::types::{
+    Epoch, HistoryContext, OperationId, ProcessSessionId, ReplicaIdentity,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,14 +19,13 @@ pub(crate) struct PublicV1BuildRecord {
     pub(crate) operation_id: OperationId,
     pub(crate) build_id: OperationId,
     pub(crate) admission_revision: u64,
-    pub(crate) verification_key: AuthorizationVerificationKey,
-    pub(crate) key_id: AuthorizationKeyId,
-    pub(crate) audit_digest: AuthorizationAuditDigest,
     pub(crate) history: HistoryContext,
     pub(crate) epoch: Epoch,
-    pub(crate) source: BuildAuthorizationEndpointV1,
-    pub(crate) target: BuildAuthorizationEndpointV1,
-    pub(crate) authorization: BuildAuthorizationV1,
+    pub(crate) source: ReplicaIdentity,
+    pub(crate) source_session: ProcessSessionId,
+    pub(crate) target: ReplicaIdentity,
+    pub(crate) target_session: ProcessSessionId,
+    pub(crate) target_address: String,
     pub(crate) retirement: PublicV1BuildRetirement,
     pub(crate) result: Option<PublicV1OperationResult>,
 }
@@ -39,25 +36,14 @@ impl PublicV1BuildRecord {
             || self.build_id.is_empty()
             || self.admission_revision == 0
             || self.operation_id != self.build_id
-            || self.key_id != self.verification_key.key_id()
-            || self.authorization.claims.operation_id != self.operation_id
-            || self.authorization.claims.build_id != self.build_id
-            || self.authorization.claims.key_id != self.key_id
-            || self.authorization.claims.history != self.history
-            || self.authorization.claims.epoch != self.epoch
-            || self.authorization.claims.source != self.source
-            || self.authorization.claims.target != self.target
-            || self
-                .authorization
-                .audit_digest()
-                .map_err(|_| "public-v1 build record has an invalid authorization envelope")?
-                != self.audit_digest
+            || self.source_session.is_empty()
+            || self.target_session.is_empty()
+            || self.target_address.is_empty()
+            || self.source == self.target
         {
-            return Err("public-v1 build record differs from signed authority");
+            return Err("public-v1 build record has incomplete exact attempt identity");
         }
-        self.verification_key
-            .verify_build_authorization(&self.authorization)
-            .map_err(|_| "public-v1 build record signature is invalid")?;
+        self.history.validate()?;
         match self.result.as_ref() {
             Some(
                 PublicV1OperationResult::Failed(detail)

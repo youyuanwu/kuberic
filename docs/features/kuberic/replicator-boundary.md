@@ -155,13 +155,12 @@ data is migrated through this boundary.
 
 Public V1 operation inputs use versioned, domain-separated canonical binary
 digests rather than Rust diagnostic formatting. The digest version remains
-part of the retained operation evidence and is distinct from the signed
-authorization audit digest added by a later Phase 5 phase. Protocol 11 also
-has a structurally separate report and accepted-status branch containing only
-public identity, role/access, first/last progress, and exact public-operation
-completion. It cannot carry the managed engine's verified, committed, quorum,
-ACK, copy-boundary, topology, or build-cursor evidence. Production
-normalization and evaluation reject this branch.
+part of the retained operation evidence. Protocol 11 also has a structurally
+separate report and accepted-status branch containing only public identity,
+role/access, first/last progress, and exact public-operation completion. It
+cannot carry the managed engine's verified, committed, quorum, ACK,
+copy-boundary, topology, or build-cursor evidence. Production normalization
+and evaluation reject this branch.
 
 `ReplicaInformation` now distinguishes an idle build target from an active
 remote peer. Unknown or inapplicable progress is `INVALID_LSN` (`-1`); zero
@@ -176,8 +175,9 @@ Typed rebuild-required results preserve the public/provider-visible reason
 without exposing agent workflow state through a callback. The operation owner
 enriches a local result from the exact captured operation, storage, epoch,
 revision, and process session; delayed completion is never enriched from
-current state. Remote build failures retain exact signed-claim references and
-are validated against the captured build input. This two-level construction
+current state. Remote build failures retain the target identity, target
+session, epoch and reason; the operation owner enriches them with the captured
+resource, operation and source session. This two-level construction
 does not change the protected Replicator, PrimaryReplicator, StateReplicator,
 StateProvider, or DurableState method sets and adds no host-only callback.
 
@@ -222,8 +222,8 @@ remain distinct in durable/report state as `Retired` versus
 `ReplacementRequired`. Every ordinary Public V1 lifecycle/program epoch is
 fenced to the current history data-loss number; only the exact recovery
 authorization may admit the one specified increment. Public V1 build/removal
-inputs carry the exact current `HistoryContext` even before Phase 3 adds signed
-authorization, so authorization-free preview builds cannot escape the fence.
+inputs carry the exact current `HistoryContext`, so build attempts cannot
+escape the history fence.
 
 After ambiguous predecessor containment, the controller conditionally replaces
 the accepted process attempt with the exact higher-epoch successor before
@@ -257,84 +257,39 @@ and evaluation still reject the feature-gated protocol-11 path.
 Phase 5.3 replaces the disposable schema-9 store with a fresh exact schema-10
 store. Schemas 6, 7, 8 and 9 are rejected before decoding; there is no
 migration, absent-field fallback or retained database fixture. Schema 10 adds
-bounded signed-authorization intent state and process-session renewal
-barriers while protocol 11 remains repository-only.
+process-session renewal barriers while protocol 11 remains repository-only.
 
-Authorization uses one fixed Ed25519 construction. Build and peer claims have
-distinct versioned domains and canonical binary field order; signatures cover
-those bytes rather than JSON, protobuf serialization or diagnostic text. Key
-IDs are the full SHA-256 digest of the raw 32-byte verification key, and audit
-digests are SHA-256 of the exact canonical signed envelope. Protobuf carries
-the raw canonical envelope bytes, while JSON/CRD values use strict canonical
-base64. Type confusion, unknown tags/versions, malformed lengths, trailing
-bytes, alternate encodings, wrong keys and re-encoding mismatches fail closed.
+Build and peer descriptors carry exact replica identities, process sessions,
+addresses, epochs and current/previous configuration IDs. These values support
+lifecycle fencing and stale-result rejection, but they are not credentials and
+do not authenticate the remote process. Primary/secondary replacement or peer
+withdrawal advances the configuration epoch, closes affected access, freezes
+the survivor set, completes or explicitly excludes every survivor epoch
+barrier, replays the replacement role when applicable, and only then installs
+fresh configuration. An unreachable survivor is waited for or retired;
+same-epoch primary-session substitution is invalid. Data-loss replacement
+preserves the Phase 5.2 logical authorization and still enforces exact captured
+replay capability before any callback.
 
-Only the controller owns private signing material. One immutable Secret of
-type `kuberic.io/public-v1-authorization-key` is created for each resource and
-Public V1 generation, with exactly three 32-byte binary keys:
-`ed25519-seed`, `ed25519-public-key` and `key-id-sha256`. Every read re-derives
-the public key and key ID from the seed and validates the exact owner UID,
-resource/generation labels, Secret UID/resourceVersion and immutable flag.
-After accepted status binds that identity, loss, recreation, mutation or
-same-generation replacement is terminal; no implicit key regeneration occurs.
-The Secret is never referenced by Pod environment, volume, annotation or
-agent command. Replica Pods disable service-account token automount, so the
-application/agent process receives no Kubernetes API credential that could
-read the controller-only Secret. Replicas receive only immutable public trust
-through `ReplicatorSettings`.
-
-Accepted Public V1 status owns a bounded authorization intent before dispatch.
-The intent freezes typed build or current/previous peer claims and advances
-monotonically through `Prepared`, `Signed`, `Dispatched`, `Observed` and
-`Retired`. Signing resolves the exact accepted Secret once and persists the
-exact envelope, signature and audit digest before dispatch. Lost responses
-reuse those retained bytes. Observation or retirement must match the exact
-operation, revision, claim kind and audit digest; superseded predecessors
-cannot replay. Retirement clears claims, canonical bytes, envelopes and
-signatures, leaving only bounded audit identity and disposition; a later
-conditional status transition removes the retired tombstone after replay is
-no longer permitted.
-
-An idle target may carry only its exact signed build authorization, including
-history, epoch, operation/build IDs and both storage/process/address
-incarnations. An active remote PC/CC member may carry only its exact peer
-session authorization, including configuration IDs/revision and both endpoint
-sessions/addresses. Immutable public trust is creation-bound and cannot be
-changed by settings update. Copy/build authorization is verified before
-provider mutation; peer authorization is verified before replication traffic
-or acknowledgement contribution. Signature validity alone does not bypass
-current local history, epoch, configuration IDs, storage, role, session or
-address checks. Dormant authority is scoped to the exact Replicator creation
-and local resource identity; descriptor value conversion has no side effects,
-failed configuration installation restores prior authority, and dropping the
-creation removes its trust, peer and build state. Successful role, epoch and
-configuration callbacks durably advance the local authority snapshot and
-invalidate predecessor peer/build capabilities before later traffic.
-
-Replacement active sessions are also explicit schema-10 authority. The new
-session begins unassigned and access-closed with only history-scoped progress.
-Primary/secondary replacement or peer-authorization withdrawal advances the
-configuration epoch, closes affected access, freezes the survivor set,
-completes or explicitly excludes every survivor epoch barrier, replays the
-replacement role when applicable, and only then installs fresh configuration.
-An unreachable survivor is waited for or retired; same-epoch primary-session
-substitution is invalid. Data-loss replacement preserves the Phase 5.2 logical
-authorization and still enforces exact captured replay capability before any
-callback.
+Public V1 currently has no transport authentication contract. The PostgreSQL
+oracle uses an unauthenticated lifecycle-owned gateway and the public
+coordination RPC accepts no Public V1 token. TLS identity, workload identity or
+an explicit token protocol may be designed later. Until then the exact
+descriptor and session checks are correctness fences, not proof of the peer's
+identity. This is a documented future gap; this phase does not define a
+production-activation policy for it.
 
 Phase 5.4 replaces the disposable schema-10 store with the final fresh
 schema-11 Public V1 store. Schemas 8, 9 and 10 are rejected before record
-decoding. Each completed protocol-11 call now reports its exact call kind,
+decoding. Each completed protocol-11 call reports its exact call kind,
 canonical input digest, replay disposition, accepted history/storage/process
-session, applicable PC/CC IDs, catch-up mode/capability, and signed
-authorization key/audit identity without native committed/quorum/ACK/copy
-evidence.
+session, applicable PC/CC IDs, and catch-up mode/capability without native
+committed/quorum/ACK/copy evidence.
 
-Schema 11 also owns one signed public build record per admitted attempt. The
-record retains the exact verification key, key ID, canonical envelope and
-audit digest; source/target history, epoch, storage, process sessions and
-addresses; admission revision; terminal public result; and retirement
-disposition. It never stores an engine cursor, copy sequence, snapshot or
+Schema 11 owns one public build record per admitted attempt. The record retains
+the source and target identities, process sessions and address, history, epoch,
+admission revision, terminal public result and retirement disposition. It
+never stores a transport credential, engine cursor, copy sequence, snapshot or
 catch-up boundary, durable target LSN, ACK/quorum state, or a Replicator store
 handle. Callback ambiguity requires retirement, successful removal retires the
 exact record, and malformed or incompletely bound current-schema records fail
@@ -343,13 +298,12 @@ on reopen.
 The dormant controller stores a structural, lossless shadow of each exact
 public completion before using it. The shadow preserves call kind, canonical
 input identity, replay disposition, accepted history/storage/process session,
-PC/CC IDs, capability/mode, signed key/audit identity, typed failure detail
-and typed local/remote rebuild authority. Failover, switchover,
-repair/replacement, scale-up/down, removal, data loss and session renewal all
-use the same conditional evidence gate. Missing completion waits; changed
-history/session/incarnation/configuration/authorization fails closed; typed
-failure retires the exact incarnation and typed rebuild authority provisions
-only the captured replacement.
+PC/CC IDs, capability/mode, typed failure detail and typed local/remote rebuild
+identity. Failover, switchover, repair/replacement, scale-up/down, removal,
+data loss and session renewal all use the same conditional evidence gate.
+Missing completion waits; changed history/session/incarnation/configuration
+fails closed; typed failure retires the exact incarnation and typed rebuild
+identity provisions only the captured replacement.
 
 These responsibilities do not move at a standard-operation boundary.
 Successful public catch-up, build, and ordinary removal completion is the

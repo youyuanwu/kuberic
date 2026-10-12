@@ -108,48 +108,20 @@ pub(super) fn replica_set(
 pub(super) async fn install(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
-    authorization_context: Option<&mut crate::replicator::PublicAuthorizationRuntimeContext>,
 ) -> Result<()> {
-    let authorization_snapshot = if let Some(context) = authorization_context.as_deref() {
-        crate::replicator::admit_public_peer_configuration(context, input)?
-    } else if input
-        .replicas
-        .iter()
-        .any(|replica| replica.peer_authorization.is_some())
-    {
-        return Err(HostError::CommandRejected(
-            "signed peer authorization requires public-v1 runtime context".into(),
-        ));
-    } else {
-        None
-    };
-    let result = if let Some(previous) = &input.previous {
+    if let Some(previous) = &input.previous {
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
                 replica_set(input, &input.current),
                 replica_set(input, previous),
             )
-            .await
+            .await?;
     } else {
         callbacks
             .primary
             .update_current_replica_set_configuration(replica_set(input, &input.current))
-            .await
-    };
-    if let Err(error) = result {
-        if let Some(snapshot) = authorization_snapshot {
-            crate::replicator::restore_public_peer_authorization(snapshot)?;
-        }
-        return Err(error.into());
-    }
-    if let Some(context) = authorization_context {
-        context.epoch = input.current.epoch;
-        context.previous_configuration_id = input
-            .previous
-            .as_ref()
-            .map(|configuration| configuration.configuration_id.clone());
-        context.current_configuration_id = Some(input.current.configuration_id.clone());
+            .await?;
     }
     Ok(())
 }
@@ -157,39 +129,11 @@ pub(super) async fn install(
 pub(super) async fn install_current(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
-    authorization_context: Option<&mut crate::replicator::PublicAuthorizationRuntimeContext>,
 ) -> Result<()> {
-    let authorization_snapshot = if let Some(context) = authorization_context.as_deref() {
-        crate::replicator::admit_public_peer_configuration(context, input)?
-    } else if input
-        .replicas
-        .iter()
-        .any(|replica| replica.peer_authorization.is_some())
-    {
-        return Err(HostError::CommandRejected(
-            "signed peer authorization requires public-v1 runtime context".into(),
-        ));
-    } else {
-        None
-    };
-    let result = callbacks
+    callbacks
         .primary
         .update_current_replica_set_configuration(replica_set(input, &input.current))
-        .await;
-    if let Err(error) = result {
-        if let Some(snapshot) = authorization_snapshot {
-            crate::replicator::restore_public_peer_authorization(snapshot)?;
-        }
-        return Err(error.into());
-    }
-    if let Some(context) = authorization_context {
-        context.epoch = input.current.epoch;
-        context.previous_configuration_id = input
-            .previous
-            .as_ref()
-            .map(|configuration| configuration.configuration_id.clone());
-        context.current_configuration_id = Some(input.current.configuration_id.clone());
-    }
+        .await?;
     Ok(())
 }
 
@@ -265,41 +209,6 @@ pub(super) async fn execute(
         .into_iter()
         .find(|record| record.intent == intent)
         .ok_or_else(|| HostError::Corrupt("missing public program".into()))?;
-    let mut authorization_context = if intent.preview.is_public_v1() {
-        let state = store.load_state().await?;
-        let preview = state
-            .public_operation_preview
-            .as_ref()
-            .ok_or_else(|| HostError::Corrupt("missing public-v1 preview state".into()))?;
-        let context = crate::replicator::PublicAuthorizationRuntimeContext {
-            identity: state.identity.local_identity.clone(),
-            history: preview
-                .history
-                .clone()
-                .ok_or_else(|| HostError::Corrupt("missing public-v1 history".into()))?,
-            storage_incarnation: preview.storage_incarnation.clone().ok_or_else(|| {
-                HostError::Corrupt("missing public-v1 storage incarnation".into())
-            })?,
-            process_session_id: intent.process_session_id.clone(),
-            role: state.role,
-            epoch: state
-                .current_configuration
-                .as_ref()
-                .map_or(state.highest_epoch, |configuration| configuration.epoch),
-            previous_configuration_id: state
-                .previous_configuration
-                .as_ref()
-                .map(|configuration| configuration.configuration_id.clone()),
-            current_configuration_id: state
-                .current_configuration
-                .as_ref()
-                .map(|configuration| configuration.configuration_id.clone()),
-        };
-        crate::replicator::bind_public_authorization_context(context.clone())?;
-        Some(context)
-    } else {
-        None
-    };
     let start = record.lifecycle.outcomes.len();
     // An interrupted close that already recorded a child failure still needs
     // process-local abort containment; the durable diagnostic is not a proof.
@@ -364,11 +273,6 @@ pub(super) async fn execute(
                 };
                 if instruction == ReplicatorRole {
                     callbacks.replicator.change_role(epoch, role).await?;
-                    if let Some(context) = authorization_context.as_mut() {
-                        context.epoch = epoch;
-                        context.role = role;
-                        crate::replicator::advance_public_authorization_context(context.clone())?;
-                    }
                     O::Done
                 } else {
                     O::ApplicationRole(
@@ -385,31 +289,17 @@ pub(super) async fn execute(
                     unreachable!()
                 };
                 callbacks.replicator.update_epoch(*epoch).await?;
-                if let Some(context) = authorization_context.as_mut() {
-                    context.epoch = *epoch;
-                    crate::replicator::advance_public_authorization_context(context.clone())?;
-                }
                 O::Done
             }
             Configuration | StartingConfiguration | RefreshedConfiguration => {
-                install(
-                    &callbacks,
-                    configuration(program, instruction),
-                    authorization_context.as_mut(),
-                )
-                .await?;
+                install(&callbacks, configuration(program, instruction)).await?;
                 O::Done
             }
             FirstCatchUp | SecondCatchUp => {
                 // At a recovery cut, the persisted install result is historical.
                 // Reinstall the exact input before reevaluating the wait.
                 if index == start && start > 0 {
-                    install(
-                        &callbacks,
-                        configuration(program, instruction),
-                        authorization_context.as_mut(),
-                    )
-                    .await?;
+                    install(&callbacks, configuration(program, instruction)).await?;
                 }
                 let (P::CatchUp { mode: selected, .. } | P::Swap { mode: selected, .. }) = program
                 else {
@@ -441,23 +331,6 @@ pub(super) async fn execute(
                     build.replication_address.clone(),
                 );
                 replica.process_session_id = build.process_session_id.clone();
-                replica.build_authorization = build.build_authorization.clone();
-                replica.storage_incarnation = build
-                    .build_authorization
-                    .as_ref()
-                    .map(|authorization| authorization.claims.target.storage_incarnation.clone());
-                if let Some(context) = &authorization_context {
-                    crate::replicator::authorize_public_build_descriptor(
-                        context,
-                        context.epoch,
-                        &intent.operation_id,
-                        &replica,
-                    )?;
-                } else if replica.build_authorization.is_some() {
-                    return Err(HostError::CommandRejected(
-                        "signed build authorization requires public-v1 runtime context".into(),
-                    ));
-                }
                 match callbacks.primary.build_replica(replica).await {
                     Ok(()) => O::Done,
                     Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
@@ -508,16 +381,7 @@ pub(super) async fn execute(
                     )
                 };
                 match result {
-                    Ok(()) => {
-                        if instruction == ReplicatorClose
-                            && let Some(context) = authorization_context.as_ref()
-                        {
-                            crate::replicator::clear_public_authorization_context(
-                                &context.identity,
-                            );
-                        }
-                        O::Done
-                    }
+                    Ok(()) => O::Done,
                     Err(error) => {
                         callbacks.abort_once();
                         O::CloseFailure {
@@ -529,9 +393,6 @@ pub(super) async fn execute(
             }
             Abort => {
                 callbacks.abort_once();
-                if let Some(context) = authorization_context.as_ref() {
-                    crate::replicator::clear_public_authorization_context(&context.identity);
-                }
                 O::Done
             }
             Cleanup => {

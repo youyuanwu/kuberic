@@ -1,11 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ed25519_dalek::{Signer as _, SigningKey};
-use kuberic_runtime::protocol::authorization::{
-    AuthorizationSignature, AuthorizationVerificationKey, BuildAuthorizationClaimsV1,
-    BuildAuthorizationEndpointV1, BuildAuthorizationV1,
-};
 use kuberic_runtime::protocol::command::{PublicV1HistoryCommand, PublicV1SessionRenewalCommand};
 use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, DataLossRenewalDecision, DataLossReplay,
@@ -68,54 +63,21 @@ fn storage(identity: ReplicaIdentity) -> ReplicaStorageIncarnationContext {
     }
 }
 
-fn signed_build_intent(
+fn build_intent(
     preview: &PublicOperationPreviewIdentity,
     history: &kuberic_runtime::protocol::types::HistoryContext,
-    source: ReplicaStorageIncarnationContext,
     target: ReplicaStorageIncarnationContext,
 ) -> PublicOperationIntent {
-    let signing_key = SigningKey::from_bytes(&[13; 32]);
-    let verification_key =
-        AuthorizationVerificationKey::from_bytes(signing_key.verifying_key().to_bytes()).unwrap();
-    let operation_id = OperationId::new("schema11-signed-build");
+    let operation_id = OperationId::new("schema11-build");
     let source_session = ProcessSessionId::new("schema11-source-session");
     let target_session = ProcessSessionId::new("schema11-target-session");
-    let claims = BuildAuthorizationClaimsV1 {
-        resource_uid: history.resource_uid.clone(),
-        protocol_generation: history.protocol_generation,
-        key_id: verification_key.key_id(),
-        history: history.clone(),
-        epoch: Epoch::new(history.data_loss_number, 7),
-        operation_id: operation_id.clone(),
-        build_id: operation_id.clone(),
-        source: BuildAuthorizationEndpointV1 {
-            storage_incarnation: source,
-            process_session_id: source_session.clone(),
-            replication_address: "https://10.0.0.1:7000".into(),
-            role: ReplicaRole::Primary,
-        },
-        target: BuildAuthorizationEndpointV1 {
-            storage_incarnation: target.clone(),
-            process_session_id: target_session.clone(),
-            replication_address: "https://10.0.0.2:7000".into(),
-            role: ReplicaRole::IdleSecondary,
-        },
-    };
-    let signature = AuthorizationSignature::from_bytes(
-        signing_key
-            .sign(&claims.signing_bytes().unwrap())
-            .to_bytes(),
-    );
-    let authorization = BuildAuthorizationV1::from_signature(claims, signature).unwrap();
     let program = PublicOperationProgram::Build(PublicBuildInput {
         attempt: operation_id.clone(),
+        epoch: Epoch::new(history.data_loss_number, 7),
         replica: target.replica.clone(),
         process_session_id: target_session,
         replication_address: "https://10.0.0.2:7000".into(),
         history: Some(history.clone()),
-        authorization: None,
-        authorization_verification_key: Some(verification_key),
-        build_authorization: Some(authorization),
     });
     PublicOperationIntent {
         preview: preview.clone(),
@@ -368,7 +330,6 @@ fn accepted_recovery(
             observed_progress: None,
         }),
         completed_operations: Vec::new(),
-        authorization: None,
         extensions: Default::default(),
     }
 }
@@ -760,10 +721,10 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
         .initialize_public_v1_history(&initialization, &history, &local_storage)
         .await
         .unwrap();
-    let signed_intent = signed_build_intent(&preview, &history, local_storage, storage(replica(2)));
-    signed_intent.validate().unwrap();
+    let build_intent = build_intent(&preview, &history, storage(replica(2)));
+    build_intent.validate().unwrap();
     store
-        .begin_public_v1_operation(&signed_intent)
+        .begin_public_v1_operation(&build_intent)
         .await
         .unwrap();
     let required = ordinary_required(Epoch::new(0, 10), Epoch::new(0, 11));
@@ -776,7 +737,7 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
     let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
     assert_eq!(
         reopened.public_v1_operation_intents().await.unwrap(),
-        vec![signed_intent.clone()]
+        vec![build_intent.clone()]
     );
     let active_builds = reopened.public_v1_build_records().await.unwrap();
     assert_eq!(active_builds.len(), 1);
@@ -785,17 +746,12 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
         PublicV1BuildRetirementSnapshot::Retain
     );
     assert!(active_builds[0].result.is_none());
-    let PublicOperationProgram::Build(build) = signed_intent.program.as_ref().unwrap() else {
-        panic!("expected signed build program");
+    let PublicOperationProgram::Build(build) = build_intent.program.as_ref().unwrap() else {
+        panic!("expected public-v1 build program");
     };
-    assert_eq!(
-        active_builds[0].authorization,
-        build.build_authorization.as_ref().unwrap().clone()
-    );
-    assert_eq!(
-        active_builds[0].verification_key,
-        build.authorization_verification_key.unwrap()
-    );
+    assert_eq!(active_builds[0].target, build.replica);
+    assert_eq!(active_builds[0].target_session, build.process_session_id);
+    assert_eq!(active_builds[0].target_address, build.replication_address);
     assert_eq!(
         reopened
             .public_v1_history_snapshot()
@@ -815,9 +771,9 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
             .await
             .is_err()
     );
-    let mut superseded_intent = signed_intent.clone();
+    let mut superseded_intent = build_intent.clone();
     let PublicOperationProgram::Build(build) = superseded_intent.program.as_mut().unwrap() else {
-        panic!("expected signed build program");
+        panic!("expected public-v1 build program");
     };
     build.replication_address = "https://10.0.0.2:7001".into();
     superseded_intent.input_digest = superseded_intent.program.as_ref().unwrap().digest();
@@ -827,11 +783,11 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
             .await
             .is_err()
     );
-    let mut incomplete_intent = signed_intent.clone();
+    let mut incomplete_intent = build_intent.clone();
     let PublicOperationProgram::Build(build) = incomplete_intent.program.as_mut().unwrap() else {
-        panic!("expected signed build program");
+        panic!("expected public-v1 build program");
     };
-    build.build_authorization = None;
+    build.process_session_id = ProcessSessionId::default();
     incomplete_intent.input_digest = incomplete_intent.program.as_ref().unwrap().digest();
     assert!(
         reopened
@@ -840,26 +796,26 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
             .is_err()
     );
     reopened
-        .complete_public_v1_build(&signed_intent)
+        .complete_public_v1_build(&build_intent)
         .await
         .unwrap();
     drop(reopened);
     let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
-    let terminal_signed = reopened
-        .public_v1_operation_snapshot(&signed_intent.operation_id)
+    let terminal_build = reopened
+        .public_v1_operation_snapshot(&build_intent.operation_id)
         .await
         .unwrap();
-    assert_eq!(&terminal_signed.intent, &signed_intent);
+    assert_eq!(&terminal_build.intent, &build_intent);
     assert_eq!(
-        terminal_signed.stage,
+        terminal_build.stage,
         PublicV1OperationSnapshotStage::Completed
     );
     assert_eq!(
-        terminal_signed.disposition,
+        terminal_build.disposition,
         Some(PublicV1OperationSnapshotDisposition::Succeeded)
     );
     assert_eq!(
-        terminal_signed.intent.replay_disposition,
+        terminal_build.intent.replay_disposition,
         PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
     );
     let terminal_builds = reopened.public_v1_build_records().await.unwrap();
@@ -897,26 +853,16 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
         ProcessSessionId::new("schema11-source-session")
     );
     assert_eq!(
-        completion.authorization_key_id,
-        Some(terminal_builds[0].key_id)
-    );
-    assert_eq!(
-        completion.authorization_audit_digest,
-        Some(terminal_builds[0].audit_digest)
-    );
-    assert_eq!(
         kuberic_runtime::control::normalize_public_v1_agent_status_report(
             kuberic_runtime::control::public_v1_agent_status_to_proto(&report),
         )
         .unwrap(),
         report
     );
-    let PublicOperationProgram::Build(build) = signed_intent.program.as_ref().unwrap() else {
-        panic!("expected signed build program");
+    let PublicOperationProgram::Build(build) = build_intent.program.as_ref().unwrap() else {
+        panic!("expected public-v1 build program");
     };
-    let mut removal_build = build.clone();
-    removal_build.authorization_verification_key = None;
-    removal_build.build_authorization = None;
+    let removal_build = build.clone();
     let removal_program = PublicOperationProgram::Remove(removal_build.clone());
     let removal_intent = PublicOperationIntent {
         preview: preview.clone(),
@@ -1043,7 +989,7 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
     *mismatched_record
         .get_mut("publicOperationPreview")
         .and_then(|preview| preview.get_mut("buildRecords"))
-        .and_then(|records| records.get_mut("schema11-signed-build"))
+        .and_then(|records| records.get_mut("schema11-build"))
         .and_then(|record| record.get_mut("admissionRevision"))
         .unwrap() = serde_json::json!(2);
     connection
@@ -1066,16 +1012,15 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
         .and_then(|preview| preview.get_mut("operations"))
         .and_then(serde_json::Value::as_object_mut)
         .unwrap();
-    let record = operations.get_mut("schema11-signed-build").unwrap();
-    let signature = record
+    let record = operations.get_mut("schema11-build").unwrap();
+    let process_session = record
         .get_mut("intent")
         .and_then(|intent| intent.get_mut("program"))
         .and_then(|program| program.get_mut("Build"))
-        .and_then(|build| build.get_mut("build_authorization"))
         .and_then(serde_json::Value::as_object_mut)
         .unwrap()
-        .remove("signature");
-    assert!(signature.is_some());
+        .remove("process_session_id");
+    assert!(process_session.is_some());
     connection
         .execute(
             "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
@@ -1117,7 +1062,7 @@ async fn public_v1_schema11_build_ambiguity_requires_retirement() {
         .initialize_public_v1_history(&initialization, &history, &local_storage)
         .await
         .unwrap();
-    let intent = signed_build_intent(&preview, &history, local_storage, storage(replica(2)));
+    let intent = build_intent(&preview, &history, storage(replica(2)));
     store.begin_public_v1_operation(&intent).await.unwrap();
     store.mark_public_v1_build_ambiguous(&intent).await.unwrap();
     drop(store);
