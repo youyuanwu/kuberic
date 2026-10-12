@@ -1,3 +1,12 @@
+const FAILOVER_SCENARIO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+async fn completes_within<F>(timeout: std::time::Duration, scenario: F) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::time::timeout(timeout, scenario).await.is_ok()
+}
+
 macro_rules! host_test {
     ($name:ident) => {
         #[test_log::test]
@@ -10,13 +19,40 @@ macro_rules! host_test {
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(scenarios::$name());
+                        .block_on(completes_within(
+                            FAILOVER_SCENARIO_TIMEOUT,
+                            scenarios::$name(),
+                        ))
                 })
                 .unwrap()
                 .join()
-                .unwrap();
+                .unwrap()
+                .then_some(())
+                .unwrap_or_else(|| {
+                    panic!("{} exceeded its 240-second test bound", stringify!($name))
+                });
         }
     };
+}
+
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn stalled_failover_scenario_times_out_and_reaps_postgres() {
+    use postgres_replicated::testing::{PgPod, ProcessProbe, TestDataDir, native_identity};
+
+    let root = TestDataDir::new("p5-timeout-cleanup");
+    let pod = PgPod::new(root.path().join("pod"), native_identity(91, "timeout")).await;
+    pod.singleton().await;
+    let processes = ProcessProbe::postgres(pod.application.instance().data_dir());
+    assert!(
+        !completes_within(std::time::Duration::from_secs(1), async move {
+            let _root = root;
+            let _pod = pod;
+            std::future::pending::<()>().await;
+        })
+        .await,
+        "stalled scenario unexpectedly completed"
+    );
+    processes.assert_reaped();
 }
 
 mod scenarios {
