@@ -297,8 +297,15 @@ impl PublicV1EvidenceApi for PublicV1EvidenceState {
             PublicV1OperationResult::Failed(_)
                 | PublicV1OperationResult::Ambiguous(_)
                 | PublicV1OperationResult::Cancelled
-        ) {
-            return Err("public-v1 retirement requires a failed completion".into());
+        ) && !(completion.result == PublicV1OperationResult::Succeeded
+            && completion.call_kind
+                == kuberic_runtime::protocol::public_operations::PublicV1CallKind::Remove
+            && expected.intent.target.is_some())
+        {
+            return Err(
+                "public-v1 retirement requires a failed completion or exact successful removal"
+                    .into(),
+            );
         }
         if target != expected.intent.effect_target() {
             return Err("public-v1 retirement target differs from accepted intent".into());

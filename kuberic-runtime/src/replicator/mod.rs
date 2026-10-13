@@ -586,6 +586,8 @@ struct ReplicatorCreation {
     guarded_control: StdMutex<Arc<dyn Replicator>>,
     capabilities: ReplicatorCapabilities,
     managed: Option<ManagedReplicatorCapabilities>,
+    #[cfg(feature = "testing")]
+    callback_containment: StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
     settings: StdMutex<Option<BoundReplicatorSettings>>,
     armed: AtomicBool,
 }
@@ -608,6 +610,8 @@ impl ReplicatorCreation {
             guarded_control: StdMutex::new(guarded_control),
             capabilities,
             managed,
+            #[cfg(feature = "testing")]
+            callback_containment: StdMutex::new(None),
             settings: StdMutex::new(None),
             armed: AtomicBool::new(true),
         }
@@ -811,6 +815,18 @@ impl ReplicatorAttachment {
         self.has_provider_writer
     }
 
+    #[cfg(feature = "testing")]
+    pub(crate) fn callback_containment(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.creation
+            .callback_containment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn disarm(&self) {
         self.creation.armed.store(false, Ordering::Release);
     }
@@ -822,6 +838,19 @@ impl ReplicatorAttachment {
 }
 
 impl ReplicatorInterfaces {
+    #[cfg(feature = "testing")]
+    pub(crate) fn with_callback_containment(
+        self,
+        containment: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        *self
+            .creation
+            .callback_containment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(containment);
+        self
+    }
+
     pub fn secondary(
         replicator: Arc<dyn Replicator>,
         state_replicator: Option<Arc<dyn StateReplicator>>,

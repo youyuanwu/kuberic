@@ -319,6 +319,7 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
         };
         public_command.validate().map_err(str::to_owned)?;
         let replica = self.replica(public_command.target())?;
+        self.dispatched.lock().unwrap().push(command.clone());
         match public_command.as_ref() {
             PublicV1HistoryCommand::Initialize {
                 accepted, storage, ..
@@ -344,7 +345,6 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
                 return Err("session-renewal command used the history API".into());
             }
         }
-        self.dispatched.lock().unwrap().push(command.clone());
         Ok(())
     }
 }

@@ -36,6 +36,7 @@ pub(crate) struct PartitionOperation {
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     revision: watch::Sender<u64>,
     descendants: Mutex<Option<watch::Receiver<bool>>>,
+    wait_for_descendants: std::sync::atomic::AtomicBool,
     #[cfg(all(test, feature = "testing"))]
     cut: Mutex<Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>>,
 }
@@ -62,6 +63,7 @@ impl PartitionOperation {
             shutting_down,
             revision,
             descendants: Mutex::new(None),
+            wait_for_descendants: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, feature = "testing"))]
             cut: Mutex::new(None),
         }
@@ -93,7 +95,11 @@ impl PartitionOperation {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub(crate) async fn track_containment(&self, witness: watch::Receiver<bool>) -> Result<()> {
+    pub(crate) async fn track_containment(
+        &self,
+        witness: watch::Receiver<bool>,
+        wait_for_descendants: bool,
+    ) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
         if self.snapshot().stage != PublicOperationStage::Ready {
             return Err(HostError::CommandRejected(
@@ -101,6 +107,8 @@ impl PartitionOperation {
             ));
         }
         *self.descendants.lock().await = Some(witness);
+        self.wait_for_descendants
+            .store(wait_for_descendants, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -120,6 +128,22 @@ impl PartitionOperation {
             self.complete_containment().await?;
         }
         Ok(())
+    }
+
+    async fn wait_for_witness(&self) -> Result<()> {
+        let Some(mut witness) = self.descendants.lock().await.clone() else {
+            return Ok(());
+        };
+        while self.snapshot().stage == PublicOperationStage::ContainmentPending
+            && !*witness.borrow()
+        {
+            witness.changed().await.map_err(|_| {
+                HostError::CommandRejected(
+                    "public-operation containment witness closed before drain".into(),
+                )
+            })?;
+        }
+        self.settle_witness().await
     }
 
     pub(crate) async fn wait_until_ready(&self) -> Result<bool> {
@@ -1104,6 +1128,13 @@ impl PartitionOperationRegistry {
         for displaced in superseded {
             if let Err(error) = displaced.cancel_root().await {
                 first_error.get_or_insert(error);
+            } else if displaced
+                .wait_for_descendants
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                if let Err(error) = displaced.wait_for_witness().await {
+                    first_error.get_or_insert(error);
+                }
             } else if let Err(error) = displaced.settle_witness().await {
                 first_error.get_or_insert(error);
             }

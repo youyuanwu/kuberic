@@ -44,6 +44,7 @@ impl KvService {
     }
 
     #[cfg(feature = "testing")]
+    #[allow(dead_code)]
     pub fn with_stateless_preview(self) -> Self {
         self.stateless_preview
             .store(true, std::sync::atomic::Ordering::Release);

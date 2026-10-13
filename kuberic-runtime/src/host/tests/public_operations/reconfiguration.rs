@@ -248,6 +248,7 @@ impl Fixture {
                     .await,
             ),
             containment: Some(replicator.containment.subscribe()),
+            wait_for_containment: false,
             aborted: Arc::new(Mutex::new(false)),
             cut: None,
         };
@@ -1496,6 +1497,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
             replicator_creation_id: ReplicatorCreationId::new("creation-2"),
             open_context: None,
             containment: None,
+            wait_for_containment: false,
             aborted: Arc::new(Mutex::new(false)),
             cut: None,
         },
@@ -1576,6 +1578,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
             replicator_creation_id: ReplicatorCreationId::new("creation-2"),
             open_context: None,
             containment: None,
+            wait_for_containment: false,
             aborted: Arc::new(Mutex::new(false)),
             cut: None,
         },
@@ -2679,7 +2682,7 @@ async fn descendant_witness_blocks_close_even_after_root_end() {
         .await
         .unwrap();
     let (contained, witness) = watch::channel(false);
-    operation.track_containment(witness).await.unwrap();
+    operation.track_containment(witness, false).await.unwrap();
     operation
         .spawn_root(CallbackContainment::RootTask, async {
             Ok::<_, Infallible>(())
@@ -3113,7 +3116,11 @@ async fn public_operation_replay_matrix_converges_each_repeatable_program_family
             PublicCutPosition::CallbackApplied,
             PublicCutPosition::Completed,
         ] {
-            let fixture = Fixture::new().await;
+            let fixture = if matches!(program, Program::Swap { .. }) {
+                Fixture::new().await
+            } else {
+                Fixture::public_v1().await
+            };
             if matches!(program, Program::Remove(_)) {
                 fixture
                     .run("remove-attempt", 2, Program::Build(build("remove-attempt")))
@@ -3263,7 +3270,7 @@ async fn durable_build_application_never_reinvokes_the_build_callback() {
         PublicCutPosition::CallbackApplied,
         PublicCutPosition::Completed,
     ] {
-        let fixture = Fixture::new().await;
+        let fixture = Fixture::public_v1().await;
         let build_intent =
             fixture.intent("durable-build", 2, Program::Build(build("durable-build")));
         let barrier = cut(position, 0);
@@ -3306,7 +3313,7 @@ async fn durable_build_application_never_reinvokes_the_build_callback() {
 
 #[tokio::test]
 async fn ambiguous_build_is_retired_before_a_fresh_attempt() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::public_v1().await;
     let first = fixture.intent(
         "ambiguous-build",
         2,
@@ -3363,10 +3370,9 @@ async fn ambiguous_build_is_retired_before_a_fresh_attempt() {
         .public_operation_preview
         .unwrap();
     assert!(preview.absent_builds.contains(&first.operation_id));
-    assert_eq!(
-        preview.active_builds[&ReplicaId::new(2)],
-        build("fresh-build")
-    );
+    let mut expected = build("fresh-build");
+    expected.history = Some(public_v1_history(&fixture.preview).1);
+    assert_eq!(preview.active_builds[&ReplicaId::new(2)], expected);
     fixture.owner.shutdown().await.unwrap();
 }
 

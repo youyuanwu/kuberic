@@ -12,31 +12,39 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use kuberic_controller::evaluator::test_bridge::{
     HostedPreviewReplica, HostedPublicV1Adapter, PublicV1AcceptedTransitionIntent,
-    PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer, PublicV1EvidenceResource,
-    PublicV1EvidenceState, PublicV1OperationApi, PublicV1ResourceAuthority,
-    PublicV1ResourceDisposition, PublicV1ResourceProof, execute_public_v1_operation,
-    reconcile_public_v1_consumer,
+    PublicV1AcceptedTransitionStatus, PublicV1EvidenceApi, PublicV1EvidenceConsumer,
+    PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1OperationApi,
+    PublicV1ResourceAuthority, PublicV1ResourceDisposition, PublicV1ResourceProof,
+    execute_public_v1_history, execute_public_v1_operation, plan_public_v1_data_loss_recovery,
+    plan_public_v1_recovery_report, reconcile_public_v1_consumer,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationProgress, OpenContext, Operation, OperationDataStream, RoleChange,
 };
 use kuberic_runtime::control::proto;
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
-use kuberic_runtime::host::{ApplicationStorageState, ReplicaHost, ReplicaProcessConfig};
+use kuberic_runtime::host::{
+    ApplicationStorageState, ReplicaHost, ReplicaProcessConfig, RunningReplica,
+};
 use kuberic_runtime::protocol::command::{ProtocolCommand, PublicV1OperationCommand};
 use kuberic_runtime::protocol::public_operations::{
-    PreviewLifecycleBinding, ProcessSessionRenewalRequired, PublicBuildInput, PublicConfiguration,
-    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
-    PublicOperationProgram, PublicReplicaDescriptor, PublicV1AcceptedStatus, PublicV1CallKind,
-    StatePersistence,
+    DataLossAttempt, DataLossAuthorization, DataLossReplay, LocalProviderRebuildRequired,
+    PossibleDataLossIntent, PreviewLifecycleBinding, ProcessAttemptContext,
+    ProcessSessionRenewalRequired, ProviderProgressReset, ProviderReplicaIdentity,
+    PublicBuildInput, PublicConfiguration, PublicDataLossRecoveryInput, PublicLifecycleInput,
+    PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
+    PublicOperationPreviewIdentity, PublicOperationProgram, PublicOperationReplayDisposition,
+    PublicReplicaDescriptor, PublicV1AcceptedStatus, PublicV1CallKind, PublicV1OperationCompletion,
+    PublicV1OperationResult, ReplicaRebuildReason, ReplicaRebuildRequired, StatePersistence,
 };
 use kuberic_runtime::protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
-    InitializationId, OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionRenewalReason,
-    PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
-    StorageGeneration, derive_agent_generation, derive_bootstrap_history,
-    derive_history_initialization_id, derive_initialization_id,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+    Epoch, InitializationId, OperationId, PodUid, ProcessSessionEndpoint,
+    ProcessSessionRenewalReason, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity, ReplicaStorageIncarnationContext,
+    ReplicatorCreationId, ResourceUid, StorageGeneration, derive_agent_generation,
+    derive_bootstrap_history, derive_data_loss_history, derive_history_initialization_id,
+    derive_initialization_id,
 };
 use kuberic_runtime::replicator::stateless::StatelessReplicatorFactory;
 use kuberic_runtime::replicator::{
@@ -147,6 +155,8 @@ struct MemoryState {
     block_copy: AtomicBool,
     data_loss_changed: AtomicBool,
     fail_data_loss: AtomicBool,
+    data_loss_rebuild: Mutex<Option<ReplicaIdentity>>,
+    data_loss_calls: AtomicU64,
     commit_entered: Notify,
     release_commit: Notify,
     copy_entered: Notify,
@@ -172,6 +182,10 @@ impl MemoryState {
 
     fn fail_next_data_loss(&self) {
         self.fail_data_loss.store(true, Ordering::Release);
+    }
+
+    fn rebuild_on_data_loss(&self, replica: ReplicaIdentity) {
+        *self.data_loss_rebuild.lock().unwrap() = Some(replica);
     }
 }
 
@@ -210,6 +224,15 @@ impl StateProvider for MemoryState {
     }
 
     async fn on_data_loss(&self) -> Result<bool> {
+        self.data_loss_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(replica) = self.data_loss_rebuild.lock().unwrap().take() {
+            return Err(RuntimeError::ReplicaRebuildRequired(Box::new(
+                ReplicaRebuildRequired::LocalProvider(LocalProviderRebuildRequired {
+                    reason: ReplicaRebuildReason::IncompatibleRetainedHistory,
+                    provider: ProviderReplicaIdentity { replica },
+                }),
+            )));
+        }
         if self.fail_data_loss.swap(false, Ordering::AcqRel) {
             return Err(RuntimeError::Application(
                 "injected data-loss callback failure".into(),
@@ -652,6 +675,104 @@ async fn install_static_authority(
         ))
         .await
         .unwrap();
+}
+
+struct HostedMemoryReplica {
+    identity: ReplicaIdentity,
+    storage: ReplicaStorageIncarnationContext,
+    root: PathBuf,
+    address: std::net::SocketAddr,
+    state: Arc<MemoryState>,
+    application: Arc<PreviewApplication>,
+    running: RunningReplica,
+}
+
+impl HostedMemoryReplica {
+    async fn start(
+        name: &str,
+        resource_uid: &ResourceUid,
+        preview: &PublicOperationPreviewIdentity,
+        replica_id: i64,
+    ) -> Self {
+        let pod_uid = format!("{name}-pod");
+        let pvc_uid = format!("{name}-pvc");
+        let identity = replica_named(replica_id, &pod_uid, &format!("{name}-agent"));
+        let storage = storage_named(identity.clone(), &pod_uid, &pvc_uid);
+        let root = test_root(name);
+        drop(
+            SqliteStore::create_public_v1(
+                SqliteStore::metadata_database_path(&root),
+                preview.clone(),
+                store_identity_named(resource_uid.clone(), identity.clone(), &pod_uid, &pvc_uid),
+            )
+            .unwrap(),
+        );
+        let address = free_address();
+        let state = Arc::new(MemoryState::default());
+        let application = Arc::new(PreviewApplication::new(
+            state.clone(),
+            format!("http://{address}"),
+        ));
+        let running = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(replica_id),
+                pod_uid: PodUid::new(&pod_uid),
+                pvc_uid: PvcUid::new(&pvc_uid),
+                data_root: root.clone(),
+                control_address: free_address(),
+                replication_address: address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            application.clone(),
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        })
+        .start()
+        .await
+        .unwrap();
+        Self {
+            identity,
+            storage,
+            root,
+            address,
+            state,
+            application,
+            running,
+        }
+    }
+
+    fn handle(&self) -> kuberic_runtime::host::ReplicaHandle {
+        self.running.handle()
+    }
+
+    async fn initialize_history(
+        &self,
+        initialization: &kuberic_runtime::protocol::types::HistoryInitializationId,
+        history: &kuberic_runtime::protocol::types::HistoryContext,
+    ) {
+        self.handle()
+            .initialize_stateless_preview_history(initialization, history, &self.storage)
+            .await
+            .unwrap();
+    }
+
+    async fn stop(&mut self) {
+        self.running.shutdown();
+        self.running.wait().await.unwrap();
+    }
+
+    fn cleanup(self) {
+        std::fs::remove_dir_all(self.root).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1436,6 +1557,700 @@ async fn preview_initialization_creates_exact_bound_schema11_before_open() {
         running.shutdown();
         running.wait().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Unchanged,
+        Changed,
+        Error,
+        AmbiguousReplacement,
+    }
+
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for (index, outcome) in [
+            Outcome::Unchanged,
+            Outcome::Changed,
+            Outcome::Error,
+            Outcome::AmbiguousReplacement,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let resource_uid = ResourceUid::new(format!("preview-data-loss-{index}"));
+            let generation_number = 30 + u64::try_from(index).unwrap();
+            let preview = PublicOperationPreviewIdentity::public_v1(generation_number);
+            let mut replica = HostedMemoryReplica::start(
+                &format!("data-loss-{index}"),
+                &resource_uid,
+                &preview,
+                1,
+            )
+            .await;
+            let generation = PublicProtocolGeneration::new(generation_number);
+            let initialization = derive_history_initialization_id(&resource_uid, generation);
+            let predecessor = derive_bootstrap_history(&resource_uid, generation, &initialization);
+            replica
+                .initialize_history(&initialization, &predecessor)
+                .await;
+            replica
+                .handle()
+                .execute_stateless_preview(intent(
+                    &preview,
+                    replica.handle().process_session_id(),
+                    1,
+                    &format!("recovery-open-{index}"),
+                    PublicOperationProgram::Open {
+                        replica: replica.identity.clone(),
+                        existing: true,
+                    },
+                ))
+                .await
+                .unwrap();
+            let before = replica.handle().stateless_preview_report().await.unwrap();
+            assert_eq!(before.write_status, AccessStatus::NotPrimary);
+
+            let authorization_id = OperationId::new(format!("authorize-data-loss-{index}"));
+            let proposed = derive_data_loss_history(
+                &authorization_id,
+                &predecessor,
+                predecessor.data_loss_number + 1,
+                &replica.storage,
+            )
+            .unwrap();
+            let authorization = DataLossAuthorization {
+                authorization_id: authorization_id.clone(),
+                predecessor: predecessor.clone(),
+                proposed: proposed.clone(),
+                provisional_primary: replica.storage.clone(),
+                reset_scope: match outcome {
+                    Outcome::Changed | Outcome::AmbiguousReplacement => {
+                        ProviderProgressReset::ResetToEmpty
+                    }
+                    Outcome::Unchanged | Outcome::Error => ProviderProgressReset::Preserve,
+                },
+                replay_disposition: DataLossReplay::ReplaceOnAmbiguity,
+            };
+            let endpoint = replica
+                .handle()
+                .stateless_preview_process_endpoint(ReplicaRole::None)
+                .await
+                .unwrap();
+            let recovery_epoch = Epoch::new(proposed.data_loss_number, 1);
+            let attempt = DataLossAttempt {
+                authorization_id,
+                attempt_id: OperationId::new(format!("data-loss-attempt-{index}")),
+                process: ProcessAttemptContext {
+                    process_session_id: endpoint.process_session_id.clone(),
+                    replicator_creation_id: endpoint.replicator_creation_id,
+                    catch_up_specific_quorum: true,
+                    data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
+                    epoch: recovery_epoch,
+                    attempt_revision: 2,
+                },
+            };
+            let members = vec![ConfigurationMember {
+                identity: replica.identity.clone(),
+                role: ReplicaRole::Primary,
+            }];
+            let lifecycle = PublicLifecycleInput {
+                recipe: PublicLifecycleRecipe::InitialPrimary,
+                replica: replica.identity.clone(),
+                epoch: recovery_epoch,
+                possible_data_loss: PossibleDataLossIntent::Possible,
+                current: ConfigurationDescriptor::new(
+                    recovery_epoch,
+                    replica.identity.replica_id,
+                    members.clone(),
+                    1,
+                ),
+                previous: Some(ConfigurationDescriptor::new(
+                    Epoch::new(proposed.data_loss_number, 0),
+                    replica.identity.replica_id,
+                    members,
+                    1,
+                )),
+                replicas: Vec::new(),
+                data_loss_recovery: Some(PublicDataLossRecoveryInput {
+                    authorization: authorization.clone(),
+                    attempt: attempt.clone(),
+                }),
+            };
+            let recovery_intent = PublicOperationIntent {
+                preview: preview.clone(),
+                operation_id: attempt.attempt_id.clone(),
+                revision: attempt.process.attempt_revision,
+                process_session_id: attempt.process.process_session_id.clone(),
+                class: PublicOperationClass::Authority,
+                input_digest: lifecycle.digest(),
+                replay_disposition: PublicOperationReplayDisposition::DataLoss(
+                    DataLossReplay::ReplaceOnAmbiguity,
+                ),
+                lifecycle: Some(lifecycle),
+                program: None,
+            };
+            let accepted = PublicV1AcceptedStatus {
+                identity: preview.clone(),
+                history_initialization_id: initialization,
+                history: predecessor.clone(),
+                data_loss_recovery: None,
+                completed_operations: Vec::new(),
+                extensions: Default::default(),
+            };
+            let transition = PublicV1AcceptedTransitionStatus {
+                resource_version: format!("data-loss-status-rv-{index}"),
+                evidence: accepted.clone(),
+                intent: PublicV1AcceptedTransitionIntent {
+                    consumer: PublicV1EvidenceConsumer::DataLoss,
+                    operation_id: recovery_intent.operation_id.clone(),
+                    revision: recovery_intent.revision,
+                    call_kind: PublicV1CallKind::InitialPrimary,
+                    history: predecessor.clone(),
+                    source: PublicV1ResourceAuthority {
+                        storage_incarnation: replica.storage.clone(),
+                        resource_version: format!("data-loss-resource-rv-{index}"),
+                    },
+                    target: None,
+                    process_session_id: recovery_intent.process_session_id.clone(),
+                    input_digest: recovery_intent.input_digest.clone(),
+                    replay_disposition: recovery_intent.replay_disposition,
+                    previous_configuration_id: None,
+                    current_configuration_id: None,
+                    catch_up_mode: None,
+                    catch_up_specific_quorum: None,
+                },
+            };
+            let evidence = Arc::new(
+                PublicV1EvidenceState::new(
+                    transition,
+                    vec![PublicV1EvidenceResource {
+                        storage_incarnation: replica.storage.clone(),
+                        resource_version: format!("data-loss-resource-rv-{index}"),
+                        proof: Some(PublicV1ResourceProof {
+                            history: predecessor.clone(),
+                            storage_incarnation: replica.storage.clone(),
+                        }),
+                        disposition: PublicV1ResourceDisposition::Active,
+                    }],
+                )
+                .unwrap(),
+            );
+            let adapter = HostedPublicV1Adapter::new(
+                vec![HostedPreviewReplica {
+                    identity: replica.identity.clone(),
+                    replication_address: format!("http://{}", replica.address),
+                    handle: replica.handle(),
+                }],
+                Some(accepted.clone()),
+                None,
+                evidence,
+            )
+            .unwrap();
+
+            let mut wrong_authorization = authorization.clone();
+            wrong_authorization.authorization_id =
+                OperationId::new(format!("wrong-data-loss-{index}"));
+            assert!(
+                plan_public_v1_data_loss_recovery(
+                    &accepted,
+                    &before,
+                    &wrong_authorization,
+                    &attempt,
+                    &recovery_intent,
+                    false,
+                )
+                .is_err()
+            );
+            let mut missing = recovery_intent.clone();
+            missing.lifecycle.as_mut().unwrap().data_loss_recovery = None;
+            missing.input_digest = missing.lifecycle.as_ref().unwrap().digest();
+            assert!(missing.validate().is_err());
+            let unchanged = replica.handle().stateless_preview_report().await.unwrap();
+            assert_eq!(unchanged.history, before.history);
+            assert_eq!(unchanged.process_session_id, before.process_session_id);
+            assert_eq!(unchanged.read_status, before.read_status);
+            assert_eq!(unchanged.write_status, before.write_status);
+            assert_eq!(unchanged.progress, before.progress);
+            assert_eq!(unchanged.data_loss_recovery, None);
+            assert!(adapter.dispatched().is_empty());
+
+            execute_public_v1_history(
+                &adapter,
+                plan_public_v1_data_loss_recovery(
+                    &accepted,
+                    &before,
+                    &authorization,
+                    &attempt,
+                    &recovery_intent,
+                    false,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let invalidated = adapter.observe_public_v1_status().await.unwrap().unwrap();
+            match outcome {
+                Outcome::Unchanged => {}
+                Outcome::Changed => replica.state.change_on_data_loss(),
+                Outcome::Error => replica.state.fail_next_data_loss(),
+                Outcome::AmbiguousReplacement => {
+                    replica.state.rebuild_on_data_loss(replica.identity.clone());
+                }
+            }
+            let dispatched = execute_public_v1_history(
+                &adapter,
+                plan_public_v1_data_loss_recovery(
+                    &invalidated,
+                    &before,
+                    &authorization,
+                    &attempt,
+                    &recovery_intent,
+                    false,
+                )
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(adapter.dispatched().len(), 1);
+            assert_eq!(
+                replica.state.data_loss_calls.load(Ordering::SeqCst),
+                1,
+                "recovery dispatch did not invoke the callback: {dispatched:?}"
+            );
+            if matches!(outcome, Outcome::Unchanged | Outcome::Changed) {
+                dispatched
+                    .as_ref()
+                    .unwrap_or_else(|error| panic!("data-loss outcome {index} failed: {error}"));
+            }
+            let report = adapter
+                .report(&replica.identity)
+                .await
+                .unwrap_or_else(|error| panic!("data-loss outcome {index} report: {error}"));
+            match outcome {
+                Outcome::Unchanged | Outcome::Changed => {
+                    assert_eq!(report.history, proposed);
+                    assert_eq!(report.write_status, AccessStatus::Granted);
+                    assert_eq!(
+                        report.data_loss_recovery.as_ref().unwrap().stage,
+                        kuberic_runtime::protocol::public_operations::
+                            PublicDataLossRecoveryStage::Admitted
+                    );
+                }
+                Outcome::Error => {
+                    assert!(dispatched.is_err());
+                    assert_eq!(report.history, predecessor);
+                    assert_eq!(report.write_status, AccessStatus::NotPrimary);
+                    assert_eq!(
+                        report.data_loss_recovery.as_ref().unwrap().stage,
+                        kuberic_runtime::protocol::public_operations::
+                            PublicDataLossRecoveryStage::Failed
+                    );
+                }
+                Outcome::AmbiguousReplacement => {
+                    assert!(dispatched.is_err());
+                    assert_eq!(report.history, predecessor);
+                    assert_eq!(report.write_status, AccessStatus::NotPrimary);
+                    assert_eq!(
+                        report.data_loss_recovery.as_ref().unwrap().stage,
+                        kuberic_runtime::protocol::public_operations::
+                            PublicDataLossRecoveryStage::ReplacementRequired
+                    );
+                }
+            }
+            if !matches!(outcome, Outcome::Unchanged | Outcome::Changed) {
+                execute_public_v1_history(
+                    &adapter,
+                    plan_public_v1_recovery_report(&invalidated, &report).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            replica.stop().await;
+            replica.cleanup();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let resource_uid = ResourceUid::new("preview-unreachable-survivor");
+        let preview = PublicOperationPreviewIdentity::public_v1(40);
+        let mut primary =
+            HostedMemoryReplica::start("fault-primary", &resource_uid, &preview, 1).await;
+        let mut survivor =
+            HostedMemoryReplica::start("fault-survivor", &resource_uid, &preview, 2).await;
+        let generation = PublicProtocolGeneration::new(40);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        primary.initialize_history(&initialization, &history).await;
+        survivor.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            primary.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: primary.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: survivor.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        install_static_authority(
+            &primary.handle(),
+            &preview,
+            primary.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: configuration.clone(),
+                previous: None,
+                replicas: vec![PublicReplicaDescriptor {
+                    build_id: OperationId::default(),
+                    identity: survivor.identity.clone(),
+                    replication_address: format!("http://{}", survivor.address),
+                    process_session_id: survivor.handle().process_session_id(),
+                    role: ReplicaRole::ActiveSecondary,
+                    current_progress: 0,
+                    catch_up_capability: 0,
+                    must_catchup: false,
+                }],
+            },
+        )
+        .await;
+        install_static_authority(
+            &survivor.handle(),
+            &preview,
+            survivor.identity.clone(),
+            ReplicaRole::ActiveSecondary,
+            epoch,
+            PublicConfiguration {
+                current: configuration.clone(),
+                previous: None,
+                replicas: vec![PublicReplicaDescriptor {
+                    build_id: OperationId::default(),
+                    identity: primary.identity.clone(),
+                    replication_address: format!("http://{}", primary.address),
+                    process_session_id: primary.handle().process_session_id(),
+                    role: ReplicaRole::Primary,
+                    current_progress: 0,
+                    catch_up_capability: 0,
+                    must_catchup: false,
+                }],
+            },
+        )
+        .await;
+        assert_eq!(
+            primary
+                .application
+                .replicate(Bytes::from_static(b"before-survivor-loss"))
+                .await
+                .unwrap(),
+            1
+        );
+        let exact_survivor_session = survivor.handle().process_session_id();
+        primary.handle().fence_stateless_preview_access().await;
+        assert_eq!(
+            primary
+                .handle()
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::NotPrimary
+        );
+        primary
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                primary.handle().process_session_id(),
+                5,
+                "exact-survivor-return",
+                PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: configuration.clone(),
+                    previous: None,
+                    replicas: vec![PublicReplicaDescriptor {
+                        build_id: OperationId::default(),
+                        identity: survivor.identity.clone(),
+                        replication_address: format!("http://{}", survivor.address),
+                        process_session_id: exact_survivor_session.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                        current_progress: 1,
+                        catch_up_capability: 1,
+                        must_catchup: false,
+                    }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            primary
+                .application
+                .replicate(Bytes::from_static(b"after-exact-session-return"))
+                .await
+                .unwrap(),
+            2
+        );
+
+        primary.handle().fence_stateless_preview_access().await;
+        let removal_program = PublicOperationProgram::Remove(PublicBuildInput {
+            attempt: OperationId::new("retire-unreachable-survivor"),
+            epoch,
+            replica: survivor.identity.clone(),
+            target_storage: survivor.storage.clone(),
+            process_session_id: exact_survivor_session.clone(),
+            replication_address: format!("http://{}", survivor.address),
+            history: Some(history.clone()),
+        });
+        let removal_intent = intent(
+            &preview,
+            primary.handle().process_session_id(),
+            6,
+            "retire-unreachable-survivor",
+            removal_program,
+        );
+        let accepted = PublicV1AcceptedStatus {
+            identity: preview.clone(),
+            history_initialization_id: initialization.clone(),
+            history: history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: Default::default(),
+        };
+        let transition = PublicV1AcceptedTransitionStatus {
+            resource_version: "fault-retirement-status-rv-1".into(),
+            evidence: accepted,
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: PublicV1EvidenceConsumer::Removal,
+                operation_id: removal_intent.operation_id.clone(),
+                revision: removal_intent.revision,
+                call_kind: PublicV1CallKind::Remove,
+                history: history.clone(),
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: primary.storage.clone(),
+                    resource_version: "fault-primary-rv-1".into(),
+                },
+                target: Some(PublicV1ResourceAuthority {
+                    storage_incarnation: survivor.storage.clone(),
+                    resource_version: "fault-survivor-rv-1".into(),
+                }),
+                process_session_id: removal_intent.process_session_id.clone(),
+                input_digest: removal_intent.input_digest.clone(),
+                replay_disposition: removal_intent.replay_disposition,
+                previous_configuration_id: None,
+                current_configuration_id: None,
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+            },
+        };
+        let evidence = PublicV1EvidenceState::new(
+            transition.clone(),
+            vec![
+                PublicV1EvidenceResource {
+                    storage_incarnation: primary.storage.clone(),
+                    resource_version: "fault-primary-rv-1".into(),
+                    proof: Some(PublicV1ResourceProof {
+                        history: history.clone(),
+                        storage_incarnation: primary.storage.clone(),
+                    }),
+                    disposition: PublicV1ResourceDisposition::Active,
+                },
+                PublicV1EvidenceResource {
+                    storage_incarnation: survivor.storage.clone(),
+                    resource_version: "fault-survivor-rv-1".into(),
+                    proof: Some(PublicV1ResourceProof {
+                        history: history.clone(),
+                        storage_incarnation: survivor.storage.clone(),
+                    }),
+                    disposition: PublicV1ResourceDisposition::Active,
+                },
+            ],
+        )
+        .unwrap();
+        let completion = PublicV1OperationCompletion {
+            operation_id: removal_intent.operation_id.clone(),
+            revision: removal_intent.revision,
+            call_kind: PublicV1CallKind::Remove,
+            process_session_id: removal_intent.process_session_id.clone(),
+            input_digest: removal_intent.input_digest.clone(),
+            replay_disposition: removal_intent.replay_disposition,
+            history: history.clone(),
+            storage_incarnation: primary.storage.clone(),
+            previous_configuration_id: None,
+            current_configuration_id: None,
+            catch_up_mode: None,
+            catch_up_specific_quorum: None,
+            result: PublicV1OperationResult::Ambiguous(
+                "survivor did not return in its exact process session".into(),
+            ),
+        };
+        let mut persisted_evidence = transition.evidence.clone();
+        persisted_evidence.completed_operations.push(
+            kuberic_runtime::protocol::public_operations::
+                PublicV1AcceptedOperationCompletion::from_completion(&completion),
+        );
+        PublicV1EvidenceApi::persist_public_v1_evidence_status(
+            &evidence,
+            &transition,
+            &persisted_evidence,
+        )
+        .await
+        .unwrap();
+        let persisted_transition = evidence.transition();
+        PublicV1EvidenceApi::retire_public_v1_incarnation(
+            &evidence,
+            &persisted_transition,
+            &completion,
+            persisted_transition.intent.target.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+        let retired = evidence
+            .resources()
+            .into_iter()
+            .find(|resource| resource.storage_incarnation == survivor.storage)
+            .unwrap();
+        assert_eq!(retired.resource_version, "fault-survivor-rv-1-next");
+        assert_eq!(retired.disposition, PublicV1ResourceDisposition::Retired);
+
+        let single = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            primary.identity.replica_id,
+            vec![ConfigurationMember {
+                identity: primary.identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        primary
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                primary.handle().process_session_id(),
+                6,
+                "epoch-after-survivor-retirement",
+                PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 2),
+                },
+            ))
+            .await
+            .unwrap();
+        primary
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                primary.handle().process_session_id(),
+                7,
+                "role-after-survivor-retirement",
+                PublicOperationProgram::Role {
+                    epoch: Epoch::new(0, 2),
+                    role: ReplicaRole::Primary,
+                },
+            ))
+            .await
+            .unwrap();
+        primary
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                primary.handle().process_session_id(),
+                8,
+                "configuration-after-survivor-retirement",
+                PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: single,
+                    previous: None,
+                    replicas: Vec::new(),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            primary
+                .application
+                .replicate(Bytes::from_static(b"after-survivor-retirement"))
+                .await
+                .unwrap(),
+            3
+        );
+
+        let retired_identity = survivor.identity.clone();
+        let retired_progress = *survivor.state.progress.lock().unwrap();
+        survivor.stop().await;
+        let mut replacement =
+            HostedMemoryReplica::start("fault-replacement", &resource_uid, &preview, 2).await;
+        replacement
+            .initialize_history(&initialization, &history)
+            .await;
+        replacement
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                replacement.handle().process_session_id(),
+                1,
+                "open-fault-replacement",
+                PublicOperationProgram::Open {
+                    replica: replacement.identity.clone(),
+                    existing: true,
+                },
+            ))
+            .await
+            .unwrap();
+        let replacement_before = *replacement.state.progress.lock().unwrap();
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{}",
+            replacement.address
+        ))
+        .await
+        .unwrap();
+        let stale = proto::ReplicationItem {
+            protocol_version: 11,
+            sender: Some(primary.identity.clone().into()),
+            receiver: Some(retired_identity.into()),
+            epoch: Some(epoch.into()),
+            previous_configuration_id: String::new(),
+            current_configuration_id: configuration.configuration_id.to_string(),
+            lsn: retired_progress.applied_lsn + 1,
+            committed_lsn: retired_progress.committed_lsn,
+            data: b"retired-session-payload".to_vec(),
+            sender_session_id: primary.handle().process_session_id().to_string(),
+            receiver_session_id: exact_survivor_session.to_string(),
+        };
+        let mut response = client
+            .replicate(tonic::Request::new(stream::iter([stale])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.next().await.unwrap().is_err());
+        assert_eq!(
+            *replacement.state.progress.lock().unwrap(),
+            replacement_before
+        );
+        assert_eq!(
+            primary
+                .handle()
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::Granted
+        );
+
+        primary.stop().await;
+        replacement.stop().await;
+        primary.cleanup();
+        survivor.cleanup();
+        replacement.cleanup();
     })
     .await
     .unwrap();
@@ -2773,6 +3588,1121 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         source.wait().await.unwrap();
         std::fs::remove_dir_all(source_root).unwrap();
         std::fs::remove_dir_all(target_root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let resource_uid = ResourceUid::new("preview-removal-drain");
+        let preview = PublicOperationPreviewIdentity::public_v1(9);
+        let mut source =
+            HostedMemoryReplica::start("removal-source", &resource_uid, &preview, 1).await;
+        let mut target =
+            HostedMemoryReplica::start("removal-target", &resource_uid, &preview, 2).await;
+        let generation = PublicProtocolGeneration::new(9);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        source.initialize_history(&initialization, &history).await;
+        target.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        let source_configuration = ConfigurationDescriptor::new(
+            epoch,
+            source.identity.replica_id,
+            vec![ConfigurationMember {
+                identity: source.identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        install_static_authority(
+            &source.handle(),
+            &preview,
+            source.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: source_configuration.clone(),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
+        .await;
+        let target_session = target.handle().process_session_id();
+        for (revision, name, program) in [
+            (
+                1,
+                "open-removal-target",
+                PublicOperationProgram::Open {
+                    replica: target.identity.clone(),
+                    existing: true,
+                },
+            ),
+            (
+                2,
+                "role-removal-target",
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::IdleSecondary,
+                },
+            ),
+            (
+                3,
+                "epoch-removal-target",
+                PublicOperationProgram::Epoch { epoch },
+            ),
+        ] {
+            target
+                .handle()
+                .execute_stateless_preview(intent(
+                    &preview,
+                    target_session.clone(),
+                    revision,
+                    name,
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"snapshot-before-removal"))
+                .await
+                .unwrap(),
+            1
+        );
+        source
+            .state
+            .copy_chunks
+            .lock()
+            .unwrap()
+            .push(Bytes::from_static(b"frozen-build-snapshot"));
+        source.state.block_copy();
+        target.state.block_commit();
+        let build_input = PublicBuildInput {
+            attempt: OperationId::new("active-build-to-remove"),
+            epoch,
+            replica: target.identity.clone(),
+            target_storage: target.storage.clone(),
+            process_session_id: target_session.clone(),
+            replication_address: format!("http://{}", target.address),
+            history: Some(history.clone()),
+        };
+        let build_intent = intent(
+            &preview,
+            source.handle().process_session_id(),
+            4,
+            "active-build-to-remove",
+            PublicOperationProgram::Build(build_input.clone()),
+        );
+        let copy_entered = source.state.copy_entered.notified();
+        let mut build = tokio::spawn({
+            let handle = source.handle();
+            async move { handle.execute_stateless_preview(build_intent).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = copy_entered => {}
+                result = &mut build => panic!("build completed before frozen copy: {result:?}"),
+            }
+        })
+        .await
+        .expect("build root did not reach the frozen copy");
+        assert!(!build.is_finished(), "build root was not active");
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"retained-before-removal"))
+                .await
+                .unwrap(),
+            2
+        );
+        let descendant_entered = target.state.commit_entered.notified();
+        source.state.release_copy.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), descendant_entered)
+            .await
+            .expect("remote build descendant did not reach durable commit");
+        assert!(!build.is_finished(), "build descendant was not active");
+
+        let removal_intent = intent(
+            &preview,
+            source.handle().process_session_id(),
+            4,
+            "remove-active-build",
+            PublicOperationProgram::Remove(build_input),
+        );
+        let accepted = PublicV1AcceptedStatus {
+            identity: preview.clone(),
+            history_initialization_id: initialization,
+            history: history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: Default::default(),
+        };
+        let transition = PublicV1AcceptedTransitionStatus {
+            resource_version: "removal-status-rv-1".into(),
+            evidence: accepted.clone(),
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: PublicV1EvidenceConsumer::Removal,
+                operation_id: removal_intent.operation_id.clone(),
+                revision: removal_intent.revision,
+                call_kind: PublicV1CallKind::Remove,
+                history: history.clone(),
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: source.storage.clone(),
+                    resource_version: "removal-source-rv-1".into(),
+                },
+                target: Some(PublicV1ResourceAuthority {
+                    storage_incarnation: target.storage.clone(),
+                    resource_version: "removal-target-rv-1".into(),
+                }),
+                process_session_id: removal_intent.process_session_id.clone(),
+                input_digest: removal_intent.input_digest.clone(),
+                replay_disposition: removal_intent.replay_disposition,
+                previous_configuration_id: None,
+                current_configuration_id: None,
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+            },
+        };
+        let evidence = Arc::new(
+            PublicV1EvidenceState::new(
+                transition.clone(),
+                vec![
+                    PublicV1EvidenceResource {
+                        storage_incarnation: source.storage.clone(),
+                        resource_version: "removal-source-rv-1".into(),
+                        proof: Some(PublicV1ResourceProof {
+                            history: history.clone(),
+                            storage_incarnation: source.storage.clone(),
+                        }),
+                        disposition: PublicV1ResourceDisposition::Active,
+                    },
+                    PublicV1EvidenceResource {
+                        storage_incarnation: target.storage.clone(),
+                        resource_version: "removal-target-rv-1".into(),
+                        proof: Some(PublicV1ResourceProof {
+                            history: history.clone(),
+                            storage_incarnation: target.storage.clone(),
+                        }),
+                        disposition: PublicV1ResourceDisposition::Active,
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let adapter = Arc::new(
+            HostedPublicV1Adapter::new(
+                vec![
+                    HostedPreviewReplica {
+                        identity: source.identity.clone(),
+                        replication_address: format!("http://{}", source.address),
+                        handle: source.handle(),
+                    },
+                    HostedPreviewReplica {
+                        identity: target.identity.clone(),
+                        replication_address: format!("http://{}", target.address),
+                        handle: target.handle(),
+                    },
+                ],
+                Some(accepted),
+                None,
+                evidence.clone(),
+            )
+            .unwrap(),
+        );
+        let removal = tokio::spawn({
+            let adapter = adapter.clone();
+            let transition = transition.clone();
+            async move {
+                execute_public_v1_operation(
+                    adapter.as_ref(),
+                    &transition,
+                    ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+                        target: transition.intent.source.storage_incarnation.replica.clone(),
+                        intent: removal_intent,
+                    })),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if removal.is_finished() {
+            panic!(
+                "removal completed before the remote descendant drained: {:?}",
+                removal.await
+            );
+        }
+        assert!(evidence.effects().is_empty());
+        target.state.release_commit.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), build)
+                .await
+                .expect("cancelled build root did not drain")
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(10), removal)
+            .await
+            .expect("removal did not complete after build drain")
+            .unwrap()
+            .unwrap();
+        let report = adapter.report(&source.identity).await.unwrap();
+        assert_eq!(
+            reconcile_public_v1_consumer(adapter.as_ref(), &report)
+                .await
+                .unwrap(),
+            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+                EvidencePersisted
+        );
+        assert_eq!(
+            reconcile_public_v1_consumer(adapter.as_ref(), &report)
+                .await
+                .unwrap(),
+            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+                EffectApplied
+        );
+        assert!(matches!(
+            evidence.effects().as_slice(),
+            [kuberic_controller::evaluator::test_bridge::PublicV1EvidenceEffect::Retired {
+                consumer: PublicV1EvidenceConsumer::Removal,
+                operation_id,
+                revision: 4,
+                storage,
+            }] if operation_id == &OperationId::new("remove-active-build")
+                && storage.as_ref() == &target.storage
+        ));
+        let target_resource = evidence
+            .resources()
+            .into_iter()
+            .find(|resource| resource.storage_incarnation == target.storage)
+            .unwrap();
+        assert_eq!(target_resource.resource_version, "removal-target-rv-1-next");
+        assert_eq!(
+            target_resource.disposition,
+            PublicV1ResourceDisposition::Retired
+        );
+
+        let before = *target.state.progress.lock().unwrap();
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{}",
+            target.address
+        ))
+        .await
+        .unwrap();
+        let stale = proto::ReplicationItem {
+            protocol_version: 11,
+            sender: Some(source.identity.clone().into()),
+            receiver: Some(target.identity.clone().into()),
+            epoch: Some(epoch.into()),
+            previous_configuration_id: String::new(),
+            current_configuration_id: source_configuration.configuration_id.to_string(),
+            lsn: before.applied_lsn + 1,
+            committed_lsn: before.committed_lsn,
+            data: b"stale-after-retirement".to_vec(),
+            sender_session_id: source.handle().process_session_id().to_string(),
+            receiver_session_id: target_session.to_string(),
+        };
+        let mut response = client
+            .replicate(tonic::Request::new(stream::iter([stale])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.next().await.unwrap().is_err());
+        assert_eq!(*target.state.progress.lock().unwrap(), before);
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"after-exact-removal"))
+                .await
+                .unwrap(),
+            3
+        );
+
+        source.stop().await;
+        target.stop().await;
+        source.cleanup();
+        target.cleanup();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let resource_uid = ResourceUid::new("preview-controller-replacement");
+        let preview = PublicOperationPreviewIdentity::public_v1(60);
+        let mut source =
+            HostedMemoryReplica::start("controller-source", &resource_uid, &preview, 1).await;
+        let mut stale =
+            HostedMemoryReplica::start("controller-stale", &resource_uid, &preview, 2).await;
+        let generation = PublicProtocolGeneration::new(60);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        source.initialize_history(&initialization, &history).await;
+        stale.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        let source_configuration = ConfigurationDescriptor::new(
+            epoch,
+            source.identity.replica_id,
+            vec![ConfigurationMember {
+                identity: source.identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        install_static_authority(
+            &source.handle(),
+            &preview,
+            source.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: source_configuration.clone(),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
+        .await;
+        let stale_session = stale.handle().process_session_id();
+        for (revision, name, program) in [
+            (
+                1,
+                "controller-stale-open",
+                PublicOperationProgram::Open {
+                    replica: stale.identity.clone(),
+                    existing: true,
+                },
+            ),
+            (
+                2,
+                "controller-stale-role",
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::IdleSecondary,
+                },
+            ),
+            (
+                3,
+                "controller-stale-epoch",
+                PublicOperationProgram::Epoch { epoch },
+            ),
+        ] {
+            stale
+                .handle()
+                .execute_stateless_preview(intent(
+                    &preview,
+                    stale_session.clone(),
+                    revision,
+                    name,
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"controller-payload"))
+                .await
+                .unwrap(),
+            1
+        );
+        source
+            .state
+            .copy_chunks
+            .lock()
+            .unwrap()
+            .push(Bytes::from_static(b"controller-snapshot"));
+        stale
+            .state
+            .copy_chunks
+            .lock()
+            .unwrap()
+            .push(Bytes::from_static(b"stale-higher-progress"));
+        stale.state.operations.lock().unwrap().push(Operation {
+            lsn: 9,
+            committed_lsn: 8,
+            data: Bytes::from_static(b"stale-higher-progress"),
+        });
+        *stale.state.progress.lock().unwrap() = DurableApplicationProgress {
+            applied_lsn: 9,
+            committed_lsn: 9,
+        };
+        let stale_before = *stale.state.progress.lock().unwrap();
+        let stale_build = PublicBuildInput {
+            attempt: OperationId::new("controller-rebuild-required"),
+            epoch,
+            replica: stale.identity.clone(),
+            target_storage: stale.storage.clone(),
+            process_session_id: stale_session.clone(),
+            replication_address: format!("http://{}", stale.address),
+            history: Some(history.clone()),
+        };
+        let stale_build_intent = intent(
+            &preview,
+            source.handle().process_session_id(),
+            4,
+            "controller-rebuild-required",
+            PublicOperationProgram::Build(stale_build.clone()),
+        );
+        let accepted = PublicV1AcceptedStatus {
+            identity: preview.clone(),
+            history_initialization_id: initialization.clone(),
+            history: history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: Default::default(),
+        };
+        let build_transition = PublicV1AcceptedTransitionStatus {
+            resource_version: "controller-build-status-rv-1".into(),
+            evidence: accepted.clone(),
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: PublicV1EvidenceConsumer::RepairReplacement,
+                operation_id: stale_build_intent.operation_id.clone(),
+                revision: stale_build_intent.revision,
+                call_kind: PublicV1CallKind::Build,
+                history: history.clone(),
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: source.storage.clone(),
+                    resource_version: "controller-source-rv-1".into(),
+                },
+                target: Some(PublicV1ResourceAuthority {
+                    storage_incarnation: stale.storage.clone(),
+                    resource_version: "controller-stale-rv-1".into(),
+                }),
+                process_session_id: stale_build_intent.process_session_id.clone(),
+                input_digest: stale_build_intent.input_digest.clone(),
+                replay_disposition: stale_build_intent.replay_disposition,
+                previous_configuration_id: None,
+                current_configuration_id: None,
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+            },
+        };
+        let build_evidence = Arc::new(
+            PublicV1EvidenceState::new(
+                build_transition.clone(),
+                vec![
+                    PublicV1EvidenceResource {
+                        storage_incarnation: source.storage.clone(),
+                        resource_version: "controller-source-rv-1".into(),
+                        proof: Some(PublicV1ResourceProof {
+                            history: history.clone(),
+                            storage_incarnation: source.storage.clone(),
+                        }),
+                        disposition: PublicV1ResourceDisposition::Active,
+                    },
+                    PublicV1EvidenceResource {
+                        storage_incarnation: stale.storage.clone(),
+                        resource_version: "controller-stale-rv-1".into(),
+                        proof: Some(PublicV1ResourceProof {
+                            history: history.clone(),
+                            storage_incarnation: stale.storage.clone(),
+                        }),
+                        disposition: PublicV1ResourceDisposition::Active,
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let build_adapter = HostedPublicV1Adapter::new(
+            vec![
+                HostedPreviewReplica {
+                    identity: source.identity.clone(),
+                    replication_address: format!("http://{}", source.address),
+                    handle: source.handle(),
+                },
+                HostedPreviewReplica {
+                    identity: stale.identity.clone(),
+                    replication_address: format!("http://{}", stale.address),
+                    handle: stale.handle(),
+                },
+            ],
+            Some(accepted),
+            None,
+            build_evidence.clone(),
+        )
+        .unwrap();
+        assert!(
+            execute_public_v1_operation(
+                &build_adapter,
+                &build_transition,
+                ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+                    target: source.identity.clone(),
+                    intent: stale_build_intent,
+                })),
+            )
+            .await
+            .is_err()
+        );
+        let rebuild_report = build_adapter.report(&source.identity).await.unwrap();
+        assert_eq!(
+            reconcile_public_v1_consumer(&build_adapter, &rebuild_report)
+                .await
+                .unwrap(),
+            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+                EvidencePersisted
+        );
+        assert_eq!(
+            reconcile_public_v1_consumer(&build_adapter, &rebuild_report)
+                .await
+                .unwrap(),
+            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+                EffectApplied
+        );
+        assert!(matches!(
+            build_evidence.effects().as_slice(),
+            [kuberic_controller::evaluator::test_bridge::PublicV1EvidenceEffect::Replacement {
+                storage,
+                ..
+            }] if storage.as_ref() == &stale.storage
+        ));
+        let replacement_requested = build_evidence
+            .resources()
+            .into_iter()
+            .find(|resource| resource.storage_incarnation == stale.storage)
+            .unwrap();
+        assert_eq!(
+            replacement_requested.resource_version,
+            "controller-stale-rv-1-next"
+        );
+        assert_eq!(
+            replacement_requested.disposition,
+            PublicV1ResourceDisposition::ReplacementRequested
+        );
+
+        let removal_intent = intent(
+            &preview,
+            source.handle().process_session_id(),
+            4,
+            "controller-retire-stale",
+            PublicOperationProgram::Remove(stale_build),
+        );
+        let removal_transition = PublicV1AcceptedTransitionStatus {
+            resource_version: "controller-removal-status-rv-1".into(),
+            evidence: build_evidence.transition().evidence,
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: PublicV1EvidenceConsumer::Removal,
+                operation_id: removal_intent.operation_id.clone(),
+                revision: removal_intent.revision,
+                call_kind: PublicV1CallKind::Remove,
+                history: history.clone(),
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: source.storage.clone(),
+                    resource_version: "controller-source-rv-1".into(),
+                },
+                target: Some(PublicV1ResourceAuthority {
+                    storage_incarnation: stale.storage.clone(),
+                    resource_version: "controller-stale-rv-1-next".into(),
+                }),
+                process_session_id: removal_intent.process_session_id.clone(),
+                input_digest: removal_intent.input_digest.clone(),
+                replay_disposition: removal_intent.replay_disposition,
+                previous_configuration_id: None,
+                current_configuration_id: None,
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+            },
+        };
+        let removal_evidence = Arc::new(
+            PublicV1EvidenceState::new(removal_transition.clone(), build_evidence.resources())
+                .unwrap(),
+        );
+        let removal_adapter = HostedPublicV1Adapter::new(
+            vec![
+                HostedPreviewReplica {
+                    identity: source.identity.clone(),
+                    replication_address: format!("http://{}", source.address),
+                    handle: source.handle(),
+                },
+                HostedPreviewReplica {
+                    identity: stale.identity.clone(),
+                    replication_address: format!("http://{}", stale.address),
+                    handle: stale.handle(),
+                },
+            ],
+            None,
+            None,
+            removal_evidence.clone(),
+        )
+        .unwrap();
+        execute_public_v1_operation(
+            &removal_adapter,
+            &removal_transition,
+            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+                target: source.identity.clone(),
+                intent: removal_intent,
+            })),
+        )
+        .await
+        .unwrap();
+        let removal_report = removal_adapter.report(&source.identity).await.unwrap();
+        reconcile_public_v1_consumer(&removal_adapter, &removal_report)
+            .await
+            .unwrap();
+        reconcile_public_v1_consumer(&removal_adapter, &removal_report)
+            .await
+            .unwrap();
+        let retired = removal_evidence
+            .resources()
+            .into_iter()
+            .find(|resource| resource.storage_incarnation == stale.storage)
+            .unwrap();
+        assert_eq!(retired.resource_version, "controller-stale-rv-1-next-next");
+        assert_eq!(retired.disposition, PublicV1ResourceDisposition::Retired);
+        assert_eq!(*stale.state.progress.lock().unwrap(), stale_before);
+
+        stale.stop().await;
+        let retired_identity = stale.identity.clone();
+        let mut fresh =
+            HostedMemoryReplica::start("controller-fresh", &resource_uid, &preview, 2).await;
+        fresh.initialize_history(&initialization, &history).await;
+        let fresh_session = fresh.handle().process_session_id();
+        for (revision, name, program) in [
+            (
+                1,
+                "controller-fresh-open",
+                PublicOperationProgram::Open {
+                    replica: fresh.identity.clone(),
+                    existing: true,
+                },
+            ),
+            (
+                2,
+                "controller-fresh-role",
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::IdleSecondary,
+                },
+            ),
+            (
+                3,
+                "controller-fresh-epoch",
+                PublicOperationProgram::Epoch { epoch },
+            ),
+        ] {
+            fresh
+                .handle()
+                .execute_stateless_preview(intent(
+                    &preview,
+                    fresh_session.clone(),
+                    revision,
+                    name,
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        source
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                source.handle().process_session_id(),
+                5,
+                "controller-authority-after-retirement",
+                PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: source_configuration,
+                    previous: None,
+                    replicas: Vec::new(),
+                }),
+            ))
+            .await
+            .unwrap();
+        let fresh_build = PublicBuildInput {
+            attempt: OperationId::new("controller-fresh-build"),
+            epoch,
+            replica: fresh.identity.clone(),
+            target_storage: fresh.storage.clone(),
+            process_session_id: fresh_session.clone(),
+            replication_address: format!("http://{}", fresh.address),
+            history: Some(history.clone()),
+        };
+        source
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                source.handle().process_session_id(),
+                5,
+                "controller-fresh-build",
+                PublicOperationProgram::Build(fresh_build),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            *fresh.state.progress.lock().unwrap(),
+            DurableApplicationProgress {
+                applied_lsn: 1,
+                committed_lsn: 1,
+            }
+        );
+        assert_eq!(
+            fresh.state.copy_chunks.lock().unwrap().as_slice(),
+            &[Bytes::from_static(b"controller-snapshot")]
+        );
+
+        let promoted_epoch = Epoch::new(0, 2);
+        let promoted = ConfigurationDescriptor::new(
+            promoted_epoch,
+            fresh.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: fresh.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            2,
+        );
+        for (handle, revision, name, program) in [
+            (
+                source.handle(),
+                6,
+                "controller-source-promoted-epoch",
+                PublicOperationProgram::Epoch {
+                    epoch: promoted_epoch,
+                },
+            ),
+            (
+                source.handle(),
+                7,
+                "controller-source-secondary-role",
+                PublicOperationProgram::Role {
+                    epoch: promoted_epoch,
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ),
+            (
+                fresh.handle(),
+                4,
+                "controller-fresh-promoted-epoch",
+                PublicOperationProgram::Epoch {
+                    epoch: promoted_epoch,
+                },
+            ),
+            (
+                fresh.handle(),
+                5,
+                "controller-fresh-primary-role",
+                PublicOperationProgram::Role {
+                    epoch: promoted_epoch,
+                    role: ReplicaRole::Primary,
+                },
+            ),
+        ] {
+            handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    revision,
+                    name,
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        source
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                source.handle().process_session_id(),
+                8,
+                "controller-source-secondary-configuration",
+                PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: promoted.clone(),
+                    previous: None,
+                    replicas: vec![PublicReplicaDescriptor {
+                        build_id: OperationId::default(),
+                        identity: fresh.identity.clone(),
+                        replication_address: format!("http://{}", fresh.address),
+                        process_session_id: fresh.handle().process_session_id(),
+                        role: ReplicaRole::Primary,
+                        current_progress: 1,
+                        catch_up_capability: 1,
+                        must_catchup: false,
+                    }],
+                }),
+            ))
+            .await
+            .unwrap();
+        fresh
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                fresh.handle().process_session_id(),
+                6,
+                "controller-fresh-primary-configuration",
+                PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: promoted,
+                    previous: None,
+                    replicas: vec![PublicReplicaDescriptor {
+                        build_id: OperationId::default(),
+                        identity: source.identity.clone(),
+                        replication_address: format!("http://{}", source.address),
+                        process_session_id: source.handle().process_session_id(),
+                        role: ReplicaRole::ActiveSecondary,
+                        current_progress: 1,
+                        catch_up_capability: 1,
+                        must_catchup: false,
+                    }],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            source
+                .handle()
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            fresh
+                .handle()
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::Granted
+        );
+        assert_eq!(
+            fresh
+                .application
+                .replicate(Bytes::from_static(b"replacement-writable-payload"))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(source.state.progress.lock().unwrap().committed_lsn, 2);
+
+        let predecessor = fresh
+            .handle()
+            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .await
+            .unwrap();
+        let predecessor_session = predecessor.process_session_id.clone();
+        let fresh_root = fresh.root.clone();
+        let fresh_identity = fresh.identity.clone();
+        let fresh_storage = fresh.storage.clone();
+        let fresh_state = fresh.state.clone();
+        fresh.stop().await;
+        let restarted_address = free_address();
+        let restarted_application = Arc::new(PreviewApplication::new(
+            fresh_state.clone(),
+            format!("http://{restarted_address}"),
+        ));
+        let mut restarted = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(2),
+                pod_uid: PodUid::new("controller-fresh-pod"),
+                pvc_uid: PvcUid::new("controller-fresh-pvc"),
+                data_root: fresh_root.clone(),
+                control_address: free_address(),
+                replication_address: restarted_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            restarted_application.clone(),
+            ApplicationStorageState::Established,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        })
+        .start()
+        .await
+        .unwrap();
+        let restarted_handle = restarted.handle();
+        let renewal_epoch = Epoch::new(0, 3);
+        let source_endpoint = source
+            .handle()
+            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+        let renewal_configuration = ConfigurationDescriptor::new(
+            renewal_epoch,
+            fresh_identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: fresh_identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            2,
+        );
+        restarted_handle
+            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+                operation_id: OperationId::new("controller-fresh-restart"),
+                reason: ProcessSessionRenewalReason::PrimaryReplacement,
+                resource_uid: resource_uid.clone(),
+                history: history.clone(),
+                previous_epoch: promoted_epoch,
+                renewal_epoch,
+                predecessor,
+                replacement: Some(ProcessSessionEndpoint {
+                    identity: fresh_identity.clone(),
+                    storage_incarnation: fresh_storage.clone(),
+                    process_session_id: restarted_handle.process_session_id(),
+                    replicator_creation_id: ReplicatorCreationId::new(
+                        "controller-fresh-restart-creation",
+                    ),
+                    role: ReplicaRole::None,
+                }),
+                surviving_sessions: vec![source_endpoint],
+                fresh_configuration: renewal_configuration.clone(),
+                predecessor_contained: true,
+                data_loss: None,
+            })
+            .await
+            .unwrap();
+        source
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                source.handle().process_session_id(),
+                9,
+                "controller-source-renewal-epoch",
+                PublicOperationProgram::Epoch {
+                    epoch: renewal_epoch,
+                },
+            ))
+            .await
+            .unwrap();
+        for (revision, name, program) in [
+            (
+                7,
+                "controller-restart-open",
+                PublicOperationProgram::Open {
+                    replica: fresh_identity.clone(),
+                    existing: true,
+                },
+            ),
+            (
+                8,
+                "controller-restart-role",
+                PublicOperationProgram::Role {
+                    epoch: renewal_epoch,
+                    role: ReplicaRole::Primary,
+                },
+            ),
+            (
+                9,
+                "controller-restart-epoch",
+                PublicOperationProgram::Epoch {
+                    epoch: renewal_epoch,
+                },
+            ),
+            (
+                10,
+                "controller-restart-configuration",
+                PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: renewal_configuration,
+                    previous: None,
+                    replicas: vec![PublicReplicaDescriptor {
+                        build_id: OperationId::default(),
+                        identity: source.identity.clone(),
+                        replication_address: format!("http://{}", source.address),
+                        process_session_id: source.handle().process_session_id(),
+                        role: ReplicaRole::ActiveSecondary,
+                        current_progress: 2,
+                        catch_up_capability: 2,
+                        must_catchup: false,
+                    }],
+                }),
+            ),
+        ] {
+            restarted_handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    restarted_handle.process_session_id(),
+                    revision,
+                    name,
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            restarted_handle
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::Granted
+        );
+        assert!(
+            fresh_state
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation.lsn == 2 && operation.data.as_ref() == b"replacement-writable-payload"
+                })
+        );
+        let before = *fresh_state.progress.lock().unwrap();
+        assert!(
+            restarted_handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    predecessor_session,
+                    11,
+                    "controller-predecessor-session",
+                    PublicOperationProgram::Progress { capability: false },
+                ))
+                .await
+                .is_err()
+        );
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{restarted_address}"
+        ))
+        .await
+        .unwrap();
+        let stale_item = proto::ReplicationItem {
+            protocol_version: 11,
+            sender: Some(source.identity.clone().into()),
+            receiver: Some(retired_identity.into()),
+            epoch: Some(epoch.into()),
+            previous_configuration_id: String::new(),
+            current_configuration_id: "retired-controller-configuration".into(),
+            lsn: 99,
+            committed_lsn: 98,
+            data: b"retired-controller-payload".to_vec(),
+            sender_session_id: source.handle().process_session_id().to_string(),
+            receiver_session_id: stale_session.to_string(),
+        };
+        let mut response = client
+            .replicate(tonic::Request::new(stream::iter([stale_item])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.next().await.unwrap().is_err());
+        assert_eq!(*fresh_state.progress.lock().unwrap(), before);
+
+        source.stop().await;
+        restarted.shutdown();
+        restarted.wait().await.unwrap();
+        source.cleanup();
+        stale.cleanup();
+        std::fs::remove_dir_all(fresh_root).unwrap();
     })
     .await
     .unwrap();

@@ -26,6 +26,8 @@ use crate::state::{RecoveryState, SqlitePersistence, persistence_error};
 
 pub struct SqliteProvider {
     persistence: Arc<SqlitePersistence>,
+    #[cfg(any(test, feature = "testing"))]
+    copy_snapshot: crate::testing::PauseGate,
 }
 
 #[async_trait]
@@ -60,6 +62,8 @@ impl StateProvider for SqliteProvider {
             .persistence
             .snapshot(up_to_lsn)
             .map_err(persistence_error)?;
+        #[cfg(any(test, feature = "testing"))]
+        self.copy_snapshot.pause().await;
         Ok(Box::pin(stream::iter([Ok(Bytes::from(data))])))
     }
     async fn on_data_loss(&self) -> Result<bool> {
@@ -116,6 +120,8 @@ impl SqliteService {
             vfs_name,
             provider: Arc::new(SqliteProvider {
                 persistence: persistence.clone(),
+                #[cfg(any(test, feature = "testing"))]
+                copy_snapshot: crate::testing::PauseGate::default(),
             }),
             persistence,
             barrier,
@@ -141,6 +147,10 @@ impl SqliteService {
     }
     pub fn provider(&self) -> &Arc<SqliteProvider> {
         &self.provider
+    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn copy_snapshot_gate(&self) -> &crate::testing::PauseGate {
+        &self.provider.copy_snapshot
     }
     pub fn vfs_name(&self) -> &str {
         &self.vfs_name

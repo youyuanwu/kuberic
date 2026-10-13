@@ -385,6 +385,8 @@ struct RegisteredReplicator {
     primary: Option<Arc<dyn PrimaryReplicator>>,
     #[cfg(feature = "testing")]
     identity: ReplicatorCreationIdentity,
+    #[cfg(feature = "testing")]
+    callback_containment: Option<tokio::sync::watch::Receiver<bool>>,
     #[allow(dead_code)]
     capabilities: ReplicatorCapabilities,
     provider: Option<Arc<dyn StateProvider>>,
@@ -1146,7 +1148,8 @@ impl PodRuntime {
                 capabilities: registered.capabilities,
                 replicator_creation_id: registered.identity.to_public_id(),
                 open_context: None,
-                containment: None,
+                containment: registered.callback_containment.clone(),
+                wait_for_containment: registered.callback_containment.is_some(),
                 aborted: Arc::new(std::sync::Mutex::new(false)),
                 #[cfg(all(test, feature = "testing"))]
                 cut: None,
@@ -1204,6 +1207,7 @@ impl PodRuntime {
             ),
             open_context: None,
             containment: None,
+            wait_for_containment: false,
             aborted: Arc::new(std::sync::Mutex::new(false)),
             #[cfg(all(test, feature = "testing"))]
             cut: None,
@@ -1290,6 +1294,7 @@ impl PodRuntime {
                 Some(PublicOperationProgram::Build(_) | PublicOperationProgram::Remove(_)) => {}
                 None if record.intent.lifecycle.is_some() => {
                     let lifecycle = record.intent.lifecycle.as_ref().expect("checked lifecycle");
+                    open = true;
                     epoch = Some(lifecycle.epoch);
                     role = Some((
                         lifecycle.epoch,
@@ -3227,6 +3232,8 @@ impl ReplicatorRegistration for RuntimeHost {
         }
         #[cfg(feature = "testing")]
         let identity = attachment.identity(RuntimeHostToken::new());
+        #[cfg(feature = "testing")]
+        let callback_containment = attachment.callback_containment(RuntimeHostToken::new());
         let managed_lifecycle = attachment.managed_lifecycle(RuntimeHostToken::new());
         let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
         let control = attachment.replicator(RuntimeHostToken::new());
@@ -3326,6 +3333,8 @@ impl ReplicatorRegistration for RuntimeHost {
                 primary,
                 #[cfg(feature = "testing")]
                 identity,
+                #[cfg(feature = "testing")]
+                callback_containment,
                 capabilities,
                 provider,
                 process_lifecycle,

@@ -50,10 +50,7 @@ fn built_in_preview_ksf_mappings_require_each_authorized_p2_observation() {
     for (gate, scenarios) in [
         (
             "KSF-02",
-            &[
-                "public_v1_history_admission_gates_all_data_loss_outcomes",
-                "static_preview_is_store_free_access_gated_and_durable_before_ack",
-            ][..],
+            &["hosted_preview_authorized_data_loss_maps_only_the_effective_outcome"][..],
         ),
         (
             "KSF-06",
@@ -76,6 +73,7 @@ fn built_in_preview_ksf_mappings_require_each_authorized_p2_observation() {
             &[
                 "public_fault_reporting_closes_access_and_location_before_returning",
                 "hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement",
+                "hosted_preview_rebuild_retires_and_restarts_fresh_replacement",
                 "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
             ][..],
         ),

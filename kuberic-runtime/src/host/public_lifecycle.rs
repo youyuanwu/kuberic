@@ -41,6 +41,7 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
+    pub(crate) wait_for_containment: bool,
     pub(crate) aborted: Arc<std::sync::Mutex<bool>>,
     #[cfg(all(test, feature = "testing"))]
     pub(crate) cut: Option<Arc<PublicOperationCut>>,
@@ -187,7 +188,9 @@ pub(crate) async fn launch(
                 return Ok::<(), HostError>(());
             }
             if let Some(witness) = callbacks.containment.clone() {
-                operation.track_containment(witness).await?;
+                operation
+                    .track_containment(witness, callbacks.wait_for_containment)
+                    .await?;
             }
             #[cfg(all(test, feature = "testing"))]
             operation.track_cut(callbacks.cut.clone()).await;

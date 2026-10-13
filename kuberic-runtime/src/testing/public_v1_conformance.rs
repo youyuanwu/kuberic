@@ -1,5 +1,122 @@
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+const CONFORMANCE_TIMEOUT: Duration = Duration::from_secs(270);
+
+#[derive(Debug)]
+struct BoundedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn bounded_output(
+    command: &mut Command,
+    deadline: Instant,
+    description: &str,
+) -> Result<BoundedOutput, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{description} failed to start: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{description} did not capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{description} did not capture stderr"))?;
+    let stdout = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stdout = stdout;
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("{description} status failed: {error}"))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            terminate_process_tree(&mut child);
+            let status = child
+                .wait()
+                .map_err(|error| format!("{description} reap failed: {error}"))?;
+            let stdout = stdout
+                .join()
+                .map_err(|_| format!("{description} stdout reader panicked"))?
+                .map_err(|error| format!("{description} stdout read failed: {error}"))?;
+            let stderr = stderr
+                .join()
+                .map_err(|_| format!("{description} stderr reader panicked"))?
+                .map_err(|error| format!("{description} stderr read failed: {error}"))?;
+            return Err(format!(
+                "{description} exceeded {CONFORMANCE_TIMEOUT:?} parent deadline \
+                 (terminated with {status}):\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout
+        .join()
+        .map_err(|_| format!("{description} stdout reader panicked"))?
+        .map_err(|error| format!("{description} stdout read failed: {error}"))?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| format!("{description} stderr reader panicked"))?
+        .map_err(|error| format!("{description} stderr read failed: {error}"))?;
+    Ok(BoundedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const SIGTERM: i32 = 15;
+        const SIGKILL: i32 = 9;
+        let process_group = -(child.id() as i32);
+        unsafe {
+            kill(process_group, SIGTERM);
+        }
+        let grace = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < grace {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unsafe {
+            kill(process_group, SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FutureObligation {
@@ -73,10 +190,7 @@ const GATES: [Gate; 16] = [
             "public_v1_data_loss_replay_uses_attached_capability",
         ],
         postgres_scenarios: &[],
-        preview_scenarios: &[
-            "public_v1_history_admission_gates_all_data_loss_outcomes",
-            "static_preview_is_store_free_access_gated_and_durable_before_ack",
-        ],
+        preview_scenarios: &["hosted_preview_authorized_data_loss_maps_only_the_effective_outcome"],
         expected: "logical authorization distinguishes every callback outcome",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -235,6 +349,7 @@ const GATES: [Gate; 16] = [
         preview_scenarios: &[
             "public_fault_reporting_closes_access_and_location_before_returning",
             "hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement",
+            "hosted_preview_rebuild_retires_and_restarts_fresh_replacement",
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "fault closes access and targets one exact incarnation",
@@ -308,6 +423,7 @@ fn run_scenarios(
     scenarios: fn(&Gate) -> &'static [&'static str],
 ) {
     let root = workspace_root();
+    let deadline = Instant::now() + CONFORMANCE_TIMEOUT;
     let filter = scenario_filter(scenarios);
     let archive = std::env::var_os("NEXTEST_ARCHIVE")
         .map(PathBuf::from)
@@ -329,10 +445,9 @@ fn run_scenarios(
         }
         list.arg("--all-features");
     }
-    let list = list
-        .args(["--profile", "ordinary", "-E", &filter])
-        .output()
-        .expect("list strict Public V1 conformance scenarios");
+    list.args(["--profile", "ordinary", "-E", &filter]);
+    let list = bounded_output(&mut list, deadline, "list Public V1 conformance scenarios")
+        .unwrap_or_else(|error| panic!("{error}"));
     assert!(
         list.status.success(),
         "strict Public V1 conformance inventory failed: {}",
@@ -353,8 +468,8 @@ fn run_scenarios(
     let mut run = Command::new("cargo");
     run.current_dir(&root).args(["nextest", "run", "-j", "1"]);
     let extract = archive.as_ref().map(|archive| {
-        let path = std::env::temp_dir().join(format!(
-            "kuberic-public-v1-conformance-{}",
+        let path = root.join("target").join(format!(
+            "public-v1-conformance-extract-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&path);
@@ -373,19 +488,67 @@ fn run_scenarios(
         }
         run.arg("--all-features");
     }
-    let run = run
-        .args(["--profile", "ordinary", "-E", &filter])
-        .output()
-        .expect("run strict Public V1 conformance scenarios");
+    run.args(["--profile", "ordinary", "-E", &filter]);
+    let result = bounded_output(
+        &mut run,
+        deadline,
+        &format!("run {subject} Public V1 conformance scenarios"),
+    );
     if let Some(extract) = extract {
         let _ = std::fs::remove_dir_all(extract);
     }
+    let run = result.unwrap_or_else(|error| panic!("{error}"));
     assert!(
         run.status.success(),
         "{subject} Public V1 conformance scenarios failed:\n{}\n{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+}
+
+#[cfg(all(test, unix))]
+mod bounded_process_tests {
+    use super::*;
+
+    fn process_exists(pid: i32) -> bool {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        unsafe { kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn stalled_nested_conformance_child_times_out_and_reaps_process_tree() {
+        let root = workspace_root()
+            .join("target")
+            .join(format!("conformance-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("descendant.pid");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait",
+            pid_file.display()
+        ));
+        let error = bounded_output(
+            &mut command,
+            Instant::now() + Duration::from_millis(200),
+            "stalled nested conformance regression",
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeded"));
+        let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        let reaped = (0..100).any(|_| {
+            if !process_exists(descendant) {
+                true
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(reaped, "descendant process {descendant} survived timeout");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub fn assert_public_v1_conformance_subject(subject: &str) {

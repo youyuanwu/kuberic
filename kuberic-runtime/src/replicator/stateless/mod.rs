@@ -84,6 +84,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
             .self_ref
             .set(Arc::downgrade(&engine))
             .expect("stateless preview self reference is unset");
+        let containment = engine.callback_containment();
         Ok(ReplicatorInterfaces::primary(
             engine.clone(),
             Some(engine),
@@ -92,7 +93,8 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
                 data_loss_replay:
                     crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity,
             },
-        ))
+        )
+        .with_callback_containment(containment))
     }
 }
 
@@ -136,6 +138,23 @@ struct ListenerOwner {
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
+struct CallbackContainmentGuard {
+    engine: Arc<StatelessReplicator>,
+}
+
+impl Drop for CallbackContainmentGuard {
+    fn drop(&mut self) {
+        if self
+            .engine
+            .active_callbacks
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.engine.callback_containment.send_replace(true);
+        }
+    }
+}
+
 pub struct StatelessReplicator {
     identity: ReplicaIdentity,
     process_session: ProcessSessionId,
@@ -149,6 +168,8 @@ pub struct StatelessReplicator {
     write_gate: Mutex<()>,
     listener: StdMutex<Option<ListenerOwner>>,
     descendants: StdMutex<Vec<tokio::task::AbortHandle>>,
+    callback_containment: watch::Sender<bool>,
+    active_callbacks: std::sync::atomic::AtomicUsize,
     self_ref: OnceLock<Weak<StatelessReplicator>>,
 }
 
@@ -161,6 +182,7 @@ impl StatelessReplicator {
         storage: Arc<dyn DurableState>,
         settings: ReplicatorSettings,
     ) -> Self {
+        let (callback_containment, _) = watch::channel(true);
         Self {
             identity,
             process_session,
@@ -186,8 +208,37 @@ impl StatelessReplicator {
             write_gate: Mutex::new(()),
             listener: StdMutex::new(None),
             descendants: StdMutex::new(Vec::new()),
+            callback_containment,
+            active_callbacks: std::sync::atomic::AtomicUsize::new(0),
             self_ref: OnceLock::new(),
         }
+    }
+
+    fn callback_containment(&self) -> watch::Receiver<bool> {
+        self.callback_containment.subscribe()
+    }
+
+    async fn send_contained_build(&self, replica: ReplicaInformation) -> Result<()> {
+        let engine =
+            self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
+                RuntimeError::Application("preview creation is unattached".into())
+            })?;
+        if engine
+            .active_callbacks
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            == 0
+        {
+            engine.callback_containment.send_replace(false);
+        }
+        let guard = CallbackContainmentGuard {
+            engine: engine.clone(),
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            engine.send_build(&replica).await
+        })
+        .await
+        .map_err(|error| RuntimeError::Application(format!("build task failed: {error}")))?
     }
 
     async fn require_primary(&self) -> Result<ConfigurationAuthority> {
@@ -1650,27 +1701,23 @@ impl PrimaryReplicator for StatelessReplicator {
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.send_build(&replica).await
+        self.send_contained_build(replica).await
     }
 
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
         let mut state = self.state.lock().await;
-        let removed = state
-            .authority
-            .as_mut()
-            .and_then(|authority| {
-                let identity = authority
-                    .peers
-                    .keys()
-                    .find(|identity| identity.replica_id == replica_id)
-                    .cloned()?;
-                authority.peers.remove(&identity);
-                Some(identity)
-            })
-            .ok_or_else(|| {
-                RuntimeError::AuthorityMismatch("removed replica lacks exact authority".into())
-            })?;
-        state.retired.insert(removed);
+        let removed = state.authority.as_mut().and_then(|authority| {
+            let identity = authority
+                .peers
+                .keys()
+                .find(|identity| identity.replica_id == replica_id)
+                .cloned()?;
+            authority.peers.remove(&identity);
+            Some(identity)
+        });
+        if let Some(removed) = removed {
+            state.retired.insert(removed);
+        }
         Ok(())
     }
 }

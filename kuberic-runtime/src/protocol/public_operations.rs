@@ -2412,6 +2412,9 @@ impl PublicV1AgentReport {
                         | PublicDataLossRecoveryStage::CallbackProcessing
                         | PublicDataLossRecoveryStage::HistoryPending
                         | PublicDataLossRecoveryStage::ConfigurationPending
+                        | PublicDataLossRecoveryStage::Failed
+                        | PublicDataLossRecoveryStage::ReplacementRequired
+                        | PublicDataLossRecoveryStage::Retired
                 )
             })
             && !self.is_access_closed_replacement_observation()

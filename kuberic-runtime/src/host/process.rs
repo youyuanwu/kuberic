@@ -888,7 +888,10 @@ impl ReplicaHandle {
         );
         if !matches!(
             intent.program,
-            Some(crate::protocol::public_operations::PublicOperationProgram::Progress { .. })
+            Some(
+                crate::protocol::public_operations::PublicOperationProgram::Progress { .. }
+                    | crate::protocol::public_operations::PublicOperationProgram::Build(_)
+            )
         ) {
             self.runtime.fence_stateless_preview_access().await;
         }
