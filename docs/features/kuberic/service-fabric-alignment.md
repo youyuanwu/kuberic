@@ -579,7 +579,7 @@ authorization while the runtime/Replicator owns execution.
 | Phase 4 | Consume a transient public fault as lifecycle control, close access and plan/execute restart for persisted state or drop/replacement for volatile state using the exact faulted incarnation | `kuberic-controller/src/evaluator.rs`, `executor.rs`, fault/report protocol and controller fault tests |
 | Phase 5 | Define the new protocol/status vocabulary, compare only compatible histories, authorize data-loss recovery, issue higher-epoch session renewal and decide fresh-incarnation rebuild | `kuberic-runtime/src/protocol/types.rs`, `protocol/command.rs`, `protocol/validation.rs`, `kuberic-controller/src/evaluator.rs` and its transition modules, `kuberic-controller/src/plan.rs` |
 | Phase 6 | Drive the real preview through evaluator, executor and reconciler; consume only public progress/completion; prove failover, swap, build, replacement and restart without direct test-only runtime commands | `kuberic-controller/src/evaluator.rs`, `executor.rs`, `reconciler.rs`, `cluster_api.rs`, controller protocol/model/integration tests |
-| Phase 7 | Build and validate the replacement-only controller artifact, own the cutover Lease, revoke legacy command/signing/RBAC authority and activate in a fresh namespace/resource UID | `kuberic-controller/src/crd.rs`, `cluster_api.rs`, deployment/RBAC manifests and cutover/live tests |
+| Phase 7 | Build and validate the replacement-only controller artifact, own the cutover Lease, revoke legacy command/RBAC authority and activate in a fresh namespace/resource UID | `kuberic-controller/src/crd.rs`, `cluster_api.rs`, deployment/RBAC manifests and cutover/live tests |
 
 The controller must not learn Replicator-private ACK sets, copy boundaries or
 queue positions. Its new state is limited to agent/controller policy:
@@ -1080,7 +1080,7 @@ Planned work:
 - require an explicit irreversible-cutover approval recording that required
   application-level exports completed or that no old data is retained;
 - disable every application, acquire an exclusive cutover Lease, terminate all
-  legacy controller Pods, revoke their command/signing credential and remove
+  legacy controller Pods, revoke their command credential and remove
   their Kubernetes mutation RBAC before changing storage;
 - stop every runtime and require fresh agent/application storage for the
   breaking activation; persisted compatibility is intentionally unsupported;
@@ -1090,7 +1090,7 @@ Planned work:
   resources;
 - deploy only the validated replacement-only artifact;
 - require the replacement controller to acquire the Lease using a fresh
-  protocol generation, namespace-scoped mutation RBAC and command/signing
+  protocol generation, namespace-scoped mutation RBAC and command
   credential before reconciliation;
 - start PostgreSQL and other custom replicators from fresh agent/application
   state under the new public contract;
@@ -1201,7 +1201,7 @@ Exit criteria:
   offline atomic switch. No KSF semantic finding may remain unresolved at
   activation.
 - Phase 7 activates through one breaking protocol boundary after old
-  controller/runtime processes are stopped, their command/signing credential
+  controller/runtime processes are stopped, their command credential
   and Kubernetes mutation RBAC are revoked, and the replacement-only
   controller owns the cutover Lease in a fresh namespace/resource generation.
   SQLite, KVStore2, PostgreSQL and every other application restart from fresh

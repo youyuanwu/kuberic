@@ -872,7 +872,7 @@ For every deployment, including SQLite, KVStore2 and PostgreSQL:
 1. disable application and replica access;
 2. acquire the exclusive cutover Lease, scale/delete the legacy controller
    deployment, wait for every old controller Pod to terminate, revoke its
-   command/signing credential and remove its Kubernetes mutation RBAC;
+   command credential and remove its Kubernetes mutation RBAC;
 3. stop all old runtime/replicator processes;
 4. delete or replace all old agent and application storage/PVCs;
 5. create a fresh installation namespace and controller-owned resource UID for
@@ -882,7 +882,7 @@ For every deployment, including SQLite, KVStore2 and PostgreSQL:
    application provider artifact that implements the complete public contract
    and contains no legacy selection. The replacement controller acquires the
    Lease with a new protocol generation, namespace-scoped mutation RBAC and
-   signing/command credential;
+   command credential;
 7. initialize fresh agent and provider storage;
 8. bootstrap new authority from the empty deployment;
 9. build the remaining replicas through the public build path;
@@ -1236,7 +1236,7 @@ This is the offline activation portion of alignment Phase 7.
   application-level exports completed or that no old data is retained;
 - disable every application and stop all old runtime processes;
 - acquire the exclusive cutover Lease, scale/delete the legacy controller,
-  verify zero old controller Pods, revoke its command/signing credential and
+  verify zero old controller Pods, revoke its command credential and
   remove its Kubernetes mutation RBAC before changing storage;
 - delete or replace all old agent and application storage/PVCs;
 - create a fresh installation namespace and controller-owned resource UID; do
