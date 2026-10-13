@@ -101,9 +101,9 @@ listeners and durable roots. `-j 1` is the reproducible diagnostic boundary;
 parallel ordinary execution may add transient Cargo, listener or host-resource
 contention, but contention is not treated as a passing result.
 
-### Runtime ownership and recovery
+### Runtime ownership, hosted recovery and conformance
 
-The inventory is exactly 13 direct recovery tests plus two catalog tests:
+The inventory is exactly 15 direct recovery tests plus two catalog tests:
 
 ```bash
 scripts/assert_nextest_selection.sh \
@@ -111,9 +111,12 @@ scripts/assert_nextest_selection.sh \
   --require-binary stateless_preview_recovery \
   --require-binary public_v1_conformance \
   --require-test preview_open_owns_registration_listener_and_writer_exactly_once \
+  --require-test hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close \
+  --require-test hosted_preview_contained_close_retains_typed_child_diagnostic \
   --require-test hosted_preview_rebuild_retires_and_restarts_fresh_replacement \
   --require-test ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress \
-  --require-test public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16 -- \
+  --require-test public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16 \
+  --require-test built_in_preview_ksf_mappings_require_each_authorized_observation -- \
   cargo nextest list -p kuberic-runtime --all-features \
     --profile ordinary \
     -E 'binary(stateless_preview_recovery) or binary(public_v1_conformance)'
@@ -123,14 +126,17 @@ cargo nextest run -j 1 -p kuberic-runtime --all-features \
 
 KUBERIC_WORKSPACE_TESTS=1 cargo nextest run -j 1 \
   -p kuberic-runtime --all-features --profile ordinary \
-  -E 'test(public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16) or test(built_in_preview_ksf_mappings_require_each_authorized_p2_observation)'
+  -E 'test(public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16) or test(built_in_preview_ksf_mappings_require_each_authorized_observation)'
 ```
 
 The direct binary covers immutable selection, exact engine/provider-writer/
 listener ownership, schema-11 bootstrap, no-fallback startup, static
 reconstruction, durable-before-ACK writes, ambiguous suffix containment,
 higher-epoch session renewal, failover/switchover, build, removal, data loss,
-permanent retirement, empty replacement and post-replacement restart.
+permanent retirement, empty replacement and post-replacement restart. The
+full hosted switchover and build chains execute in this
+`stateless_preview_recovery` binary because it owns both the preview runtime
+fixtures and the feature-gated controller adapter.
 
 The shared catalog contains exactly KSF-01 through KSF-16. The
 `built-in-preview` subject has public-observable scenarios for every KSF-01
@@ -139,7 +145,7 @@ retain negative replacement-artifact guards while the legacy managed
 capability/listener exists. KSF-16 has no preview scenario and remains the
 Phase 7 legacy-continuation guard.
 
-### Hosted controller chain
+### Controller operation/evidence boundaries
 
 The controller selection is exactly the 10 `public_v1_evidence` and six
 `public_v1_session_renewal` tests:
@@ -162,11 +168,14 @@ cargo nextest run -j 1 -p kuberic-controller --all-features \
 ```
 
 The feature-gated hosted adapter implements history, session-renewal,
-`PublicV1OperationApi` and evidence APIs. Tests prove the complete accepted
-evaluator authority -> executor -> `PublicV1Operation` command -> preview
-runtime operation owner -> matching durable report -> evidence acceptance/
-retirement/replacement chain. Wrong targets, predecessor reports, changed
-authority and stale resource versions fail before effect.
+`PublicV1OperationApi` and evidence APIs. This selector covers operation
+target fencing, evidence acceptance/removal/replacement behavior and
+session-renewal planning/order. The full accepted evaluator authority ->
+executor -> `PublicV1Operation` command -> preview runtime owner -> matching
+durable report -> effect chain is exercised by the runtime
+`stateless_preview_recovery` selector, not by these controller-only fixtures.
+Wrong targets, predecessor reports, changed authority and stale resource
+versions fail before effect.
 
 ### Real SQLite and KVStore2 replacement journeys
 
@@ -199,8 +208,10 @@ Every newly added Phase 6 test has an internal timeout no greater than 270
 seconds:
 
 - direct runtime tests: 30, 120, 150 or 180 seconds;
-- shared nested KSF runner: one 270-second parent deadline with process-tree
-  termination/reaping coverage;
+- shared nested KSF runner: one absolute 270-second parent deadline shared by
+  strict-custom and built-in-preview inventory and execution commands; the
+  second subject cannot reset the budget, with process-tree
+  termination/reaping regression coverage;
 - new controller target/removal/survivor tests: 270 seconds;
 - SQLite/KVStore2 journeys: 180 seconds, with tighter build waits.
 
@@ -229,6 +240,16 @@ The Phase 6 implementation spans commits `eec6d25` through `c6010a0`. The
 - `scripts/check_runtime_public_api.sh`, `cargo check --workspace`,
   `cargo fmt --all -- --check`, Markdown-link and documented-path checks
   passed.
+
+The review-guard P3 rerun on 2026-10-13 updated the runtime inventory to 17
+tests: 15/15 direct preview scenarios passed in 101.109s, the exact two-test
+KSF selector passed in 127.350s, and the shared-deadline reset/reaping
+regression passed in 0.419s. Workspace all-feature check, runtime public-API
+inventory, formatting, diff hygiene and documentation target checks passed.
+The broad `just nextest-test` run passed 1,122/1,123 tests; its nested KSF
+oracle reached the intentional 270-second parent deadline while competing
+with the broad suite. The exact serial KSF selector above passed and remains
+the supported diagnostic result for that nested test.
 
 The KSF runner and KVStore2 journey have deliberately bounded but finite
 headroom on this host. Do not add parallel work inside those tests or combine

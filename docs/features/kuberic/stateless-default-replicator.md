@@ -198,7 +198,7 @@ the replacement starts with empty provider state and must complete a new exact
 build before admission. Real SQLite and KVStore2 journeys prove that a retired
 higher-progress store is not copied or readmitted after replacement restart.
 
-### Hosted controller chain
+### Hosted runtime/controller chain
 
 The feature-gated `HostedPublicV1Adapter` implements history,
 session-renewal, `PublicV1OperationApi` and evidence APIs. An evaluator-accepted
@@ -209,16 +209,24 @@ path to the durable operation owner. Only the matching
 accept, retirement or replacement effect. History/session renewal precede
 dependent operation/evidence acceptance.
 
-This chain is compiled only by `runtime-test-bridge`; production normalization,
-CRDs and dispatch continue to reject Public V1.
+The runtime `stateless_preview_recovery` selector executes the complete hosted
+switchover/build chain because it owns the preview replicas and adapter. The
+controller selector independently covers operation/evidence target fencing,
+removal and session renewal. The architecture still separates the controller
+API boundary from the runtime operation owner.
+
+This integration is compiled only by `runtime-test-bridge`; production
+normalization, CRDs and dispatch continue to reject Public V1.
 
 ### Conformance and security boundary
 
 The shared KSF catalog maps the built-in preview to every KSF-01 through
-KSF-15 public-observable result. KSF-09 and KSF-10 also retain negative
-replacement-artifact guards while the legacy capability and listener remain.
-KSF-16 has no preview scenario and remains the Phase 7 legacy-continuation
-guard.
+KSF-15 public-observable result. KSF-12 holds a real callback descendant
+through supersession and close, and KSF-14 injects a child close failure while
+retaining the typed diagnostic under normalized outer success. KSF-09 and
+KSF-10 also retain negative replacement-artifact guards while the legacy
+capability and listener remain. KSF-16 has no preview scenario and remains
+the Phase 7 legacy-continuation guard.
 
 Public V1 replication transport intentionally has no peer authentication or
 authorization. Identity, process session, epoch, configuration, history,
@@ -1267,23 +1275,30 @@ production deployment.
 
 The delivered preview is covered by:
 
-- 13 direct `stateless_preview_recovery` ownership, static/dynamic recovery,
+- 15 direct `stateless_preview_recovery` ownership, static/dynamic recovery,
   ambiguity, replacement and dormancy tests;
 - the shared KSF runner, which maps built-in preview observations to every
-  KSF-01 through KSF-15 result and keeps KSF-16 as a Phase 7-only guard;
-- feature-gated controller operation/evidence and session-renewal tests;
+  KSF-01 through KSF-15 result and keeps KSF-16 as a Phase 7-only guard,
+  including focused KSF-12 callback-root/descendant cancellation and KSF-14
+  typed contained-close diagnostics;
+- feature-gated controller operation/evidence target-fencing, removal and
+  session-renewal tests;
 - one real SQLite and one real KVStore2 fresh restart/build/corrective-empty-
   replacement journey;
 - the unchanged bounded PostgreSQL smoke tier for the independent custom
   implementation.
 
 Every newly added Phase 6 test has an internal bound of at most 270 seconds;
-the generic 300-second nextest limit is only an external backstop. Run the
-exact selectors serially (`-j 1`): the shared KSF test starts nested Cargo/
-nextest work, and the hosted runtime/provider journeys own real listeners and
-durable test roots. Parallel execution can add transient build, port and host
-resource contention, so it is not the diagnostic oracle. Exact commands and
-the documentation-phase verification record are in
+the generic 300-second nextest limit is only an external backstop. The shared
+KSF test gives strict-custom and built-in-preview inventory/execution commands
+one absolute 270-second parent budget; the second subject cannot reset it. Run
+the exact selectors serially (`-j 1`): the hosted runtime/provider journeys
+own real listeners and durable test roots. Parallel execution can add
+transient build, port and host resource contention, so it is not the
+diagnostic oracle. The full hosted switchover/build chain belongs to the
+runtime `stateless_preview_recovery` selector. The controller selector covers
+only its operation/evidence target-fencing, removal and renewal boundaries.
+Exact commands and the documentation-phase verification record are in
 [Kuberic Test Strategy](testing.md#service-fabric-public-v1-phase-6-preview).
 
 ## Testing Strategy

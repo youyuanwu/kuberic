@@ -54,6 +54,7 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
+use serde::Deserialize;
 use tokio::sync::{Notify, RwLock};
 use tonic::Request;
 
@@ -153,6 +154,7 @@ struct MemoryState {
     block_commit: AtomicBool,
     fail_commit: AtomicBool,
     block_copy: AtomicBool,
+    spawn_copy_descendant: AtomicBool,
     data_loss_changed: AtomicBool,
     fail_data_loss: AtomicBool,
     data_loss_rebuild: Mutex<Option<ReplicaIdentity>>,
@@ -161,6 +163,10 @@ struct MemoryState {
     release_commit: Notify,
     copy_entered: Notify,
     release_copy: Notify,
+    copy_descendant_entered: Arc<Notify>,
+    release_copy_descendant: Arc<Notify>,
+    cancelled_copy_descendants: Arc<AtomicU64>,
+    copy_descendant_mutations: Arc<AtomicU64>,
 }
 
 impl MemoryState {
@@ -174,6 +180,11 @@ impl MemoryState {
 
     fn block_copy(&self) {
         self.block_copy.store(true, Ordering::Release);
+    }
+
+    fn block_copy_with_descendant(&self) {
+        self.block_copy();
+        self.spawn_copy_descendant.store(true, Ordering::Release);
     }
 
     fn change_on_data_loss(&self) {
@@ -214,9 +225,50 @@ impl StateProvider for MemoryState {
         _copy_context: OperationDataStream,
     ) -> Result<OperationDataStream> {
         if self.block_copy.load(Ordering::Acquire) {
+            struct AbortDescendant(tokio::task::JoinHandle<()>);
+
+            impl Drop for AbortDescendant {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+
+            let descendant = self
+                .spawn_copy_descendant
+                .swap(false, Ordering::AcqRel)
+                .then(|| {
+                    let entered = self.copy_descendant_entered.clone();
+                    let release = self.release_copy_descendant.clone();
+                    let cancelled = self.cancelled_copy_descendants.clone();
+                    let mutations = self.copy_descendant_mutations.clone();
+                    AbortDescendant(tokio::spawn(async move {
+                        struct CancellationProbe {
+                            cancelled: Arc<AtomicU64>,
+                            completed: bool,
+                        }
+
+                        impl Drop for CancellationProbe {
+                            fn drop(&mut self) {
+                                if !self.completed {
+                                    self.cancelled.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+
+                        let mut probe = CancellationProbe {
+                            cancelled,
+                            completed: false,
+                        };
+                        entered.notify_one();
+                        release.notified().await;
+                        mutations.fetch_add(1, Ordering::SeqCst);
+                        probe.completed = true;
+                    }))
+                });
             self.copy_entered.notify_waiters();
             self.release_copy.notified().await;
             self.block_copy.store(false, Ordering::Release);
+            drop(descendant);
         }
         Ok(Box::pin(stream::iter(
             self.copy_chunks.lock().unwrap().clone().into_iter().map(Ok),
@@ -400,6 +452,10 @@ struct PreviewApplication {
     failed_factory_calls: Arc<AtomicU64>,
     metadata_database: Option<PathBuf>,
     instruction_seen_before_open: AtomicBool,
+    fail_close: AtomicBool,
+    abort_calls: AtomicU64,
+    replicator_released_before_application_close: AtomicBool,
+    lifecycle_events: Mutex<Vec<&'static str>>,
 }
 
 impl PreviewApplication {
@@ -418,6 +474,10 @@ impl PreviewApplication {
             failed_factory_calls: Arc::new(AtomicU64::new(0)),
             metadata_database: None,
             instruction_seen_before_open: AtomicBool::new(false),
+            fail_close: AtomicBool::new(false),
+            abort_calls: AtomicU64::new(0),
+            replicator_released_before_application_close: AtomicBool::new(false),
+            lifecycle_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -436,6 +496,10 @@ impl PreviewApplication {
     fn with_failed_creation(mut self) -> Self {
         self.fail_first_creation = AtomicBool::new(true);
         self
+    }
+
+    fn fail_next_close(&self) {
+        self.fail_close.store(true, Ordering::Release);
     }
 
     async fn duplicate_creation(&self) -> Result<()> {
@@ -570,13 +634,42 @@ impl StatefulServiceReplica for PreviewApplication {
     }
 
     async fn close(&self) -> Result<()> {
+        self.lifecycle_events
+            .lock()
+            .unwrap()
+            .push("application.close.begin");
+        let address: std::net::SocketAddr = self
+            .replication_address
+            .strip_prefix("http://")
+            .expect("preview replication address")
+            .parse()
+            .expect("preview socket address");
+        if std::net::TcpListener::bind(address).is_ok() {
+            self.replicator_released_before_application_close
+                .store(true, Ordering::Release);
+        }
         self.state_replicator.write().await.take();
         self.primary.write().await.take();
         self.control.write().await.take();
+        self.lifecycle_events
+            .lock()
+            .unwrap()
+            .push("application.close.end");
+        if self.fail_close.swap(false, Ordering::AcqRel) {
+            return Err(RuntimeError::Application(
+                "injected application close failure".into(),
+            ));
+        }
         Ok(())
     }
 
-    fn abort(&self) {}
+    fn abort(&self) {
+        self.abort_calls.fetch_add(1, Ordering::SeqCst);
+        self.lifecycle_events
+            .lock()
+            .unwrap()
+            .push("application.abort");
+    }
 }
 
 struct Resolver;
@@ -775,6 +868,20 @@ impl HostedMemoryReplica {
     }
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+enum StoredCloseDiagnostic {
+    CloseFailure {
+        child: StoredCloseChild,
+        error: String,
+    },
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+enum StoredCloseChild {
+    Replicator,
+    Application,
+}
+
 #[tokio::test]
 async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -891,6 +998,115 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
         running.shutdown();
         running.wait().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_preview_contained_close_retains_typed_child_diagnostic() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let resource_uid = ResourceUid::new("preview-contained-close");
+        let preview = PublicOperationPreviewIdentity::public_v1(12);
+        let mut replica =
+            HostedMemoryReplica::start("contained-close", &resource_uid, &preview, 1).await;
+        let generation = PublicProtocolGeneration::new(12);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        replica.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        install_static_authority(
+            &replica.handle(),
+            &preview,
+            replica.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: ConfigurationDescriptor::new(
+                    epoch,
+                    replica.identity.replica_id,
+                    vec![ConfigurationMember {
+                        identity: replica.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    }],
+                    1,
+                ),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
+        .await;
+
+        replica.application.fail_next_close();
+        let close_id = OperationId::new("preview-contained-close");
+        replica
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                replica.handle().process_session_id(),
+                5,
+                close_id.as_str(),
+                PublicOperationProgram::Close,
+            ))
+            .await
+            .expect("child close failure must normalize to outer success");
+
+        assert!(
+            replica
+                .application
+                .replicator_released_before_application_close
+                .load(Ordering::Acquire),
+            "Replicator teardown did not precede application close"
+        );
+        assert_eq!(
+            *replica.application.lifecycle_events.lock().unwrap(),
+            [
+                "application.close.begin",
+                "application.close.end",
+                "application.abort",
+            ],
+            "child failure did not trigger ordered abort containment"
+        );
+        assert_eq!(
+            replica.application.abort_calls.load(Ordering::SeqCst),
+            1,
+            "close failure must abort each child bundle exactly once"
+        );
+
+        let database = SqliteStore::metadata_database_path(&replica.root);
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let json: String = connection
+            .query_row(
+                "SELECT state_json FROM agent_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let close = &state["publicOperationPreview"]["operations"][close_id.as_str()];
+        assert_eq!(
+            close["disposition"]["kind"],
+            serde_json::Value::String("succeeded".into()),
+            "normalized outer close result was not retained as success"
+        );
+        let outcomes = close["lifecycle"]["outcomes"]
+            .as_array()
+            .expect("close lifecycle outcomes");
+        let diagnostic = outcomes
+            .iter()
+            .find(|outcome| outcome.get("CloseFailure").is_some())
+            .cloned()
+            .expect("typed close failure was not retained");
+        assert_eq!(
+            serde_json::from_value::<StoredCloseDiagnostic>(diagnostic).unwrap(),
+            StoredCloseDiagnostic::CloseFailure {
+                child: StoredCloseChild::Application,
+                error: "application error: injected application close failure".into(),
+            }
+        );
+
+        replica.stop().await;
+        replica.cleanup();
     })
     .await
     .unwrap();
@@ -3588,6 +3804,186 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         source.wait().await.unwrap();
         std::fs::remove_dir_all(source_root).unwrap();
         std::fs::remove_dir_all(target_root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let resource_uid = ResourceUid::new("preview-close-cancels-build");
+        let preview = PublicOperationPreviewIdentity::public_v1(13);
+        let mut source =
+            HostedMemoryReplica::start("close-build-source", &resource_uid, &preview, 1).await;
+        let generation = PublicProtocolGeneration::new(13);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        source.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        install_static_authority(
+            &source.handle(),
+            &preview,
+            source.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: ConfigurationDescriptor::new(
+                    epoch,
+                    source.identity.replica_id,
+                    vec![ConfigurationMember {
+                        identity: source.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    }],
+                    1,
+                ),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"snapshot-before-close"))
+                .await
+                .unwrap(),
+            1
+        );
+        source
+            .state
+            .copy_chunks
+            .lock()
+            .unwrap()
+            .push(Bytes::from_static(b"close-build-snapshot"));
+        source.state.block_copy_with_descendant();
+        let target_identity =
+            replica_named(2, "close-build-target-pod", "close-build-target-agent");
+        let build_input = PublicBuildInput {
+            attempt: OperationId::new("build-superseded-by-close"),
+            epoch,
+            replica: target_identity.clone(),
+            target_storage: storage_named(
+                target_identity,
+                "close-build-target-pod",
+                "close-build-target-pvc",
+            ),
+            process_session_id: kuberic_runtime::protocol::types::ProcessSessionId::new(
+                "close-build-target-session",
+            ),
+            replication_address: "http://127.0.0.1:1".into(),
+            history: Some(history),
+        };
+        let build_intent = intent(
+            &preview,
+            source.handle().process_session_id(),
+            4,
+            "build-superseded-by-close",
+            PublicOperationProgram::Build(build_input),
+        );
+        let copy_entered = source.state.copy_entered.notified();
+        let mut build = tokio::spawn({
+            let handle = source.handle();
+            async move { handle.execute_stateless_preview(build_intent).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = copy_entered => {}
+                result = &mut build => panic!("build root completed before held callback: {result:?}"),
+            }
+        })
+        .await
+        .expect("build root did not enter the provider copy callback");
+        assert!(!build.is_finished(), "build root was not held");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            source.state.copy_descendant_entered.notified(),
+        )
+            .await
+            .expect("provider callback descendant did not start");
+
+        let successor = tokio::spawn({
+            let handle = source.handle();
+            let preview = preview.clone();
+            async move {
+                handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        handle.process_session_id(),
+                        5,
+                        "progress-supersedes-build",
+                        PublicOperationProgram::Progress { capability: true },
+                    ))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !successor.is_finished(),
+            "successor completed before the held build descendant drained"
+        );
+        source.state.release_copy.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if source
+                    .state
+                    .cancelled_copy_descendants
+                    .load(Ordering::SeqCst)
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successor did not cancel and drain the callback descendant");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), build)
+                .await
+                .expect("superseded build root did not terminate")
+                .unwrap()
+                .is_err(),
+            "superseded build root completed successfully"
+        );
+        tokio::time::timeout(Duration::from_secs(10), successor)
+            .await
+            .expect("successor did not complete after descendant drain")
+            .unwrap()
+            .unwrap();
+        source
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                source.handle().process_session_id(),
+                6,
+                "close-after-build-supersession",
+                PublicOperationProgram::Close,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            source
+                .state
+                .copy_descendant_mutations
+                .load(Ordering::SeqCst),
+            0,
+            "cancelled callback descendant mutated state"
+        );
+        source.state.release_copy_descendant.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            source
+                .state
+                .copy_descendant_mutations
+                .load(Ordering::SeqCst),
+            0,
+            "cancelled callback descendant performed a delayed mutation after close"
+        );
+        assert!(std::net::TcpListener::bind(source.address).is_ok());
+
+        source.stop().await;
+        source.cleanup();
     })
     .await
     .unwrap();

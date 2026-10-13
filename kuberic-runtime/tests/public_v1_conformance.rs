@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 #[test]
 fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
-    kuberic_runtime::testing::assert_public_v1_conformance_subject("strict-custom");
-    kuberic_runtime::testing::assert_public_v1_conformance_subject("built-in-preview");
+    kuberic_runtime::testing::assert_public_v1_conformance_subject(
+        "strict-custom+built-in-preview",
+    );
     assert_eq!(
         kuberic_runtime::testing::public_v1_postgres_conformance_scenarios(),
         vec![
@@ -46,7 +47,7 @@ fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
 }
 
 #[test]
-fn built_in_preview_ksf_mappings_require_each_authorized_p2_observation() {
+fn built_in_preview_ksf_mappings_require_each_authorized_observation() {
     for (gate, scenarios) in [
         (
             "KSF-02",
@@ -69,6 +70,11 @@ fn built_in_preview_ksf_mappings_require_each_authorized_p2_observation() {
             ][..],
         ),
         (
+            "KSF-12",
+            &["hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close"]
+                [..],
+        ),
+        (
             "KSF-13",
             &[
                 "public_fault_reporting_closes_access_and_location_before_returning",
@@ -76,6 +82,10 @@ fn built_in_preview_ksf_mappings_require_each_authorized_p2_observation() {
                 "hosted_preview_rebuild_retires_and_restarts_fresh_replacement",
                 "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
             ][..],
+        ),
+        (
+            "KSF-14",
+            &["hosted_preview_contained_close_retains_typed_child_diagnostic"][..],
         ),
         (
             "KSF-15",

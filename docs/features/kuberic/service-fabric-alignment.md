@@ -1011,17 +1011,22 @@ Delivered work:
   `HostedPublicV1Adapter`. The controller chain validates accepted evaluator
   authority, dispatches one exact `PublicV1Operation` through the executor and
   runtime owner, then accepts only matching public report completion before
-  exact accept/retire/provision effects;
+  exact accept/retire/provision effects. Full hosted switchover/build chain
+  coverage is selected by the runtime `stateless_preview_recovery` binary;
+  controller-only selectors cover operation/evidence target fencing, removal
+  and renewal boundaries;
 - registered public-observable built-in preview scenarios for KSF-01 through
   KSF-15 in the same oracle used by strict-custom and applicable PostgreSQL
-  subjects. KSF-09 and KSF-10 retain global Phase 7 eligibility guards, and
-  KSF-16 remains Phase 7-only;
+  subjects, including focused KSF-12 callback-root/descendant cancellation and
+  KSF-14 contained-close diagnostics. KSF-09 and KSF-10 retain global Phase 7
+  eligibility guards, and KSF-16 remains Phase 7-only;
 - added real SQLite and KVStore2 fresh restart, snapshot-plus-retained build,
   divergent-history retirement, empty corrective replacement and
   post-replacement restart journeys;
-- bounded every new Phase 6 test internally at no more than 270 seconds and
-  retained the bounded real PostgreSQL smoke path for the independent custom
-  implementation.
+- bounded every new Phase 6 test internally at no more than 270 seconds. The
+  nested strict-custom and built-in-preview inventories/executions share one
+  absolute 270-second parent deadline, so the second subject cannot reset the
+  budget. The bounded real PostgreSQL smoke path remains independent.
 
 Delivered result:
 

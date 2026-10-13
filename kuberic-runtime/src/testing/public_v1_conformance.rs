@@ -66,7 +66,7 @@ fn bounded_output(
                 .map_err(|_| format!("{description} stderr reader panicked"))?
                 .map_err(|error| format!("{description} stderr read failed: {error}"))?;
             return Err(format!(
-                "{description} exceeded {CONFORMANCE_TIMEOUT:?} parent deadline \
+                "{description} exceeded the shared parent deadline \
                  (terminated with {status}):\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
@@ -335,7 +335,9 @@ const GATES: [Gate; 16] = [
             "callback_cancellation_cross_product_has_exact_root_end_and_descendant_drain",
         ],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
-        preview_scenarios: &["commit_failure_permanently_contains_the_ambiguous_suffix"],
+        preview_scenarios: &[
+            "hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close",
+        ],
         expected: "supersession contains callback roots and descendants",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -362,7 +364,7 @@ const GATES: [Gate; 16] = [
         owner: "close",
         strict_scenarios: &["contained_close_failures_preserve_typed_diagnostics_and_order"],
         postgres_scenarios: &["public_v1_postgres_contained_close"],
-        preview_scenarios: &["preview_open_owns_registration_listener_and_writer_exactly_once"],
+        preview_scenarios: &["hosted_preview_contained_close_retains_typed_child_diagnostic"],
         expected: "child diagnostics do not change normalized outer close",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -421,9 +423,9 @@ fn run_scenarios(
     subject: &str,
     packages: &[&str],
     scenarios: fn(&Gate) -> &'static [&'static str],
+    deadline: Instant,
 ) {
     let root = workspace_root();
-    let deadline = Instant::now() + CONFORMANCE_TIMEOUT;
     let filter = scenario_filter(scenarios);
     let archive = std::env::var_os("NEXTEST_ARCHIVE")
         .map(PathBuf::from)
@@ -518,25 +520,32 @@ mod bounded_process_tests {
     }
 
     #[test]
-    fn stalled_nested_conformance_child_times_out_and_reaps_process_tree() {
+    fn shared_deadline_does_not_reset_and_reaps_nested_process_tree() {
         let root = workspace_root()
             .join("target")
             .join(format!("conformance-timeout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let pid_file = root.join("descendant.pid");
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let started = Instant::now();
+        let mut first = Command::new("sh");
+        first.args(["-c", "sleep 0.25"]);
+        let first = bounded_output(&mut first, deadline, "first shared-deadline subject").unwrap();
+        assert!(first.status.success());
+
         let mut command = Command::new("sh");
         command.arg("-c").arg(format!(
             "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait",
             pid_file.display()
         ));
-        let error = bounded_output(
-            &mut command,
-            Instant::now() + Duration::from_millis(200),
-            "stalled nested conformance regression",
-        )
-        .unwrap_err();
+        let error =
+            bounded_output(&mut command, deadline, "second shared-deadline subject").unwrap_err();
         assert!(error.contains("exceeded"));
+        assert!(
+            started.elapsed() < Duration::from_millis(550),
+            "the second subject reset the shared deadline"
+        );
         let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
         let reaped = (0..100).any(|_| {
             if !process_exists(descendant) {
@@ -553,19 +562,34 @@ mod bounded_process_tests {
 
 pub fn assert_public_v1_conformance_subject(subject: &str) {
     assert!(
-        matches!(subject, "strict-custom" | "postgresql" | "built-in-preview"),
+        matches!(
+            subject,
+            "strict-custom" | "postgresql" | "built-in-preview" | "strict-custom+built-in-preview"
+        ),
         "unknown Public V1 conformance subject: {subject}"
     );
-    if subject == "strict-custom" {
-        run_scenarios("strict-custom", &["kuberic-runtime"], |gate| {
-            gate.strict_scenarios
-        });
-    } else if subject == "built-in-preview" {
-        run_scenarios(
-            "built-in-preview",
-            &["kuberic-runtime", "kuberic-controller"],
-            |gate| gate.preview_scenarios,
-        );
+    let deadline = Instant::now() + CONFORMANCE_TIMEOUT;
+    let subjects = if subject == "strict-custom+built-in-preview" {
+        &["strict-custom", "built-in-preview"][..]
+    } else {
+        std::slice::from_ref(&subject)
+    };
+    for selected in subjects {
+        if *selected == "strict-custom" {
+            run_scenarios(
+                "strict-custom",
+                &["kuberic-runtime"],
+                |gate| gate.strict_scenarios,
+                deadline,
+            );
+        } else if *selected == "built-in-preview" {
+            run_scenarios(
+                "built-in-preview",
+                &["kuberic-runtime", "kuberic-controller"],
+                |gate| gate.preview_scenarios,
+                deadline,
+            );
+        }
     }
 
     for (index, gate) in GATES.iter().enumerate() {
