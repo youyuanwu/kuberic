@@ -271,6 +271,11 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
         if !operation_matches_transition(expected, &operation.intent) {
             return Err("hosted public-v1 operation changed accepted authority".into());
         }
+        if operation.target != expected.intent.source.storage_incarnation.replica {
+            return Err(
+                "hosted public-v1 command target differs from accepted source incarnation".into(),
+            );
+        }
         self.replica(&operation.target)?
             .handle
             .execute_stateless_preview_command(command.clone())

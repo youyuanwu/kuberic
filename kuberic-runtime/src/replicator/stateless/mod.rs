@@ -28,6 +28,11 @@ use crate::replicator::{
 };
 use crate::{Result, RuntimeError};
 
+enum ReplicationSendFailure {
+    Unavailable(String),
+    Rejected(String),
+}
+
 pub struct StatelessReplicatorFactory {
     storage: Arc<dyn DurableState>,
 }
@@ -337,7 +342,9 @@ impl StatelessReplicator {
             }
             (authority, state.applied_lsn, state.committed_lsn)
         };
-        if item.committed_lsn < prior_committed || item.lsn > prior_applied.saturating_add(1) {
+        if item.lsn > prior_applied.saturating_add(1)
+            || (item.lsn > prior_applied && item.committed_lsn < prior_committed)
+        {
             return Err(Status::failed_precondition(
                 "replication progress is not contiguous",
             ));
@@ -464,13 +471,13 @@ impl StatelessReplicator {
         })
     }
 
-    async fn send_replication(
+    async fn send_replication_classified(
         &self,
         authority: &ConfigurationAuthority,
         peer: &ReplicaInformation,
         operation: &Operation,
         committed_lsn: i64,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), ReplicationSendFailure> {
         let endpoint = if peer.replication_address.starts_with("http://")
             || peer.replication_address.starts_with("https://")
         {
@@ -480,7 +487,7 @@ impl StatelessReplicator {
         };
         let mut client = proto::replication_data_client::ReplicationDataClient::connect(endpoint)
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            .map_err(|error| ReplicationSendFailure::Unavailable(error.to_string()))?;
         let item = proto::ReplicationItem {
             protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
             sender: Some(self.identity.clone().into()),
@@ -502,33 +509,42 @@ impl StatelessReplicator {
         let response = client
             .replicate(Request::new(stream::iter([item])))
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            .map_err(|error| match error.code() {
+                tonic::Code::Cancelled
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Unavailable => {
+                    ReplicationSendFailure::Unavailable(error.to_string())
+                }
+                _ => ReplicationSendFailure::Rejected(error.to_string()),
+            })?;
         let acknowledgement = response
             .into_inner()
             .next()
             .await
-            .ok_or(RuntimeError::WriteCompletionClosed)?
-            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            .ok_or_else(|| {
+                ReplicationSendFailure::Rejected("replication acknowledgement closed".into())
+            })?
+            .map_err(|error| ReplicationSendFailure::Rejected(error.to_string()))?;
         let acknowledgement_sender: ReplicaIdentity = acknowledgement
             .sender
             .clone()
-            .ok_or_else(|| RuntimeError::InvalidReplication("ACK sender is absent".into()))?
+            .ok_or_else(|| ReplicationSendFailure::Rejected("ACK sender is absent".into()))?
             .try_into()
             .map_err(|error: crate::control::WireError| {
-                RuntimeError::InvalidReplication(error.to_string())
+                ReplicationSendFailure::Rejected(error.to_string())
             })?;
         let acknowledgement_receiver: ReplicaIdentity = acknowledgement
             .receiver
             .clone()
-            .ok_or_else(|| RuntimeError::InvalidReplication("ACK receiver is absent".into()))?
+            .ok_or_else(|| ReplicationSendFailure::Rejected("ACK receiver is absent".into()))?
             .try_into()
             .map_err(|error: crate::control::WireError| {
-                RuntimeError::InvalidReplication(error.to_string())
+                ReplicationSendFailure::Rejected(error.to_string())
             })?;
         let acknowledgement_epoch: Epoch = acknowledgement
             .epoch
             .clone()
-            .ok_or_else(|| RuntimeError::InvalidReplication("ACK epoch is absent".into()))?
+            .ok_or_else(|| ReplicationSendFailure::Rejected("ACK epoch is absent".into()))?
             .into();
         if acknowledgement.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
             || acknowledgement_sender != self.identity
@@ -549,11 +565,83 @@ impl StatelessReplicator {
             || acknowledgement.applied_lsn < operation.lsn
             || acknowledgement.committed_lsn < committed_lsn
         {
-            return Err(RuntimeError::InvalidReplication(
+            return Err(ReplicationSendFailure::Rejected(
                 "stateless preview ACK changed exact authority".into(),
             ));
         }
         Ok(())
+    }
+
+    async fn send_replication(
+        &self,
+        authority: &ConfigurationAuthority,
+        peer: &ReplicaInformation,
+        operation: &Operation,
+        committed_lsn: i64,
+    ) -> Result<()> {
+        self.send_replication_classified(authority, peer, operation, committed_lsn)
+            .await
+            .map_err(|error| match error {
+                ReplicationSendFailure::Unavailable(detail)
+                | ReplicationSendFailure::Rejected(detail) => RuntimeError::Application(detail),
+            })
+    }
+
+    fn remote_rebuild_required(
+        authority: &ConfigurationAuthority,
+        peer: &ReplicaInformation,
+    ) -> RuntimeError {
+        RuntimeError::ReplicaRebuildRequired(Box::new(ReplicaRebuildRequired::RemoteBuildTarget(
+            Box::new(RemoteBuildTargetRebuildRequired {
+                reason: ReplicaRebuildReason::IncompatibleRetainedHistory,
+                epoch: authority.epoch,
+                target: peer.identity.clone(),
+                target_session: peer.process_session_id.clone(),
+            }),
+        )))
+    }
+
+    async fn verify_peer_applied_suffix(
+        &self,
+        authority: &ConfigurationAuthority,
+        peer: &ReplicaInformation,
+        committed_lsn: i64,
+        applied_lsn: i64,
+    ) -> Result<Option<i64>> {
+        let first = committed_lsn.saturating_add(1).max(1);
+        let mut retained = self
+            .storage
+            .get_replication_operations(first, applied_lsn)
+            .await
+            .map_err(|_| Self::remote_rebuild_required(authority, peer))?;
+        let mut expected = first;
+        while let Some(operation) = retained.next().await {
+            let operation =
+                operation.map_err(|_| Self::remote_rebuild_required(authority, peer))?;
+            let verified = self
+                .storage
+                .verify_applied(&operation)
+                .await
+                .map_err(|_| Self::remote_rebuild_required(authority, peer))?;
+            if operation.lsn != expected || !verified {
+                return Err(Self::remote_rebuild_required(authority, peer));
+            }
+            match self
+                .send_replication_classified(authority, peer, &operation, committed_lsn)
+                .await
+            {
+                Ok(()) => {}
+                Err(ReplicationSendFailure::Unavailable(_)) => return Ok(None),
+                Err(ReplicationSendFailure::Rejected(_)) => {
+                    return Err(Self::remote_rebuild_required(authority, peer));
+                }
+            }
+            expected = expected.saturating_add(1);
+        }
+        if expected <= applied_lsn {
+            return Err(Self::remote_rebuild_required(authority, peer));
+        }
+        Ok(Some(applied_lsn))
     }
 
     async fn catch_up_peer(
@@ -633,15 +721,29 @@ impl StatelessReplicator {
         };
         let mut peer_progress = BTreeMap::new();
         for peer in authority.peers.values() {
-            match self
-                .catch_up_peer(authority, peer, applied_lsn, committed_lsn)
-                .await
-            {
-                Ok(progress) => {
-                    peer_progress.insert(peer.identity.clone(), progress);
+            if applied_lsn > committed_lsn {
+                match self
+                    .verify_peer_applied_suffix(authority, peer, committed_lsn, applied_lsn)
+                    .await
+                {
+                    Ok(Some(progress)) => {
+                        peer_progress.insert(peer.identity.clone(), progress);
+                    }
+                    Ok(None) => {}
+                    Err(error @ RuntimeError::ReplicaRebuildRequired(_)) => return Err(error),
+                    Err(_) => {}
                 }
-                Err(error @ RuntimeError::ReplicaRebuildRequired(_)) => return Err(error),
-                Err(_) => {}
+            } else {
+                match self
+                    .catch_up_peer(authority, peer, applied_lsn, committed_lsn)
+                    .await
+                {
+                    Ok(progress) => {
+                        peer_progress.insert(peer.identity.clone(), progress);
+                    }
+                    Err(error @ RuntimeError::ReplicaRebuildRequired(_)) => return Err(error),
+                    Err(_) => {}
+                }
             }
         }
         if applied_lsn > committed_lsn {

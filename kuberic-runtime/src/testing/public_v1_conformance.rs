@@ -74,8 +74,8 @@ const GATES: [Gate; 16] = [
         ],
         postgres_scenarios: &[],
         preview_scenarios: &[
+            "public_v1_history_admission_gates_all_data_loss_outcomes",
             "static_preview_is_store_free_access_gated_and_durable_before_ack",
-            "commit_failure_permanently_contains_the_ambiguous_suffix",
         ],
         expected: "logical authorization distinguishes every callback outcome",
         eligibility: contract_gate,
@@ -134,6 +134,7 @@ const GATES: [Gate; 16] = [
         strict_scenarios: &["exact_build_is_cancelled_and_drained_before_removal_and_successor"],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         preview_scenarios: &[
+            "exact_build_is_cancelled_and_drained_before_removal_and_successor",
             "hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion",
             "hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session",
         ],
@@ -168,6 +169,8 @@ const GATES: [Gate; 16] = [
         ],
         postgres_scenarios: &["public_v1_postgres_data_loss_history_and_replay"],
         preview_scenarios: &[
+            "public_v1_history_partition_seed_is_shared",
+            "ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress",
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "numeric progress is comparable only inside one history",
@@ -230,6 +233,8 @@ const GATES: [Gate; 16] = [
         strict_scenarios: &["public_fault_reporting_closes_access_and_location_before_returning"],
         postgres_scenarios: &[],
         preview_scenarios: &[
+            "public_fault_reporting_closes_access_and_location_before_returning",
+            "hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement",
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "fault closes access and targets one exact incarnation",
@@ -257,7 +262,11 @@ const GATES: [Gate; 16] = [
         ],
         postgres_scenarios: &[],
         preview_scenarios: &[
-            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "durable_build_application_never_reinvokes_the_build_callback",
+            "public_operation_replay_matrix_converges_each_repeatable_program_family",
+            "public_v1_history_admission_gates_all_data_loss_outcomes",
+            "public_v1_replay_preserves_declared_disposition",
+            "public_v1_schema11_build_ambiguity_requires_retirement",
         ],
         expected: "journal replay preserves ambiguity and capability policy",
         eligibility: contract_gate,

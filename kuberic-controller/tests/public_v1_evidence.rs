@@ -1,26 +1,30 @@
 #![cfg(feature = "runtime-test-bridge")]
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use kuberic_controller::evaluator::test_bridge::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
-    PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState,
+    PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1OperationApi,
     PublicV1ReconciliationOutcome, PublicV1ResourceAuthority, PublicV1ResourceDisposition,
-    PublicV1ResourceProof, reconcile_public_v1_consumer,
+    PublicV1ResourceProof, execute_public_v1_operation, reconcile_public_v1_consumer,
 };
+use kuberic_runtime::protocol::command::{ProtocolCommand, PublicV1OperationCommand};
 use kuberic_runtime::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, ProviderReplicaIdentity,
-    PublicOperationPreviewIdentity, PublicOperationReplayDisposition, PublicProgress,
-    PublicProgressRole, PublicV1AcceptedOperationCompletion, PublicV1AcceptedStatus,
-    PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
-    ReplicaRebuildReason,
+    PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicOperationClass,
+    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram,
+    PublicOperationReplayDisposition, PublicProgress, PublicProgressRole,
+    PublicV1AcceptedOperationCompletion, PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
 };
 use kuberic_runtime::protocol::types::{
-    AccessStatus, AgentGeneration, ConfigurationId, Epoch, OperationId, PodUid, ProcessSessionId,
-    PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration,
-    derive_bootstrap_history, derive_history_initialization_id,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
+    Epoch, OperationId, PodUid, ProcessSessionId, PublicProtocolGeneration, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
+    ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration, derive_bootstrap_history,
+    derive_history_initialization_id,
 };
 
 fn replica(id: i64) -> ReplicaIdentity {
@@ -200,6 +204,210 @@ fn call_for(consumer: PublicV1EvidenceConsumer) -> PublicV1CallKind {
             PublicV1CallKind::Remove
         }
         PublicV1EvidenceConsumer::SessionRenewal => PublicV1CallKind::Epoch,
+    }
+}
+
+struct DispatchProbe {
+    observed: Mutex<Option<PublicV1AcceptedTransitionStatus>>,
+    dispatches: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl PublicV1OperationApi for DispatchProbe {
+    async fn observe_public_v1_operation(
+        &self,
+    ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
+        Ok(self.observed.lock().unwrap().clone())
+    }
+
+    async fn dispatch_public_v1_operation(
+        &self,
+        _expected: &PublicV1AcceptedTransitionStatus,
+        _command: &ProtocolCommand,
+    ) -> Result<(), String> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn operation_intent(
+    accepted: &PublicV1AcceptedStatus,
+    name: &str,
+    program: PublicOperationProgram,
+) -> PublicOperationIntent {
+    let class = match &program {
+        PublicOperationProgram::Swap { .. } => PublicOperationClass::PlannedSwap,
+        PublicOperationProgram::Build(build) => PublicOperationClass::Build {
+            target: build.replica.replica_id,
+        },
+        PublicOperationProgram::Remove(build) => PublicOperationClass::Remove {
+            target: build.replica.replica_id,
+        },
+        _ => PublicOperationClass::Authority,
+    };
+    PublicOperationIntent {
+        preview: accepted.identity.clone(),
+        operation_id: OperationId::new(name),
+        revision: 1,
+        process_session_id: ProcessSessionId::new("source-session"),
+        class,
+        input_digest: program.digest(),
+        replay_disposition: program.replay_disposition(),
+        lifecycle: None,
+        program: Some(program),
+    }
+}
+
+#[tokio::test]
+async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_program() {
+    let accepted = accepted();
+    let epoch = Epoch::new(0, 2);
+    let source = replica(1);
+    let target = replica(2);
+    let configuration = |epoch| PublicConfiguration {
+        current: ConfigurationDescriptor::new(
+            epoch,
+            source.replica_id,
+            vec![ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        ),
+        previous: None,
+        replicas: Vec::new(),
+    };
+    let build = |attempt: &str| PublicBuildInput {
+        attempt: OperationId::new(attempt),
+        epoch,
+        replica: target.clone(),
+        target_storage: storage(2),
+        process_session_id: ProcessSessionId::new("target-session"),
+        replication_address: "http://127.0.0.1:2".into(),
+        history: Some(accepted.history.clone()),
+    };
+    let cases = vec![
+        (
+            PublicV1CallKind::Role,
+            operation_intent(
+                &accepted,
+                "wrong-target-role",
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::Primary,
+                },
+            ),
+        ),
+        (
+            PublicV1CallKind::Epoch,
+            operation_intent(
+                &accepted,
+                "wrong-target-epoch",
+                PublicOperationProgram::Epoch { epoch },
+            ),
+        ),
+        (
+            PublicV1CallKind::Swap,
+            operation_intent(
+                &accepted,
+                "wrong-target-swap",
+                PublicOperationProgram::Swap {
+                    starting: configuration(Epoch::new(0, 1)),
+                    refreshed: configuration(epoch),
+                    epoch,
+                    handoff: ReplicaRole::None,
+                    catch_up_specific_quorum: false,
+                    mode: PublicCatchUpMode::All,
+                },
+            ),
+        ),
+        (
+            PublicV1CallKind::Build,
+            operation_intent(
+                &accepted,
+                "wrong-target-build",
+                PublicOperationProgram::Build(build("wrong-target-build")),
+            ),
+        ),
+        (
+            PublicV1CallKind::Remove,
+            operation_intent(
+                &accepted,
+                "wrong-target-remove",
+                PublicOperationProgram::Remove(build("remove-attempt")),
+            ),
+        ),
+    ];
+
+    for (call_kind, intent) in cases {
+        let (previous_configuration_id, current_configuration_id, catch_up_mode, specific) =
+            match intent.program.as_ref().unwrap() {
+                PublicOperationProgram::Swap {
+                    refreshed,
+                    mode,
+                    catch_up_specific_quorum,
+                    ..
+                } => (
+                    refreshed
+                        .previous
+                        .as_ref()
+                        .map(|previous| previous.configuration_id.clone()),
+                    Some(refreshed.current.configuration_id.clone()),
+                    Some(*mode),
+                    Some(*catch_up_specific_quorum),
+                ),
+                _ => (None, None, None, None),
+            };
+        let expected = PublicV1AcceptedTransitionStatus {
+            resource_version: "target-fence-rv".into(),
+            evidence: accepted.clone(),
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: match call_kind {
+                    PublicV1CallKind::Build => PublicV1EvidenceConsumer::ScaleUp,
+                    PublicV1CallKind::Remove => PublicV1EvidenceConsumer::Removal,
+                    PublicV1CallKind::Swap => PublicV1EvidenceConsumer::Switchover,
+                    _ => PublicV1EvidenceConsumer::SessionRenewal,
+                },
+                operation_id: intent.operation_id.clone(),
+                revision: intent.revision,
+                call_kind,
+                history: accepted.history.clone(),
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: storage(1),
+                    resource_version: "source-rv-1".into(),
+                },
+                target: matches!(
+                    call_kind,
+                    PublicV1CallKind::Build | PublicV1CallKind::Remove
+                )
+                .then(|| PublicV1ResourceAuthority {
+                    storage_incarnation: storage(2),
+                    resource_version: "target-rv-1".into(),
+                }),
+                process_session_id: intent.process_session_id.clone(),
+                input_digest: intent.input_digest.clone(),
+                replay_disposition: intent.replay_disposition,
+                previous_configuration_id,
+                current_configuration_id,
+                catch_up_mode,
+                catch_up_specific_quorum: specific,
+            },
+        };
+        let probe = DispatchProbe {
+            observed: Mutex::new(Some(expected.clone())),
+            dispatches: AtomicUsize::new(0),
+        };
+        let command = ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+            target: target.clone(),
+            intent,
+        }));
+
+        let error = execute_public_v1_operation(&probe, &expected, command)
+            .await
+            .unwrap_err();
+        assert!(error.contains("target differs from accepted source incarnation"));
+        assert_eq!(probe.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(*probe.observed.lock().unwrap(), Some(expected));
     }
 }
 

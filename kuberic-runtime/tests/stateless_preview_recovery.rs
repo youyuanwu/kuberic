@@ -1,5 +1,7 @@
 #![cfg(feature = "testing")]
 
+// Hosted Public V1 preview lifecycle and recovery journeys.
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,8 +13,9 @@ use futures::{StreamExt, stream};
 use kuberic_controller::evaluator::test_bridge::{
     HostedPreviewReplica, HostedPublicV1Adapter, PublicV1AcceptedTransitionIntent,
     PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer, PublicV1EvidenceResource,
-    PublicV1EvidenceState, PublicV1ResourceAuthority, PublicV1ResourceDisposition,
-    PublicV1ResourceProof, execute_public_v1_operation, reconcile_public_v1_consumer,
+    PublicV1EvidenceState, PublicV1OperationApi, PublicV1ResourceAuthority,
+    PublicV1ResourceDisposition, PublicV1ResourceProof, execute_public_v1_operation,
+    reconcile_public_v1_consumer,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationProgress, OpenContext, Operation, OperationDataStream, RoleChange,
@@ -143,6 +146,7 @@ struct MemoryState {
     fail_commit: AtomicBool,
     block_copy: AtomicBool,
     data_loss_changed: AtomicBool,
+    fail_data_loss: AtomicBool,
     commit_entered: Notify,
     release_commit: Notify,
     copy_entered: Notify,
@@ -164,6 +168,10 @@ impl MemoryState {
 
     fn change_on_data_loss(&self) {
         self.data_loss_changed.store(true, Ordering::Release);
+    }
+
+    fn fail_next_data_loss(&self) {
+        self.fail_data_loss.store(true, Ordering::Release);
     }
 }
 
@@ -202,6 +210,11 @@ impl StateProvider for MemoryState {
     }
 
     async fn on_data_loss(&self) -> Result<bool> {
+        if self.fail_data_loss.swap(false, Ordering::AcqRel) {
+            return Err(RuntimeError::Application(
+                "injected data-loss callback failure".into(),
+            ));
+        }
         Ok(self.data_loss_changed.swap(false, Ordering::AcqRel))
     }
 }
@@ -442,6 +455,18 @@ impl PreviewApplication {
             .as_ref()
             .ok_or(RuntimeError::NotPrimary)?
             .on_data_loss()
+            .await
+    }
+
+    async fn wait_for_write_quorum(&self) -> Result<()> {
+        self.primary
+            .read()
+            .await
+            .as_ref()
+            .ok_or(RuntimeError::NotPrimary)?
+            .wait_for_catch_up_quorum(
+                kuberic_runtime::replicator::ReplicaSetQuorumMode::WriteQuorum,
+            )
             .await
     }
 }
@@ -898,8 +923,11 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
         storage.release_commit.notify_waiters();
         assert_eq!(write.await.unwrap().unwrap(), 1);
         assert_eq!(storage.progress.lock().unwrap().committed_lsn, 1);
+        assert!(!application.on_data_loss().await.unwrap());
         storage.change_on_data_loss();
         assert!(application.on_data_loss().await.unwrap());
+        storage.fail_next_data_loss();
+        assert!(application.on_data_loss().await.is_err());
         assert!(
             application
                 .replicate(Bytes::from_static(b"requires-history-readmission"))
@@ -1610,6 +1638,11 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         assert_eq!(secondary_state.progress.lock().unwrap().applied_lsn, 1);
         assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 0);
         let applied_only = secondary_handle.stateless_preview_report().await.unwrap();
+        assert_eq!(
+            applied_only.progress.role,
+            kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery
+        );
+        assert_eq!(applied_only.history, history);
         assert_eq!(applied_only.progress.first, 0);
         assert_eq!(applied_only.progress.last, 1);
         assert_eq!(
@@ -1621,6 +1654,11 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
         assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 1);
         let committed = secondary_handle.stateless_preview_report().await.unwrap();
+        assert_eq!(
+            committed.progress.role,
+            kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary
+        );
+        assert_eq!(committed.history, history);
         assert_eq!(committed.progress.first, 1);
         assert_eq!(committed.progress.last, 1);
         assert_eq!(
@@ -1859,8 +1897,32 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         .unwrap();
         let command = ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
             target: primary_identity.clone(),
-            intent: switchover,
+            intent: switchover.clone(),
         }));
+        let wrong_target =
+            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+                target: secondary_identity.clone(),
+                intent: switchover,
+            }));
+        let error = PublicV1OperationApi::dispatch_public_v1_operation(
+            &adapter,
+            &transition,
+            &wrong_target,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("target differs from accepted source incarnation"));
+        assert!(adapter.dispatched().is_empty());
+        assert!(evidence.effects().is_empty());
+        assert!(
+            adapter
+                .report(&primary_identity)
+                .await
+                .unwrap()
+                .completed_operations
+                .iter()
+                .all(|completion| completion.operation_id != transition.intent.operation_id)
+        );
         execute_public_v1_operation(&adapter, &transition, command)
             .await
             .unwrap();
@@ -2711,6 +2773,348 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         source.wait().await.unwrap();
         std::fs::remove_dir_all(source_root).unwrap();
         std::fs::remove_dir_all(target_root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress() {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        for (case, divergent, unavailable, unverifiable) in [
+            ("identical", false, false, false),
+            ("divergent", true, false, false),
+            ("unavailable", false, true, false),
+            ("unverifiable", false, false, true),
+        ] {
+            let resource_uid = ResourceUid::new(format!("suffix-{case}"));
+            let preview = PublicOperationPreviewIdentity::public_v1(12);
+            let binding = PreviewLifecycleBinding {
+                preview: preview.clone(),
+                resource_uid: resource_uid.clone(),
+                spec_generation: 1,
+                state_persistence: StatePersistence::Persisted,
+            };
+            let primary_identity = replica_named(
+                1,
+                &format!("{case}-primary-pod"),
+                &format!("{case}-primary-agent"),
+            );
+            let secondary_identity = replica_named(
+                2,
+                &format!("{case}-secondary-pod"),
+                &format!("{case}-secondary-agent"),
+            );
+            let primary_root = test_root(&format!("{case}-suffix-primary"));
+            let secondary_root = test_root(&format!("{case}-suffix-secondary"));
+            for (root, identity, pod, pvc) in [
+                (
+                    &primary_root,
+                    primary_identity.clone(),
+                    format!("{case}-primary-pod"),
+                    format!("{case}-primary-pvc"),
+                ),
+                (
+                    &secondary_root,
+                    secondary_identity.clone(),
+                    format!("{case}-secondary-pod"),
+                    format!("{case}-secondary-pvc"),
+                ),
+            ] {
+                drop(
+                    SqliteStore::create_public_v1(
+                        SqliteStore::metadata_database_path(root),
+                        preview.clone(),
+                        store_identity_named(
+                            resource_uid.clone(),
+                            identity,
+                            pod.as_str(),
+                            pvc.as_str(),
+                        ),
+                    )
+                    .unwrap(),
+                );
+            }
+            let primary_address = free_address();
+            let secondary_address = free_address();
+            let primary_state = Arc::new(MemoryState::default());
+            let secondary_state = Arc::new(MemoryState::default());
+            let primary_app = Arc::new(PreviewApplication::new(
+                primary_state.clone(),
+                format!("http://{primary_address}"),
+            ));
+            let mut primary = ReplicaHost::new(
+                ReplicaProcessConfig {
+                    resource_uid: resource_uid.clone(),
+                    replica_id: ReplicaId::new(1),
+                    pod_uid: PodUid::new(format!("{case}-primary-pod")),
+                    pvc_uid: PvcUid::new(format!("{case}-primary-pvc")),
+                    data_root: primary_root.clone(),
+                    control_address: free_address(),
+                    replication_address: primary_address,
+                    bearer_token: "preview-token".into(),
+                    rpc_deadline: Duration::from_secs(2),
+                    transport_window_capacity: 8,
+                },
+                primary_app.clone(),
+                ApplicationStorageState::FreshEmpty,
+                Arc::new(Resolver),
+            )
+            .with_stateless_preview(binding.clone())
+            .start()
+            .await
+            .unwrap();
+            let mut secondary = ReplicaHost::new(
+                ReplicaProcessConfig {
+                    resource_uid: resource_uid.clone(),
+                    replica_id: ReplicaId::new(2),
+                    pod_uid: PodUid::new(format!("{case}-secondary-pod")),
+                    pvc_uid: PvcUid::new(format!("{case}-secondary-pvc")),
+                    data_root: secondary_root.clone(),
+                    control_address: free_address(),
+                    replication_address: secondary_address,
+                    bearer_token: "preview-token".into(),
+                    rpc_deadline: Duration::from_secs(2),
+                    transport_window_capacity: 8,
+                },
+                Arc::new(PreviewApplication::new(
+                    secondary_state.clone(),
+                    format!("http://{secondary_address}"),
+                )),
+                ApplicationStorageState::FreshEmpty,
+                Arc::new(Resolver),
+            )
+            .with_stateless_preview(binding)
+            .start()
+            .await
+            .unwrap();
+            let primary_handle = primary.handle();
+            let secondary_handle = secondary.handle();
+            let initialization =
+                derive_history_initialization_id(&resource_uid, PublicProtocolGeneration::new(12));
+            let history = derive_bootstrap_history(
+                &resource_uid,
+                PublicProtocolGeneration::new(12),
+                &initialization,
+            );
+            for (handle, identity, pod, pvc) in [
+                (
+                    &primary_handle,
+                    primary_identity.clone(),
+                    format!("{case}-primary-pod"),
+                    format!("{case}-primary-pvc"),
+                ),
+                (
+                    &secondary_handle,
+                    secondary_identity.clone(),
+                    format!("{case}-secondary-pod"),
+                    format!("{case}-secondary-pvc"),
+                ),
+            ] {
+                handle
+                    .initialize_stateless_preview_history(
+                        &initialization,
+                        &history,
+                        &storage_named(identity, pod.as_str(), pvc.as_str()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let epoch = Epoch::new(0, 1);
+            let descriptor = ConfigurationDescriptor::new(
+                epoch,
+                ReplicaId::new(1),
+                vec![
+                    ConfigurationMember {
+                        identity: primary_identity.clone(),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: secondary_identity.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                    },
+                ],
+                2,
+            );
+            install_static_authority(
+                &primary_handle,
+                &preview,
+                primary_identity.clone(),
+                ReplicaRole::Primary,
+                epoch,
+                PublicConfiguration {
+                    current: descriptor.clone(),
+                    previous: None,
+                    replicas: vec![PublicReplicaDescriptor {
+                        build_id: OperationId::default(),
+                        identity: secondary_identity.clone(),
+                        replication_address: format!("http://{secondary_address}"),
+                        process_session_id: secondary_handle.process_session_id(),
+                        role: ReplicaRole::ActiveSecondary,
+                        current_progress: 0,
+                        catch_up_capability: 0,
+                        must_catchup: true,
+                    }],
+                },
+            )
+            .await;
+            install_static_authority(
+                &secondary_handle,
+                &preview,
+                secondary_identity.clone(),
+                ReplicaRole::ActiveSecondary,
+                epoch,
+                PublicConfiguration {
+                    current: descriptor.clone(),
+                    previous: None,
+                    replicas: vec![PublicReplicaDescriptor {
+                        build_id: OperationId::default(),
+                        identity: primary_identity.clone(),
+                        replication_address: format!("http://{primary_address}"),
+                        process_session_id: primary_handle.process_session_id(),
+                        role: ReplicaRole::Primary,
+                        current_progress: 0,
+                        catch_up_capability: 0,
+                        must_catchup: false,
+                    }],
+                },
+            )
+            .await;
+            assert_eq!(
+                primary_app
+                    .replicate(Bytes::from_static(b"committed"))
+                    .await
+                    .unwrap(),
+                1
+            );
+            primary_state.fail_next_commit();
+            assert!(
+                primary_app
+                    .replicate(Bytes::from_static(b"ambiguous"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                *primary_state.progress.lock().unwrap(),
+                DurableApplicationProgress {
+                    applied_lsn: 2,
+                    committed_lsn: 1,
+                }
+            );
+            secondary_state
+                .apply(Operation {
+                    lsn: 3,
+                    committed_lsn: 2,
+                    data: Bytes::from_static(b"peer-higher-progress"),
+                })
+                .await
+                .unwrap();
+            secondary_state.commit(3).await.unwrap();
+            if divergent {
+                secondary_state
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|operation| operation.lsn == 2)
+                    .unwrap()
+                    .data = Bytes::from_static(b"divergent");
+            }
+            if unverifiable {
+                primary_state
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .retain(|operation| operation.lsn != 2);
+            }
+            if unavailable {
+                secondary.shutdown();
+                secondary.wait().await.unwrap();
+            }
+            primary_handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    primary_handle.process_session_id(),
+                    5,
+                    &format!("advertise-higher-{case}"),
+                    PublicOperationProgram::Configuration(PublicConfiguration {
+                        current: descriptor,
+                        previous: None,
+                        replicas: vec![PublicReplicaDescriptor {
+                            build_id: OperationId::default(),
+                            identity: secondary_identity.clone(),
+                            replication_address: format!("http://{secondary_address}"),
+                            process_session_id: secondary_handle.process_session_id(),
+                            role: ReplicaRole::ActiveSecondary,
+                            current_progress: 99,
+                            catch_up_capability: 99,
+                            must_catchup: true,
+                        }],
+                    }),
+                ))
+                .await
+                .unwrap();
+            let settlement = primary_app.wait_for_write_quorum().await;
+            let report = primary_handle.stateless_preview_report().await.unwrap();
+            if divergent || unverifiable {
+                assert!(matches!(
+                    settlement,
+                    Err(RuntimeError::ReplicaRebuildRequired(rebuild))
+                        if matches!(
+                            rebuild.as_ref(),
+                            kuberic_runtime::protocol::public_operations::
+                                ReplicaRebuildRequired::RemoteBuildTarget(target)
+                                if target.target == secondary_identity
+                                    && target.reason
+                                        == kuberic_runtime::protocol::public_operations::
+                                            ReplicaRebuildReason::IncompatibleRetainedHistory
+                        )
+                ));
+                assert_eq!(
+                    report.write_status,
+                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+                );
+                assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
+            } else if unavailable {
+                assert!(matches!(
+                    settlement,
+                    Err(RuntimeError::ReconfigurationPending)
+                ));
+                assert_eq!(
+                    report.write_status,
+                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+                );
+                assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
+            } else {
+                settlement.unwrap();
+                assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 2);
+                assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 3);
+                primary_handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        primary_handle.process_session_id(),
+                        6,
+                        "refresh-settled-progress",
+                        PublicOperationProgram::Progress { capability: false },
+                    ))
+                    .await
+                    .unwrap();
+                let report = primary_handle.stateless_preview_report().await.unwrap();
+                assert_eq!(
+                    report.write_status,
+                    kuberic_runtime::protocol::types::AccessStatus::Granted
+                );
+            }
+
+            primary.shutdown();
+            primary.wait().await.unwrap();
+            if !unavailable {
+                secondary.shutdown();
+                secondary.wait().await.unwrap();
+            }
+            std::fs::remove_dir_all(primary_root).unwrap();
+            std::fs::remove_dir_all(secondary_root).unwrap();
+        }
     })
     .await
     .unwrap();

@@ -162,6 +162,9 @@ pub async fn execute_public_v1_operation(
     ) {
         return Err("public-v1 operation differs from accepted transition".into());
     }
+    if operation.target != expected.intent.source.storage_incarnation.replica {
+        return Err("public-v1 command target differs from accepted source incarnation".into());
+    }
     api.dispatch_public_v1_operation(expected, &command).await
 }
 
