@@ -949,6 +949,137 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn execute_stateless_preview_command(
+        &self,
+        command: crate::protocol::command::ProtocolCommand,
+    ) -> Result<()> {
+        let crate::protocol::command::ProtocolCommand::PublicV1Operation(command) = command else {
+            return Err(crate::host::HostError::CommandRejected(
+                "stateless preview operation dispatcher received another command".into(),
+            ));
+        };
+        command
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        let state = self.store.load_state().await?;
+        if command.target != state.identity.local_identity {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "public-v1 operation command targets another replica".into(),
+            ));
+        }
+        self.execute_stateless_preview(command.intent).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn fence_stateless_preview_access(&self) {
+        self.runtime.fence_stateless_preview_access().await;
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn stateless_preview_process_endpoint(
+        &self,
+        role: crate::protocol::types::ReplicaRole,
+    ) -> Result<crate::protocol::types::ProcessSessionEndpoint> {
+        let state = self.store.load_state().await?;
+        let preview = state.public_operation_preview.ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "stateless preview process endpoint requires schema-11 state".into(),
+            )
+        })?;
+        Ok(crate::protocol::types::ProcessSessionEndpoint {
+            identity: state.identity.local_identity,
+            process_session_id: self.process_session_id(),
+            replicator_creation_id: self.runtime.stateless_preview_replicator_creation_id()?,
+            role,
+            storage_incarnation: preview.storage_incarnation.ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview process endpoint lacks storage authority".into(),
+                )
+            })?,
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn authorize_stateless_preview_session_renewal(
+        &self,
+        required: crate::protocol::public_operations::ProcessSessionRenewalRequired,
+    ) -> Result<crate::protocol::public_operations::PublicV1SessionRenewalStatus> {
+        use crate::protocol::public_operations::PublicV1SessionRenewalStatus;
+
+        let mut current = PublicV1SessionRenewalStatus::required(required)
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.store
+            .persist_public_v1_session_renewal(None, &current)
+            .await?;
+        for next in [
+            current.close_access(),
+            current
+                .close_access()
+                .and_then(|status| status.freeze_surviving_set()),
+            current
+                .close_access()
+                .and_then(|status| status.freeze_surviving_set())
+                .and_then(|status| status.begin_epoch_barriers()),
+        ] {
+            let next =
+                next.map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        for survivor in current
+            .barriers
+            .iter()
+            .filter(|barrier| {
+                barrier.stage
+                    == crate::protocol::public_operations::PublicSessionEpochBarrierStage::Pending
+            })
+            .map(|barrier| barrier.survivor.clone())
+            .collect::<Vec<_>>()
+        {
+            let next = current
+                .record_epoch_updated(&survivor, current.required.renewal_epoch)
+                .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        if current.stage
+            == crate::protocol::public_operations::PublicSessionRenewalStage::EpochBarriersPending
+        {
+            let next = current
+                .finish_epoch_barriers()
+                .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        if let Some(replacement) = current.required.replacement.clone() {
+            let next = current
+                .replay_replacement_role(
+                    &replacement.process_session_id,
+                    current.required.renewal_epoch,
+                    current.required.predecessor.role,
+                )
+                .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        let next = current
+            .install_fresh_configuration(&current.required.fresh_configuration)
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.store
+            .persist_public_v1_session_renewal(Some(&current), &next)
+            .await?;
+        Ok(next)
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn stateless_preview_report(
         &self,
     ) -> Result<crate::protocol::public_operations::PublicV1AgentReport> {

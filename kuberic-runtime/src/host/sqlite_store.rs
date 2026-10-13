@@ -1985,11 +1985,37 @@ impl AgentStore for SqliteStore {
 
             let mut exact_blockers = std::collections::BTreeSet::new();
             if !intent.class.is_terminal()
-                && preview.operations.values().any(|record| record.intent.process_session_id != intent.process_session_id)
+                && preview
+                    .operations
+                    .values()
+                    .any(|record| record.intent.process_session_id != intent.process_session_id)
             {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "fresh session cannot resume predecessor public operations".into(),
-                ));
+                let renewal_authorized = preview.session_renewal.as_ref().is_some_and(|renewal| {
+                    renewal.stage
+                        == crate::protocol::public_operations::PublicSessionRenewalStage::Authorized
+                        && renewal
+                            .required
+                            .replacement
+                            .as_ref()
+                            .is_some_and(|replacement| {
+                                replacement.identity == state.identity.local_identity
+                                    && replacement.process_session_id == intent.process_session_id
+                            })
+                        && preview
+                            .history
+                            .as_ref()
+                            .is_some_and(|history| renewal.required.history == *history)
+                });
+                if !renewal_authorized {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "fresh session cannot resume predecessor public operations".into(),
+                    ));
+                }
+                preview.operations.clear();
+                preview.current_operation = None;
+                preview.current_topology_operation = None;
+                preview.active_builds.clear();
+                preview.writes_revoked = false;
             }
             if !intent.class.is_terminal() && !preview.history_barriers.is_empty() {
                 return Err(crate::host::HostError::CommandRejected(

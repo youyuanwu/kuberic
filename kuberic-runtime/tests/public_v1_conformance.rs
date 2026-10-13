@@ -3,6 +3,7 @@ use std::path::PathBuf;
 #[test]
 fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
     kuberic_runtime::testing::assert_public_v1_conformance_subject("strict-custom");
+    kuberic_runtime::testing::assert_public_v1_conformance_subject("built-in-preview");
     assert_eq!(
         kuberic_runtime::testing::public_v1_postgres_conformance_scenarios(),
         vec![

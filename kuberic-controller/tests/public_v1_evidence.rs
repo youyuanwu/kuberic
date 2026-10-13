@@ -311,13 +311,13 @@ async fn concurrent_accept_reconciliation_commits_one_exact_effect() {
 }
 
 #[tokio::test]
-async fn lost_retirement_response_is_idempotent_and_retires_exact_target() {
+async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session() {
     let accepted = accepted();
     let completion = completion(
         &accepted,
         "retire-target-once",
-        PublicV1CallKind::Build,
-        PublicV1OperationResult::Failed("target build failed".into()),
+        PublicV1CallKind::Remove,
+        PublicV1OperationResult::Failed("exact removal requires retirement".into()),
     );
     let report = report(&accepted, completion.clone());
     let target = PublicV1ResourceAuthority {
@@ -328,7 +328,7 @@ async fn lost_retirement_response_is_idempotent_and_retires_exact_target() {
         &accepted,
         transition(
             accepted.clone(),
-            PublicV1EvidenceConsumer::RepairReplacement,
+            PublicV1EvidenceConsumer::Removal,
             &completion,
             Some(target),
         ),

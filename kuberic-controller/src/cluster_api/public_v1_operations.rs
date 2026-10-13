@@ -1,0 +1,590 @@
+use std::sync::{Arc, Mutex};
+
+use kuberic_runtime::host::ReplicaHandle;
+use kuberic_runtime::protocol::command::{
+    ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
+};
+use kuberic_runtime::protocol::public_operations::{
+    PublicConfiguration, PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+    PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1SessionRenewalStatus,
+};
+use kuberic_runtime::protocol::types::{OperationId, ReplicaIdentity};
+
+use super::{
+    PublicV1EvidenceApi, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1SessionRenewalApi,
+};
+use crate::evaluator::public_v1_evidence::{
+    PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
+};
+
+#[async_trait::async_trait]
+pub trait PublicV1OperationApi: Send + Sync {
+    async fn observe_public_v1_operation(
+        &self,
+    ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String>;
+
+    async fn dispatch_public_v1_operation(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+        command: &ProtocolCommand,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct HostedPreviewReplica {
+    pub identity: ReplicaIdentity,
+    pub replication_address: String,
+    pub handle: ReplicaHandle,
+}
+
+pub struct HostedPublicV1Adapter {
+    replicas: Vec<HostedPreviewReplica>,
+    history: Mutex<Option<PublicV1AcceptedStatus>>,
+    renewal: Mutex<Option<PublicV1SessionRenewalStatus>>,
+    evidence: Arc<PublicV1EvidenceState>,
+    dispatched: Mutex<Vec<ProtocolCommand>>,
+}
+
+impl HostedPublicV1Adapter {
+    pub fn new(
+        replicas: Vec<HostedPreviewReplica>,
+        history: Option<PublicV1AcceptedStatus>,
+        renewal: Option<PublicV1SessionRenewalStatus>,
+        evidence: Arc<PublicV1EvidenceState>,
+    ) -> Result<Self, String> {
+        if replicas.is_empty() {
+            return Err("hosted public-v1 adapter requires at least one replica".into());
+        }
+        for (index, replica) in replicas.iter().enumerate() {
+            if replica.replication_address.is_empty()
+                || replicas[..index]
+                    .iter()
+                    .any(|existing| existing.identity == replica.identity)
+            {
+                return Err("hosted public-v1 adapter contains an invalid replica".into());
+            }
+        }
+        if let Some(history) = &history {
+            history.validate_evidence().map_err(str::to_owned)?;
+        }
+        if let Some(renewal) = &renewal {
+            renewal.validate().map_err(str::to_owned)?;
+        }
+        Ok(Self {
+            replicas,
+            history: Mutex::new(history),
+            renewal: Mutex::new(renewal),
+            evidence,
+            dispatched: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn dispatched(&self) -> Vec<ProtocolCommand> {
+        self.dispatched.lock().unwrap().clone()
+    }
+
+    pub async fn report(&self, identity: &ReplicaIdentity) -> Result<PublicV1AgentReport, String> {
+        self.replica(identity)?
+            .handle
+            .stateless_preview_report()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn replica(&self, identity: &ReplicaIdentity) -> Result<&HostedPreviewReplica, String> {
+        self.replicas
+            .iter()
+            .find(|replica| &replica.identity == identity)
+            .ok_or_else(|| "hosted public-v1 command targets an unknown replica".to_string())
+    }
+
+    async fn dispatch_session(
+        &self,
+        command: &PublicV1SessionRenewalCommand,
+    ) -> Result<(), String> {
+        command.validate().map_err(str::to_owned)?;
+        match command {
+            PublicV1SessionRenewalCommand::CloseAccessAndIngress { accepted } => {
+                self.replica(&accepted.required.predecessor.identity)?
+                    .handle
+                    .fence_stateless_preview_access()
+                    .await;
+            }
+            PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+                accepted,
+                survivor,
+                epoch,
+            } => {
+                let program = PublicOperationProgram::Epoch { epoch: *epoch };
+                self.replica(&survivor.identity)?
+                    .handle
+                    .execute_stateless_preview(PublicOperationIntent {
+                        preview: kuberic_runtime::protocol::public_operations::
+                            PublicOperationPreviewIdentity::public_v1(
+                                accepted.required.history.protocol_generation.value(),
+                            ),
+                        operation_id: OperationId::new(format!(
+                            "{}-barrier-{}",
+                            accepted.required.operation_id, survivor.identity.replica_id
+                        )),
+                        revision: 1,
+                        process_session_id: survivor.process_session_id.clone(),
+                        class: PublicOperationClass::Authority,
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                accepted,
+                process_session_id,
+                epoch,
+                role,
+            } => {
+                let replacement = accepted
+                    .required
+                    .replacement
+                    .as_ref()
+                    .ok_or_else(|| "session renewal lacks a replacement".to_string())?;
+                let program = PublicOperationProgram::Role {
+                    epoch: *epoch,
+                    role: *role,
+                };
+                self.replica(&replacement.identity)?
+                    .handle
+                    .execute_stateless_preview(PublicOperationIntent {
+                        preview: kuberic_runtime::protocol::public_operations::
+                            PublicOperationPreviewIdentity::public_v1(
+                                accepted.required.history.protocol_generation.value(),
+                            ),
+                        operation_id: OperationId::new(format!(
+                            "{}-role",
+                            accepted.required.operation_id
+                        )),
+                        revision: 1,
+                        process_session_id: process_session_id.clone(),
+                        class: PublicOperationClass::Authority,
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1SessionRenewalCommand::InstallFreshConfiguration {
+                accepted,
+                configuration,
+            } => {
+                let local = configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == configuration.primary_id)
+                    .ok_or_else(|| "fresh configuration lacks a primary".to_string())?;
+                let local_replica = self.replica(&local.identity)?;
+                let mut descriptors = Vec::new();
+                for member in configuration
+                    .members
+                    .iter()
+                    .filter(|member| member.identity != local.identity)
+                {
+                    let remote = self.replica(&member.identity)?;
+                    let report = remote
+                        .handle
+                        .stateless_preview_report()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    descriptors.push(
+                        kuberic_runtime::protocol::public_operations::PublicReplicaDescriptor {
+                            build_id: OperationId::default(),
+                            identity: member.identity.clone(),
+                            replication_address: remote.replication_address.clone(),
+                            process_session_id: report.process_session_id,
+                            role: member.role,
+                            current_progress: report.progress.last,
+                            catch_up_capability: report.progress.first,
+                            must_catchup: false,
+                        },
+                    );
+                }
+                let program = PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: configuration.clone(),
+                    previous: None,
+                    replicas: descriptors,
+                });
+                local_replica
+                    .handle
+                    .execute_stateless_preview(PublicOperationIntent {
+                        preview: kuberic_runtime::protocol::public_operations::
+                            PublicOperationPreviewIdentity::public_v1(
+                                accepted.required.history.protocol_generation.value(),
+                            ),
+                        operation_id: OperationId::new(format!(
+                            "{}-configuration",
+                            accepted.required.operation_id
+                        )),
+                        revision: 1,
+                        process_session_id: local_replica.handle.process_session_id(),
+                        class: PublicOperationClass::Authority,
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PublicV1OperationApi for HostedPublicV1Adapter {
+    async fn observe_public_v1_operation(
+        &self,
+    ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
+        self.evidence.observe_public_v1_evidence_status().await
+    }
+
+    async fn dispatch_public_v1_operation(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+        command: &ProtocolCommand,
+    ) -> Result<(), String> {
+        if self
+            .evidence
+            .observe_public_v1_evidence_status()
+            .await?
+            .as_ref()
+            != Some(expected)
+        {
+            return Err("stale hosted public-v1 operation authority".into());
+        }
+        let ProtocolCommand::PublicV1Operation(operation) = command else {
+            return Err("hosted public-v1 adapter received another operation command".into());
+        };
+        operation.validate().map_err(str::to_owned)?;
+        if !operation_matches_transition(expected, &operation.intent) {
+            return Err("hosted public-v1 operation changed accepted authority".into());
+        }
+        self.replica(&operation.target)?
+            .handle
+            .execute_stateless_preview_command(command.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        self.dispatched.lock().unwrap().push(command.clone());
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PublicV1HistoryApi for HostedPublicV1Adapter {
+    async fn observe_public_v1_status(&self) -> Result<Option<PublicV1AcceptedStatus>, String> {
+        Ok(self.history.lock().unwrap().clone())
+    }
+
+    async fn persist_public_v1_status(
+        &self,
+        expected: Option<&PublicV1AcceptedStatus>,
+        next: &PublicV1AcceptedStatus,
+    ) -> Result<(), String> {
+        next.validate_evidence().map_err(str::to_owned)?;
+        let mut current = self.history.lock().unwrap();
+        if current.as_ref() != expected {
+            return Err("stale hosted public-v1 history status".into());
+        }
+        *current = Some(next.clone());
+        Ok(())
+    }
+
+    async fn dispatch_public_v1_history(
+        &self,
+        expected: &PublicV1AcceptedStatus,
+        command: &ProtocolCommand,
+    ) -> Result<(), String> {
+        if self.history.lock().unwrap().as_ref() != Some(expected) {
+            return Err("stale hosted public-v1 history dispatch".into());
+        }
+        let ProtocolCommand::PublicV1History(public_command) = command else {
+            return Err("hosted public-v1 history received another command".into());
+        };
+        public_command.validate().map_err(str::to_owned)?;
+        let replica = self.replica(public_command.target())?;
+        match public_command.as_ref() {
+            PublicV1HistoryCommand::Initialize {
+                accepted, storage, ..
+            } => {
+                replica
+                    .handle
+                    .initialize_stateless_preview_history(
+                        &accepted.history_initialization_id,
+                        &accepted.history,
+                        storage,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::Recover { intent, .. } => {
+                replica
+                    .handle
+                    .execute_stateless_preview(intent.as_ref().clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::SessionRenewal(_) => {
+                return Err("session-renewal command used the history API".into());
+            }
+        }
+        self.dispatched.lock().unwrap().push(command.clone());
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
+    async fn observe_public_v1_session_renewal(
+        &self,
+    ) -> Result<Option<PublicV1SessionRenewalStatus>, String> {
+        Ok(self.renewal.lock().unwrap().clone())
+    }
+
+    async fn persist_public_v1_session_renewal(
+        &self,
+        expected: Option<&PublicV1SessionRenewalStatus>,
+        next: &PublicV1SessionRenewalStatus,
+    ) -> Result<(), String> {
+        next.validate().map_err(str::to_owned)?;
+        let mut current = self.renewal.lock().unwrap();
+        if current.as_ref() != expected {
+            return Err("stale hosted public-v1 session-renewal status".into());
+        }
+        *current = Some(next.clone());
+        Ok(())
+    }
+
+    async fn dispatch_public_v1_session_renewal(
+        &self,
+        expected: &PublicV1SessionRenewalStatus,
+        command: &ProtocolCommand,
+    ) -> Result<(), String> {
+        if self.renewal.lock().unwrap().as_ref() != Some(expected) {
+            return Err("stale hosted public-v1 session-renewal dispatch".into());
+        }
+        let ProtocolCommand::PublicV1History(public_command) = command else {
+            return Err("hosted session renewal received another command".into());
+        };
+        let PublicV1HistoryCommand::SessionRenewal(renewal_command) = public_command.as_ref()
+        else {
+            return Err("hosted session renewal received a history command".into());
+        };
+        if renewal_command.accepted() != expected {
+            return Err("hosted session renewal changed accepted authority".into());
+        }
+        self.dispatch_session(renewal_command).await?;
+        let next = match renewal_command.as_ref() {
+            PublicV1SessionRenewalCommand::CloseAccessAndIngress { accepted } => {
+                accepted.close_access()
+            }
+            PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+                accepted,
+                survivor,
+                epoch,
+            } => accepted.record_epoch_updated(survivor, *epoch),
+            PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                accepted,
+                process_session_id,
+                epoch,
+                role,
+            } => accepted.replay_replacement_role(process_session_id, *epoch, *role),
+            PublicV1SessionRenewalCommand::InstallFreshConfiguration {
+                accepted,
+                configuration,
+            } => accepted.install_fresh_configuration(configuration),
+        }
+        .map_err(str::to_owned)?;
+        *self.renewal.lock().unwrap() = Some(next);
+        self.dispatched.lock().unwrap().push(command.clone());
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PublicV1EvidenceApi for HostedPublicV1Adapter {
+    async fn observe_public_v1_evidence_status(
+        &self,
+    ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
+        self.evidence.observe_public_v1_evidence_status().await
+    }
+
+    async fn persist_public_v1_evidence_status(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+        next: &PublicV1AcceptedStatus,
+    ) -> Result<(), String> {
+        self.evidence
+            .persist_public_v1_evidence_status(expected, next)
+            .await
+    }
+
+    async fn accept_public_v1_completion(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+        completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
+    ) -> Result<(), String> {
+        self.evidence
+            .accept_public_v1_completion(expected, completion)
+            .await
+    }
+
+    async fn retire_public_v1_incarnation(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+        completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
+        target: &PublicV1ResourceAuthority,
+    ) -> Result<(), String> {
+        self.evidence
+            .retire_public_v1_incarnation(expected, completion, target)
+            .await
+    }
+
+    async fn provision_public_v1_replacement(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+        completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
+        target: &PublicV1ResourceAuthority,
+        rebuild: &kuberic_runtime::protocol::public_operations::CanonicalReplicaRebuildRequired,
+    ) -> Result<(), String> {
+        self.evidence
+            .provision_public_v1_replacement(expected, completion, target, rebuild)
+            .await
+    }
+}
+
+pub(crate) fn operation_matches_transition(
+    expected: &PublicV1AcceptedTransitionStatus,
+    intent: &PublicOperationIntent,
+) -> bool {
+    if intent.operation_id != expected.intent.operation_id
+        || intent.revision != expected.intent.revision
+        || intent.process_session_id != expected.intent.process_session_id
+        || intent.input_digest != expected.intent.input_digest
+        || intent.replay_disposition != expected.intent.replay_disposition
+        || !intent_history_matches(intent, expected.intent.history.data_loss_number)
+    {
+        return false;
+    }
+    let Some(program) = intent.program.as_ref() else {
+        return matches!(
+            expected.intent.call_kind,
+            PublicV1CallKind::InitialPrimary
+                | PublicV1CallKind::FailoverPromotion
+                | PublicV1CallKind::SecondaryEpochAdvance
+        );
+    };
+    let (call, previous, current, mode, specific) = match program {
+        PublicOperationProgram::Open { .. } => (PublicV1CallKind::Open, None, None, None, None),
+        PublicOperationProgram::Role { .. } => (PublicV1CallKind::Role, None, None, None, None),
+        PublicOperationProgram::Epoch { .. } => (PublicV1CallKind::Epoch, None, None, None, None),
+        PublicOperationProgram::Configuration(configuration) => (
+            PublicV1CallKind::Configuration,
+            configuration
+                .previous
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            Some(configuration.current.configuration_id.clone()),
+            None,
+            None,
+        ),
+        PublicOperationProgram::CatchUp {
+            configuration,
+            mode,
+        } => (
+            PublicV1CallKind::CatchUp,
+            configuration
+                .previous
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            Some(configuration.current.configuration_id.clone()),
+            Some(*mode),
+            None,
+        ),
+        PublicOperationProgram::Progress { .. } => {
+            (PublicV1CallKind::Progress, None, None, None, None)
+        }
+        PublicOperationProgram::Swap {
+            refreshed,
+            mode,
+            catch_up_specific_quorum,
+            ..
+        } => (
+            PublicV1CallKind::Swap,
+            refreshed
+                .previous
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            Some(refreshed.current.configuration_id.clone()),
+            Some(*mode),
+            Some(*catch_up_specific_quorum),
+        ),
+        PublicOperationProgram::Build(_) => (PublicV1CallKind::Build, None, None, None, None),
+        PublicOperationProgram::Remove(_) => (PublicV1CallKind::Remove, None, None, None, None),
+        PublicOperationProgram::Close => (PublicV1CallKind::Close, None, None, None, None),
+        PublicOperationProgram::Abort => (PublicV1CallKind::Abort, None, None, None, None),
+    };
+    call == expected.intent.call_kind
+        && previous == expected.intent.previous_configuration_id
+        && current == expected.intent.current_configuration_id
+        && mode == expected.intent.catch_up_mode
+        && specific == expected.intent.catch_up_specific_quorum
+}
+
+fn intent_history_matches(intent: &PublicOperationIntent, data_loss_number: i64) -> bool {
+    let epoch_matches =
+        |epoch: kuberic_runtime::protocol::types::Epoch| epoch.data_loss_number == data_loss_number;
+    match intent.program.as_ref() {
+        Some(PublicOperationProgram::Role { epoch, .. })
+        | Some(PublicOperationProgram::Epoch { epoch }) => epoch_matches(*epoch),
+        Some(PublicOperationProgram::Configuration(configuration))
+        | Some(PublicOperationProgram::CatchUp { configuration, .. }) => {
+            epoch_matches(configuration.current.epoch)
+                && configuration
+                    .previous
+                    .as_ref()
+                    .is_none_or(|previous| epoch_matches(previous.epoch))
+        }
+        Some(PublicOperationProgram::Swap {
+            starting,
+            refreshed,
+            epoch,
+            ..
+        }) => {
+            epoch_matches(*epoch)
+                && epoch_matches(starting.current.epoch)
+                && epoch_matches(refreshed.current.epoch)
+                && starting
+                    .previous
+                    .as_ref()
+                    .is_none_or(|previous| epoch_matches(previous.epoch))
+                && refreshed
+                    .previous
+                    .as_ref()
+                    .is_none_or(|previous| epoch_matches(previous.epoch))
+        }
+        Some(PublicOperationProgram::Build(build))
+        | Some(PublicOperationProgram::Remove(build)) => build
+            .history
+            .as_ref()
+            .is_some_and(|history| history.data_loss_number == data_loss_number),
+        Some(
+            PublicOperationProgram::Open { .. }
+            | PublicOperationProgram::Progress { .. }
+            | PublicOperationProgram::Close
+            | PublicOperationProgram::Abort,
+        )
+        | None => true,
+    }
+}

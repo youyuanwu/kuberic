@@ -1231,27 +1231,34 @@ impl PodRuntime {
         let mut role = None;
         let mut epoch = None;
         let mut configuration = None;
-        let mut dynamic = false;
-        for record in preview
+        let mut dynamic_pending = false;
+        let mut records = preview
             .operations
             .values()
             .filter(|record| &record.intent.process_session_id == process_session)
-        {
-            if matches!(
-                record.intent.program.as_ref(),
-                Some(
-                    PublicOperationProgram::CatchUp { .. }
-                        | PublicOperationProgram::Swap { .. }
-                        | PublicOperationProgram::Build(_)
-                        | PublicOperationProgram::Remove(_)
-                )
-            ) || record.intent.lifecycle.is_some()
-            {
-                dynamic = true;
-            }
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.intent
+                .revision
+                .cmp(&right.intent.revision)
+                .then_with(|| left.intent.operation_id.cmp(&right.intent.operation_id))
+        });
+        for record in records {
             if record.stage != PublicOperationStage::Completed
                 || record.disposition != Some(PublicOperationDisposition::Succeeded)
             {
+                if matches!(
+                    record.intent.program.as_ref(),
+                    Some(
+                        PublicOperationProgram::CatchUp { .. }
+                            | PublicOperationProgram::Swap { .. }
+                            | PublicOperationProgram::Build(_)
+                            | PublicOperationProgram::Remove(_)
+                    )
+                ) || record.intent.lifecycle.is_some()
+                {
+                    dynamic_pending = true;
+                }
                 continue;
             }
             match record.intent.program.as_ref() {
@@ -1266,19 +1273,45 @@ impl PodRuntime {
                 Some(PublicOperationProgram::Configuration(selected)) => {
                     configuration = Some(selected.clone());
                 }
-                Some(
-                    PublicOperationProgram::CatchUp { .. }
-                    | PublicOperationProgram::Swap { .. }
-                    | PublicOperationProgram::Build(_)
-                    | PublicOperationProgram::Remove(_),
-                ) => {}
-                None if record.intent.lifecycle.is_some() => {}
-                Some(
-                    PublicOperationProgram::Progress { .. }
-                    | PublicOperationProgram::Close
-                    | PublicOperationProgram::Abort,
-                )
-                | None => {}
+                Some(PublicOperationProgram::CatchUp {
+                    configuration: selected,
+                    ..
+                }) => configuration = Some(selected.clone()),
+                Some(PublicOperationProgram::Swap {
+                    refreshed,
+                    epoch: selected_epoch,
+                    handoff,
+                    ..
+                }) => {
+                    role = Some((*selected_epoch, *handoff));
+                    epoch = Some(*selected_epoch);
+                    configuration = Some(refreshed.clone());
+                }
+                Some(PublicOperationProgram::Build(_) | PublicOperationProgram::Remove(_)) => {}
+                None if record.intent.lifecycle.is_some() => {
+                    let lifecycle = record.intent.lifecycle.as_ref().expect("checked lifecycle");
+                    epoch = Some(lifecycle.epoch);
+                    role = Some((
+                        lifecycle.epoch,
+                        if lifecycle.recipe
+                            == crate::protocol::public_operations::PublicLifecycleRecipe::
+                                SecondaryEpochAdvance
+                        {
+                            ReplicaRole::ActiveSecondary
+                        } else {
+                            ReplicaRole::Primary
+                        },
+                    ));
+                    configuration = Some(lifecycle.configuration());
+                }
+                Some(PublicOperationProgram::Progress { .. }) => {}
+                Some(PublicOperationProgram::Close | PublicOperationProgram::Abort) => {
+                    open = false;
+                    role = Some((Epoch::default(), ReplicaRole::None));
+                    epoch = None;
+                    configuration = None;
+                }
+                None => {}
             }
         }
         let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
@@ -1288,7 +1321,7 @@ impl PodRuntime {
             None => 0,
         };
         let (role_epoch, selected_role) = role.unwrap_or((Epoch::default(), ReplicaRole::None));
-        let candidate_ready = !dynamic
+        let candidate_ready = !dynamic_pending
             && open
             && epoch == Some(role_epoch)
             && configuration.as_ref().is_some_and(|selected| {
@@ -1945,6 +1978,17 @@ impl PodRuntime {
                     "the selected replicator does not expose default-engine provider access".into(),
                 )
             })
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn stateless_preview_replicator_creation_id(
+        &self,
+    ) -> Result<crate::protocol::types::ReplicatorCreationId> {
+        self.host
+            .registered
+            .get()
+            .map(|registered| registered.identity.to_public_id())
+            .ok_or(RuntimeError::NotOpen)
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -3023,9 +3067,8 @@ impl PartitionAccessView for HostAccessView {
         ambiguous: bool,
     ) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        if ambiguous {
-            host.preview_ambiguity_fenced.store(true, Ordering::Release);
-        }
+        host.preview_ambiguity_fenced
+            .store(ambiguous, Ordering::Release);
         let fenced = ambiguous
             || applied_lsn != committed_lsn
             || host.preview_ambiguity_fenced.load(Ordering::Acquire)
@@ -3272,11 +3315,6 @@ impl ReplicatorRegistration for RuntimeHost {
         }
         let consumes_provider_writer =
             provider.is_some() && attachment.has_provider_writer(RuntimeHostToken::new());
-        if provider.is_none() && attachment.has_provider_writer(RuntimeHostToken::new()) {
-            return Err(RuntimeError::Application(
-                "StateReplicator writer requires a registered provider".into(),
-            ));
-        }
         if consumes_provider_writer && provider_writer.consumed {
             return Err(RuntimeError::Application(
                 "provider writer lease was already consumed".into(),

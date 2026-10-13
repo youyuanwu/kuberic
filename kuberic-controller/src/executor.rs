@@ -142,6 +142,30 @@ pub async fn execute_public_v1_session_renewal(
 }
 
 #[cfg(feature = "runtime-test-bridge")]
+pub async fn execute_public_v1_operation(
+    api: &dyn crate::cluster_api::PublicV1OperationApi,
+    expected: &crate::evaluator::test_bridge::PublicV1AcceptedTransitionStatus,
+    command: kuberic_runtime::protocol::command::ProtocolCommand,
+) -> std::result::Result<(), String> {
+    if api.observe_public_v1_operation().await?.as_ref() != Some(expected) {
+        return Err("stale public-v1 operation authority".into());
+    }
+    let kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(operation) =
+        &command
+    else {
+        return Err("public-v1 operation executor received another command".into());
+    };
+    operation.validate().map_err(str::to_owned)?;
+    if !crate::cluster_api::public_v1_operations::operation_matches_transition(
+        expected,
+        &operation.intent,
+    ) {
+        return Err("public-v1 operation differs from accepted transition".into());
+    }
+    api.dispatch_public_v1_operation(expected, &command).await
+}
+
+#[cfg(feature = "runtime-test-bridge")]
 pub async fn execute_public_v1_evidence(
     api: &dyn crate::cluster_api::PublicV1EvidenceApi,
     plan: crate::evaluator::test_bridge::PublicV1EvidencePlan,

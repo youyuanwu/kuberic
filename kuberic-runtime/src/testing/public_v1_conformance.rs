@@ -15,6 +15,7 @@ struct Gate {
     owner: &'static str,
     strict_scenarios: &'static [&'static str],
     postgres_scenarios: &'static [&'static str],
+    preview_scenarios: &'static [&'static str],
     expected: &'static str,
     eligibility: fn(),
     future: FutureObligation,
@@ -58,6 +59,7 @@ const GATES: [Gate; 16] = [
             "strict_trace_fixture_covers_the_public_callback_inventory_and_primary_guard",
         ],
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
+        preview_scenarios: &["static_preview_is_store_free_access_gated_and_durable_before_ack"],
         expected: "primary role completes before primary configuration",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -71,9 +73,13 @@ const GATES: [Gate; 16] = [
             "public_v1_data_loss_replay_uses_attached_capability",
         ],
         postgres_scenarios: &[],
+        preview_scenarios: &[
+            "static_preview_is_store_free_access_gated_and_durable_before_ack",
+            "commit_failure_permanently_contains_the_ambiguous_suffix",
+        ],
         expected: "logical authorization distinguishes every callback outcome",
         eligibility: contract_gate,
-        future: FutureObligation::Phase6Engine,
+        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-03",
@@ -81,6 +87,9 @@ const GATES: [Gate; 16] = [
         owner: "lifecycle",
         strict_scenarios: &["public_v1_session_renewal_requires_higher_epoch"],
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
+        preview_scenarios: &[
+            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+        ],
         expected: "same-role epoch renewal fences predecessor traffic",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -95,6 +104,9 @@ const GATES: [Gate; 16] = [
             "public_v1_role_and_epoch_transitions_persist_current_authority",
         ],
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
+        preview_scenarios: &[
+            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+        ],
         expected: "configuration contains only exact ready remote peers",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -108,6 +120,9 @@ const GATES: [Gate; 16] = [
             "build_rejects_targets_present_in_lifecycle_or_swap_topology",
         ],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
+        preview_scenarios: &[
+            "hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion",
+        ],
         expected: "build target is idle, outside PC/CC, and has invalid progress",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -118,6 +133,10 @@ const GATES: [Gate; 16] = [
         owner: "build",
         strict_scenarios: &["exact_build_is_cancelled_and_drained_before_removal_and_successor"],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
+        preview_scenarios: &[
+            "hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion",
+            "hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session",
+        ],
         expected: "build root and descendants drain before removal",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -131,9 +150,12 @@ const GATES: [Gate; 16] = [
             "public_operation_replay_swap_install_cuts_never_wait_on_stale_topology",
         ],
         postgres_scenarios: &[],
+        preview_scenarios: &[
+            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+        ],
         expected: "specific quorum and fallback are captured replay inputs",
         eligibility: contract_gate,
-        future: FutureObligation::Phase6Engine,
+        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-08",
@@ -145,9 +167,12 @@ const GATES: [Gate; 16] = [
             "public_v1_schema11_build_ambiguity_requires_retirement",
         ],
         postgres_scenarios: &["public_v1_postgres_data_loss_history_and_replay"],
+        preview_scenarios: &[
+            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+        ],
         expected: "numeric progress is comparable only inside one history",
         eligibility: contract_gate,
-        future: FutureObligation::Phase6Engine,
+        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-09",
@@ -155,6 +180,9 @@ const GATES: [Gate; 16] = [
         owner: "construction",
         strict_scenarios: &["public_v1_source_uses_no_native_evidence"],
         postgres_scenarios: &[],
+        preview_scenarios: &[
+            "production_config_has_no_preview_selector_and_stateless_source_has_no_legacy_store_or_auth",
+        ],
         expected: "current legacy-bearing artifact is production ineligible",
         eligibility: ksf_09,
         future: FutureObligation::Phase7Cutover,
@@ -165,6 +193,7 @@ const GATES: [Gate; 16] = [
         owner: "transport",
         strict_scenarios: &["public_lifecycle_owns_replicator_endpoint_until_close_and_abort"],
         postgres_scenarios: &[],
+        preview_scenarios: &["preview_open_owns_registration_listener_and_writer_exactly_once"],
         expected: "public endpoint lifetime follows Replicator lifecycle",
         eligibility: ksf_10,
         future: FutureObligation::Phase7Cutover,
@@ -175,6 +204,7 @@ const GATES: [Gate; 16] = [
         owner: "reporting",
         strict_scenarios: &["public_v1_role_address_runtime_to_controller_publish_replace_clear"],
         postgres_scenarios: &[],
+        preview_scenarios: &["public_v1_role_address_runtime_to_controller_publish_replace_clear"],
         expected: "exact role completion publishes and clears address",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -188,6 +218,7 @@ const GATES: [Gate; 16] = [
             "callback_cancellation_cross_product_has_exact_root_end_and_descendant_drain",
         ],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
+        preview_scenarios: &["commit_failure_permanently_contains_the_ambiguous_suffix"],
         expected: "supersession contains callback roots and descendants",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -198,6 +229,9 @@ const GATES: [Gate; 16] = [
         owner: "fault",
         strict_scenarios: &["public_fault_reporting_closes_access_and_location_before_returning"],
         postgres_scenarios: &[],
+        preview_scenarios: &[
+            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+        ],
         expected: "fault closes access and targets one exact incarnation",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -208,6 +242,7 @@ const GATES: [Gate; 16] = [
         owner: "close",
         strict_scenarios: &["contained_close_failures_preserve_typed_diagnostics_and_order"],
         postgres_scenarios: &["public_v1_postgres_contained_close"],
+        preview_scenarios: &["preview_open_owns_registration_listener_and_writer_exactly_once"],
         expected: "child diagnostics do not change normalized outer close",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -221,6 +256,9 @@ const GATES: [Gate; 16] = [
             "public_v1_replay_preserves_declared_disposition",
         ],
         postgres_scenarios: &[],
+        preview_scenarios: &[
+            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+        ],
         expected: "journal replay preserves ambiguity and capability policy",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -231,6 +269,7 @@ const GATES: [Gate; 16] = [
         owner: "cutover",
         strict_scenarios: &[],
         postgres_scenarios: &[],
+        preview_scenarios: &[],
         expected: "current artifact inventories and rejects legacy continuation owners",
         eligibility: ksf_16,
         future: FutureObligation::Phase7Cutover,
@@ -244,19 +283,23 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn scenario_filter() -> String {
+fn scenario_filter(scenarios: fn(&Gate) -> &'static [&'static str]) -> String {
     GATES
         .iter()
         .filter(|gate| gate.id != "KSF-16")
-        .flat_map(|gate| gate.strict_scenarios.iter())
+        .flat_map(|gate| scenarios(gate).iter())
         .map(|scenario| format!("test({scenario})"))
         .collect::<Vec<_>>()
         .join(" or ")
 }
 
-fn run_strict_scenarios() {
+fn run_scenarios(
+    subject: &str,
+    packages: &[&str],
+    scenarios: fn(&Gate) -> &'static [&'static str],
+) {
     let root = workspace_root();
-    let filter = scenario_filter();
+    let filter = scenario_filter(scenarios);
     let archive = std::env::var_os("NEXTEST_ARCHIVE")
         .map(PathBuf::from)
         .map(|path| {
@@ -272,7 +315,10 @@ fn run_strict_scenarios() {
     if let Some(archive) = &archive {
         list.arg("--archive-file").arg(archive);
     } else {
-        list.args(["-p", "kuberic-runtime", "--all-features"]);
+        for package in packages {
+            list.args(["-p", package]);
+        }
+        list.arg("--all-features");
     }
     let list = list
         .args(["--profile", "ordinary", "-E", &filter])
@@ -285,7 +331,7 @@ fn run_strict_scenarios() {
     );
     let inventory = String::from_utf8(list.stdout).expect("nextest inventory is UTF-8");
     for gate in GATES.iter().filter(|gate| gate.id != "KSF-16") {
-        for scenario in gate.strict_scenarios {
+        for scenario in scenarios(gate) {
             assert!(
                 inventory.contains(scenario),
                 "{} scenario is not selected: {}",
@@ -313,7 +359,10 @@ fn run_strict_scenarios() {
         path
     });
     if archive.is_none() {
-        run.args(["-p", "kuberic-runtime", "--all-features"]);
+        for package in packages {
+            run.args(["-p", package]);
+        }
+        run.arg("--all-features");
     }
     let run = run
         .args(["--profile", "ordinary", "-E", &filter])
@@ -324,7 +373,7 @@ fn run_strict_scenarios() {
     }
     assert!(
         run.status.success(),
-        "strict Public V1 conformance scenarios failed:\n{}\n{}",
+        "{subject} Public V1 conformance scenarios failed:\n{}\n{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
@@ -332,11 +381,19 @@ fn run_strict_scenarios() {
 
 pub fn assert_public_v1_conformance_subject(subject: &str) {
     assert!(
-        matches!(subject, "strict-custom" | "postgresql"),
+        matches!(subject, "strict-custom" | "postgresql" | "built-in-preview"),
         "unknown Public V1 conformance subject: {subject}"
     );
     if subject == "strict-custom" {
-        run_strict_scenarios();
+        run_scenarios("strict-custom", &["kuberic-runtime"], |gate| {
+            gate.strict_scenarios
+        });
+    } else if subject == "built-in-preview" {
+        run_scenarios(
+            "built-in-preview",
+            &["kuberic-runtime", "kuberic-controller"],
+            |gate| gate.preview_scenarios,
+        );
     }
 
     for (index, gate) in GATES.iter().enumerate() {
@@ -367,26 +424,25 @@ pub fn assert_public_v1_conformance_subject(subject: &str) {
         );
     }
     assert!(
-        GATES
+        !GATES
             .iter()
-            .any(|gate| gate.future == FutureObligation::Phase6Engine),
-        "the oracle must retain Phase 6 engine obligations"
+            .any(|gate| gate.future == FutureObligation::Phase6Engine)
     );
 }
 
 pub fn assert_public_v1_conformance_gate(subject: &str, id: &str, scenario: &str) {
     assert!(
-        matches!(subject, "strict-custom" | "postgresql"),
+        matches!(subject, "strict-custom" | "postgresql" | "built-in-preview"),
         "unknown Public V1 conformance subject: {subject}"
     );
     let gate = GATES
         .iter()
         .find(|gate| gate.id == id)
         .unwrap_or_else(|| panic!("unknown Public V1 conformance gate: {id}"));
-    let scenarios = if subject == "postgresql" {
-        gate.postgres_scenarios
-    } else {
-        gate.strict_scenarios
+    let scenarios = match subject {
+        "postgresql" => gate.postgres_scenarios,
+        "built-in-preview" => gate.preview_scenarios,
+        _ => gate.strict_scenarios,
     };
     assert!(
         scenarios.contains(&scenario),
@@ -397,17 +453,17 @@ pub fn assert_public_v1_conformance_gate(subject: &str, id: &str, scenario: &str
 
 pub fn assert_public_v1_conformance_not_applicable(subject: &str, id: &str) {
     assert!(
-        matches!(subject, "strict-custom" | "postgresql"),
+        matches!(subject, "strict-custom" | "postgresql" | "built-in-preview"),
         "unknown Public V1 conformance subject: {subject}"
     );
     let gate = GATES
         .iter()
         .find(|gate| gate.id == id)
         .unwrap_or_else(|| panic!("unknown Public V1 conformance gate: {id}"));
-    let scenarios = if subject == "postgresql" {
-        gate.postgres_scenarios
-    } else {
-        gate.strict_scenarios
+    let scenarios = match subject {
+        "postgresql" => gate.postgres_scenarios,
+        "built-in-preview" => gate.preview_scenarios,
+        _ => gate.strict_scenarios,
     };
     assert!(
         scenarios.is_empty(),

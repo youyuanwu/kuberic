@@ -1187,7 +1187,8 @@ where
             #[cfg(feature = "testing")]
             ProtocolCommand::RestartReplicaProcess(_)
             | ProtocolCommand::DropReplicaIncarnation(_)
-            | ProtocolCommand::PublicV1History(_) => {
+            | ProtocolCommand::PublicV1History(_)
+            | ProtocolCommand::PublicV1Operation(_) => {
                 return Err(Status::failed_precondition(
                     "preview commands require a repository-only dispatch path",
                 ));

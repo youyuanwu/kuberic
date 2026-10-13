@@ -287,7 +287,7 @@ fn public_v1_primary_and_secondary_replacements_obey_epoch_ordering() {
 }
 
 #[test]
-fn public_v1_session_renewal_waits_for_blocked_survivor() {
+fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement() {
     let required = requirement(ProcessSessionRenewalReason::PrimaryReplacement);
     let pending = pending_barriers(required.clone());
     assert!(matches!(
@@ -312,6 +312,18 @@ fn public_v1_session_renewal_waits_for_blocked_survivor() {
     .unwrap();
     assert_eq!(
         excluded.finish_epoch_barriers().unwrap().stage,
+        PublicSessionRenewalStage::ReplacementRolePending
+    );
+
+    let pending = pending_barriers(requirement(ProcessSessionRenewalReason::PrimaryReplacement));
+    let returned = accept_public_v1_session_epoch_updated(
+        &pending,
+        &pending.required.surviving_sessions[0],
+        pending.required.renewal_epoch,
+    )
+    .unwrap();
+    assert_eq!(
+        returned.finish_epoch_barriers().unwrap().stage,
         PublicSessionRenewalStage::ReplacementRolePending
     );
 }
