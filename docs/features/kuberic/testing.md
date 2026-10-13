@@ -30,8 +30,8 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,338 tests: 1,086 ordinary, one
-build-only, 212 directly runnable PostgreSQL tests, 19 live KinD tests covering
+The consolidated validator accounts for 1,374 tests: 1,121 ordinary, one
+build-only, 213 directly runnable PostgreSQL tests, 19 live KinD tests covering
 12 scenario identities, one DEX live test and 19 mapped parent-driven
 subprocess helpers.
 Use its generated counts as the inventory evolves.
@@ -87,43 +87,164 @@ Controller library tests verify that the checked-in CRD equals the generated
 schema. Runtime protocol tests guard representative status growth and reject quadratic
 evidence expansion.
 
-The dormant Service Fabric public-operation gate exercises runtime callback
-ownership/replay, controller service projection, fault planning and the real
-preview child-process boundary:
+## Service Fabric Public V1 Phase 6 Preview
+
+Phase 6 adds a dormant, built-in stateless preview on top of the existing
+Public V1 operation/evidence gates. It is selectable only through
+test/development features. Ordinary production construction and manifests
+remain on protocol 9/schema 6 and the legacy managed engine; the preview uses
+fresh protocol 11/schema 11 state.
+
+Run the exact Phase 6 selectors serially. The shared KSF test starts nested
+Cargo/nextest commands, while the hosted runtime and provider journeys own real
+listeners and durable roots. `-j 1` is the reproducible diagnostic boundary;
+parallel ordinary execution may add transient Cargo, listener or host-resource
+contention, but contention is not treated as a passing result.
+
+### Runtime ownership and recovery
+
+The inventory is exactly 13 direct recovery tests plus two catalog tests:
 
 ```bash
-KUBERIC_WORKSPACE_TESTS=1 scripts/assert_nextest_selection.sh \
-  --label public-v1-phase4-runtime \
-  --require-binary public_v1_evidence \
-  --require-binary public_v1_conformance \
-  --require-test public_v1_evidence_report_is_structurally_public_only \
-  --require-test public_v1_schema11_rejects_prior_preview_stores \
-  --require-test public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16 -- \
-  cargo nextest list -p kuberic-runtime --all-features --profile ordinary \
-    -E 'binary(public_v1_evidence) or binary(public_v1_conformance) or test(public_operations) or test(public_operation_replay) or test(process_supervisor)'
-KUBERIC_WORKSPACE_TESTS=1 cargo nextest run -j 1 --profile ordinary \
-  -p kuberic-runtime --all-features \
-  -E 'binary(public_v1_evidence) or binary(public_v1_conformance) or test(public_operations) or test(public_operation_replay) or test(process_supervisor)'
 scripts/assert_nextest_selection.sh \
-  --label public-v1-phase4-controller \
-  --require-binary public_v1_evidence \
-  --require-binary public_operation_faults \
-  --require-binary public_operation_role_address \
-  --require-binary protocol --require-binary model --require-binary controller -- \
-  cargo nextest list -p kuberic-controller --all-features --profile ordinary \
-    -E 'binary(public_v1_evidence) or binary(public_operation_faults) or binary(public_operation_role_address) or binary(protocol) or binary(model) or binary(controller)'
-cargo nextest run -j 1 --profile ordinary \
-  -p kuberic-controller --all-features \
-  -E 'binary(public_v1_evidence) or binary(public_operation_faults) or binary(public_operation_role_address) or binary(protocol) or binary(model) or binary(controller)'
+  --label phase6-runtime \
+  --require-binary stateless_preview_recovery \
+  --require-binary public_v1_conformance \
+  --require-test preview_open_owns_registration_listener_and_writer_exactly_once \
+  --require-test hosted_preview_rebuild_retires_and_restarts_fresh_replacement \
+  --require-test ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress \
+  --require-test public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16 -- \
+  cargo nextest list -p kuberic-runtime --all-features \
+    --profile ordinary \
+    -E 'binary(stateless_preview_recovery) or binary(public_v1_conformance)'
+
+cargo nextest run -j 1 -p kuberic-runtime --all-features \
+  --profile ordinary -E 'binary(stateless_preview_recovery)'
+
+KUBERIC_WORKSPACE_TESTS=1 cargo nextest run -j 1 \
+  -p kuberic-runtime --all-features --profile ordinary \
+  -E 'test(public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16) or test(built_in_preview_ksf_mappings_require_each_authorized_p2_observation)'
 ```
 
-The supervisor cases use a true child executable and same data root. They cut
-after durable restart acceptance, predecessor containment and successor start;
-unproven containment must prevent re-exec. The Public V1 conformance binary
-owns exactly sixteen KSF rows and preserves Phase 6/7 obligations through
-negative KSF-09, KSF-10 and KSF-16 eligibility guards. This path remains
-repository-only and does not activate preview commands in production
-controller or gRPC construction.
+The direct binary covers immutable selection, exact engine/provider-writer/
+listener ownership, schema-11 bootstrap, no-fallback startup, static
+reconstruction, durable-before-ACK writes, ambiguous suffix containment,
+higher-epoch session renewal, failover/switchover, build, removal, data loss,
+permanent retirement, empty replacement and post-replacement restart.
+
+The shared catalog contains exactly KSF-01 through KSF-16. The
+`built-in-preview` subject has public-observable scenarios for every KSF-01
+through KSF-15 row. KSF-09 and KSF-10 have positive preview coverage but
+retain negative replacement-artifact guards while the legacy managed
+capability/listener exists. KSF-16 has no preview scenario and remains the
+Phase 7 legacy-continuation guard.
+
+### Hosted controller chain
+
+The controller selection is exactly the 10 `public_v1_evidence` and six
+`public_v1_session_renewal` tests:
+
+```bash
+scripts/assert_nextest_selection.sh \
+  --label phase6-controller \
+  --require-binary public_v1_evidence \
+  --require-binary public_v1_session_renewal \
+  --require-test wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_program \
+  --require-test hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session \
+  --require-test hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement -- \
+  cargo nextest list -p kuberic-controller --all-features \
+    --profile ordinary \
+    -E 'binary(public_v1_evidence) or binary(public_v1_session_renewal)'
+
+cargo nextest run -j 1 -p kuberic-controller --all-features \
+  --profile ordinary \
+  -E 'binary(public_v1_evidence) or binary(public_v1_session_renewal)'
+```
+
+The feature-gated hosted adapter implements history, session-renewal,
+`PublicV1OperationApi` and evidence APIs. Tests prove the complete accepted
+evaluator authority -> executor -> `PublicV1Operation` command -> preview
+runtime operation owner -> matching durable report -> evidence acceptance/
+retirement/replacement chain. Wrong targets, predecessor reports, changed
+authority and stale resource versions fail before effect.
+
+### Real SQLite and KVStore2 replacement journeys
+
+These are one exact test per real provider:
+
+```bash
+scripts/assert_nextest_selection.sh \
+  --label phase6-providers \
+  --require-binary durable_data_loss \
+  --require-binary public_v1_preview \
+  --require-test sqlite_fresh_restart_build_and_corrective_empty_replacement \
+  --require-test kvstore2_fresh_restart_build_and_corrective_empty_replacement -- \
+  cargo nextest list -p sqlite-replicated -p kvstore2 --all-features \
+    --profile ordinary \
+    -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement)'
+
+cargo nextest run -j 1 -p sqlite-replicated -p kvstore2 \
+  --all-features --profile ordinary \
+  -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement)'
+```
+
+Both journeys restart fresh source state, freeze a copy snapshot, commit a
+known retained operation, withhold admission until the target durably closes
+that gap, retire a divergent higher-progress incarnation, build an empty
+replacement and restart it without recovering the retired bytes.
+
+### Timeouts and implementation evidence
+
+Every newly added Phase 6 test has an internal timeout no greater than 270
+seconds:
+
+- direct runtime tests: 30, 120, 150 or 180 seconds;
+- shared nested KSF runner: one 270-second parent deadline with process-tree
+  termination/reaping coverage;
+- new controller target/removal/survivor tests: 270 seconds;
+- SQLite/KVStore2 journeys: 180 seconds, with tighter build waits.
+
+The nextest 300-second termination limit is an external backstop and is not
+used to satisfy the Phase 6 requirement. A retained one-shot notification
+prevents the hosted switchover commit handshake from being lost during nested
+conformance execution. Focused serial selectors remain the supported way to
+separate protocol failures from transient build/host contention.
+
+The Phase 6 implementation spans commits `eec6d25` through `c6010a0`. The
+2026-10-13 documentation rerun at `c6010a0` produced:
+
+- runtime inventory: 15 tests; direct recovery: 13/13 passed in 70.734s;
+- shared KSF selector: 2/2 passed, with the nested KSF-01..16 oracle taking
+  222.845s inside its 270-second parent bound;
+- controller inventory/execution: 16/16 passed in 0.071s;
+- provider inventory/execution: 2/2 passed; SQLite took 24.962s and KVStore2
+  took 143.775s inside their 180-second bounds.
+- bounded PostgreSQL smoke: 4/4 Public V1 scenarios passed in 41.397s, then
+  8/8 representative workspace scenarios passed in 317.421s. The slowest
+  single scenario took 179.547s, within its 240-second internal bound.
+- `just nextest-test`: passed all 1,121 selected ordinary tests;
+- `just nextest-validate`: passed exact-once validation for 1,374 tests,
+  including 1,121 ordinary and 213 directly runnable PostgreSQL tests;
+- `lifecycle_capability_boundaries`: 6/6 passed;
+- `scripts/check_runtime_public_api.sh`, `cargo check --workspace`,
+  `cargo fmt --all -- --check`, Markdown-link and documented-path checks
+  passed.
+
+The KSF runner and KVStore2 journey have deliberately bounded but finite
+headroom on this host. Do not add parallel work inside those tests or combine
+them into a broader focused command without remeasuring the internal deadline.
+Run their exact serial selectors before attributing a timeout to protocol
+failure.
+
+The first PostgreSQL documentation attempt exhausted `/data` while compiling;
+removing only `target/debug/incremental` restored 15 GiB. A second attempt used
+a project-local path that was too long for PostgreSQL's 107-byte Unix socket
+limit. The exact short project-local scratch command in the PostgreSQL section
+below then passed. These are known environment/contention limits, not accepted
+test skips or retries.
+
+The full `just nextest-postgres` suite is not part of routine Phase 6
+verification and is not claimed unless explicitly requested.
 
 ## Level-Triggered Live Validation
 
@@ -212,17 +333,27 @@ primary lifecycle/joint configuration, build cancellation/retirement,
 data-loss history/replay and contained close, and each records the applicable
 KSF rows. The smoke target depends on that inventory and covers representative
 lifecycle paths. It runs the four Public V1 scenarios package-only before a
-separate seven-test workspace pass so compilation I/O cannot consume their
+separate eight-test workspace pass so compilation I/O cannot consume their
 runtime budget. Their data roots use `KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR`, or
 the smoke recipe selects sufficiently sized `/dev/shm` before falling back to
 `/tmp`. CI-derived nextest profiles terminate an individual test at five
 minutes. Run the full target only when explicitly requested or in the dedicated
 CI validation that owns its resource budget.
 
+To keep all scratch state in the repository, use a short path so PostgreSQL's
+107-byte Unix-domain socket limit is not exceeded:
+
+```bash
+mkdir -p "$PWD/p"
+TMPDIR="$PWD/p" KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$PWD/p" \
+  just nextest-postgres-smoke
+rmdir "$PWD/p"
+```
+
 The matrix covers physical build/rewind, fencing, failover, switchover,
 replacement, scaling, quorum restoration, read-only secondaries and
 application/agent restart. The profile has one execution slot. Its complete
-214-test inventory is 212 directly partitioned tests plus two ignored
+215-test inventory is 213 directly partitioned tests plus two ignored
 subprocess helpers executed by mapped parent tests. PostgreSQL has no
 application-specific KinD test.
 

@@ -11,8 +11,11 @@ The Service Fabric findings come from a read-only analysis of the local
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`. Service Fabric citations are
 relative to that checkout. Kuberic citations are relative to this repository.
 
-This is an architecture direction and implementation plan, not a description
-of already completed changes.
+This document is both the architecture direction and the implementation
+roadmap. Phases 0-6 are now delivered. Phase 6 is a dormant
+test/development-only stateless preview; production remains on protocol
+9/schema 6 and the legacy managed engine. Phase 7 is the next production
+cutover step.
 
 The exact stateful lifecycle, Replicator, configuration, catch-up, build,
 data-loss, access and cancellation contract—and the complete audit of current
@@ -41,17 +44,17 @@ access, builds, topology and progress are represented across the durable
 agent, hosting layer, custom-replicator host and default replication engine.
 Broad runtime actions and snapshots cross these layers.
 
-The typed boundary, state-owner separation and narrow effect contracts are now
-complete foundations. The remaining simplification should move the runtime and
-controller to a public-only contract, build a new stateless default Replicator
-beside the legacy engine, then delete the managed path. Decomposing
+The typed boundary, state-owner separation, narrow effect contracts, Public V1
+contract and parallel stateless default Replicator are complete. The remaining
+simplification is Phase 7: delete the managed path, validate a
+replacement-only artifact and activate it from fresh state. Decomposing
 `host/custom.rs` before that deletion would organize substantial code that the
-replacement removes, so source decomposition is deferred until the
+replacement removes, so source decomposition remains deferred until the
 post-cutover shape is known.
 
 The default-replicator durability target is specified separately in
 [Stateless Default Replicator](stateless-default-replicator.md). That design
-makes the managed engine restart-reconstructable like the Service Fabric V1
+provides a restart-reconstructable built-in engine like the Service Fabric V1
 Replicator while retaining agent-owned topology durability and
 state-provider-owned application durability.
 
@@ -532,12 +535,12 @@ will delete:
 | Deferred maintainability | Decompose the remaining custom host only after the managed path is gone | After Phase 7 |
 | Optional V2 storage | Add a deliberate transactional log and provider protocol above V1 | Phase 8 |
 
-The critical replication path is therefore:
+The delivered and remaining critical replication path is:
 
 ```text
 Phase 4 public operation ownership and SF lifecycle semantics
     -> Phase 5 public V1 values, evidence and conformance oracle
-    -> Phase 6 parallel stateless default replicator
+    -> Phase 6 parallel stateless default replicator (delivered preview)
     -> Phase 7 cutover and legacy deletion
     -> Phase 8 optional V2 transactional replicator and SQLite migration
 ```
@@ -845,8 +848,8 @@ consumed by the Phase 4 orchestrator, runtime and controller before the
 replacement engine exists.
 
 **Status:** delivered as a dormant protocol-11/schema-11 contract. Production
-remains on protocol 9/schema 6; Phase 6 replacement-engine and Phase 7 cutover
-obligations remain prospective.
+remains on protocol 9/schema 6. Phase 6 has since delivered the dormant
+replacement preview; Phase 7 cutover obligations remain prospective.
 
 Delivered work:
 
@@ -980,61 +983,67 @@ engine, using only the public runtime/replicator contract.
 The complete ownership, recovery, migration and validation design is in
 [Stateless Default Replicator](stateless-default-replicator.md).
 
-Planned work:
+**Status:** delivered as a feature-gated test/development preview.
 
-- create a separate stateless default implementation rather than reshaping
-  `DefaultReplicatorInner` in place;
-- add an immutable process launch selection for `LegacyManaged` or
-  `StatelessPreview`, decided before any replication listener is bound;
-- expose that selection through public construction/settings so the host and
-  selected factory agree without inspecting private capabilities;
-- in legacy mode, retain the agent-owned replication listener; in preview
-  mode, do not bind or register that service and let the replacement own the
-  endpoint;
-- require exactly one selected engine and provider writer; replacement Open
-  failure aborts startup and never falls back to legacy;
-- return only the standard public `ReplicatorInterfaces` bundle;
-- own listener, peer sessions, ACK aggregation, copy,
-  replication queues, retry and cancellation internally;
-- initialize applied, committed and retained progress from
-  `StateProvider`/`DurableState`;
-- implement public role, epoch, PC/CC, catch-up, build, removal and data-loss
-  behavior against an empty engine session;
-- implement `StateReplicator` and provider cooperation according to the Phase 5
-  contract, including provider previous-epoch boundaries, secondary-only
-  streams and committed-progress ownership;
-- implement role-specific progress types, per-peer mailboxes and retry
-  mechanics inside the replacement rather than the legacy engine;
-- validate exact history after `on_data_loss` and return
-  `ReplicaRebuildRequired` for incompatible providers;
-- permanently retire divergent incarnations and build empty replacements;
-- run the replacement through public conformance, crash-boundary and live
-  tests while the legacy engine remains the production default;
-- run exactly the same Phase 5 conformance oracle against the public/custom
-  trace implementation and the built-in preview; no built-in-only receipt or
-  observation may satisfy an oracle assertion.
-- run preview failover, switchover, process replacement, data loss, build and
-  corrective rebuild through the real controller evaluator, executor and
-  reconciler rather than direct test-only runtime commands.
+Delivered work:
 
-Exit criteria:
+- added immutable `LegacyManaged`/`StatelessPreview` selection before schema
+  open or replication-listener binding. Ordinary production constructors,
+  manifests and CRDs have no preview selector;
+- retained schema 6, the managed engine and the agent replication listener in
+  legacy mode. Preview mode requires fresh exact schema 11, skips the agent
+  replication listener and lets `StatelessReplicator::open` own the endpoint;
+- added one store-free built-in engine using only the standard public bundle.
+  Registration enforces one creation, one provider-writer lease and one
+  listener owner; mismatched selection, schema, factory, listener or Open
+  failure aborts without fallback;
+- reconstructs an empty engine from controller-renewed Public V1 authority and
+  provider applied/committed/retained progress. The engine owns only volatile
+  role/configuration, peer, ACK, retry, listener and build state;
+- implements durable-before-acknowledgement replication, PC/CC quorum,
+  applied-suffix settlement, specific-quorum/`All` catch-up, failover,
+  switchover, removal, data loss and exact process-session fencing;
+- implements copy plus retained replication and admits a target only after the
+  catch-up boundary is durable. Incompatible history returns
+  `ReplicaRebuildRequired`, permanently retires the old incarnation and
+  requires an empty replacement;
+- added feature-gated `PublicV1OperationApi` and
+  `HostedPublicV1Adapter`. The controller chain validates accepted evaluator
+  authority, dispatches one exact `PublicV1Operation` through the executor and
+  runtime owner, then accepts only matching public report completion before
+  exact accept/retire/provision effects;
+- registered public-observable built-in preview scenarios for KSF-01 through
+  KSF-15 in the same oracle used by strict-custom and applicable PostgreSQL
+  subjects. KSF-09 and KSF-10 retain global Phase 7 eligibility guards, and
+  KSF-16 remains Phase 7-only;
+- added real SQLite and KVStore2 fresh restart, snapshot-plus-retained build,
+  divergent-history retirement, empty corrective replacement and
+  post-replacement restart journeys;
+- bounded every new Phase 6 test internally at no more than 270 seconds and
+  retained the bounded real PostgreSQL smoke path for the independent custom
+  implementation.
 
-- the replacement opens no agent/engine metadata store;
-- it exposes no private lifecycle, data-plane, observation, fencing or receipt
-  capability;
-- controller-renewed authority plus provider state reconstruct a fresh engine;
-- all-survivor restart can elect, settle and serve without private evidence;
-- build, removal, switchover, failover and ambiguous-write contracts match the
-  approved public plan;
-- every KSF-01 through KSF-15 required-conformance test passes against the
-  preview, while KSF-16 remains isolated to the unselected legacy engine;
-- SQLite and KVStore2 pass the fresh-storage and corrective-replacement suites;
-- production still selects the legacy engine until the complete replacement
-  acceptance suite passes;
-- hosted preview tests prove endpoint ownership, failed-Open cleanup, immutable
-  selection and unchanged production manifests.
-- controller-driven preview tests prove the same outcomes as the direct public
-  oracle and cannot observe or consume engine-private evidence.
+Delivered result:
+
+- the replacement opens no Replicator-owned metadata or continuation store and
+  exposes no managed lifecycle/data-plane/observation capability;
+- exactly one selected engine, provider writer and replication-listener owner
+  exists in each mode;
+- static and dynamic reconstruction remain access-closed until exact authority
+  and provider progress reconcile;
+- all required built-in KSF-01 through KSF-15 mappings, controller-driven
+  journeys and real SQLite/KVStore2 replacement journeys are implemented;
+- Public V1 replication transport remains unauthenticated by design.
+  Identity, session, epoch, configuration, history, build, operation and
+  storage checks are correctness fences rather than credentials;
+- production still selects the legacy protocol-9/schema-6 engine. The compiled
+  artifact still contains the managed capability, agent listener and
+  continuation stores, so replacement-artifact eligibility and KSF-16 remain
+  Phase 7 work.
+
+Exact Phase 6 selectors, timing evidence and the known nested-conformance,
+provider, disk-capacity and PostgreSQL socket-path limits are recorded in the
+[test strategy](testing.md#service-fabric-public-v1-phase-6-preview).
 
 ### Phase 7: Finalize the Replacement-Only Release and Cut Over
 
@@ -1176,12 +1185,11 @@ Exit criteria:
   incompatible public value/evidence/protocol/store contract plus the shared
   conformance oracle. It is tested independently but never activated against
   the legacy production engine.
-- Phase 6 builds a separate replacement while the legacy engine remains the
-  production default. It must use the Phase 4 orchestrator and pass the exact
-  Phase 5 oracle used by public/custom tests. Its immutable pre-bind launch
-  selection is a Phase 6 prerequisite; internal progress types, per-peer
-  mailboxes and retry mechanics belong in the replacement, not the legacy
-  engine.
+- Phase 6 delivered a separate replacement while the legacy engine remained
+  the production default. It uses the Phase 4 orchestrator and exact Phase 5
+  oracle used by public/custom tests. Its immutable pre-bind launch selection,
+  internal progress, peer sessions and retry mechanics live in the
+  replacement, not the legacy engine.
 - Phase 7 requires the complete Phase 6 acceptance suite. It performs one
   replacement-only build step that removes the private managed attachment,
   legacy selection, dispatcher and persistence/recovery path before the
@@ -1208,11 +1216,12 @@ Exit criteria:
 
 ## Semantic Finding Disposition and Activation Gates
 
-This mapping is also the executable Phase 5 conformance catalog. The strict
-custom fixture and real PostgreSQL parent share the same sixteen-row catalog.
-KSF-09, KSF-10 and KSF-16 execute as negative eligibility guards: they pass
-only by inventorying the current legacy-bearing artifact and retaining the
-stated Phase 7 cutover obligations.
+This mapping is also the executable Public V1 conformance catalog. The strict
+custom fixture, applicable real PostgreSQL scenarios and built-in preview use
+the same sixteen-row catalog. KSF-09 and KSF-10 combine positive preview
+evidence with negative replacement-artifact eligibility guards while the
+legacy path remains. KSF-16 is negative-only and retains the Phase 7 cutover
+obligation.
 
 | Finding | Owning phase(s) | Component owner(s) | Named public-observable gate | Required result before activation |
 |---|---|---|---|---|
@@ -1224,7 +1233,7 @@ stated Phase 7 cutover obligations.
 | KSF-06 | 4 | Agent/Runtime, Replicator | `build_is_cancelled_and_drained_before_remove` | Exact build future terminates before removal and cannot recreate resources |
 | KSF-07 | 4-6 | Controller, Agent/Runtime, Replicator | `swap_uses_captured_specific_quorum_capability` | Ordering is wait/revoke/epoch/config/wait; Write includes successor when supported, otherwise explicit All |
 | KSF-08 | 5-6 | Controller, Agent/Runtime, Replicator, Provider | `progress_is_role_correct_and_history_scoped` | Primary exposes committed progress; incomparable histories are never ranked; exact build admits a new PVC incarnation into the source lineage |
-| KSF-09 | 7 | Agent/Runtime, Replicator | `replacement_bundle_has_no_managed_capability` | Replacement-only artifact cannot attach/discover any private capability |
+| KSF-09 | 6-7 | Agent/Runtime, Replicator | `replacement_bundle_has_no_managed_capability` | Preview bundle has no managed provenance; replacement-only artifact cannot attach/discover any private capability |
 | KSF-10 | 6-7 | Agent/Runtime, Replicator | `replicator_open_owns_endpoint_lifetime` | One listener exists only after successful Open and stops on Close/Abort; dispatcher absent at activation |
 | KSF-11 | 4 | Agent/Runtime, Application | `role_address_is_published_and_cleared` | Exact successful role completion controls the visible service address |
 | KSF-12 | 4 | Agent/Runtime | `supersession_cancels_and_drains_public_callbacks` | New authority/Close/Abort progresses within a bound and stale work cannot mutate externally |
@@ -1298,14 +1307,16 @@ and more visible, not to reproduce Service Fabric internally.
 
 ## Recommended Starting Point
 
-Phases 0-5 are complete. Continue with **Phase 6: Build the Stateless Default
-Replicator**. Add the new engine beside the legacy implementation and require it
-to pass the same public oracle as an independent custom Replicator rather than
-using built-in-only proof. Public V1 transport remains unauthenticated by
-design; identity, session, epoch, history and build checks are correctness
-fences rather than credentials.
+Phases 0-6 are complete. Continue with **Phase 7: Finalize the
+Replacement-Only Release and Cut Over**. Remove the legacy engine, managed
+attachments, continuation stores and agent replication dispatcher; validate
+the exact replacement-only artifact; then activate only from fresh
+controller, agent and application state.
 
-After the complete Phase 6 suite passes, **Phase 7** performs the fresh-storage
-cutover and deletes the legacy managed path. Decompose the remaining custom
-host only if its post-cutover shape still warrants it. Phase 8 builds optional
-V2 durability on the completed public-only V1 replacement.
+The Phase 6 preview already passes the shared public oracle and real provider
+journeys without built-in-only proof, but it remains feature-gated and
+production-dormant. Public V1 transport remains unauthenticated by design;
+identity, session, epoch, history and build checks are correctness fences
+rather than credentials. Decompose the remaining custom host only if its
+post-cutover shape still warrants it. Phase 8 builds optional V2 durability on
+the completed public-only V1 replacement.

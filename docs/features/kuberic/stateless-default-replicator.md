@@ -2,18 +2,22 @@
 
 ## Status
 
-Proposed architectural alignment with the Service Fabric V1 Fabric Replicator.
-This document defines the target ownership and recovery model; it does not
-describe behavior that is already implemented.
+Alignment Phase 6 is delivered as a dormant, feature-gated
+`StatelessPreview` beside the legacy managed default engine. The preview
+implements the Service Fabric V1 ownership and recovery model in this document
+through protocol 11/schema 11, but it is selectable only by repository
+test/development construction. Production remains on protocol 9/schema 6 and
+the legacy engine. Phase 7 is the next step: remove the legacy path, build the
+replacement-only artifact and perform the breaking fresh-storage cutover.
 
 ## Overview
 
-Kuberic's default replicator currently participates directly in durable
+Kuberic's production default replicator still participates directly in durable
 metadata management. The host injects SQLite-backed authority, replication
-progress, local-write, build, removal and retirement stores into the managed
-engine. This allows exact continuation across many process crash boundaries,
-but it also makes the replicator a second durable control-plane owner alongside
-the replica agent.
+progress, local-write, build, removal and retirement stores into that legacy
+managed engine. This allows exact continuation across many process crash
+boundaries, but it also makes the replicator a second durable control-plane
+owner alongside the replica agent.
 
 The Service Fabric V1 Replicator uses a simpler boundary:
 
@@ -23,13 +27,13 @@ The Service Fabric V1 Replicator uses a simpler boundary:
   intent;
 - a restarted Replicator is reconstructed from those two durable owners.
 
-Kuberic should adopt the same boundary. The default replicator should not open,
-write or recover a metadata database. It should be an executable,
-restart-reconstructable data-plane component. The local replica agent remains
-durable, but its SQLite state must be clearly agent-owned rather than exposed
-as replicator persistence.
+The Phase 6 preview adopts that boundary. It does not open, write or recover an
+engine metadata database; it is a restart-reconstructable data-plane
+component. The local replica agent remains durable, but its schema-11 SQLite
+state is agent-owned lifecycle/operation authority rather than Replicator
+persistence.
 
-The default remains a built-in implementation, but the runtime must host it
+The preview remains a built-in implementation, but the runtime hosts it
 through the same public interface bundle as an application-provided custom
 replicator. No private managed lifecycle, data-plane, observation, fencing or
 receipt capability may cross that boundary. This change does not require
@@ -91,7 +95,7 @@ Replicator metadata persistence. See
 
 ## Current Kuberic Ownership
 
-The current default engine receives these durable dependencies:
+The production legacy default engine receives these durable dependencies:
 
 - `ManagedReplicaStore`;
 - `ReplicationProgressStore`;
@@ -113,9 +117,10 @@ This creates three problems:
 3. **Stronger-than-SF continuation:** the engine attempts to resume internal
    work that SF V1 discards and reconstructs.
 
-The SQLite database is still necessary for the agent. The problem is not the
-existence of `.kuberic/agent.sqlite3`; it is allowing the default replication
-engine to treat parts of that database as its own durable state.
+The SQLite database is still necessary for the agent. The Phase 6 preview uses
+a separate fresh schema-11 store only for agent-owned identity, history,
+lifecycle intent, operation ownership and terminal public completion. Its
+stateless engine does not receive any of the dependencies above.
 
 ## Target Ownership
 
@@ -136,6 +141,90 @@ engine to treat parts of that database as its own durable state.
 The agent may persist the fact that a topology operation is required or that a
 target replica must be built. It must not persist an engine cursor merely to
 continue a particular in-memory copy stream.
+
+## Phase 6 As-Built Preview
+
+### Selection and ownership
+
+The process-wide selection is fixed before store open and listener binding:
+
+- `LegacyManaged` is the ordinary production default. It opens schema 6,
+  constructs the managed engine and lets `AgentService` own the replication
+  listener.
+- `StatelessPreview` exists only with the runtime `testing` feature. Tests
+  select it through `ReplicaHost::with_stateless_preview` and an exact
+  `PreviewLifecycleBinding`. It creates/opens only schema 11, suppresses the
+  agent replication listener and lets `StatelessReplicator::open` own the
+  selected endpoint.
+
+`ReplicaProcessConfig`, production manifests and ordinary controller
+configuration expose no preview selector. The application-side SQLite and
+KVStore2 factory switches are likewise testing-only.
+
+One Open may reserve and register one coherent public bundle. The registration
+lease permits one provider writer, and the selected Replicator owns one
+listener. Crossed factory/process selection, schema 6, mismatched preview
+identity, duplicate creation, listener mismatch or Open failure aborts startup
+without legacy fallback.
+
+### Store-free engine
+
+`kuberic-runtime/src/replicator/stateless/` owns only process-local role,
+epoch, exact PC/CC authority, peer sessions, acknowledgement aggregation,
+build state, listener/descendant tasks and provider-derived progress. It has no
+dependency on the managed authority, replication-progress, local-write or
+build-continuation stores.
+
+Open reconciles `StateProvider::last_committed_lsn` with
+`DurableState::durable_progress`, verifies retained bytes for any
+applied-above-committed suffix, and starts access-closed. Role, epoch and
+configuration are admitted only by exact Public V1 replay. Replication
+acknowledgement follows provider durability; both current and previous
+configuration write quorums are required. Any ambiguous provider failure
+fences serving until exact suffix settlement or corrective replacement.
+
+### Dynamic recovery and replacement
+
+The preview implements higher-epoch process-session renewal, specific-quorum
+and `All` catch-up, failover, switchover, build, removal, data-loss handling
+and permanent retirement through the same public methods as an independent
+custom Replicator.
+
+Build freezes a provider copy boundary, streams deterministic copy, then
+streams every retained operation through a later catch-up boundary before
+completion. Incompatible provider or retained history returns
+`ReplicaRebuildRequired`. The old storage incarnation is retired permanently;
+the replacement starts with empty provider state and must complete a new exact
+build before admission. Real SQLite and KVStore2 journeys prove that a retired
+higher-progress store is not copied or readmitted after replacement restart.
+
+### Hosted controller chain
+
+The feature-gated `HostedPublicV1Adapter` implements history,
+session-renewal, `PublicV1OperationApi` and evidence APIs. An evaluator-accepted
+transition becomes one validated `ProtocolCommand::PublicV1Operation`; the
+executor dispatches it through the adapter and preview-only runtime command
+path to the durable operation owner. Only the matching
+`PublicV1AgentReport` completion can be persisted and applied as an exact
+accept, retirement or replacement effect. History/session renewal precede
+dependent operation/evidence acceptance.
+
+This chain is compiled only by `runtime-test-bridge`; production normalization,
+CRDs and dispatch continue to reject Public V1.
+
+### Conformance and security boundary
+
+The shared KSF catalog maps the built-in preview to every KSF-01 through
+KSF-15 public-observable result. KSF-09 and KSF-10 also retain negative
+replacement-artifact guards while the legacy capability and listener remain.
+KSF-16 has no preview scenario and remains the Phase 7 legacy-continuation
+guard.
+
+Public V1 replication transport intentionally has no peer authentication or
+authorization. Identity, process session, epoch, configuration, history,
+storage incarnation, build attempt and operation IDs are correctness fences,
+not credentials. The bearer token used by hosted fixtures protects the
+separate agent control endpoint, not Replicator peer transport.
 
 ## Public V1 Contract
 
@@ -1003,10 +1092,10 @@ Exit criteria:
 - evaluator/executor tests consume only the new public protocol and produce the
   same commands/outcomes expected by the strict conformance oracle.
 
-### Phase 3: Build a Parallel Stateless Engine Core
+### Alignment Phase 6A: Build a Parallel Stateless Engine Core
 
-This phase begins alignment Phase 6. It creates a separate replacement rather
-than removing persistence from `DefaultReplicatorInner` incrementally.
+**Status:** delivered in Phase 6. This step created a separate replacement
+rather than removing persistence from `DefaultReplicatorInner` incrementally.
 
 - implement a new stateless default Replicator behind a test-only or explicitly
   selected factory;
@@ -1046,7 +1135,9 @@ Exit criteria:
 - role, epoch, configuration, StateReplicator, provider and transport unit
   suites pass against an empty engine.
 
-### Phase 4: Complete Recovery, Provider and Semantic Conformance
+### Alignment Phase 6B: Complete Recovery, Provider and Semantic Conformance
+
+**Status:** delivered in Phase 6.
 
 - implement durable-before-acknowledgement replication and conservative
   ambiguous client failure without local-write recovery;
@@ -1070,9 +1161,9 @@ Exit criteria:
   reconciler; direct runtime-command tests do not satisfy this gate;
 - pass every required KSF-01 through KSF-15 behavior and prove KSF-16 is
   confined to the unselected legacy engine;
-- pass ordinary, crash-boundary, all-survivor restart, divergence, transport,
-  stale-session and live-cluster conformance tests without selecting the
-  replacement for production.
+- pass focused bounded ownership, all-survivor restart, divergence, transport,
+  stale-session, controller and real-provider conformance tests without
+  selecting the replacement for production.
 
 Exit criteria:
 
@@ -1082,15 +1173,15 @@ Exit criteria:
   validation admits the new history or returns rebuild-required;
 - all required KSF-01 through KSF-15 tests pass and KSF-16 is reachable only
   through the still-unselected legacy engine;
-- real PostgreSQL, SQLite and KVStore2 fresh-state suites pass under preview
-  selection;
+- real SQLite and KVStore2 fresh-state suites pass under preview selection,
+  while PostgreSQL retains independent custom/Public V1 coverage;
 - controller-driven preview scenarios match the direct public oracle while
   reading no private progress/build evidence;
 - production manifests and the running production protocol remain legacy.
 
-### Phase 5: Finalize the Replacement-Only Cutover Release
+### Alignment Phase 7A: Finalize the Replacement-Only Cutover Release
 
-This phase is the code-removal portion of alignment Phase 7. It produces the
+This is the code-removal portion of alignment Phase 7. It produces the
 only binary eligible for production activation; no application traffic uses it
 yet.
 
@@ -1123,15 +1214,15 @@ Exit criteria:
 - KSF-16 is closed before activation: no compiled/reachable legacy continuation
   owner, store, capability attachment or replication dispatcher remains;
 - source guards reject reintroduction of every removed private path;
-- the replacement-only artifact passes the complete Phase 4 acceptance suite
+- the replacement-only artifact passes the complete Phase 6 acceptance suite
   from empty controller, agent and application state;
 - the approved cutover manifest references the exact reviewed/tested artifact
   digest;
 - no production deployment has yet selected the new protocol.
 
-### Phase 6: Perform the Atomic Fresh-Storage Cutover
+### Alignment Phase 7B: Perform the Atomic Fresh-Storage Cutover
 
-This phase is the offline activation portion of alignment Phase 7.
+This is the offline activation portion of alignment Phase 7.
 
 - require an explicit irreversible-cutover approval recording that required
   application-level exports completed or that no old data is retained;
@@ -1143,7 +1234,7 @@ This phase is the offline activation portion of alignment Phase 7.
 - create a fresh installation namespace and controller-owned resource UID; do
   not reset or reuse the old namespace/resource. Quarantine the old namespace
   so already-accepted delayed mutations cannot affect the replacement;
-- deploy only the Phase 5 replacement-only controller/runtime/Replicator and
+- deploy only the Phase 7A replacement-only controller/runtime/Replicator and
   provider artifact; the new controller uses a fresh protocol generation,
   command credential and namespace-scoped mutation RBAC and must acquire the
   Lease before reconciling;
@@ -1169,7 +1260,31 @@ Exit criteria:
 - post-activation ordinary, PostgreSQL smoke and fresh SQLite/KVStore2 live
   gates pass.
 
-No part of Phases 1-6 is activated independently in a production deployment.
+No dormant Public V1 or preview step is activated independently in a
+production deployment.
+
+### Phase 6 verification boundary
+
+The delivered preview is covered by:
+
+- 13 direct `stateless_preview_recovery` ownership, static/dynamic recovery,
+  ambiguity, replacement and dormancy tests;
+- the shared KSF runner, which maps built-in preview observations to every
+  KSF-01 through KSF-15 result and keeps KSF-16 as a Phase 7-only guard;
+- feature-gated controller operation/evidence and session-renewal tests;
+- one real SQLite and one real KVStore2 fresh restart/build/corrective-empty-
+  replacement journey;
+- the unchanged bounded PostgreSQL smoke tier for the independent custom
+  implementation.
+
+Every newly added Phase 6 test has an internal bound of at most 270 seconds;
+the generic 300-second nextest limit is only an external backstop. Run the
+exact selectors serially (`-j 1`): the shared KSF test starts nested Cargo/
+nextest work, and the hosted runtime/provider journeys own real listeners and
+durable test roots. Parallel execution can add transient build, port and host
+resource contention, so it is not the diagnostic oracle. Exact commands and
+the documentation-phase verification record are in
+[Kuberic Test Strategy](testing.md#service-fabric-public-v1-phase-6-preview).
 
 ## Testing Strategy
 
