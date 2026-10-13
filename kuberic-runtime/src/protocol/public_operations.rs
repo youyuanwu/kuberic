@@ -587,6 +587,7 @@ pub struct PublicReplicaDescriptor {
     pub identity: ReplicaIdentity,
     pub replication_address: String,
     pub process_session_id: ProcessSessionId,
+    pub storage_incarnation: Option<ReplicaStorageIncarnationContext>,
     pub role: ReplicaRole,
     pub current_progress: i64,
     pub catch_up_capability: i64,
@@ -598,6 +599,14 @@ impl PublicReplicaDescriptor {
         validate_exact_replica_identity(&self.identity)?;
         if self.replication_address.is_empty() || self.process_session_id.is_empty() {
             return Err("public replica descriptor lacks an exact address or process session");
+        }
+        let storage = self
+            .storage_incarnation
+            .as_ref()
+            .ok_or("public replica descriptor lacks storage incarnation")?;
+        storage.validate()?;
+        if storage.replica != self.identity {
+            return Err("public replica descriptor storage differs from its identity");
         }
         validate_progress_value(self.current_progress)?;
         validate_progress_value(self.catch_up_capability)?;
@@ -688,9 +697,31 @@ impl PublicBuildAttemptReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicInboundBuildAuthority {
+    pub attempt: PublicBuildAttemptReference,
+    pub history: HistoryContext,
+    pub current_configuration_id: ConfigurationId,
+    pub target_address: String,
+}
+
+impl PublicInboundBuildAuthority {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.attempt.validate()?;
+        self.history.validate()?;
+        if self.current_configuration_id.is_empty() || self.target_address.is_empty() {
+            return Err("inbound build authority lacks configuration or target address");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PublicBuildInput {
     pub attempt: OperationId,
     pub epoch: Epoch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_configuration_id: Option<ConfigurationId>,
     pub replica: ReplicaIdentity,
     pub target_storage: ReplicaStorageIncarnationContext,
     pub process_session_id: ProcessSessionId,
@@ -704,6 +735,7 @@ impl PublicBuildInput {
     pub(crate) fn same_attempt_as(&self, other: &Self) -> bool {
         self.attempt == other.attempt
             && self.epoch == other.epoch
+            && self.current_configuration_id == other.current_configuration_id
             && self.replica == other.replica
             && self.target_storage == other.target_storage
             && self.process_session_id == other.process_session_id
@@ -740,6 +772,7 @@ pub enum PublicOperationProgram {
         handoff: ReplicaRole,
         catch_up_specific_quorum: bool,
         mode: PublicCatchUpMode,
+        controller_composed: bool,
     },
     Build(PublicBuildInput),
     Remove(PublicBuildInput),
@@ -826,6 +859,7 @@ impl PublicOperationProgram {
                 handoff,
                 catch_up_specific_quorum,
                 mode,
+                controller_composed,
             } => {
                 starting.validate_for_preview(public_v1)?;
                 refreshed.validate_for_preview(public_v1)?;
@@ -849,6 +883,9 @@ impl PublicOperationProgram {
                     }
                 } else if *catch_up_specific_quorum {
                     return Err("protocol-10 swap cannot carry public-v1 capability metadata");
+                }
+                if *controller_composed && !public_v1 {
+                    return Err("protocol-10 swap cannot be controller composed");
                 }
                 PublicOperationClass::PlannedSwap
             }
@@ -882,6 +919,14 @@ impl PublicOperationProgram {
                     return Err("protocol-10 build cannot carry public-v1 history");
                 }
                 if matches!(self, Self::Build(_)) {
+                    if public_v1
+                        && build
+                            .current_configuration_id
+                            .as_ref()
+                            .is_none_or(ConfigurationId::is_empty)
+                    {
+                        return Err("public-v1 build lacks exact current configuration");
+                    }
                     if &build.attempt != id {
                         return Err("build operation is not its exact attempt");
                     }
@@ -943,6 +988,7 @@ impl PublicOperationProgram {
                 handoff,
                 catch_up_specific_quorum,
                 mode,
+                controller_composed,
             } => {
                 encoder.u8(7);
                 encoder.public_configuration(starting);
@@ -951,6 +997,7 @@ impl PublicOperationProgram {
                 encoder.replica_role(*handoff);
                 encoder.bool(*catch_up_specific_quorum);
                 encoder.catch_up_mode(*mode);
+                encoder.bool(*controller_composed);
             }
             Self::Build(build) => {
                 encoder.u8(8);
@@ -2918,6 +2965,9 @@ impl CanonicalEncoder {
         self.replica_identity(&replica.identity);
         self.string(&replica.replication_address);
         self.string(replica.process_session_id.as_str());
+        self.option(replica.storage_incarnation.as_ref(), |encoder, storage| {
+            encoder.storage_incarnation(storage);
+        });
         self.replica_role(replica.role);
         self.i64(replica.current_progress);
         self.i64(replica.catch_up_capability);
@@ -2940,6 +2990,12 @@ impl CanonicalEncoder {
     fn public_build(&mut self, build: &PublicBuildInput) {
         self.string(build.attempt.as_str());
         self.epoch(build.epoch);
+        self.option(
+            build.current_configuration_id.as_ref(),
+            |encoder, configuration| {
+                encoder.string(configuration.as_str());
+            },
+        );
         self.replica_identity(&build.replica);
         self.storage_incarnation(&build.target_storage);
         self.string(build.process_session_id.as_str());

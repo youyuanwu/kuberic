@@ -321,7 +321,7 @@ const GATES: [Gate; 16] = [
         owner: "reporting",
         strict_scenarios: &["public_v1_role_address_runtime_to_controller_publish_replace_clear"],
         postgres_scenarios: &[],
-        preview_scenarios: &["public_v1_role_address_runtime_to_controller_publish_replace_clear"],
+        preview_scenarios: &["hosted_preview_role_address_publishes_replaces_and_clears"],
         expected: "exact role completion publishes and clears address",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -364,7 +364,9 @@ const GATES: [Gate; 16] = [
         owner: "close",
         strict_scenarios: &["contained_close_failures_preserve_typed_diagnostics_and_order"],
         postgres_scenarios: &["public_v1_postgres_contained_close"],
-        preview_scenarios: &["hosted_preview_contained_close_retains_typed_child_diagnostic"],
+        preview_scenarios: &[
+            "hosted_preview_contained_close_restarts_without_replaying_interrupted_children",
+        ],
         expected: "child diagnostics do not change normalized outer close",
         eligibility: contract_gate,
         future: FutureObligation::None,
@@ -379,6 +381,7 @@ const GATES: [Gate; 16] = [
         ],
         postgres_scenarios: &[],
         preview_scenarios: &[
+            "hosted_preview_contained_close_restarts_without_replaying_interrupted_children",
             "durable_build_application_never_reinvokes_the_build_callback",
             "public_operation_replay_matrix_converges_each_repeatable_program_family",
             "public_v1_history_admission_gates_all_data_loss_outcomes",
@@ -568,30 +571,6 @@ pub fn assert_public_v1_conformance_subject(subject: &str) {
         ),
         "unknown Public V1 conformance subject: {subject}"
     );
-    let deadline = Instant::now() + CONFORMANCE_TIMEOUT;
-    let subjects = if subject == "strict-custom+built-in-preview" {
-        &["strict-custom", "built-in-preview"][..]
-    } else {
-        std::slice::from_ref(&subject)
-    };
-    for selected in subjects {
-        if *selected == "strict-custom" {
-            run_scenarios(
-                "strict-custom",
-                &["kuberic-runtime"],
-                |gate| gate.strict_scenarios,
-                deadline,
-            );
-        } else if *selected == "built-in-preview" {
-            run_scenarios(
-                "built-in-preview",
-                &["kuberic-runtime", "kuberic-controller"],
-                |gate| gate.preview_scenarios,
-                deadline,
-            );
-        }
-    }
-
     for (index, gate) in GATES.iter().enumerate() {
         assert_eq!(gate.id, format!("KSF-{:02}", index + 1));
         assert!(!gate.name.is_empty(), "{} has no stable gate name", gate.id);
@@ -624,6 +603,33 @@ pub fn assert_public_v1_conformance_subject(subject: &str) {
             .iter()
             .any(|gate| gate.future == FutureObligation::Phase6Engine)
     );
+}
+
+pub fn execute_public_v1_conformance_subject(subject: &str) {
+    assert_public_v1_conformance_subject(subject);
+    let deadline = Instant::now() + CONFORMANCE_TIMEOUT;
+    let subjects = if subject == "strict-custom+built-in-preview" {
+        &["strict-custom", "built-in-preview"][..]
+    } else {
+        std::slice::from_ref(&subject)
+    };
+    for selected in subjects {
+        if *selected == "strict-custom" {
+            run_scenarios(
+                "strict-custom",
+                &["kuberic-runtime"],
+                |gate| gate.strict_scenarios,
+                deadline,
+            );
+        } else if *selected == "built-in-preview" {
+            run_scenarios(
+                "built-in-preview",
+                &["kuberic-runtime", "kuberic-controller"],
+                |gate| gate.preview_scenarios,
+                deadline,
+            );
+        }
+    }
 }
 
 pub fn assert_public_v1_conformance_gate(subject: &str, id: &str, scenario: &str) {

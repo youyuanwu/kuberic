@@ -1288,6 +1288,10 @@ pub(crate) fn copy_to_proto(item: CopyItem) -> proto::CopyItem {
         snapshot_chunk: item.snapshot_chunk,
         sender_session_id: String::new(),
         receiver_session_id: String::new(),
+        source_storage: None,
+        target_storage: None,
+        history: None,
+        target_address: String::new(),
     }
 }
 

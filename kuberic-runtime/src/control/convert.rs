@@ -405,7 +405,7 @@ fn extension_slot(version: u32) -> Result<PublicV1ExtensionSlot, WireError> {
     })
 }
 
-fn public_v1_history_from_proto(
+pub(crate) fn public_v1_history_from_proto(
     value: proto::PublicV1HistoryContext,
 ) -> Result<HistoryContext, WireError> {
     let history = HistoryContext {
@@ -420,7 +420,7 @@ fn public_v1_history_from_proto(
     Ok(history)
 }
 
-fn public_v1_history_to_proto(value: &HistoryContext) -> proto::PublicV1HistoryContext {
+pub(crate) fn public_v1_history_to_proto(value: &HistoryContext) -> proto::PublicV1HistoryContext {
     proto::PublicV1HistoryContext {
         resource_uid: value.resource_uid.as_str().to_string(),
         protocol_generation: value.protocol_generation.value(),
@@ -429,7 +429,7 @@ fn public_v1_history_to_proto(value: &HistoryContext) -> proto::PublicV1HistoryC
     }
 }
 
-fn public_v1_storage_from_proto(
+pub(crate) fn public_v1_storage_from_proto(
     value: proto::PublicV1StorageIncarnation,
 ) -> Result<ReplicaStorageIncarnationContext, WireError> {
     let kind =
@@ -480,7 +480,7 @@ fn public_v1_storage_from_proto(
     Ok(incarnation)
 }
 
-fn public_v1_storage_to_proto(
+pub(crate) fn public_v1_storage_to_proto(
     value: &ReplicaStorageIncarnationContext,
 ) -> proto::PublicV1StorageIncarnation {
     let (kind, pod_uid, pvc_uid, volatile_identity) = match &value.storage {

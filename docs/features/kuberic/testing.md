@@ -16,10 +16,10 @@ just nextest-test
 ```
 
 The `ordinary` profile is cluster-free and excludes PostgreSQL, DEX's real
-Kubernetes target and build-only guards. It runs with four global slots; the
-SQLite group has one slot, and each runtime host process-boundary test reserves
-all four slots so its subprocess recovery deadlines are not competing with
-another test. CI divides the current ordinary inventory into four slices.
+Kubernetes target and build-only guards. `just nextest-test` runs it with two
+test threads in a clean non-incremental `target/nextest-ordinary`; the SQLite
+group remains serial and process-boundary grouping prevents competing recovery
+fixtures. CI divides the current ordinary inventory into four slices.
 
 The all-features archive includes every test binary, including resource-backed
 tiers. Validate its exact-one disposition and partition union before relying on
@@ -30,9 +30,9 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated validator accounts for 1,374 tests: 1,121 ordinary, one
+The consolidated inventory accounts for 1,382 tests: 1,128 ordinary, one
 build-only, 213 directly runnable PostgreSQL tests, 19 live KinD tests covering
-12 scenario identities, one DEX live test and 19 mapped parent-driven
+12 scenario identities, one DEX live test and 20 mapped parent-driven
 subprocess helpers.
 Use its generated counts as the inventory evolves.
 
@@ -95,15 +95,15 @@ test/development features. Ordinary production construction and manifests
 remain on protocol 9/schema 6 and the legacy managed engine; the preview uses
 fresh protocol 11/schema 11 state.
 
-Run the exact Phase 6 selectors serially. The shared KSF test starts nested
-Cargo/nextest commands, while the hosted runtime and provider journeys own real
-listeners and durable roots. `-j 1` is the reproducible diagnostic boundary;
-parallel ordinary execution may add transient Cargo, listener or host-resource
-contention, but contention is not treated as a passing result.
+Run exact hosted selectors serially. Structural KSF checks do not start nested
+Cargo work; the separate ignored KSF execution gate does. Hosted runtime and
+provider journeys own real listeners and durable roots. `-j 1` is the
+reproducible focused boundary.
 
 ### Runtime ownership, hosted recovery and conformance
 
-The inventory is exactly 15 direct recovery tests plus two catalog tests:
+The inventory is exactly 20 direct recovery tests, two ordinary structural
+catalog tests and one ignored bounded execution gate:
 
 ```bash
 scripts/assert_nextest_selection.sh \
@@ -112,7 +112,10 @@ scripts/assert_nextest_selection.sh \
   --require-binary public_v1_conformance \
   --require-test preview_open_owns_registration_listener_and_writer_exactly_once \
   --require-test hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close \
-  --require-test hosted_preview_contained_close_retains_typed_child_diagnostic \
+  --require-test hosted_preview_contained_close_restarts_without_replaying_interrupted_children \
+  --require-test hosted_preview_role_address_publishes_replaces_and_clears \
+  --require-test primary_write_revocation_fences_provider_apply_and_peer_ack_interleavings \
+  --require-test bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close \
   --require-test hosted_preview_rebuild_retires_and_restarts_fresh_replacement \
   --require-test ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress \
   --require-test public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16 \
@@ -124,16 +127,22 @@ scripts/assert_nextest_selection.sh \
 cargo nextest run -j 1 -p kuberic-runtime --all-features \
   --profile ordinary -E 'binary(stateless_preview_recovery)'
 
-KUBERIC_WORKSPACE_TESTS=1 cargo nextest run -j 1 \
+cargo nextest run -j 1 \
   -p kuberic-runtime --all-features --profile ordinary \
   -E 'test(public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16) or test(built_in_preview_ksf_mappings_require_each_authorized_observation)'
+
+cargo nextest run -j 1 -p kuberic-runtime --all-features \
+  --profile ordinary --run-ignored only \
+  -E 'test(public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
 ```
 
 The direct binary covers immutable selection, exact engine/provider-writer/
 listener ownership, schema-11 bootstrap, no-fallback startup, static
-reconstruction, durable-before-ACK writes, ambiguous suffix containment,
-higher-epoch session renewal, failover/switchover, build, removal, data loss,
-permanent retirement, empty replacement and post-replacement restart. The
+reconstruction, durable-before-ACK writes, write-authority interleavings,
+exact-current-primary ingress, bounded concurrent peer work, ambiguous suffix
+containment, higher-epoch session renewal, failover/switchover, build, removal,
+data loss, permanent retirement, empty replacement and post-replacement
+restart. The
 full hosted switchover and build chains execute in this
 `stateless_preview_recovery` binary because it owns both the preview runtime
 fixtures and the feature-gated controller adapter.
@@ -208,10 +217,10 @@ Every newly added Phase 6 test has an internal timeout no greater than 270
 seconds:
 
 - direct runtime tests: 30, 120, 150 or 180 seconds;
-- shared nested KSF runner: one absolute 270-second parent deadline shared by
-  strict-custom and built-in-preview inventory and execution commands; the
-  second subject cannot reset the budget, with process-tree
-  termination/reaping regression coverage;
+- exact structural mapping override: 270 seconds;
+- ignored nested KSF execution gate: one absolute 270-second parent deadline
+  shared by strict-custom and built-in-preview inventory/execution, with
+  process-tree termination/reaping regression coverage;
 - new controller target/removal/survivor tests: 270 seconds;
 - SQLite/KVStore2 journeys: 180 seconds, with tighter build waits.
 
@@ -221,41 +230,33 @@ prevents the hosted switchover commit handshake from being lost during nested
 conformance execution. Focused serial selectors remain the supported way to
 separate protocol failures from transient build/host contention.
 
-The Phase 6 implementation spans commits `eec6d25` through `c6010a0`. The
-2026-10-13 documentation rerun at `c6010a0` produced:
+The 2026-10-13 final-review remediation rerun recorded:
 
-- runtime inventory: 15 tests; direct recovery: 13/13 passed in 70.734s;
-- shared KSF selector: 2/2 passed, with the nested KSF-01..16 oracle taking
-  222.845s inside its 270-second parent bound;
-- controller inventory/execution: 16/16 passed in 0.071s;
-- provider inventory/execution: 2/2 passed; SQLite took 24.962s and KVStore2
-  took 143.775s inside their 180-second bounds.
-- bounded PostgreSQL smoke: 4/4 Public V1 scenarios passed in 41.397s, then
-  8/8 representative workspace scenarios passed in 317.421s. The slowest
-  single scenario took 179.547s, within its 240-second internal bound.
-- `just nextest-test`: passed all 1,121 selected ordinary tests;
-- `just nextest-validate`: passed exact-once validation for 1,374 tests,
-  including 1,121 ordinary and 213 directly runnable PostgreSQL tests;
-- `lifecycle_capability_boundaries`: 6/6 passed;
-- `scripts/check_runtime_public_api.sh`, `cargo check --workspace`,
-  `cargo fmt --all -- --check`, Markdown-link and documented-path checks
-  passed.
+- direct runtime recovery: 20/20 passed in 64.810s;
+- structural KSF catalog: 2/2 passed; the separate ignored exact conformance
+  execution gate passed in 160.907s inside its 270-second parent bound;
+- controller operation/evidence and renewal: 16/16 passed in 0.077s;
+- real provider journeys: 2/2 passed together in 152.689s (KVStore2 106.171s,
+  SQLite 46.517s), each inside its 180-second bound;
+- `just nextest-test`: 1,128/1,128 passed, 37 skipped, in 512.867s. The recipe
+  used a clean `target/nextest-ordinary`, `CARGO_INCREMENTAL=0`, disabled test
+  debuginfo and two test threads; no nested conformance process ran in the
+  ordinary tier;
+- bounded PostgreSQL smoke: 4/4 Public V1 scenarios passed in 15.509s, then
+  8/8 representative scenarios passed in 156.886s; the slowest passing
+  individual scenario took 42.185s;
+- lifecycle capability boundaries passed 6/6; runtime API inventory, workspace
+  all-feature check, formatting and diff hygiene passed.
 
-The review-guard P3 rerun on 2026-10-13 updated the runtime inventory to 17
-tests: 15/15 direct preview scenarios passed in 101.109s, the exact two-test
-KSF selector passed in 127.350s, and the shared-deadline reset/reaping
-regression passed in 0.419s. Workspace all-feature check, runtime public-API
-inventory, formatting, diff hygiene and documentation target checks passed.
-The broad `just nextest-test` run passed 1,122/1,123 tests; its nested KSF
-oracle reached the intentional 270-second parent deadline while competing
-with the broad suite. The exact serial KSF selector above passed and remains
-the supported diagnostic result for that nested test.
+The KSF runner and real-provider journeys have deliberately bounded but finite
+headroom on this host. Run exact serial selectors before attributing a timeout
+to protocol failure.
 
-The KSF runner and KVStore2 journey have deliberately bounded but finite
-headroom on this host. Do not add parallel work inside those tests or combine
-them into a broader focused command without remeasuring the internal deadline.
-Run their exact serial selectors before attributing a timeout to protocol
-failure.
+The first PostgreSQL smoke immediately after a clean rebuild hit the existing
+240-second internal bounds in the acknowledged-row failover and planned
+switchover scenarios. Their timeout containment reaped all PostgreSQL
+processes; an immediate unchanged rerun passed 4/4 plus 8/8. No deadline was
+increased and no result from the timed-out run is claimed as passing evidence.
 
 The first PostgreSQL documentation attempt exhausted `/data` while compiling;
 removing only `target/debug/incremental` restored 15 GiB. A second attempt used

@@ -51,7 +51,11 @@ message CopyItem {
   string sender_session_id = 14;
   string receiver_session_id = 15;
   optional int64 catch_up_boundary_lsn = 16;
-  reserved 17;
+  PublicV1StorageIncarnation source_storage = 17;
+  PublicV1StorageIncarnation target_storage = 18;
+  PublicV1HistoryContext history = 19;
+  string target_address = 20;
+  reserved 21;
 }
 
 message CopyAck {

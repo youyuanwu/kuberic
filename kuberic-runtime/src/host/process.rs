@@ -857,6 +857,28 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn install_stateless_preview_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let preview = self.preview.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with stateless preview selection".into(),
+            )
+        })?;
+        if !preview.binding.preview.is_public_v1()
+            || authority.attempt.target != self.store.load_state().await?.identity.local_identity
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "inbound build authority differs from selected preview target".into(),
+            ));
+        }
+        self.store
+            .install_public_v1_inbound_build_authority(authority)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn execute_stateless_preview(
         &self,
         intent: crate::protocol::public_operations::PublicOperationIntent,

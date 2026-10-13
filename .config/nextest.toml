@@ -56,6 +56,16 @@ filter = 'package(=sqlite-replicated)'
 test-group = 'sqlite'
 
 [[profile.default.overrides]]
+filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=built_in_preview_ksf_mappings_require_each_authorized_observation)'
+slow-timeout = { period = "270s", terminate-after = 1 }
+test-group = 'process-boundaries'
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
+slow-timeout = { period = "270s", terminate-after = 1 }
+test-group = 'process-boundaries'
+
+[[profile.default.overrides]]
 filter = 'binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)'
 test-group = 'process-boundaries'
 threads-required = 4

@@ -128,6 +128,9 @@ fn build_intent(
     let program = PublicOperationProgram::Build(PublicBuildInput {
         attempt: operation_id.clone(),
         epoch: Epoch::new(history.data_loss_number, 7),
+        current_configuration_id: Some(kuberic_runtime::protocol::types::ConfigurationId::new(
+            "schema11-build-configuration",
+        )),
         replica: target.replica.clone(),
         target_storage: target.clone(),
         process_session_id: target_session,

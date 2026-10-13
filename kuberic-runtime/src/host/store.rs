@@ -4,6 +4,8 @@ use crate::effects::{RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::DataLossRenewalDecision;
+#[cfg(any(test, feature = "testing"))]
+use crate::protocol::public_operations::PublicInboundBuildAuthority;
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 use crate::protocol::public_operations::{
     PublicFaultAction, RestartActionRecord, RestartActionStage,
@@ -214,6 +216,48 @@ pub(crate) trait AgentStore: Send + Sync {
         Err(crate::host::HostError::CommandRejected(
             "public-operation preview is not enabled for this store".into(),
         ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn install_public_v1_inbound_build_authority(
+        &self,
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 inbound build authority is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_inbound_build_authority(
+        &self,
+        _build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        Ok(None)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_outbound_build_authority(
+        &self,
+        _build_id: &OperationId,
+        _current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        Ok(None)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn complete_public_v1_inbound_build(&self, _build_id: &OperationId) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 inbound build authority is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_storage_is_retired(
+        &self,
+        _storage: &ReplicaStorageIncarnationContext,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     #[cfg(all(feature = "testing", kuberic_workspace_tests))]

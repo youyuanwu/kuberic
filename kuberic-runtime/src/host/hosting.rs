@@ -3072,6 +3072,9 @@ impl PartitionAccessView for HostAccessView {
         ambiguous: bool,
     ) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
         host.preview_ambiguity_fenced
             .store(ambiguous, Ordering::Release);
         let fenced = ambiguous
@@ -3093,6 +3096,83 @@ impl PartitionAccessView for HostAccessView {
         state.fallback_snapshot.read_status = read;
         state.fallback_snapshot.write_status = write;
         Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    async fn preview_inbound_build_authority(
+        &self,
+        build_id: &crate::protocol::types::OperationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .public_v1_inbound_build_authority(build_id)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    async fn preview_outbound_build_authority(
+        &self,
+        build_id: &crate::protocol::types::OperationId,
+        current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .public_v1_outbound_build_authority(build_id, current_configuration_id)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    async fn complete_preview_inbound_build(
+        &self,
+        build_id: &crate::protocol::types::OperationId,
+    ) -> Result<()> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .complete_public_v1_inbound_build(build_id)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    async fn preview_storage_is_retired(
+        &self,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .public_v1_storage_is_retired(storage)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {

@@ -249,6 +249,28 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
             ));
         }
     }
+    for (build_id, authority) in &preview.inbound_build_authorities {
+        authority
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+        if build_id != &authority.attempt.build_id
+            || authority.attempt.target != state.identity.local_identity
+            || preview
+                .storage_incarnation
+                .as_ref()
+                .is_some_and(|storage| storage != &authority.attempt.target_storage)
+            || preview.history.as_ref() != Some(&authority.history)
+        {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 inbound build authority differs from target durable authority".into(),
+            ));
+        }
+    }
+    for storage in &preview.retired_storage_incarnations {
+        storage
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+    }
     Ok(())
 }
 
@@ -2015,6 +2037,9 @@ impl AgentStore for SqliteStore {
                 preview.current_operation = None;
                 preview.current_topology_operation = None;
                 preview.active_builds.clear();
+                preview.build_records.clear();
+                preview.absent_builds.clear();
+                preview.inbound_build_authorities.clear();
                 preview.writes_revoked = false;
             }
             if !intent.class.is_terminal() && !preview.history_barriers.is_empty() {
@@ -2063,7 +2088,10 @@ impl AgentStore for SqliteStore {
                     } else {
                         None
                     };
-                    if preview.active_builds.contains_key(&build.replica.replica_id)
+                    if preview
+                        .retired_storage_incarnations
+                        .contains(&build.target_storage)
+                        || preview.active_builds.contains_key(&build.replica.replica_id)
                         || preview.operations.values().filter(|record| {
                             preview.current_topology_operation.as_ref().map_or_else(
                                 || {
@@ -2261,6 +2289,7 @@ impl AgentStore for SqliteStore {
                         preview.active_builds.clear();
                         preview.build_records.clear();
                         preview.absent_builds.clear();
+                        preview.inbound_build_authorities.clear();
                         preview.operations.clear();
                         preview.current_topology_operation = None;
                         preview.current_operation = None;
@@ -3282,8 +3311,19 @@ impl AgentStore for SqliteStore {
                         }
                         preview.active_builds.remove(&build.replica.replica_id);
                         preview.absent_builds.insert(build.attempt.clone());
-                        if let Some(build_record) =
-                            preview.build_records.get_mut(&build.attempt)
+                        if intent.preview.is_public_v1()
+                            && !preview
+                                .retired_storage_incarnations
+                                .contains(&build.target_storage)
+                        {
+                            preview
+                                .retired_storage_incarnations
+                                .push(build.target_storage.clone());
+                        }
+                        if let Some(build_record) = preview
+                            .build_records
+                            .values_mut()
+                            .find(|record| record.build_id == build.attempt)
                         {
                             if build_record.target != build.replica
                                 || build_record.target_storage != build.target_storage
@@ -3338,6 +3378,163 @@ impl AgentStore for SqliteStore {
             }
             write_agent_state(transaction, &state)
         })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn install_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        authority
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "inbound build authority requires a public-v1 store".into(),
+                )
+            })?;
+            if !preview.identity.is_public_v1()
+                || authority.attempt.target != state.identity.local_identity
+                || preview.history.as_ref() != Some(&authority.history)
+                || preview.storage_incarnation.as_ref() != Some(&authority.attempt.target_storage)
+                || preview
+                    .retired_storage_incarnations
+                    .contains(&authority.attempt.target_storage)
+                || preview
+                    .completed_inbound_builds
+                    .contains(&authority.attempt.build_id)
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "inbound build authority differs from durable target authority".into(),
+                ));
+            }
+            match preview
+                .inbound_build_authorities
+                .get(&authority.attempt.build_id)
+            {
+                Some(existing) if existing != authority => {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "inbound build ID changed exact authority".into(),
+                    ));
+                }
+                Some(_) => return Ok(()),
+                None => {}
+            }
+            preview
+                .inbound_build_authorities
+                .insert(authority.attempt.build_id.clone(), authority.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_inbound_build_authority(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        Ok(self
+            .load_state()
+            .await?
+            .public_operation_preview
+            .and_then(|preview| preview.inbound_build_authorities.get(build_id).cloned()))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_outbound_build_authority(
+        &self,
+        build_id: &OperationId,
+        current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        let state = self.load_state().await?;
+        let Some(preview) = state.public_operation_preview else {
+            return Ok(None);
+        };
+        let Some(record) = preview
+            .build_records
+            .values()
+            .find(|record| &record.build_id == build_id)
+        else {
+            return Ok(None);
+        };
+        let operation = preview
+            .operations
+            .get(&record.operation_id)
+            .ok_or_else(|| {
+                crate::host::HostError::Corrupt(
+                    "outbound build record lacks its durable operation".into(),
+                )
+            })?;
+        let Some(crate::protocol::public_operations::PublicOperationProgram::Build(build)) =
+            operation.intent.program.as_ref()
+        else {
+            return Err(crate::host::HostError::Corrupt(
+                "outbound build record operation changed kind".into(),
+            ));
+        };
+        if build.current_configuration_id.as_ref() != Some(current_configuration_id) {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "outbound build changed current configuration".into(),
+            ));
+        }
+        Ok(Some(
+            crate::protocol::public_operations::PublicInboundBuildAuthority {
+                attempt: crate::protocol::public_operations::PublicBuildAttemptReference {
+                    resource_uid: state.identity.resource_uid,
+                    epoch: record.epoch,
+                    build_id: record.build_id.clone(),
+                    source: record.source.clone(),
+                    source_storage: record.source_storage.clone(),
+                    source_session: record.source_session.clone(),
+                    target: record.target.clone(),
+                    target_storage: record.target_storage.clone(),
+                    target_session: record.target_session.clone(),
+                },
+                history: record.history.clone(),
+                current_configuration_id: current_configuration_id.clone(),
+                target_address: record.target_address.clone(),
+            },
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn complete_public_v1_inbound_build(&self, build_id: &OperationId) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "inbound build completion requires a public-v1 store".into(),
+                )
+            })?;
+            let authority = preview
+                .inbound_build_authorities
+                .remove(build_id)
+                .ok_or_else(|| {
+                    crate::host::HostError::StaleEffectCompletion(
+                        "inbound build completion lacks exact authority".into(),
+                    )
+                })?;
+            if authority.attempt.target != state.identity.local_identity {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "inbound build completion changed target".into(),
+                ));
+            }
+            preview.completed_inbound_builds.insert(build_id.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_storage_is_retired(
+        &self,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool> {
+        Ok(self
+            .load_state()
+            .await?
+            .public_operation_preview
+            .is_some_and(|preview| preview.retired_storage_incarnations.contains(storage)))
     }
 
     #[cfg(all(feature = "testing", kuberic_workspace_tests))]

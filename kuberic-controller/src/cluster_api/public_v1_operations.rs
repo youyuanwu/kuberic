@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kuberic_runtime::host::ReplicaHandle;
@@ -5,8 +6,9 @@ use kuberic_runtime::protocol::command::{
     ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicConfiguration, PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
-    PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1SessionRenewalStatus,
+    PublicBuildAttemptReference, PublicConfiguration, PublicInboundBuildAuthority,
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1AcceptedStatus,
+    PublicV1AgentReport, PublicV1CallKind, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{OperationId, ReplicaIdentity};
 
@@ -16,6 +18,8 @@ use super::{
 use crate::evaluator::public_v1_evidence::{
     PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
 };
+
+static NEXT_HOSTED_AUTHORITY_REVISION: AtomicU64 = AtomicU64::new(1_000_000);
 
 #[async_trait::async_trait]
 pub trait PublicV1OperationApi: Send + Sync {
@@ -91,11 +95,152 @@ impl HostedPublicV1Adapter {
             .map_err(|error| error.to_string())
     }
 
+    pub async fn reconstruct_hosted_configuration(
+        &self,
+        operation_id: &OperationId,
+        preview_generation: u64,
+        configuration: &kuberic_runtime::protocol::types::ConfigurationDescriptor,
+    ) -> Result<(), String> {
+        for member in &configuration.members {
+            self.execute_authority_program(
+                &member.identity,
+                preview_generation,
+                OperationId::new(format!(
+                    "{operation_id}-open-{}",
+                    member.identity.replica_id
+                )),
+                PublicOperationProgram::Open {
+                    replica: member.identity.clone(),
+                    existing: true,
+                },
+            )
+            .await?;
+        }
+        self.install_configuration_on_all(operation_id, preview_generation, configuration)
+            .await
+    }
+
     fn replica(&self, identity: &ReplicaIdentity) -> Result<&HostedPreviewReplica, String> {
         self.replicas
             .iter()
             .find(|replica| &replica.identity == identity)
             .ok_or_else(|| "hosted public-v1 command targets an unknown replica".to_string())
+    }
+
+    async fn public_configuration_for(
+        &self,
+        local: &ReplicaIdentity,
+        configuration: &kuberic_runtime::protocol::types::ConfigurationDescriptor,
+    ) -> Result<PublicConfiguration, String> {
+        let mut descriptors = Vec::new();
+        for member in configuration
+            .members
+            .iter()
+            .filter(|member| &member.identity != local)
+        {
+            let remote = self.replica(&member.identity)?;
+            let report = remote
+                .handle
+                .stateless_preview_report()
+                .await
+                .map_err(|error| error.to_string())?;
+            descriptors.push(
+                kuberic_runtime::protocol::public_operations::PublicReplicaDescriptor {
+                    build_id: OperationId::default(),
+                    identity: member.identity.clone(),
+                    replication_address: remote.replication_address.clone(),
+                    process_session_id: report.process_session_id,
+                    storage_incarnation: Some(report.storage_incarnation),
+                    role: member.role,
+                    current_progress: report.progress.last,
+                    catch_up_capability: report.progress.first,
+                    must_catchup: false,
+                },
+            );
+        }
+        Ok(PublicConfiguration {
+            current: configuration.clone(),
+            previous: None,
+            replicas: descriptors,
+        })
+    }
+
+    async fn execute_authority_program(
+        &self,
+        target: &ReplicaIdentity,
+        preview_generation: u64,
+        operation_id: OperationId,
+        program: PublicOperationProgram,
+    ) -> Result<(), String> {
+        let replica = self.replica(target)?;
+        replica
+            .handle
+            .execute_stateless_preview(PublicOperationIntent {
+                preview: kuberic_runtime::protocol::public_operations::
+                    PublicOperationPreviewIdentity::public_v1(preview_generation),
+                operation_id,
+                revision: NEXT_HOSTED_AUTHORITY_REVISION.fetch_add(1, Ordering::AcqRel),
+                process_session_id: replica.handle.process_session_id(),
+                class: PublicOperationClass::Authority,
+                input_digest: program.digest(),
+                replay_disposition: program.replay_disposition(),
+                lifecycle: None,
+                program: Some(program),
+            })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn install_configuration_on_all(
+        &self,
+        operation_id: &OperationId,
+        preview_generation: u64,
+        configuration: &kuberic_runtime::protocol::types::ConfigurationDescriptor,
+    ) -> Result<(), String> {
+        for member in &configuration.members {
+            self.execute_authority_program(
+                &member.identity,
+                preview_generation,
+                OperationId::new(format!(
+                    "{operation_id}-epoch-{}",
+                    member.identity.replica_id
+                )),
+                PublicOperationProgram::Epoch {
+                    epoch: configuration.epoch,
+                },
+            )
+            .await?;
+            self.execute_authority_program(
+                &member.identity,
+                preview_generation,
+                OperationId::new(format!(
+                    "{operation_id}-role-{}",
+                    member.identity.replica_id
+                )),
+                PublicOperationProgram::Role {
+                    epoch: configuration.epoch,
+                    role: member.role,
+                },
+            )
+            .await?;
+        }
+        for member in &configuration.members {
+            let program = PublicOperationProgram::Configuration(
+                self.public_configuration_for(&member.identity, configuration)
+                    .await?,
+            );
+            self.execute_authority_program(
+                &member.identity,
+                preview_generation,
+                OperationId::new(format!(
+                    "{operation_id}-configuration-{}",
+                    member.identity.replica_id
+                )),
+                program,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn dispatch_session(
@@ -179,63 +324,12 @@ impl HostedPublicV1Adapter {
                 accepted,
                 configuration,
             } => {
-                let local = configuration
-                    .members
-                    .iter()
-                    .find(|member| member.identity.replica_id == configuration.primary_id)
-                    .ok_or_else(|| "fresh configuration lacks a primary".to_string())?;
-                let local_replica = self.replica(&local.identity)?;
-                let mut descriptors = Vec::new();
-                for member in configuration
-                    .members
-                    .iter()
-                    .filter(|member| member.identity != local.identity)
-                {
-                    let remote = self.replica(&member.identity)?;
-                    let report = remote
-                        .handle
-                        .stateless_preview_report()
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    descriptors.push(
-                        kuberic_runtime::protocol::public_operations::PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: member.identity.clone(),
-                            replication_address: remote.replication_address.clone(),
-                            process_session_id: report.process_session_id,
-                            role: member.role,
-                            current_progress: report.progress.last,
-                            catch_up_capability: report.progress.first,
-                            must_catchup: false,
-                        },
-                    );
-                }
-                let program = PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: configuration.clone(),
-                    previous: None,
-                    replicas: descriptors,
-                });
-                local_replica
-                    .handle
-                    .execute_stateless_preview(PublicOperationIntent {
-                        preview: kuberic_runtime::protocol::public_operations::
-                            PublicOperationPreviewIdentity::public_v1(
-                                accepted.required.history.protocol_generation.value(),
-                            ),
-                        operation_id: OperationId::new(format!(
-                            "{}-configuration",
-                            accepted.required.operation_id
-                        )),
-                        revision: 1,
-                        process_session_id: local_replica.handle.process_session_id(),
-                        class: PublicOperationClass::Authority,
-                        input_digest: program.digest(),
-                        replay_disposition: program.replay_disposition(),
-                        lifecycle: None,
-                        program: Some(program),
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.install_configuration_on_all(
+                    &accepted.required.operation_id,
+                    accepted.required.history.protocol_generation.value(),
+                    configuration,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -276,11 +370,92 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
                 "hosted public-v1 command target differs from accepted source incarnation".into(),
             );
         }
+        if let Some(PublicOperationProgram::Build(build)) = operation.intent.program.as_ref() {
+            let target = expected
+                .intent
+                .target
+                .as_ref()
+                .ok_or_else(|| "hosted build lacks accepted target authority".to_string())?;
+            if target.storage_incarnation != build.target_storage
+                || build.replica != build.target_storage.replica
+                || build.history.as_ref() != Some(&expected.intent.history)
+                || expected.intent.current_configuration_id.is_none()
+            {
+                return Err("hosted build changed target, history, or configuration".into());
+            }
+            let target_replica = self.replica(&build.replica)?;
+            if target_replica.replication_address != build.replication_address {
+                return Err("hosted build changed target address".into());
+            }
+            target_replica
+                .handle
+                .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+                    attempt: PublicBuildAttemptReference {
+                        resource_uid: expected.intent.history.resource_uid.clone(),
+                        epoch: build.epoch,
+                        build_id: build.attempt.clone(),
+                        source: operation.target.clone(),
+                        source_storage: expected.intent.source.storage_incarnation.clone(),
+                        source_session: operation.intent.process_session_id.clone(),
+                        target: build.replica.clone(),
+                        target_storage: build.target_storage.clone(),
+                        target_session: build.process_session_id.clone(),
+                    },
+                    history: expected.intent.history.clone(),
+                    current_configuration_id: expected
+                        .intent
+                        .current_configuration_id
+                        .clone()
+                        .expect("checked current configuration"),
+                    target_address: build.replication_address.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         self.replica(&operation.target)?
             .handle
             .execute_stateless_preview_command(command.clone())
             .await
             .map_err(|error| error.to_string())?;
+        if let Some(PublicOperationProgram::Swap {
+            refreshed, epoch, ..
+        }) = operation.intent.program.as_ref()
+        {
+            if refreshed.current.epoch != *epoch {
+                return Err("hosted switchover changed refreshed epoch".into());
+            }
+            let target =
+                expected.intent.target.as_ref().ok_or_else(|| {
+                    "hosted switchover lacks accepted target authority".to_string()
+                })?;
+            let target_id = target.storage_incarnation.replica.replica_id;
+            let members = refreshed
+                .current
+                .members
+                .iter()
+                .cloned()
+                .map(|mut member| {
+                    member.role = if member.identity.replica_id == target_id {
+                        kuberic_runtime::protocol::types::ReplicaRole::Primary
+                    } else {
+                        kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary
+                    };
+                    member
+                })
+                .collect();
+            let promoted = kuberic_runtime::protocol::types::ConfigurationDescriptor::new(
+                *epoch,
+                target_id,
+                members,
+                refreshed.current.write_quorum,
+            );
+            self.install_configuration_on_all(
+                &operation.intent.operation_id,
+                expected.intent.history.protocol_generation.value(),
+                &promoted,
+            )
+            .await?;
+        }
         self.dispatched.lock().unwrap().push(command.clone());
         Ok(())
     }
@@ -535,7 +710,13 @@ pub(crate) fn operation_matches_transition(
             Some(*mode),
             Some(*catch_up_specific_quorum),
         ),
-        PublicOperationProgram::Build(_) => (PublicV1CallKind::Build, None, None, None, None),
+        PublicOperationProgram::Build(build) => (
+            PublicV1CallKind::Build,
+            None,
+            build.current_configuration_id.clone(),
+            None,
+            None,
+        ),
         PublicOperationProgram::Remove(_) => (PublicV1CallKind::Remove, None, None, None, None),
         PublicOperationProgram::Close => (PublicV1CallKind::Close, None, None, None, None),
         PublicOperationProgram::Abort => (PublicV1CallKind::Abort, None, None, None, None),

@@ -1002,31 +1002,43 @@ Delivered work:
   role/configuration, peer, ACK, retry, listener and build state;
 - implements durable-before-acknowledgement replication, PC/CC quorum,
   applied-suffix settlement, specific-quorum/`All` catch-up, failover,
-  switchover, removal, data loss and exact process-session fencing;
+  switchover, removal, data loss and exact process-session fencing. Remote
+  quorum counts only current-session exact retained-byte acknowledgements;
+  advertised progress is never a fallback after rejection or unavailability;
+- gives every primary write a revocable authority generation. Role, epoch,
+  configuration, Close and Abort changes fence admission and drain or contain
+  in-flight provider/peer work; revalidation occurs after apply and ACKs,
+  before commit and before progress/success publication;
 - implements copy plus retained replication and admits a target only after the
-  catch-up boundary is durable. Incompatible history returns
+  catch-up boundary is durable. The target durably receives exact inbound
+  source/target storage, session, history, epoch, configuration and address
+  authority before copy; copy frames and ACK direction/epoch must match it.
+  Incompatible history returns
   `ReplicaRebuildRequired`, permanently retires the old incarnation and
   requires an empty replacement;
 - added feature-gated `PublicV1OperationApi` and
   `HostedPublicV1Adapter`. The controller chain validates accepted evaluator
   authority, dispatches one exact `PublicV1Operation` through the executor and
   runtime owner, then accepts only matching public report completion before
-  exact accept/retire/provision effects. Full hosted switchover/build chain
-  coverage is selected by the runtime `stateless_preview_recovery` binary;
-  controller-only selectors cover operation/evidence target fencing, removal
-  and renewal boundaries;
+  exact accept/retire/provision effects. The hosted adapter installs role,
+  epoch and exact configuration on every participant, observes fresh reports
+  and proves one writable primary plus a known replicated write after
+  switchover and all-process restart/failover;
 - registered public-observable built-in preview scenarios for KSF-01 through
   KSF-15 in the same oracle used by strict-custom and applicable PostgreSQL
-  subjects, including focused KSF-12 callback-root/descendant cancellation and
-  KSF-14 contained-close diagnostics. KSF-09 and KSF-10 retain global Phase 7
-  eligibility guards, and KSF-16 remains Phase 7-only;
+  subjects, including hosted KSF-11 address lifecycle, focused KSF-12
+  callback-root/descendant cancellation, KSF-14 contained-close diagnostics
+  and KSF-15 interrupted-restart replay behavior. KSF-09 and KSF-10 retain
+  global Phase 7 eligibility guards, and KSF-16 remains Phase 7-only;
 - added real SQLite and KVStore2 fresh restart, snapshot-plus-retained build,
   divergent-history retirement, empty corrective replacement and
   post-replacement restart journeys;
-- bounded every new Phase 6 test internally at no more than 270 seconds. The
-  nested strict-custom and built-in-preview inventories/executions share one
-  absolute 270-second parent deadline, so the second subject cannot reset the
-  budget. The bounded real PostgreSQL smoke path remains independent.
+- bounded every new Phase 6 test internally at no more than 270 seconds.
+  Structural mapping is covered by an exact 270-second nextest override; the
+  separate ignored strict-custom/built-in-preview execution gate shares one
+  absolute 270-second parent deadline. The ordinary tier no longer nests that
+  gate and runs in a clean non-incremental target directory. The bounded real
+  PostgreSQL smoke path remains independent.
 
 Delivered result:
 

@@ -70,11 +70,27 @@ fn build(attempt: &str) -> PublicBuildInput {
     PublicBuildInput {
         attempt: OperationId::new(attempt),
         epoch: Epoch::new(0, 1),
+        current_configuration_id: None,
         replica,
         target_storage,
         process_session_id: ProcessSessionId::new("target-session"),
         replication_address: "trace://target".into(),
         history: None,
+    }
+}
+
+fn descriptor_storage(
+    replica: crate::protocol::types::ReplicaIdentity,
+) -> crate::protocol::types::ReplicaStorageIncarnationContext {
+    crate::protocol::types::ReplicaStorageIncarnationContext {
+        replica,
+        storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("descriptor-pod"),
+            pvc_uid: PvcUid::new("descriptor-pvc"),
+        },
+        storage_generation: crate::protocol::types::StorageGeneration::new(
+            "descriptor-storage-generation",
+        ),
     }
 }
 
@@ -110,6 +126,7 @@ fn configuration_with_target(epoch: i64) -> PublicConfiguration {
         identity: target.clone(),
         replication_address: "trace://secondary".into(),
         process_session_id: ProcessSessionId::new("secondary-session"),
+        storage_incarnation: Some(descriptor_storage(target.clone())),
         role: ReplicaRole::ActiveSecondary,
         current_progress: 0,
         catch_up_capability: 0,
@@ -161,9 +178,10 @@ fn configuration_with_previous_only_secondary(epoch: i64) -> PublicConfiguration
         replicas: vec![
             crate::protocol::public_operations::PublicReplicaDescriptor {
                 build_id: OperationId::default(),
-                identity: previous_only,
+                identity: previous_only.clone(),
                 replication_address: "trace://previous-only-secondary".into(),
                 process_session_id: ProcessSessionId::new("previous-only-session"),
+                storage_incarnation: Some(descriptor_storage(previous_only.clone())),
                 role: ReplicaRole::ActiveSecondary,
                 current_progress: 0,
                 catch_up_capability: 0,
@@ -181,6 +199,7 @@ fn swap() -> Program {
         handoff: ReplicaRole::ActiveSecondary,
         catch_up_specific_quorum: false,
         mode: PublicCatchUpMode::All,
+        controller_composed: false,
     }
 }
 
@@ -196,6 +215,7 @@ fn specific_quorum_swap() -> Program {
         handoff: ReplicaRole::ActiveSecondary,
         catch_up_specific_quorum: true,
         mode: PublicCatchUpMode::WriteQuorum,
+        controller_composed: false,
     }
 }
 
@@ -207,6 +227,7 @@ fn legacy_write_quorum_swap() -> Program {
         handoff: ReplicaRole::ActiveSecondary,
         catch_up_specific_quorum: false,
         mode: PublicCatchUpMode::WriteQuorum,
+        controller_composed: false,
     }
 }
 
@@ -305,10 +326,22 @@ impl Fixture {
     }
 
     fn intent(&self, id: &str, revision: u64, mut program: Program) -> PublicOperationIntent {
-        if self.preview.is_public_v1()
-            && let Program::Build(build) | Program::Remove(build) = &mut program
-        {
-            build.history = Some(public_v1_history(&self.preview).1);
+        if self.preview.is_public_v1() {
+            if let Program::Build(build) = &mut program {
+                build.history = Some(public_v1_history(&self.preview).1);
+                build.current_configuration_id = Some(
+                    configuration(build.epoch.configuration_number)
+                        .current
+                        .configuration_id,
+                );
+            } else if let Program::Remove(build) = &mut program {
+                build.history = Some(public_v1_history(&self.preview).1);
+                build.current_configuration_id = Some(
+                    configuration(build.epoch.configuration_number)
+                        .current
+                        .configuration_id,
+                );
+            }
         }
         let class = match &program {
             Program::Swap { .. } => PublicOperationClass::PlannedSwap,
@@ -2209,6 +2242,9 @@ async fn public_v1_remote_rebuild_attempt_is_exact_and_fail_closed() {
     let input = PublicBuildInput {
         attempt: operation_id.clone(),
         epoch: Epoch::new(0, 9),
+        current_configuration_id: Some(crate::protocol::types::ConfigurationId::new(
+            "public-v1-remote-build-configuration",
+        )),
         replica: target.clone(),
         target_storage: target_storage.clone(),
         process_session_id: target_session.clone(),
@@ -2571,6 +2607,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
                 handoff: ReplicaRole::ActiveSecondary,
                 catch_up_specific_quorum: false,
                 mode: PublicCatchUpMode::All,
+                controller_composed: false,
             },
         ),
         (
@@ -2582,6 +2619,7 @@ async fn build_rejects_targets_present_in_lifecycle_or_swap_topology() {
                 handoff: ReplicaRole::ActiveSecondary,
                 catch_up_specific_quorum: false,
                 mode: PublicCatchUpMode::All,
+                controller_composed: false,
             },
         ),
     ] {
@@ -3353,10 +3391,13 @@ async fn ambiguous_build_is_retired_before_a_fresh_attempt() {
         )
         .await;
     terminal(&removal).await;
+    let mut fresh = build("fresh-build");
+    fresh.target_storage.storage_generation =
+        crate::protocol::types::StorageGeneration::new("fresh-storage-generation");
     terminal(
         &fixture
             .launch(
-                fixture.intent("fresh-build", 2, Program::Build(build("fresh-build"))),
+                fixture.intent("fresh-build", 2, Program::Build(fresh.clone())),
                 None,
             )
             .await,
@@ -3370,8 +3411,13 @@ async fn ambiguous_build_is_retired_before_a_fresh_attempt() {
         .public_operation_preview
         .unwrap();
     assert!(preview.absent_builds.contains(&first.operation_id));
-    let mut expected = build("fresh-build");
+    let mut expected = fresh;
     expected.history = Some(public_v1_history(&fixture.preview).1);
+    expected.current_configuration_id = Some(
+        configuration(expected.epoch.configuration_number)
+            .current
+            .configuration_id,
+    );
     assert_eq!(preview.active_builds[&ReplicaId::new(2)], expected);
     fixture.owner.shutdown().await.unwrap();
 }

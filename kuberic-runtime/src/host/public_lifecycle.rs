@@ -759,11 +759,13 @@ fn public_v1_completion_authority(
                 Some(*catch_up_specific_quorum),
             )
         }
+        PublicOperationProgram::Build(build) => {
+            (None, build.current_configuration_id.clone(), None, None)
+        }
         PublicOperationProgram::Open { .. }
         | PublicOperationProgram::Role { .. }
         | PublicOperationProgram::Epoch { .. }
         | PublicOperationProgram::Progress { .. }
-        | PublicOperationProgram::Build(_)
         | PublicOperationProgram::Remove(_)
         | PublicOperationProgram::Close
         | PublicOperationProgram::Abort => (None, None, None, None),

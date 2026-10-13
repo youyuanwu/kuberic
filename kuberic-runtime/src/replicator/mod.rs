@@ -35,6 +35,8 @@ use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
 #[cfg(feature = "testing")]
 use crate::protocol::public_operations::PreviewLifecycleBinding;
+#[cfg(feature = "testing")]
+use crate::protocol::public_operations::PublicInboundBuildAuthority;
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -475,7 +477,7 @@ impl From<PublicReplicaDescriptor> for ReplicaInformation {
             current_progress: replica.current_progress,
             catch_up_capability: replica.catch_up_capability,
             must_catchup: replica.must_catchup,
-            storage_incarnation: None,
+            storage_incarnation: replica.storage_incarnation,
         }
     }
 }
@@ -1119,6 +1121,41 @@ impl ReplicatorFactoryContext {
             .publish_preview_progress(applied_lsn, committed_lsn, ambiguous)
             .await
     }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn preview_inbound_build_authority(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        self.access.preview_inbound_build_authority(build_id).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn preview_outbound_build_authority(
+        &self,
+        build_id: &OperationId,
+        current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        self.access
+            .preview_outbound_build_authority(build_id, current_configuration_id)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn complete_preview_inbound_build(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<()> {
+        self.access.complete_preview_inbound_build(build_id).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn preview_storage_is_retired(
+        &self,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool> {
+        self.access.preview_storage_is_retired(storage).await
+    }
 }
 
 #[async_trait]
@@ -1136,6 +1173,28 @@ pub(crate) trait PartitionAccessView: Send + Sync {
         committed_lsn: i64,
         ambiguous: bool,
     ) -> Result<()>;
+
+    #[cfg(feature = "testing")]
+    async fn preview_inbound_build_authority(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>>;
+
+    #[cfg(feature = "testing")]
+    async fn preview_outbound_build_authority(
+        &self,
+        build_id: &OperationId,
+        current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>>;
+
+    #[cfg(feature = "testing")]
+    async fn complete_preview_inbound_build(&self, build_id: &OperationId) -> Result<()>;
+
+    #[cfg(feature = "testing")]
+    async fn preview_storage_is_retired(
+        &self,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool>;
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()>;
 

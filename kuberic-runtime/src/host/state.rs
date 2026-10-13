@@ -241,6 +241,13 @@ pub(crate) struct PublicOperationPreviewState {
     #[serde(default)]
     pub(crate) absent_builds: BTreeSet<OperationId>,
     #[serde(default)]
+    pub(crate) inbound_build_authorities:
+        BTreeMap<OperationId, crate::protocol::public_operations::PublicInboundBuildAuthority>,
+    #[serde(default)]
+    pub(crate) completed_inbound_builds: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub(crate) retired_storage_incarnations: Vec<ReplicaStorageIncarnationContext>,
+    #[serde(default)]
     pub(crate) writes_revoked: bool,
     #[serde(default)]
     pub(crate) terminal: bool,
@@ -266,6 +273,9 @@ impl PublicOperationPreviewState {
             active_builds: BTreeMap::new(),
             build_records: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
+            inbound_build_authorities: BTreeMap::new(),
+            completed_inbound_builds: BTreeSet::new(),
+            retired_storage_incarnations: Vec::new(),
             writes_revoked: false,
             terminal: false,
         }
@@ -289,6 +299,9 @@ impl PublicOperationPreviewState {
             active_builds: BTreeMap::new(),
             build_records: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
+            inbound_build_authorities: BTreeMap::new(),
+            completed_inbound_builds: BTreeSet::new(),
+            retired_storage_incarnations: Vec::new(),
             writes_revoked: false,
             terminal: false,
         }

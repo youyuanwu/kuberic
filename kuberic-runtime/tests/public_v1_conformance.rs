@@ -47,6 +47,14 @@ fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
 }
 
 #[test]
+#[ignore = "bounded nested conformance execution gate"]
+fn public_v1_conformance_executes_strict_and_hosted_preview_scenarios() {
+    kuberic_runtime::testing::execute_public_v1_conformance_subject(
+        "strict-custom+built-in-preview",
+    );
+}
+
+#[test]
 fn built_in_preview_ksf_mappings_require_each_authorized_observation() {
     for (gate, scenarios) in [
         (
@@ -70,6 +78,10 @@ fn built_in_preview_ksf_mappings_require_each_authorized_observation() {
             ][..],
         ),
         (
+            "KSF-11",
+            &["hosted_preview_role_address_publishes_replaces_and_clears"][..],
+        ),
+        (
             "KSF-12",
             &["hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close"]
                 [..],
@@ -85,11 +97,12 @@ fn built_in_preview_ksf_mappings_require_each_authorized_observation() {
         ),
         (
             "KSF-14",
-            &["hosted_preview_contained_close_retains_typed_child_diagnostic"][..],
+            &["hosted_preview_contained_close_restarts_without_replaying_interrupted_children"][..],
         ),
         (
             "KSF-15",
             &[
+                "hosted_preview_contained_close_restarts_without_replaying_interrupted_children",
                 "durable_build_application_never_reinvokes_the_build_callback",
                 "public_operation_replay_matrix_converges_each_repeatable_program_family",
                 "public_v1_history_admission_gates_all_data_loss_outcomes",

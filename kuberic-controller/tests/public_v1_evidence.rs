@@ -282,6 +282,7 @@ async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_pro
         let build = |attempt: &str| PublicBuildInput {
             attempt: OperationId::new(attempt),
             epoch,
+            current_configuration_id: Some(configuration(epoch).current.configuration_id),
             replica: target.clone(),
             target_storage: storage(2),
             process_session_id: ProcessSessionId::new("target-session"),
@@ -320,6 +321,7 @@ async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_pro
                         handoff: ReplicaRole::None,
                         catch_up_specific_quorum: false,
                         mode: PublicCatchUpMode::All,
+                        controller_composed: false,
                     },
                 ),
             ),
@@ -358,6 +360,9 @@ async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_pro
                         Some(*mode),
                         Some(*catch_up_specific_quorum),
                     ),
+                    PublicOperationProgram::Build(build) => {
+                        (None, build.current_configuration_id.clone(), None, None)
+                    }
                     _ => (None, None, None, None),
                 };
             let expected = PublicV1AcceptedTransitionStatus {

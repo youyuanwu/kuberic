@@ -27,7 +27,8 @@ fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> U {
 
 pub use public_v1_conformance::{
     assert_public_v1_conformance_gate, assert_public_v1_conformance_not_applicable,
-    assert_public_v1_conformance_subject, public_v1_postgres_conformance_scenarios,
+    assert_public_v1_conformance_subject, execute_public_v1_conformance_subject,
+    public_v1_postgres_conformance_scenarios,
 };
 pub use transport::{
     ControlOutput, DeliveryId, InProcessTransport, Message, PumpReport, TransportError,

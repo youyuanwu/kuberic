@@ -16,6 +16,16 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
         Some(P::Configuration(_)) => vec![Configuration],
         Some(P::CatchUp { .. }) => vec![Configuration, FirstCatchUp],
         Some(P::Progress { .. }) => vec![Progress],
+        Some(P::Swap {
+            controller_composed: true,
+            ..
+        }) => vec![
+            Revoke,
+            ProgramEpoch,
+            RefreshedConfiguration,
+            ReplicatorRole,
+            ApplicationRole,
+        ],
         Some(P::Swap { .. }) => vec![
             StartingConfiguration,
             FirstCatchUp,

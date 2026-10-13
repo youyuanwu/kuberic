@@ -1275,12 +1275,14 @@ production deployment.
 
 The delivered preview is covered by:
 
-- 15 direct `stateless_preview_recovery` ownership, static/dynamic recovery,
+- 20 direct `stateless_preview_recovery` ownership, static/dynamic recovery,
+  write-revocation interleaving, exact-primary ingress, bounded-peer,
   ambiguity, replacement and dormancy tests;
 - the shared KSF runner, which maps built-in preview observations to every
   KSF-01 through KSF-15 result and keeps KSF-16 as a Phase 7-only guard,
-  including focused KSF-12 callback-root/descendant cancellation and KSF-14
-  typed contained-close diagnostics;
+  including hosted KSF-11 address publish/replace/clear, KSF-12
+  callback-root/descendant cancellation, KSF-14 typed contained-close
+  diagnostics and KSF-15 restart-without-callback-replay;
 - feature-gated controller operation/evidence target-fencing, removal and
   session-renewal tests;
 - one real SQLite and one real KVStore2 fresh restart/build/corrective-empty-
@@ -1289,15 +1291,15 @@ The delivered preview is covered by:
   implementation.
 
 Every newly added Phase 6 test has an internal bound of at most 270 seconds;
-the generic 300-second nextest limit is only an external backstop. The shared
-KSF test gives strict-custom and built-in-preview inventory/execution commands
-one absolute 270-second parent budget; the second subject cannot reset it. Run
-the exact selectors serially (`-j 1`): the hosted runtime/provider journeys
-own real listeners and durable test roots. Parallel execution can add
-transient build, port and host resource contention, so it is not the
-diagnostic oracle. The full hosted switchover/build chain belongs to the
-runtime `stateless_preview_recovery` selector. The controller selector covers
-only its operation/evidence target-fencing, removal and renewal boundaries.
+the generic 300-second nextest limit is only an external backstop. Structural
+catalog checks run in the ordinary tier without nested Cargo work. A separate
+ignored execution gate gives strict-custom and built-in-preview inventory and
+execution one absolute 270-second parent budget. Run exact hosted selectors
+serially (`-j 1`): they own real listeners and durable test roots. The ordinary
+gate uses a clean, non-incremental target directory and two test threads so
+prior build variants and nested conformance cannot exhaust its disk or process
+budget. The full controller-composed switchover, restart/failover and build
+chains belong to the runtime `stateless_preview_recovery` selector.
 Exact commands and the documentation-phase verification record are in
 [Kuberic Test Strategy](testing.md#service-fabric-public-v1-phase-6-preview).
 
