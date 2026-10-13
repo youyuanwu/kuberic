@@ -1298,10 +1298,12 @@ The delivered preview is covered by:
   callback-root/descendant cancellation, KSF-14 typed contained-close
   diagnostics and KSF-15 restart-without-callback-replay;
 - feature-gated controller operation/evidence target-fencing, removal and
-  session-renewal tests;
-- two real SQLite and two real KVStore2 journeys: fresh
-  restart/build/corrective-empty replacement plus all-process restart,
-  applied-suffix settlement and primary handoff;
+  session-renewal tests, including exact replay after runtime completion but
+  before renewal persistence and partial composed dispatch;
+- three real SQLite and three real KVStore2 journeys: fresh
+  restart/build/corrective-empty replacement, all-process restart with
+  applied-suffix settlement and primary handoff, and original-primary loss
+  with public failover promotion plus returning-predecessor fencing;
 - the unchanged bounded PostgreSQL smoke tier for the independent custom
   implementation.
 
@@ -1317,6 +1319,15 @@ budget. The full controller-composed switchover, restart/failover and build
 chains belong to the runtime `stateless_preview_recovery` selector.
 Exact commands and the documentation-phase verification record are in
 [Kuberic Test Strategy](testing.md#service-fabric-public-v1-phase-6-preview).
+
+Inbound build-authority replacement is itself a containment boundary: the
+accepted successor advances the target generation, cancels ingress, drains
+the provider-effect gate and clears the old cursor before admission returns.
+Local source retained-history corruption similarly closes read/write access
+before rebuild-required is surfaced and remains closed through ordinary
+progress/report observation. Hosted composed operations allocate exact
+suboperation revisions from durable agent state and replay the captured intent
+unchanged; no process-global synthetic revision sequence is used.
 
 ## Testing Strategy
 

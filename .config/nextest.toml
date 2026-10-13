@@ -66,6 +66,11 @@ slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 
 [[profile.default.overrides]]
+filter = 'binary_id(=kuberic-runtime) and test(=host::sqlite_store::tests::terminal_inbound_build_receipt_reopens_for_exact_replay_only)'
+slow-timeout = { period = "270s", terminate-after = 1 }
+test-group = 'process-boundaries'
+
+[[profile.default.overrides]]
 filter = 'binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)'
 test-group = 'process-boundaries'
 threads-required = 4

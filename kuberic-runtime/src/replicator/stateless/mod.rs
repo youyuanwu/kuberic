@@ -36,6 +36,22 @@ enum ReplicationSendFailure {
     Rejected(String),
 }
 
+#[async_trait]
+impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
+    async fn install_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.revoke_generation();
+        self.cancel_inbound_effects();
+        let _effect_drain = self.provider_effect_gate.lock().await;
+        self.state.lock().await.inbound_build = None;
+        self.context
+            .install_preview_inbound_build_authority(authority)
+            .await
+    }
+}
+
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct StatelessReplicatorFactory {
@@ -92,14 +108,15 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
         let containment = engine.callback_containment();
         Ok(ReplicatorInterfaces::primary(
             engine.clone(),
-            Some(engine),
+            Some(engine.clone()),
             ReplicatorCapabilities {
                 catch_up_specific_quorum: true,
                 data_loss_replay:
                     crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity,
             },
         )
-        .with_callback_containment(containment))
+        .with_callback_containment(containment)
+        .with_stateless_preview_control(engine))
     }
 }
 
@@ -131,6 +148,7 @@ struct EngineState {
     applied_lsn: i64,
     committed_lsn: i64,
     ambiguous_suffix: bool,
+    local_rebuild_required: bool,
     closed: bool,
 }
 
@@ -238,6 +256,7 @@ impl StatelessReplicator {
                 applied_lsn: 0,
                 committed_lsn: 0,
                 ambiguous_suffix: false,
+                local_rebuild_required: false,
                 closed: false,
             }),
             closed: AtomicBool::new(false),
@@ -305,7 +324,15 @@ impl StatelessReplicator {
             engine: engine.clone(),
         };
         let _effect = engine.provider_effect_gate.lock().await;
-        engine.send_build(&replica).await
+        let result = engine.send_build(&replica).await;
+        if matches!(
+            &result,
+            Err(RuntimeError::ReplicaRebuildRequired(rebuild))
+                if matches!(rebuild.as_ref(), ReplicaRebuildRequired::LocalProvider(_))
+        ) {
+            engine.fence_local_build_source().await;
+        }
+        result
     }
 
     async fn require_primary(&self) -> Result<ConfigurationAuthority> {
@@ -322,7 +349,7 @@ impl StatelessReplicator {
         if state.role != ReplicaRole::Primary {
             return Err(RuntimeError::NotPrimary);
         }
-        if state.ambiguous_suffix {
+        if state.ambiguous_suffix || state.local_rebuild_required {
             return Err(RuntimeError::ReconfigurationPending);
         }
         if self.abandoned_applied_floor.load(Ordering::Acquire) > 0 {
@@ -345,12 +372,20 @@ impl StatelessReplicator {
         if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        let (applied_lsn, committed_lsn) = {
+        let (applied_lsn, committed_lsn, local_rebuild_required) = {
             let state = self.state.lock().await;
-            (state.applied_lsn, state.committed_lsn)
+            (
+                state.applied_lsn,
+                state.committed_lsn,
+                state.local_rebuild_required,
+            )
         };
         self.context
-            .publish_preview_progress(applied_lsn, committed_lsn, ambiguous)
+            .publish_preview_progress(
+                applied_lsn,
+                committed_lsn,
+                ambiguous || local_rebuild_required,
+            )
             .await
     }
 
@@ -402,6 +437,18 @@ impl StatelessReplicator {
         drop(state);
         self.publish_progress(progress.applied_lsn > progress.committed_lsn)
             .await
+    }
+
+    async fn fence_local_build_source(&self) {
+        self.revoke_generation();
+        self.cancel_inbound_effects();
+        {
+            let mut state = self.state.lock().await;
+            state.authority = None;
+            state.inbound_build = None;
+            state.local_rebuild_required = true;
+        }
+        let _ = self.publish_progress(true).await;
     }
 
     async fn reconcile_provider_committed_tail(&self) -> Result<i64> {
@@ -1969,7 +2016,11 @@ impl Replicator for StatelessReplicator {
                 "role replay regressed the exact epoch".into(),
             ));
         }
+        let failover_promotion = state.role == ReplicaRole::ActiveSecondary
+            && role == ReplicaRole::Primary
+            && state.role_epoch.is_some_and(|current| epoch > current);
         if state.role != ReplicaRole::None
+            && !failover_promotion
             && state.updated_epoch != Some(epoch)
             && state.role_epoch != Some(epoch)
         {
@@ -2094,6 +2145,7 @@ impl PrimaryReplicator for StatelessReplicator {
         self.fence_authority().await;
         let _drain = self.write_gate.lock().await;
         let changed = self.provider.on_data_loss().await?;
+        self.state.lock().await.local_rebuild_required = false;
         self.refresh_provider_progress().await?;
         Ok(changed)
     }

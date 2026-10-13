@@ -12,14 +12,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use kuberic_controller::evaluator::test_bridge::{
-    HostedPreviewReplica, HostedPublicV1Adapter, PublicV1AcceptedTransitionIntent,
+    HostedPreviewReplica, HostedPublicV1Adapter, PreviewTransition,
+    PublicOperationPreviewEvaluationConfig, PublicV1AcceptedTransitionIntent,
     PublicV1AcceptedTransitionStatus, PublicV1EvidenceApi, PublicV1EvidenceConsumer,
     PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1OperationApi,
     PublicV1ResourceAuthority, PublicV1ResourceDisposition, PublicV1ResourceProof,
     PublicV1SessionRenewalApi, PublicV1SessionRenewalPlan, accept_public_v1_session_renewal,
     accept_public_v1_survivor_retired, execute_public_v1_history, execute_public_v1_operation,
-    execute_public_v1_session_renewal, plan_public_v1_data_loss_recovery,
+    execute_public_v1_session_renewal, plan_public_lifecycle, plan_public_v1_data_loss_recovery,
     plan_public_v1_recovery_report, plan_public_v1_session_renewal, reconcile_public_v1_consumer,
+    reconcile_public_v1_operation,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationProgress, OpenContext, Operation, OperationDataStream, RoleChange,
@@ -4048,6 +4050,13 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 .iter()
                 .all(|completion| completion.operation_id != transition.intent.operation_id)
         );
+        adapter.cut_after_hosted_suboperations(1);
+        assert!(
+            execute_public_v1_operation(&adapter, &transition, command.clone())
+                .await
+                .unwrap_err()
+                .contains("injected cut after hosted suboperation completion")
+        );
         execute_public_v1_operation(&adapter, &transition, command)
             .await
             .unwrap();
@@ -4084,6 +4093,20 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 .write_status,
             kuberic_runtime::protocol::types::AccessStatus::Granted
         );
+        let next_revision = secondary_handle
+            .stateless_preview_next_operation_revision()
+            .await
+            .unwrap();
+        secondary_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                secondary_handle.process_session_id(),
+                next_revision,
+                "same-session-after-composed-swap",
+                PublicOperationProgram::Progress { capability: true },
+            ))
+            .await
+            .unwrap();
         assert_eq!(
             secondary_app
                 .replicate(Bytes::from_static(b"after-switchover"))
@@ -4228,8 +4251,9 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             ],
             2,
         );
+        let promotion_epoch = Epoch::new(0, 4);
         let failover_configuration = ConfigurationDescriptor::new(
-            failover_epoch,
+            promotion_epoch,
             ReplicaId::new(2),
             vec![
                 ConfigurationMember {
@@ -4369,7 +4393,152 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         )
         .await
         .unwrap();
+        loop {
+            let accepted = secondary_renewal
+                .observe_public_v1_session_renewal()
+                .await
+                .unwrap()
+                .unwrap();
+            let plan = plan_public_v1_session_renewal(&accepted, &[]).unwrap();
+            let is_epoch_dispatch = matches!(
+                &plan,
+                PublicV1SessionRenewalPlan::Dispatch { command, .. }
+                    if matches!(
+                        command,
+                        ProtocolCommand::PublicV1History(public)
+                            if matches!(
+                                public.as_ref(),
+                                kuberic_runtime::protocol::command::PublicV1HistoryCommand::
+                                    SessionRenewal(renewal)
+                                    if matches!(
+                                        renewal.as_ref(),
+                                        kuberic_runtime::protocol::command::
+                                            PublicV1SessionRenewalCommand::UpdateEpochBarrier { .. }
+                                    )
+                            )
+                    )
+            );
+            if is_epoch_dispatch {
+                secondary_renewal.cut_after_hosted_suboperations(1);
+                assert!(
+                    execute_public_v1_session_renewal(&secondary_renewal, plan.clone())
+                        .await
+                        .unwrap_err()
+                        .contains("injected cut after hosted suboperation completion")
+                );
+                assert_eq!(
+                    secondary_renewal
+                        .observe_public_v1_session_renewal()
+                        .await
+                        .unwrap(),
+                    Some(accepted)
+                );
+                execute_public_v1_session_renewal(&secondary_renewal, plan)
+                    .await
+                    .unwrap();
+                break;
+            }
+            execute_public_v1_session_renewal(&secondary_renewal, plan)
+                .await
+                .unwrap();
+        }
         drive_session_renewal(&secondary_renewal, &[], false).await;
+        let primary_restart_progress = primary_state.progress.lock().unwrap().committed_lsn;
+        let failover_lifecycle = PublicLifecycleInput {
+            recipe: PublicLifecycleRecipe::FailoverPromotion,
+            replica: secondary_identity.clone(),
+            epoch: promotion_epoch,
+            possible_data_loss: PossibleDataLossIntent::NotPossible,
+            current: failover_configuration.clone(),
+            previous: Some(renewal_configuration.clone()),
+            replicas: vec![PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: primary_identity.clone(),
+                replication_address: format!("http://{primary_address}"),
+                process_session_id: restarted_primary_handle.process_session_id(),
+                storage_incarnation: Some(storage_named(
+                    primary_identity.clone(),
+                    "primary-pod",
+                    "primary-pvc",
+                )),
+                role: ReplicaRole::ActiveSecondary,
+                current_progress: primary_restart_progress,
+                catch_up_capability: primary_restart_progress,
+                must_catchup: true,
+            }],
+            data_loss_recovery: None,
+        };
+        let failover_revision = restarted_secondary_handle
+            .stateless_preview_next_operation_revision()
+            .await
+            .unwrap();
+        let failover_intent = plan_public_lifecycle(
+            &PublicOperationPreviewEvaluationConfig::new(
+                preview.clone(),
+                Default::default(),
+            ),
+            OperationId::new("controller-restart-failover"),
+            failover_revision,
+            restarted_secondary_handle.process_session_id(),
+            failover_lifecycle,
+            PreviewTransition::Ordinary,
+        )
+        .unwrap();
+        let failover_accepted = PublicV1AcceptedStatus {
+            identity: preview.clone(),
+            history_initialization_id: initialization.clone(),
+            history: history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: Default::default(),
+        };
+        let failover_source_storage = storage_named(
+            secondary_identity.clone(),
+            "secondary-pod",
+            "secondary-pvc",
+        );
+        let failover_transition = PublicV1AcceptedTransitionStatus {
+            resource_version: "restart-failover-status-1".into(),
+            evidence: failover_accepted.clone(),
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: PublicV1EvidenceConsumer::Failover,
+                operation_id: failover_intent.operation_id.clone(),
+                revision: failover_intent.revision,
+                call_kind: PublicV1CallKind::FailoverPromotion,
+                history: history.clone(),
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: failover_source_storage.clone(),
+                    resource_version: "restart-secondary-rv-1".into(),
+                },
+                target: None,
+                process_session_id: failover_intent.process_session_id.clone(),
+                input_digest: failover_intent.input_digest.clone(),
+                replay_disposition: failover_intent.replay_disposition,
+                previous_configuration_id: Some(
+                    renewal_configuration.configuration_id.clone(),
+                ),
+                current_configuration_id: Some(
+                    failover_configuration.configuration_id.clone(),
+                ),
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+            },
+        };
+        let failover_evidence = Arc::new(
+            PublicV1EvidenceState::new(
+                failover_transition.clone(),
+                vec![PublicV1EvidenceResource {
+                    storage_incarnation: failover_source_storage.clone(),
+                    resource_version: "restart-secondary-rv-1".into(),
+                    proof: Some(PublicV1ResourceProof {
+                        history: history.clone(),
+                        storage_incarnation: failover_source_storage,
+                    }),
+                    disposition: PublicV1ResourceDisposition::Active,
+                }],
+            )
+            .unwrap(),
+        );
         let restart_adapter = HostedPublicV1Adapter::new(
             vec![
                 HostedPreviewReplica {
@@ -4383,19 +4552,31 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                     handle: restarted_secondary_handle.clone(),
                 },
             ],
-            Some(transition.evidence.clone()),
+            Some(failover_accepted),
             None,
-            evidence.clone(),
+            failover_evidence.clone(),
         )
         .unwrap();
-        restart_adapter
-            .reconstruct_hosted_configuration(
-                &OperationId::new("controller-restart-failover"),
-                preview.generation,
-                &failover_configuration,
-            )
-            .await
-            .unwrap();
+        let failover_command =
+            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+                target: secondary_identity.clone(),
+                intent: failover_intent,
+            }));
+        assert_eq!(
+            reconcile_public_v1_operation(&restart_adapter, failover_command.clone())
+                .await
+                .unwrap(),
+            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+                EvidencePersisted
+        );
+        assert_eq!(
+            reconcile_public_v1_operation(&restart_adapter, failover_command)
+                .await
+                .unwrap(),
+            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+                EffectApplied
+        );
+        assert_eq!(failover_evidence.effects().len(), 1);
         let old_primary_report = restarted_primary_handle
             .stateless_preview_report()
             .await
@@ -4411,6 +4592,12 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         assert_eq!(
             new_primary_report.write_status,
             kuberic_runtime::protocol::types::AccessStatus::Granted
+        );
+        assert!(
+            primary_restart_app
+                .replicate(Bytes::from_static(b"fenced-restart-predecessor"))
+                .await
+                .is_err()
         );
         assert_eq!(
             secondary_restart_app
@@ -4678,10 +4865,6 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .install_stateless_preview_inbound_build_authority(&authority_a)
             .await
             .unwrap();
-        target_handle
-            .install_stateless_preview_inbound_build_authority(&authority_b)
-            .await
-            .unwrap();
         let copy_frame = |authority: &PublicInboundBuildAuthority,
                           sequence,
                           snapshot_chunk,
@@ -4716,7 +4899,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         ))
         .await
         .unwrap();
-        let mut delayed_a = client
+        let mut first_a = client
             .build(Request::new(stream::iter([copy_frame(
                 &authority_a,
                 0,
@@ -4726,29 +4909,12 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .await
             .unwrap()
             .into_inner();
-        assert!(delayed_a.next().await.unwrap().is_err());
-        assert!(target_state.copy_chunks.lock().unwrap().is_empty());
+        assert!(!first_a.next().await.unwrap().unwrap().final_item);
 
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{target_address}"
-        ))
-        .await
-        .unwrap();
-        let mut first_b = client
-            .build(Request::new(stream::iter([copy_frame(
-                &authority_b,
-                0,
-                true,
-                false,
-            )])))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!first_b.next().await.unwrap().unwrap().final_item);
         target_state.block_finish_copy();
         let held_finish = tokio::spawn({
             let target_address = target_address;
-            let frame = copy_frame(&authority_b, 1, false, false);
+            let frame = copy_frame(&authority_a, 1, false, false);
             async move {
                 let mut client = proto::replication_data_client::ReplicationDataClient::connect(
                     format!("http://{target_address}"),
@@ -4766,16 +4932,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         });
         target_state.finish_copy_entered.notified().await;
         target_handle
-            .execute_stateless_preview(intent(
-                &preview,
-                target_session.clone(),
-                4,
-                "revoke-held-build-target",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::None,
-                },
-            ))
+            .install_stateless_preview_inbound_build_authority(&authority_b)
             .await
             .unwrap();
         assert!(
@@ -4788,34 +4945,27 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         assert_eq!(
             *target_state.progress.lock().unwrap(),
             DurableApplicationProgress::default(),
-            "revoked finish_copy changed target durable progress"
+            "superseded finish_copy changed target durable progress"
         );
         target_state
             .block_finish_copy
             .store(false, Ordering::Release);
-        target_handle
-            .execute_stateless_preview(intent(
-                &preview,
-                target_session.clone(),
-                5,
-                "restore-build-target-role",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ))
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{target_address}"
+        ))
+        .await
+        .unwrap();
+        let mut first_b = client
+            .build(Request::new(stream::iter([copy_frame(
+                &authority_b,
+                0,
+                true,
+                false,
+            )])))
             .await
-            .unwrap();
-        target_handle
-            .execute_stateless_preview(intent(
-                &preview,
-                target_session.clone(),
-                6,
-                "restore-build-target-epoch",
-                PublicOperationProgram::Epoch { epoch },
-            ))
-            .await
-            .unwrap();
+            .unwrap()
+            .into_inner();
+        assert!(!first_b.next().await.unwrap().unwrap().final_item);
         source_state.block_copy();
         let build_program = PublicOperationProgram::Build(build_input.clone());
         let build_intent = intent(
@@ -5678,6 +5828,44 @@ async fn build_retained_gap_corruption_replaces_source_without_contacting_target
                 .await
                 .is_err(),
             "source corruption contacted or mutated the healthy target"
+        );
+        let partition = source.application.partition.read().await.clone().unwrap();
+        assert_eq!(
+            partition.get_read_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            partition.get_write_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert!(
+            source
+                .application
+                .replicate(Bytes::from_static(
+                    b"must-not-write-after-source-corruption"
+                ))
+                .await
+                .is_err(),
+            "local rebuild-required returned before write authority was revoked"
+        );
+        source
+            .handle()
+            .execute_stateless_preview(intent(
+                &preview,
+                source.handle().process_session_id(),
+                5,
+                "progress-after-source-corruption",
+                PublicOperationProgram::Progress { capability: true },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            partition.get_read_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            partition.get_write_status().await.unwrap(),
+            AccessStatus::NotPrimary
         );
         let report = source.handle().stateless_preview_report().await.unwrap();
         let completion = report

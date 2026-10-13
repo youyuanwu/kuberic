@@ -92,6 +92,15 @@ pub trait StateReplicator: Send + Sync {
 }
 
 #[async_trait]
+#[cfg(feature = "testing")]
+pub(crate) trait StatelessPreviewControl: Send + Sync {
+    async fn install_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
+}
+
+#[async_trait]
 #[doc(hidden)]
 pub(crate) trait ManagedReplicatorLifecycle: Send + Sync {
     async fn fence_writes(&self) -> Result<()>;
@@ -590,6 +599,8 @@ struct ReplicatorCreation {
     managed: Option<ManagedReplicatorCapabilities>,
     #[cfg(feature = "testing")]
     callback_containment: StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    #[cfg(feature = "testing")]
+    stateless_preview_control: StdMutex<Option<Arc<dyn StatelessPreviewControl>>>,
     settings: StdMutex<Option<BoundReplicatorSettings>>,
     armed: AtomicBool,
 }
@@ -614,6 +625,8 @@ impl ReplicatorCreation {
             managed,
             #[cfg(feature = "testing")]
             callback_containment: StdMutex::new(None),
+            #[cfg(feature = "testing")]
+            stateless_preview_control: StdMutex::new(None),
             settings: StdMutex::new(None),
             armed: AtomicBool::new(true),
         }
@@ -829,6 +842,18 @@ impl ReplicatorAttachment {
             .clone()
     }
 
+    #[cfg(feature = "testing")]
+    pub(crate) fn stateless_preview_control(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<Arc<dyn StatelessPreviewControl>> {
+        self.creation
+            .stateless_preview_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn disarm(&self) {
         self.creation.armed.store(false, Ordering::Release);
     }
@@ -850,6 +875,19 @@ impl ReplicatorInterfaces {
             .callback_containment
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(containment);
+        self
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn with_stateless_preview_control(
+        self,
+        control: Arc<dyn StatelessPreviewControl>,
+    ) -> Self {
+        *self
+            .creation
+            .stateless_preview_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control);
         self
     }
 
@@ -1131,6 +1169,16 @@ impl ReplicatorFactoryContext {
     }
 
     #[cfg(feature = "testing")]
+    pub(crate) async fn install_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.access
+            .install_preview_inbound_build_authority(authority)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
     pub(crate) async fn preview_terminal_inbound_build_receipt(
         &self,
         build_id: &OperationId,
@@ -1194,6 +1242,12 @@ pub(crate) trait PartitionAccessView: Send + Sync {
         &self,
         build_id: &OperationId,
     ) -> Result<Option<PublicInboundBuildAuthority>>;
+
+    #[cfg(feature = "testing")]
+    async fn install_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
 
     #[cfg(feature = "testing")]
     async fn preview_terminal_inbound_build_receipt(

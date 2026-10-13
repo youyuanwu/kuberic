@@ -8,10 +8,11 @@ use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PreviewLifecycleBinding, ProcessSessionRenewalRequired, PublicBuildAttemptReference,
-    PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicInboundBuildAuthority,
-    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
-    PublicOperationProgram, PublicReplicaDescriptor, StatePersistence,
+    PossibleDataLossIntent, PreviewLifecycleBinding, ProcessSessionRenewalRequired,
+    PublicBuildAttemptReference, PublicBuildInput, PublicCatchUpMode, PublicConfiguration,
+    PublicInboundBuildAuthority, PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass,
+    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram,
+    PublicOperationReplayDisposition, PublicReplicaDescriptor, StatePersistence,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -110,6 +111,26 @@ fn intent(
         replay_disposition: program.replay_disposition(),
         lifecycle: None,
         program: Some(program),
+    }
+}
+
+fn lifecycle_intent(
+    preview: &PublicOperationPreviewIdentity,
+    session: kuberic_runtime::protocol::types::ProcessSessionId,
+    revision: u64,
+    name: &str,
+    lifecycle: PublicLifecycleInput,
+) -> PublicOperationIntent {
+    PublicOperationIntent {
+        preview: preview.clone(),
+        operation_id: OperationId::new(name),
+        revision,
+        process_session_id: session,
+        class: PublicOperationClass::Authority,
+        input_digest: lifecycle.digest(),
+        replay_disposition: PublicOperationReplayDisposition::Convergent,
+        lifecycle: Some(lifecycle),
+        program: None,
     }
 }
 
@@ -1988,4 +2009,412 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_original_primary_loss_promotes_survivor_and_fences_return() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target")
+            .join("sqlite-public-v1-failover")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&root);
+        let source_root = root.join("source");
+        let survivor_root = root.join("survivor");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&survivor_root).unwrap();
+
+        let resource_uid = ResourceUid::new("sqlite-public-v1-failover");
+        let preview = PublicOperationPreviewIdentity::public_v1(53);
+        let binding = PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let source_identity = identity(1, "sqlite-failover-source");
+        let survivor_identity = identity(2, "sqlite-failover-survivor");
+        let source_storage = storage(source_identity.clone(), "sqlite-failover-source");
+        let survivor_storage = storage(survivor_identity.clone(), "sqlite-failover-survivor");
+        for (path, identity, name) in [
+            (
+                &source_root,
+                source_identity.clone(),
+                "sqlite-failover-source",
+            ),
+            (
+                &survivor_root,
+                survivor_identity.clone(),
+                "sqlite-failover-survivor",
+            ),
+        ] {
+            drop(
+                SqliteStore::create_public_v1(
+                    SqliteStore::metadata_database_path(path),
+                    preview.clone(),
+                    store_identity(resource_uid.clone(), identity, name),
+                )
+                .unwrap(),
+            );
+        }
+        let source_address = address();
+        let survivor_address = address();
+        let source_persistence =
+            Arc::new(SqlitePersistence::open(source_root.join("application")).unwrap());
+        let survivor_persistence =
+            Arc::new(SqlitePersistence::open(survivor_root.join("application")).unwrap());
+        let source_service = Arc::new(
+            SqliteService::new(
+                source_persistence.clone(),
+                format!("http://{source_address}"),
+            )
+            .unwrap()
+            .with_stateless_preview(),
+        );
+        let survivor_service = Arc::new(
+            SqliteService::new(
+                survivor_persistence.clone(),
+                format!("http://{survivor_address}"),
+            )
+            .unwrap()
+            .with_stateless_preview(),
+        );
+        let source_server = SqliteServer::new(source_service.clone());
+        let survivor_server = SqliteServer::new(survivor_service.clone());
+        let mut source = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(1),
+                pod_uid: PodUid::new("sqlite-failover-source-pod"),
+                pvc_uid: PvcUid::new("sqlite-failover-source-pvc"),
+                data_root: source_root.clone(),
+                control_address: address(),
+                replication_address: source_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            source_service,
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding.clone())
+        .start()
+        .await
+        .unwrap();
+        let mut survivor = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(2),
+                pod_uid: PodUid::new("sqlite-failover-survivor-pod"),
+                pvc_uid: PvcUid::new("sqlite-failover-survivor-pvc"),
+                data_root: survivor_root.clone(),
+                control_address: address(),
+                replication_address: survivor_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            survivor_service,
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding.clone())
+        .start()
+        .await
+        .unwrap();
+        let source_handle = source.handle();
+        let survivor_handle = survivor.handle();
+        let generation = PublicProtocolGeneration::new(53);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        source_handle
+            .initialize_stateless_preview_history(&initialization, &history, &source_storage)
+            .await
+            .unwrap();
+        survivor_handle
+            .initialize_stateless_preview_history(&initialization, &history, &survivor_storage)
+            .await
+            .unwrap();
+        let initial_epoch = Epoch::new(0, 1);
+        let initial = ConfigurationDescriptor::new(
+            initial_epoch,
+            source_identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source_identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: survivor_identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            1,
+        );
+        for (handle, identity, role, peer, peer_address, peer_session, peer_storage) in [
+            (
+                &source_handle,
+                source_identity.clone(),
+                ReplicaRole::Primary,
+                survivor_identity.clone(),
+                survivor_address,
+                survivor_handle.process_session_id(),
+                survivor_storage.clone(),
+            ),
+            (
+                &survivor_handle,
+                survivor_identity.clone(),
+                ReplicaRole::ActiveSecondary,
+                source_identity.clone(),
+                source_address,
+                source_handle.process_session_id(),
+                source_storage.clone(),
+            ),
+        ] {
+            for (revision, name, program) in [
+                (
+                    1,
+                    format!("{}-open", identity.instance_id),
+                    PublicOperationProgram::Open {
+                        replica: identity.clone(),
+                        existing: true,
+                    },
+                ),
+                (
+                    2,
+                    format!("{}-role", identity.instance_id),
+                    PublicOperationProgram::Role {
+                        epoch: initial_epoch,
+                        role,
+                    },
+                ),
+                (
+                    3,
+                    format!("{}-epoch", identity.instance_id),
+                    PublicOperationProgram::Epoch {
+                        epoch: initial_epoch,
+                    },
+                ),
+                (
+                    4,
+                    format!("{}-configuration", identity.instance_id),
+                    PublicOperationProgram::Configuration(PublicConfiguration {
+                        current: initial.clone(),
+                        previous: None,
+                        replicas: vec![PublicReplicaDescriptor {
+                            build_id: OperationId::default(),
+                            identity: peer,
+                            replication_address: format!("http://{peer_address}"),
+                            process_session_id: peer_session,
+                            storage_incarnation: Some(peer_storage),
+                            role: if role == ReplicaRole::Primary {
+                                ReplicaRole::ActiveSecondary
+                            } else {
+                                ReplicaRole::Primary
+                            },
+                            current_progress: 0,
+                            catch_up_capability: 0,
+                            must_catchup: role == ReplicaRole::Primary,
+                        }],
+                    }),
+                ),
+            ] {
+                handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        handle.process_session_id(),
+                        revision,
+                        &name,
+                        program,
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            execute(
+                &source_server,
+                "CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT)"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            execute(&source_server, "INSERT INTO data VALUES(1,'committed')").await,
+            2
+        );
+        source_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                source_handle.process_session_id(),
+                5,
+                "sqlite-failover-catch-up",
+                PublicOperationProgram::CatchUp {
+                    configuration: PublicConfiguration {
+                        current: initial.clone(),
+                        previous: None,
+                        replicas: vec![PublicReplicaDescriptor {
+                            build_id: OperationId::default(),
+                            identity: survivor_identity.clone(),
+                            replication_address: format!("http://{survivor_address}"),
+                            process_session_id: survivor_handle.process_session_id(),
+                            storage_incarnation: Some(survivor_storage.clone()),
+                            role: ReplicaRole::ActiveSecondary,
+                            current_progress: 0,
+                            catch_up_capability: 0,
+                            must_catchup: true,
+                        }],
+                    },
+                    mode: PublicCatchUpMode::WriteQuorum,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(survivor_persistence.progress().unwrap().committed_lsn, 2);
+        source.shutdown();
+        source.wait().await.unwrap();
+        assert!(
+            source_server
+                .execute(tonic::Request::new(proto::ExecuteRequest {
+                    sql: "INSERT INTO data VALUES(9,'lost-primary')".into(),
+                    params: Vec::new(),
+                }))
+                .await
+                .is_err()
+        );
+
+        let failover_epoch = Epoch::new(0, 2);
+        let promoted = ConfigurationDescriptor::new(
+            failover_epoch,
+            survivor_identity.replica_id,
+            vec![ConfigurationMember {
+                identity: survivor_identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let failover_previous = ConfigurationDescriptor::new(
+            initial_epoch,
+            survivor_identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source_identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: survivor_identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            1,
+        );
+        survivor_handle
+            .execute_stateless_preview(lifecycle_intent(
+                &preview,
+                survivor_handle.process_session_id(),
+                5,
+                "sqlite-original-primary-loss",
+                PublicLifecycleInput {
+                    recipe: PublicLifecycleRecipe::FailoverPromotion,
+                    replica: survivor_identity.clone(),
+                    epoch: failover_epoch,
+                    possible_data_loss: PossibleDataLossIntent::NotPossible,
+                    current: promoted,
+                    previous: Some(failover_previous),
+                    replicas: vec![PublicReplicaDescriptor {
+                        build_id: OperationId::default(),
+                        identity: source_identity.clone(),
+                        replication_address: format!("http://{source_address}"),
+                        process_session_id: source_handle.process_session_id(),
+                        storage_incarnation: Some(source_storage.clone()),
+                        role: ReplicaRole::ActiveSecondary,
+                        current_progress: 2,
+                        catch_up_capability: 2,
+                        must_catchup: false,
+                    }],
+                    data_loss_recovery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            execute(
+                &survivor_server,
+                "INSERT INTO data VALUES(2,'after-failover')"
+            )
+            .await,
+            3
+        );
+        let rows = survivor_server
+            .query(tonic::Request::new(proto::QueryRequest {
+                sql: "SELECT value FROM data WHERE value IN ('committed','after-failover') ORDER BY id"
+                    .into(),
+                params: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(rows.rows.len(), 2);
+
+        let returning_service = Arc::new(
+            SqliteService::new(
+                Arc::new(SqlitePersistence::open(source_root.join("application")).unwrap()),
+                format!("http://{source_address}"),
+            )
+            .unwrap()
+            .with_stateless_preview(),
+        );
+        let returning_server = SqliteServer::new(returning_service.clone());
+        let mut returning = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid,
+                replica_id: ReplicaId::new(1),
+                pod_uid: PodUid::new("sqlite-failover-source-pod"),
+                pvc_uid: PvcUid::new("sqlite-failover-source-pvc"),
+                data_root: source_root,
+                control_address: address(),
+                replication_address: source_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            returning_service,
+            ApplicationStorageState::Established,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding)
+        .start()
+        .await
+        .unwrap();
+        assert_ne!(
+            returning
+                .handle()
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::Granted
+        );
+        assert!(
+            returning_server
+                .execute(tonic::Request::new(proto::ExecuteRequest {
+                    sql: "INSERT INTO data VALUES(10,'returning-predecessor')".into(),
+                    params: Vec::new(),
+                }))
+                .await
+                .is_err()
+        );
+        returning.shutdown();
+        survivor.shutdown();
+        returning.wait().await.unwrap();
+        survivor.wait().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
 }

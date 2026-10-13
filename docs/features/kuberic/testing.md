@@ -188,7 +188,7 @@ versions fail before effect.
 
 ### Real SQLite and KVStore2 recovery journeys
 
-These are two exact tests per real provider:
+These are three exact tests per real provider:
 
 ```bash
 scripts/assert_nextest_selection.sh \
@@ -198,14 +198,16 @@ scripts/assert_nextest_selection.sh \
   --require-test sqlite_fresh_restart_build_and_corrective_empty_replacement \
   --require-test kvstore2_fresh_restart_build_and_corrective_empty_replacement \
   --require-test sqlite_real_provider_restart_settlement_and_handoff \
-  --require-test kvstore2_real_provider_restart_settlement_and_handoff -- \
+  --require-test kvstore2_real_provider_restart_settlement_and_handoff \
+  --require-test sqlite_original_primary_loss_promotes_survivor_and_fences_return \
+  --require-test kvstore2_original_primary_loss_promotes_survivor_and_fences_return -- \
   cargo nextest list -p sqlite-replicated -p kvstore2 --all-features \
     --profile ordinary \
-    -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement) or test(sqlite_real_provider_restart_settlement_and_handoff) or test(kvstore2_real_provider_restart_settlement_and_handoff)'
+    -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement) or test(sqlite_real_provider_restart_settlement_and_handoff) or test(kvstore2_real_provider_restart_settlement_and_handoff) or test(sqlite_original_primary_loss_promotes_survivor_and_fences_return) or test(kvstore2_original_primary_loss_promotes_survivor_and_fences_return)'
 
 cargo nextest run -j 1 -p sqlite-replicated -p kvstore2 \
   --all-features --profile ordinary \
-  -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement) or test(sqlite_real_provider_restart_settlement_and_handoff) or test(kvstore2_real_provider_restart_settlement_and_handoff)'
+  -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement) or test(sqlite_real_provider_restart_settlement_and_handoff) or test(kvstore2_real_provider_restart_settlement_and_handoff) or test(sqlite_original_primary_loss_promotes_survivor_and_fences_return) or test(kvstore2_original_primary_loss_promotes_survivor_and_fences_return)'
 ```
 
 The corrective-replacement journeys freeze a copy snapshot, commit a known
@@ -221,6 +223,11 @@ They subsequently hand primary authority to the former secondary, reject the
 old primary's write and commit a known post-handoff write through the new
 primary.
 
+The separate primary-loss journey stops the original primary after the
+survivor has exact committed data, promotes that survivor through a public
+`FailoverPromotion`, verifies one writer and the known data, then restarts the
+predecessor and proves it remains access-closed.
+
 ### Timeouts and implementation evidence
 
 Every newly added Phase 6 test has an internal timeout no greater than 270
@@ -232,7 +239,9 @@ seconds:
   shared by strict-custom and built-in-preview inventory/execution, with
   process-tree termination/reaping regression coverage;
 - new controller target/removal/survivor tests: 270 seconds;
-- SQLite/KVStore2 journeys: 180 seconds, with tighter build waits.
+- SQLite/KVStore2 journeys: 120 or 180 seconds, with tighter build waits;
+- terminal inbound receipt reopen/replay: an exact 270-second nextest override,
+  proven by an exact one-test selector.
 
 The nextest 300-second termination limit is an external backstop and is not
 used to satisfy the Phase 6 requirement. A retained one-shot notification
@@ -240,24 +249,25 @@ prevents the hosted switchover commit handshake from being lost during nested
 conformance execution. Focused serial selectors remain the supported way to
 separate protocol failures from transient build/host contention.
 
-The second-final-review remediation expands the direct recovery binary from 20
-to 23 scenarios with primary-apply cancellation, exact LSN-0 live proof,
-revisioned inbound build/terminal replay, local build-source attribution and a
-hung build-ACK deadline. Final evidence is recorded in the Phase 6 PAW
-`Docs.md`.
+The third-final-review corrections retain 23 direct recovery scenarios while
+adding exact controller retry cuts, synchronous inbound supersession,
+failover evidence reconciliation, immediate local-source fail-closed behavior
+and one primary-loss journey per real provider. Final evidence is recorded in
+the Phase 6 PAW `Docs.md`.
 
-- direct runtime recovery: 23/23 passed in 68.852s;
+- direct runtime recovery: 23/23 passed in 68.404s;
 - structural KSF catalog: 2/2 passed; the separate ignored exact conformance
-  execution gate passed in 160.907s inside its 270-second parent bound;
+  execution gate passed in 133.111s inside its 270-second parent bound;
 - controller operation/evidence and renewal: 16/16 passed in 0.074s;
-- real provider replacement/restart and composite journeys: 4/4 passed in
-  112.115s on the focused serial guard-closure run; the two new composites
-  completed in 1.890s (SQLite) and 1.421s (KVStore2);
-- `just nextest-test`: 1,134/1,134 passed, 37 skipped. The recipe used a clean
+- real provider replacement/restart, restart/handoff and primary-loss
+  journeys: 6/6 passed in 13.062s on the final focused serial rerun;
+- `just nextest-test`: passed. The recipe used a clean
   `target/nextest-ordinary`, `CARGO_INCREMENTAL=0`, disabled test debuginfo and
   two test threads; no nested conformance process ran in the ordinary tier;
-- bounded PostgreSQL smoke: 4/4 Public V1 scenarios passed in 15.497s, then
-  8/8 representative scenarios passed in 226.429s;
+- bounded PostgreSQL smoke: after one contained acknowledged-row failover
+  timeout at the unchanged 240-second bound, the immediate unchanged rerun
+  passed 4/4 Public V1 scenarios in 32.091s and 8/8 representative scenarios
+  in 156.548s;
 - lifecycle capability boundaries passed 6/6; runtime API inventory, workspace
   all-feature check, formatting and diff hygiene passed.
 

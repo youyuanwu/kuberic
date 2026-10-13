@@ -387,6 +387,8 @@ struct RegisteredReplicator {
     identity: ReplicatorCreationIdentity,
     #[cfg(feature = "testing")]
     callback_containment: Option<tokio::sync::watch::Receiver<bool>>,
+    #[cfg(feature = "testing")]
+    stateless_preview_control: Option<Arc<dyn crate::replicator::StatelessPreviewControl>>,
     #[allow(dead_code)]
     capabilities: ReplicatorCapabilities,
     provider: Option<Arc<dyn StateProvider>>,
@@ -1392,6 +1394,20 @@ impl PodRuntime {
     #[cfg(feature = "testing")]
     pub(crate) async fn complete_stateless_preview_open(&self) {
         self.host.state.write().await.fallback_snapshot.open = true;
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn install_stateless_preview_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.host
+            .registered
+            .get()
+            .and_then(|registered| registered.stateless_preview_control.clone())
+            .ok_or(RuntimeError::NotOpen)?
+            .install_inbound_build_authority(authority)
+            .await
     }
 
     #[cfg(feature = "testing")]
@@ -3126,6 +3142,25 @@ impl PartitionAccessView for HostAccessView {
     }
 
     #[cfg(feature = "testing")]
+    async fn install_preview_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .install_public_v1_inbound_build_authority(authority)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
     async fn preview_outbound_build_authority(
         &self,
         build_id: &crate::protocol::types::OperationId,
@@ -3357,6 +3392,9 @@ impl ReplicatorRegistration for RuntimeHost {
         let identity = attachment.identity(RuntimeHostToken::new());
         #[cfg(feature = "testing")]
         let callback_containment = attachment.callback_containment(RuntimeHostToken::new());
+        #[cfg(feature = "testing")]
+        let stateless_preview_control =
+            attachment.stateless_preview_control(RuntimeHostToken::new());
         let managed_lifecycle = attachment.managed_lifecycle(RuntimeHostToken::new());
         let managed_data_plane = attachment.managed_data_plane(RuntimeHostToken::new());
         let control = attachment.replicator(RuntimeHostToken::new());
@@ -3458,6 +3496,8 @@ impl ReplicatorRegistration for RuntimeHost {
                 identity,
                 #[cfg(feature = "testing")]
                 callback_containment,
+                #[cfg(feature = "testing")]
+                stateless_preview_control,
                 capabilities,
                 provider,
                 process_lifecycle,

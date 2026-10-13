@@ -873,9 +873,10 @@ impl ReplicaHandle {
                 "inbound build authority differs from selected preview target".into(),
             ));
         }
-        self.store
-            .install_public_v1_inbound_build_authority(authority)
+        self.runtime
+            .install_stateless_preview_inbound_build_authority(authority)
             .await
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string().into()))
     }
 
     #[cfg(feature = "testing")]
@@ -1022,6 +1023,32 @@ impl ReplicaHandle {
                 )
             })?,
         })
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn stateless_preview_next_operation_revision(&self) -> Result<u64> {
+        let preview = self
+            .store
+            .load_state()
+            .await?
+            .public_operation_preview
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview requires schema-11 operation state".into(),
+                )
+            })?;
+        preview
+            .operations
+            .values()
+            .map(|record| record.intent.revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview operation revision exhausted".into(),
+                )
+            })
     }
 
     #[cfg(feature = "testing")]

@@ -229,6 +229,13 @@ impl PublicV1OperationApi for DispatchProbe {
         self.dispatches.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn observe_public_v1_operation_report(
+        &self,
+        _expected: &PublicV1AcceptedTransitionStatus,
+    ) -> Result<PublicV1AgentReport, String> {
+        Err("dispatch probe does not publish runtime reports".into())
+    }
 }
 
 fn operation_intent(

@@ -1,9 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kuberic_runtime::host::ReplicaHandle;
 use kuberic_runtime::protocol::command::{
-    ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
+    ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
+    PublicV1SessionRenewalCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
     PublicBuildAttemptReference, PublicConfiguration, PublicInboundBuildAuthority,
@@ -19,8 +20,6 @@ use crate::evaluator::public_v1_evidence::{
     PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
 };
 
-static NEXT_HOSTED_AUTHORITY_REVISION: AtomicU64 = AtomicU64::new(1_000_000);
-
 #[async_trait::async_trait]
 pub trait PublicV1OperationApi: Send + Sync {
     async fn observe_public_v1_operation(
@@ -32,6 +31,11 @@ pub trait PublicV1OperationApi: Send + Sync {
         expected: &PublicV1AcceptedTransitionStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String>;
+
+    async fn observe_public_v1_operation_report(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+    ) -> Result<PublicV1AgentReport, String>;
 }
 
 #[derive(Clone)]
@@ -47,6 +51,8 @@ pub struct HostedPublicV1Adapter {
     renewal: Mutex<Option<PublicV1SessionRenewalStatus>>,
     evidence: Arc<PublicV1EvidenceState>,
     dispatched: Mutex<Vec<ProtocolCommand>>,
+    suboperations: Mutex<BTreeMap<(ReplicaIdentity, OperationId), PublicOperationIntent>>,
+    suboperation_cut: Mutex<Option<usize>>,
 }
 
 impl HostedPublicV1Adapter {
@@ -80,11 +86,17 @@ impl HostedPublicV1Adapter {
             renewal: Mutex::new(renewal),
             evidence,
             dispatched: Mutex::new(Vec::new()),
+            suboperations: Mutex::new(BTreeMap::new()),
+            suboperation_cut: Mutex::new(None),
         })
     }
 
     pub fn dispatched(&self) -> Vec<ProtocolCommand> {
         self.dispatched.lock().unwrap().clone()
+    }
+
+    pub fn cut_after_hosted_suboperations(&self, count: usize) {
+        *self.suboperation_cut.lock().unwrap() = Some(count.max(1));
     }
 
     pub async fn report(&self, identity: &ReplicaIdentity) -> Result<PublicV1AgentReport, String> {
@@ -172,23 +184,77 @@ impl HostedPublicV1Adapter {
         operation_id: OperationId,
         program: PublicOperationProgram,
     ) -> Result<(), String> {
+        let process_session_id = self.replica(target)?.handle.process_session_id();
+        self.execute_authority_program_for_session(
+            target,
+            preview_generation,
+            operation_id,
+            process_session_id,
+            program,
+        )
+        .await
+    }
+
+    async fn execute_authority_program_for_session(
+        &self,
+        target: &ReplicaIdentity,
+        preview_generation: u64,
+        operation_id: OperationId,
+        process_session_id: kuberic_runtime::protocol::types::ProcessSessionId,
+        program: PublicOperationProgram,
+    ) -> Result<(), String> {
         let replica = self.replica(target)?;
-        replica
-            .handle
-            .execute_stateless_preview(PublicOperationIntent {
+        if replica.handle.process_session_id() != process_session_id {
+            return Err("hosted suboperation changed its process session".into());
+        }
+        let key = (target.clone(), operation_id.clone());
+        let existing = self.suboperations.lock().unwrap().get(&key).cloned();
+        let intent = if let Some(existing) = existing {
+            existing
+        } else {
+            let revision = replica
+                .handle
+                .stateless_preview_next_operation_revision()
+                .await
+                .map_err(|error| error.to_string())?;
+            let intent = PublicOperationIntent {
                 preview: kuberic_runtime::protocol::public_operations::
                     PublicOperationPreviewIdentity::public_v1(preview_generation),
                 operation_id,
-                revision: NEXT_HOSTED_AUTHORITY_REVISION.fetch_add(1, Ordering::AcqRel),
-                process_session_id: replica.handle.process_session_id(),
+                revision,
+                process_session_id,
                 class: PublicOperationClass::Authority,
                 input_digest: program.digest(),
                 replay_disposition: program.replay_disposition(),
                 lifecycle: None,
                 program: Some(program),
-            })
+            };
+            self.suboperations
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_insert_with(|| intent.clone())
+                .clone()
+        };
+        replica
+            .handle
+            .execute_stateless_preview(intent.clone())
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                format!(
+                    "hosted suboperation {} revision {} for {} failed: {error}",
+                    intent.operation_id, intent.revision, target.replica_id
+                )
+            })?;
+        let mut cut = self.suboperation_cut.lock().unwrap();
+        if let Some(remaining) = cut.as_mut() {
+            if *remaining == 1 {
+                *cut = None;
+                return Err("injected cut after hosted suboperation completion".into());
+            }
+            *remaining -= 1;
+        }
+        Ok(())
     }
 
     async fn install_configuration_on_all(
@@ -261,27 +327,17 @@ impl HostedPublicV1Adapter {
                 epoch,
             } => {
                 let program = PublicOperationProgram::Epoch { epoch: *epoch };
-                self.replica(&survivor.identity)?
-                    .handle
-                    .execute_stateless_preview(PublicOperationIntent {
-                        preview: kuberic_runtime::protocol::public_operations::
-                            PublicOperationPreviewIdentity::public_v1(
-                                accepted.required.history.protocol_generation.value(),
-                            ),
-                        operation_id: OperationId::new(format!(
-                            "{}-barrier-{}",
-                            accepted.required.operation_id, survivor.identity.replica_id
-                        )),
-                        revision: NEXT_HOSTED_AUTHORITY_REVISION.fetch_add(1, Ordering::AcqRel),
-                        process_session_id: survivor.process_session_id.clone(),
-                        class: PublicOperationClass::Authority,
-                        input_digest: program.digest(),
-                        replay_disposition: program.replay_disposition(),
-                        lifecycle: None,
-                        program: Some(program),
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.execute_authority_program_for_session(
+                    &survivor.identity,
+                    accepted.required.history.protocol_generation.value(),
+                    OperationId::new(format!(
+                        "{}-barrier-{}",
+                        accepted.required.operation_id, survivor.identity.replica_id
+                    )),
+                    survivor.process_session_id.clone(),
+                    program,
+                )
+                .await?;
             }
             PublicV1SessionRenewalCommand::ReplayReplacementRole {
                 accepted,
@@ -318,27 +374,14 @@ impl HostedPublicV1Adapter {
                     epoch: *epoch,
                     role: *role,
                 };
-                self.replica(&replacement.identity)?
-                    .handle
-                    .execute_stateless_preview(PublicOperationIntent {
-                        preview: kuberic_runtime::protocol::public_operations::
-                            PublicOperationPreviewIdentity::public_v1(
-                                accepted.required.history.protocol_generation.value(),
-                            ),
-                        operation_id: OperationId::new(format!(
-                            "{}-role",
-                            accepted.required.operation_id
-                        )),
-                        revision: NEXT_HOSTED_AUTHORITY_REVISION.fetch_add(1, Ordering::AcqRel),
-                        process_session_id: process_session_id.clone(),
-                        class: PublicOperationClass::Authority,
-                        input_digest: program.digest(),
-                        replay_disposition: program.replay_disposition(),
-                        lifecycle: None,
-                        program: Some(program),
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.execute_authority_program_for_session(
+                    &replacement.identity,
+                    accepted.required.history.protocol_generation.value(),
+                    OperationId::new(format!("{}-role", accepted.required.operation_id)),
+                    process_session_id.clone(),
+                    program,
+                )
+                .await?;
             }
             PublicV1SessionRenewalCommand::InstallFreshConfiguration {
                 accepted,
@@ -366,6 +409,70 @@ impl HostedPublicV1Adapter {
                 .persist_stateless_preview_session_renewal(expected, next)
                 .await
                 .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_failover_predecessors(
+        &self,
+        operation: &PublicV1OperationCommand,
+    ) -> Result<(), String> {
+        let Some(lifecycle) = operation.intent.lifecycle.as_ref().filter(|lifecycle| {
+            lifecycle.recipe
+                == kuberic_runtime::protocol::public_operations::PublicLifecycleRecipe::
+                    FailoverPromotion
+        }) else {
+            return Ok(());
+        };
+        for member in lifecycle
+            .current
+            .members
+            .iter()
+            .filter(|member| member.identity != operation.target)
+        {
+            self.replica(&member.identity)?
+                .handle
+                .fence_stateless_preview_access()
+                .await;
+            self.execute_authority_program(
+                &member.identity,
+                operation.intent.preview.generation,
+                OperationId::new(format!(
+                    "{}-predecessor-epoch-{}",
+                    operation.intent.operation_id, member.identity.replica_id
+                )),
+                PublicOperationProgram::Epoch {
+                    epoch: lifecycle.epoch,
+                },
+            )
+            .await?;
+            self.execute_authority_program(
+                &member.identity,
+                operation.intent.preview.generation,
+                OperationId::new(format!(
+                    "{}-predecessor-role-{}",
+                    operation.intent.operation_id, member.identity.replica_id
+                )),
+                PublicOperationProgram::Role {
+                    epoch: lifecycle.epoch,
+                    role: member.role,
+                },
+            )
+            .await?;
+            let mut configuration = self
+                .public_configuration_for(&member.identity, &lifecycle.current)
+                .await?;
+            configuration.previous = lifecycle.previous.clone();
+            self.execute_authority_program(
+                &member.identity,
+                operation.intent.preview.generation,
+                OperationId::new(format!(
+                    "{}-predecessor-configuration-{}",
+                    operation.intent.operation_id, member.identity.replica_id
+                )),
+                PublicOperationProgram::Configuration(configuration),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -405,6 +512,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
                 "hosted public-v1 command target differs from accepted source incarnation".into(),
             );
         }
+        Box::pin(self.prepare_failover_predecessors(operation)).await?;
         if let Some(PublicOperationProgram::Build(build)) = operation.intent.program.as_ref() {
             let target = expected
                 .intent
@@ -591,6 +699,14 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
         }
         self.dispatched.lock().unwrap().push(command.clone());
         Ok(())
+    }
+
+    async fn observe_public_v1_operation_report(
+        &self,
+        expected: &PublicV1AcceptedTransitionStatus,
+    ) -> Result<PublicV1AgentReport, String> {
+        self.report(&expected.intent.source.storage_incarnation.replica)
+            .await
     }
 }
 
