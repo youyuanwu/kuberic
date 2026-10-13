@@ -215,10 +215,18 @@ fn decide(
             completion: Box::new(completion.clone()),
         },
         PublicV1OperationResult::RebuildRequired(rebuild) => {
+            let target = match rebuild.as_ref() {
+                CanonicalReplicaRebuildRequired::LocalProvider { .. } => {
+                    accepted.intent.source.clone()
+                }
+                CanonicalReplicaRebuildRequired::RemoteBuildTarget { .. } => {
+                    accepted.intent.effect_target().clone()
+                }
+            };
             PublicV1EvidencePlan::ProvisionReplacement {
                 expected: Box::new(accepted.clone()),
                 completion: Box::new(completion.clone()),
-                target: Box::new(accepted.intent.effect_target().clone()),
+                target: Box::new(target),
                 rebuild: rebuild.clone(),
             }
         }

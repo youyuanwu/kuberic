@@ -35,9 +35,9 @@ use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
 #[cfg(feature = "testing")]
 use crate::protocol::public_operations::PreviewLifecycleBinding;
-#[cfg(feature = "testing")]
-use crate::protocol::public_operations::PublicInboundBuildAuthority;
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
+#[cfg(feature = "testing")]
+use crate::protocol::public_operations::{PublicInboundBuildAuthority, PublicInboundBuildReceipt};
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -1131,6 +1131,21 @@ impl ReplicatorFactoryContext {
     }
 
     #[cfg(feature = "testing")]
+    pub(crate) async fn preview_terminal_inbound_build_receipt(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildReceipt>> {
+        self.access
+            .preview_terminal_inbound_build_receipt(build_id)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn revoke_preview_inbound_build_authority(&self) -> Result<()> {
+        self.access.revoke_preview_inbound_build_authority().await
+    }
+
+    #[cfg(feature = "testing")]
     pub(crate) async fn preview_outbound_build_authority(
         &self,
         build_id: &OperationId,
@@ -1144,9 +1159,9 @@ impl ReplicatorFactoryContext {
     #[cfg(feature = "testing")]
     pub(crate) async fn complete_preview_inbound_build(
         &self,
-        build_id: &OperationId,
+        receipt: &PublicInboundBuildReceipt,
     ) -> Result<()> {
-        self.access.complete_preview_inbound_build(build_id).await
+        self.access.complete_preview_inbound_build(receipt).await
     }
 
     #[cfg(feature = "testing")]
@@ -1181,6 +1196,15 @@ pub(crate) trait PartitionAccessView: Send + Sync {
     ) -> Result<Option<PublicInboundBuildAuthority>>;
 
     #[cfg(feature = "testing")]
+    async fn preview_terminal_inbound_build_receipt(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildReceipt>>;
+
+    #[cfg(feature = "testing")]
+    async fn revoke_preview_inbound_build_authority(&self) -> Result<()>;
+
+    #[cfg(feature = "testing")]
     async fn preview_outbound_build_authority(
         &self,
         build_id: &OperationId,
@@ -1188,7 +1212,10 @@ pub(crate) trait PartitionAccessView: Send + Sync {
     ) -> Result<Option<PublicInboundBuildAuthority>>;
 
     #[cfg(feature = "testing")]
-    async fn complete_preview_inbound_build(&self, build_id: &OperationId) -> Result<()>;
+    async fn complete_preview_inbound_build(
+        &self,
+        receipt: &PublicInboundBuildReceipt,
+    ) -> Result<()>;
 
     #[cfg(feature = "testing")]
     async fn preview_storage_is_retired(

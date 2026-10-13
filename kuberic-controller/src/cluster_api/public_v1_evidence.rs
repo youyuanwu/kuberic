@@ -348,7 +348,13 @@ impl PublicV1EvidenceApi for PublicV1EvidenceState {
         ) {
             return Err("public-v1 replacement differs from accepted rebuild evidence".into());
         }
-        if target != expected.intent.effect_target() {
+        let expected_target = match rebuild {
+            CanonicalReplicaRebuildRequired::LocalProvider { .. } => &expected.intent.source,
+            CanonicalReplicaRebuildRequired::RemoteBuildTarget { .. } => {
+                expected.intent.effect_target()
+            }
+        };
+        if target != expected_target {
             return Err("public-v1 replacement target differs from accepted intent".into());
         }
         let key = PublicV1EffectKey {

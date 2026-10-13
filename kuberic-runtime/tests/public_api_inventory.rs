@@ -4,9 +4,6 @@ use std::path::{Path, PathBuf};
 use quote::ToTokens;
 use syn::{Attribute, Fields, ImplItem, Item, ItemMod, Meta, TraitItem, Visibility, parse_file};
 
-const ALLOWLIST: &str = include_str!("source_public_api.allowlist");
-const CONTROL_ALLOWLIST: &str = include_str!("control_source_public_api.allowlist");
-
 #[test]
 fn application_replication_api_has_no_parallel_driver_or_admission_surface() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
@@ -71,9 +68,12 @@ fn source_public_api_matches_reviewed_inventory() {
         return;
     }
 
-    let mut expected = ALLOWLIST
+    let allowlist = fs::read_to_string(&allowlist_path).expect("read source API allowlist");
+    let control_allowlist =
+        fs::read_to_string(&control_allowlist_path).expect("read control source API allowlist");
+    let mut expected = allowlist
         .lines()
-        .chain(CONTROL_ALLOWLIST.lines())
+        .chain(control_allowlist.lines())
         .collect::<Vec<_>>();
     expected.sort_unstable();
     expected.dedup();

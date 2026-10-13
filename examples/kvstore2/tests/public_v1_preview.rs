@@ -3,22 +3,24 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use kuberic_runtime::application::Operation;
 use kuberic_runtime::engine::DurableState;
 use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
 };
 use kuberic_runtime::protocol::public_operations::{
     PreviewLifecycleBinding, ProcessSessionRenewalRequired, PublicBuildAttemptReference,
-    PublicBuildInput, PublicConfiguration, PublicInboundBuildAuthority, PublicOperationClass,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram,
-    PublicReplicaDescriptor, StatePersistence,
+    PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicInboundBuildAuthority,
+    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
+    PublicOperationProgram, PublicReplicaDescriptor, StatePersistence,
 };
 use kuberic_runtime::protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
-    InitializationId, OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionRenewalReason,
-    PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
-    StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+    Epoch, InitializationId, OperationId, PodUid, ProcessSessionEndpoint,
+    ProcessSessionRenewalReason, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity, ReplicaStorageIncarnationContext,
+    ReplicatorCreationId, ResourceUid, StorageGeneration, derive_bootstrap_history,
+    derive_history_initialization_id,
 };
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
@@ -424,6 +426,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         };
         divergent_handle
             .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+                operation_id: OperationId::new("kv-divergent-build"),
+                operation_revision: 4,
                 attempt: PublicBuildAttemptReference {
                     resource_uid: resource_uid.clone(),
                     epoch,
@@ -642,6 +646,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         };
         replacement_handle
             .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+                operation_id: OperationId::new("kv-corrective-build"),
+                operation_revision: 8,
                 attempt: PublicBuildAttemptReference {
                     resource_uid: resource_uid.clone(),
                     epoch,
@@ -955,6 +961,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 .await
                 .unwrap();
         }
+
         source_handle
             .execute_stateless_preview(intent(
                 &preview,
@@ -1105,6 +1112,771 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 .as_deref(),
             Some("must-not-return")
         );
+        std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn kvstore2_real_provider_restart_settlement_and_handoff() {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("kvstore2-public-v1-composite")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&root);
+        let source_root = root.join("source");
+        let secondary_root = root.join("secondary");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&secondary_root).unwrap();
+
+        let resource_uid = ResourceUid::new("kvstore2-public-v1-composite");
+        let preview = PublicOperationPreviewIdentity::public_v1(51);
+        let binding = PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let source_identity = identity(1, "kv-composite-source");
+        let secondary_identity = identity(2, "kv-composite-secondary");
+        let source_storage = storage(source_identity.clone(), "kv-composite-source");
+        let secondary_storage = storage(secondary_identity.clone(), "kv-composite-secondary");
+        for (path, identity, name) in [
+            (&source_root, source_identity.clone(), "kv-composite-source"),
+            (
+                &secondary_root,
+                secondary_identity.clone(),
+                "kv-composite-secondary",
+            ),
+        ] {
+            drop(
+                SqliteStore::create_public_v1(
+                    SqliteStore::metadata_database_path(path),
+                    preview.clone(),
+                    store_identity(resource_uid.clone(), identity, name),
+                )
+                .unwrap(),
+            );
+        }
+
+        let source_address = address();
+        let secondary_address = address();
+        let source_persistence =
+            Arc::new(KvPersistence::open(source_root.join("application")).unwrap());
+        let secondary_persistence =
+            Arc::new(KvPersistence::open(secondary_root.join("application")).unwrap());
+        let source_service = Arc::new(
+            KvService::new(
+                source_persistence.clone(),
+                format!("http://{source_address}"),
+                CopyGate::disabled(),
+            )
+            .with_stateless_preview(),
+        );
+        let secondary_service = Arc::new(
+            KvService::new(
+                secondary_persistence.clone(),
+                format!("http://{secondary_address}"),
+                CopyGate::disabled(),
+            )
+            .with_stateless_preview(),
+        );
+        let mut source = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(1),
+                pod_uid: PodUid::new("kv-composite-source-pod"),
+                pvc_uid: PvcUid::new("kv-composite-source-pvc"),
+                data_root: source_root.clone(),
+                control_address: address(),
+                replication_address: source_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            source_service.clone(),
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding.clone())
+        .start()
+        .await
+        .unwrap();
+        let mut secondary = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(2),
+                pod_uid: PodUid::new("kv-composite-secondary-pod"),
+                pvc_uid: PvcUid::new("kv-composite-secondary-pvc"),
+                data_root: secondary_root.clone(),
+                control_address: address(),
+                replication_address: secondary_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            secondary_service.clone(),
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding.clone())
+        .start()
+        .await
+        .unwrap();
+        let source_handle = source.handle();
+        let secondary_handle = secondary.handle();
+        let generation = PublicProtocolGeneration::new(51);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        source_handle
+            .initialize_stateless_preview_history(&initialization, &history, &source_storage)
+            .await
+            .unwrap();
+        secondary_handle
+            .initialize_stateless_preview_history(&initialization, &history, &secondary_storage)
+            .await
+            .unwrap();
+
+        let initial_epoch = Epoch::new(0, 1);
+        let initial_configuration = ConfigurationDescriptor::new(
+            initial_epoch,
+            source_identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source_identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: secondary_identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        for (handle, identity, role, peer, peer_address, peer_session, peer_storage) in [
+            (
+                &secondary_handle,
+                secondary_identity.clone(),
+                ReplicaRole::ActiveSecondary,
+                source_identity.clone(),
+                source_address,
+                source_handle.process_session_id(),
+                source_storage.clone(),
+            ),
+            (
+                &source_handle,
+                source_identity.clone(),
+                ReplicaRole::Primary,
+                secondary_identity.clone(),
+                secondary_address,
+                secondary_handle.process_session_id(),
+                secondary_storage.clone(),
+            ),
+        ] {
+            for (revision, name, program) in [
+                (
+                    1,
+                    format!("{}-open", identity.instance_id),
+                    PublicOperationProgram::Open {
+                        replica: identity.clone(),
+                        existing: true,
+                    },
+                ),
+                (
+                    2,
+                    format!("{}-role", identity.instance_id),
+                    PublicOperationProgram::Role {
+                        epoch: initial_epoch,
+                        role,
+                    },
+                ),
+                (
+                    3,
+                    format!("{}-epoch", identity.instance_id),
+                    PublicOperationProgram::Epoch {
+                        epoch: initial_epoch,
+                    },
+                ),
+                (
+                    4,
+                    format!("{}-configuration", identity.instance_id),
+                    PublicOperationProgram::Configuration(PublicConfiguration {
+                        current: initial_configuration.clone(),
+                        previous: None,
+                        replicas: vec![PublicReplicaDescriptor {
+                            build_id: OperationId::default(),
+                            identity: peer,
+                            replication_address: format!("http://{peer_address}"),
+                            process_session_id: peer_session,
+                            storage_incarnation: Some(peer_storage),
+                            role: if role == ReplicaRole::Primary {
+                                ReplicaRole::ActiveSecondary
+                            } else {
+                                ReplicaRole::Primary
+                            },
+                            current_progress: 0,
+                            catch_up_capability: 0,
+                            must_catchup: role == ReplicaRole::Primary,
+                        }],
+                    }),
+                ),
+            ] {
+                handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        handle.process_session_id(),
+                        revision,
+                        &name,
+                        program,
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            source_service
+                .replicate_put("baseline".into(), "v1".into())
+                .await
+                .unwrap(),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while secondary_persistence
+                .durable_progress()
+                .await
+                .unwrap()
+                .committed_lsn
+                < 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("baseline did not reach the real secondary provider");
+        let source_predecessor = source_handle
+            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .await
+            .unwrap();
+        let secondary_predecessor = secondary_handle
+            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+        source.shutdown();
+        secondary.shutdown();
+        source.wait().await.unwrap();
+        secondary.wait().await.unwrap();
+
+        let unsettled = Operation {
+            lsn: 2,
+            committed_lsn: 1,
+            data: KvPersistence::encode_put("unsettled".into(), "v2".into()).unwrap(),
+        };
+        source_persistence.apply(unsettled.clone()).await.unwrap();
+        secondary_persistence.apply(unsettled).await.unwrap();
+        assert_eq!(
+            source_persistence.durable_progress().await.unwrap(),
+            kuberic_runtime::application::DurableApplicationProgress {
+                applied_lsn: 2,
+                committed_lsn: 1,
+            }
+        );
+        assert_eq!(
+            secondary_persistence.durable_progress().await.unwrap(),
+            kuberic_runtime::application::DurableApplicationProgress {
+                applied_lsn: 2,
+                committed_lsn: 1,
+            }
+        );
+        drop(source_service);
+        drop(secondary_service);
+        drop(source_persistence);
+        drop(secondary_persistence);
+
+        let source_address = address();
+        let secondary_address = address();
+        let source_persistence =
+            Arc::new(KvPersistence::open(source_root.join("application")).unwrap());
+        let secondary_persistence =
+            Arc::new(KvPersistence::open(secondary_root.join("application")).unwrap());
+        let source_service = Arc::new(
+            KvService::new(
+                source_persistence.clone(),
+                format!("http://{source_address}"),
+                CopyGate::disabled(),
+            )
+            .with_stateless_preview(),
+        );
+        let secondary_service = Arc::new(
+            KvService::new(
+                secondary_persistence.clone(),
+                format!("http://{secondary_address}"),
+                CopyGate::disabled(),
+            )
+            .with_stateless_preview(),
+        );
+        let mut source = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(1),
+                pod_uid: PodUid::new("kv-composite-source-pod"),
+                pvc_uid: PvcUid::new("kv-composite-source-pvc"),
+                data_root: source_root.clone(),
+                control_address: address(),
+                replication_address: source_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            source_service.clone(),
+            ApplicationStorageState::Established,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding.clone())
+        .start()
+        .await
+        .unwrap();
+        let mut secondary = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(2),
+                pod_uid: PodUid::new("kv-composite-secondary-pod"),
+                pvc_uid: PvcUid::new("kv-composite-secondary-pvc"),
+                data_root: secondary_root.clone(),
+                control_address: address(),
+                replication_address: secondary_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            secondary_service.clone(),
+            ApplicationStorageState::Established,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding)
+        .start()
+        .await
+        .unwrap();
+        let source_handle = source.handle();
+        let secondary_handle = secondary.handle();
+        assert!(source_service.get("unsettled").await.is_err());
+        assert!(secondary_service.get("unsettled").await.is_err());
+
+        let restart_epoch = Epoch::new(0, 2);
+        let source_only_configuration = ConfigurationDescriptor::new(
+            restart_epoch,
+            source_identity.replica_id,
+            vec![ConfigurationMember {
+                identity: source_identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        source_handle
+            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+                operation_id: OperationId::new("kv-composite-renew-source"),
+                reason: ProcessSessionRenewalReason::PrimaryReplacement,
+                resource_uid: resource_uid.clone(),
+                history: history.clone(),
+                previous_epoch: initial_epoch,
+                renewal_epoch: restart_epoch,
+                predecessor: source_predecessor,
+                replacement: Some(ProcessSessionEndpoint {
+                    identity: source_identity.clone(),
+                    storage_incarnation: source_storage.clone(),
+                    process_session_id: source_handle.process_session_id(),
+                    replicator_creation_id: ReplicatorCreationId::new(
+                        "kv-composite-renew-source-creation",
+                    ),
+                    role: ReplicaRole::None,
+                }),
+                surviving_sessions: Vec::new(),
+                fresh_configuration: source_only_configuration,
+                predecessor_contained: true,
+                data_loss: None,
+            })
+            .await
+            .unwrap();
+        for (revision, name, program) in [
+            (
+                5,
+                "kv-composite-source-reopen",
+                PublicOperationProgram::Open {
+                    replica: source_identity.clone(),
+                    existing: true,
+                },
+            ),
+            (
+                6,
+                "kv-composite-source-rerole",
+                PublicOperationProgram::Role {
+                    epoch: restart_epoch,
+                    role: ReplicaRole::Primary,
+                },
+            ),
+            (
+                7,
+                "kv-composite-source-reepoch",
+                PublicOperationProgram::Epoch {
+                    epoch: restart_epoch,
+                },
+            ),
+        ] {
+            source_handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    source_handle.process_session_id(),
+                    revision,
+                    name,
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        let renewed_source = source_handle
+            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .await
+            .unwrap();
+        let restart_configuration = ConfigurationDescriptor::new(
+            restart_epoch,
+            source_identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source_identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: secondary_identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        secondary_handle
+            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+                operation_id: OperationId::new("kv-composite-renew-secondary"),
+                reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
+                resource_uid: resource_uid.clone(),
+                history: history.clone(),
+                previous_epoch: initial_epoch,
+                renewal_epoch: restart_epoch,
+                predecessor: secondary_predecessor,
+                replacement: Some(ProcessSessionEndpoint {
+                    identity: secondary_identity.clone(),
+                    storage_incarnation: secondary_storage.clone(),
+                    process_session_id: secondary_handle.process_session_id(),
+                    replicator_creation_id: ReplicatorCreationId::new(
+                        "kv-composite-renew-secondary-creation",
+                    ),
+                    role: ReplicaRole::None,
+                }),
+                surviving_sessions: vec![renewed_source],
+                fresh_configuration: restart_configuration.clone(),
+                predecessor_contained: true,
+                data_loss: None,
+            })
+            .await
+            .unwrap();
+        for (revision, name, program) in [
+            (
+                5,
+                "kv-composite-secondary-reopen",
+                PublicOperationProgram::Open {
+                    replica: secondary_identity.clone(),
+                    existing: true,
+                },
+            ),
+            (
+                6,
+                "kv-composite-secondary-rerole",
+                PublicOperationProgram::Role {
+                    epoch: restart_epoch,
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ),
+            (
+                7,
+                "kv-composite-secondary-reepoch",
+                PublicOperationProgram::Epoch {
+                    epoch: restart_epoch,
+                },
+            ),
+        ] {
+            secondary_handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    secondary_handle.process_session_id(),
+                    revision,
+                    name,
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        let source_configuration = PublicConfiguration {
+            current: restart_configuration.clone(),
+            previous: None,
+            replicas: vec![PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: secondary_identity.clone(),
+                replication_address: format!("http://{secondary_address}"),
+                process_session_id: secondary_handle.process_session_id(),
+                storage_incarnation: Some(secondary_storage.clone()),
+                role: ReplicaRole::ActiveSecondary,
+                current_progress: 1,
+                catch_up_capability: 1,
+                must_catchup: true,
+            }],
+        };
+        let secondary_configuration = PublicConfiguration {
+            current: restart_configuration.clone(),
+            previous: None,
+            replicas: vec![PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: source_identity.clone(),
+                replication_address: format!("http://{source_address}"),
+                process_session_id: source_handle.process_session_id(),
+                storage_incarnation: Some(source_storage.clone()),
+                role: ReplicaRole::Primary,
+                current_progress: 1,
+                catch_up_capability: 1,
+                must_catchup: false,
+            }],
+        };
+        secondary_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                secondary_handle.process_session_id(),
+                8,
+                "kv-composite-secondary-reconfiguration",
+                PublicOperationProgram::Configuration(secondary_configuration),
+            ))
+            .await
+            .unwrap();
+        source_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                source_handle.process_session_id(),
+                8,
+                "kv-composite-source-reconfiguration",
+                PublicOperationProgram::Configuration(source_configuration.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            source_handle
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::Granted
+        );
+        assert!(source_service.get("unsettled").await.is_err());
+        assert!(
+            source_service
+                .replicate_put("must-stay-closed".into(), "bad".into())
+                .await
+                .is_err()
+        );
+        source_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                source_handle.process_session_id(),
+                9,
+                "kv-composite-settle-suffix",
+                PublicOperationProgram::CatchUp {
+                    configuration: source_configuration,
+                    mode: PublicCatchUpMode::WriteQuorum,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            source_persistence
+                .durable_progress()
+                .await
+                .unwrap()
+                .committed_lsn,
+            2
+        );
+        assert_eq!(
+            secondary_persistence
+                .durable_progress()
+                .await
+                .unwrap()
+                .committed_lsn,
+            2
+        );
+        assert_eq!(
+            source_service.get("unsettled").await.unwrap().as_deref(),
+            Some("v2")
+        );
+        let source_report = source_handle.stateless_preview_report().await.unwrap();
+        let secondary_report = secondary_handle.stateless_preview_report().await.unwrap();
+        assert_eq!(source_report.write_status, AccessStatus::Granted);
+        assert_ne!(secondary_report.write_status, AccessStatus::Granted);
+
+        let handoff_epoch = Epoch::new(0, 3);
+        let handoff_configuration = ConfigurationDescriptor::new(
+            handoff_epoch,
+            secondary_identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source_identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: secondary_identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            2,
+        );
+        for (handle, revision, name, role) in [
+            (
+                &source_handle,
+                10,
+                "kv-composite-source-handoff-role",
+                ReplicaRole::ActiveSecondary,
+            ),
+            (
+                &secondary_handle,
+                9,
+                "kv-composite-secondary-handoff-role",
+                ReplicaRole::Primary,
+            ),
+        ] {
+            handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    revision,
+                    &format!("{name}-epoch"),
+                    PublicOperationProgram::Epoch {
+                        epoch: handoff_epoch,
+                    },
+                ))
+                .await
+                .unwrap();
+            handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    revision + 1,
+                    name,
+                    PublicOperationProgram::Role {
+                        epoch: handoff_epoch,
+                        role,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let source_handoff = PublicConfiguration {
+            current: handoff_configuration.clone(),
+            previous: None,
+            replicas: vec![PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: secondary_identity.clone(),
+                replication_address: format!("http://{secondary_address}"),
+                process_session_id: secondary_handle.process_session_id(),
+                storage_incarnation: Some(secondary_storage.clone()),
+                role: ReplicaRole::Primary,
+                current_progress: 2,
+                catch_up_capability: 2,
+                must_catchup: false,
+            }],
+        };
+        let secondary_handoff = PublicConfiguration {
+            current: handoff_configuration,
+            previous: None,
+            replicas: vec![PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: source_identity.clone(),
+                replication_address: format!("http://{source_address}"),
+                process_session_id: source_handle.process_session_id(),
+                storage_incarnation: Some(source_storage.clone()),
+                role: ReplicaRole::ActiveSecondary,
+                current_progress: 2,
+                catch_up_capability: 2,
+                must_catchup: false,
+            }],
+        };
+        source_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                source_handle.process_session_id(),
+                12,
+                "kv-composite-source-handoff-configuration",
+                PublicOperationProgram::Configuration(source_handoff),
+            ))
+            .await
+            .unwrap();
+        secondary_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                secondary_handle.process_session_id(),
+                11,
+                "kv-composite-secondary-handoff-configuration",
+                PublicOperationProgram::Configuration(secondary_handoff.clone()),
+            ))
+            .await
+            .unwrap();
+        secondary_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                secondary_handle.process_session_id(),
+                12,
+                "kv-composite-secondary-handoff-catch-up",
+                PublicOperationProgram::CatchUp {
+                    configuration: secondary_handoff,
+                    mode: PublicCatchUpMode::WriteQuorum,
+                },
+            ))
+            .await
+            .unwrap();
+        let source_report = source_handle.stateless_preview_report().await.unwrap();
+        let secondary_report = secondary_handle.stateless_preview_report().await.unwrap();
+        assert_ne!(source_report.write_status, AccessStatus::Granted);
+        assert_eq!(secondary_report.write_status, AccessStatus::Granted);
+        assert!(
+            source_service
+                .replicate_put("old-primary".into(), "bad".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            secondary_service
+                .replicate_put("after-handoff".into(), "v3".into())
+                .await
+                .unwrap(),
+            3
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while source_persistence
+                .durable_progress()
+                .await
+                .unwrap()
+                .committed_lsn
+                < 3
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-handoff write did not reach the old primary provider");
+        for persistence in [&source_persistence, &secondary_persistence] {
+            assert_eq!(persistence.get("baseline").as_deref(), Some("v1"));
+            assert_eq!(persistence.get("unsettled").as_deref(), Some("v2"));
+            assert_eq!(persistence.get("after-handoff").as_deref(), Some("v3"));
+        }
+
+        source.shutdown();
+        secondary.shutdown();
+        source.wait().await.unwrap();
+        secondary.wait().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     })
     .await

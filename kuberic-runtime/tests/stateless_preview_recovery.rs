@@ -3,20 +3,23 @@
 // Hosted Public V1 preview lifecycle and recovery journeys.
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use kuberic_controller::evaluator::test_bridge::{
     HostedPreviewReplica, HostedPublicV1Adapter, PublicV1AcceptedTransitionIntent,
     PublicV1AcceptedTransitionStatus, PublicV1EvidenceApi, PublicV1EvidenceConsumer,
     PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1OperationApi,
     PublicV1ResourceAuthority, PublicV1ResourceDisposition, PublicV1ResourceProof,
-    execute_public_v1_history, execute_public_v1_operation, plan_public_v1_data_loss_recovery,
-    plan_public_v1_recovery_report, reconcile_public_v1_consumer,
+    PublicV1SessionRenewalApi, PublicV1SessionRenewalPlan, accept_public_v1_session_renewal,
+    accept_public_v1_survivor_retired, execute_public_v1_history, execute_public_v1_operation,
+    execute_public_v1_session_renewal, plan_public_v1_data_loss_recovery,
+    plan_public_v1_recovery_report, plan_public_v1_session_renewal, reconcile_public_v1_consumer,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationProgress, OpenContext, Operation, OperationDataStream, RoleChange,
@@ -89,6 +92,72 @@ fn authorized<T>(message: T) -> Request<T> {
         .metadata_mut()
         .insert("authorization", "Bearer preview-token".parse().unwrap());
     request
+}
+
+type HungReplicationStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<proto::ReplicationAck, tonic::Status>> + Send>>;
+type HungBuildStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<proto::CopyAck, tonic::Status>> + Send>>;
+
+struct HungBuildService {
+    entered: Arc<Notify>,
+}
+
+#[tonic::async_trait]
+impl proto::replication_data_server::ReplicationData for HungBuildService {
+    type ReplicateStream = HungReplicationStream;
+    type BuildStream = HungBuildStream;
+
+    async fn replicate(
+        &self,
+        _request: Request<tonic::Streaming<proto::ReplicationItem>>,
+    ) -> std::result::Result<tonic::Response<Self::ReplicateStream>, tonic::Status> {
+        Ok(tonic::Response::new(Box::pin(stream::empty())))
+    }
+
+    async fn build(
+        &self,
+        _request: Request<tonic::Streaming<proto::CopyItem>>,
+    ) -> std::result::Result<tonic::Response<Self::BuildStream>, tonic::Status> {
+        self.entered.notify_one();
+        Ok(tonic::Response::new(Box::pin(stream::pending())))
+    }
+}
+
+async fn drive_session_renewal(
+    adapter: &HostedPublicV1Adapter,
+    unreachable: &[ProcessSessionId],
+    retire_unreachable: bool,
+) {
+    loop {
+        let accepted = adapter
+            .observe_public_v1_session_renewal()
+            .await
+            .unwrap()
+            .unwrap();
+        let plan = plan_public_v1_session_renewal(&accepted, unreachable).unwrap();
+        match plan {
+            PublicV1SessionRenewalPlan::Stable => break,
+            PublicV1SessionRenewalPlan::WaitForSurvivor { survivor, .. } if retire_unreachable => {
+                let next = accept_public_v1_survivor_retired(
+                    &accepted,
+                    &survivor,
+                    OperationId::new(format!(
+                        "{}-retire-unreachable-{}",
+                        accepted.required.operation_id, survivor.identity.replica_id
+                    )),
+                )
+                .unwrap();
+                adapter
+                    .persist_public_v1_session_renewal(Some(&accepted), &next)
+                    .await
+                    .unwrap();
+            }
+            plan => execute_public_v1_session_renewal(adapter, plan)
+                .await
+                .unwrap(),
+        }
+    }
 }
 
 fn replica() -> ReplicaIdentity {
@@ -189,10 +258,12 @@ struct MemoryState {
     progress: Mutex<DurableApplicationProgress>,
     operations: Mutex<Vec<Operation>>,
     copy_chunks: Mutex<Vec<Bytes>>,
+    epoch_tails: Mutex<Vec<i64>>,
     block_apply: AtomicBool,
     block_commit: AtomicBool,
     fail_commit: AtomicBool,
     block_copy: AtomicBool,
+    block_finish_copy: AtomicBool,
     spawn_copy_descendant: AtomicBool,
     data_loss_changed: AtomicBool,
     fail_data_loss: AtomicBool,
@@ -204,6 +275,8 @@ struct MemoryState {
     release_apply: Notify,
     copy_entered: Notify,
     release_copy: Notify,
+    finish_copy_entered: Notify,
+    release_finish_copy: Notify,
     copy_descendant_entered: Arc<Notify>,
     release_copy_descendant: Arc<Notify>,
     cancelled_copy_descendants: Arc<AtomicU64>,
@@ -225,6 +298,10 @@ impl MemoryState {
 
     fn block_copy(&self) {
         self.block_copy.store(true, Ordering::Release);
+    }
+
+    fn block_finish_copy(&self) {
+        self.block_finish_copy.store(true, Ordering::Release);
     }
 
     fn block_copy_with_descendant(&self) {
@@ -253,6 +330,10 @@ impl StateProvider for MemoryState {
                 "negative previous epoch LSN".into(),
             ));
         }
+        self.epoch_tails
+            .lock()
+            .unwrap()
+            .push(previous_epoch_last_lsn);
         Ok(())
     }
 
@@ -393,6 +474,11 @@ impl DurableState for MemoryState {
         up_to_lsn: i64,
         committed_lsn: i64,
     ) -> Result<DurableApplicationProgress> {
+        if self.block_finish_copy.load(Ordering::Acquire) {
+            self.finish_copy_entered.notify_one();
+            self.release_finish_copy.notified().await;
+            self.block_finish_copy.store(false, Ordering::Release);
+        }
         let mut progress = self.progress.lock().unwrap();
         progress.applied_lsn = up_to_lsn;
         progress.committed_lsn = committed_lsn;
@@ -1023,6 +1109,32 @@ impl AuthorizedHostedPair {
     }
 }
 
+#[tokio::test]
+async fn empty_history_catch_up_requires_exact_live_peer_proof() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut pair = AuthorizedHostedPair::start("zero-progress-proof", 752).await;
+        pair.primary
+            .application
+            .wait_for_write_quorum()
+            .await
+            .unwrap();
+        assert_eq!(
+            *pair.primary.state.progress.lock().unwrap(),
+            DurableApplicationProgress::default()
+        );
+        pair.secondary.stop().await;
+        assert!(matches!(
+            pair.primary.application.wait_for_write_quorum().await,
+            Err(RuntimeError::ReconfigurationPending)
+        ));
+        pair.primary.stop().await;
+        pair.primary.cleanup();
+        pair.secondary.cleanup();
+    })
+    .await
+    .unwrap();
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 enum StoredCloseDiagnostic {
     CloseFailure {
@@ -1592,16 +1704,61 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
         );
         close_pair.cleanup().await;
 
+        let epoch_pair = AuthorizedHostedPair::start("write-epoch-tail-cut", 751).await;
+        epoch_pair.primary.state.block_commit();
+        let write = tokio::spawn({
+            let application = epoch_pair.primary.application.clone();
+            async move {
+                application
+                    .replicate(Bytes::from_static(b"epoch-tail-cut"))
+                    .await
+            }
+        });
+        epoch_pair.primary.state.commit_entered.notified().await;
+        let next_epoch = Epoch::new(0, 2);
+        let epoch_update = tokio::spawn({
+            let handle = epoch_pair.primary.handle();
+            let preview = epoch_pair.preview.clone();
+            async move {
+                handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        handle.process_session_id(),
+                        5,
+                        "epoch-during-commit",
+                        PublicOperationProgram::Epoch { epoch: next_epoch },
+                    ))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        epoch_pair.primary.state.release_commit.notify_waiters();
+        assert!(write.await.unwrap().is_err());
+        epoch_update.await.unwrap().unwrap();
+        assert_eq!(
+            epoch_pair
+                .primary
+                .state
+                .epoch_tails
+                .lock()
+                .unwrap()
+                .last()
+                .copied(),
+            Some(1),
+            "epoch callback did not receive the drained provider committed tail"
+        );
+        epoch_pair.cleanup().await;
+
         let dropped_pair = AuthorizedHostedPair::start("write-drop-cut", 75).await;
-        dropped_pair.secondary.state.block_apply();
+        dropped_pair.primary.state.block_apply();
         let write = tokio::spawn({
             let application = dropped_pair.primary.application.clone();
             async move { application.replicate(Bytes::from_static(b"drop-cut")).await }
         });
-        dropped_pair.secondary.state.apply_entered.notified().await;
+        dropped_pair.primary.state.apply_entered.notified().await;
         write.abort();
         let _ = write.await;
-        dropped_pair.secondary.state.release_apply.notify_waiters();
+        dropped_pair.primary.state.release_apply.notify_waiters();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if dropped_pair
@@ -3708,7 +3865,23 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             .await
             .unwrap();
         assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 2);
-        let starting_secondary_descriptor = || PublicReplicaDescriptor {
+            secondary_state.fail_next_commit();
+            assert_eq!(
+                primary_app
+                    .replicate(Bytes::from_static(b"intervening-before-composed-swap"))
+                    .await
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                *secondary_state.progress.lock().unwrap(),
+                DurableApplicationProgress {
+                    applied_lsn: 3,
+                    committed_lsn: 2,
+                },
+                "designated successor was not lagging at composed swap admission"
+            );
+            let starting_secondary_descriptor = || PublicReplicaDescriptor {
             build_id: OperationId::default(),
             identity: secondary_identity.clone(),
             replication_address: format!("http://{secondary_address}"),
@@ -3894,7 +4067,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 EffectApplied
         );
         assert_eq!(evidence.effects().len(), 1);
-        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 2);
+        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 3);
         assert_eq!(
             primary_handle
                 .stateless_preview_report()
@@ -3916,10 +4089,10 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 .replicate(Bytes::from_static(b"after-switchover"))
                 .await
                 .unwrap(),
-            3
+            4
         );
         tokio::time::timeout(Duration::from_secs(10), async {
-            while primary_state.progress.lock().unwrap().committed_lsn < 3 {
+            while primary_state.progress.lock().unwrap().committed_lsn < 4 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3945,8 +4118,8 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         assert_eq!(
             *primary_state.progress.lock().unwrap(),
             DurableApplicationProgress {
-                applied_lsn: 3,
-                committed_lsn: 3,
+                applied_lsn: 4,
+                committed_lsn: 4,
             }
         );
         std::net::TcpListener::bind(secondary_address).unwrap();
@@ -4020,17 +4193,21 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         assert_eq!(primary_restart_app.opens.load(Ordering::SeqCst), 0);
         assert_eq!(secondary_restart_app.opens.load(Ordering::SeqCst), 0);
-        assert!(
+        assert_eq!(
             restarted_primary_handle
                 .stateless_preview_report()
                 .await
-                .is_err()
+                .unwrap()
+                .write_status,
+            AccessStatus::NotPrimary
         );
-        assert!(
+        assert_eq!(
             restarted_secondary_handle
                 .stateless_preview_report()
                 .await
-                .is_err()
+                .unwrap()
+                .write_status,
+            AccessStatus::NotPrimary
         );
         std::net::TcpListener::bind(primary_address).unwrap();
         std::net::TcpListener::bind(secondary_address).unwrap();
@@ -4066,51 +4243,133 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             ],
             2,
         );
-        for (handle, predecessor, survivor, reason, operation) in [
-            (
-                &restarted_primary_handle,
-                primary_predecessor.clone(),
-                secondary_predecessor.clone(),
-                ProcessSessionRenewalReason::PrimaryReplacement,
-                "renew-primary-process",
-            ),
-            (
-                &restarted_secondary_handle,
-                secondary_predecessor,
-                primary_predecessor,
-                ProcessSessionRenewalReason::ActiveSecondaryReplacement,
-                "renew-secondary-process",
-            ),
-        ] {
-            let replacement = ProcessSessionEndpoint {
-                identity: predecessor.identity.clone(),
-                storage_incarnation: predecessor.storage_incarnation.clone(),
-                process_session_id: handle.process_session_id(),
-                replicator_creation_id: ReplicatorCreationId::new(format!(
-                    "{operation}-creation"
-                )),
-                role: ReplicaRole::None,
-            };
-            handle
-                .authorize_stateless_preview_session_renewal(
-                    ProcessSessionRenewalRequired {
-                        operation_id: OperationId::new(operation),
-                        reason,
-                        resource_uid: resource_uid.clone(),
-                        history: history.clone(),
-                        previous_epoch: Epoch::new(0, 2),
-                        renewal_epoch: failover_epoch,
-                        predecessor,
-                        replacement: Some(replacement),
-                        surviving_sessions: vec![survivor],
-                        fresh_configuration: renewal_configuration.clone(),
-                        predecessor_contained: true,
-                        data_loss: None,
-                    },
-                )
-                .await
-                .unwrap();
-        }
+        let hosted_replicas = || {
+            vec![
+                HostedPreviewReplica {
+                    identity: primary_identity.clone(),
+                    replication_address: format!("http://{primary_address}"),
+                    handle: restarted_primary_handle.clone(),
+                },
+                HostedPreviewReplica {
+                    identity: secondary_identity.clone(),
+                    replication_address: format!("http://{secondary_address}"),
+                    handle: restarted_secondary_handle.clone(),
+                },
+            ]
+        };
+        let single_primary_configuration = ConfigurationDescriptor::new(
+            failover_epoch,
+            ReplicaId::new(1),
+            vec![ConfigurationMember {
+                identity: primary_identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let primary_replacement = ProcessSessionEndpoint {
+            identity: primary_predecessor.identity.clone(),
+            storage_incarnation: primary_predecessor.storage_incarnation.clone(),
+            process_session_id: restarted_primary_handle.process_session_id(),
+            replicator_creation_id: ReplicatorCreationId::new("renew-primary-process-creation"),
+            role: ReplicaRole::None,
+        };
+        let primary_renewal = HostedPublicV1Adapter::new(
+            hosted_replicas(),
+            Some(transition.evidence.clone()),
+            None,
+            evidence.clone(),
+        )
+        .unwrap();
+        let primary_report = restarted_primary_handle
+            .stateless_preview_report()
+            .await
+            .unwrap();
+        execute_public_v1_session_renewal(
+            &primary_renewal,
+            accept_public_v1_session_renewal(
+                None,
+                ProcessSessionRenewalRequired {
+                    operation_id: OperationId::new("renew-primary-process"),
+                    reason: ProcessSessionRenewalReason::PrimaryReplacement,
+                    resource_uid: resource_uid.clone(),
+                    history: history.clone(),
+                    previous_epoch: Epoch::new(0, 2),
+                    renewal_epoch: failover_epoch,
+                    predecessor: primary_predecessor,
+                    replacement: Some(primary_replacement),
+                    surviving_sessions: vec![secondary_predecessor.clone()],
+                    fresh_configuration: single_primary_configuration.clone(),
+                    predecessor_contained: true,
+                    data_loss: None,
+                },
+                Some(&primary_report),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        drive_session_renewal(
+            &primary_renewal,
+            &[secondary_predecessor.process_session_id.clone()],
+            true,
+        )
+        .await;
+        primary_renewal
+            .reconstruct_hosted_configuration(
+                &OperationId::new("reconstruct-primary-after-renewal"),
+                preview.generation,
+                &single_primary_configuration,
+            )
+            .await
+            .unwrap();
+        let renewed_primary = restarted_primary_handle
+            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .await
+            .unwrap();
+
+        let secondary_replacement = ProcessSessionEndpoint {
+            identity: secondary_predecessor.identity.clone(),
+            storage_incarnation: secondary_predecessor.storage_incarnation.clone(),
+            process_session_id: restarted_secondary_handle.process_session_id(),
+            replicator_creation_id: ReplicatorCreationId::new("renew-secondary-process-creation"),
+            role: ReplicaRole::None,
+        };
+        let secondary_renewal = HostedPublicV1Adapter::new(
+            hosted_replicas(),
+            Some(transition.evidence.clone()),
+            None,
+            evidence.clone(),
+        )
+        .unwrap();
+        let secondary_report = restarted_secondary_handle
+            .stateless_preview_report()
+            .await
+            .unwrap();
+        execute_public_v1_session_renewal(
+            &secondary_renewal,
+            accept_public_v1_session_renewal(
+                None,
+                ProcessSessionRenewalRequired {
+                    operation_id: OperationId::new("renew-secondary-process"),
+                    reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
+                    resource_uid: resource_uid.clone(),
+                    history: history.clone(),
+                    previous_epoch: Epoch::new(0, 2),
+                    renewal_epoch: failover_epoch,
+                    predecessor: secondary_predecessor,
+                    replacement: Some(secondary_replacement),
+                    surviving_sessions: vec![renewed_primary],
+                    fresh_configuration: renewal_configuration.clone(),
+                    predecessor_contained: true,
+                    data_loss: None,
+                },
+                Some(&secondary_report),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        drive_session_renewal(&secondary_renewal, &[], false).await;
         let restart_adapter = HostedPublicV1Adapter::new(
             vec![
                 HostedPreviewReplica {
@@ -4158,16 +4417,16 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 .replicate(Bytes::from_static(b"after-all-process-restart"))
                 .await
                 .unwrap(),
-            4
+            5
         );
         tokio::time::timeout(Duration::from_secs(10), async {
-            while primary_state.progress.lock().unwrap().committed_lsn < 4 {
+            while primary_state.progress.lock().unwrap().committed_lsn < 5 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("restart failover write did not reach secondary");
-        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 4);
+        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 5);
 
         restarted_primary.shutdown();
         restarted_secondary.shutdown();
@@ -4374,7 +4633,6 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .lock()
             .unwrap()
             .push(Bytes::from_static(b"snapshot-bytes"));
-        source_state.block_copy();
         let build_input = PublicBuildInput {
             attempt: OperationId::new("preview-build-attempt"),
             epoch,
@@ -4389,6 +4647,176 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             replication_address: format!("http://{target_address}"),
             history: Some(history.clone()),
         };
+        let source_storage = storage_named(
+            source_identity.clone(),
+            "build-source-pod",
+            "build-source-pvc",
+        );
+        let target_storage = build_input.target_storage.clone();
+        let build_authority =
+            |operation_id: &str, operation_revision, build_id: &str| PublicInboundBuildAuthority {
+                operation_id: OperationId::new(operation_id),
+                operation_revision,
+                attempt: PublicBuildAttemptReference {
+                    resource_uid: resource_uid.clone(),
+                    epoch,
+                    build_id: OperationId::new(build_id),
+                    source: source_identity.clone(),
+                    source_storage: source_storage.clone(),
+                    source_session: source_handle.process_session_id(),
+                    target: target_identity.clone(),
+                    target_storage: target_storage.clone(),
+                    target_session: target_session.clone(),
+                },
+                history: history.clone(),
+                current_configuration_id: source_configuration.configuration_id.clone(),
+                target_address: format!("http://{target_address}"),
+            };
+        let authority_a = build_authority("superseded-build-a", 2, "superseded-build-a");
+        let authority_b = build_authority("held-build-b", 3, "held-build-b");
+        target_handle
+            .install_stateless_preview_inbound_build_authority(&authority_a)
+            .await
+            .unwrap();
+        target_handle
+            .install_stateless_preview_inbound_build_authority(&authority_b)
+            .await
+            .unwrap();
+        let copy_frame = |authority: &PublicInboundBuildAuthority,
+                          sequence,
+                          snapshot_chunk,
+                          final_item| proto::CopyItem {
+            protocol_version: 11,
+            build_id: authority.attempt.build_id.to_string(),
+            sender: Some(source_identity.clone().into()),
+            receiver: Some(target_identity.clone().into()),
+            epoch: Some(epoch.into()),
+            current_configuration_id: source_configuration.configuration_id.to_string(),
+            sequence,
+            lsn: 1,
+            committed_lsn: 1,
+            replication_boundary_lsn: 1,
+            final_item,
+            data: if snapshot_chunk {
+                b"snapshot-bytes".to_vec()
+            } else {
+                Vec::new()
+            },
+            snapshot_chunk,
+            sender_session_id: source_handle.process_session_id().to_string(),
+            receiver_session_id: target_session.to_string(),
+            catch_up_boundary_lsn: final_item.then_some(1),
+            source_storage: Some(storage_proto(&source_storage)),
+            target_storage: Some(storage_proto(&target_storage)),
+            history: Some(history_proto(&history)),
+            target_address: format!("http://{target_address}"),
+        };
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{target_address}"
+        ))
+        .await
+        .unwrap();
+        let mut delayed_a = client
+            .build(Request::new(stream::iter([copy_frame(
+                &authority_a,
+                0,
+                true,
+                false,
+            )])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(delayed_a.next().await.unwrap().is_err());
+        assert!(target_state.copy_chunks.lock().unwrap().is_empty());
+
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{target_address}"
+        ))
+        .await
+        .unwrap();
+        let mut first_b = client
+            .build(Request::new(stream::iter([copy_frame(
+                &authority_b,
+                0,
+                true,
+                false,
+            )])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!first_b.next().await.unwrap().unwrap().final_item);
+        target_state.block_finish_copy();
+        let held_finish = tokio::spawn({
+            let target_address = target_address;
+            let frame = copy_frame(&authority_b, 1, false, false);
+            async move {
+                let mut client = proto::replication_data_client::ReplicationDataClient::connect(
+                    format!("http://{target_address}"),
+                )
+                .await
+                .unwrap();
+                client
+                    .build(Request::new(stream::iter([frame])))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .next()
+                    .await
+            }
+        });
+        target_state.finish_copy_entered.notified().await;
+        target_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                target_session.clone(),
+                4,
+                "revoke-held-build-target",
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            held_finish
+                .await
+                .unwrap()
+                .is_none_or(|result| result.is_err()),
+            "revoked target finish_copy returned a successful acknowledgement"
+        );
+        assert_eq!(
+            *target_state.progress.lock().unwrap(),
+            DurableApplicationProgress::default(),
+            "revoked finish_copy changed target durable progress"
+        );
+        target_state
+            .block_finish_copy
+            .store(false, Ordering::Release);
+        target_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                target_session.clone(),
+                5,
+                "restore-build-target-role",
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::IdleSecondary,
+                },
+            ))
+            .await
+            .unwrap();
+        target_handle
+            .execute_stateless_preview(intent(
+                &preview,
+                target_session.clone(),
+                6,
+                "restore-build-target-epoch",
+                PublicOperationProgram::Epoch { epoch },
+            ))
+            .await
+            .unwrap();
+        source_state.block_copy();
         let build_program = PublicOperationProgram::Build(build_input.clone());
         let build_intent = intent(
             &preview,
@@ -4405,12 +4833,6 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             completed_operations: Vec::new(),
             extensions: Default::default(),
         };
-        let source_storage = storage_named(
-            source_identity.clone(),
-            "build-source-pod",
-            "build-source-pvc",
-        );
-        let target_storage = build_input.target_storage.clone();
         let build_transition = PublicV1AcceptedTransitionStatus {
             resource_version: "build-status-1".into(),
             evidence: build_accepted.clone(),
@@ -4568,7 +4990,11 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
                 *target_state.progress.lock().unwrap(),
                 DurableApplicationProgress::default()
             );
-            assert!(target_state.copy_chunks.lock().unwrap().is_empty());
+            assert_eq!(
+                target_state.copy_chunks.lock().unwrap().as_slice(),
+                &[Bytes::from_static(b"snapshot-bytes")],
+                "rejected frame changed the superseded target copy"
+            );
         }
         assert_eq!(
             source_app
@@ -4616,6 +5042,74 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
                     operation.lsn == 2 && operation.data.as_ref() == b"retained-after-snapshot"
                 })
         );
+        let terminal_counts = (
+            target_state.copy_chunks.lock().unwrap().len(),
+            target_state.operations.lock().unwrap().len(),
+        );
+        let terminal_frame = proto::CopyItem {
+            protocol_version: 11,
+            build_id: build_input.attempt.to_string(),
+            sender: Some(source_identity.clone().into()),
+            receiver: Some(target_identity.clone().into()),
+            epoch: Some(epoch.into()),
+            current_configuration_id: source_configuration.configuration_id.to_string(),
+            sequence: 3,
+            lsn: 2,
+            committed_lsn: 2,
+            replication_boundary_lsn: 1,
+            final_item: true,
+            data: Vec::new(),
+            snapshot_chunk: false,
+            sender_session_id: source_handle.process_session_id().to_string(),
+            receiver_session_id: target_session.to_string(),
+            catch_up_boundary_lsn: Some(2),
+            source_storage: Some(storage_proto(&source_storage)),
+            target_storage: Some(storage_proto(&target_storage)),
+            history: Some(history_proto(&history)),
+            target_address: format!("http://{target_address}"),
+        };
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{target_address}"
+        ))
+        .await
+        .unwrap();
+        let replayed_ack = client
+            .build(Request::new(stream::iter([terminal_frame.clone()])))
+            .await
+            .unwrap()
+            .into_inner()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replayed_ack.final_item);
+        assert_eq!(replayed_ack.durable_lsn, 2);
+        assert_eq!(
+            terminal_counts,
+            (
+                target_state.copy_chunks.lock().unwrap().len(),
+                target_state.operations.lock().unwrap().len(),
+            ),
+            "terminal ACK replay repeated provider mutation"
+        );
+        let mut changed_terminal = terminal_frame;
+        changed_terminal.current_configuration_id = "changed-terminal-authority".into();
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{target_address}"
+        ))
+        .await
+        .unwrap();
+        assert!(
+            client
+                .build(Request::new(stream::iter([changed_terminal])))
+                .await
+                .unwrap()
+                .into_inner()
+                .next()
+                .await
+                .unwrap()
+                .is_err()
+        );
         let admitted = ConfigurationDescriptor::new(
             epoch,
             ReplicaId::new(1),
@@ -4635,7 +5129,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .execute_stateless_preview(intent(
                 &preview,
                 target_session.clone(),
-                4,
+                7,
                 "admit-build-target-role",
                 PublicOperationProgram::Role {
                     epoch,
@@ -4648,7 +5142,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .execute_stateless_preview(intent(
                 &preview,
                 target_session.clone(),
-                5,
+                8,
                 "admit-build-target-configuration",
                 PublicOperationProgram::Configuration(PublicConfiguration {
                     current: admitted.clone(),
@@ -4868,12 +5362,6 @@ async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_be
                     .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !successor.is_finished(),
-            "successor completed before the held build descendant drained"
-        );
-        source.state.release_copy.notify_waiters();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if source
@@ -4933,6 +5421,282 @@ async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_be
         );
         assert!(std::net::TcpListener::bind(source.address).is_ok());
 
+        source.stop().await;
+        source.cleanup();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let resource_uid = ResourceUid::new("hung-build-peer");
+        let preview = PublicOperationPreviewIdentity::public_v1(753);
+        let mut source =
+            HostedMemoryReplica::start("hung-build-source", &resource_uid, &preview, 1).await;
+        let generation = PublicProtocolGeneration::new(753);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        source.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            source.identity.replica_id,
+            vec![ConfigurationMember {
+                identity: source.identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        install_static_authority(
+            &source.handle(),
+            &preview,
+            source.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: configuration.clone(),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"hung-build-snapshot"))
+                .await
+                .unwrap(),
+            1
+        );
+        let listener = TcpListener::bind(free_address()).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(Notify::new());
+        let hang = tokio::spawn({
+            let accepted = accepted.clone();
+            async move {
+                tonic::transport::Server::builder()
+                    .add_service(proto::replication_data_server::ReplicationDataServer::new(
+                        HungBuildService { entered: accepted },
+                    ))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                    .await
+            }
+        });
+        let target = replica_named(2, "hung-build-target-pod", "hung-build-target-agent");
+        let build = tokio::spawn({
+            let handle = source.handle();
+            let preview = preview.clone();
+            let history = history.clone();
+            let configuration_id = configuration.configuration_id.clone();
+            async move {
+                handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        handle.process_session_id(),
+                        4,
+                        "hung-build-attempt",
+                        PublicOperationProgram::Build(PublicBuildInput {
+                            attempt: OperationId::new("hung-build-attempt"),
+                            epoch,
+                            current_configuration_id: Some(configuration_id),
+                            replica: target.clone(),
+                            target_storage: storage_named(
+                                target,
+                                "hung-build-target-pod",
+                                "hung-build-target-pvc",
+                            ),
+                            process_session_id: ProcessSessionId::new("hung-build-target-session"),
+                            replication_address: format!("http://{address}"),
+                            history: Some(history),
+                        }),
+                    ))
+                    .await
+            }
+        });
+        accepted.notified().await;
+        let deadline_started = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), build)
+                .await
+                .expect("hung build exceeded its peer deadline")
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            deadline_started.elapsed() >= Duration::from_secs(4),
+            "hung build did not exercise the peer ACK deadline"
+        );
+        let successor = tokio::spawn({
+            let handle = source.handle();
+            let preview = preview.clone();
+            async move {
+                handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        handle.process_session_id(),
+                        5,
+                        "progress-after-hung-build",
+                        PublicOperationProgram::Progress { capability: true },
+                    ))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), successor)
+            .await
+            .expect("successor did not drain the timed-out build")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            source.handle().execute_stateless_preview(intent(
+                &preview,
+                source.handle().process_session_id(),
+                6,
+                "close-after-hung-build",
+                PublicOperationProgram::Close,
+            )),
+        )
+        .await
+        .expect("Close was not bounded after a hung build")
+        .unwrap();
+        hang.abort();
+        let _ = hang.await;
+        source.stop().await;
+        source.cleanup();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn build_retained_gap_corruption_replaces_source_without_contacting_target() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let resource_uid = ResourceUid::new("build-source-gap-corruption");
+        let preview = PublicOperationPreviewIdentity::public_v1(754);
+        let mut source =
+            HostedMemoryReplica::start("build-gap-source", &resource_uid, &preview, 1).await;
+        let generation = PublicProtocolGeneration::new(754);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        source.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            source.identity.replica_id,
+            vec![ConfigurationMember {
+                identity: source.identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        install_static_authority(
+            &source.handle(),
+            &preview,
+            source.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: configuration.clone(),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"source-snapshot"))
+                .await
+                .unwrap(),
+            1
+        );
+        source.state.block_copy();
+        let target_listener = TcpListener::bind(free_address()).await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let target = replica_named(2, "healthy-target-pod", "healthy-target-agent");
+        let operation_id = OperationId::new("build-with-corrupt-source-gap");
+        let copy_entered = source.state.copy_entered.notified();
+        let build = tokio::spawn({
+            let handle = source.handle();
+            let preview = preview.clone();
+            let history = history.clone();
+            let configuration_id = configuration.configuration_id.clone();
+            let target = target.clone();
+            async move {
+                handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        handle.process_session_id(),
+                        4,
+                        "build-with-corrupt-source-gap",
+                        PublicOperationProgram::Build(PublicBuildInput {
+                            attempt: operation_id,
+                            epoch,
+                            current_configuration_id: Some(configuration_id),
+                            replica: target.clone(),
+                            target_storage: storage_named(
+                                target,
+                                "healthy-target-pod",
+                                "healthy-target-pvc",
+                            ),
+                            process_session_id: ProcessSessionId::new("healthy-target-session"),
+                            replication_address: format!("http://{target_address}"),
+                            history: Some(history),
+                        }),
+                    ))
+                    .await
+            }
+        });
+        copy_entered.await;
+        assert_eq!(
+            source
+                .application
+                .replicate(Bytes::from_static(b"missing-retained-gap"))
+                .await
+                .unwrap(),
+            2
+        );
+        source
+            .state
+            .operations
+            .lock()
+            .unwrap()
+            .retain(|operation| operation.lsn != 2);
+        source.state.release_copy.notify_waiters();
+        assert!(
+            build
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("local build source requires replacement")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target_listener.accept())
+                .await
+                .is_err(),
+            "source corruption contacted or mutated the healthy target"
+        );
+        let report = source.handle().stateless_preview_report().await.unwrap();
+        let completion = report
+            .completed_operations
+            .iter()
+            .find(|completion| completion.operation_id.as_str() == "build-with-corrupt-source-gap")
+            .unwrap();
+        assert!(matches!(
+            completion.result,
+            PublicV1OperationResult::RebuildRequired(ref rebuild)
+                if matches!(
+                    rebuild.as_ref(),
+                    kuberic_runtime::protocol::public_operations::
+                        CanonicalReplicaRebuildRequired::LocalProvider {
+                            local_replica,
+                            ..
+                        } if local_replica == &source.identity
+                )
+        ));
         source.stop().await;
         source.cleanup();
     })
@@ -5049,6 +5813,8 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         target
             .handle()
             .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+                operation_id: OperationId::new("active-build-to-remove"),
+                operation_revision: 4,
                 attempt: PublicBuildAttemptReference {
                     resource_uid: resource_uid.clone(),
                     epoch,
@@ -5197,15 +5963,7 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
                 .await
             }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if removal.is_finished() {
-            panic!(
-                "removal completed before the remote descendant drained: {:?}",
-                removal.await
-            );
-        }
         assert!(evidence.effects().is_empty());
-        target.state.release_commit.notify_one();
         assert!(
             tokio::time::timeout(Duration::from_secs(10), build)
                 .await
@@ -5215,9 +5973,17 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         );
         tokio::time::timeout(Duration::from_secs(10), removal)
             .await
-            .expect("removal did not complete after build drain")
+            .expect("removal did not cancel and drain the build")
             .unwrap()
             .unwrap();
+        let committed_before_release = target.state.progress.lock().unwrap().committed_lsn;
+        target.state.release_commit.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            target.state.progress.lock().unwrap().committed_lsn,
+            committed_before_release,
+            "cancelled target build committed after removal completed"
+        );
         let report = adapter.report(&source.identity).await.unwrap();
         assert_eq!(
             reconcile_public_v1_consumer(adapter.as_ref(), &report)
@@ -5761,6 +6527,8 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         fresh
             .handle()
             .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+                operation_id: OperationId::new("controller-fresh-build"),
+                operation_revision: 7,
                 attempt: PublicBuildAttemptReference {
                     resource_uid: resource_uid.clone(),
                     epoch,

@@ -699,6 +699,8 @@ impl PublicBuildAttemptReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicInboundBuildAuthority {
+    pub operation_id: OperationId,
+    pub operation_revision: u64,
     pub attempt: PublicBuildAttemptReference,
     pub history: HistoryContext,
     pub current_configuration_id: ConfigurationId,
@@ -709,8 +711,35 @@ impl PublicInboundBuildAuthority {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.attempt.validate()?;
         self.history.validate()?;
-        if self.current_configuration_id.is_empty() || self.target_address.is_empty() {
+        if self.operation_id.is_empty()
+            || self.operation_revision == 0
+            || self.current_configuration_id.is_empty()
+            || self.target_address.is_empty()
+        {
             return Err("inbound build authority lacks configuration or target address");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicInboundBuildReceipt {
+    pub authority: PublicInboundBuildAuthority,
+    pub final_sequence: u64,
+    pub replication_boundary_lsn: i64,
+    pub catch_up_boundary_lsn: i64,
+    pub durable_lsn: i64,
+}
+
+impl PublicInboundBuildReceipt {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.authority.validate()?;
+        if self.replication_boundary_lsn < 0
+            || self.catch_up_boundary_lsn < self.replication_boundary_lsn
+            || self.durable_lsn < self.catch_up_boundary_lsn
+        {
+            return Err("inbound build receipt has inconsistent durable progress");
         }
         Ok(())
     }

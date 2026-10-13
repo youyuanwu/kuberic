@@ -272,7 +272,7 @@ impl HostedPublicV1Adapter {
                             "{}-barrier-{}",
                             accepted.required.operation_id, survivor.identity.replica_id
                         )),
-                        revision: 1,
+                        revision: NEXT_HOSTED_AUTHORITY_REVISION.fetch_add(1, Ordering::AcqRel),
                         process_session_id: survivor.process_session_id.clone(),
                         class: PublicOperationClass::Authority,
                         input_digest: program.digest(),
@@ -294,6 +294,26 @@ impl HostedPublicV1Adapter {
                     .replacement
                     .as_ref()
                     .ok_or_else(|| "session renewal lacks a replacement".to_string())?;
+                if self
+                    .replica(&replacement.identity)?
+                    .handle
+                    .stateless_preview_provider_writer_count()
+                    == 0
+                {
+                    self.execute_authority_program(
+                        &replacement.identity,
+                        accepted.required.history.protocol_generation.value(),
+                        OperationId::new(format!(
+                            "{}-replacement-open",
+                            accepted.required.operation_id
+                        )),
+                        PublicOperationProgram::Open {
+                            replica: replacement.identity.clone(),
+                            existing: true,
+                        },
+                    )
+                    .await?;
+                }
                 let program = PublicOperationProgram::Role {
                     epoch: *epoch,
                     role: *role,
@@ -309,7 +329,7 @@ impl HostedPublicV1Adapter {
                             "{}-role",
                             accepted.required.operation_id
                         )),
-                        revision: 1,
+                        revision: NEXT_HOSTED_AUTHORITY_REVISION.fetch_add(1, Ordering::AcqRel),
                         process_session_id: process_session_id.clone(),
                         class: PublicOperationClass::Authority,
                         input_digest: program.digest(),
@@ -331,6 +351,21 @@ impl HostedPublicV1Adapter {
                 )
                 .await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn persist_runtime_renewal(
+        &self,
+        expected: Option<&PublicV1SessionRenewalStatus>,
+        next: &PublicV1SessionRenewalStatus,
+    ) -> Result<(), String> {
+        if let Some(replacement) = &next.required.replacement {
+            self.replica(&replacement.identity)?
+                .handle
+                .persist_stateless_preview_session_renewal(expected, next)
+                .await
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -390,6 +425,8 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
             target_replica
                 .handle
                 .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+                    operation_id: expected.intent.operation_id.clone(),
+                    operation_revision: expected.intent.revision,
                     attempt: PublicBuildAttemptReference {
                         resource_uid: expected.intent.history.resource_uid.clone(),
                         epoch: build.epoch,
@@ -411,6 +448,102 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
                 })
                 .await
                 .map_err(|error| error.to_string())?;
+        }
+        if let Some(PublicOperationProgram::Remove(build)) = operation.intent.program.as_ref() {
+            self.execute_authority_program(
+                &build.replica,
+                operation.intent.preview.generation,
+                OperationId::new(format!("{}-revoke-target", operation.intent.operation_id)),
+                PublicOperationProgram::Role {
+                    epoch: build.epoch,
+                    role: kuberic_runtime::protocol::types::ReplicaRole::None,
+                },
+            )
+            .await?;
+        }
+        if let Some(PublicOperationProgram::Swap {
+            starting,
+            refreshed,
+            mode,
+            controller_composed: true,
+            ..
+        }) = operation.intent.program.as_ref()
+        {
+            let catch_up = PublicOperationProgram::CatchUp {
+                configuration: starting.clone(),
+                mode: *mode,
+            };
+            let catch_up_revision = operation.intent.revision.checked_sub(1).ok_or_else(|| {
+                "controller-composed swap lacks a pre-catch-up revision".to_string()
+            })?;
+            self.replica(&operation.target)?
+                .handle
+                .execute_stateless_preview(PublicOperationIntent {
+                    preview: operation.intent.preview.clone(),
+                    operation_id: OperationId::new(format!(
+                        "{}-first-catch-up",
+                        operation.intent.operation_id
+                    )),
+                    revision: catch_up_revision,
+                    process_session_id: operation.intent.process_session_id.clone(),
+                    class: PublicOperationClass::Authority,
+                    input_digest: catch_up.digest(),
+                    replay_disposition: catch_up.replay_disposition(),
+                    lifecycle: None,
+                    program: Some(catch_up),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            for member in refreshed
+                .current
+                .members
+                .iter()
+                .filter(|member| member.identity != operation.target)
+            {
+                self.replica(&member.identity)?
+                    .handle
+                    .fence_stateless_preview_access()
+                    .await;
+                self.execute_authority_program(
+                    &member.identity,
+                    operation.intent.preview.generation,
+                    OperationId::new(format!(
+                        "{}-target-epoch-{}",
+                        operation.intent.operation_id, member.identity.replica_id
+                    )),
+                    PublicOperationProgram::Epoch {
+                        epoch: refreshed.current.epoch,
+                    },
+                )
+                .await?;
+                self.execute_authority_program(
+                    &member.identity,
+                    operation.intent.preview.generation,
+                    OperationId::new(format!(
+                        "{}-target-role-{}",
+                        operation.intent.operation_id, member.identity.replica_id
+                    )),
+                    PublicOperationProgram::Role {
+                        epoch: refreshed.current.epoch,
+                        role: member.role,
+                    },
+                )
+                .await?;
+                let configuration = PublicOperationProgram::Configuration(
+                    self.public_configuration_for(&member.identity, &refreshed.current)
+                        .await?,
+                );
+                self.execute_authority_program(
+                    &member.identity,
+                    operation.intent.preview.generation,
+                    OperationId::new(format!(
+                        "{}-target-configuration-{}",
+                        operation.intent.operation_id, member.identity.replica_id
+                    )),
+                    configuration,
+                )
+                .await?;
+            }
         }
         self.replica(&operation.target)?
             .handle
@@ -538,6 +671,10 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
         next: &PublicV1SessionRenewalStatus,
     ) -> Result<(), String> {
         next.validate().map_err(str::to_owned)?;
+        if self.renewal.lock().unwrap().as_ref() != expected {
+            return Err("stale hosted public-v1 session-renewal status".into());
+        }
+        self.persist_runtime_renewal(expected, next).await?;
         let mut current = self.renewal.lock().unwrap();
         if current.as_ref() != expected {
             return Err("stale hosted public-v1 session-renewal status".into());
@@ -586,6 +723,7 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
             } => accepted.install_fresh_configuration(configuration),
         }
         .map_err(str::to_owned)?;
+        self.persist_runtime_renewal(Some(expected), &next).await?;
         *self.renewal.lock().unwrap() = Some(next);
         self.dispatched.lock().unwrap().push(command.clone());
         Ok(())

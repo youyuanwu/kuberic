@@ -23,6 +23,7 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
             Revoke,
             ProgramEpoch,
             RefreshedConfiguration,
+            SecondCatchUp,
             ReplicatorRole,
             ApplicationRole,
         ],
@@ -430,12 +431,21 @@ pub(super) async fn execute(
                         rebuild_failure = Some("remote build target requires replacement");
                         O::RebuildRequired(Box::new(canonical))
                     }
-                    Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => {
-                        return Err(HostError::CommandRejected(
-                            "local-provider rebuild failure substituted for remote build failure"
-                                .into(),
-                        ));
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
+                        if matches!(failure.as_ref(), ReplicaRebuildRequired::LocalProvider(_)) =>
+                    {
+                        let state = store.load_state().await?;
+                        let canonical = super::enrich_local_rebuild_at_epoch(
+                            &state.identity,
+                            &intent,
+                            build.epoch,
+                            &state.identity.local_identity,
+                            *failure,
+                        )?;
+                        rebuild_failure = Some("local build source requires replacement");
+                        O::RebuildRequired(Box::new(canonical))
                     }
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => unreachable!(),
                     Err(error) => return Err(error.into()),
                 }
             }

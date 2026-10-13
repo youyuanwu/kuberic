@@ -1319,11 +1319,15 @@ impl PodRuntime {
                 None => {}
             }
         }
-        let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
-        let applied = registered.current_progress().await?;
-        let committed = match registered.provider.as_ref() {
-            Some(provider) => provider.last_committed_lsn().await?,
-            None => 0,
+        let (applied, committed) = match self.host.registered.get() {
+            Some(registered) => (
+                registered.current_progress().await?,
+                match registered.provider.as_ref() {
+                    Some(provider) => provider.last_committed_lsn().await?,
+                    None => 0,
+                },
+            ),
+            None => (0, 0),
         };
         let (role_epoch, selected_role) = role.unwrap_or((Epoch::default(), ReplicaRole::None));
         let candidate_ready = !dynamic_pending
@@ -1398,11 +1402,15 @@ impl PodRuntime {
     ) -> Result<crate::host::public_lifecycle::PublicV1ReportProjection> {
         use crate::protocol::public_operations::{PublicProgress, PublicProgressRole};
 
-        let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
-        let applied = registered.current_progress().await?;
-        let committed = match registered.provider.as_ref() {
-            Some(provider) => provider.last_committed_lsn().await?,
-            None => 0,
+        let (applied, committed) = match self.host.registered.get() {
+            Some(registered) => (
+                registered.current_progress().await?,
+                match registered.provider.as_ref() {
+                    Some(provider) => provider.last_committed_lsn().await?,
+                    None => 0,
+                },
+            ),
+            None => (0, 0),
         };
         let state = self.host.state.read().await;
         let role = state.fallback_snapshot.role;
@@ -3138,9 +3146,44 @@ impl PartitionAccessView for HostAccessView {
     }
 
     #[cfg(feature = "testing")]
-    async fn complete_preview_inbound_build(
+    async fn preview_terminal_inbound_build_receipt(
         &self,
         build_id: &crate::protocol::types::OperationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildReceipt>> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .public_v1_terminal_inbound_build_receipt(build_id)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    async fn revoke_preview_inbound_build_authority(&self) -> Result<()> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .revoke_public_v1_inbound_build_authority()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    async fn complete_preview_inbound_build(
+        &self,
+        receipt: &crate::protocol::public_operations::PublicInboundBuildReceipt,
     ) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
         let bridge = host
@@ -3151,7 +3194,7 @@ impl PartitionAccessView for HostAccessView {
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
         bridge
             .store
-            .complete_public_v1_inbound_build(build_id)
+            .complete_public_v1_inbound_build(receipt)
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }

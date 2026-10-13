@@ -4,12 +4,12 @@ use crate::effects::{RuntimeEffect, RuntimeEffectResult};
 use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::DataLossRenewalDecision;
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::public_operations::PublicInboundBuildAuthority;
 #[cfg(all(feature = "testing", kuberic_workspace_tests))]
 use crate::protocol::public_operations::{
     PublicFaultAction, RestartActionRecord, RestartActionStage,
 };
+#[cfg(any(test, feature = "testing"))]
+use crate::protocol::public_operations::{PublicInboundBuildAuthority, PublicInboundBuildReceipt};
 #[cfg(any(test, feature = "testing"))]
 use crate::protocol::public_operations::{PublicOperationIntent, PublicV1SessionRenewalStatus};
 use crate::protocol::types::{FaultType, LoadMetric, OperationId};
@@ -237,6 +237,21 @@ pub(crate) trait AgentStore: Send + Sync {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_terminal_inbound_build_receipt(
+        &self,
+        _build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildReceipt>> {
+        Ok(None)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn revoke_public_v1_inbound_build_authority(&self) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 inbound build authority is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     async fn public_v1_outbound_build_authority(
         &self,
         _build_id: &OperationId,
@@ -246,7 +261,10 @@ pub(crate) trait AgentStore: Send + Sync {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    async fn complete_public_v1_inbound_build(&self, _build_id: &OperationId) -> Result<()> {
+    async fn complete_public_v1_inbound_build(
+        &self,
+        _receipt: &PublicInboundBuildReceipt,
+    ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
             "public-v1 inbound build authority is not enabled for this store".into(),
         ))

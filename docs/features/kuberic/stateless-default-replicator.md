@@ -182,6 +182,10 @@ configuration are admitted only by exact Public V1 replay. Replication
 acknowledgement follows provider durability; both current and previous
 configuration write quorums are required. Any ambiguous provider failure
 fences serving until exact suffix settlement or corrective replacement.
+Ambiguity ownership is armed before provider apply, lifecycle changes cancel
+and drain authority-scoped ingress effects, and epoch updates receive the
+provider's exact committed tail after drainage. Empty-history catch-up uses an
+exact live LSN-0 wire proof rather than advertised descriptor progress.
 
 ### Dynamic recovery and replacement
 
@@ -192,8 +196,14 @@ custom Replicator.
 
 Build freezes a provider copy boundary, streams deterministic copy, then
 streams every retained operation through a later catch-up boundary before
-completion. Incompatible provider or retained history returns
-`ReplicaRebuildRequired`. The old storage incarnation is retired permanently;
+completion. The agent persists one revisioned current inbound attempt and an
+exact terminal receipt. Superseded frames cannot mutate the provider, while an
+unchanged lost final ACK replays idempotently across store reopen. Build RPC
+work is peer-deadline bounded and cancellation-owned. Missing source retained
+history is canonical local-provider evidence and replaces the source; actual
+target conflict remains remote-target evidence. Incompatible provider or
+retained history returns `ReplicaRebuildRequired`. The old storage incarnation
+is retired permanently;
 the replacement starts with empty provider state and must complete a new exact
 build before admission. Real SQLite and KVStore2 journeys prove that a retired
 higher-progress store is not copied or readmitted after replacement restart.
@@ -207,7 +217,11 @@ executor dispatches it through the adapter and preview-only runtime command
 path to the durable operation owner. Only the matching
 `PublicV1AgentReport` completion can be persisted and applied as an exact
 accept, retirement or replacement effect. History/session renewal precede
-dependent operation/evidence acceptance.
+dependent operation/evidence acceptance. The all-process restart acceptance
+test drives the real renewal planner/executor into replacement agent stores,
+including unreachable-survivor retirement, and controller-composed
+switchover runs first catch-up before target epoch preparation plus second
+catch-up before handoff.
 
 The runtime `stateless_preview_recovery` selector executes the complete hosted
 switchover/build chain because it owns the preview replicas and adapter. The
@@ -1275,7 +1289,7 @@ production deployment.
 
 The delivered preview is covered by:
 
-- 20 direct `stateless_preview_recovery` ownership, static/dynamic recovery,
+- 23 direct `stateless_preview_recovery` ownership, static/dynamic recovery,
   write-revocation interleaving, exact-primary ingress, bounded-peer,
   ambiguity, replacement and dormancy tests;
 - the shared KSF runner, which maps built-in preview observations to every
@@ -1285,8 +1299,9 @@ The delivered preview is covered by:
   diagnostics and KSF-15 restart-without-callback-replay;
 - feature-gated controller operation/evidence target-fencing, removal and
   session-renewal tests;
-- one real SQLite and one real KVStore2 fresh restart/build/corrective-empty-
-  replacement journey;
+- two real SQLite and two real KVStore2 journeys: fresh
+  restart/build/corrective-empty replacement plus all-process restart,
+  applied-suffix settlement and primary handoff;
 - the unchanged bounded PostgreSQL smoke tier for the independent custom
   implementation.
 

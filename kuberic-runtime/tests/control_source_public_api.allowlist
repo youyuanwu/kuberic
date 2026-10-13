@@ -950,7 +950,14 @@ public-path hidden field crate::protocol::public_operations::PublicFaultAction::
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::attempt: PublicBuildAttemptReference
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::current_configuration_id: ConfigurationId
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::history: HistoryContext
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_revision: u64
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::target_address: String
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::authority: PublicInboundBuildAuthority
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::catch_up_boundary_lsn: i64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::durable_lsn: i64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::final_sequence: u64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::replication_boundary_lsn: i64
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::current: ConfigurationDescriptor
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::data_loss_recovery: Option < PublicDataLossRecoveryInput >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::epoch: Epoch
@@ -1103,6 +1110,7 @@ public-path hidden impl crate::protocol::public_operations::PublicFaultAction::f
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_kind (persistence : StatePersistence , fault : FaultType) -> PublicFaultActionKind
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicInboundBuildAuthority::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicInboundBuildReceipt::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn configuration (& self) -> PublicConfiguration
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn digest (& self) -> CanonicalOperationInputDigest
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn validate (& self) -> Result < () , & 'static str >
@@ -1152,6 +1160,7 @@ public-path hidden struct crate::protocol::public_operations::PublicDataLossReco
 public-path hidden struct crate::protocol::public_operations::PublicDataLossSessionRenewal
 public-path hidden struct crate::protocol::public_operations::PublicFaultAction
 public-path hidden struct crate::protocol::public_operations::PublicInboundBuildAuthority
+public-path hidden struct crate::protocol::public_operations::PublicInboundBuildReceipt
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleInput
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleReport
 public-path hidden struct crate::protocol::public_operations::PublicOperationIntent

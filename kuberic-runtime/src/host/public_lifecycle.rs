@@ -459,7 +459,7 @@ pub(super) fn enrich_local_rebuild(
     enrich_local_rebuild_at_epoch(identity, intent, input.epoch, &input.replica, failure)
 }
 
-fn enrich_local_rebuild_at_epoch(
+pub(super) fn enrich_local_rebuild_at_epoch(
     identity: &crate::host::state::StorageIdentity,
     intent: &PublicOperationIntent,
     epoch: crate::protocol::types::Epoch,

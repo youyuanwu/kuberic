@@ -30,7 +30,7 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated inventory accounts for 1,382 tests: 1,128 ordinary, one
+The consolidated inventory accounts for 1,388 tests: 1,134 ordinary, one
 build-only, 213 directly runnable PostgreSQL tests, 19 live KinD tests covering
 12 scenario identities, one DEX live test and 20 mapped parent-driven
 subprocess helpers.
@@ -186,9 +186,9 @@ durable report -> effect chain is exercised by the runtime
 Wrong targets, predecessor reports, changed authority and stale resource
 versions fail before effect.
 
-### Real SQLite and KVStore2 replacement journeys
+### Real SQLite and KVStore2 recovery journeys
 
-These are one exact test per real provider:
+These are two exact tests per real provider:
 
 ```bash
 scripts/assert_nextest_selection.sh \
@@ -196,20 +196,30 @@ scripts/assert_nextest_selection.sh \
   --require-binary durable_data_loss \
   --require-binary public_v1_preview \
   --require-test sqlite_fresh_restart_build_and_corrective_empty_replacement \
-  --require-test kvstore2_fresh_restart_build_and_corrective_empty_replacement -- \
+  --require-test kvstore2_fresh_restart_build_and_corrective_empty_replacement \
+  --require-test sqlite_real_provider_restart_settlement_and_handoff \
+  --require-test kvstore2_real_provider_restart_settlement_and_handoff -- \
   cargo nextest list -p sqlite-replicated -p kvstore2 --all-features \
     --profile ordinary \
-    -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement)'
+    -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement) or test(sqlite_real_provider_restart_settlement_and_handoff) or test(kvstore2_real_provider_restart_settlement_and_handoff)'
 
 cargo nextest run -j 1 -p sqlite-replicated -p kvstore2 \
   --all-features --profile ordinary \
-  -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement)'
+  -E 'test(sqlite_fresh_restart_build_and_corrective_empty_replacement) or test(kvstore2_fresh_restart_build_and_corrective_empty_replacement) or test(sqlite_real_provider_restart_settlement_and_handoff) or test(kvstore2_real_provider_restart_settlement_and_handoff)'
 ```
 
-Both journeys restart fresh source state, freeze a copy snapshot, commit a
-known retained operation, withhold admission until the target durably closes
-that gap, retire a divergent higher-progress incarnation, build an empty
-replacement and restart it without recovering the retired bytes.
+The corrective-replacement journeys freeze a copy snapshot, commit a known
+retained operation, withhold admission until the target durably closes that
+gap, retire a divergent higher-progress incarnation, build an empty
+replacement and restart it without recovering retired bytes.
+
+The composite journeys prepare identical real-provider
+`applied_lsn > committed_lsn` suffixes, restart every live preview process,
+prove access remains closed until exact write-quorum settlement, and then
+verify one writable primary and independently known data in both providers.
+They subsequently hand primary authority to the former secondary, reject the
+old primary's write and commit a known post-handoff write through the new
+primary.
 
 ### Timeouts and implementation evidence
 
@@ -230,21 +240,24 @@ prevents the hosted switchover commit handshake from being lost during nested
 conformance execution. Focused serial selectors remain the supported way to
 separate protocol failures from transient build/host contention.
 
-The 2026-10-13 final-review remediation rerun recorded:
+The second-final-review remediation expands the direct recovery binary from 20
+to 23 scenarios with primary-apply cancellation, exact LSN-0 live proof,
+revisioned inbound build/terminal replay, local build-source attribution and a
+hung build-ACK deadline. Final evidence is recorded in the Phase 6 PAW
+`Docs.md`.
 
-- direct runtime recovery: 20/20 passed in 64.810s;
+- direct runtime recovery: 23/23 passed in 68.852s;
 - structural KSF catalog: 2/2 passed; the separate ignored exact conformance
   execution gate passed in 160.907s inside its 270-second parent bound;
-- controller operation/evidence and renewal: 16/16 passed in 0.077s;
-- real provider journeys: 2/2 passed together in 152.689s (KVStore2 106.171s,
-  SQLite 46.517s), each inside its 180-second bound;
-- `just nextest-test`: 1,128/1,128 passed, 37 skipped, in 512.867s. The recipe
-  used a clean `target/nextest-ordinary`, `CARGO_INCREMENTAL=0`, disabled test
-  debuginfo and two test threads; no nested conformance process ran in the
-  ordinary tier;
-- bounded PostgreSQL smoke: 4/4 Public V1 scenarios passed in 15.509s, then
-  8/8 representative scenarios passed in 156.886s; the slowest passing
-  individual scenario took 42.185s;
+- controller operation/evidence and renewal: 16/16 passed in 0.074s;
+- real provider replacement/restart and composite journeys: 4/4 passed in
+  112.115s on the focused serial guard-closure run; the two new composites
+  completed in 1.890s (SQLite) and 1.421s (KVStore2);
+- `just nextest-test`: 1,134/1,134 passed, 37 skipped. The recipe used a clean
+  `target/nextest-ordinary`, `CARGO_INCREMENTAL=0`, disabled test debuginfo and
+  two test threads; no nested conformance process ran in the ordinary tier;
+- bounded PostgreSQL smoke: 4/4 Public V1 scenarios passed in 15.497s, then
+  8/8 representative scenarios passed in 226.429s;
 - lifecycle capability boundaries passed 6/6; runtime API inventory, workspace
   all-feature check, formatting and diff hygiene passed.
 

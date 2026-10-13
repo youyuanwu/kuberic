@@ -1105,6 +1105,17 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn persist_stateless_preview_session_renewal(
+        &self,
+        expected: Option<&crate::protocol::public_operations::PublicV1SessionRenewalStatus>,
+        next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    ) -> Result<()> {
+        self.store
+            .persist_public_v1_session_renewal(expected, next)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn stateless_preview_report(
         &self,
     ) -> Result<crate::protocol::public_operations::PublicV1AgentReport> {

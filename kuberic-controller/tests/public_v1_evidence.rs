@@ -607,7 +607,7 @@ fn rebuild(
 }
 
 #[tokio::test]
-async fn lost_replacement_response_is_idempotent_and_replaces_exact_target() {
+async fn lost_local_provider_replacement_response_is_idempotent_and_replaces_source() {
     let accepted = accepted();
     let rebuild = rebuild(&accepted, "replace-target-once");
     let completion = completion(
@@ -641,7 +641,7 @@ async fn lost_replacement_response_is_idempotent_and_replaces_exact_target() {
             storage: replaced,
             rebuild: observed,
             ..
-        } if **replaced == storage(2) && **observed == rebuild
+        } if **replaced == storage(1) && **observed == rebuild
     ));
     let resources = state.resources();
     assert_eq!(
@@ -650,7 +650,7 @@ async fn lost_replacement_response_is_idempotent_and_replaces_exact_target() {
             .find(|resource| resource.storage_incarnation == storage(1))
             .unwrap()
             .disposition,
-        PublicV1ResourceDisposition::Active
+        PublicV1ResourceDisposition::ReplacementRequested
     );
     assert_eq!(
         resources
@@ -658,7 +658,7 @@ async fn lost_replacement_response_is_idempotent_and_replaces_exact_target() {
             .find(|resource| resource.storage_incarnation == storage(2))
             .unwrap()
             .disposition,
-        PublicV1ResourceDisposition::ReplacementRequested
+        PublicV1ResourceDisposition::Active
     );
 }
 
