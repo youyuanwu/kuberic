@@ -286,46 +286,51 @@ fn public_v1_primary_and_secondary_replacements_obey_epoch_ordering() {
     }
 }
 
-#[test]
-fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement() {
-    let required = requirement(ProcessSessionRenewalReason::PrimaryReplacement);
-    let pending = pending_barriers(required.clone());
-    assert!(matches!(
-        plan_public_v1_session_renewal(
+#[tokio::test]
+async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement() {
+    tokio::time::timeout(std::time::Duration::from_secs(270), async {
+        let required = requirement(ProcessSessionRenewalReason::PrimaryReplacement);
+        let pending = pending_barriers(required.clone());
+        assert!(matches!(
+            plan_public_v1_session_renewal(
+                &pending,
+                &[required.surviving_sessions[0].process_session_id.clone()],
+            )
+            .unwrap(),
+            PublicV1SessionRenewalPlan::WaitForSurvivor { survivor, .. }
+                if *survivor == required.surviving_sessions[0]
+        ));
+
+        let mut excluding = required;
+        excluding.fresh_configuration =
+            configuration(excluding.renewal_epoch, &excluding.predecessor, None);
+        let pending = pending_barriers(excluding.clone());
+        let excluded = accept_public_v1_survivor_retired(
             &pending,
-            &[required.surviving_sessions[0].process_session_id.clone()],
+            &excluding.surviving_sessions[0],
+            OperationId::new("retire-unreachable-survivor"),
         )
-        .unwrap(),
-        PublicV1SessionRenewalPlan::WaitForSurvivor { survivor, .. }
-            if *survivor == required.surviving_sessions[0]
-    ));
+        .unwrap();
+        assert_eq!(
+            excluded.finish_epoch_barriers().unwrap().stage,
+            PublicSessionRenewalStage::ReplacementRolePending
+        );
 
-    let mut excluding = required;
-    excluding.fresh_configuration =
-        configuration(excluding.renewal_epoch, &excluding.predecessor, None);
-    let pending = pending_barriers(excluding.clone());
-    let excluded = accept_public_v1_survivor_retired(
-        &pending,
-        &excluding.surviving_sessions[0],
-        OperationId::new("retire-unreachable-survivor"),
-    )
+        let pending =
+            pending_barriers(requirement(ProcessSessionRenewalReason::PrimaryReplacement));
+        let returned = accept_public_v1_session_epoch_updated(
+            &pending,
+            &pending.required.surviving_sessions[0],
+            pending.required.renewal_epoch,
+        )
+        .unwrap();
+        assert_eq!(
+            returned.finish_epoch_barriers().unwrap().stage,
+            PublicSessionRenewalStage::ReplacementRolePending
+        );
+    })
+    .await
     .unwrap();
-    assert_eq!(
-        excluded.finish_epoch_barriers().unwrap().stage,
-        PublicSessionRenewalStage::ReplacementRolePending
-    );
-
-    let pending = pending_barriers(requirement(ProcessSessionRenewalReason::PrimaryReplacement));
-    let returned = accept_public_v1_session_epoch_updated(
-        &pending,
-        &pending.required.surviving_sessions[0],
-        pending.required.renewal_epoch,
-    )
-    .unwrap();
-    assert_eq!(
-        returned.finish_epoch_barriers().unwrap().stage,
-        PublicSessionRenewalStage::ReplacementRolePending
-    );
 }
 
 #[test]
