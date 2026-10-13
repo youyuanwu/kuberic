@@ -67,6 +67,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
         let engine = Arc::new(StatelessReplicator::new(
             context.identity()?,
             context.process_session_id()?,
+            context,
             provider,
             self.storage.clone(),
             settings,
@@ -111,6 +112,7 @@ struct ListenerOwner {
 pub struct StatelessReplicator {
     identity: ReplicaIdentity,
     process_session: ProcessSessionId,
+    context: ReplicatorFactoryContext,
     provider: Arc<dyn StateProvider>,
     storage: Arc<dyn DurableState>,
     settings: RwLock<ReplicatorSettings>,
@@ -127,6 +129,7 @@ impl StatelessReplicator {
     fn new(
         identity: ReplicaIdentity,
         process_session: ProcessSessionId,
+        context: ReplicatorFactoryContext,
         provider: Arc<dyn StateProvider>,
         storage: Arc<dyn DurableState>,
         settings: ReplicatorSettings,
@@ -134,6 +137,7 @@ impl StatelessReplicator {
         Self {
             identity,
             process_session,
+            context,
             provider,
             storage,
             settings: RwLock::new(settings),
@@ -184,6 +188,41 @@ impl StatelessReplicator {
         Ok(authority)
     }
 
+    async fn publish_progress(&self, ambiguous: bool) -> Result<()> {
+        let (applied_lsn, committed_lsn) = {
+            let state = self.state.lock().await;
+            (state.applied_lsn, state.committed_lsn)
+        };
+        self.context
+            .publish_preview_progress(applied_lsn, committed_lsn, ambiguous)
+            .await
+    }
+
+    async fn contain_ambiguous_suffix(&self, applied_floor: i64) {
+        {
+            let mut state = self.state.lock().await;
+            state.applied_lsn = state.applied_lsn.max(applied_floor);
+            state.ambiguous_suffix = true;
+        }
+        let _ = self.publish_progress(true).await;
+    }
+
+    async fn verify_retained_payload(&self, lsn: i64, data: &[u8]) -> Result<()> {
+        let mut retained = self.storage.get_replication_operations(lsn, lsn).await?;
+        let operation = retained.next().await.ok_or_else(|| {
+            RuntimeError::InvalidReplication("committed watermark lacks retained operation".into())
+        })??;
+        if operation.lsn != lsn
+            || operation.data.as_ref() != data
+            || retained.next().await.is_some()
+        {
+            return Err(RuntimeError::InvalidReplication(
+                "committed watermark changed retained operation".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn accept_replication(
         &self,
         item: proto::ReplicationItem,
@@ -224,11 +263,16 @@ impl StatelessReplicator {
                 "replication receiver, session, or progress is stale",
             ));
         }
-        let (authority, prior_committed) = {
+        let (authority, prior_applied, prior_committed) = {
             let state = self.state.lock().await;
             if state.closed || !state.opened || state.role != ReplicaRole::ActiveSecondary {
                 return Err(Status::failed_precondition(
                     "replica is not an admitted active secondary",
+                ));
+            }
+            if state.ambiguous_suffix {
+                return Err(Status::failed_precondition(
+                    "replica has an ambiguous applied suffix",
                 ));
             }
             let authority = state.authority.clone().ok_or_else(|| {
@@ -252,31 +296,49 @@ impl StatelessReplicator {
                     "replication authority or predecessor session is stale",
                 ));
             }
-            (authority, state.committed_lsn)
+            (authority, state.applied_lsn, state.committed_lsn)
         };
-        let applied = self
-            .storage
-            .apply(Operation {
-                lsn: item.lsn,
-                committed_lsn: item.committed_lsn,
-                data: item.data.into(),
-            })
-            .await
-            .map_err(runtime_status)?;
-        let committed = if item.committed_lsn > prior_committed {
-            self.storage
-                .commit(item.committed_lsn)
-                .await
-                .map_err(runtime_status)?
+        if item.committed_lsn < prior_committed || item.lsn > prior_applied.saturating_add(1) {
+            return Err(Status::failed_precondition(
+                "replication progress is not contiguous",
+            ));
+        }
+        let operation = Operation {
+            lsn: item.lsn,
+            committed_lsn: prior_committed,
+            data: item.data.clone().into(),
+        };
+        let applied = if item.lsn > prior_applied {
+            match self.storage.apply(operation).await {
+                Ok(applied) => applied,
+                Err(error) => {
+                    self.contain_ambiguous_suffix(item.lsn).await;
+                    return Err(runtime_status(error));
+                }
+            }
         } else {
-            applied
+            if let Err(error) = self
+                .verify_retained_payload(item.lsn, item.data.as_slice())
+                .await
+            {
+                self.contain_ambiguous_suffix(prior_applied).await;
+                return Err(runtime_status(error));
+            }
+            match self.storage.durable_progress().await {
+                Ok(progress) => progress,
+                Err(error) => {
+                    self.contain_ambiguous_suffix(prior_applied).await;
+                    return Err(runtime_status(error));
+                }
+            }
         };
         if applied.applied_lsn < item.lsn
-            || committed.committed_lsn < item.committed_lsn
-            || committed.committed_lsn > committed.applied_lsn
+            || applied.committed_lsn > applied.applied_lsn
+            || applied.committed_lsn < prior_committed
         {
+            self.contain_ambiguous_suffix(item.lsn).await;
             return Err(Status::failed_precondition(
-                "provider returned inconsistent durable progress",
+                "provider returned inconsistent durable apply progress",
             ));
         }
         {
@@ -284,13 +346,53 @@ impl StatelessReplicator {
             if state.authority.as_ref() != Some(&authority)
                 || state.role != ReplicaRole::ActiveSecondary
             {
+                drop(state);
+                self.contain_ambiguous_suffix(item.lsn).await;
                 return Err(Status::failed_precondition(
                     "replication authority changed during provider durability",
                 ));
             }
             state.applied_lsn = state.applied_lsn.max(applied.applied_lsn);
+        }
+        if let Err(error) = self.publish_progress(false).await {
+            self.contain_ambiguous_suffix(item.lsn).await;
+            return Err(runtime_status(error));
+        }
+        let committed = if item.committed_lsn > prior_committed {
+            match self.storage.commit(item.committed_lsn).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.contain_ambiguous_suffix(item.lsn).await;
+                    return Err(runtime_status(error));
+                }
+            }
+        } else {
+            applied
+        };
+        if committed.committed_lsn < item.committed_lsn
+            || committed.committed_lsn > committed.applied_lsn
+            || committed.applied_lsn < item.lsn
+        {
+            self.contain_ambiguous_suffix(item.lsn).await;
+            return Err(Status::failed_precondition(
+                "provider returned inconsistent durable commit progress",
+            ));
+        }
+        {
+            let mut state = self.state.lock().await;
+            if state.authority.as_ref() != Some(&authority)
+                || state.role != ReplicaRole::ActiveSecondary
+            {
+                drop(state);
+                self.contain_ambiguous_suffix(item.lsn).await;
+                return Err(Status::failed_precondition(
+                    "replication authority changed during provider commit",
+                ));
+            }
+            state.applied_lsn = state.applied_lsn.max(committed.applied_lsn);
             state.committed_lsn = state.committed_lsn.max(committed.committed_lsn);
         }
+        self.publish_progress(false).await.map_err(runtime_status)?;
         Ok(proto::ReplicationAck {
             protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
             sender: Some(sender.into()),
@@ -316,6 +418,7 @@ impl StatelessReplicator {
         authority: &StaticAuthority,
         peer: &ReplicaInformation,
         operation: &Operation,
+        committed_lsn: i64,
     ) -> Result<()> {
         let endpoint = if peer.replication_address.starts_with("http://")
             || peer.replication_address.starts_with("https://")
@@ -340,7 +443,7 @@ impl StatelessReplicator {
                 }),
             current_configuration_id: authority.current.configuration_id.to_string(),
             lsn: operation.lsn,
-            committed_lsn: operation.committed_lsn,
+            committed_lsn,
             data: operation.data.to_vec(),
             sender_session_id: self.process_session.to_string(),
             receiver_session_id: peer.process_session_id.to_string(),
@@ -393,6 +496,7 @@ impl StatelessReplicator {
                     })
             || acknowledgement.received_lsn != operation.lsn
             || acknowledgement.applied_lsn < operation.lsn
+            || acknowledgement.committed_lsn < committed_lsn
         {
             return Err(RuntimeError::InvalidReplication(
                 "stateless preview ACK changed exact authority".into(),
@@ -515,6 +619,12 @@ impl Replicator for StatelessReplicator {
         state.applied_lsn = progress.applied_lsn;
         state.committed_lsn = progress.committed_lsn;
         state.ambiguous_suffix = progress.applied_lsn > progress.committed_lsn;
+        let ambiguous = state.ambiguous_suffix;
+        drop(state);
+        if let Err(error) = self.publish_progress(ambiguous).await {
+            self.abort_listener();
+            return Err(error);
+        }
         Ok(address)
     }
 
@@ -852,8 +962,15 @@ impl StateReplicator for StatelessReplicator {
             committed_lsn,
             data,
         };
-        let applied = self.storage.apply(operation.clone()).await?;
+        let applied = match self.storage.apply(operation.clone()).await {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.contain_ambiguous_suffix(lsn).await;
+                return Err(error);
+            }
+        };
         if applied.applied_lsn < lsn || applied.committed_lsn > applied.applied_lsn {
+            self.contain_ambiguous_suffix(lsn).await;
             return Err(RuntimeError::Application(
                 "provider returned inconsistent durable apply progress".into(),
             ));
@@ -862,10 +979,14 @@ impl StateReplicator for StatelessReplicator {
             let mut state = self.state.lock().await;
             state.applied_lsn = state.applied_lsn.max(applied.applied_lsn);
         }
+        if let Err(error) = self.publish_progress(false).await {
+            self.contain_ambiguous_suffix(lsn).await;
+            return Err(error);
+        }
         let mut acknowledgements = std::collections::BTreeSet::from([self.identity.clone()]);
         for peer in authority.peers.values() {
             if self
-                .send_replication(&authority, peer, &operation)
+                .send_replication(&authority, peer, &operation, committed_lsn)
                 .await
                 .is_ok()
             {
@@ -881,12 +1002,18 @@ impl StateReplicator for StatelessReplicator {
                 >= configuration.write_quorum as usize
         };
         if !quorum(&authority.current) || authority.previous.as_ref().is_some_and(|p| !quorum(p)) {
-            let mut state = self.state.lock().await;
-            state.ambiguous_suffix = true;
+            self.contain_ambiguous_suffix(lsn).await;
             return Err(RuntimeError::OperationCancelled);
         }
-        let committed = self.storage.commit(lsn).await?;
+        let committed = match self.storage.commit(lsn).await {
+            Ok(committed) => committed,
+            Err(error) => {
+                self.contain_ambiguous_suffix(lsn).await;
+                return Err(error);
+            }
+        };
         if committed.committed_lsn < lsn || committed.committed_lsn > committed.applied_lsn {
+            self.contain_ambiguous_suffix(lsn).await;
             return Err(RuntimeError::Application(
                 "provider returned inconsistent durable commit progress".into(),
             ));
@@ -894,6 +1021,13 @@ impl StateReplicator for StatelessReplicator {
         let mut state = self.state.lock().await;
         state.applied_lsn = state.applied_lsn.max(committed.applied_lsn);
         state.committed_lsn = state.committed_lsn.max(committed.committed_lsn);
+        drop(state);
+        self.publish_progress(false).await?;
+        for peer in authority.peers.values() {
+            let _ = self
+                .send_replication(&authority, peer, &operation, lsn)
+                .await;
+        }
         Ok(lsn)
     }
 

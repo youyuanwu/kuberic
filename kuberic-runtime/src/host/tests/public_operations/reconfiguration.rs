@@ -232,6 +232,7 @@ impl Fixture {
             application,
             replicator: replicator.clone(),
             primary: replicator.clone(),
+            application_control_match: None,
             capabilities: if preview.is_public_v1() {
                 ReplicatorCapabilities {
                     catch_up_specific_quorum: true,
@@ -1487,6 +1488,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
             application,
             replicator: replicator.clone(),
             primary: replicator.clone(),
+            application_control_match: None,
             capabilities: ReplicatorCapabilities {
                 catch_up_specific_quorum: true,
                 data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
@@ -1566,6 +1568,7 @@ async fn public_v1_data_loss_renewal_is_durable_and_capability_exact() {
             application,
             replicator: replicator.clone(),
             primary: replicator.clone(),
+            application_control_match: None,
             capabilities: ReplicatorCapabilities {
                 catch_up_specific_quorum: true,
                 data_loss_replay: DataLossReplay::Convergent,

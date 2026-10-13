@@ -35,6 +35,8 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) application: Arc<dyn StatefulServiceReplica>,
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
+    pub(crate) application_control_match:
+        Option<Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>>,
     pub(crate) capabilities: ReplicatorCapabilities,
     pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,
@@ -73,6 +75,14 @@ impl PublicOperationCut {
 }
 
 impl PublicLifecycleCallbacks {
+    pub(crate) fn application_control_matches(&self, control: &Arc<dyn Replicator>) -> bool {
+        Arc::ptr_eq(control, &self.replicator)
+            || self
+                .application_control_match
+                .as_ref()
+                .is_some_and(|matches| matches(control))
+    }
+
     pub(crate) fn abort_once(&self) {
         let mut aborted = self.aborted.lock().expect("preview abort lock");
         if !*aborted {

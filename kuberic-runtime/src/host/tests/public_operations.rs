@@ -1853,7 +1853,7 @@ async fn agent_service_retains_and_drains_the_preview_runtime() {
         .unwrap();
 
     assert!(
-        trace
+        !trace
             .events
             .lock()
             .unwrap()

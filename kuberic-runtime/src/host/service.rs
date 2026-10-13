@@ -913,10 +913,11 @@ where
                 .await?;
         }
         // Consume creation permission before readiness permits any authority/access commands.
-        if state
-            .application_storage
-            .as_ref()
-            .is_some_and(|b| b.initializing)
+        if !preview_quarantine
+            && state
+                .application_storage
+                .as_ref()
+                .is_some_and(|b| b.initializing)
         {
             self.store.complete_application_initialization().await?;
         }

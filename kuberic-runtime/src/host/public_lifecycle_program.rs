@@ -255,15 +255,28 @@ pub(super) async fn execute(
                 {
                     return Err(HostError::IdentityMismatch("open context changed".into()));
                 }
-                let control = callbacks.application.clone().open(context).await?;
-                if !Arc::ptr_eq(&control, &callbacks.replicator) {
+                let control = match callbacks.application.clone().open(context).await {
+                    Ok(control) => control,
+                    Err(error) => {
+                        callbacks.abort_once();
+                        return Err(error.into());
+                    }
+                };
+                if !callbacks.application_control_matches(&control) {
+                    callbacks.abort_once();
                     return Err(HostError::IdentityMismatch(
                         "application returned a different Replicator".into(),
                     ));
                 }
                 O::Done
             }
-            ReplicatorOpen => O::Endpoint(callbacks.replicator.open().await?),
+            ReplicatorOpen => match callbacks.replicator.open().await {
+                Ok(endpoint) => O::Endpoint(endpoint),
+                Err(error) => {
+                    callbacks.abort_once();
+                    return Err(error.into());
+                }
+            },
             ReplicatorRole | ApplicationRole => {
                 let (epoch, role) = match program {
                     P::Role { epoch, role } => (*epoch, *role),

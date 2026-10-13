@@ -28,7 +28,8 @@ use kuberic_runtime::protocol::types::{
 };
 use kuberic_runtime::replicator::stateless::StatelessReplicatorFactory;
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
+    DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorFactoryContext,
+    ReplicatorInterfaces, ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
@@ -129,6 +130,7 @@ struct MemoryState {
     progress: Mutex<DurableApplicationProgress>,
     operations: Mutex<Vec<Operation>>,
     block_commit: AtomicBool,
+    fail_commit: AtomicBool,
     commit_entered: Notify,
     release_commit: Notify,
 }
@@ -136,6 +138,10 @@ struct MemoryState {
 impl MemoryState {
     fn block_commit(&self) {
         self.block_commit.store(true, Ordering::Release);
+    }
+
+    fn fail_next_commit(&self) {
+        self.fail_commit.store(true, Ordering::Release);
     }
 }
 
@@ -251,6 +257,11 @@ impl DurableState for MemoryState {
             self.release_commit.notified().await;
             self.block_commit.store(false, Ordering::Release);
         }
+        if self.fail_commit.swap(false, Ordering::AcqRel) {
+            return Err(RuntimeError::Application(
+                "injected provider commit failure".into(),
+            ));
+        }
         let mut progress = self.progress.lock().unwrap();
         if committed_lsn > progress.applied_lsn {
             return Err(RuntimeError::Application("commit exceeds apply".into()));
@@ -260,12 +271,58 @@ impl DurableState for MemoryState {
     }
 }
 
+struct CountingStatelessFactory {
+    storage: Arc<MemoryState>,
+    calls: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl ReplicatorFactory for CountingStatelessFactory {
+    async fn create_replicator(
+        &self,
+        context: ReplicatorFactoryContext,
+        state_provider: Option<Arc<dyn StateProvider>>,
+        settings: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        StatelessReplicatorFactory::new(self.storage.clone())
+            .create_replicator(context, state_provider, settings)
+            .await
+    }
+}
+
+struct RejectingFactory {
+    calls: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl ReplicatorFactory for RejectingFactory {
+    async fn create_replicator(
+        &self,
+        _context: ReplicatorFactoryContext,
+        _state_provider: Option<Arc<dyn StateProvider>>,
+        _settings: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(RuntimeError::Application(
+            "injected creation failure".into(),
+        ))
+    }
+}
+
 struct PreviewApplication {
     storage: Arc<MemoryState>,
     replication_address: String,
     control: RwLock<Option<Arc<dyn Replicator>>>,
     state_replicator: RwLock<Option<Arc<dyn StateReplicator>>>,
+    partition: RwLock<Option<StatefulServicePartition>>,
     legacy_factory: bool,
+    fail_first_creation: AtomicBool,
+    opens: AtomicU64,
+    factory_calls: Arc<AtomicU64>,
+    failed_factory_calls: Arc<AtomicU64>,
+    metadata_database: Option<PathBuf>,
+    instruction_seen_before_open: AtomicBool,
 }
 
 impl PreviewApplication {
@@ -275,7 +332,14 @@ impl PreviewApplication {
             replication_address,
             control: RwLock::new(None),
             state_replicator: RwLock::new(None),
+            partition: RwLock::new(None),
             legacy_factory: false,
+            fail_first_creation: AtomicBool::new(false),
+            opens: AtomicU64::new(0),
+            factory_calls: Arc::new(AtomicU64::new(0)),
+            failed_factory_calls: Arc::new(AtomicU64::new(0)),
+            metadata_database: None,
+            instruction_seen_before_open: AtomicBool::new(false),
         }
     }
 
@@ -284,6 +348,39 @@ impl PreviewApplication {
             legacy_factory: true,
             ..Self::new(storage, replication_address)
         }
+    }
+
+    fn with_open_probe(mut self, metadata_database: PathBuf) -> Self {
+        self.metadata_database = Some(metadata_database);
+        self
+    }
+
+    fn with_failed_creation(mut self) -> Self {
+        self.fail_first_creation = AtomicBool::new(true);
+        self
+    }
+
+    async fn duplicate_creation(&self) -> Result<()> {
+        let partition = self
+            .partition
+            .read()
+            .await
+            .clone()
+            .ok_or(RuntimeError::NotOpen)?;
+        partition
+            .with_factory(Arc::new(CountingStatelessFactory {
+                storage: self.storage.clone(),
+                calls: self.factory_calls.clone(),
+            }))
+            .create_replicator(
+                Some(self.storage.clone()),
+                Some(ReplicatorSettings {
+                    replication_address: self.replication_address.clone(),
+                    public_v1: true,
+                }),
+            )
+            .await
+            .map(|_| ())
     }
 
     async fn replicate(&self, data: Bytes) -> Result<i64> {
@@ -300,13 +397,52 @@ impl PreviewApplication {
 #[async_trait]
 impl StatefulServiceReplica for PreviewApplication {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        if let Some(database) = &self.metadata_database {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            let json: String = connection
+                .query_row(
+                    "SELECT state_json FROM agent_state WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            self.instruction_seen_before_open.store(
+                json.contains("ApplicationOpen") && json.contains("\"open-once\""),
+                Ordering::Release,
+            );
+        }
         if let Some(control) = self.control.read().await.clone() {
             return Ok(control);
+        }
+        *self.partition.write().await = Some(context.partition.clone());
+        if self.fail_first_creation.swap(false, Ordering::AcqRel) {
+            let failed = context
+                .partition
+                .with_factory(Arc::new(RejectingFactory {
+                    calls: self.failed_factory_calls.clone(),
+                }))
+                .create_replicator(
+                    Some(self.storage.clone()),
+                    Some(ReplicatorSettings {
+                        replication_address: self.replication_address.clone(),
+                        public_v1: true,
+                    }),
+                )
+                .await;
+            if failed.is_ok() {
+                return Err(RuntimeError::Application(
+                    "injected creation unexpectedly succeeded".into(),
+                ));
+            }
         }
         let factory: Arc<dyn ReplicatorFactory> = if self.legacy_factory {
             Arc::new(DefaultReplicatorFactory::new(self.storage.clone()))
         } else {
-            Arc::new(StatelessReplicatorFactory::new(self.storage.clone()))
+            Arc::new(CountingStatelessFactory {
+                storage: self.storage.clone(),
+                calls: self.factory_calls.clone(),
+            })
         };
         let interfaces = context
             .partition
@@ -440,6 +576,127 @@ async fn install_static_authority(
 }
 
 #[tokio::test]
+async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = test_root("open-once");
+        let resource_uid = ResourceUid::new("preview-open-once");
+        let preview = PublicOperationPreviewIdentity::public_v1(7);
+        let binding = PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let database = SqliteStore::metadata_database_path(&root);
+        drop(
+            SqliteStore::create_public_v1(
+                &database,
+                preview.clone(),
+                store_identity(resource_uid.clone()),
+            )
+            .unwrap(),
+        );
+        let replication_address = free_address();
+        let storage = Arc::new(MemoryState::default());
+        let application = Arc::new(
+            PreviewApplication::new(storage.clone(), format!("http://{replication_address}"))
+                .with_open_probe(database)
+                .with_failed_creation(),
+        );
+        let mut running = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(1),
+                pod_uid: PodUid::new("preview-pod-uid"),
+                pvc_uid: PvcUid::new("preview-pvc-uid"),
+                data_root: root.clone(),
+                control_address: free_address(),
+                replication_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            application.clone(),
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding)
+        .start()
+        .await
+        .unwrap();
+        let handle = running.handle();
+        assert_eq!(application.opens.load(Ordering::SeqCst), 0);
+        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(application.failed_factory_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handle.stateless_preview_provider_writer_count(), 0);
+        drop(std::net::TcpListener::bind(replication_address).unwrap());
+
+        let generation = PublicProtocolGeneration::new(7);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        handle
+            .initialize_stateless_preview_history(
+                &initialization,
+                &history,
+                &storage_incarnation(replica()),
+            )
+            .await
+            .unwrap();
+        let open = intent(
+            &preview,
+            handle.process_session_id(),
+            1,
+            "open-once",
+            PublicOperationProgram::Open {
+                replica: replica(),
+                existing: true,
+            },
+        );
+        handle
+            .execute_stateless_preview(open.clone())
+            .await
+            .unwrap();
+        assert_eq!(application.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(application.failed_factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            application
+                .instruction_seen_before_open
+                .load(Ordering::Acquire),
+            "ApplicationOpen instruction was not durable before its effect"
+        );
+        assert_eq!(handle.stateless_preview_provider_writer_count(), 1);
+        assert!(std::net::TcpListener::bind(replication_address).is_err());
+
+        assert!(application.duplicate_creation().await.is_err());
+        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.stateless_preview_provider_writer_count(), 1);
+
+        handle.execute_stateless_preview(open).await.unwrap();
+        assert_eq!(application.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
+        assert!(std::net::TcpListener::bind(replication_address).is_err());
+
+        handle
+            .execute_stateless_preview(intent(
+                &preview,
+                handle.process_session_id(),
+                2,
+                "close-open-once",
+                PublicOperationProgram::Close,
+            ))
+            .await
+            .unwrap();
+        drop(std::net::TcpListener::bind(replication_address).unwrap());
+        running.shutdown();
+        running.wait().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("static");
@@ -489,7 +746,7 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
         .await
         .unwrap();
         let handle = running.handle();
-        assert_eq!(handle.stateless_preview_provider_writer_count(), 1);
+        assert_eq!(handle.stateless_preview_provider_writer_count(), 0);
         let generation = PublicProtocolGeneration::new(1);
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
@@ -515,6 +772,7 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
             ))
             .await
             .unwrap();
+        assert_eq!(handle.stateless_preview_provider_writer_count(), 1);
         let epoch = Epoch::new(0, 1);
         handle
             .execute_stateless_preview(intent(
@@ -614,16 +872,16 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
         drop(
             SqliteStore::create_public_v1(
                 SqliteStore::metadata_database_path(&root),
-                preview,
+                preview.clone(),
                 store_identity(resource_uid.clone()),
             )
             .unwrap(),
         );
         let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let replication_address = blocker.local_addr().unwrap();
-        let result = ReplicaHost::new(
+        let mut running = ReplicaHost::new(
             ReplicaProcessConfig {
-                resource_uid,
+                resource_uid: resource_uid.clone(),
                 replica_id: ReplicaId::new(1),
                 pod_uid: PodUid::new("preview-pod-uid"),
                 pvc_uid: PvcUid::new("preview-pvc-uid"),
@@ -643,10 +901,41 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
         )
         .with_stateless_preview(binding)
         .start()
-        .await;
-        assert!(result.is_err(), "preview Open failure must abort startup");
+        .await
+        .unwrap();
+        let handle = running.handle();
+        let generation = PublicProtocolGeneration::new(5);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        handle
+            .initialize_stateless_preview_history(
+                &initialization,
+                &history,
+                &storage_incarnation(replica()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    1,
+                    "open-failure",
+                    PublicOperationProgram::Open {
+                        replica: replica(),
+                        existing: true,
+                    },
+                ))
+                .await
+                .is_err(),
+            "preview Open failure must fail the durable Open"
+        );
+        assert!(handle.stateless_preview_report().await.is_err());
         drop(blocker);
         std::net::TcpListener::bind(replication_address).unwrap();
+        running.shutdown();
+        running.wait().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
 
         let root = test_root("factory-mismatch");
@@ -660,13 +949,17 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
         };
         let database = SqliteStore::metadata_database_path(&root);
         drop(
-            SqliteStore::create_public_v1(&database, preview, store_identity(resource_uid.clone()))
-                .unwrap(),
+            SqliteStore::create_public_v1(
+                &database,
+                preview.clone(),
+                store_identity(resource_uid.clone()),
+            )
+            .unwrap(),
         );
         let replication_address = free_address();
-        let result = ReplicaHost::new(
+        let mut running = ReplicaHost::new(
             ReplicaProcessConfig {
-                resource_uid,
+                resource_uid: resource_uid.clone(),
                 replica_id: ReplicaId::new(1),
                 pod_uid: PodUid::new("preview-pod-uid"),
                 pvc_uid: PvcUid::new("preview-pvc-uid"),
@@ -686,12 +979,191 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
         )
         .with_stateless_preview(binding)
         .start()
-        .await;
+        .await
+        .unwrap();
+        let handle = running.handle();
+        let generation = PublicProtocolGeneration::new(3);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        handle
+            .initialize_stateless_preview_history(
+                &initialization,
+                &history,
+                &storage_incarnation(replica()),
+            )
+            .await
+            .unwrap();
         assert!(
-            result.is_err(),
+            handle
+                .execute_stateless_preview(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    1,
+                    "factory-mismatch",
+                    PublicOperationProgram::Open {
+                        replica: replica(),
+                        existing: true,
+                    },
+                ))
+                .await
+                .is_err(),
             "crossed preview/managed factory selection must fail"
         );
         std::net::TcpListener::bind(replication_address).unwrap();
+        running.shutdown();
+        running.wait().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = test_root("commit-ambiguity");
+        let resource_uid = ResourceUid::new("preview-commit-ambiguity");
+        let preview = PublicOperationPreviewIdentity::public_v1(8);
+        let binding = PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        drop(
+            SqliteStore::create_public_v1(
+                SqliteStore::metadata_database_path(&root),
+                preview.clone(),
+                store_identity(resource_uid.clone()),
+            )
+            .unwrap(),
+        );
+        let replication_address = free_address();
+        let storage = Arc::new(MemoryState::default());
+        let application = Arc::new(PreviewApplication::new(
+            storage.clone(),
+            format!("http://{replication_address}"),
+        ));
+        let mut running = ReplicaHost::new(
+            ReplicaProcessConfig {
+                resource_uid: resource_uid.clone(),
+                replica_id: ReplicaId::new(1),
+                pod_uid: PodUid::new("preview-pod-uid"),
+                pvc_uid: PvcUid::new("preview-pvc-uid"),
+                data_root: root.clone(),
+                control_address: free_address(),
+                replication_address,
+                bearer_token: "preview-token".into(),
+                rpc_deadline: Duration::from_secs(2),
+                transport_window_capacity: 8,
+            },
+            application.clone(),
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_stateless_preview(binding)
+        .start()
+        .await
+        .unwrap();
+        let handle = running.handle();
+        let generation = PublicProtocolGeneration::new(8);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        handle
+            .initialize_stateless_preview_history(
+                &initialization,
+                &history,
+                &storage_incarnation(replica()),
+            )
+            .await
+            .unwrap();
+        let epoch = Epoch::new(0, 1);
+        install_static_authority(
+            &handle,
+            &preview,
+            replica(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: ConfigurationDescriptor::new(
+                    epoch,
+                    ReplicaId::new(1),
+                    vec![ConfigurationMember {
+                        identity: replica(),
+                        role: ReplicaRole::Primary,
+                    }],
+                    1,
+                ),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
+        .await;
+        let ready = handle.stateless_preview_report().await.unwrap();
+        assert_eq!(
+            ready.write_status,
+            kuberic_runtime::protocol::types::AccessStatus::Granted
+        );
+
+        storage.fail_next_commit();
+        let error = application
+            .replicate(Bytes::from_static(b"ambiguous"))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected provider commit failure")
+        );
+        assert_eq!(
+            *storage.progress.lock().unwrap(),
+            DurableApplicationProgress {
+                applied_lsn: 1,
+                committed_lsn: 0,
+            }
+        );
+        let fenced = handle.stateless_preview_report().await.unwrap();
+        assert_eq!(
+            fenced.read_status,
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            fenced.write_status,
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+        );
+        assert!(
+            application
+                .replicate(Bytes::from_static(b"later"))
+                .await
+                .is_err()
+        );
+        assert_eq!(storage.operations.lock().unwrap().len(), 1);
+
+        DurableState::commit(storage.as_ref(), 1).await.unwrap();
+        handle
+            .execute_stateless_preview(intent(
+                &preview,
+                handle.process_session_id(),
+                5,
+                "progress-after-ambiguity",
+                PublicOperationProgram::Progress { capability: false },
+            ))
+            .await
+            .unwrap();
+        let still_fenced = handle.stateless_preview_report().await.unwrap();
+        assert_eq!(still_fenced.progress.first, 1);
+        assert_eq!(still_fenced.progress.last, 1);
+        assert_eq!(
+            still_fenced.read_status,
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            still_fenced.write_status,
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+        );
+
+        running.shutdown();
+        running.wait().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     })
     .await
@@ -1063,14 +1535,36 @@ async fn preview_transport_fences_predecessor_sessions_and_closes_with_its_owner
             },
         )
         .await;
-        assert_eq!(
-            primary_app
-                .replicate(Bytes::from_static(b"replicated"))
-                .await
-                .unwrap(),
-            1
-        );
+        secondary_state.block_commit();
+        let write = tokio::spawn({
+            let primary_app = primary_app.clone();
+            async move {
+                primary_app
+                    .replicate(Bytes::from_static(b"replicated"))
+                    .await
+            }
+        });
+        secondary_state.commit_entered.notified().await;
         assert_eq!(secondary_state.progress.lock().unwrap().applied_lsn, 1);
+        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 0);
+        let applied_only = secondary_handle.stateless_preview_report().await.unwrap();
+        assert_eq!(applied_only.progress.first, 0);
+        assert_eq!(applied_only.progress.last, 1);
+        assert_eq!(
+            applied_only.read_status,
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+        );
+        secondary_state.release_commit.notify_waiters();
+        assert_eq!(write.await.unwrap().unwrap(), 1);
+        assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
+        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 1);
+        let committed = secondary_handle.stateless_preview_report().await.unwrap();
+        assert_eq!(committed.progress.first, 1);
+        assert_eq!(committed.progress.last, 1);
+        assert_eq!(
+            committed.read_status,
+            kuberic_runtime::protocol::types::AccessStatus::Granted
+        );
 
         let mut client = kuberic_runtime::control::proto::replication_data_client::ReplicationDataClient::connect(
             format!("http://{secondary_address}"),
@@ -1097,6 +1591,36 @@ async fn preview_transport_fences_predecessor_sessions_and_closes_with_its_owner
             .into_inner();
         assert!(response.next().await.unwrap().is_err());
         assert_eq!(secondary_state.progress.lock().unwrap().applied_lsn, 1);
+
+        secondary_state.fail_next_commit();
+        assert_eq!(
+            primary_app
+                .replicate(Bytes::from_static(b"lost-watermark"))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            *primary_state.progress.lock().unwrap(),
+            DurableApplicationProgress {
+                applied_lsn: 2,
+                committed_lsn: 2,
+            }
+        );
+        assert_eq!(
+            *secondary_state.progress.lock().unwrap(),
+            DurableApplicationProgress {
+                applied_lsn: 2,
+                committed_lsn: 1,
+            }
+        );
+        let lost = secondary_handle.stateless_preview_report().await.unwrap();
+        assert_eq!(lost.progress.first, 1);
+        assert_eq!(lost.progress.last, 2);
+        assert_eq!(
+            lost.read_status,
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+        );
 
         let refreshed = ConfigurationDescriptor::new(
             Epoch::new(0, 2),
@@ -1157,8 +1681,8 @@ async fn preview_transport_fences_predecessor_sessions_and_closes_with_its_owner
         assert_eq!(
             *primary_state.progress.lock().unwrap(),
             DurableApplicationProgress {
-                applied_lsn: 2,
-                committed_lsn: 1,
+                applied_lsn: 3,
+                committed_lsn: 2,
             }
         );
         std::net::TcpListener::bind(secondary_address).unwrap();
@@ -1181,7 +1705,7 @@ async fn preview_transport_fences_predecessor_sessions_and_closes_with_its_owner
                 rpc_deadline: Duration::from_secs(2),
                 transport_window_capacity: 8,
             },
-            restart_app,
+            restart_app.clone(),
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
@@ -1195,23 +1719,9 @@ async fn preview_transport_fences_predecessor_sessions_and_closes_with_its_owner
         .await
         .unwrap();
         let restarted_handle = restarted.handle();
-        let restarted_report = restarted_handle.stateless_preview_report().await.unwrap();
-        assert_eq!(
-            restarted_report.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        assert_eq!(restarted_report.progress.first, 1);
-        assert_eq!(restarted_report.progress.last, 2);
-        restarted_handle
-            .execute_stateless_preview(intent(
-                &preview,
-                restarted_handle.process_session_id(),
-                1,
-                "abort-restarted",
-                PublicOperationProgram::Abort,
-            ))
-            .await
-            .unwrap();
+        assert_eq!(restarted_handle.stateless_preview_provider_writer_count(), 0);
+        assert_eq!(restart_app.opens.load(Ordering::SeqCst), 0);
+        assert!(restarted_handle.stateless_preview_report().await.is_err());
         std::net::TcpListener::bind(primary_address).unwrap();
         restarted.shutdown();
         restarted.wait().await.unwrap();

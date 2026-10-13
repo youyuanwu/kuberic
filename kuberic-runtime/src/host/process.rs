@@ -882,6 +882,10 @@ impl ReplicaHandle {
                     | crate::protocol::public_operations::PublicOperationProgram::Abort
             )
         );
+        let open_program = matches!(
+            intent.program.as_ref(),
+            Some(crate::protocol::public_operations::PublicOperationProgram::Open { .. })
+        );
         if !matches!(
             intent.program,
             Some(crate::protocol::public_operations::PublicOperationProgram::Progress { .. })
@@ -920,6 +924,17 @@ impl ReplicaHandle {
                 "public operation did not complete successfully: {:?}",
                 terminal.disposition
             )));
+        }
+        if open_program {
+            self.runtime.complete_stateless_preview_open().await;
+            let state = self.store.load_state().await?;
+            if state
+                .application_storage
+                .as_ref()
+                .is_some_and(|binding| binding.initializing)
+            {
+                self.store.complete_application_initialization().await?;
+            }
         }
         if !terminal_program {
             self.runtime

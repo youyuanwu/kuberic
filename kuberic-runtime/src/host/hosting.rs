@@ -421,6 +421,102 @@ struct ProviderWriterLease {
     consumed: bool,
 }
 
+#[cfg(feature = "testing")]
+struct DeferredPreviewReplicator {
+    control: Arc<dyn Fn() -> Result<Arc<dyn Replicator>> + Send + Sync>,
+    primary: Arc<dyn Fn() -> Result<Arc<dyn PrimaryReplicator>> + Send + Sync>,
+    abort_unregistered: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(feature = "testing")]
+impl DeferredPreviewReplicator {
+    fn control(&self) -> Result<Arc<dyn Replicator>> {
+        (self.control)()
+    }
+
+    fn primary(&self) -> Result<Arc<dyn PrimaryReplicator>> {
+        (self.primary)()
+    }
+}
+
+#[async_trait]
+#[cfg(feature = "testing")]
+impl Replicator for DeferredPreviewReplicator {
+    async fn open(&self) -> Result<String> {
+        self.control()?.open().await
+    }
+
+    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        self.control()?.change_role(epoch, role).await
+    }
+
+    async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        self.control()?.update_epoch(epoch).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.control()?.close().await
+    }
+
+    fn abort(&self) {
+        if let Ok(control) = self.control() {
+            control.abort();
+        } else {
+            (self.abort_unregistered)();
+        }
+    }
+
+    async fn current_progress(&self) -> Result<i64> {
+        self.control()?.current_progress().await
+    }
+
+    async fn catch_up_capability(&self) -> Result<i64> {
+        self.control()?.catch_up_capability().await
+    }
+}
+
+#[async_trait]
+#[cfg(feature = "testing")]
+impl PrimaryReplicator for DeferredPreviewReplicator {
+    async fn on_data_loss(&self) -> Result<bool> {
+        self.primary()?.on_data_loss().await
+    }
+
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        current: crate::replicator::ReplicaSetConfiguration,
+        previous: crate::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        self.primary()?
+            .update_catch_up_replica_set_configuration(current, previous)
+            .await
+    }
+
+    async fn wait_for_catch_up_quorum(
+        &self,
+        mode: crate::replicator::ReplicaSetQuorumMode,
+    ) -> Result<()> {
+        self.primary()?.wait_for_catch_up_quorum(mode).await
+    }
+
+    async fn update_current_replica_set_configuration(
+        &self,
+        current: crate::replicator::ReplicaSetConfiguration,
+    ) -> Result<()> {
+        self.primary()?
+            .update_current_replica_set_configuration(current)
+            .await
+    }
+
+    async fn build_replica(&self, replica: crate::replicator::ReplicaInformation) -> Result<()> {
+        self.primary()?.build_replica(replica).await
+    }
+
+    async fn remove_replica(&self, replica_id: crate::protocol::types::ReplicaId) -> Result<()> {
+        self.primary()?.remove_replica(replica_id).await
+    }
+}
+
 #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
 struct HostedPrimaryReplicator {
     inner: Arc<dyn PrimaryReplicator>,
@@ -1041,13 +1137,71 @@ impl PodRuntime {
     pub(crate) fn public_lifecycle_callbacks(
         &self,
     ) -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks> {
-        let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
+        if let Some(registered) = self.host.registered.get() {
+            return Ok(crate::host::public_lifecycle::PublicLifecycleCallbacks {
+                application: self.host.application.clone(),
+                replicator: registered.control.clone(),
+                primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
+                application_control_match: None,
+                capabilities: registered.capabilities,
+                replicator_creation_id: registered.identity.to_public_id(),
+                open_context: None,
+                containment: None,
+                aborted: Arc::new(std::sync::Mutex::new(false)),
+                #[cfg(all(test, feature = "testing"))]
+                cut: None,
+            });
+        }
+        if self.host.engine_selection.preview_binding().is_none() {
+            return Err(RuntimeError::NotOpen);
+        }
+        let control_host = Arc::downgrade(&self.host);
+        let primary_host = Arc::downgrade(&self.host);
+        let abort_host = Arc::downgrade(&self.host);
+        let deferred = Arc::new(DeferredPreviewReplicator {
+            control: Arc::new(move || {
+                let host = control_host.upgrade().ok_or(RuntimeError::Closed)?;
+                Ok(host
+                    .registered
+                    .get()
+                    .ok_or(RuntimeError::NotOpen)?
+                    .control
+                    .clone())
+            }),
+            primary: Arc::new(move || {
+                let host = primary_host.upgrade().ok_or(RuntimeError::Closed)?;
+                host.registered
+                    .get()
+                    .ok_or(RuntimeError::NotOpen)?
+                    .primary()
+                    .ok_or(RuntimeError::NotPrimary)
+            }),
+            abort_unregistered: Arc::new(move || {
+                if let Some(host) = abort_host.upgrade() {
+                    host.application.abort();
+                }
+            }),
+        });
+        let replicator: Arc<dyn Replicator> = deferred.clone();
+        let primary: Arc<dyn PrimaryReplicator> = deferred;
+        let host = Arc::downgrade(&self.host);
         Ok(crate::host::public_lifecycle::PublicLifecycleCallbacks {
             application: self.host.application.clone(),
-            replicator: registered.control.clone(),
-            primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
-            capabilities: registered.capabilities,
-            replicator_creation_id: registered.identity.to_public_id(),
+            replicator,
+            primary,
+            application_control_match: Some(Arc::new(move |control| {
+                host.upgrade()
+                    .and_then(|host| {
+                        host.registered
+                            .get()
+                            .map(|registered| Arc::ptr_eq(control, &registered.control))
+                    })
+                    .unwrap_or(false)
+            })),
+            capabilities: ReplicatorCapabilities::conservative(),
+            replicator_creation_id: crate::protocol::types::ReplicatorCreationId::new(
+                "pending-preview-open",
+            ),
             open_context: None,
             containment: None,
             aborted: Arc::new(std::sync::Mutex::new(false)),
@@ -1143,18 +1297,19 @@ impl PodRuntime {
                         member.identity == self.host.identity && member.role == selected_role
                     })
             });
-        if allow_reopen && candidate_ready {
+        let ambiguity_fenced = self.host.preview_ambiguity_fenced.load(Ordering::Acquire);
+        if allow_reopen && candidate_ready && !ambiguity_fenced {
             self.host
                 .preview_authority_fenced
                 .store(false, Ordering::Release);
         }
-        let static_ready =
-            candidate_ready && !self.host.preview_authority_fenced.load(Ordering::Acquire);
+        let static_ready = candidate_ready
+            && applied == committed
+            && !ambiguity_fenced
+            && !self.host.preview_authority_fenced.load(Ordering::Acquire);
         let (read, write) = if static_ready {
             match selected_role {
-                ReplicaRole::Primary if applied == committed => {
-                    (AccessStatus::Granted, AccessStatus::Granted)
-                }
+                ReplicaRole::Primary => (AccessStatus::Granted, AccessStatus::Granted),
                 ReplicaRole::ActiveSecondary => (AccessStatus::Granted, AccessStatus::NotPrimary),
                 _ => (AccessStatus::NotPrimary, AccessStatus::NotPrimary),
             }
@@ -1190,6 +1345,11 @@ impl PodRuntime {
         let mut state = self.host.state.write().await;
         state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
         state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn complete_stateless_preview_open(&self) {
+        self.host.state.write().await.fallback_snapshot.open = true;
     }
 
     #[cfg(feature = "testing")]
@@ -1346,6 +1506,8 @@ impl PodRuntime {
                 preview_fault_fenced: AtomicBool::new(false),
                 #[cfg(feature = "testing")]
                 preview_authority_fenced: AtomicBool::new(false),
+                #[cfg(feature = "testing")]
+                preview_ambiguity_fenced: AtomicBool::new(false),
                 recovery_revision: AtomicU64::new(0),
                 recovery_changed: Notify::new(),
                 recovery_tasks: RecoveryTaskOwner::new(),
@@ -1659,11 +1821,9 @@ impl PodRuntime {
         Ok(())
     }
 
-    pub(crate) async fn reconstruct_quarantined(&self, mode: OpenMode) -> Result<()> {
-        if !self.host.snapshot().await.open {
-            self.host.open(mode).await?;
-        }
+    pub(crate) async fn reconstruct_quarantined(&self, _mode: OpenMode) -> Result<()> {
         let mut state = self.host.state.write().await;
+        state.fallback_snapshot.open = false;
         state.fallback_snapshot.role = ReplicaRole::None;
         state.fallback_snapshot.role_transition = None;
         state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
@@ -2113,6 +2273,8 @@ struct RuntimeHost {
     preview_fault_fenced: AtomicBool,
     #[cfg(feature = "testing")]
     preview_authority_fenced: AtomicBool,
+    #[cfg(feature = "testing")]
+    preview_ambiguity_fenced: AtomicBool,
     recovery_revision: AtomicU64,
     recovery_changed: Notify,
     recovery_tasks: Arc<RecoveryTaskOwner>,
@@ -2853,6 +3015,38 @@ impl PartitionAccessView for HostAccessView {
         Ok(host.state.read().await.fallback_snapshot.write_status)
     }
 
+    #[cfg(feature = "testing")]
+    async fn publish_preview_progress(
+        &self,
+        applied_lsn: i64,
+        committed_lsn: i64,
+        ambiguous: bool,
+    ) -> Result<()> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        if ambiguous {
+            host.preview_ambiguity_fenced.store(true, Ordering::Release);
+        }
+        let fenced = ambiguous
+            || applied_lsn != committed_lsn
+            || host.preview_ambiguity_fenced.load(Ordering::Acquire)
+            || host.preview_authority_fenced.load(Ordering::Acquire);
+        let mut state = host.state.write().await;
+        state.fallback_snapshot.current_progress = applied_lsn;
+        state.fallback_snapshot.committed_lsn = committed_lsn;
+        let (read, write) = if fenced {
+            (AccessStatus::NotPrimary, AccessStatus::NotPrimary)
+        } else {
+            match state.fallback_snapshot.role {
+                ReplicaRole::Primary => (AccessStatus::Granted, AccessStatus::Granted),
+                ReplicaRole::ActiveSecondary => (AccessStatus::Granted, AccessStatus::NotPrimary),
+                _ => (AccessStatus::NotPrimary, AccessStatus::NotPrimary),
+            }
+        };
+        state.fallback_snapshot.read_status = read;
+        state.fallback_snapshot.write_status = write;
+        Ok(())
+    }
+
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
         let _effect = host.effect_lock.lock().await;
@@ -3076,18 +3270,17 @@ impl ReplicatorRegistration for RuntimeHost {
                 "CreateReplicator reservation was lost before registration".into(),
             ));
         }
+        let consumes_provider_writer =
+            provider.is_some() && attachment.has_provider_writer(RuntimeHostToken::new());
         if provider.is_none() && attachment.has_provider_writer(RuntimeHostToken::new()) {
             return Err(RuntimeError::Application(
                 "StateReplicator writer requires a registered provider".into(),
             ));
         }
-        if provider.is_some() && attachment.has_provider_writer(RuntimeHostToken::new()) {
-            if provider_writer.consumed {
-                return Err(RuntimeError::Application(
-                    "provider writer lease was already consumed".into(),
-                ));
-            }
-            provider_writer.consumed = true;
+        if consumes_provider_writer && provider_writer.consumed {
+            return Err(RuntimeError::Application(
+                "provider writer lease was already consumed".into(),
+            ));
         }
         self.registered
             .set(RegisteredReplicator {
@@ -3113,13 +3306,14 @@ impl ReplicatorRegistration for RuntimeHost {
                 recovery_lifecycle,
                 managed_data_plane,
                 #[cfg(feature = "testing")]
-                provider_writer_lease_consumed: provider_writer.consumed,
+                provider_writer_lease_consumed: consumes_provider_writer,
             })
             .map_err(|_| {
                 RuntimeError::Application(
                     "CreateReplicator may be called only once per Open".into(),
                 )
             })?;
+        provider_writer.consumed = consumes_provider_writer;
         *creation = ReplicatorCreationState::Registered;
         Ok(())
     }

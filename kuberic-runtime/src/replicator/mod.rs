@@ -1078,6 +1078,18 @@ impl ReplicatorFactoryContext {
                 )
             })
     }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn publish_preview_progress(
+        &self,
+        applied_lsn: i64,
+        committed_lsn: i64,
+        ambiguous: bool,
+    ) -> Result<()> {
+        self.access
+            .publish_preview_progress(applied_lsn, committed_lsn, ambiguous)
+            .await
+    }
 }
 
 #[async_trait]
@@ -1087,6 +1099,14 @@ pub(crate) trait PartitionAccessView: Send + Sync {
     async fn read_status(&self) -> Result<AccessStatus>;
 
     async fn write_status(&self) -> Result<AccessStatus>;
+
+    #[cfg(feature = "testing")]
+    async fn publish_preview_progress(
+        &self,
+        applied_lsn: i64,
+        committed_lsn: i64,
+        ambiguous: bool,
+    ) -> Result<()>;
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()>;
 
