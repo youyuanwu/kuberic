@@ -306,7 +306,7 @@ impl DurableState for MemoryState {
 
     async fn commit(&self, committed_lsn: i64) -> Result<DurableApplicationProgress> {
         if self.block_commit.load(Ordering::Acquire) {
-            self.commit_entered.notify_waiters();
+            self.commit_entered.notify_one();
             self.release_commit.notified().await;
             self.block_commit.store(false, Ordering::Release);
         }
