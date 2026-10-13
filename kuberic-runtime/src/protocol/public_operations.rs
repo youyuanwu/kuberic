@@ -459,7 +459,41 @@ pub struct PublicConfiguration {
 
 impl PublicConfiguration {
     pub fn validate(&self) -> Result<(), &'static str> {
-        self.validate_for_local(self.current.primary_id)
+        self.validate_descriptors()?;
+        let members = std::iter::once(&self.current)
+            .chain(self.previous.iter())
+            .flat_map(|configuration| configuration.members.iter())
+            .collect::<Vec<_>>();
+        let mut identities = std::collections::BTreeSet::new();
+        let mut successor = None;
+        for replica in &self.replicas {
+            replica.validate()?;
+            if !identities.insert(&replica.identity)
+                || replica.build_id != OperationId::default()
+                || !members.iter().any(|member| {
+                    member.identity == replica.identity && member.role == replica.role
+                })
+                || !matches!(
+                    replica.role,
+                    ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                )
+            {
+                return Err(
+                    "public configuration contains an idle, build, non-member, or duplicate peer",
+                );
+            }
+            if replica.must_catchup && successor.replace(&replica.identity).is_some() {
+                return Err("public configuration contains multiple must-catchup successors");
+            }
+        }
+        let member_identities = members
+            .iter()
+            .map(|member| &member.identity)
+            .collect::<std::collections::BTreeSet<_>>();
+        if member_identities.len() != self.replicas.len().saturating_add(1) {
+            return Err("public configuration does not describe every exact remote peer");
+        }
+        Ok(())
     }
 
     fn validate_descriptors(&self) -> Result<(), &'static str> {

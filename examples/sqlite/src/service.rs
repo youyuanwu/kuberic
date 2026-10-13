@@ -11,9 +11,11 @@ use futures::{StreamExt, stream};
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::engine::DurableState;
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
+#[cfg(feature = "testing")]
+use kuberic_runtime::replicator::stateless::StatelessReplicatorFactory;
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
+    DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
     StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
@@ -74,9 +76,11 @@ pub struct SqliteService {
     barrier: Arc<ReplicationBarrier>,
     provider: Arc<SqliteProvider>,
     partition: Mutex<Option<StatefulServicePartition>>,
+    control: Mutex<Option<Arc<dyn Replicator>>>,
     replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
     streams: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     replication_address: String,
+    stateless_preview: AtomicBool,
 }
 
 impl SqliteService {
@@ -116,10 +120,18 @@ impl SqliteService {
             persistence,
             barrier,
             partition: Mutex::new(None),
+            control: Mutex::new(None),
             replicator: Mutex::new(None),
             streams: Mutex::new(Vec::new()),
             replication_address,
+            stateless_preview: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn with_stateless_preview(self) -> Self {
+        self.stateless_preview.store(true, Ordering::Release);
+        self
     }
     pub fn persistence(&self) -> &Arc<SqlitePersistence> {
         &self.persistence
@@ -214,6 +226,9 @@ impl SqliteService {
 #[async_trait]
 impl StatefulServiceReplica for SqliteService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        if let Some(control) = self.control.lock().expect("control").clone() {
+            return Ok(control);
+        }
         self.persistence.initialize().map_err(persistence_error)?;
         self.barrier.reset_receipt(
             self.persistence
@@ -222,19 +237,31 @@ impl StatefulServiceReplica for SqliteService {
                 .committed_lsn,
         );
         *self.partition.lock().expect("partition") = Some(context.partition.clone());
+        let preview = self.stateless_preview.load(Ordering::Acquire);
+        let factory: Arc<dyn ReplicatorFactory> = if preview {
+            #[cfg(feature = "testing")]
+            {
+                Arc::new(StatelessReplicatorFactory::new(self.persistence.clone()))
+            }
+            #[cfg(not(feature = "testing"))]
+            {
+                unreachable!("preview construction is unavailable without testing")
+            }
+        } else {
+            Arc::new(DefaultReplicatorFactory::new(self.persistence.clone()))
+        };
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new(
-                self.persistence.clone(),
-            )))
+            .with_factory(factory)
             .create_replicator(
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: false,
+                    public_v1: preview,
                 }),
             )
             .await?;
+        let control = interfaces.replicator();
         let replicator = interfaces
             .state_replicator()
             .expect("default operation/copy capability");
@@ -246,6 +273,7 @@ impl StatefulServiceReplica for SqliteService {
             self.streams.lock().expect("streams").push(task);
         }
         *self.replicator.lock().expect("replicator") = Some(replicator);
+        *self.control.lock().expect("control") = Some(control.clone());
         if matches!(
             self.persistence
                 .recovery_state()
@@ -254,7 +282,7 @@ impl StatefulServiceReplica for SqliteService {
         ) {
             self.partition()?.report_fault(FaultType::Permanent).await?;
         }
-        Ok(interfaces.replicator())
+        Ok(control)
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
@@ -317,6 +345,7 @@ impl StatefulServiceReplica for SqliteService {
         self.barrier.uninstall();
         self.partition.lock().expect("partition").take();
         self.replicator.lock().expect("replicator").take();
+        self.control.lock().expect("control").take();
         for task in self.streams.lock().expect("streams").drain(..) {
             task.abort();
         }

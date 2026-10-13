@@ -95,8 +95,7 @@ pub(super) fn replica_set(
             .iter()
             .filter(|replica| {
                 configuration.members.iter().any(|member| {
-                    member.identity == replica.identity
-                        && member.role == crate::protocol::types::ReplicaRole::ActiveSecondary
+                    member.identity == replica.identity && member.role == replica.role
                 })
             })
             .cloned()

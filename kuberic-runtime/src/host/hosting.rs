@@ -35,8 +35,8 @@ use crate::replicator::copy::{
 use crate::replicator::{
     DefaultReplicatorDependencies, ManagedReplicaStore, ManagedReplicatorDataPlane,
     PartitionAccessView, PrimaryReplicator, Replicator, ReplicatorAttachment,
-    ReplicatorCapabilities, ReplicatorCreationReservation, ReplicatorFactoryContext,
-    ReplicatorRegistration, StatefulServicePartition,
+    ReplicatorCapabilities, ReplicatorCreationReservation, ReplicatorEngineSelection,
+    ReplicatorFactoryContext, ReplicatorRegistration, StatefulServicePartition,
 };
 use crate::runtime::PendingReplication as RuntimePendingReplication;
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -403,12 +403,22 @@ struct RegisteredReplicator {
     topology_lifecycle: Option<lifecycle::TopologyRuntime>,
     recovery_lifecycle: Option<lifecycle::RecoveryRuntime>,
     managed_data_plane: Option<Arc<dyn ManagedReplicatorDataPlane>>,
+    #[cfg(feature = "testing")]
+    provider_writer_lease_consumed: bool,
 }
 
 enum ReplicatorCreationState {
     Available,
-    Reserved(ReplicatorCreationIdentity),
+    Reserved {
+        identity: ReplicatorCreationIdentity,
+        provider_writer: ProviderWriterLease,
+    },
     Registered,
+}
+
+#[derive(Debug)]
+struct ProviderWriterLease {
+    consumed: bool,
 }
 
 #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -1014,6 +1024,7 @@ impl PodRuntime {
                 partition_information: self.host.state.read().await.partition_information.clone(),
             }),
             self.host.default_dependencies.clone(),
+            self.host.engine_selection.clone(),
         );
         OpenContext {
             identity: self.host.identity.clone(),
@@ -1042,6 +1053,176 @@ impl PodRuntime {
             aborted: Arc::new(std::sync::Mutex::new(false)),
             #[cfg(all(test, feature = "testing"))]
             cut: None,
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn refresh_stateless_preview_projection(
+        &self,
+        store: &dyn crate::host::store::AgentStore,
+        process_session: &crate::protocol::types::ProcessSessionId,
+        allow_reopen: bool,
+    ) -> Result<()> {
+        use crate::host::state::{PublicOperationDisposition, PublicOperationStage};
+        use crate::protocol::public_operations::PublicOperationProgram;
+
+        let persisted = store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let preview = persisted.public_operation_preview.ok_or_else(|| {
+            RuntimeError::Application("stateless preview requires schema-11 state".into())
+        })?;
+        let mut open = false;
+        let mut role = None;
+        let mut epoch = None;
+        let mut configuration = None;
+        let mut dynamic = false;
+        for record in preview
+            .operations
+            .values()
+            .filter(|record| &record.intent.process_session_id == process_session)
+        {
+            if matches!(
+                record.intent.program.as_ref(),
+                Some(
+                    PublicOperationProgram::CatchUp { .. }
+                        | PublicOperationProgram::Swap { .. }
+                        | PublicOperationProgram::Build(_)
+                        | PublicOperationProgram::Remove(_)
+                )
+            ) || record.intent.lifecycle.is_some()
+            {
+                dynamic = true;
+            }
+            if record.stage != PublicOperationStage::Completed
+                || record.disposition != Some(PublicOperationDisposition::Succeeded)
+            {
+                continue;
+            }
+            match record.intent.program.as_ref() {
+                Some(PublicOperationProgram::Open { .. }) => open = true,
+                Some(PublicOperationProgram::Role {
+                    epoch: role_epoch,
+                    role: selected,
+                }) => role = Some((*role_epoch, *selected)),
+                Some(PublicOperationProgram::Epoch {
+                    epoch: selected_epoch,
+                }) => epoch = Some(*selected_epoch),
+                Some(PublicOperationProgram::Configuration(selected)) => {
+                    configuration = Some(selected.clone());
+                }
+                Some(
+                    PublicOperationProgram::CatchUp { .. }
+                    | PublicOperationProgram::Swap { .. }
+                    | PublicOperationProgram::Build(_)
+                    | PublicOperationProgram::Remove(_),
+                ) => {}
+                None if record.intent.lifecycle.is_some() => {}
+                Some(
+                    PublicOperationProgram::Progress { .. }
+                    | PublicOperationProgram::Close
+                    | PublicOperationProgram::Abort,
+                )
+                | None => {}
+            }
+        }
+        let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
+        let applied = registered.current_progress().await?;
+        let committed = match registered.provider.as_ref() {
+            Some(provider) => provider.last_committed_lsn().await?,
+            None => 0,
+        };
+        let (role_epoch, selected_role) = role.unwrap_or((Epoch::default(), ReplicaRole::None));
+        let candidate_ready = !dynamic
+            && open
+            && epoch == Some(role_epoch)
+            && configuration.as_ref().is_some_and(|selected| {
+                selected.current.epoch == role_epoch
+                    && selected.current.members.iter().any(|member| {
+                        member.identity == self.host.identity && member.role == selected_role
+                    })
+            });
+        if allow_reopen && candidate_ready {
+            self.host
+                .preview_authority_fenced
+                .store(false, Ordering::Release);
+        }
+        let static_ready =
+            candidate_ready && !self.host.preview_authority_fenced.load(Ordering::Acquire);
+        let (read, write) = if static_ready {
+            match selected_role {
+                ReplicaRole::Primary if applied == committed => {
+                    (AccessStatus::Granted, AccessStatus::Granted)
+                }
+                ReplicaRole::ActiveSecondary => (AccessStatus::Granted, AccessStatus::NotPrimary),
+                _ => (AccessStatus::NotPrimary, AccessStatus::NotPrimary),
+            }
+        } else {
+            (AccessStatus::NotPrimary, AccessStatus::NotPrimary)
+        };
+        let mut state = self.host.state.write().await;
+        state.fallback_snapshot.role = if static_ready {
+            selected_role
+        } else {
+            ReplicaRole::None
+        };
+        state.fallback_snapshot.read_status = read;
+        state.fallback_snapshot.write_status = write;
+        state.fallback_snapshot.current_progress = applied;
+        state.fallback_snapshot.committed_lsn = committed;
+        Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn provider_writer_lease_count(&self) -> usize {
+        self.host
+            .registered
+            .get()
+            .is_some_and(|registered| registered.provider_writer_lease_consumed) as usize
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn fence_stateless_preview_access(&self) {
+        self.host
+            .preview_authority_fenced
+            .store(true, Ordering::Release);
+        let mut state = self.host.state.write().await;
+        state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
+        state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn stateless_preview_report_projection(
+        &self,
+        process_session_id: crate::protocol::types::ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<crate::host::public_lifecycle::PublicV1ReportProjection> {
+        use crate::protocol::public_operations::{PublicProgress, PublicProgressRole};
+
+        let registered = self.host.registered.get().ok_or(RuntimeError::NotOpen)?;
+        let applied = registered.current_progress().await?;
+        let committed = match registered.provider.as_ref() {
+            Some(provider) => provider.last_committed_lsn().await?,
+            None => 0,
+        };
+        let state = self.host.state.read().await;
+        let role = state.fallback_snapshot.role;
+        Ok(crate::host::public_lifecycle::PublicV1ReportProjection {
+            process_session_id,
+            report_sequence,
+            role,
+            read_status: state.fallback_snapshot.read_status,
+            write_status: state.fallback_snapshot.write_status,
+            progress: PublicProgress {
+                role: match role {
+                    ReplicaRole::Primary => PublicProgressRole::Primary,
+                    ReplicaRole::ActiveSecondary => PublicProgressRole::Secondary,
+                    _ => PublicProgressRole::Recovery,
+                },
+                first: committed,
+                last: applied,
+            },
         })
     }
 
@@ -1074,6 +1255,52 @@ impl PodRuntime {
         A: StatefulServiceReplica + 'static,
         S: AuthorityStore + 'static,
     {
+        Self::new_for_partition_with_selection(
+            partition_information,
+            identity,
+            application,
+            authority_store,
+            ReplicatorEngineSelection::LegacyManaged,
+        )
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn new_stateless_preview<A, S>(
+        identity: ReplicaIdentity,
+        application: Arc<A>,
+        authority_store: Arc<S>,
+        binding: crate::protocol::public_operations::PreviewLifecycleBinding,
+        replication_address: std::net::SocketAddr,
+    ) -> Self
+    where
+        A: StatefulServiceReplica + 'static,
+        S: AuthorityStore + 'static,
+    {
+        let partition_id =
+            PartitionId::new(format!("partition-{}", identity.agent_generation.as_str()));
+        Self::new_for_partition_with_selection(
+            PartitionInformation { partition_id },
+            identity,
+            application,
+            authority_store,
+            ReplicatorEngineSelection::StatelessPreview {
+                binding,
+                replication_address,
+            },
+        )
+    }
+
+    fn new_for_partition_with_selection<A, S>(
+        partition_information: PartitionInformation,
+        identity: ReplicaIdentity,
+        application: Arc<A>,
+        authority_store: Arc<S>,
+        engine_selection: ReplicatorEngineSelection,
+    ) -> Self
+    where
+        A: StatefulServiceReplica + 'static,
+        S: AuthorityStore + 'static,
+    {
         let application: Arc<dyn StatefulServiceReplica> = application;
         let replica_authority_store: Arc<dyn ReplicaAuthorityStore> = authority_store.clone();
         let managed_store: Arc<dyn ManagedReplicaStore> = Arc::new(ManagedReplicaStoreView {
@@ -1096,6 +1323,7 @@ impl PodRuntime {
                     build_authority_store,
                     build_progress_store,
                 },
+                engine_selection,
                 state: RwLock::new(HostState {
                     effects: BTreeMap::new(),
                     fallback_snapshot,
@@ -1116,6 +1344,8 @@ impl PodRuntime {
                 partition_reports_closed: AtomicBool::new(false),
                 #[cfg(feature = "testing")]
                 preview_fault_fenced: AtomicBool::new(false),
+                #[cfg(feature = "testing")]
+                preview_authority_fenced: AtomicBool::new(false),
                 recovery_revision: AtomicU64::new(0),
                 recovery_changed: Notify::new(),
                 recovery_tasks: RecoveryTaskOwner::new(),
@@ -1870,6 +2100,7 @@ struct RuntimeHost {
     identity: ReplicaIdentity,
     application: Arc<dyn StatefulServiceReplica>,
     default_dependencies: DefaultReplicatorDependencies,
+    engine_selection: ReplicatorEngineSelection,
     state: RwLock<HostState>,
     effect_lock: Mutex<()>,
     registered: OnceLock<RegisteredReplicator>,
@@ -1880,6 +2111,8 @@ struct RuntimeHost {
     partition_reports_closed: AtomicBool,
     #[cfg(feature = "testing")]
     preview_fault_fenced: AtomicBool,
+    #[cfg(feature = "testing")]
+    preview_authority_fenced: AtomicBool,
     recovery_revision: AtomicU64,
     recovery_changed: Notify,
     recovery_tasks: Arc<RecoveryTaskOwner>,
@@ -2707,12 +2940,13 @@ impl ReplicatorRegistration for RuntimeHost {
         })?;
         match &*creation {
             ReplicatorCreationState::Available => {
-                *creation = ReplicatorCreationState::Reserved(
-                    reservation.identity(RuntimeHostToken::new()),
-                );
+                *creation = ReplicatorCreationState::Reserved {
+                    identity: reservation.identity(RuntimeHostToken::new()),
+                    provider_writer: ProviderWriterLease { consumed: false },
+                };
                 Ok(reservation)
             }
-            ReplicatorCreationState::Reserved(_) | ReplicatorCreationState::Registered => {
+            ReplicatorCreationState::Reserved { .. } | ReplicatorCreationState::Registered => {
                 Err(RuntimeError::Application(
                     "CreateReplicator may be called only once per Open".into(),
                 ))
@@ -2724,7 +2958,7 @@ impl ReplicatorRegistration for RuntimeHost {
         if let Ok(mut creation) = self.replicator_creation.lock()
             && matches!(
                 &*creation,
-                ReplicatorCreationState::Reserved(identity)
+                ReplicatorCreationState::Reserved { identity, .. }
                     if *identity == reservation.identity(RuntimeHostToken::new())
             )
         {
@@ -2745,7 +2979,7 @@ impl ReplicatorRegistration for RuntimeHost {
             })?;
             if !matches!(
                 &*creation,
-                ReplicatorCreationState::Reserved(identity)
+                ReplicatorCreationState::Reserved { identity, .. }
                     if *identity == reservation_identity
                         && attachment.identity(RuntimeHostToken::new()) == *identity
             ) {
@@ -2826,15 +3060,34 @@ impl ReplicatorRegistration for RuntimeHost {
         let mut creation = self.replicator_creation.lock().map_err(|_| {
             RuntimeError::Application("replicator creation state was poisoned".into())
         })?;
-        if !matches!(
-            &*creation,
-            ReplicatorCreationState::Reserved(identity)
-                if *identity == reservation_identity
-                    && attachment.identity(RuntimeHostToken::new()) == *identity
-        ) {
+        let ReplicatorCreationState::Reserved {
+            identity: reserved_identity,
+            provider_writer,
+        } = &mut *creation
+        else {
             return Err(RuntimeError::Application(
                 "CreateReplicator reservation was lost before registration".into(),
             ));
+        };
+        if *reserved_identity != reservation_identity
+            || attachment.identity(RuntimeHostToken::new()) != *reserved_identity
+        {
+            return Err(RuntimeError::Application(
+                "CreateReplicator reservation was lost before registration".into(),
+            ));
+        }
+        if provider.is_none() && attachment.has_provider_writer(RuntimeHostToken::new()) {
+            return Err(RuntimeError::Application(
+                "StateReplicator writer requires a registered provider".into(),
+            ));
+        }
+        if provider.is_some() && attachment.has_provider_writer(RuntimeHostToken::new()) {
+            if provider_writer.consumed {
+                return Err(RuntimeError::Application(
+                    "provider writer lease was already consumed".into(),
+                ));
+            }
+            provider_writer.consumed = true;
         }
         self.registered
             .set(RegisteredReplicator {
@@ -2859,6 +3112,8 @@ impl ReplicatorRegistration for RuntimeHost {
                 topology_lifecycle,
                 recovery_lifecycle,
                 managed_data_plane,
+                #[cfg(feature = "testing")]
+                provider_writer_lease_consumed: provider_writer.consumed,
             })
             .map_err(|_| {
                 RuntimeError::Application(
@@ -3643,6 +3898,7 @@ impl RuntimeHost {
                 partition_information: self.state.read().await.partition_information.clone(),
             }),
             self.default_dependencies.clone(),
+            self.engine_selection.clone(),
         );
         let registration = self
             .application

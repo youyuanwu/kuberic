@@ -47,6 +47,8 @@ pub(crate) struct InitializationService {
     initialized: watch::Sender<bool>,
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
+    #[cfg(feature = "testing")]
+    preview_binding: Option<crate::protocol::public_operations::PreviewLifecycleBinding>,
 }
 
 impl InitializationService {
@@ -73,6 +75,8 @@ impl InitializationService {
             initialized,
             fresh_application_state,
             application_storage_paths: None,
+            #[cfg(feature = "testing")]
+            preview_binding: None,
         })
     }
 
@@ -81,6 +85,15 @@ impl InitializationService {
         paths: Option<BTreeMap<String, PathBuf>>,
     ) -> Self {
         self.application_storage_paths = paths;
+        self
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn with_stateless_preview(
+        mut self,
+        binding: Option<crate::protocol::public_operations::PreviewLifecycleBinding>,
+    ) -> Self {
+        self.preview_binding = binding;
         self
     }
 
@@ -236,11 +249,36 @@ impl InitializationService {
             .provisioning
             .clone()
             .filter(|provisioning| provisioning.scale_up().is_some());
-        match SqliteStore::create_authorized(&self.database_path, state) {
+        #[cfg(feature = "testing")]
+        let create = match self.preview_binding.clone() {
+            Some(binding) => {
+                SqliteStore::create_preview_bound_authorized(&self.database_path, state, binding)
+            }
+            None => SqliteStore::create_authorized(&self.database_path, state),
+        };
+        #[cfg(not(feature = "testing"))]
+        let create = SqliteStore::create_authorized(&self.database_path, state);
+        match create {
             Ok(store) => drop(store),
             Err(crate::host::HostError::Io(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
             {
+                #[cfg(feature = "testing")]
+                match self.preview_binding.as_ref() {
+                    Some(binding) => {
+                        SqliteStore::open_preview_bound_existing(
+                            &self.database_path,
+                            Some(&identity),
+                            binding,
+                        )
+                        .map_err(status_from_agent)?;
+                    }
+                    None => {
+                        SqliteStore::open_existing(&self.database_path, Some(&identity))
+                            .map_err(status_from_agent)?;
+                    }
+                }
+                #[cfg(not(feature = "testing"))]
                 SqliteStore::open_existing(&self.database_path, Some(&identity))
                     .map_err(status_from_agent)?;
             }
@@ -265,6 +303,8 @@ impl Clone for InitializationService {
             initialized: self.initialized.clone(),
             fresh_application_state: self.fresh_application_state,
             application_storage_paths: self.application_storage_paths.clone(),
+            #[cfg(feature = "testing")]
+            preview_binding: self.preview_binding.clone(),
         }
     }
 }
@@ -559,10 +599,38 @@ where
             .await
     }
 
+    #[cfg(feature = "testing")]
+    pub(crate) async fn serve_control_only(
+        self,
+        control_address: SocketAddr,
+        ready: watch::Sender<bool>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let control_listener = TcpListener::bind(control_address).await?;
+        self.serve_with_optional_replication_listener(control_listener, None, ready, shutdown)
+            .await
+    }
+
     pub(crate) async fn serve_with_listeners(
         self,
         control_listener: TcpListener,
         replication_listener: TcpListener,
+        ready: watch::Sender<bool>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.serve_with_optional_replication_listener(
+            control_listener,
+            Some(replication_listener),
+            ready,
+            shutdown,
+        )
+        .await
+    }
+
+    async fn serve_with_optional_replication_listener(
+        self,
+        control_listener: TcpListener,
+        replication_listener: Option<TcpListener>,
         ready: watch::Sender<bool>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
@@ -594,17 +662,25 @@ where
                 .await
         });
         let mut replication = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(proto::replication_data_server::ReplicationDataServer::new(
-                    replication_service,
-                ))
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(replication_listener),
-                    async move {
-                        wait_for_shutdown(&mut replication_shutdown).await;
-                    },
-                )
-                .await
+            match replication_listener {
+                Some(replication_listener) => {
+                    tonic::transport::Server::builder()
+                        .add_service(proto::replication_data_server::ReplicationDataServer::new(
+                            replication_service,
+                        ))
+                        .serve_with_incoming_shutdown(
+                            TcpListenerStream::new(replication_listener),
+                            async move {
+                                wait_for_shutdown(&mut replication_shutdown).await;
+                            },
+                        )
+                        .await
+                }
+                None => {
+                    wait_for_shutdown(&mut replication_shutdown).await;
+                    Ok(())
+                }
+            }
         });
 
         let startup_result = {

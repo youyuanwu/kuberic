@@ -3,6 +3,8 @@ pub(crate) mod copy;
 mod queue;
 pub(crate) mod quorum;
 pub(crate) mod sender;
+#[cfg(feature = "testing")]
+pub mod stateless;
 pub mod stream;
 
 pub(crate) mod log;
@@ -31,6 +33,8 @@ use crate::authority::{
 };
 use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
+#[cfg(feature = "testing")]
+use crate::protocol::public_operations::PreviewLifecycleBinding;
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
@@ -513,6 +517,42 @@ pub struct ReplicatorInterfaces {
     creation: Arc<ReplicatorCreation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum ReplicatorEngineSelection {
+    #[default]
+    LegacyManaged,
+    #[cfg(feature = "testing")]
+    StatelessPreview {
+        binding: PreviewLifecycleBinding,
+        replication_address: std::net::SocketAddr,
+    },
+}
+
+impl ReplicatorEngineSelection {
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self, Self::LegacyManaged)
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_binding(&self) -> Option<&PreviewLifecycleBinding> {
+        match self {
+            Self::LegacyManaged => None,
+            Self::StatelessPreview { binding, .. } => Some(binding),
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_replication_address(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::LegacyManaged => None,
+            Self::StatelessPreview {
+                replication_address,
+                ..
+            } => Some(*replication_address),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicatorCapabilities {
     pub catch_up_specific_quorum: bool,
@@ -719,6 +759,7 @@ pub(crate) struct ReplicatorAttachment {
     creation: Arc<ReplicatorCreation>,
     replicator: Arc<dyn Replicator>,
     primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+    has_provider_writer: bool,
 }
 
 #[doc(hidden)]
@@ -764,6 +805,10 @@ impl ReplicatorAttachment {
 
     pub(crate) fn capabilities(&self, _token: RuntimeHostToken) -> ReplicatorCapabilities {
         self.creation.capabilities
+    }
+
+    pub(crate) fn has_provider_writer(&self, _token: RuntimeHostToken) -> bool {
+        self.has_provider_writer
     }
 
     fn disarm(&self) {
@@ -926,6 +971,7 @@ impl ReplicatorInterfaces {
             creation: self.creation.clone(),
             replicator: self.replicator(),
             primary_replicator: self.primary_replicator(),
+            has_provider_writer: self.state_replicator.is_some(),
         })
     }
 
@@ -947,6 +993,7 @@ pub struct ReplicatorFactoryContext {
     access: Arc<dyn PartitionAccessView>,
     reservation: Option<ReplicatorCreationReservation>,
     pub(crate) default_dependencies: Option<DefaultReplicatorDependencies>,
+    pub(crate) engine_selection: ReplicatorEngineSelection,
 }
 
 impl ReplicatorFactoryContext {
@@ -957,13 +1004,15 @@ impl ReplicatorFactoryContext {
         process_session_id: ProcessSessionId,
         access: Arc<dyn PartitionAccessView>,
         default_dependencies: DefaultReplicatorDependencies,
+        engine_selection: ReplicatorEngineSelection,
     ) -> Self {
         Self {
             identity,
             process_session_id,
             access,
             reservation: None,
-            default_dependencies: Some(default_dependencies),
+            default_dependencies: engine_selection.is_legacy().then_some(default_dependencies),
+            engine_selection,
         }
     }
 
@@ -1008,6 +1057,26 @@ impl ReplicatorFactoryContext {
         self.reservation
             .map(|reservation| reservation.identity(RuntimeHostToken::new()))
             .ok_or_else(|| RuntimeError::Application("replicator creation is not reserved".into()))
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_binding(&self) -> Result<&PreviewLifecycleBinding> {
+        self.engine_selection.preview_binding().ok_or_else(|| {
+            RuntimeError::Application(
+                "stateless preview factory requires preview process selection".into(),
+            )
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_replication_address(&self) -> Result<std::net::SocketAddr> {
+        self.engine_selection
+            .preview_replication_address()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "stateless preview factory requires a preview listener selection".into(),
+                )
+            })
     }
 }
 
@@ -1191,6 +1260,11 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
+        if !context.engine_selection.is_legacy() || settings.public_v1 {
+            return Err(RuntimeError::Application(
+                "managed default factory requires legacy process and bundle selection".into(),
+            ));
+        }
         let state_provider = state_provider.ok_or_else(|| {
             RuntimeError::Application("the default replicator requires a state provider".into())
         })?;

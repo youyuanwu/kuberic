@@ -1615,6 +1615,22 @@ fn managed_replica_runtime_boundary_is_typed() {
     .unwrap();
     validate_replicator_tree(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/replicator"))
         .unwrap();
+    let stateless = source("src/replicator/stateless/mod.rs");
+    for forbidden in [
+        "ManagedReplicatorLifecycle",
+        "ManagedReplicatorDataPlane",
+        "ReplicatorInterfaces::managed_primary",
+        "ManagedReplicaStore",
+        "ReplicationProgressStore",
+        "LocalWriteJournal",
+        "BuildAuthorityStore",
+        "BuildProgressStore",
+    ] {
+        assert!(
+            !stateless.contains(forbidden),
+            "stateless preview attached forbidden managed capability {forbidden}"
+        );
+    }
 
     let leaked_trait = replicator.replace(
         "configuration: ManagedReplicaConfiguration",
