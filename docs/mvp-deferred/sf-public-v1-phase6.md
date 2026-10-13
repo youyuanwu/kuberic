@@ -39,3 +39,10 @@
 - MVP alternative: Keep state providers authoritative for application bytes, progress and retained history.
 - Revisit when: A separately selected consumer requires the V2 transactional contract after the public-only V1 replacement is stable.
 - Evidence: `docs/features/kuberic/service-fabric-alignment.md` places optional V2 after the public-only V1 replacement.
+
+### P6D-06: Eagerly reap completed transport task handles
+- Status: DEFERRED
+- Reason: The dormant preview retains completed inbound RPC abort handles until Close or Abort. Existing lifecycle shutdown drains them, and Phase 6 tests have bounded lifetimes; changing active-task bookkeeping is not required for the accepted correctness outcome.
+- MVP alternative: Retain complete Close/Abort drainage and bounded preview test lifetimes.
+- Revisit when: Before Phase 7 production activation, or earlier if a sustained many-write soak demonstrates material process-memory growth.
+- Evidence: Final review finding ASTRA-11 identified cumulative completed-handle retention as resource hygiene rather than a Phase 6 correctness blocker.
