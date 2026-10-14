@@ -50,6 +50,15 @@ pub trait PublicV1OperationApi: Send + Sync {
         Err("public-v1 topology persistence is unsupported".into())
     }
 
+    async fn persist_public_v1_primary_unavailable(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &ConfigurationId,
+        _unavailable: Option<(kuberic_runtime::protocol::types::ReplicaId, i64)>,
+    ) -> Result<(), String> {
+        Err("public-v1 primary availability persistence is unsupported".into())
+    }
+
     async fn begin_public_v1_operation(
         &self,
         _scope: &PublicV1Scope,
@@ -58,6 +67,15 @@ pub trait PublicV1OperationApi: Send + Sync {
         _command: &kuberic_runtime::protocol::command::PublicV1OperationCommand,
     ) -> Result<(), String> {
         Err("public-v1 operation origination is unsupported".into())
+    }
+
+    async fn contain_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &PublicV1AcceptedTransitionStatus,
+        _command: &kuberic_runtime::protocol::command::ProtocolCommand,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     async fn observe_public_v1_operation(
@@ -901,7 +919,7 @@ impl PublicV1HistoryApi for HostedPublicV1Harness {
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            PublicV1HistoryCommand::SessionRenewal(_) => {
+            PublicV1HistoryCommand::SessionRenewal { .. } => {
                 return Err("session-renewal command used the history API".into());
             }
         }
@@ -950,7 +968,9 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Harness {
         let ProtocolCommand::PublicV1History(public_command) = command else {
             return Err("hosted session renewal received another command".into());
         };
-        let PublicV1HistoryCommand::SessionRenewal(renewal_command) = public_command.as_ref()
+        let PublicV1HistoryCommand::SessionRenewal {
+            command: renewal_command,
+        } = public_command.as_ref()
         else {
             return Err("hosted session renewal received a history command".into());
         };

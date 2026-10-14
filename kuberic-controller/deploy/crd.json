@@ -270,6 +270,128 @@
                         "format": "int64",
                         "minimum": 1.0,
                         "type": "integer"
+                      },
+                      "sessions": {
+                        "items": {
+                          "properties": {
+                            "identity": {
+                              "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                              "properties": {
+                                "agentGeneration": {
+                                  "type": "string"
+                                },
+                                "instanceId": {
+                                  "type": "string"
+                                },
+                                "replicaId": {
+                                  "format": "int64",
+                                  "minimum": 1.0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "agentGeneration",
+                                "instanceId",
+                                "replicaId"
+                              ],
+                              "type": "object"
+                            },
+                            "processSessionId": {
+                              "type": "string"
+                            },
+                            "replicatorCreationId": {
+                              "type": "string"
+                            },
+                            "role": {
+                              "description": "Runtime role of one exact replica incarnation.",
+                              "enum": [
+                                "primary",
+                                "activeSecondary",
+                                "idleSecondary",
+                                "none"
+                              ],
+                              "type": "string"
+                            },
+                            "storageIncarnation": {
+                              "properties": {
+                                "replica": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "minimum": 1.0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId"
+                                  ],
+                                  "type": "object"
+                                },
+                                "storage": {
+                                  "properties": {
+                                    "identity": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "kind": {
+                                      "type": "string"
+                                    },
+                                    "podUid": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "pvcUid": {
+                                      "nullable": true,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "type": "object"
+                                },
+                                "storageGeneration": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "replica",
+                                "storage",
+                                "storageGeneration"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "identity",
+                            "processSessionId",
+                            "replicatorCreationId",
+                            "role",
+                            "storageIncarnation"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "unavailablePrimaryId": {
+                        "format": "int64",
+                        "minimum": 1.0,
+                        "nullable": true,
+                        "type": "integer"
+                      },
+                      "unavailableSinceUnixSeconds": {
+                        "format": "int64",
+                        "nullable": true,
+                        "type": "integer"
                       }
                     },
                     "required": [
@@ -277,7 +399,8 @@
                       "configurationId",
                       "epoch",
                       "memberCount",
-                      "primaryId"
+                      "primaryId",
+                      "sessions"
                     ],
                     "type": "object"
                   },

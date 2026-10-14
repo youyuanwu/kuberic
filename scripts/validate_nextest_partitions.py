@@ -9,6 +9,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -254,6 +256,39 @@ def validate_kind_contract(root: Path) -> None:
         for scenario in arguments.split():
             if scenario not in scenarios | {"all"}:
                 raise ValueError(f"CI invokes unsupported KinD scenario: {scenario}")
+    config = tomllib.loads((root / ".config/nextest.toml").read_text())
+    validate_timeout_profiles(config)
+    mutated = deepcopy(config)
+    mutated["profile"]["ci"]["slow-timeout"]["period"] = "300s"
+    try:
+        validate_timeout_profiles(mutated)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("timeout validator accepted an inherited 300-second mutation")
+
+
+def validate_timeout_profiles(config: dict) -> None:
+    profiles = config.get("profile", {})
+    for name in ["default", "ci", "ordinary", "build-only", "postgres", "kind", "dex-live"]:
+        current = profiles.get(name, {})
+        seen: set[str] = set()
+        while "slow-timeout" not in current:
+            inherited = current.get("inherits")
+            if not inherited or inherited in seen:
+                raise ValueError(f"profile {name} has no terminating timeout")
+            seen.add(inherited)
+            current = profiles.get(inherited, {})
+        timeout = current["slow-timeout"]
+        period = timeout.get("period", "")
+        match = re.fullmatch(r"(\d+)(s|m)", period)
+        if match is None:
+            raise ValueError(f"profile {name} has an unsupported timeout: {period}")
+        seconds = int(match.group(1)) * (60 if match.group(2) == "m" else 1)
+        if seconds > 270 or timeout.get("terminate-after") != 1:
+            raise ValueError(
+                f"profile {name} timeout must terminate once within 270 seconds"
+            )
 
 
 def main() -> int:

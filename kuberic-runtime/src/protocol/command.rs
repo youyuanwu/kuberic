@@ -182,7 +182,9 @@ pub enum PublicV1HistoryCommand {
     RevokeInboundBuildAuthority {
         authority: Box<PublicInboundBuildAuthority>,
     },
-    SessionRenewal(Box<PublicV1SessionRenewalCommand>),
+    SessionRenewal {
+        command: Box<PublicV1SessionRenewalCommand>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,7 +347,7 @@ impl PublicV1HistoryCommand {
             }
             Self::InstallInboundBuildAuthority { authority }
             | Self::RevokeInboundBuildAuthority { authority } => authority.validate()?,
-            Self::SessionRenewal(command) => command.validate()?,
+            Self::SessionRenewal { command } => command.validate()?,
         }
         Ok(())
     }
@@ -355,7 +357,7 @@ impl PublicV1HistoryCommand {
             Self::Initialize { accepted, .. } | Self::Recover { accepted, .. } => Some(accepted),
             Self::InstallInboundBuildAuthority { .. }
             | Self::RevokeInboundBuildAuthority { .. } => None,
-            Self::SessionRenewal(_) => None,
+            Self::SessionRenewal { .. } => None,
         }
     }
 
@@ -372,7 +374,7 @@ impl PublicV1HistoryCommand {
             }
             Self::InstallInboundBuildAuthority { authority }
             | Self::RevokeInboundBuildAuthority { authority } => &authority.attempt.target,
-            Self::SessionRenewal(command) => command.target(),
+            Self::SessionRenewal { command } => command.target(),
         }
     }
 
@@ -383,7 +385,7 @@ impl PublicV1HistoryCommand {
             }
             Self::InstallInboundBuildAuthority { authority }
             | Self::RevokeInboundBuildAuthority { authority } => &authority.history.resource_uid,
-            Self::SessionRenewal(command) => &command.accepted().required.resource_uid,
+            Self::SessionRenewal { command } => &command.accepted().required.resource_uid,
         }
     }
 
@@ -405,7 +407,7 @@ impl PublicV1HistoryCommand {
             Self::Recover { .. }
             | Self::InstallInboundBuildAuthority { .. }
             | Self::RevokeInboundBuildAuthority { .. }
-            | Self::SessionRenewal(_) => None,
+            | Self::SessionRenewal { .. } => None,
         }
     }
 }

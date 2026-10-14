@@ -342,6 +342,7 @@ pub fn normalize_public_v1_agent_status_report(
         resource_uid: ResourceUid::new(public.resource_uid),
         replica: identity,
         process_session_id: ProcessSessionId::new(public.process_session_id),
+        replicator_creation_id: ReplicatorCreationId::new(public.replicator_creation_id),
         report_sequence: public.report_sequence,
         role,
         read_status,
@@ -367,6 +368,10 @@ pub fn normalize_public_v1_agent_status_report(
 /// Encodes only the structurally public protocol-11 branch. All legacy/native
 /// fields in the outer envelope remain at their protobuf defaults.
 pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::AgentStatusReport {
+    debug_assert_eq!(
+        crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_REGISTRATIONS,
+        &["PUBLIC_V1_PROTOCOL_VERSION"]
+    );
     proto::AgentStatusReport {
         protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
         public_v1: Some(proto::PublicV1AgentStatus {
@@ -375,6 +380,7 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
             resource_uid: report.resource_uid.as_str().to_string(),
             identity: Some(report.replica.clone().into()),
             process_session_id: report.process_session_id.as_str().to_string(),
+            replicator_creation_id: report.replicator_creation_id.as_str().to_string(),
             report_sequence: report.report_sequence,
             role: role_to_proto(report.role) as i32,
             read_status: access_status_to_proto(report.read_status) as i32,

@@ -123,9 +123,9 @@ where
             else {
                 return Err("public-v1 session-renewal executor received another command".into());
             };
-            let kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal(
-                renewal_command,
-            ) = public_command.as_ref()
+            let kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal {
+                command: renewal_command,
+            } = public_command.as_ref()
             else {
                 return Err("public-v1 session-renewal executor received a history command".into());
             };

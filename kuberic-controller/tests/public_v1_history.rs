@@ -109,6 +109,7 @@ fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
         resource_uid: resource_uid.clone(),
         replica: storage.replica.clone(),
         process_session_id: ProcessSessionId::new("session-1"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-1"),
         report_sequence: 1,
         role: ReplicaRole::Primary,
         read_status: AccessStatus::Granted,
@@ -214,6 +215,7 @@ fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() 
         resource_uid,
         replica: storage.replica.clone(),
         process_session_id: ProcessSessionId::new("session-1"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-1"),
         report_sequence: 2,
         role: ReplicaRole::Primary,
         read_status: AccessStatus::NotPrimary,
@@ -289,6 +291,10 @@ fn public_v1_all_survivor_election_requires_history_and_storage_admission() {
         replica: storage.replica.clone(),
         process_session_id: ProcessSessionId::new(format!(
             "session-{}",
+            storage.replica.replica_id.value()
+        )),
+        replicator_creation_id: ReplicatorCreationId::new(format!(
+            "creation-{}",
             storage.replica.replica_id.value()
         )),
         report_sequence: 1,
@@ -724,6 +730,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         resource_uid: resource_uid.clone(),
         replica: authorization.provisional_primary.replica.clone(),
         process_session_id: successor_attempt.process.process_session_id.clone(),
+        replicator_creation_id: successor_attempt.process.replicator_creation_id.clone(),
         report_sequence: 1,
         role: ReplicaRole::ActiveSecondary,
         read_status: AccessStatus::NotPrimary,

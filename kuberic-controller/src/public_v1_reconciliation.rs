@@ -59,7 +59,7 @@ where
         }
     }
     if let Err(dispatch_error) =
-        crate::executor::execute_public_v1_operation(api, scope, &expected, command).await
+        crate::executor::execute_public_v1_operation(api, scope, &expected, command.clone()).await
     {
         if let Ok(report) = api
             .observe_public_v1_operation_report(scope, &expected)
@@ -70,6 +70,8 @@ where
                 return Ok(outcome);
             }
         }
+        api.contain_public_v1_operation(scope, &expected, &command)
+            .await?;
         return Err(dispatch_error);
     }
     let report = api

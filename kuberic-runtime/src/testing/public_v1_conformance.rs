@@ -131,18 +131,13 @@ struct Gate {
 
 const PUBLIC_LIFECYCLE: &str = include_str!("../host/public_lifecycle.rs");
 const REPLICATOR: &str = include_str!("../replicator/mod.rs");
-const HOSTING: &str = include_str!("../host/hosting.rs");
 const HOST_PROCESS: &str = include_str!("../host/process.rs");
-const HOST_SERVICE: &str = include_str!("../host/service.rs");
-const SQLITE_STORE: &str = include_str!("../host/sqlite_store.rs");
-const STATELESS: &str = include_str!("../replicator/stateless/mod.rs");
-const CONTROL_CONVERT: &str = include_str!("../control/convert.rs");
 const PUBLIC_OPERATIONS: &str = include_str!("../protocol/public_operations.rs");
 const HOST_OPERATION: &str = include_str!("../host/operation.rs");
 const HOST_LIFECYCLE_PROGRAM: &str = include_str!("../host/public_lifecycle_program.rs");
-const CONTROLLER_LIB: &str = include_str!("../../../kuberic-controller/src/lib.rs");
-const CONTROLLER_EVALUATOR: &str = include_str!("../../../kuberic-controller/src/evaluator.rs");
-const CONTROLLER_CLUSTER_API: &str = include_str!("../../../kuberic-controller/src/cluster_api.rs");
+mod controller_registration {
+    include!("../../../kuberic-controller/src/public_v1_registration.rs");
+}
 
 fn contract_gate() {}
 
@@ -159,40 +154,36 @@ pub struct ReplacementOwnershipInventory {
 }
 
 struct ProductionSources<'a> {
-    replicator: &'a str,
-    stateless: &'a str,
-    hosting: &'a str,
-    process: &'a str,
-    service: &'a str,
-    sqlite_store: &'a str,
-    control_convert: &'a str,
     public_operations: &'a str,
     host_operation: &'a str,
     host_lifecycle_program: &'a str,
-    controller_lib: &'a str,
-    controller_evaluator: &'a str,
-    controller_cluster_api: &'a str,
+    controller_modules: &'a [&'a str],
     control_services: &'a [&'a str],
     data_services: &'a [&'a str],
+    factories: &'a [&'a str],
+    host_attachments: &'a [&'a str],
+    report_branches: &'a [&'a str],
+    store_tables: &'a [&'a str],
+    service_startup_owners: &'a [&'a str],
+    process_startup_owners: &'a [&'a str],
+    protocol_versions: &'a [&'a str],
 }
 
 fn production_sources() -> ProductionSources<'static> {
     ProductionSources {
-        replicator: REPLICATOR,
-        stateless: STATELESS,
-        hosting: HOSTING,
-        process: HOST_PROCESS,
-        service: HOST_SERVICE,
-        sqlite_store: SQLITE_STORE,
-        control_convert: CONTROL_CONVERT,
         public_operations: PUBLIC_OPERATIONS,
         host_operation: HOST_OPERATION,
         host_lifecycle_program: HOST_LIFECYCLE_PROGRAM,
-        controller_lib: CONTROLLER_LIB,
-        controller_evaluator: CONTROLLER_EVALUATOR,
-        controller_cluster_api: CONTROLLER_CLUSTER_API,
+        controller_modules: controller_registration::PUBLIC_V1_CONTROLLER_MODULES,
         control_services: crate::host::service::PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS,
         data_services: crate::replicator::stateless::PUBLIC_V1_DATA_SERVICE_REGISTRATIONS,
+        factories: crate::replicator::PUBLIC_V1_FACTORY_REGISTRATIONS,
+        host_attachments: crate::host::hosting::PUBLIC_V1_HOST_ATTACHMENTS,
+        report_branches: crate::host::service::PUBLIC_V1_AGENT_REPORT_BRANCHES,
+        store_tables: crate::host::sqlite_store::PUBLIC_V1_AGENT_TABLES,
+        service_startup_owners: crate::host::service::PUBLIC_V1_SERVICE_STARTUP_OWNERS,
+        process_startup_owners: crate::host::PUBLIC_V1_PROCESS_STARTUP_OWNERS,
+        protocol_versions: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_REGISTRATIONS,
     }
 }
 
@@ -202,88 +193,12 @@ fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
-fn discover_after(source: &str, marker: &str, end: impl Fn(char) -> bool) -> Vec<String> {
-    source
-        .match_indices(marker)
-        .filter_map(|(offset, _)| {
-            let value = &source[offset + marker.len()..];
-            let end = value.find(&end).unwrap_or(value.len());
-            let value = value[..end].trim();
-            (!value.is_empty()).then(|| value.rsplit("::").next().unwrap().to_string())
-        })
-        .collect()
-}
-
-fn struct_body<'a>(source: &'a str, declaration: &str) -> Option<&'a str> {
-    let start = source.find(declaration)?;
-    let open = source[start..].find('{')? + start;
-    let mut depth = 0_u32;
-    for (offset, character) in source[open..].char_indices() {
-        match character {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&source[open + 1..open + offset]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn discover_attachments(source: &str) -> Vec<String> {
-    let body = struct_body(source, "struct RegisteredReplicator")
-        .expect("production RegisteredReplicator registration surface exists");
-    sorted_unique(discover_after(body, "Arc<dyn ", |character| {
-        !character.is_ascii_alphanumeric() && character != '_' && character != ':'
-    }))
-}
-
-fn discover_report_branches(source: &str) -> Vec<String> {
-    let body = struct_body(source, "    proto::AgentStatusReport {")
-        .expect("production agent report construction exists");
-    let mut depth = 0_i32;
-    let mut branches = Vec::new();
-    for line in body.lines() {
-        if depth == 0
-            && let Some((field, value)) = line.trim().split_once(':')
-            && value.trim_start().starts_with("Some(")
-        {
-            branches.push(field.trim().to_string());
-        }
-        depth += line.chars().filter(|character| *character == '{').count() as i32;
-        depth -= line.chars().filter(|character| *character == '}').count() as i32;
-    }
-    sorted_unique(branches)
-}
-
-fn discover_before(source: &str, marker: &str) -> Vec<String> {
-    source
-        .match_indices(marker)
-        .filter_map(|(offset, _)| {
-            let prefix = &source[..offset];
-            let start = prefix
-                .rfind(|character: char| {
-                    !character.is_ascii_alphanumeric() && character != '_' && character != ':'
-                })
-                .map_or(0, |index| index + 1);
-            let value = prefix[start..].trim();
-            (!value.is_empty()).then(|| value.rsplit("::").next().unwrap().to_string())
-        })
-        .collect()
-}
-
 fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipInventory {
     let factories = sorted_unique(
-        [sources.replicator, sources.stateless]
-            .into_iter()
-            .flat_map(|source| {
-                discover_after(source, "impl ReplicatorFactory for ", |character| {
-                    character.is_whitespace() || character == '{'
-                })
-            })
+        sources
+            .factories
+            .iter()
+            .map(|name| (*name).to_string())
             .collect(),
     );
     let services = sorted_unique(
@@ -294,38 +209,46 @@ fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipIn
             .map(|name| (*name).to_string())
             .collect(),
     );
-    let store_tables = sorted_unique(discover_after(
-        sources.sqlite_store,
-        "CREATE TABLE ",
-        |character| !character.is_ascii_alphanumeric() && character != '_',
-    ));
-    let mut startup_owners = discover_before(sources.service, "::start(");
-    if sources.process.contains(".serve_control_only(") {
-        startup_owners.push("serve_control_only".into());
-    }
-    let protocol_versions = discover_after(sources.public_operations, "pub const ", |character| {
-        !character.is_ascii_alphanumeric() && character != '_'
-    })
-    .into_iter()
-    .filter(|name| name.ends_with("_PROTOCOL_VERSION"))
-    .collect();
-    let controller_modules = [
-        sources.controller_lib,
-        sources.controller_evaluator,
-        sources.controller_cluster_api,
-    ]
-    .into_iter()
-    .flat_map(|source| {
-        discover_after(source, "mod ", |character| {
-            !character.is_ascii_alphanumeric() && character != '_'
-        })
-    })
-    .collect();
+    let store_tables = sorted_unique(
+        sources
+            .store_tables
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+    );
+    let startup_owners = sources
+        .service_startup_owners
+        .iter()
+        .chain(sources.process_startup_owners.iter())
+        .map(|name| (*name).to_string())
+        .collect();
+    let protocol_versions = sources
+        .protocol_versions
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let controller_modules = sources
+        .controller_modules
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
     ReplacementOwnershipInventory {
         factories,
         services,
-        host_attachments: discover_attachments(sources.hosting),
-        report_branches: discover_report_branches(sources.control_convert),
+        host_attachments: sorted_unique(
+            sources
+                .host_attachments
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        ),
+        report_branches: sorted_unique(
+            sources
+                .report_branches
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        ),
         store_tables,
         startup_owners: sorted_unique(startup_owners),
         protocol_versions: sorted_unique(protocol_versions),
@@ -352,19 +275,19 @@ pub fn replacement_ownership_inventory_with_extra_endpoint_fixture() -> Replacem
 
 pub fn replacement_ownership_inventory_with_alternate_protocol_fixture()
 -> ReplacementOwnershipInventory {
-    let public_operations =
-        format!("{PUBLIC_OPERATIONS}\npub const ALTERNATE_PROTOCOL_VERSION: u32 = 10;");
+    let protocol_versions = ["PUBLIC_V1_PROTOCOL_VERSION", "ALTERNATE_PROTOCOL_VERSION"];
     discover_inventory(&ProductionSources {
-        public_operations: &public_operations,
+        protocol_versions: &protocol_versions,
         ..production_sources()
     })
 }
 
 pub fn replacement_ownership_inventory_with_alternate_controller_fixture()
 -> ReplacementOwnershipInventory {
-    let controller_lib = format!("{CONTROLLER_LIB}\npub mod alternate_controller_owner;");
+    let mut controller_modules = controller_registration::PUBLIC_V1_CONTROLLER_MODULES.to_vec();
+    controller_modules.push("alternate_controller_owner");
     discover_inventory(&ProductionSources {
-        controller_lib: &controller_lib,
+        controller_modules: &controller_modules,
         ..production_sources()
     })
 }
@@ -470,9 +393,6 @@ fn sources_contain_alternate_protocol(sources: &ProductionSources<'_>) -> bool {
         sources.public_operations,
         sources.host_operation,
         sources.host_lifecycle_program,
-        sources.controller_lib,
-        sources.controller_evaluator,
-        sources.controller_cluster_api,
     ]
     .into_iter()
     .any(|source| {

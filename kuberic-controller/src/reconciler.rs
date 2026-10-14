@@ -11,7 +11,7 @@ use crate::cluster_api::{ProductionClusterApi, PublicV1Scope};
 use crate::evaluator::public_v1_history::{
     PublicV1HistoryPlan, plan_bootstrap_history, plan_recovery_report,
 };
-use crate::evaluator::public_v1_session_renewal::plan_session_renewal;
+use crate::evaluator::public_v1_session_renewal::{accept_session_renewal, plan_session_renewal};
 use crate::evaluator::public_v1_topology::{
     PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
 };
@@ -19,10 +19,14 @@ use crate::executor::ExecutionKind;
 use crate::observation::RawAgentObservation;
 use crate::{ControllerError, Result};
 use kuberic_runtime::protocol::command::{InitializeAgentStore, ProtocolCommand};
+use kuberic_runtime::protocol::public_operations::{
+    ProcessSessionRenewalRequired, PublicSessionRenewalStage, PublicV1AcceptedStatus,
+    PublicV1AgentReport,
+};
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, PodUid, PvcUid,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, derive_agent_generation,
-    derive_initialization_id,
+    ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid,
+    ProcessSessionEndpoint, ProcessSessionRenewalReason, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, derive_agent_generation, derive_initialization_id,
 };
 
 pub struct Reconciler {
@@ -40,10 +44,17 @@ async fn cleanup_stale_scaffolding(
         return Ok(false);
     };
     if let Some(pod) = raw.pods.iter().find(|pod| {
-        pod.labels()
+        let replica_id = pod
+            .labels()
             .get(crate::crd::REPLICA_ID_LABEL)
             .and_then(|value| value.parse::<i64>().ok())
-            .is_some_and(|replica_id| replica_id > i64::from(raw.set.spec.replicas))
+            .filter(|replica_id| *replica_id > i64::from(raw.set.spec.replicas));
+        replica_id.is_some_and(|replica_id| {
+            !current
+                .members
+                .iter()
+                .any(|member| member.identity.replica_id.value() == replica_id)
+        })
     }) {
         let pod_uid = pod.uid().map(PodUid::new);
         let replica_id = pod
@@ -68,6 +79,7 @@ async fn cleanup_stale_scaffolding(
         .await?;
         return Ok(true);
     }
+
     for member in &current.members {
         let canonical_pvc_name = format!(
             "{}-{}-data",
@@ -98,6 +110,106 @@ async fn cleanup_stale_scaffolding(
         }
     }
     Ok(false)
+}
+
+fn required_session_renewal(
+    topology: &crate::crd::PublicV1TopologyState,
+    accepted: &PublicV1AcceptedStatus,
+    reports: &[PublicV1AgentReport],
+) -> Result<Option<(ProcessSessionRenewalRequired, PublicV1AgentReport)>> {
+    let configuration = topology
+        .configuration()
+        .map_err(ControllerError::InvalidAgentEvidence)?;
+    for predecessor in &topology.sessions {
+        let Some(replacement_report) = reports.iter().find(|report| {
+            report.replica == predecessor.identity
+                && report.storage_incarnation == predecessor.storage_incarnation
+                && (report.process_session_id != predecessor.process_session_id
+                    || report.replicator_creation_id != predecessor.replicator_creation_id)
+        }) else {
+            continue;
+        };
+        let mut surviving_sessions = Vec::with_capacity(topology.sessions.len().saturating_sub(1));
+        for survivor in topology
+            .sessions
+            .iter()
+            .filter(|session| session.identity != predecessor.identity)
+        {
+            let Some(report) = reports.iter().find(|report| {
+                report.replica == survivor.identity
+                    && report.storage_incarnation == survivor.storage_incarnation
+                    && report.process_session_id == survivor.process_session_id
+                    && report.replicator_creation_id == survivor.replicator_creation_id
+                    && report.role == survivor.role
+            }) else {
+                return Ok(None);
+            };
+            surviving_sessions.push(ProcessSessionEndpoint {
+                identity: report.replica.clone(),
+                storage_incarnation: report.storage_incarnation.clone(),
+                process_session_id: report.process_session_id.clone(),
+                replicator_creation_id: report.replicator_creation_id.clone(),
+                role: report.role,
+            });
+        }
+        let renewal_epoch = Epoch::new(
+            configuration.epoch.data_loss_number,
+            configuration
+                .epoch
+                .configuration_number
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ControllerError::InvalidAgentEvidence(
+                        "public-v1 session-renewal epoch overflow".into(),
+                    )
+                })?,
+        );
+        let fresh_configuration = ConfigurationDescriptor::new(
+            renewal_epoch,
+            configuration.primary_id,
+            configuration.members.clone(),
+            configuration.write_quorum,
+        );
+        let replacement = ProcessSessionEndpoint {
+            identity: replacement_report.replica.clone(),
+            storage_incarnation: replacement_report.storage_incarnation.clone(),
+            process_session_id: replacement_report.process_session_id.clone(),
+            replicator_creation_id: replacement_report.replicator_creation_id.clone(),
+            role: ReplicaRole::None,
+        };
+        let reason = match predecessor.role {
+            ReplicaRole::Primary => ProcessSessionRenewalReason::PrimaryReplacement,
+            ReplicaRole::ActiveSecondary => ProcessSessionRenewalReason::ActiveSecondaryReplacement,
+            _ => {
+                return Err(ControllerError::InvalidAgentEvidence(
+                    "public-v1 topology session is not active".into(),
+                ));
+            }
+        };
+        return Ok(Some((
+            ProcessSessionRenewalRequired {
+                operation_id: OperationId::new(format!(
+                    "session-renewal-{}-{}-{}",
+                    configuration.configuration_id,
+                    predecessor.identity.replica_id,
+                    replacement.process_session_id.as_str()
+                )),
+                reason,
+                resource_uid: accepted.history.resource_uid.clone(),
+                history: accepted.history.clone(),
+                previous_epoch: configuration.epoch,
+                renewal_epoch,
+                predecessor: predecessor.clone(),
+                replacement: Some(replacement),
+                surviving_sessions,
+                fresh_configuration,
+                predecessor_contained: true,
+                data_loss: None,
+            },
+            replacement_report.clone(),
+        )));
+    }
+    Ok(None)
 }
 
 impl Reconciler {
@@ -241,6 +353,16 @@ impl Reconciler {
             .transpose()
             .map_err(ControllerError::InvalidAgentEvidence)?
         {
+            if renewal.stage == PublicSessionRenewalStage::Authorized {
+                self.api
+                    .complete_public_v1_session_renewal(&scope, &renewal)
+                    .await
+                    .map_err(ControllerError::InvalidAgentEvidence)?;
+                return Ok(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Applied,
+                });
+            }
             let unreachable = Vec::new();
             let plan = plan_session_renewal(&renewal, &unreachable)
                 .map_err(ControllerError::InvalidAgentEvidence)?;
@@ -334,6 +456,84 @@ impl Reconciler {
             ));
         }
         let current = current_topology;
+        if let Some(topology) = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            && let Some((required, replacement_report)) =
+                required_session_renewal(topology, accepted, &reports)?
+        {
+            let plan = accept_session_renewal(None, required, Some(&replacement_report))
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            crate::executor::execute_public_v1_session_renewal(self.api.as_ref(), &scope, plan)
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Applied,
+            });
+        }
+        if let Some(configuration) = current.as_ref() {
+            let primary_present = reports
+                .iter()
+                .any(|report| report.replica.replica_id == configuration.primary_id);
+            let topology_state = raw
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_topology.as_ref())
+                .ok_or_else(|| {
+                    ControllerError::InvalidAgentEvidence(
+                        "accepted topology lacks typed state".into(),
+                    )
+                })?;
+            if !primary_present {
+                let since = match (
+                    topology_state.unavailable_primary_id,
+                    topology_state.unavailable_since_unix_seconds,
+                ) {
+                    (Some(primary), Some(since)) if primary == configuration.primary_id => since,
+                    _ => {
+                        self.api
+                            .persist_public_v1_primary_unavailable(
+                                &scope,
+                                &configuration.configuration_id,
+                                Some((configuration.primary_id, raw.now_unix_seconds)),
+                            )
+                            .await
+                            .map_err(ControllerError::InvalidAgentEvidence)?;
+                        return Ok(ReconcileAction {
+                            requeue_after: Duration::from_secs(
+                                self.evaluation.wait_requeue_seconds,
+                            ),
+                            kind: ReconcileKind::Applied,
+                        });
+                    }
+                };
+                if raw.now_unix_seconds.saturating_sub(since)
+                    < raw.set.spec.failover_delay_seconds as i64
+                {
+                    return Ok(ReconcileAction {
+                        requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
+                        kind: ReconcileKind::Waiting,
+                    });
+                }
+            } else if topology_state.unavailable_primary_id.is_some() {
+                self.api
+                    .persist_public_v1_primary_unavailable(
+                        &scope,
+                        &configuration.configuration_id,
+                        None,
+                    )
+                    .await
+                    .map_err(ControllerError::InvalidAgentEvidence)?;
+                return Ok(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Applied,
+                });
+            }
+        }
         let topology_replicas = topology_replicas(&raw, &reports)?;
         let switchover_target = raw
             .set
@@ -543,7 +743,6 @@ fn topology_replicas(
         .ok_or(ControllerError::ObservationStale)?;
     reports
         .iter()
-        .filter(|report| report.replica.replica_id.value() <= i64::from(raw.set.spec.replicas))
         .map(|report| {
             let service = raw
                 .services

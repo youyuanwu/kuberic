@@ -267,7 +267,7 @@ impl SqliteStore {
                 }
                 self.inner.revoke_public_v1_inbound_build_authority().await
             }
-            PublicV1HistoryCommand::SessionRenewal(_) => {
+            PublicV1HistoryCommand::SessionRenewal { .. } => {
                 Err(crate::host::HostError::CommandRejected(
                     "session-renewal commands require an attached public executor".into(),
                 ))
@@ -809,6 +809,10 @@ impl SqliteStore {
             self.inner.as_ref(),
             identity,
             crate::host::public_lifecycle::PublicV1ReportProjection {
+                replicator_creation_id: crate::protocol::types::ReplicatorCreationId::new(format!(
+                    "testing-{}",
+                    projection.process_session_id
+                )),
                 process_session_id: projection.process_session_id,
                 report_sequence: projection.report_sequence,
                 role: projection.role,

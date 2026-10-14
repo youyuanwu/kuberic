@@ -24,6 +24,7 @@ pub mod observation;
 #[cfg(feature = "runtime-test-bridge")]
 mod public_v1_normalize;
 mod public_v1_reconciliation;
+mod public_v1_registration;
 pub mod reconciler;
 
 pub use error::{ControllerError, Result};
@@ -66,6 +67,7 @@ struct Config {
 /// }
 /// ```
 pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    debug_assert!(public_v1_registration::PUBLIC_V1_CONTROLLER_MODULES.contains(&"reconciler"));
     tracing_subscriber::fmt::init();
     let config = Config::parse();
     validate_installation_namespace(&config.installation_namespace)?;

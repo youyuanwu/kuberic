@@ -1,4 +1,7 @@
 pub mod stateless;
+
+pub(crate) const PUBLIC_V1_FACTORY_REGISTRATIONS: &[&str] =
+    &["DefaultReplicatorFactory", "StatelessReplicatorFactory"];
 pub mod stream;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -975,6 +978,7 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
+        debug_assert_eq!(PUBLIC_V1_FACTORY_REGISTRATIONS.len(), 2);
         stateless::StatelessReplicatorFactory::new(self.storage.clone())
             .create_replicator(context, state_provider, settings)
             .await

@@ -47,6 +47,14 @@ pub trait PublicV1SessionRenewalApi: Send + Sync {
         next: &PublicV1SessionRenewalStatus,
     ) -> Result<(), String>;
 
+    async fn complete_public_v1_session_renewal(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &PublicV1SessionRenewalStatus,
+    ) -> Result<(), String> {
+        Err("public-v1 session-renewal completion is unsupported".into())
+    }
+
     async fn dispatch_public_v1_session_renewal(
         &self,
         scope: &PublicV1Scope,

@@ -215,6 +215,7 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
         resource_uid: required.resource_uid.clone(),
         replica: replacement.identity.clone(),
         process_session_id: replacement.process_session_id.clone(),
+        replicator_creation_id: replacement.replicator_creation_id.clone(),
         report_sequence: 1,
         role: ReplicaRole::None,
         read_status: AccessStatus::NotPrimary,
@@ -1534,6 +1535,59 @@ fn public_v1_replacement_schema_recovers_hot_rollback_journal() {
     let before = runtime.block_on(store.load_state()).unwrap();
     drop(store);
 
+    leave_hot_rollback_journal(
+        &path,
+        "UPDATE agent_state SET state_json = 'interrupted-current-state' WHERE singleton = 1;",
+    );
+    assert!(PathBuf::from(format!("{}-journal", path.display())).is_file());
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    assert_eq!(runtime.block_on(reopened.load_state()).unwrap(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn public_v1_partial_hot_rollback_store_rejects_without_mutation() {
+    let root = test_root("replacement_schema-partial-hot-rollback");
+    let path = SqliteStore::metadata_database_path(&root);
+    let preview = PublicV1Identity::new(42);
+    let store = SqliteStore::create_public_v1(
+        &path,
+        preview.clone(),
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource-partial-hot-rollback"),
+            pod_uid: PodUid::new("pod-partial-hot-rollback"),
+            pvc_uid: PvcUid::new("pvc-partial-hot-rollback"),
+            initialization_id: InitializationId::new("partial-hot-rollback-initialization"),
+            local_identity: replica(1),
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        },
+    )
+    .unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE agent_state SET state_json = 'committed-malformed-state' WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    leave_hot_rollback_journal(
+        &path,
+        "UPDATE agent_state SET state_json = 'interrupted-malformed-state' WHERE singleton = 1;",
+    );
+    let journal = PathBuf::from(format!("{}-journal", path.display()));
+    let main_before = std::fs::read(&path).unwrap();
+    let journal_before = std::fs::read(&journal).unwrap();
+    assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), main_before);
+    assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn leave_hot_rollback_journal(path: &std::path::Path, update: &str) {
     #[cfg(unix)]
     unsafe {
         unsafe extern "C" {
@@ -1543,26 +1597,20 @@ fn public_v1_replacement_schema_recovers_hot_rollback_journal() {
         let pid = fork();
         assert!(pid >= 0);
         if pid == 0 {
-            let connection = rusqlite::Connection::open(&path).unwrap();
+            let connection = rusqlite::Connection::open(path).unwrap();
             connection
                 .execute_batch(
                     "PRAGMA journal_mode = DELETE;
                      PRAGMA synchronous = FULL;
                      PRAGMA cache_size = 1;
-                     BEGIN IMMEDIATE;
-                     UPDATE agent_state SET state_json = 'interrupted-current-state'
-                     WHERE singleton = 1;",
+                     BEGIN IMMEDIATE;",
                 )
                 .unwrap();
+            connection.execute_batch(update).unwrap();
             std::process::abort();
         }
         let mut status = 0;
         assert_eq!(waitpid(pid, &mut status, 0), pid);
         assert_ne!(status, 0);
     }
-    assert!(PathBuf::from(format!("{}-journal", path.display())).is_file());
-
-    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
-    assert_eq!(runtime.block_on(reopened.load_state()).unwrap(), before);
-    std::fs::remove_dir_all(root).unwrap();
 }

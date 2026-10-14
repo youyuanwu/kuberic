@@ -6,7 +6,8 @@ use kuberic_runtime::protocol::public_operations::{
 };
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationId, Epoch, HistoryContext, HistoryInitializationId,
-    OperationId, ReplicaId, ReplicaIdentity, ReplicaStorageIncarnationContext, ResourceUid,
+    OperationId, ProcessSessionEndpoint, ReplicaId, ReplicaIdentity,
+    ReplicaStorageIncarnationContext, ResourceUid,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -77,12 +78,20 @@ pub struct PublicV1TopologyState {
     pub epoch: Epoch,
     pub primary_id: ReplicaId,
     pub member_count: u32,
+    pub sessions: Vec<ProcessSessionEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_primary_id: Option<ReplicaId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_since_unix_seconds: Option<i64>,
     #[schemars(length(min = 2))]
     pub canonical_configuration_json: String,
 }
 
 impl PublicV1TopologyState {
-    pub fn from_configuration(configuration: &ConfigurationDescriptor) -> Result<Self, String> {
+    pub fn from_configuration(
+        configuration: &ConfigurationDescriptor,
+        sessions: &[ProcessSessionEndpoint],
+    ) -> Result<Self, String> {
         if configuration.configuration_id != configuration.expected_id()
             || configuration.members.is_empty()
             || configuration
@@ -93,8 +102,21 @@ impl PublicV1TopologyState {
                 })
                 .count()
                 != 1
+            || sessions.len() != configuration.members.len()
+            || sessions.iter().any(|session| {
+                session.validate().is_err()
+                    || !configuration.members.iter().any(|member| {
+                        member.identity == session.identity && member.role == session.role
+                    })
+            })
+            || sessions
+                .iter()
+                .map(|session| session.identity.replica_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != sessions.len()
         {
-            return Err("invalid public-v1 topology configuration".into());
+            return Err("invalid public-v1 topology configuration or sessions".into());
         }
         Ok(Self {
             configuration_id: configuration.configuration_id.clone(),
@@ -105,6 +127,9 @@ impl PublicV1TopologyState {
                 .len()
                 .try_into()
                 .map_err(|_| "public-v1 topology member count exceeds u32".to_string())?,
+            sessions: sessions.to_vec(),
+            unavailable_primary_id: None,
+            unavailable_since_unix_seconds: None,
             canonical_configuration_json: serde_json::to_string(configuration)
                 .map_err(|error| error.to_string())?,
         })
@@ -119,10 +144,42 @@ impl PublicV1TopologyState {
             || configuration.primary_id != self.primary_id
             || configuration.members.len() != self.member_count as usize
             || configuration.configuration_id != configuration.expected_id()
+            || self.sessions.len() != configuration.members.len()
+            || self.sessions.iter().any(|session| {
+                session.validate().is_err()
+                    || !configuration.members.iter().any(|member| {
+                        member.identity == session.identity && member.role == session.role
+                    })
+            })
+            || self
+                .sessions
+                .iter()
+                .map(|session| session.identity.replica_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.sessions.len()
+            || self.unavailable_primary_id.is_some()
+                != self.unavailable_since_unix_seconds.is_some()
+            || self
+                .unavailable_primary_id
+                .is_some_and(|primary| primary != configuration.primary_id)
+            || self
+                .unavailable_since_unix_seconds
+                .is_some_and(|since| since < 0)
         {
             return Err("public-v1 topology summary differs from canonical configuration".into());
         }
         Ok(configuration)
+    }
+
+    pub fn record_primary_unavailable(&mut self, primary_id: ReplicaId, since: i64) {
+        self.unavailable_primary_id = Some(primary_id);
+        self.unavailable_since_unix_seconds = Some(since);
+    }
+
+    pub fn clear_primary_unavailable(&mut self) {
+        self.unavailable_primary_id = None;
+        self.unavailable_since_unix_seconds = None;
     }
 }
 

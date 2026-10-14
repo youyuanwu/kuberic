@@ -37,6 +37,8 @@ const AUTHORIZATION_HEADER: &str = "authorization";
 pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub(crate) const PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS: &[&str] =
     &["AgentControlServer", "ReplicaPeerServer"];
+pub(crate) const PUBLIC_V1_AGENT_REPORT_BRANCHES: &[&str] = &["public_v1"];
+pub(crate) const PUBLIC_V1_SERVICE_STARTUP_OWNERS: &[&str] = &["PartitionOperationRuntime"];
 
 pub(crate) struct InitializationService {
     observed: ObservedStorageIdentity,
@@ -166,7 +168,7 @@ impl InitializationService {
         Ok(())
     }
 
-    fn initialize(
+    async fn initialize(
         &self,
         request: proto::ExecuteCommandRequest,
     ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
@@ -231,12 +233,12 @@ impl InitializationService {
         let binding = self.binding.as_ref().ok_or_else(|| {
             Status::failed_precondition("Public V1 lifecycle binding is required")
         })?;
-        match SqliteStore::create_replacement_authorized(
+        let store = match SqliteStore::create_replacement_authorized(
             &self.database_path,
             state,
             binding.clone(),
         ) {
-            Ok(store) => drop(store),
+            Ok(store) => store,
             Err(crate::host::HostError::Io(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
             {
@@ -245,10 +247,37 @@ impl InitializationService {
                     Some(&identity),
                     binding,
                 )
-                .map_err(status_from_agent)?;
+                .map_err(status_from_agent)?
             }
             Err(error) => return Err(status_from_agent(error)),
-        }
+        };
+        let generation =
+            crate::protocol::types::PublicProtocolGeneration::new(binding.identity.generation);
+        let history_initialization_id = crate::protocol::types::derive_history_initialization_id(
+            &identity.resource_uid,
+            generation,
+        );
+        let history = crate::protocol::types::derive_bootstrap_history(
+            &identity.resource_uid,
+            generation,
+            &history_initialization_id,
+        );
+        let storage = crate::protocol::types::ReplicaStorageIncarnationContext {
+            replica: identity.local_identity.clone(),
+            storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+                pod_uid: identity.pod_uid.clone(),
+                pvc_uid: identity.pvc_uid.clone(),
+            },
+            storage_generation: crate::protocol::types::StorageGeneration::new(format!(
+                "storage-{}",
+                identity.initialization_id
+            )),
+        };
+        store
+            .initialize_public_v1_history(&history_initialization_id, &history, &storage)
+            .await
+            .map_err(status_from_agent)?;
+        drop(store);
         self.initialized.send_replace(true);
         Ok(proto::ExecuteCommandResponse {
             protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
@@ -289,7 +318,7 @@ impl proto::agent_control_server::AgentControl for InitializationService {
         request: Request<proto::ExecuteCommandRequest>,
     ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
         self.authorize(&request)?;
-        Ok(Response::new(self.initialize(request.into_inner())?))
+        Ok(Response::new(self.initialize(request.into_inner()).await?))
     }
 }
 
@@ -309,7 +338,7 @@ impl proto::replica_peer_server::ReplicaPeer for InitializationService {
         request: Request<proto::ExecuteCommandRequest>,
     ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
         self.authorize(&request)?;
-        Ok(Response::new(self.initialize(request.into_inner())?))
+        Ok(Response::new(self.initialize(request.into_inner()).await?))
     }
 }
 
@@ -572,7 +601,7 @@ where
                     .await
                     .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
             }
-            PublicV1HistoryCommand::SessionRenewal(command) => {
+            PublicV1HistoryCommand::SessionRenewal { command } => {
                 self.execute_session_renewal(*command).await
             }
         }
@@ -822,5 +851,117 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
         if shutdown.changed().await.is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::command::InitializeAgentStore;
+    use crate::protocol::public_operations::{
+        PublicV1Identity, PublicV1LifecycleBinding, StatePersistence,
+    };
+    use crate::protocol::types::{
+        ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, InitializationId,
+        PodUid, PvcUid, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+        derive_agent_generation, derive_initialization_id,
+    };
+
+    #[tokio::test]
+    async fn initialization_service_persists_bootstrap_history_before_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let resource_uid = ResourceUid::new("resource-init");
+        let pod_uid = PodUid::new("pod-init");
+        let pvc_uid = PvcUid::new("pvc-init");
+        let replica_id = ReplicaId::new(1);
+        let initialization_id =
+            derive_initialization_id(&resource_uid, replica_id, &pod_uid, &pvc_uid);
+        let local = ReplicaIdentity {
+            replica_id,
+            instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+            agent_generation: derive_agent_generation(&initialization_id),
+        };
+        let policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            replica_id,
+            vec![ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let binding = PublicV1LifecycleBinding {
+            identity: PublicV1Identity::new(1),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let database = root.path().join("agent.sqlite3");
+        let (initialized, _) = watch::channel(false);
+        let service = InitializationService::new(
+            ObservedStorageIdentity {
+                resource_uid: resource_uid.clone(),
+                pod_uid: pod_uid.clone(),
+                pvc_uid: pvc_uid.clone(),
+                instance_id: local.instance_id.clone(),
+            },
+            replica_id,
+            database.clone(),
+            "test-token",
+            initialized,
+            true,
+        )
+        .unwrap()
+        .with_public_v1_binding(Some(binding.clone()));
+        let command = InitializeAgentStore {
+            initialization_id: InitializationId::new(initialization_id.as_str()),
+            resource_uid: resource_uid.clone(),
+            local_replica_id: replica_id,
+            expected_instance_id: local.instance_id.clone(),
+            expected_pod_uid: pod_uid,
+            expected_pvc_uid: pvc_uid,
+            assigned_agent_generation: local.agent_generation.clone(),
+            effective_policy: policy.clone(),
+            bootstrap_configuration: configuration.clone(),
+            provisioning: None,
+        };
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            resource_uid: resource_uid.to_string(),
+            target: Some(local.clone().into()),
+            expected_process_session_id: service.session.id().to_string(),
+            command: Some(
+                proto::execute_command_request::Command::InitializeAgentStore(
+                    proto::InitializeAgentStoreCommand {
+                        initialization_id: command.initialization_id.to_string(),
+                        resource_uid: resource_uid.to_string(),
+                        local_replica_id: replica_id.value(),
+                        expected_instance_id: local.instance_id.to_string(),
+                        expected_pod_uid: command.expected_pod_uid.to_string(),
+                        expected_pvc_uid: command.expected_pvc_uid.to_string(),
+                        assigned_agent_generation: local.agent_generation.to_string(),
+                        effective_policy: Some(proto::EffectivePolicy {
+                            replica_set_size: policy.replica_set_size,
+                            write_quorum: policy.write_quorum,
+                            read_quorum: policy.read_quorum,
+                            failover_delay_seconds: policy.failover_delay_seconds,
+                        }),
+                        bootstrap_configuration: Some(configuration.into()),
+                        provisioning: None,
+                    },
+                ),
+            ),
+        };
+        service.initialize(request).await.unwrap();
+        let store =
+            SqliteStore::open_replacement_bound_existing(&database, None, &binding).unwrap();
+        let state = store.load_state().await.unwrap();
+        let public = state
+            .public_v1_operation_state
+            .expect("initialized Public V1 state");
+        let history = public.history.expect("bootstrap history");
+        assert_eq!(history.resource_uid, resource_uid);
+        assert_eq!(history.protocol_generation.value(), 1);
     }
 }

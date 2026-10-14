@@ -182,6 +182,7 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
         resource_uid: required.resource_uid.clone(),
         replica: replacement.identity.clone(),
         process_session_id: replacement.process_session_id.clone(),
+        replicator_creation_id: replacement.replicator_creation_id.clone(),
         report_sequence: 1,
         role: ReplicaRole::None,
         read_status: AccessStatus::NotPrimary,
@@ -218,7 +219,7 @@ fn renewal_command(plan: &PublicV1SessionRenewalPlan) -> &PublicV1SessionRenewal
     let ProtocolCommand::PublicV1History(command) = command else {
         panic!("expected dormant public-v1 command");
     };
-    let PublicV1HistoryCommand::SessionRenewal(command) = command.as_ref() else {
+    let PublicV1HistoryCommand::SessionRenewal { command } = command.as_ref() else {
         panic!("expected session-renewal command");
     };
     command

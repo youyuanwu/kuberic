@@ -569,6 +569,7 @@ pub(super) fn enrich_remote_rebuild(
 
 pub(crate) struct PublicV1ReportProjection {
     pub(crate) process_session_id: ProcessSessionId,
+    pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) report_sequence: u64,
     pub(crate) role: ReplicaRole,
     pub(crate) read_status: AccessStatus,
@@ -816,6 +817,7 @@ pub(crate) async fn public_v1_report(
         resource_uid: state.identity.resource_uid,
         replica: state.identity.local_identity,
         process_session_id: projection.process_session_id,
+        replicator_creation_id: projection.replicator_creation_id,
         report_sequence: projection.report_sequence,
         role: projection.role,
         read_status: projection.read_status,

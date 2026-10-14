@@ -21,6 +21,8 @@ use crate::host::sqlite_store::SqliteStore;
 use crate::host::store::AgentStore;
 use crate::host::transport::ReplicaEndpointResolver;
 
+pub(crate) const PUBLIC_V1_PROCESS_STARTUP_OWNERS: &[&str] = &["serve_control_only"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationStorageState {
     FreshEmpty,

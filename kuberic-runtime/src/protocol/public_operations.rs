@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 11;
+pub(crate) const PUBLIC_V1_PROTOCOL_REGISTRATIONS: &[&str] = &["PUBLIC_V1_PROTOCOL_VERSION"];
 pub const INVALID_LSN: i64 = -1;
 
 #[derive(
@@ -2353,6 +2354,7 @@ pub struct PublicV1AgentReport {
     pub resource_uid: ResourceUid,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
+    pub replicator_creation_id: ReplicatorCreationId,
     pub report_sequence: u64,
     pub role: ReplicaRole,
     pub read_status: AccessStatus,
@@ -2382,6 +2384,7 @@ impl PublicV1AgentReport {
         if !self.identity.is_public_v1()
             || self.resource_uid.is_empty()
             || self.process_session_id.is_empty()
+            || self.replicator_creation_id.is_empty()
             || self.report_sequence == 0
         {
             return Err("invalid public-v1 report identity");

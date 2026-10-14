@@ -27,6 +27,13 @@ pub(crate) struct PodRuntime {
     host: Arc<RuntimeHost>,
 }
 
+pub(crate) const PUBLIC_V1_HOST_ATTACHMENTS: &[&str] = &[
+    "PrimaryReplicator",
+    "Replicator",
+    "StateProvider",
+    "StatelessRuntimeControl",
+];
+
 #[derive(Debug)]
 struct ProviderWriterLease {
     consumed: bool,
@@ -601,8 +608,20 @@ impl PodRuntime {
         };
         let state = self.host.state.read().await;
         let role = state.projection.role;
+        let replicator_creation_id = self
+            .host
+            .registered
+            .get()
+            .map(|registered| registered.identity.to_public_id())
+            .unwrap_or_else(|| {
+                crate::protocol::types::ReplicatorCreationId::new(format!(
+                    "pending-{}",
+                    process_session_id
+                ))
+            });
         Ok(crate::host::public_lifecycle::PublicV1ReportProjection {
             process_session_id,
+            replicator_creation_id,
             report_sequence,
             role,
             read_status: state.projection.read_status,

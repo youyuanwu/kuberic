@@ -73,6 +73,9 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
         resource_uid,
         replica: identity.clone(),
         process_session_id: kuberic_runtime::protocol::types::ProcessSessionId::new("session-1"),
+        replicator_creation_id: kuberic_runtime::protocol::types::ReplicatorCreationId::new(
+            "creation-1",
+        ),
         report_sequence: 1,
         role: ReplicaRole::None,
         read_status: AccessStatus::NotPrimary,
@@ -365,6 +368,25 @@ async fn production_reconciler_originates_failover_and_retargets_writer() {
             .expect("initial primary");
         assert_eq!(primary_key.replica_id, ReplicaId::new(1));
         observed.agents.remove(&primary_key);
+        api.set_observation(observed).await;
+        assert_eq!(
+            reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+        assert_eq!(
+            reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Waiting
+        );
+        let mut observed = api.observation().await;
+        observed.now_unix_seconds = 30;
         api.set_observation(observed).await;
 
         let mut stable = false;
@@ -695,7 +717,7 @@ async fn production_reconciler_originates_desired_membership_changes() {
 }
 
 #[tokio::test]
-async fn production_reconciler_replays_authority_for_new_process_session() {
+async fn production_reconciler_originates_and_completes_session_renewal() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
         let reconciler = Reconciler::new(
@@ -714,6 +736,13 @@ async fn production_reconciler_replays_authority_for_new_process_session() {
             }
         }
         let mut observed = api.observation().await;
+        let previous_epoch = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .expect("initial topology")
+            .epoch;
         let (key, mut restarted) = observed
             .agents
             .iter()
@@ -728,6 +757,10 @@ async fn production_reconciler_replays_authority_for_new_process_session() {
             .expect("current primary report");
         restarted.process_session_id =
             kuberic_runtime::protocol::types::ProcessSessionId::new("restarted-primary-session");
+        restarted.replicator_creation_id =
+            kuberic_runtime::protocol::types::ReplicatorCreationId::new(
+                "restarted-primary-creation",
+            );
         restarted.report_sequence = 1;
         restarted.role = ReplicaRole::None;
         restarted.read_status = AccessStatus::NotPrimary;
@@ -754,7 +787,12 @@ async fn production_reconciler_replays_authority_for_new_process_session() {
                 break;
             }
         }
-        assert!(stable, "session renewal replay did not converge");
+        if !stable {
+            panic!(
+                "session renewal replay did not converge: {:#?}",
+                api.observation().await
+            );
+        }
         let observed = api.observation().await;
         let writers = observed
             .agents
@@ -768,6 +806,24 @@ async fn production_reconciler_replays_authority_for_new_process_session() {
             })
             .count();
         assert_eq!(writers, 1);
+        let topology = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .expect("renewed topology");
+        assert!(topology.epoch > previous_epoch);
+        assert!(topology.sessions.iter().any(|session| {
+            session.process_session_id.as_str() == "restarted-primary-session"
+                && session.replicator_creation_id.as_str() == "restarted-primary-creation"
+        }));
+        assert!(
+            observed
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_session_renewal.is_none())
+        );
         assert!(observed.agents.values().any(|agent| matches!(
             agent,
             RawAgentObservation::PublicV1Report(report)

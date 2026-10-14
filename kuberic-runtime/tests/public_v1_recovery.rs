@@ -4443,7 +4443,7 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
                             if matches!(
                                 public.as_ref(),
                                 kuberic_runtime::protocol::command::PublicV1HistoryCommand::
-                                    SessionRenewal(renewal)
+                                    SessionRenewal { command: renewal }
                                     if matches!(
                                         renewal.as_ref(),
                                         kuberic_runtime::protocol::command::

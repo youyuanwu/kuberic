@@ -26,6 +26,8 @@ use crate::host::store::{
     AgentStore, BeginPublicOperation, PublicInboundBuildAdmission, RenewPublicDataLossAttempt,
 };
 
+pub(crate) const PUBLIC_V1_AGENT_TABLES: &[&str] = &["agent_state"];
+
 const DATABASE_FILE: &str = "agent.sqlite3";
 
 fn validate_public_v1_state(state: &AgentState) -> Result<()> {
@@ -2241,7 +2243,7 @@ fn classify_replacement_store(
     path: &Path,
     expected_protocol: &PublicV1Identity,
     expected_binding: Option<&PublicV1LifecycleBinding>,
-    validate_identity: impl FnOnce(&StorageIdentity) -> Result<()>,
+    validate_identity: impl Fn(&StorageIdentity) -> Result<()>,
 ) -> Result<AgentState> {
     if !path.is_file() {
         return Err(crate::host::HostError::MissingEstablishedStore);
@@ -2257,7 +2259,12 @@ fn classify_replacement_store(
             observed: version,
         });
     }
-    recover_current_rollback_journal(path)?;
+    recover_current_rollback_journal(
+        path,
+        expected_protocol,
+        expected_binding,
+        &validate_identity,
+    )?;
     let connection = open_read_only_connection(path).map_err(|error| {
         crate::host::HostError::Corrupt(format!(
             "cannot validate replacement SQLite metadata: {error}"
@@ -2271,42 +2278,6 @@ fn classify_replacement_store(
         });
     }
 
-    fn recover_current_rollback_journal(path: &Path) -> Result<()> {
-        let journal = PathBuf::from(format!("{}-journal", path.display()));
-        if !journal.is_file() {
-            return Ok(());
-        }
-        let immutable = open_read_only_connection_with_immutable(path, true)?;
-        let exact_table: i64 = immutable.query_row(
-            "SELECT count(*) FROM sqlite_master
-             WHERE type = 'table' AND name = 'agent_state'
-               AND sql LIKE '%singleton INTEGER PRIMARY KEY%'
-               AND sql LIKE '%state_json TEXT NOT NULL%'",
-            [],
-            |row| row.get(0),
-        )?;
-        let row_count: i64 = immutable.query_row(
-            "SELECT count(*) FROM agent_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        if exact_table != 1 || row_count != 1 {
-            return Err(crate::host::HostError::Corrupt(
-                "schema-12 store with rollback journal lacks exact current layout".into(),
-            ));
-        }
-        drop(immutable);
-        let connection = open_writable_connection(path)?;
-        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION {
-            return Err(crate::host::HostError::SchemaMismatch {
-                expected: PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
-                observed: version,
-            });
-        }
-        drop(connection);
-        Ok(())
-    }
     validate_identity(&state.identity)?;
     let replacement = state.public_v1_operation_state.as_ref().ok_or_else(|| {
         crate::host::HostError::InitializationNotAuthorized(
@@ -2329,6 +2300,75 @@ fn classify_replacement_store(
     validate_integrity(&connection)
         .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
     Ok(state)
+}
+
+fn recover_current_rollback_journal(
+    path: &Path,
+    expected_protocol: &PublicV1Identity,
+    expected_binding: Option<&PublicV1LifecycleBinding>,
+    validate_identity: &impl Fn(&StorageIdentity) -> Result<()>,
+) -> Result<()> {
+    let journal = PathBuf::from(format!("{}-journal", path.display()));
+    if !journal.is_file() {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        crate::host::HostError::Corrupt("SQLite metadata path has no parent".into())
+    })?;
+    let recovery_root = parent.join(format!(
+        ".kuberic-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?
+            .as_nanos()
+    ));
+    std::fs::create_dir(&recovery_root)?;
+    let recovery_path = recovery_root.join("agent.sqlite3");
+    let recovery_journal = PathBuf::from(format!("{}-journal", recovery_path.display()));
+    let validation = (|| -> Result<()> {
+        std::fs::copy(path, &recovery_path)?;
+        std::fs::copy(&journal, &recovery_journal)?;
+        let recovery = open_writable_connection(&recovery_path)?;
+        let version: u32 = recovery.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION {
+            return Err(crate::host::HostError::SchemaMismatch {
+                expected: PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
+                observed: version,
+            });
+        }
+        drop(recovery);
+        let recovery = open_read_only_connection(&recovery_path)?;
+        let state = load_state_from_connection(&recovery)?;
+        validate_identity(&state.identity)?;
+        let replacement = state.public_v1_operation_state.as_ref().ok_or_else(|| {
+            crate::host::HostError::InitializationNotAuthorized(
+                "replacement store lacks Public V1 state".into(),
+            )
+        })?;
+        if &replacement.identity != expected_protocol
+            || expected_binding.is_some_and(|binding| replacement.binding.as_ref() != Some(binding))
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "recovered Public V1 authority changed".into(),
+            ));
+        }
+        validate_public_v1_state(&state)?;
+        validate_integrity(&recovery)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&recovery_root);
+    validation?;
+    let connection = open_writable_connection(path)?;
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION {
+        return Err(crate::host::HostError::SchemaMismatch {
+            expected: PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
+            observed: version,
+        });
+    }
+    drop(connection);
+    Ok(())
 }
 
 fn read_schema_version_immutable(path: &Path) -> Result<u32> {
@@ -2395,12 +2435,13 @@ fn configure_durability(connection: &Connection) -> Result<()> {
 
 fn create_schema(connection: &mut Connection, state: &AgentState) -> Result<()> {
     let transaction = connection.transaction()?;
-    transaction.execute_batch(
-        "CREATE TABLE agent_state (
+    transaction.execute_batch(&format!(
+        "CREATE TABLE {} (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             state_json TEXT NOT NULL
          );",
-    )?;
+        PUBLIC_V1_AGENT_TABLES[0]
+    ))?;
     transaction.pragma_update(None, "user_version", state.identity.schema_version)?;
     write_agent_state(&transaction, state)?;
     transaction.commit()?;

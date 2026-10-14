@@ -25,8 +25,8 @@ use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
     Epoch, OperationId, PodUid, ProcessSessionId, PublicProtocolGeneration, PvcUid, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
-    ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration, derive_bootstrap_history,
-    derive_history_initialization_id,
+    ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, StorageGeneration,
+    derive_bootstrap_history, derive_history_initialization_id,
 };
 
 fn replica(id: i64) -> ReplicaIdentity {
@@ -102,6 +102,7 @@ fn report(
         resource_uid: accepted.history.resource_uid.clone(),
         replica: replica(1),
         process_session_id: ProcessSessionId::new("session-1"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-1"),
         report_sequence: 1,
         role: ReplicaRole::Primary,
         read_status: AccessStatus::NotPrimary,
