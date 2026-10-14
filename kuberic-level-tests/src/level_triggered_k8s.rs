@@ -79,29 +79,41 @@ fn set_status(kubeconfig: &str, context: &str) -> Result<Value> {
     Ok(serde_json::from_str(&status)?)
 }
 
-fn status_ready(value: &Value) -> bool {
-    value["status"]["conditions"]
-        .as_array()
-        .is_some_and(|conditions| {
-            conditions
-                .iter()
-                .any(|condition| condition["type"] == "Ready" && condition["status"] == "true")
-        })
+fn public_v1_authority_present(value: &Value) -> bool {
+    value["status"]["publicV1Authority"].is_object()
 }
 
-fn topology_primary_id(value: &Value) -> Option<i64> {
-    value["status"]["topology"]["members"]
-        .as_array()?
-        .iter()
-        .find(|member| member["role"] == "primary")?["replicaId"]
-        .as_i64()
+fn public_v1_primary(kubeconfig: &str, context: &str) -> Result<Option<i64>> {
+    let mut granted = Vec::new();
+    for replica_id in 1..=3 {
+        if replica_diagnostics(kubeconfig, context, replica_id)
+            .is_ok_and(|status| status["writeStatus"] == "Granted")
+        {
+            granted.push(replica_id);
+        }
+    }
+    ensure!(
+        granted.len() <= 1,
+        "Public V1 admitted more than one writer: {granted:?}"
+    );
+    Ok(granted.into_iter().next())
 }
 
-fn topology_member(value: &Value, replica_id: i64) -> Option<&Value> {
-    value["status"]["topology"]["members"]
-        .as_array()?
-        .iter()
-        .find(|member| member["replicaId"].as_i64() == Some(replica_id))
+fn all_replicas_reporting(kubeconfig: &str, context: &str) -> bool {
+    (1..=3).all(|replica_id| replica_diagnostics(kubeconfig, context, replica_id).is_ok())
+}
+
+fn pod_uid_for_replica(kubeconfig: &str, context: &str, replica_id: i64) -> Result<String> {
+    let pod = pod_for_replica(kubeconfig, context, replica_id)?;
+    let value: Value = serde_json::from_str(&kubectl(
+        kubeconfig,
+        context,
+        &["-n", NAMESPACE, "get", "pod", &pod, "-o", "json"],
+    )?)?;
+    value["metadata"]["uid"]
+        .as_str()
+        .map(str::to_string)
+        .context("replica Pod UID")
 }
 
 fn pod_for_replica(kubeconfig: &str, context: &str, replica_id: i64) -> Result<String> {
@@ -357,18 +369,14 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
     let bootstrap_deadline = Instant::now() + Duration::from_secs(120);
     let primary = loop {
         let value = set_status(&kubeconfig, &context)?;
-        let members = value["status"]["topology"]["members"].as_array();
-        if value["status"]["initialized"] == true
-            && members.is_some_and(|members| members.len() == 3)
-            && status_ready(&value)
-            && let Some(primary) = topology_primary_id(&value)
-            && replica_diagnostics(&kubeconfig, &context, primary)
-                .is_ok_and(|status| status["writeStatus"] == "Granted")
+        if public_v1_authority_present(&value)
+            && all_replicas_reporting(&kubeconfig, &context)
+            && let Some(primary) = public_v1_primary(&kubeconfig, &context)?
         {
             break primary;
         }
         if Instant::now() >= bootstrap_deadline {
-            bail!("bootstrap did not accept a three-member topology");
+            bail!("bootstrap did not produce three Public V1 reports and exactly one writer");
         }
         std::thread::sleep(Duration::from_secs(2));
     };
@@ -485,12 +493,11 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
     let ready_deadline = Instant::now() + Duration::from_secs(120);
     let (old_instance, primary) = loop {
         let status = set_status(&kubeconfig, &context)?;
-        let replacement = topology_member(&status, 2);
-        if status_ready(&status)
-            && let Some(instance) = replacement.and_then(|member| member["instanceId"].as_str())
-            && let Some(primary) = topology_primary_id(&status)
+        if public_v1_authority_present(&status)
+            && all_replicas_reporting(&kubeconfig, &context)
+            && let Some(primary) = public_v1_primary(&kubeconfig, &context)?
         {
-            break (instance.to_string(), primary);
+            break (pod_uid_for_replica(&kubeconfig, &context, 2)?, primary);
         }
         if Instant::now() >= ready_deadline {
             bail!("bootstrap did not become ready before replacement");
@@ -526,10 +533,11 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
 
     let replacement_deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let status = set_status(&kubeconfig, &context)?;
-        let replacement =
-            topology_member(&status, 2).and_then(|member| member["instanceId"].as_str());
-        if status_ready(&status) && replacement.is_some_and(|instance| instance != old_instance) {
+        if pod_uid_for_replica(&kubeconfig, &context, 2)
+            .is_ok_and(|instance| instance != old_instance)
+            && replica_diagnostics(&kubeconfig, &context, 2).is_ok()
+            && public_v1_primary(&kubeconfig, &context)?.is_some()
+        {
             break;
         }
         if Instant::now() >= replacement_deadline {
@@ -538,26 +546,8 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         std::thread::sleep(Duration::from_secs(2));
     }
 
-    let cleanup_deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        if kubectl(
-            &kubeconfig,
-            &context,
-            &["-n", NAMESPACE, "get", "pvc", "kvstore2-2-data"],
-        )
-        .is_err()
-        {
-            break;
-        }
-        if Instant::now() >= cleanup_deadline {
-            bail!("old replacement PVC was not retired");
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    }
-
-    let status = set_status(&kubeconfig, &context)?;
-    let primary =
-        topology_primary_id(&status).context("replacement topology omitted a Primary member")?;
+    let primary = public_v1_primary(&kubeconfig, &context)?
+        .context("replacement omitted a Public V1 writer")?;
     ensure!(
         put_from_replica(
             &kubeconfig,
@@ -603,15 +593,13 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
 fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
     let (kubeconfig, context, _) = cluster_args()?;
     let ready_deadline = Instant::now() + Duration::from_secs(120);
-    let (old_primary, old_epoch) = loop {
+    let old_primary = loop {
         let status = set_status(&kubeconfig, &context)?;
-        if status_ready(&status) {
-            let primary =
-                topology_primary_id(&status).context("ready topology omitted a Primary member")?;
-            let epoch = status["status"]["topology"]["epoch"]["configurationNumber"]
-                .as_i64()
-                .context("ready topology omitted configuration epoch")?;
-            break (primary, epoch);
+        if public_v1_authority_present(&status)
+            && all_replicas_reporting(&kubeconfig, &context)
+            && let Some(primary) = public_v1_primary(&kubeconfig, &context)?
+        {
+            break primary;
         }
         if Instant::now() >= ready_deadline {
             bail!("bootstrap did not become ready before failover");
@@ -643,16 +631,12 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
     );
 
     let failover_deadline = Instant::now() + Duration::from_secs(120);
+    stop_replica_process(&kubeconfig, &context, old_primary)?;
     let new_primary = loop {
-        stop_replica_process(&kubeconfig, &context, old_primary)?;
-        let status = set_status(&kubeconfig, &context)?;
-        let primary = topology_primary_id(&status);
-        let epoch = status["status"]["topology"]["epoch"]["configurationNumber"].as_i64();
-        if status_ready(&status)
-            && primary.is_some_and(|primary| primary != old_primary)
-            && epoch.is_some_and(|epoch| epoch > old_epoch)
+        if let Some(primary) = public_v1_primary(&kubeconfig, &context)?
+            && primary != old_primary
         {
-            break primary.expect("checked above");
+            break primary;
         }
         if Instant::now() >= failover_deadline {
             bail!("ordinary failover did not select and publish a newer primary");

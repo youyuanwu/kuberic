@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::host::store::AgentStore;
 use crate::protocol::command::{PublicV1HistoryCommand, PublicV1SessionRenewalCommand};
 use crate::protocol::public_operations::{
-    DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
-    PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport, PublicV1OperationResult,
+    DataLossAuthorization, PublicDataLossRecoveryStatus, PublicProgress, PublicV1AgentReport,
+    PublicV1Identity, PublicV1LifecycleBinding, PublicV1OperationResult,
     PublicV1SessionRenewalStatus, StatePersistence,
 };
 use crate::protocol::types::{
@@ -128,7 +128,7 @@ impl SqliteStore {
 
     pub fn create_public_v1(
         path: impl AsRef<Path>,
-        preview: PublicOperationPreviewIdentity,
+        preview: PublicV1Identity,
         identity: StorageIdentity,
     ) -> crate::host::Result<Self> {
         if !preview.is_public_v1() {
@@ -142,8 +142,8 @@ impl SqliteStore {
                 crate::host::sqlite_store::SqliteStore::create_replacement_authorized(
                     path,
                     crate::host::state::AgentState::new(super::convert(identity)),
-                    PreviewLifecycleBinding {
-                        preview,
+                    PublicV1LifecycleBinding {
+                        identity: preview,
                         resource_uid,
                         spec_generation: 1,
                         state_persistence: StatePersistence::Persisted,
@@ -155,7 +155,7 @@ impl SqliteStore {
 
     pub fn open_public_v1(
         path: impl AsRef<Path>,
-        preview: &PublicOperationPreviewIdentity,
+        preview: &PublicV1Identity,
     ) -> crate::host::Result<Self> {
         Ok(Self {
             inner: Arc::new(
@@ -187,7 +187,7 @@ impl SqliteStore {
 
     pub async fn public_v1_history_snapshot(&self) -> crate::host::Result<PublicV1HistorySnapshot> {
         let state = self.inner.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected("public-v1 preview state required".into())
         })?;
         Ok(PublicV1HistorySnapshot {
@@ -234,7 +234,7 @@ impl SqliteStore {
                     .inner
                     .load_state()
                     .await?
-                    .public_operation_preview
+                    .public_v1_operation_state
                     .and_then(|preview| preview.data_loss_recovery)
                     .is_some_and(|recovery| {
                         intent
@@ -614,7 +614,7 @@ impl SqliteStore {
 
     pub async fn public_v1_build_records(&self) -> crate::host::Result<Vec<PublicV1BuildSnapshot>> {
         let state = self.inner.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected(
                 "public-v1 build store requires preview state".into(),
             )
@@ -664,7 +664,7 @@ impl SqliteStore {
             .inner
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .and_then(|preview| preview.session_renewal)
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
@@ -785,7 +785,7 @@ impl SqliteStore {
 
     pub async fn public_v1_agent_report(
         &self,
-        identity: &PublicOperationPreviewIdentity,
+        identity: &PublicV1Identity,
         projection: PublicV1ReportProjection,
     ) -> crate::host::Result<PublicV1AgentReport> {
         crate::host::public_lifecycle::public_v1_report(

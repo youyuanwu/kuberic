@@ -1605,7 +1605,7 @@ pub struct AcceptedStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale_up_admission_started: Option<OperationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_lifecycle: Option<crate::protocol::public_operations::PreviewLifecycleBinding>,
+    pub preview_lifecycle: Option<crate::protocol::public_operations::PublicV1LifecycleBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_fault_action: Option<crate::protocol::public_operations::PublicFaultAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

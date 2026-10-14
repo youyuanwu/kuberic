@@ -12,4 +12,4 @@ pub mod types;
 pub mod validation;
 
 /// Exact protocol version supported by the current minimum contract.
-pub const PROTOCOL_VERSION: u32 = public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION;
+pub const PROTOCOL_VERSION: u32 = public_operations::PUBLIC_V1_PROTOCOL_VERSION;

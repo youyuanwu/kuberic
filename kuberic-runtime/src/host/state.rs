@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::host::public_build_store::PublicV1BuildRecord;
 use crate::protocol::public_operations::{
-    DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicV1SessionRenewalStatus,
+    DataLossAuthorization, PublicDataLossRecoveryStatus, PublicOperationIntent, PublicV1Identity,
+    PublicV1LifecycleBinding, PublicV1SessionRenewalStatus,
 };
 use crate::protocol::types::{
     EffectivePolicy, FaultType, HistoryContext, HistoryInitializationId, InitializationId,
@@ -157,10 +157,10 @@ pub(crate) struct HistoryAdmissionBarrier {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PublicOperationPreviewState {
-    pub(crate) identity: PublicOperationPreviewIdentity,
+pub(crate) struct PublicV1OperationState {
+    pub(crate) identity: PublicV1Identity,
     #[serde(default)]
-    pub(crate) binding: Option<PreviewLifecycleBinding>,
+    pub(crate) binding: Option<PublicV1LifecycleBinding>,
     pub(crate) operations: BTreeMap<OperationId, PublicOperationRecord>,
     #[serde(default)]
     pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
@@ -204,15 +204,12 @@ pub(crate) struct PublicOperationPreviewState {
     pub(crate) terminal: bool,
 }
 
-impl PublicOperationPreviewState {
-    pub(crate) fn new_bound(binding: PreviewLifecycleBinding) -> Self {
-        Self::from_parts(binding.preview.clone(), Some(binding))
+impl PublicV1OperationState {
+    pub(crate) fn new_bound(binding: PublicV1LifecycleBinding) -> Self {
+        Self::from_parts(binding.identity.clone(), Some(binding))
     }
 
-    fn from_parts(
-        identity: PublicOperationPreviewIdentity,
-        binding: Option<PreviewLifecycleBinding>,
-    ) -> Self {
+    fn from_parts(identity: PublicV1Identity, binding: Option<PublicV1LifecycleBinding>) -> Self {
         Self {
             identity,
             binding,
@@ -251,7 +248,7 @@ pub(crate) struct ApplicationStorageBinding {
 pub(crate) struct AgentState {
     pub(crate) identity: StorageIdentity,
     #[serde(default)]
-    pub(crate) public_operation_preview: Option<PublicOperationPreviewState>,
+    pub(crate) public_v1_operation_state: Option<PublicV1OperationState>,
     pub(crate) application_storage: Option<ApplicationStorageBinding>,
     #[serde(default)]
     pub(crate) load_metrics: Vec<LoadMetric>,
@@ -263,7 +260,7 @@ impl AgentState {
     pub(crate) fn new(identity: StorageIdentity) -> Self {
         Self {
             identity,
-            public_operation_preview: None,
+            public_v1_operation_state: None,
             application_storage: None,
             load_metrics: Vec::new(),
             reported_fault: None,

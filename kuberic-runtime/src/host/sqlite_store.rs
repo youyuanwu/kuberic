@@ -5,8 +5,8 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::protocol::public_operations::PreviewLifecycleBinding;
-use crate::protocol::public_operations::PublicOperationPreviewIdentity;
+use crate::protocol::public_operations::PublicV1Identity;
+use crate::protocol::public_operations::PublicV1LifecycleBinding;
 use crate::protocol::public_operations::{
     DataLossRenewalDecision, PossibleDataLossIntent, PublicOperationIntent,
 };
@@ -19,8 +19,8 @@ use crate::host::public_build_store::{PublicV1BuildRecord, PublicV1BuildRetireme
 use crate::host::state::PublicOperationContainment;
 use crate::host::state::{
     AgentState, PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, PublicInstructionOutcome,
-    PublicOperationDisposition, PublicOperationPreviewState, PublicOperationRecord,
-    PublicOperationStage, StorageIdentity,
+    PublicOperationDisposition, PublicOperationRecord, PublicOperationStage,
+    PublicV1OperationState, StorageIdentity,
 };
 use crate::host::store::{
     AgentStore, BeginPublicOperation, PublicInboundBuildAdmission, RenewPublicDataLossAttempt,
@@ -29,7 +29,7 @@ use crate::host::store::{
 const DATABASE_FILE: &str = "agent.sqlite3";
 
 fn validate_public_v1_state(state: &AgentState) -> Result<()> {
-    let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+    let preview = state.public_v1_operation_state.as_ref().ok_or_else(|| {
         crate::host::HostError::Corrupt("replacement store lacks Public V1 state".into())
     })?;
     if !preview.identity.is_public_v1() {
@@ -216,12 +216,12 @@ impl SqliteStore {
     pub(crate) fn create_replacement_authorized(
         path: impl AsRef<Path>,
         mut state: AgentState,
-        binding: PreviewLifecycleBinding,
+        binding: PublicV1LifecycleBinding,
     ) -> Result<Self> {
         binding.validate().map_err(|message| {
             crate::host::HostError::InitializationNotAuthorized(message.into())
         })?;
-        if !binding.preview.is_public_v1() {
+        if !binding.identity.is_public_v1() {
             return Err(crate::host::HostError::InitializationNotAuthorized(
                 "replacement store requires Public V1".into(),
             ));
@@ -231,19 +231,19 @@ impl SqliteStore {
                 "replacement binding resource UID differs from store identity".into(),
             ));
         }
-        if state.public_operation_preview.is_some() {
+        if state.public_v1_operation_state.is_some() {
             return Err(crate::host::HostError::InitializationNotAuthorized(
                 "Public V1 replacement state is already initialized".into(),
             ));
         }
         state.identity.schema_version = PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION;
-        state.public_operation_preview = Some(PublicOperationPreviewState::new_bound(binding));
+        state.public_v1_operation_state = Some(PublicV1OperationState::new_bound(binding));
         Self::create_store(path, state)
     }
 
     fn create_store(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if state.public_operation_preview.is_none() {
+        if state.public_v1_operation_state.is_none() {
             return Err(crate::host::HostError::InitializationNotAuthorized(
                 "replacement store requires Public V1 state".into(),
             ));
@@ -281,7 +281,7 @@ impl SqliteStore {
     pub(crate) fn open_replacement_existing(
         path: impl AsRef<Path>,
         expected_identity: Option<&StorageIdentity>,
-        expected_protocol: &PublicOperationPreviewIdentity,
+        expected_protocol: &PublicV1Identity,
     ) -> Result<Self> {
         if !expected_protocol.is_valid() {
             return Err(crate::host::HostError::InitializationNotAuthorized(
@@ -312,7 +312,7 @@ impl SqliteStore {
     pub(crate) fn open_replacement_bound_existing(
         path: impl AsRef<Path>,
         expected_identity: Option<&StorageIdentity>,
-        expected_binding: &PreviewLifecycleBinding,
+        expected_binding: &PublicV1LifecycleBinding,
     ) -> Result<Self> {
         expected_binding.validate().map_err(|message| {
             crate::host::HostError::InitializationNotAuthorized(message.into())
@@ -320,7 +320,7 @@ impl SqliteStore {
         let path = path.as_ref().to_path_buf();
         classify_replacement_store(
             &path,
-            &expected_binding.preview,
+            &expected_binding.identity,
             Some(expected_binding),
             |actual| validate_expected_identity(actual, expected_identity),
         )?;
@@ -341,7 +341,7 @@ impl SqliteStore {
         observed: &crate::host::provisioning::ObservedStorageIdentity,
         replica_id: crate::protocol::types::ReplicaId,
         application_storage_paths: Option<&BTreeMap<String, PathBuf>>,
-        expected_binding: &PreviewLifecycleBinding,
+        expected_binding: &PublicV1LifecycleBinding,
     ) -> Result<Self> {
         expected_binding.validate().map_err(|message| {
             crate::host::HostError::InitializationNotAuthorized(message.into())
@@ -349,7 +349,7 @@ impl SqliteStore {
         let path = path.as_ref().to_path_buf();
         let state = classify_replacement_store(
             &path,
-            &expected_binding.preview,
+            &expected_binding.identity,
             Some(expected_binding),
             |actual| {
                 crate::host::provisioning::validate_established_identity(
@@ -402,7 +402,7 @@ fn classify_public_v1_inbound_build_authority(
     authority
         .validate()
         .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
-    let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+    let preview = state.public_v1_operation_state.as_ref().ok_or_else(|| {
         crate::host::HostError::CommandRejected(
             "inbound build authority requires a public-v1 store".into(),
         )
@@ -507,7 +507,7 @@ impl AgentStore for SqliteStore {
             .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "Public V1 replacement store required".into(),
                 )
@@ -569,7 +569,7 @@ impl AgentStore for SqliteStore {
             .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("Public V1 replacement store required".into())
             })?;
             if !preview.identity.is_public_v1()
@@ -643,7 +643,7 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let local_identity = state.identity.local_identity.clone();
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
                 )
@@ -1176,7 +1176,7 @@ impl AgentStore for SqliteStore {
 
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("replacement store required".into())
             })?;
             if preview.identity != intent.preview {
@@ -1416,7 +1416,7 @@ impl AgentStore for SqliteStore {
                 )));
             }
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
                 )
@@ -1528,7 +1528,7 @@ impl AgentStore for SqliteStore {
             .map_err(|message| crate::host::HostError::CommandRejected(message.to_string()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
                 )
@@ -1614,7 +1614,7 @@ impl AgentStore for SqliteStore {
 
     async fn public_operation_records(&self) -> Result<Vec<PublicOperationRecord>> {
         let state = self.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected(
                 "public-operation preview is not enabled for this store".into(),
             )
@@ -1632,7 +1632,7 @@ impl AgentStore for SqliteStore {
         use crate::host::state::{DataLossOutcome, PublicInstruction, PublicInstructionOutcome};
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("replacement store required".into())
             })?;
             let record = preview
@@ -1984,7 +1984,7 @@ impl AgentStore for SqliteStore {
                 PublicInboundBuildAdmission::Successor => {}
             }
             let preview = state
-                .public_operation_preview
+                .public_v1_operation_state
                 .as_mut()
                 .expect("classified public-v1 state");
             preview.inbound_build_generation = authority.operation_revision;
@@ -2000,7 +2000,7 @@ impl AgentStore for SqliteStore {
         Ok(self
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .and_then(|preview| {
                 preview
                     .current_inbound_build_authority
@@ -2015,7 +2015,7 @@ impl AgentStore for SqliteStore {
         Ok(self
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .and_then(|preview| {
                 preview
                     .terminal_inbound_build_receipts
@@ -2027,7 +2027,7 @@ impl AgentStore for SqliteStore {
     async fn revoke_public_v1_inbound_build_authority(&self) -> Result<()> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "inbound build revocation requires a public-v1 store".into(),
                 )
@@ -2043,7 +2043,7 @@ impl AgentStore for SqliteStore {
         current_configuration_id: &crate::protocol::types::ConfigurationId,
     ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
         let state = self.load_state().await?;
-        let Some(preview) = state.public_operation_preview else {
+        let Some(preview) = state.public_v1_operation_state else {
             return Ok(None);
         };
         let Some(record) = preview
@@ -2104,7 +2104,7 @@ impl AgentStore for SqliteStore {
             .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "inbound build completion requires a public-v1 store".into(),
                 )
@@ -2149,15 +2149,12 @@ impl AgentStore for SqliteStore {
         Ok(self
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .is_some_and(|preview| preview.retired_storage_incarnations.contains(storage)))
     }
 }
 
-fn retire_history_barriers(
-    preview: &mut PublicOperationPreviewState,
-    intent: &PublicOperationIntent,
-) {
+fn retire_history_barriers(preview: &mut PublicV1OperationState, intent: &PublicOperationIntent) {
     use crate::protocol::public_operations::PublicOperationClass;
     if matches!(
         intent.class,
@@ -2242,8 +2239,8 @@ fn validate_expected_identity(
 
 fn classify_replacement_store(
     path: &Path,
-    expected_protocol: &PublicOperationPreviewIdentity,
-    expected_binding: Option<&PreviewLifecycleBinding>,
+    expected_protocol: &PublicV1Identity,
+    expected_binding: Option<&PublicV1LifecycleBinding>,
     validate_identity: impl FnOnce(&StorageIdentity) -> Result<()>,
 ) -> Result<AgentState> {
     if !path.is_file() {
@@ -2273,7 +2270,7 @@ fn classify_replacement_store(
         });
     }
     validate_identity(&state.identity)?;
-    let replacement = state.public_operation_preview.as_ref().ok_or_else(|| {
+    let replacement = state.public_v1_operation_state.as_ref().ok_or_else(|| {
         crate::host::HostError::InitializationNotAuthorized(
             "replacement store lacks Public V1 state".into(),
         )
@@ -2428,10 +2425,9 @@ mod tests {
     async fn terminal_inbound_build_receipt_reopens_for_exact_replay_only() {
         let directory = crate::host::tests::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
-        let preview =
-            crate::protocol::public_operations::PublicOperationPreviewIdentity::public_v1(11);
-        let binding = crate::protocol::public_operations::PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = crate::protocol::public_operations::PublicV1Identity::new(11);
+        let binding = crate::protocol::public_operations::PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: identity().resource_uid,
             spec_generation: 1,
             state_persistence: crate::protocol::public_operations::StatePersistence::Persisted,

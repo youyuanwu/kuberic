@@ -60,9 +60,6 @@ pub(crate) fn replayable(record: &PublicOperationRecord) -> bool {
     if record.intent.lifecycle.is_none() && record.intent.program.is_none() {
         return false;
     }
-    if record.intent.preview.is_legacy_preview() {
-        return record.lifecycle.in_flight.is_none_or(repeatable);
-    }
     record
         .lifecycle
         .in_flight
@@ -379,7 +376,7 @@ pub(super) async fn execute(
                     {
                         let state = store.load_state().await?;
                         let source_storage = state
-                            .public_operation_preview
+                            .public_v1_operation_state
                             .as_ref()
                             .and_then(|preview| preview.storage_incarnation.as_ref())
                             .ok_or_else(|| {

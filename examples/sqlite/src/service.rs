@@ -130,10 +130,6 @@ impl SqliteService {
         })
     }
 
-    #[cfg(feature = "testing")]
-    pub fn with_stateless_preview(self) -> Self {
-        self
-    }
     pub fn persistence(&self) -> &Arc<SqlitePersistence> {
         &self.persistence
     }
@@ -251,7 +247,6 @@ impl StatefulServiceReplica for SqliteService {
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: true,
                 }),
             )
             .await?;

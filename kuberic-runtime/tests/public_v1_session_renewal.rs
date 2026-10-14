@@ -9,9 +9,9 @@ use kuberic_runtime::protocol::public_operations::{
     ProviderProgressReset, PublicBuildInput, PublicDataLossRecoveryInput,
     PublicDataLossRecoveryStage, PublicDataLossRecoveryStatus, PublicDataLossSessionRenewal,
     PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
-    PublicOperationPreviewIdentity, PublicOperationProgram, PublicOperationReplayDisposition,
-    PublicProgress, PublicProgressRole, PublicSessionRenewalStage, PublicV1AcceptedStatus,
-    PublicV1AgentReport, PublicV1OperationResult, PublicV1SessionRenewalStatus,
+    PublicOperationProgram, PublicOperationReplayDisposition, PublicProgress, PublicProgressRole,
+    PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1Identity,
+    PublicV1OperationResult, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -118,7 +118,7 @@ fn storage(identity: ReplicaIdentity) -> ReplicaStorageIncarnationContext {
 }
 
 fn build_intent(
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     history: &kuberic_runtime::protocol::types::HistoryContext,
     target: ReplicaStorageIncarnationContext,
 ) -> PublicOperationIntent {
@@ -211,7 +211,7 @@ fn ordinary_required(previous_epoch: Epoch, renewal_epoch: Epoch) -> ProcessSess
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
-        identity: PublicOperationPreviewIdentity::public_v1(42),
+        identity: PublicV1Identity::new(42),
         resource_uid: required.resource_uid.clone(),
         replica: replacement.identity.clone(),
         process_session_id: replacement.process_session_id.clone(),
@@ -334,7 +334,7 @@ fn data_loss_required(
 }
 
 fn recovery_intent(
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     authorization: &DataLossAuthorization,
     attempt: &DataLossAttempt,
 ) -> PublicOperationIntent {
@@ -385,7 +385,7 @@ fn recovery_intent(
 }
 
 fn accepted_recovery(
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     initialization_id: kuberic_runtime::protocol::types::HistoryInitializationId,
     authorization: &DataLossAuthorization,
     attempt: &DataLossAttempt,
@@ -429,7 +429,7 @@ async fn public_v1_session_renewal_requires_higher_epoch() {
 
     let root = test_root("higher-epoch");
     let path = SqliteStore::metadata_database_path(&root);
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let store = SqliteStore::create_public_v1(
         &path,
         preview.clone(),
@@ -661,7 +661,7 @@ async fn public_v1_data_loss_attempt_renews_same_authorization() {
 
     let root = test_root("data-loss-renewal");
     let path = SqliteStore::metadata_database_path(&root);
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let store = SqliteStore::create_public_v1(
         &path,
         preview.clone(),
@@ -855,7 +855,7 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
     assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
     let root = test_root("schema11-fresh");
     let path = SqliteStore::metadata_database_path(&root);
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let local = replica(1);
     let store = SqliteStore::create_public_v1(
         &path,
@@ -1149,14 +1149,14 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
     let original_state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
     let mut mismatched_record = original_state.clone();
     let admission_revision = mismatched_record
-        .get("publicOperationPreview")
+        .get("publicV1OperationState")
         .and_then(|preview| preview.get("buildRecords"))
         .and_then(|records| records.get("schema11-build"))
         .and_then(|record| record.get("admissionRevision"))
         .and_then(serde_json::Value::as_u64)
         .unwrap();
     *mismatched_record
-        .get_mut("publicOperationPreview")
+        .get_mut("publicV1OperationState")
         .and_then(|preview| preview.get_mut("buildRecords"))
         .and_then(|records| records.get_mut("schema11-build"))
         .and_then(|record| record.get_mut("admissionRevision"))
@@ -1187,7 +1187,7 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
     ] {
         let mut changed = original_state.clone();
         *changed
-            .get_mut("publicOperationPreview")
+            .get_mut("publicV1OperationState")
             .and_then(|preview| preview.get_mut("buildRecords"))
             .and_then(|records| records.get_mut("schema11-build"))
             .and_then(|record| record.get_mut(field))
@@ -1212,7 +1212,7 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
 
     let mut changed_storage = original_state.clone();
     *changed_storage
-        .get_mut("publicOperationPreview")
+        .get_mut("publicV1OperationState")
         .and_then(|preview| preview.get_mut("buildRecords"))
         .and_then(|records| records.get_mut("schema11-build"))
         .and_then(|record| record.get_mut("targetStorage"))
@@ -1237,7 +1237,7 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
 
     let mut state = original_state;
     let operations = state
-        .get_mut("publicOperationPreview")
+        .get_mut("publicV1OperationState")
         .and_then(|preview| preview.get_mut("operations"))
         .and_then(serde_json::Value::as_object_mut)
         .unwrap();
@@ -1265,7 +1265,7 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
 async fn public_v1_schema11_build_ambiguity_requires_retirement() {
     let root = test_root("schema11-build-ambiguity");
     let path = SqliteStore::metadata_database_path(&root);
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let local = replica(1);
     let local_storage = storage(local.clone());
     let store = SqliteStore::create_public_v1(
@@ -1314,7 +1314,7 @@ async fn public_v1_schema11_build_ambiguity_requires_retirement() {
 async fn public_v1_schema11_failed_build_containment_survives_reopen() {
     let root = test_root("schema11-build-failed-pending");
     let path = SqliteStore::metadata_database_path(&root);
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let local = replica(1);
     let local_storage = storage(local.clone());
     let store = SqliteStore::create_public_v1(
@@ -1380,7 +1380,7 @@ async fn public_v1_schema11_rebuild_then_cancellation_survives_reopen() {
 
     let root = test_root("schema11-build-rebuild-cancelled");
     let path = SqliteStore::metadata_database_path(&root);
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let local = replica(1);
     let local_storage = storage(local.clone());
     let target_storage = storage(replica(2));
@@ -1481,7 +1481,7 @@ async fn public_v1_schema11_rebuild_then_cancellation_survives_reopen() {
 
 #[test]
 fn public_v1_schema11_rejects_prior_preview_stores() {
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     for version in [6, 7, 8, 9, 10] {
         let root = test_root(&format!("schema11-reject-{version}"));
         let path = SqliteStore::metadata_database_path(&root);

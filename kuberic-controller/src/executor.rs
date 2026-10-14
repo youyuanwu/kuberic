@@ -1,35 +1,35 @@
 #[cfg(feature = "runtime-test-bridge")]
-pub async fn execute_preview_service_location(
-    api: &dyn crate::cluster_api::PreviewServiceApi,
-    plan: crate::evaluator::test_bridge::PreviewServiceLocationPlan,
+pub async fn execute_public_v1_service_location(
+    api: &dyn crate::cluster_api::PublicV1ServiceApi,
+    plan: crate::evaluator::testing::PublicV1ServiceLocationPlan,
 ) -> std::result::Result<(), String> {
-    use crate::evaluator::test_bridge::PreviewServiceLocationPlan;
+    use crate::evaluator::testing::PublicV1ServiceLocationPlan;
     match plan {
-        PreviewServiceLocationPlan::Stable => Ok(()),
-        PreviewServiceLocationPlan::PersistStatus { expected, next } => {
-            if let crate::evaluator::test_bridge::PreviewServiceLocationStage::Published(
-                projection,
-            ) = &next.service_location_projection
+        PublicV1ServiceLocationPlan::Stable => Ok(()),
+        PublicV1ServiceLocationPlan::PersistStatus { expected, next } => {
+            if let crate::evaluator::testing::PublicV1ServiceLocationStage::Published(projection) =
+                &next.service_location_projection
             {
-                let (status, service) = api.observe_preview().await?;
+                let (status, service) = api.observe_public_v1_service().await?;
                 if status != expected
                     || service.metadata.uid.as_ref() != Some(&projection.service_uid)
                     || service.metadata.resource_version.as_ref()
                         != Some(&projection.service_resource_version)
-                    || !crate::cluster_api::preview_service_matches(&service, projection)
+                    || !crate::cluster_api::public_v1_service_matches(&service, projection)
                 {
                     return Err("stale service-location publication".into());
                 }
             }
-            api.persist_preview_status(&expected, &next).await
+            api.persist_public_v1_lifecycle_status(&expected, &next)
+                .await
         }
-        PreviewServiceLocationPlan::WriteService {
+        PublicV1ServiceLocationPlan::WriteService {
             expected_status,
             expected_uid,
             expected_version,
             projection,
         } => {
-            let (status, service) = api.observe_preview().await?;
+            let (status, service) = api.observe_public_v1_service().await?;
             if status != expected_status
                 || service.metadata.uid.as_ref() != Some(&expected_uid)
                 || service.metadata.resource_version.as_ref() != Some(&expected_version)
@@ -37,7 +37,7 @@ pub async fn execute_preview_service_location(
                 return Err("stale service-location write".into());
             }
             if expected_status.service_location_projection
-                != crate::evaluator::test_bridge::PreviewServiceLocationStage::Pending(
+                != crate::evaluator::testing::PublicV1ServiceLocationStage::Pending(
                     projection.clone(),
                 )
             {
@@ -45,7 +45,7 @@ pub async fn execute_preview_service_location(
                     "service-location mutation is not the accepted pending projection".into(),
                 );
             }
-            api.replace_preview_service(crate::cluster_api::preview_service_update(
+            api.replace_public_v1_service(crate::cluster_api::public_v1_service_update(
                 &service,
                 &projection,
             ))

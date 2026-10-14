@@ -19,11 +19,10 @@ pub mod cluster_api;
 pub mod crd;
 mod error;
 pub mod evaluator;
-#[cfg(feature = "runtime-test-bridge")]
-mod exact_resources;
 pub mod executor;
-mod normalize;
 pub mod observation;
+#[cfg(feature = "runtime-test-bridge")]
+mod public_v1_normalize;
 mod public_v1_reconciliation;
 pub mod reconciler;
 

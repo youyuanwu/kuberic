@@ -185,7 +185,7 @@ pub enum ValidationError {
 #[doc(hidden)]
 pub fn validate_public_fault_action(
     action: &crate::protocol::public_operations::PublicFaultAction,
-    binding: &crate::protocol::public_operations::PreviewLifecycleBinding,
+    binding: &crate::protocol::public_operations::PublicV1LifecycleBinding,
     target: &ReplicaIdentity,
     process_session: &crate::protocol::types::ProcessSessionId,
     fault: crate::protocol::types::FaultType,

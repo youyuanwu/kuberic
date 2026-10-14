@@ -11,7 +11,7 @@ use crate::host::state::{PublicOperationDisposition, PublicOperationRecord, Publ
 use crate::host::store::{AgentStore, BeginPublicOperation};
 use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
-    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
+    PublicOperationClass, PublicOperationIntent, PublicV1Identity,
 };
 use crate::protocol::types::{OperationId, ProcessSessionId};
 
@@ -695,7 +695,7 @@ struct RegistryState {
 
 pub(crate) struct PartitionOperationRegistry {
     store: Arc<dyn AgentStore>,
-    preview: PublicOperationPreviewIdentity,
+    preview: PublicV1Identity,
     process_session_id: ProcessSessionId,
     admission: Mutex<()>,
     state: Mutex<RegistryState>,
@@ -710,12 +710,12 @@ pub(crate) struct PartitionOperationRegistry {
 impl PartitionOperationRegistry {
     pub(crate) fn new(
         store: Arc<dyn AgentStore>,
-        preview: PublicOperationPreviewIdentity,
+        preview: PublicV1Identity,
         process_session_id: ProcessSessionId,
     ) -> Result<Arc<Self>> {
-        if !preview.is_valid() {
+        if !preview.is_public_v1() {
             return Err(HostError::CommandRejected(
-                "invalid public-operation preview identity".into(),
+                "invalid Public V1 identity".into(),
             ));
         }
         if process_session_id.is_empty() {
@@ -853,7 +853,7 @@ impl PartitionOperationRegistry {
                 .store
                 .load_state()
                 .await?
-                .public_operation_preview
+                .public_v1_operation_state
                 .is_some_and(|preview| !preview.history_barriers.is_empty());
         if has_history_barrier
             && intent.preview.is_public_v1()
@@ -1219,7 +1219,7 @@ impl PartitionOperationRegistry {
             .store
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .is_some_and(|preview| preview.terminal)
         {
             self.fence();
@@ -1439,7 +1439,7 @@ mod tests {
 
     fn intent(class: PublicOperationClass, revision: u64) -> PublicOperationIntent {
         PublicOperationIntent {
-            preview: PublicOperationPreviewIdentity::new(1),
+            preview: PublicV1Identity::new(1),
             operation_id: OperationId::new(format!("operation-{revision}-{class:?}")),
             revision,
             process_session_id: ProcessSessionId::new("session"),
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_relation_covers_the_reviewed_compatibility_edges() {
+    fn admission_relation_covers_public_v1_operation_edges() {
         use AdmissionRelation::{Attach, Coexist, Reject, Supersede};
         use PublicOperationClass::{
             Abort, Authority, Build, Close, DropReplacement, PermanentFault, PlannedSwap, Remove,

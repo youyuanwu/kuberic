@@ -1,7 +1,7 @@
 #![cfg(feature = "runtime-test-bridge")]
 
-pub(crate) fn normalize_public_service_location(
-    config: &crate::evaluator::test_bridge::PublicOperationPreviewEvaluationConfig,
+pub(crate) fn normalize_public_v1_lifecycle_service_location(
+    config: &crate::evaluator::testing::PublicV1EvaluationConfig,
     authority: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
     report: Option<&kuberic_runtime::protocol::public_operations::PublicLifecycleReport>,
 ) -> std::result::Result<
@@ -44,7 +44,7 @@ pub(crate) fn normalize_public_service_location(
 }
 
 pub fn normalize_public_v1_service_location(
-    config: &crate::evaluator::test_bridge::PublicOperationPreviewEvaluationConfig,
+    config: &crate::evaluator::testing::PublicV1EvaluationConfig,
     authority: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
     report: Option<&kuberic_runtime::protocol::public_operations::PublicV1AgentReport>,
 ) -> std::result::Result<

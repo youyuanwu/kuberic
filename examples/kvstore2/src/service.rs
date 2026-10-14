@@ -39,12 +39,6 @@ impl KvService {
         }
     }
 
-    #[cfg(feature = "testing")]
-    #[allow(dead_code)]
-    pub fn with_stateless_preview(self) -> Self {
-        self
-    }
-
     pub fn persistence(&self) -> &Arc<KvPersistence> {
         self.provider.persistence()
     }
@@ -98,7 +92,6 @@ impl StatefulServiceReplica for KvService {
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: true,
                 }),
             )
             .await?;

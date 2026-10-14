@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::StatefulServiceReplica;
-use crate::protocol::public_operations::PreviewLifecycleBinding;
-use crate::protocol::public_operations::{PublicOperationPreviewIdentity, StatePersistence};
+use crate::protocol::public_operations::PublicV1LifecycleBinding;
+use crate::protocol::public_operations::{PublicV1Identity, StatePersistence};
 use crate::protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid};
 use serde::Serialize;
 use tokio::sync::watch;
@@ -87,7 +87,7 @@ pub struct ReplicaHandle {
 
 #[derive(Clone)]
 struct ReplacementProcessHandle {
-    binding: PreviewLifecycleBinding,
+    binding: PublicV1LifecycleBinding,
     registry: Arc<crate::host::operation::PartitionOperationRegistry>,
     report_sequence: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -111,7 +111,7 @@ impl ReplicaHandle {
             process_session: self.process_session.to_string(),
             role: format!("{role:?}"),
             epoch: state
-                .public_operation_preview
+                .public_v1_operation_state
                 .as_ref()
                 .and_then(|preview| preview.history.as_ref())
                 .map_or_else(
@@ -135,11 +135,11 @@ impl ReplicaHandle {
             catch_up_complete: current_progress == committed_lsn,
             scale_up_operation: None,
             retired: state
-                .public_operation_preview
+                .public_v1_operation_state
                 .as_ref()
                 .is_some_and(|preview| preview.terminal),
             pending_operation: state
-                .public_operation_preview
+                .public_v1_operation_state
                 .as_ref()
                 .and_then(|preview| preview.current_operation.as_ref().map(ToString::to_string)),
             blocking: None,
@@ -148,7 +148,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn initialize_stateless_preview_history(
+    pub async fn initialize_public_v1_history(
         &self,
         initialization_id: &crate::protocol::types::HistoryInitializationId,
         history: &crate::protocol::types::HistoryContext,
@@ -159,7 +159,7 @@ impl ReplicaHandle {
                 "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
-        if !preview.binding.preview.is_public_v1() {
+        if !preview.binding.identity.is_public_v1() {
             return Err(crate::host::HostError::IdentityMismatch(
                 "replacement runtime requires Public V1".into(),
             ));
@@ -170,7 +170,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn install_stateless_preview_inbound_build_authority(
+    pub async fn install_public_v1_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
@@ -179,7 +179,7 @@ impl ReplicaHandle {
                 "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
-        if !preview.binding.preview.is_public_v1()
+        if !preview.binding.identity.is_public_v1()
             || authority.attempt.target != self.store.load_state().await?.identity.local_identity
         {
             return Err(crate::host::HostError::IdentityMismatch(
@@ -193,7 +193,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn execute_stateless_preview(
+    pub async fn execute_public_v1(
         &self,
         intent: crate::protocol::public_operations::PublicOperationIntent,
     ) -> Result<()> {
@@ -204,7 +204,7 @@ impl ReplicaHandle {
                 "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
-        if intent.preview != preview.binding.preview
+        if intent.preview != preview.binding.identity
             || intent.process_session_id.as_str() != self.process_session.as_ref()
         {
             return Err(crate::host::HostError::IdentityMismatch(
@@ -288,7 +288,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn execute_stateless_preview_command(
+    pub async fn execute_public_v1_command(
         &self,
         command: crate::protocol::command::ProtocolCommand,
     ) -> Result<()> {
@@ -306,21 +306,21 @@ impl ReplicaHandle {
                 "public-v1 operation command targets another replica".into(),
             ));
         }
-        self.execute_stateless_preview(command.intent).await
+        self.execute_public_v1(command.intent).await
     }
 
     #[cfg(feature = "testing")]
-    pub async fn fence_stateless_preview_access(&self) {
+    pub async fn fence_public_v1_access(&self) {
         self.runtime.fence_replacement_access().await;
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_process_endpoint(
+    pub async fn public_v1_process_endpoint(
         &self,
         role: crate::protocol::types::ReplicaRole,
     ) -> Result<crate::protocol::types::ProcessSessionEndpoint> {
         let state = self.store.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected(
                 "replacement process endpoint requires current state".into(),
             )
@@ -339,12 +339,12 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_next_operation_revision(&self) -> Result<u64> {
+    pub async fn public_v1_next_operation_revision(&self) -> Result<u64> {
         let preview = self
             .store
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "replacement runtime requires operation state".into(),
@@ -365,7 +365,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_operation_intent(
+    pub async fn public_v1_operation_intent(
         &self,
         operation_id: &crate::protocol::types::OperationId,
     ) -> Result<Option<crate::protocol::public_operations::PublicOperationIntent>> {
@@ -373,7 +373,7 @@ impl ReplicaHandle {
             .store
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "replacement runtime requires operation state".into(),
@@ -386,7 +386,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn authorize_stateless_preview_session_renewal(
+    pub async fn authorize_public_v1_session_renewal(
         &self,
         required: crate::protocol::public_operations::ProcessSessionRenewalRequired,
     ) -> Result<crate::protocol::public_operations::PublicV1SessionRenewalStatus> {
@@ -466,7 +466,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn persist_stateless_preview_session_renewal(
+    pub async fn persist_public_v1_session_renewal(
         &self,
         expected: Option<&crate::protocol::public_operations::PublicV1SessionRenewalStatus>,
         next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
@@ -477,7 +477,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_report(
+    pub async fn public_v1_report(
         &self,
     ) -> Result<crate::protocol::public_operations::PublicV1AgentReport> {
         let preview = self.replacement.as_ref().ok_or_else(|| {
@@ -500,7 +500,7 @@ impl ReplicaHandle {
             .await?;
         crate::host::public_lifecycle::public_v1_report(
             self.store.as_ref(),
-            &preview.binding.preview,
+            &preview.binding.identity,
             projection,
         )
         .await
@@ -512,12 +512,12 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub fn stateless_preview_provider_writer_count(&self) -> usize {
+    pub fn public_v1_provider_writer_count(&self) -> usize {
         self.runtime.provider_writer_lease_count()
     }
 
     #[cfg(feature = "testing")]
-    pub fn stateless_preview_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
+    pub fn public_v1_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
         self.runtime
             .replacement_raw_retained_task_cardinality()
             .map_err(Into::into)
@@ -562,7 +562,7 @@ pub struct ReplicaHost<A, R> {
     application_storage: ApplicationStorageState,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     _resolver: Arc<R>,
-    replacement_binding: Option<PreviewLifecycleBinding>,
+    public_v1_binding: Option<PublicV1LifecycleBinding>,
 }
 
 impl<A, R> ReplicaHost<A, R>
@@ -577,8 +577,8 @@ where
         resolver: Arc<R>,
     ) -> Self {
         Self {
-            replacement_binding: Some(PreviewLifecycleBinding {
-                preview: PublicOperationPreviewIdentity::public_v1(1),
+            public_v1_binding: Some(PublicV1LifecycleBinding {
+                identity: PublicV1Identity::new(1),
                 resource_uid: config.resource_uid.clone(),
                 spec_generation: 1,
                 state_persistence: StatePersistence::Persisted,
@@ -591,8 +591,8 @@ where
         }
     }
 
-    pub fn with_stateless_preview(mut self, binding: PreviewLifecycleBinding) -> Self {
-        self.replacement_binding = Some(binding);
+    pub fn with_public_v1_binding(mut self, binding: PublicV1LifecycleBinding) -> Self {
+        self.public_v1_binding = Some(binding);
         self
     }
 
@@ -628,7 +628,7 @@ where
                 "replica ID must be positive".into(),
             ));
         }
-        let binding = self.replacement_binding.as_ref().ok_or_else(|| {
+        let binding = self.public_v1_binding.as_ref().ok_or_else(|| {
             crate::host::HostError::InitializationNotAuthorized(
                 "Public V1 lifecycle binding is required".into(),
             )
@@ -636,7 +636,7 @@ where
         binding.validate().map_err(|message| {
             crate::host::HostError::InitializationNotAuthorized(message.into())
         })?;
-        if !binding.preview.is_public_v1() || binding.resource_uid != self.config.resource_uid {
+        if !binding.identity.is_public_v1() || binding.resource_uid != self.config.resource_uid {
             return Err(crate::host::HostError::InitializationNotAuthorized(
                 "Public V1 binding differs from the selected process identity".into(),
             ));
@@ -665,7 +665,7 @@ where
                 self.application_storage == ApplicationStorageState::FreshEmpty,
                 paths.clone(),
                 startup_shutdown.clone(),
-                self.replacement_binding.clone(),
+                self.public_v1_binding.clone(),
             )
             .await?;
         }
@@ -696,7 +696,7 @@ where
         let local_session = agent.local_session().clone();
         let process_session: Arc<str> = Arc::from(local_session.as_str());
         let replacement_registry = agent
-            .public_operation_runtime(binding.preview.clone())
+            .public_operation_runtime(binding.identity.clone())
             .await?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready, mut ready_rx) = watch::channel(false);
@@ -771,9 +771,7 @@ where
                 store,
                 process_session,
                 replacement: Some(ReplacementProcessHandle {
-                    binding: self
-                        .replacement_binding
-                        .expect("validated Public V1 binding"),
+                    binding: self.public_v1_binding.expect("validated Public V1 binding"),
                     registry: replacement_registry,
                     report_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 }),
@@ -832,7 +830,7 @@ async fn serve_initialization(
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     mut startup_shutdown: watch::Receiver<bool>,
-    replacement_binding: Option<PreviewLifecycleBinding>,
+    public_v1_binding: Option<PublicV1LifecycleBinding>,
 ) -> Result<()> {
     let (initialized, mut initialized_rx) = watch::channel(false);
     let service = InitializationService::new(
@@ -844,7 +842,7 @@ async fn serve_initialization(
         fresh_application_state,
     )?
     .with_application_storage_paths(application_storage_paths);
-    let service = service.with_replacement_binding(replacement_binding);
+    let service = service.with_public_v1_binding(public_v1_binding);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (ready, _) = watch::channel(false);
     let stop = tokio::spawn(async move {

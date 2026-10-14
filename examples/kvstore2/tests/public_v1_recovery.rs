@@ -9,11 +9,11 @@ use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PossibleDataLossIntent, PreviewLifecycleBinding, ProcessSessionRenewalRequired,
-    PublicBuildAttemptReference, PublicBuildInput, PublicCatchUpMode, PublicConfiguration,
-    PublicInboundBuildAuthority, PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram,
-    PublicOperationReplayDisposition, PublicReplicaDescriptor, StatePersistence,
+    PossibleDataLossIntent, ProcessSessionRenewalRequired, PublicBuildAttemptReference,
+    PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicInboundBuildAuthority,
+    PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
+    PublicOperationProgram, PublicOperationReplayDisposition, PublicReplicaDescriptor,
+    PublicV1Identity, PublicV1LifecycleBinding, StatePersistence,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -84,7 +84,7 @@ fn store_identity(
 }
 
 fn intent(
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     session: kuberic_runtime::protocol::types::ProcessSessionId,
     revision: u64,
     name: &str,
@@ -113,7 +113,7 @@ fn intent(
 }
 
 fn lifecycle_intent(
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     session: kuberic_runtime::protocol::types::ProcessSessionId,
     revision: u64,
     name: &str,
@@ -160,9 +160,9 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         drop(retired);
 
         let resource_uid = ResourceUid::new("kvstore2-public-v1-preview");
-        let preview = PublicOperationPreviewIdentity::public_v1(51);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(51);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -201,30 +201,21 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             Arc::new(KvPersistence::open(replacement_root.join("application")).unwrap());
         let divergent_persistence = Arc::new(KvPersistence::open(&retired_root).unwrap());
         let copy_gate = CopyGate::enabled(source_root.join("copy-gate")).unwrap();
-        let source_service = Arc::new(
-            KvService::new(
-                source_persistence.clone(),
-                format!("http://{source_address}"),
-                copy_gate.clone(),
-            )
-            .with_stateless_preview(),
-        );
-        let replacement_service = Arc::new(
-            KvService::new(
-                replacement_persistence.clone(),
-                format!("http://{replacement_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
-        let divergent_service = Arc::new(
-            KvService::new(
-                divergent_persistence.clone(),
-                format!("http://{divergent_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
+        let source_service = Arc::new(KvService::new(
+            source_persistence.clone(),
+            format!("http://{source_address}"),
+            copy_gate.clone(),
+        ));
+        let replacement_service = Arc::new(KvService::new(
+            replacement_persistence.clone(),
+            format!("http://{replacement_address}"),
+            CopyGate::disabled(),
+        ));
+        let divergent_service = Arc::new(KvService::new(
+            divergent_persistence.clone(),
+            format!("http://{divergent_address}"),
+            CopyGate::disabled(),
+        ));
         let mut source = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource_uid.clone(),
@@ -242,7 +233,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -263,7 +254,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -284,7 +275,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -295,15 +286,15 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         source_handle
-            .initialize_stateless_preview_history(&initialization, &history, &source_storage)
+            .initialize_public_v1_history(&initialization, &history, &source_storage)
             .await
             .unwrap();
         replacement_handle
-            .initialize_stateless_preview_history(&initialization, &history, &replacement_storage)
+            .initialize_public_v1_history(&initialization, &history, &replacement_storage)
             .await
             .unwrap();
         divergent_handle
-            .initialize_stateless_preview_history(&initialization, &history, &divergent_storage)
+            .initialize_public_v1_history(&initialization, &history, &divergent_storage)
             .await
             .unwrap();
         let epoch = Epoch::new(0, 1);
@@ -349,7 +340,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     revision,
@@ -383,7 +374,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             divergent_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     divergent_handle.process_session_id(),
                     revision,
@@ -417,7 +408,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             replacement_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     replacement_handle.process_session_id(),
                     revision,
@@ -446,7 +437,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             history: Some(history.clone()),
         };
         divergent_handle
-            .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
                 operation_id: OperationId::new("kv-divergent-build"),
                 operation_revision: 4,
                 attempt: PublicBuildAttemptReference {
@@ -468,7 +459,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             .unwrap();
         assert!(
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     4,
@@ -480,7 +471,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         );
         assert!(
             source_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .completed_operations
@@ -495,7 +486,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 })
         );
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 4,
@@ -515,19 +506,16 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             9
         );
         let source_predecessor = source_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         source.shutdown();
         source.wait().await.unwrap();
-        let source_service = Arc::new(
-            KvService::new(
-                source_persistence.clone(),
-                format!("http://{source_address}"),
-                copy_gate.clone(),
-            )
-            .with_stateless_preview(),
-        );
+        let source_service = Arc::new(KvService::new(
+            source_persistence.clone(),
+            format!("http://{source_address}"),
+            copy_gate.clone(),
+        ));
         let mut source = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource_uid.clone(),
@@ -545,7 +533,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -561,7 +549,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             1,
         );
         source_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("kv-source-after-divergent-retirement"),
                 reason: ProcessSessionRenewalReason::PrimaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -618,7 +606,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     revision,
@@ -644,7 +632,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             replacement_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     replacement_handle.process_session_id(),
                     revision,
@@ -666,7 +654,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             history: Some(history.clone()),
         };
         replacement_handle
-            .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
                 operation_id: OperationId::new("kv-corrective-build"),
                 operation_revision: 8,
                 attempt: PublicBuildAttemptReference {
@@ -692,7 +680,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             let input = build_input.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         8,
@@ -755,7 +743,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             2,
         );
         replacement_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replacement_handle.process_session_id(),
                 6,
@@ -768,7 +756,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         replacement_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replacement_handle.process_session_id(),
                 7,
@@ -792,7 +780,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 9,
@@ -837,7 +825,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         .await
         .expect("replacement did not observe committed post-build write");
         let replacement_predecessor = replacement_handle
-            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
         replacement.shutdown();
@@ -845,14 +833,11 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         let replacement_restart_address = address();
         let replacement_restart_persistence =
             Arc::new(KvPersistence::open(replacement_root.join("application")).unwrap());
-        let replacement_restart_service = Arc::new(
-            KvService::new(
-                replacement_restart_persistence.clone(),
-                format!("http://{replacement_restart_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
+        let replacement_restart_service = Arc::new(KvService::new(
+            replacement_restart_persistence.clone(),
+            format!("http://{replacement_restart_address}"),
+            CopyGate::disabled(),
+        ));
         let mut restarted_replacement = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource_uid.clone(),
@@ -870,7 +855,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
@@ -892,7 +877,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             2,
         );
         replacement_restart_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("kv-replacement-restart"),
                 reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -911,7 +896,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 }),
                 surviving_sessions: vec![
                     source_handle
-                        .stateless_preview_process_endpoint(ReplicaRole::Primary)
+                        .public_v1_process_endpoint(ReplicaRole::Primary)
                         .await
                         .unwrap(),
                 ],
@@ -922,7 +907,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 10,
@@ -934,7 +919,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 11,
@@ -972,7 +957,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             replacement_restart_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     replacement_restart_handle.process_session_id(),
                     revision,
@@ -984,7 +969,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         }
 
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 12,
@@ -1008,7 +993,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         replacement_restart_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replacement_restart_handle.process_session_id(),
                 11,
@@ -1082,7 +1067,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
         );
         assert!(
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     13,
@@ -1154,9 +1139,9 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
         std::fs::create_dir_all(&secondary_root).unwrap();
 
         let resource_uid = ResourceUid::new("kvstore2-public-v1-composite");
-        let preview = PublicOperationPreviewIdentity::public_v1(51);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(51);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -1189,22 +1174,16 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             Arc::new(KvPersistence::open(source_root.join("application")).unwrap());
         let secondary_persistence =
             Arc::new(KvPersistence::open(secondary_root.join("application")).unwrap());
-        let source_service = Arc::new(
-            KvService::new(
-                source_persistence.clone(),
-                format!("http://{source_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
-        let secondary_service = Arc::new(
-            KvService::new(
-                secondary_persistence.clone(),
-                format!("http://{secondary_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
+        let source_service = Arc::new(KvService::new(
+            source_persistence.clone(),
+            format!("http://{source_address}"),
+            CopyGate::disabled(),
+        ));
+        let secondary_service = Arc::new(KvService::new(
+            secondary_persistence.clone(),
+            format!("http://{secondary_address}"),
+            CopyGate::disabled(),
+        ));
         let mut source = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource_uid.clone(),
@@ -1222,7 +1201,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -1243,7 +1222,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -1253,11 +1232,11 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         source_handle
-            .initialize_stateless_preview_history(&initialization, &history, &source_storage)
+            .initialize_public_v1_history(&initialization, &history, &source_storage)
             .await
             .unwrap();
         secondary_handle
-            .initialize_stateless_preview_history(&initialization, &history, &secondary_storage)
+            .initialize_public_v1_history(&initialization, &history, &secondary_storage)
             .await
             .unwrap();
 
@@ -1346,7 +1325,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 ),
             ] {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         revision,
@@ -1378,11 +1357,11 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
         .await
         .expect("baseline did not reach the real secondary provider");
         let source_predecessor = source_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         let secondary_predecessor = secondary_handle
-            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
         source.shutdown();
@@ -1422,22 +1401,16 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             Arc::new(KvPersistence::open(source_root.join("application")).unwrap());
         let secondary_persistence =
             Arc::new(KvPersistence::open(secondary_root.join("application")).unwrap());
-        let source_service = Arc::new(
-            KvService::new(
-                source_persistence.clone(),
-                format!("http://{source_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
-        let secondary_service = Arc::new(
-            KvService::new(
-                secondary_persistence.clone(),
-                format!("http://{secondary_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
+        let source_service = Arc::new(KvService::new(
+            source_persistence.clone(),
+            format!("http://{source_address}"),
+            CopyGate::disabled(),
+        ));
+        let secondary_service = Arc::new(KvService::new(
+            secondary_persistence.clone(),
+            format!("http://{secondary_address}"),
+            CopyGate::disabled(),
+        ));
         let mut source = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource_uid.clone(),
@@ -1455,7 +1428,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -1476,7 +1449,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
@@ -1496,7 +1469,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             1,
         );
         source_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("kv-composite-renew-source"),
                 reason: ProcessSessionRenewalReason::PrimaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -1546,7 +1519,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ),
         ] {
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     revision,
@@ -1557,7 +1530,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 .unwrap();
         }
         let renewed_source = source_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         let restart_configuration = ConfigurationDescriptor::new(
@@ -1576,7 +1549,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             2,
         );
         secondary_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("kv-composite-renew-secondary"),
                 reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -1626,7 +1599,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ),
         ] {
             secondary_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     secondary_handle.process_session_id(),
                     revision,
@@ -1667,7 +1640,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             }],
         };
         secondary_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
                 8,
@@ -1677,7 +1650,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 8,
@@ -1687,11 +1660,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .await
             .unwrap();
         assert_ne!(
-            source_handle
-                .stateless_preview_report()
-                .await
-                .unwrap()
-                .write_status,
+            source_handle.public_v1_report().await.unwrap().write_status,
             AccessStatus::Granted
         );
         assert!(source_service.get("unsettled").await.is_err());
@@ -1702,7 +1671,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 .is_err()
         );
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 9,
@@ -1734,8 +1703,8 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             source_service.get("unsettled").await.unwrap().as_deref(),
             Some("v2")
         );
-        let source_report = source_handle.stateless_preview_report().await.unwrap();
-        let secondary_report = secondary_handle.stateless_preview_report().await.unwrap();
+        let source_report = source_handle.public_v1_report().await.unwrap();
+        let secondary_report = secondary_handle.public_v1_report().await.unwrap();
         assert_eq!(source_report.write_status, AccessStatus::Granted);
         assert_ne!(secondary_report.write_status, AccessStatus::Granted);
 
@@ -1770,7 +1739,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ),
         ] {
             handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     handle.process_session_id(),
                     revision,
@@ -1782,7 +1751,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 .await
                 .unwrap();
             handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     handle.process_session_id(),
                     revision + 1,
@@ -1826,7 +1795,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             }],
         };
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 12,
@@ -1836,7 +1805,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .await
             .unwrap();
         secondary_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
                 11,
@@ -1846,7 +1815,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .await
             .unwrap();
         secondary_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
                 12,
@@ -1858,8 +1827,8 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ))
             .await
             .unwrap();
-        let source_report = source_handle.stateless_preview_report().await.unwrap();
-        let secondary_report = secondary_handle.stateless_preview_report().await.unwrap();
+        let source_report = source_handle.public_v1_report().await.unwrap();
+        let secondary_report = secondary_handle.public_v1_report().await.unwrap();
         assert_ne!(source_report.write_status, AccessStatus::Granted);
         assert_eq!(secondary_report.write_status, AccessStatus::Granted);
         assert!(
@@ -1919,9 +1888,9 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
         std::fs::create_dir_all(&survivor_root).unwrap();
 
         let resource_uid = ResourceUid::new("kvstore2-public-v1-failover");
-        let preview = PublicOperationPreviewIdentity::public_v1(54);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(54);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -1953,22 +1922,16 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             Arc::new(KvPersistence::open(source_root.join("application")).unwrap());
         let survivor_persistence =
             Arc::new(KvPersistence::open(survivor_root.join("application")).unwrap());
-        let source_service = Arc::new(
-            KvService::new(
-                source_persistence,
-                format!("http://{source_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
-        let survivor_service = Arc::new(
-            KvService::new(
-                survivor_persistence.clone(),
-                format!("http://{survivor_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
+        let source_service = Arc::new(KvService::new(
+            source_persistence,
+            format!("http://{source_address}"),
+            CopyGate::disabled(),
+        ));
+        let survivor_service = Arc::new(KvService::new(
+            survivor_persistence.clone(),
+            format!("http://{survivor_address}"),
+            CopyGate::disabled(),
+        ));
         let mut source = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource_uid.clone(),
@@ -1986,7 +1949,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -2007,7 +1970,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -2017,11 +1980,11 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         source_handle
-            .initialize_stateless_preview_history(&initialization, &history, &source_storage)
+            .initialize_public_v1_history(&initialization, &history, &source_storage)
             .await
             .unwrap();
         survivor_handle
-            .initialize_stateless_preview_history(&initialization, &history, &survivor_storage)
+            .initialize_public_v1_history(&initialization, &history, &survivor_storage)
             .await
             .unwrap();
         let initial_epoch = Epoch::new(0, 1);
@@ -2109,7 +2072,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 ),
             ] {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         revision,
@@ -2128,7 +2091,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             1
         );
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 5,
@@ -2181,7 +2144,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             1,
         );
         survivor_handle
-            .execute_stateless_preview(lifecycle_intent(
+            .execute_public_v1(lifecycle_intent(
                 &preview,
                 survivor_handle.process_session_id(),
                 5,
@@ -2230,14 +2193,11 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             Some("v2")
         );
 
-        let returning_service = Arc::new(
-            KvService::new(
-                Arc::new(KvPersistence::open(source_root.join("application")).unwrap()),
-                format!("http://{source_address}"),
-                CopyGate::disabled(),
-            )
-            .with_stateless_preview(),
-        );
+        let returning_service = Arc::new(KvService::new(
+            Arc::new(KvPersistence::open(source_root.join("application")).unwrap()),
+            format!("http://{source_address}"),
+            CopyGate::disabled(),
+        ));
         let mut returning = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid,
@@ -2255,14 +2215,14 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
         assert_ne!(
             returning
                 .handle()
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,

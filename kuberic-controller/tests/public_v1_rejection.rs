@@ -1,8 +1,6 @@
 use kuberic_controller::crd::{KubericSetStatus, PublicV1AuthorityStatus};
 use kuberic_runtime::control::{normalize_public_v1_agent_status_report, proto};
-use kuberic_runtime::protocol::public_operations::{
-    PublicOperationPreviewIdentity, PublicV1AcceptedStatus,
-};
+use kuberic_runtime::protocol::public_operations::{PublicV1AcceptedStatus, PublicV1Identity};
 use kuberic_runtime::protocol::types::{
     HistoryContext, HistoryId, HistoryInitializationId, PublicProtocolGeneration, ResourceUid,
 };
@@ -45,7 +43,7 @@ fn old_and_partial_controller_status_reject_without_mutation() {
 
     let partial = KubericSetStatus {
         public_v1_authority: Some(PublicV1AuthorityStatus {
-            identity: PublicOperationPreviewIdentity::public_v1(1),
+            identity: PublicV1Identity::new(1),
             history_initialization_id: HistoryInitializationId::new(""),
             history: HistoryContext {
                 resource_uid: ResourceUid::new("resource-1"),
@@ -55,7 +53,7 @@ fn old_and_partial_controller_status_reject_without_mutation() {
             },
             completed_operation_count: 0,
             canonical_authority_json: serde_json::to_string(&PublicV1AcceptedStatus {
-                identity: PublicOperationPreviewIdentity::public_v1(1),
+                identity: PublicV1Identity::new(1),
                 history_initialization_id: HistoryInitializationId::new("different"),
                 history: HistoryContext {
                     resource_uid: ResourceUid::new("resource-1"),

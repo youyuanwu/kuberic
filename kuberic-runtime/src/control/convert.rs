@@ -8,10 +8,10 @@ use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
     DataLossReplay, ProcessAttemptContext, ProviderProgressReset, ProviderReplicaIdentity,
     PublicBuildAttemptReference, PublicCatchUpMode, PublicDataLossRecoveryStage,
-    PublicDataLossRecoveryStatus, PublicOperationPreviewIdentity, PublicOperationReplayDisposition,
-    PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1CallKind,
-    PublicV1ExtensionSlot, PublicV1Extensions, PublicV1OperationCompletion,
-    PublicV1OperationResult, ReplicaRebuildReason, ServiceLocation,
+    PublicDataLossRecoveryStatus, PublicOperationReplayDisposition, PublicProgress,
+    PublicProgressRole, PublicV1AgentReport, PublicV1CallKind, PublicV1ExtensionSlot,
+    PublicV1Extensions, PublicV1Identity, PublicV1OperationCompletion, PublicV1OperationResult,
+    ReplicaRebuildReason, ServiceLocation,
 };
 use crate::protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
@@ -172,11 +172,9 @@ pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
 pub fn normalize_public_v1_agent_status_report(
     report: proto::AgentStatusReport,
 ) -> Result<PublicV1AgentReport, WireError> {
-    if report.protocol_version
-        != crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
-    {
+    if report.protocol_version != crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION {
         return Err(WireError::UnsupportedProtocolVersion {
-            expected: crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            expected: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
             observed: report.protocol_version,
         });
     }
@@ -188,8 +186,7 @@ pub fn normalize_public_v1_agent_status_report(
     let public = report
         .public_v1
         .ok_or(WireError::MissingField("agent_status.public_v1"))?;
-    if public.protocol_version
-        != crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+    if public.protocol_version != crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION
         || public.generation == 0
     {
         return Err(WireError::InvalidAuthority(
@@ -269,7 +266,7 @@ pub fn normalize_public_v1_agent_status_report(
         .service_location
         .map(|location| {
             Ok(ServiceLocation {
-                preview: PublicOperationPreviewIdentity {
+                preview: PublicV1Identity {
                     protocol_version: location.protocol_version,
                     generation: location.generation,
                 },
@@ -292,7 +289,7 @@ pub fn normalize_public_v1_agent_status_report(
         })
         .transpose()?;
     let report = PublicV1AgentReport {
-        identity: PublicOperationPreviewIdentity {
+        identity: PublicV1Identity {
             protocol_version: public.protocol_version,
             generation: public.generation,
         },
@@ -325,7 +322,7 @@ pub fn normalize_public_v1_agent_status_report(
 /// fields in the outer envelope remain at their protobuf defaults.
 pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::AgentStatusReport {
     proto::AgentStatusReport {
-        protocol_version: crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+        protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
         public_v1: Some(proto::PublicV1AgentStatus {
             protocol_version: report.identity.protocol_version,
             generation: report.identity.generation,
@@ -843,7 +840,7 @@ fn captured_operation_from_proto(
         .into();
     let identity = CapturedPublicOperationIdentity {
         resource_uid: ResourceUid::new(value.resource_uid),
-        preview: PublicOperationPreviewIdentity {
+        preview: PublicV1Identity {
             protocol_version: value.protocol_version,
             generation: value.generation,
         },

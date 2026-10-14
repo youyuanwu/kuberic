@@ -1,11 +1,7 @@
-use kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity;
+use kuberic_runtime::protocol::public_operations::PublicV1Identity;
 
 use super::EvaluationConfig;
 
-pub use super::public_lifecycle::{
-    PreviewAcceptedStatus, PreviewServiceLocationPlan, PreviewServiceLocationStage,
-    PreviewTransition, ServiceLocationProjection, evaluate_service_location, plan_public_lifecycle,
-};
 pub use super::public_v1_evidence::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
     PublicV1EvidencePlan, PublicV1ResourceAuthority, plan_public_v1_evidence,
@@ -23,6 +19,11 @@ pub use super::public_v1_history::{
     plan_data_loss_recovery as plan_public_v1_data_loss_recovery,
     plan_recovery_report as plan_public_v1_recovery_report,
 };
+pub use super::public_v1_lifecycle::{
+    PublicV1LifecycleStatus, PublicV1LifecycleTransition, PublicV1ServiceLocationPlan,
+    PublicV1ServiceLocationStage, ServiceLocationProjection, evaluate_service_location,
+    plan_public_v1_lifecycle,
+};
 pub use super::public_v1_session_renewal::{
     PublicV1SessionRenewalPlan, accept_access_closed as accept_public_v1_session_access_closed,
     accept_epoch_updated as accept_public_v1_session_epoch_updated,
@@ -33,45 +34,39 @@ pub use super::public_v1_session_renewal::{
     plan_session_renewal as plan_public_v1_session_renewal,
 };
 pub use crate::cluster_api::{
-    HostedPreviewReplica, HostedPublicV1Adapter, PreviewServiceApi, PublicV1EvidenceApi,
-    PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi,
-    PublicV1OperationApi, PublicV1ResourceDisposition, PublicV1ResourceProof,
-    PublicV1SessionRenewalApi, preview_service_matches, preview_service_update,
+    HostedPublicV1Harness, HostedPublicV1Replica, PublicV1EvidenceApi, PublicV1EvidenceEffect,
+    PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1OperationApi,
+    PublicV1ResourceDisposition, PublicV1ResourceProof, PublicV1ServiceApi,
+    PublicV1SessionRenewalApi, public_v1_service_matches, public_v1_service_update,
 };
 pub use crate::executor::{
-    execute_preview_service_location, execute_public_v1_evidence, execute_public_v1_history,
-    execute_public_v1_operation, execute_public_v1_session_renewal,
+    execute_public_v1_evidence, execute_public_v1_history, execute_public_v1_operation,
+    execute_public_v1_service_location, execute_public_v1_session_renewal,
 };
-pub use crate::normalize::normalize_public_v1_service_location;
+pub use crate::public_v1_normalize::normalize_public_v1_service_location;
 pub use crate::public_v1_reconciliation::{
     PublicV1ReconciliationOutcome, reconcile_public_v1_consumer, reconcile_public_v1_operation,
 };
-pub use k8s_openapi::api::core::v1::Service as PreviewWriteService;
+pub use k8s_openapi::api::core::v1::Service as PublicV1WriteService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicOperationPreviewEvaluationConfig {
-    pub identity: PublicOperationPreviewIdentity,
+pub struct PublicV1EvaluationConfig {
+    pub identity: PublicV1Identity,
     pub evaluation: EvaluationConfig,
 }
 
-impl PublicOperationPreviewEvaluationConfig {
-    pub fn new(identity: PublicOperationPreviewIdentity, evaluation: EvaluationConfig) -> Self {
-        assert!(
-            identity.is_valid(),
-            "public-operation preview identity must be valid"
-        );
+impl PublicV1EvaluationConfig {
+    pub fn new(identity: PublicV1Identity, evaluation: EvaluationConfig) -> Self {
+        assert!(identity.is_valid(), "Public V1 identity must be valid");
         Self {
             identity,
             evaluation,
         }
     }
 
-    pub fn validate_identity(
-        &self,
-        observed: &PublicOperationPreviewIdentity,
-    ) -> Result<(), String> {
+    pub fn validate_identity(&self, observed: &PublicV1Identity) -> Result<(), String> {
         if observed != &self.identity {
-            return Err("public-operation preview identity mismatch".into());
+            return Err("Public V1 identity mismatch".into());
         }
         Ok(())
     }

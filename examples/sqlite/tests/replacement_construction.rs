@@ -10,8 +10,7 @@ use kuberic_runtime::host::{
 use kuberic_runtime::protocol::public_operations::{
     ProcessSessionRenewalRequired, PublicBuildAttemptReference, PublicBuildInput,
     PublicCatchUpMode, PublicConfiguration, PublicInboundBuildAuthority, PublicOperationClass,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram,
-    PublicReplicaDescriptor,
+    PublicOperationIntent, PublicOperationProgram, PublicReplicaDescriptor, PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -84,7 +83,7 @@ fn store_identity(
 }
 
 fn intent(
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     session: kuberic_runtime::protocol::types::ProcessSessionId,
     revision: u64,
     name: &str,
@@ -138,7 +137,7 @@ async fn seed_retired_provider(
     root: &std::path::Path,
 ) -> kuberic_runtime::application::DurableApplicationProgress {
     let resource_uid = ResourceUid::new("sqlite-retired-seed");
-    let preview = PublicOperationPreviewIdentity::public_v1(1);
+    let preview = PublicV1Identity::new(1);
     let local_identity = identity(2, "sqlite-retired-seed");
     let local_storage = storage(local_identity.clone(), "sqlite-retired-seed");
     drop(
@@ -184,7 +183,7 @@ async fn seed_retired_provider(
     let initialization = derive_history_initialization_id(&resource_uid, generation);
     let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
     handle
-        .initialize_stateless_preview_history(&initialization, &history, &local_storage)
+        .initialize_public_v1_history(&initialization, &history, &local_storage)
         .await
         .unwrap();
     let epoch = Epoch::new(0, 1);
@@ -230,7 +229,7 @@ async fn seed_retired_provider(
         ),
     ] {
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 handle.process_session_id(),
                 revision,
@@ -289,7 +288,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         let retired_progress = seed_retired_provider(&retired_root).await;
 
         let resource_uid = ResourceUid::new("sqlite-public-v1-replacement");
-        let preview = PublicOperationPreviewIdentity::public_v1(1);
+        let preview = PublicV1Identity::new(1);
         let source_identity = identity(1, "sqlite-source");
         let divergent_identity = identity(2, "sqlite-divergent");
         let replacement_identity = identity(2, "sqlite-replacement");
@@ -416,15 +415,15 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         source_handle
-            .initialize_stateless_preview_history(&initialization, &history, &source_storage)
+            .initialize_public_v1_history(&initialization, &history, &source_storage)
             .await
             .unwrap();
         replacement_handle
-            .initialize_stateless_preview_history(&initialization, &history, &replacement_storage)
+            .initialize_public_v1_history(&initialization, &history, &replacement_storage)
             .await
             .unwrap();
         divergent_handle
-            .initialize_stateless_preview_history(&initialization, &history, &divergent_storage)
+            .initialize_public_v1_history(&initialization, &history, &divergent_storage)
             .await
             .unwrap();
         let epoch = Epoch::new(0, 1);
@@ -470,7 +469,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     revision,
@@ -504,7 +503,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             divergent_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     divergent_handle.process_session_id(),
                     revision,
@@ -538,7 +537,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             replacement_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     replacement_handle.process_session_id(),
                     revision,
@@ -576,7 +575,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             history: Some(history.clone()),
         };
         divergent_handle
-            .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
                 operation_id: OperationId::new("sqlite-divergent-build"),
                 operation_revision: 4,
                 attempt: PublicBuildAttemptReference {
@@ -598,7 +597,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             .unwrap();
         assert!(
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     4,
@@ -610,7 +609,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         );
         assert!(
             source_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .completed_operations
@@ -625,7 +624,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 })
         );
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 4,
@@ -638,7 +637,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         divergent.wait().await.unwrap();
         assert_eq!(divergent_persistence.progress().unwrap(), retired_progress);
         let source_predecessor = source_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         source.shutdown();
@@ -683,7 +682,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             1,
         );
         source_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("sqlite-source-after-divergent-retirement"),
                 reason: ProcessSessionRenewalReason::PrimaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -740,7 +739,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     revision,
@@ -766,7 +765,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             replacement_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     replacement_handle.process_session_id(),
                     revision,
@@ -787,7 +786,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             history: Some(history.clone()),
         };
         replacement_handle
-            .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
                 operation_id: OperationId::new("sqlite-corrective-build"),
                 operation_revision: 8,
                 attempt: PublicBuildAttemptReference {
@@ -814,7 +813,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             let input = build_input.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         8,
@@ -872,7 +871,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             2,
         );
         replacement_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replacement_handle.process_session_id(),
                 6,
@@ -885,7 +884,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         replacement_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replacement_handle.process_session_id(),
                 7,
@@ -909,7 +908,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 9,
@@ -966,7 +965,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         );
 
         let replacement_predecessor = replacement_handle
-            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
         replacement.shutdown();
@@ -1019,7 +1018,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             2,
         );
         replacement_restart_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("sqlite-replacement-restart"),
                 reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -1038,7 +1037,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 }),
                 surviving_sessions: vec![
                     source_handle
-                        .stateless_preview_process_endpoint(ReplicaRole::Primary)
+                        .public_v1_process_endpoint(ReplicaRole::Primary)
                         .await
                         .unwrap(),
                 ],
@@ -1049,7 +1048,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 14,
@@ -1086,7 +1085,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ),
         ] {
             replacement_restart_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     replacement_restart_handle.process_session_id(),
                     revision,
@@ -1098,7 +1097,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         }
 
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 15,
@@ -1122,7 +1121,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .unwrap();
         replacement_restart_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replacement_restart_handle.process_session_id(),
                 11,
@@ -1177,7 +1176,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         );
         assert!(
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     16,
@@ -1252,7 +1251,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
         std::fs::create_dir_all(&secondary_root).unwrap();
 
         let resource_uid = ResourceUid::new("sqlite-public-v1-composite");
-        let preview = PublicOperationPreviewIdentity::public_v1(1);
+        let preview = PublicV1Identity::new(1);
         let source_identity = identity(1, "sqlite-composite-source");
         let secondary_identity = identity(2, "sqlite-composite-secondary");
         let source_storage = storage(source_identity.clone(), "sqlite-composite-source");
@@ -1346,11 +1345,11 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         source_handle
-            .initialize_stateless_preview_history(&initialization, &history, &source_storage)
+            .initialize_public_v1_history(&initialization, &history, &source_storage)
             .await
             .unwrap();
         secondary_handle
-            .initialize_stateless_preview_history(&initialization, &history, &secondary_storage)
+            .initialize_public_v1_history(&initialization, &history, &secondary_storage)
             .await
             .unwrap();
 
@@ -1439,7 +1438,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 ),
             ] {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         revision,
@@ -1471,11 +1470,11 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
         .expect("baseline did not reach the real secondary provider");
         let baseline_snapshot = source_persistence.snapshot(2).unwrap();
         let source_predecessor = source_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         let secondary_predecessor = secondary_handle
-            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
 
@@ -1643,7 +1642,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             1,
         );
         source_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("sqlite-composite-renew-source"),
                 reason: ProcessSessionRenewalReason::PrimaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -1693,7 +1692,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ),
         ] {
             source_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source_handle.process_session_id(),
                     revision,
@@ -1704,7 +1703,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 .unwrap_or_else(|error| panic!("{name} failed: {error}"));
         }
         let renewed_source = source_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         let restart_configuration = ConfigurationDescriptor::new(
@@ -1723,7 +1722,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             2,
         );
         secondary_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("sqlite-composite-renew-secondary"),
                 reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -1773,7 +1772,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ),
         ] {
             secondary_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     secondary_handle.process_session_id(),
                     revision,
@@ -1814,7 +1813,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             }],
         };
         secondary_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
                 8,
@@ -1824,7 +1823,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 8,
@@ -1834,11 +1833,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             .await
             .unwrap();
         assert_ne!(
-            source_handle
-                .stateless_preview_report()
-                .await
-                .unwrap()
-                .write_status,
+            source_handle.public_v1_report().await.unwrap().write_status,
             AccessStatus::Granted
         );
         assert!(
@@ -1851,7 +1846,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 .is_err()
         );
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 9,
@@ -1874,8 +1869,8 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             .unwrap()
             .into_inner();
         assert_eq!(settled.rows.len(), 1);
-        let source_report = source_handle.stateless_preview_report().await.unwrap();
-        let secondary_report = secondary_handle.stateless_preview_report().await.unwrap();
+        let source_report = source_handle.public_v1_report().await.unwrap();
+        let secondary_report = secondary_handle.public_v1_report().await.unwrap();
         assert_eq!(source_report.write_status, AccessStatus::Granted);
         assert_ne!(secondary_report.write_status, AccessStatus::Granted);
 
@@ -1910,7 +1905,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ),
         ] {
             handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     handle.process_session_id(),
                     revision,
@@ -1922,7 +1917,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 .await
                 .unwrap();
             handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     handle.process_session_id(),
                     revision + 1,
@@ -1966,7 +1961,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             }],
         };
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 12,
@@ -1976,7 +1971,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             .await
             .unwrap();
         secondary_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
                 11,
@@ -1985,8 +1980,8 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ))
             .await
             .unwrap();
-        let source_report = source_handle.stateless_preview_report().await.unwrap();
-        let secondary_report = secondary_handle.stateless_preview_report().await.unwrap();
+        let source_report = source_handle.public_v1_report().await.unwrap();
+        let secondary_report = secondary_handle.public_v1_report().await.unwrap();
         assert_ne!(source_report.write_status, AccessStatus::Granted);
         assert_eq!(secondary_report.write_status, AccessStatus::Granted);
         assert!(

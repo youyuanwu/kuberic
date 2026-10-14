@@ -65,6 +65,21 @@ impl Reconciler {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let replica_ids = (1..=raw.set.spec.replicas)
+            .map(|replica_id| {
+                kuberic_runtime::protocol::types::ReplicaId::new(i64::from(replica_id))
+            })
+            .collect::<Vec<_>>();
+        if bootstrap_resources_missing(&raw, &replica_ids) {
+            self.api.ensure_replica_support(&raw).await?;
+            self.api
+                .ensure_replica_scaffolding(&raw, &replica_ids)
+                .await?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            });
+        }
         let status = raw.set.status.as_ref();
         if let Some(renewal) = status
             .and_then(|status| status.public_v1_session_renewal.as_ref())
@@ -171,6 +186,51 @@ impl Reconciler {
             kind,
         })
     }
+}
+
+fn bootstrap_resources_missing(
+    raw: &crate::observation::RawObservation,
+    replica_ids: &[kuberic_runtime::protocol::types::ReplicaId],
+) -> bool {
+    let set_name = raw.set.name_any();
+    if !raw
+        .secrets
+        .iter()
+        .any(|secret| secret.name_any() == format!("{set_name}-agent-credentials"))
+        || !raw
+            .services
+            .iter()
+            .any(|service| service.name_any() == format!("{set_name}-peer"))
+        || !raw
+            .services
+            .iter()
+            .any(|service| service.name_any() == format!("{set_name}-write"))
+    {
+        return true;
+    }
+    replica_ids.iter().any(|replica_id| {
+        let pod_name = format!("{set_name}-{}", replica_id.value());
+        let pvc_name = format!("{pod_name}-data");
+        let pod = raw.pods.iter().find(|pod| pod.name_any() == pod_name);
+        let Some(pod) = pod else {
+            return true;
+        };
+        if !raw.pvcs.iter().any(|pvc| pvc.name_any() == pvc_name) {
+            return true;
+        }
+        let Some(pod_uid) = pod.uid() else {
+            return true;
+        };
+        !raw.services.iter().any(|service| {
+            service.spec.as_ref().is_some_and(|spec| {
+                spec.selector.as_ref().is_some_and(|selector| {
+                    selector
+                        .get(crate::crd::INSTANCE_LABEL)
+                        .is_some_and(|selected| selected == &pod_uid)
+                })
+            })
+        })
+    })
 }
 
 fn plan_kind_for_history(plan: &PublicV1HistoryPlan) -> ExecutionKind {

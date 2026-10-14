@@ -1,11 +1,9 @@
 use kube::CustomResource;
 use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationPreviewIdentity, PublicSessionRenewalStage, PublicV1AcceptedStatus,
-    PublicV1CallKind, PublicV1SessionRenewalStatus,
+    PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1CallKind, PublicV1Identity,
+    PublicV1SessionRenewalStatus,
 };
-#[cfg(feature = "runtime-test-bridge")]
-use kuberic_runtime::protocol::types::AcceptedStatus;
 use kuberic_runtime::protocol::types::{
     HistoryContext, HistoryInitializationId, OperationId, ReplicaIdentity,
     ReplicaStorageIncarnationContext, ResourceUid,
@@ -60,11 +58,6 @@ pub struct PlannedSwitchoverRequestSpec {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetStatus {
-    #[cfg(feature = "runtime-test-bridge")]
-    #[serde(skip)]
-    #[schemars(skip)]
-    #[doc(hidden)]
-    pub authority: AcceptedStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_authority: Option<PublicV1AuthorityStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,7 +71,7 @@ pub struct KubericSetStatus {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicV1AuthorityStatus {
-    pub identity: PublicOperationPreviewIdentity,
+    pub identity: PublicV1Identity,
     pub history_initialization_id: HistoryInitializationId,
     pub history: HistoryContext,
     pub completed_operation_count: u32,

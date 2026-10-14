@@ -1,13 +1,13 @@
 //! Public V1 reconciliation decisions over canonical reports and accepted status.
 
-#[cfg(feature = "runtime-test-bridge")]
-pub(crate) mod public_lifecycle;
 pub mod public_v1_evidence;
 pub mod public_v1_history;
+#[cfg(feature = "runtime-test-bridge")]
+pub(crate) mod public_v1_lifecycle;
 pub mod public_v1_session_renewal;
 #[cfg(feature = "runtime-test-bridge")]
 #[doc(hidden)]
-pub mod test_bridge;
+pub mod testing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluationConfig {

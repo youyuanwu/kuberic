@@ -6,8 +6,7 @@ use kuberic_runtime::protocol::command::{
     ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
-    PublicOperationProgram,
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
     AgentGeneration, OperationId, PodUid, PublicProtocolGeneration, PvcUid, ReplicaId,
@@ -39,7 +38,7 @@ fn accepted() -> kuberic_runtime::protocol::public_operations::PublicV1AcceptedS
     let generation = PublicProtocolGeneration::new(1);
     let initialization = derive_history_initialization_id(&resource_uid, generation);
     kuberic_runtime::protocol::public_operations::PublicV1AcceptedStatus {
-        identity: PublicOperationPreviewIdentity::public_v1(1),
+        identity: PublicV1Identity::new(1),
         history_initialization_id: initialization.clone(),
         history: derive_bootstrap_history(&resource_uid, generation, &initialization),
         data_loss_recovery: None,
@@ -81,7 +80,7 @@ fn public_v1_history_command_round_trips_with_exact_envelope_fences() {
 fn public_v1_operation_command_round_trips_and_rejects_partial_or_crossed_input() {
     let program = PublicOperationProgram::Abort;
     let intent = PublicOperationIntent {
-        preview: PublicOperationPreviewIdentity::public_v1(1),
+        preview: PublicV1Identity::new(1),
         operation_id: OperationId::new("operation-1"),
         revision: 1,
         process_session_id: kuberic_runtime::protocol::types::ProcessSessionId::new("session-1"),
@@ -91,6 +90,12 @@ fn public_v1_operation_command_round_trips_and_rejects_partial_or_crossed_input(
         lifecycle: None,
         program: Some(program),
     };
+    let mut legacy_intent = intent.clone();
+    legacy_intent.preview.protocol_version = 10;
+    assert!(
+        legacy_intent.validate().is_err(),
+        "protocol 10 must not enter the Public V1 operation path"
+    );
     let command = PublicV1OperationCommand {
         target: identity(),
         intent,

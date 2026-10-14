@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, DataLossRenewalDecision, DataLossReplay,
-    ProcessAttemptContext, ProviderProgressReset, PublicOperationPreviewIdentity,
+    ProcessAttemptContext, ProviderProgressReset, PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
     AgentGeneration, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
@@ -252,7 +252,7 @@ async fn public_v1_history_store_uses_the_current_exact_schema() {
     assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
     let directory = tempfile::tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let resource_uid = ResourceUid::new("resource-1");
     let local = replica(1, "pod-1", "generation-1");
     let store = SqliteStore::create_public_v1(

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kuberic_controller::cluster_api::PublicV1Scope;
-use kuberic_controller::evaluator::test_bridge::{
+use kuberic_controller::evaluator::testing::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
     PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1OperationApi,
     PublicV1ReconciliationOutcome, PublicV1ResourceAuthority, PublicV1ResourceDisposition,
@@ -16,10 +16,10 @@ use kuberic_runtime::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, ProviderReplicaIdentity,
     PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicOperationClass,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram,
-    PublicOperationReplayDisposition, PublicProgress, PublicProgressRole,
-    PublicV1AcceptedOperationCompletion, PublicV1AcceptedStatus, PublicV1AgentReport,
-    PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
+    PublicOperationIntent, PublicOperationProgram, PublicOperationReplayDisposition,
+    PublicProgress, PublicProgressRole, PublicV1AcceptedOperationCompletion,
+    PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1Identity,
+    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
@@ -53,7 +53,7 @@ fn accepted() -> PublicV1AcceptedStatus {
     let generation = PublicProtocolGeneration::new(42);
     let initialization = derive_history_initialization_id(&resource_uid, generation);
     PublicV1AcceptedStatus {
-        identity: PublicOperationPreviewIdentity::public_v1(generation.value()),
+        identity: PublicV1Identity::new(generation.value()),
         history_initialization_id: initialization.clone(),
         history: derive_bootstrap_history(&resource_uid, generation, &initialization),
         data_loss_recovery: None,
@@ -551,7 +551,7 @@ async fn concurrent_accept_reconciliation_commits_one_exact_effect() {
 }
 
 #[tokio::test]
-async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session() {
+async fn hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let accepted = accepted();
         let completion = completion(

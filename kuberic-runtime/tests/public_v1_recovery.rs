@@ -12,15 +12,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use kuberic_controller::cluster_api::PublicV1Scope;
-use kuberic_controller::evaluator::test_bridge::{
-    HostedPreviewReplica, HostedPublicV1Adapter, PreviewTransition,
-    PublicOperationPreviewEvaluationConfig, PublicV1AcceptedTransitionIntent,
-    PublicV1AcceptedTransitionStatus, PublicV1EvidenceApi, PublicV1EvidenceConsumer,
-    PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1OperationApi,
-    PublicV1ResourceAuthority, PublicV1ResourceDisposition, PublicV1ResourceProof,
-    PublicV1SessionRenewalApi, PublicV1SessionRenewalPlan, accept_public_v1_session_renewal,
+use kuberic_controller::evaluator::testing::{
+    HostedPublicV1Harness, HostedPublicV1Replica, PublicV1AcceptedTransitionIntent,
+    PublicV1AcceptedTransitionStatus, PublicV1EvaluationConfig, PublicV1EvidenceApi,
+    PublicV1EvidenceConsumer, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi,
+    PublicV1LifecycleTransition, PublicV1OperationApi, PublicV1ResourceAuthority,
+    PublicV1ResourceDisposition, PublicV1ResourceProof, PublicV1SessionRenewalApi,
+    PublicV1SessionRenewalPlan, accept_public_v1_session_renewal,
     accept_public_v1_survivor_retired, execute_public_v1_history, execute_public_v1_operation,
-    execute_public_v1_session_renewal, plan_public_lifecycle, plan_public_v1_data_loss_recovery,
+    execute_public_v1_session_renewal, plan_public_v1_data_loss_recovery, plan_public_v1_lifecycle,
     plan_public_v1_recovery_report, plan_public_v1_session_renewal, reconcile_public_v1_consumer,
     reconcile_public_v1_operation,
 };
@@ -35,14 +35,14 @@ use kuberic_runtime::host::{
 use kuberic_runtime::protocol::command::{ProtocolCommand, PublicV1OperationCommand};
 use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, DataLossReplay, LocalProviderRebuildRequired,
-    PossibleDataLossIntent, PreviewLifecycleBinding, ProcessAttemptContext,
-    ProcessSessionRenewalRequired, ProviderProgressReset, ProviderReplicaIdentity,
-    PublicBuildAttemptReference, PublicBuildInput, PublicConfiguration,
-    PublicDataLossRecoveryInput, PublicInboundBuildAuthority, PublicLifecycleInput,
-    PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
-    PublicOperationPreviewIdentity, PublicOperationProgram, PublicOperationReplayDisposition,
-    PublicReplicaDescriptor, PublicV1AcceptedStatus, PublicV1CallKind, PublicV1OperationCompletion,
-    PublicV1OperationResult, ReplicaRebuildReason, ReplicaRebuildRequired, StatePersistence,
+    PossibleDataLossIntent, ProcessAttemptContext, ProcessSessionRenewalRequired,
+    ProviderProgressReset, ProviderReplicaIdentity, PublicBuildAttemptReference, PublicBuildInput,
+    PublicConfiguration, PublicDataLossRecoveryInput, PublicInboundBuildAuthority,
+    PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
+    PublicOperationProgram, PublicOperationReplayDisposition, PublicReplicaDescriptor,
+    PublicV1AcceptedStatus, PublicV1CallKind, PublicV1Identity, PublicV1LifecycleBinding,
+    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
+    ReplicaRebuildRequired, StatePersistence,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -138,7 +138,7 @@ impl proto::replication_data_server::ReplicationData for HungBuildService {
 }
 
 async fn drive_session_renewal(
-    adapter: &HostedPublicV1Adapter,
+    adapter: &HostedPublicV1Harness,
     resource_uid: &ResourceUid,
     unreachable: &[ProcessSessionId],
     retire_unreachable: bool,
@@ -667,7 +667,6 @@ impl PreviewApplication {
                 Some(self.storage.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: true,
                 }),
             )
             .await
@@ -739,7 +738,6 @@ impl StatefulServiceReplica for PreviewApplication {
                     Some(self.storage.clone()),
                     Some(ReplicatorSettings {
                         replication_address: self.replication_address.clone(),
-                        public_v1: true,
                     }),
                 )
                 .await;
@@ -760,7 +758,6 @@ impl StatefulServiceReplica for PreviewApplication {
                 Some(self.storage.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: true,
                 }),
             )
             .await?;
@@ -830,7 +827,7 @@ impl kuberic_runtime::host::ReplicaEndpointResolver for Resolver {
 }
 
 fn intent(
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     session: kuberic_runtime::protocol::types::ProcessSessionId,
     revision: u64,
     name: &str,
@@ -863,7 +860,7 @@ fn intent(
 
 async fn install_static_authority(
     handle: &kuberic_runtime::host::ReplicaHandle,
-    preview: &PublicOperationPreviewIdentity,
+    preview: &PublicV1Identity,
     local: ReplicaIdentity,
     role: ReplicaRole,
     epoch: Epoch,
@@ -871,7 +868,7 @@ async fn install_static_authority(
 ) {
     let session = handle.process_session_id();
     handle
-        .execute_stateless_preview(intent(
+        .execute_public_v1(intent(
             preview,
             session.clone(),
             1,
@@ -884,7 +881,7 @@ async fn install_static_authority(
         .await
         .unwrap();
     handle
-        .execute_stateless_preview(intent(
+        .execute_public_v1(intent(
             preview,
             session.clone(),
             2,
@@ -894,7 +891,7 @@ async fn install_static_authority(
         .await
         .unwrap();
     handle
-        .execute_stateless_preview(intent(
+        .execute_public_v1(intent(
             preview,
             session.clone(),
             3,
@@ -904,7 +901,7 @@ async fn install_static_authority(
         .await
         .unwrap();
     handle
-        .execute_stateless_preview(intent(
+        .execute_public_v1(intent(
             preview,
             session,
             4,
@@ -929,7 +926,7 @@ impl HostedMemoryReplica {
     async fn start(
         name: &str,
         resource_uid: &ResourceUid,
-        preview: &PublicOperationPreviewIdentity,
+        preview: &PublicV1Identity,
         replica_id: i64,
     ) -> Self {
         let pod_uid = format!("{name}-pod");
@@ -968,8 +965,8 @@ impl HostedMemoryReplica {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(PreviewLifecycleBinding {
-            preview: preview.clone(),
+        .with_public_v1_binding(PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -998,7 +995,7 @@ impl HostedMemoryReplica {
         history: &kuberic_runtime::protocol::types::HistoryContext,
     ) {
         self.handle()
-            .initialize_stateless_preview_history(initialization, history, &self.storage)
+            .initialize_public_v1_history(initialization, history, &self.storage)
             .await
             .unwrap();
     }
@@ -1014,7 +1011,7 @@ impl HostedMemoryReplica {
 }
 
 struct AuthorizedHostedPair {
-    preview: PublicOperationPreviewIdentity,
+    preview: PublicV1Identity,
     epoch: Epoch,
     primary: HostedMemoryReplica,
     secondary: HostedMemoryReplica,
@@ -1023,7 +1020,7 @@ struct AuthorizedHostedPair {
 impl AuthorizedHostedPair {
     async fn start(name: &str, generation: u64) -> Self {
         let resource_uid = ResourceUid::new(format!("{name}-resource"));
-        let preview = PublicOperationPreviewIdentity::public_v1(generation);
+        let preview = PublicV1Identity::new(generation);
         let primary =
             HostedMemoryReplica::start(&format!("{name}-primary"), &resource_uid, &preview, 1)
                 .await;
@@ -1156,13 +1153,13 @@ enum StoredCloseChild {
 }
 
 #[tokio::test]
-async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
+async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("open-once");
         let resource_uid = ResourceUid::new("preview-open-once");
-        let preview = PublicOperationPreviewIdentity::public_v1(7);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(7);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -1200,7 +1197,7 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
@@ -1208,14 +1205,14 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
         assert_eq!(application.opens.load(Ordering::SeqCst), 0);
         assert_eq!(application.factory_calls.load(Ordering::SeqCst), 0);
         assert_eq!(application.failed_factory_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(handle.stateless_preview_provider_writer_count(), 0);
+        assert_eq!(handle.public_v1_provider_writer_count(), 0);
         drop(std::net::TcpListener::bind(replication_address).unwrap());
 
         let generation = PublicProtocolGeneration::new(7);
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_incarnation(replica()),
@@ -1232,10 +1229,7 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
                 existing: true,
             },
         );
-        handle
-            .execute_stateless_preview(open.clone())
-            .await
-            .unwrap();
+        handle.execute_public_v1(open.clone()).await.unwrap();
         assert_eq!(application.opens.load(Ordering::SeqCst), 1);
         assert_eq!(application.failed_factory_calls.load(Ordering::SeqCst), 1);
         assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
@@ -1245,20 +1239,20 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
                 .load(Ordering::Acquire),
             "ApplicationOpen instruction was not durable before its effect"
         );
-        assert_eq!(handle.stateless_preview_provider_writer_count(), 1);
+        assert_eq!(handle.public_v1_provider_writer_count(), 1);
         assert!(std::net::TcpListener::bind(replication_address).is_err());
 
         assert!(application.duplicate_creation().await.is_err());
         assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handle.stateless_preview_provider_writer_count(), 1);
+        assert_eq!(handle.public_v1_provider_writer_count(), 1);
 
-        handle.execute_stateless_preview(open).await.unwrap();
+        handle.execute_public_v1(open).await.unwrap();
         assert_eq!(application.opens.load(Ordering::SeqCst), 1);
         assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
         assert!(std::net::TcpListener::bind(replication_address).is_err());
 
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 handle.process_session_id(),
                 2,
@@ -1267,7 +1261,7 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
             ))
             .await
             .unwrap();
-        assert_eq!(handle.stateless_preview_provider_writer_count(), 0);
+        assert_eq!(handle.public_v1_provider_writer_count(), 0);
         drop(std::net::TcpListener::bind(replication_address).unwrap());
         running.shutdown();
         running.wait().await.unwrap();
@@ -1278,10 +1272,10 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
 }
 
 #[tokio::test]
-async fn hosted_preview_contained_close_restarts_without_replaying_interrupted_children() {
+async fn hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let resource_uid = ResourceUid::new("preview-contained-close");
-        let preview = PublicOperationPreviewIdentity::public_v1(12);
+        let preview = PublicV1Identity::new(12);
         let mut replica =
             HostedMemoryReplica::start("contained-close", &resource_uid, &preview, 1).await;
         let generation = PublicProtocolGeneration::new(12);
@@ -1315,7 +1309,7 @@ async fn hosted_preview_contained_close_restarts_without_replaying_interrupted_c
         let close_id = OperationId::new("preview-contained-close");
         replica
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replica.handle().process_session_id(),
                 5,
@@ -1357,7 +1351,7 @@ async fn hosted_preview_contained_close_restarts_without_replaying_interrupted_c
             )
             .unwrap();
         let state: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let close = &state["publicOperationPreview"]["operations"][close_id.as_str()];
+        let close = &state["publicV1OperationState"]["operations"][close_id.as_str()];
         assert_eq!(
             close["disposition"]["kind"],
             serde_json::Value::String("succeeded".into()),
@@ -1405,8 +1399,8 @@ async fn hosted_preview_contained_close_restarts_without_replaying_interrupted_c
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(PreviewLifecycleBinding {
-            preview,
+        .with_public_v1_binding(PublicV1LifecycleBinding {
+            identity: preview,
             resource_uid,
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -1432,10 +1426,10 @@ async fn hosted_preview_contained_close_restarts_without_replaying_interrupted_c
 }
 
 #[tokio::test]
-async fn hosted_preview_role_address_publishes_replaces_and_clears() {
+async fn hosted_public_v1_role_address_publishes_replaces_and_clears() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let resource_uid = ResourceUid::new("preview-role-address");
-        let preview = PublicOperationPreviewIdentity::public_v1(71);
+        let preview = PublicV1Identity::new(71);
         let mut replica =
             HostedMemoryReplica::start("role-address", &resource_uid, &preview, 1).await;
         let initialization =
@@ -1469,7 +1463,7 @@ async fn hosted_preview_role_address_publishes_replaces_and_clears() {
             },
         )
         .await;
-        let published = replica.handle().stateless_preview_report().await.unwrap();
+        let published = replica.handle().public_v1_report().await.unwrap();
         let first_location = published
             .service_location
             .expect("primary address published");
@@ -1478,7 +1472,7 @@ async fn hosted_preview_role_address_publishes_replaces_and_clears() {
         let second_epoch = Epoch::new(0, 2);
         replica
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replica.handle().process_session_id(),
                 5,
@@ -1491,7 +1485,7 @@ async fn hosted_preview_role_address_publishes_replaces_and_clears() {
             .unwrap();
         replica
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replica.handle().process_session_id(),
                 6,
@@ -1505,7 +1499,7 @@ async fn hosted_preview_role_address_publishes_replaces_and_clears() {
             .unwrap();
         replica
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replica.handle().process_session_id(),
                 8,
@@ -1526,7 +1520,7 @@ async fn hosted_preview_role_address_publishes_replaces_and_clears() {
             ))
             .await
             .unwrap();
-        let replaced = replica.handle().stateless_preview_report().await.unwrap();
+        let replaced = replica.handle().public_v1_report().await.unwrap();
         let second_location = replaced
             .service_location
             .expect("replacement address published");
@@ -1535,7 +1529,7 @@ async fn hosted_preview_role_address_publishes_replaces_and_clears() {
 
         replica
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replica.handle().process_session_id(),
                 9,
@@ -1550,7 +1544,7 @@ async fn hosted_preview_role_address_publishes_replaces_and_clears() {
         assert!(
             replica
                 .handle()
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .service_location
@@ -1583,7 +1577,7 @@ async fn primary_write_revocation_fences_provider_apply_and_peer_ack_interleavin
             let epoch = apply_pair.epoch;
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         5,
@@ -1614,7 +1608,7 @@ async fn primary_write_revocation_fences_provider_apply_and_peer_ack_interleavin
             apply_pair
                 .primary
                 .handle()
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -1635,7 +1629,7 @@ async fn primary_write_revocation_fences_provider_apply_and_peer_ack_interleavin
             let epoch = ack_pair.epoch;
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         5,
@@ -1687,7 +1681,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
             let preview = close_pair.preview.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         5,
@@ -1728,7 +1722,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
             let preview = epoch_pair.preview.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         5,
@@ -1771,7 +1765,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
                 if dropped_pair
                     .primary
                     .handle()
-                    .stateless_preview_report()
+                    .public_v1_report()
                     .await
                     .is_ok_and(|report| report.write_status == AccessStatus::NotPrimary)
                 {
@@ -1800,7 +1794,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
 async fn replication_ingress_accepts_only_exact_current_primary_in_three_replica_set() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let resource_uid = ResourceUid::new("three-replica-ingress");
-        let preview = PublicOperationPreviewIdentity::public_v1(76);
+        let preview = PublicV1Identity::new(76);
         let primary =
             HostedMemoryReplica::start("ingress-primary", &resource_uid, &preview, 1).await;
         let receiver =
@@ -1923,7 +1917,7 @@ async fn replication_ingress_accepts_only_exact_current_primary_in_three_replica
 
         let baseline = receiver
             .handle()
-            .stateless_preview_raw_retained_task_cardinality()
+            .public_v1_raw_retained_task_cardinality()
             .unwrap();
         for _ in 0..2 {
             stream::iter(0..1_000)
@@ -1945,7 +1939,7 @@ async fn replication_ingress_accepts_only_exact_current_primary_in_three_replica
                 loop {
                     if receiver
                         .handle()
-                        .stateless_preview_raw_retained_task_cardinality()
+                        .public_v1_raw_retained_task_cardinality()
                         .unwrap()
                         == baseline
                     {
@@ -2006,7 +2000,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
         );
         pair.primary
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &pair.preview,
                 pair.primary.handle().process_session_id(),
                 5,
@@ -2044,7 +2038,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
             .unwrap();
         pair.secondary
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &pair.preview,
                 pair.secondary.handle().process_session_id(),
                 5,
@@ -2095,7 +2089,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
         pair.cleanup().await;
 
         let resource_uid = ResourceUid::new("required-hung-peer");
-        let preview = PublicOperationPreviewIdentity::public_v1(78);
+        let preview = PublicV1Identity::new(78);
         let mut primary =
             HostedMemoryReplica::start("required-hung-primary", &resource_uid, &preview, 1).await;
         let initialization =
@@ -2186,7 +2180,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
             let preview = close_pair.preview.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         5,
@@ -2214,9 +2208,9 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("static");
         let resource_uid = ResourceUid::new("preview-resource");
-        let preview = PublicOperationPreviewIdentity::public_v1(1);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(1);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -2254,17 +2248,17 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
         let handle = running.handle();
-        assert_eq!(handle.stateless_preview_provider_writer_count(), 0);
+        assert_eq!(handle.public_v1_provider_writer_count(), 0);
         let generation = PublicProtocolGeneration::new(1);
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_incarnation(replica()),
@@ -2273,7 +2267,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             .unwrap();
         let session = handle.process_session_id();
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 session.clone(),
                 1,
@@ -2285,10 +2279,10 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             ))
             .await
             .unwrap();
-        assert_eq!(handle.stateless_preview_provider_writer_count(), 1);
+        assert_eq!(handle.public_v1_provider_writer_count(), 1);
         let epoch = Epoch::new(0, 1);
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 session.clone(),
                 2,
@@ -2301,7 +2295,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             .await
             .unwrap();
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 session.clone(),
                 3,
@@ -2310,7 +2304,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             ))
             .await
             .unwrap();
-        let before = handle.stateless_preview_report().await.unwrap();
+        let before = handle.public_v1_report().await.unwrap();
         assert_eq!(
             before.write_status,
             kuberic_runtime::protocol::types::AccessStatus::NotPrimary
@@ -2325,7 +2319,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             1,
         );
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 session,
                 4,
@@ -2338,7 +2332,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             ))
             .await
             .unwrap();
-        let ready = handle.stateless_preview_report().await.unwrap();
+        let ready = handle.public_v1_report().await.unwrap();
         assert_eq!(
             ready.write_status,
             kuberic_runtime::protocol::types::AccessStatus::Granted
@@ -2370,7 +2364,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
         );
 
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 handle.process_session_id(),
                 5,
@@ -2386,9 +2380,9 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
 
         let root = test_root("open-failure");
         let resource_uid = ResourceUid::new("preview-open-failure");
-        let preview = PublicOperationPreviewIdentity::public_v1(5);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(5);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -2423,7 +2417,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
@@ -2432,7 +2426,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_incarnation(replica()),
@@ -2441,7 +2435,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             .unwrap();
         assert!(
             handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     handle.process_session_id(),
                     1,
@@ -2455,7 +2449,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
                 .is_err(),
             "preview Open failure must fail the durable Open"
         );
-        assert!(handle.stateless_preview_report().await.is_err());
+        assert!(handle.public_v1_report().await.is_err());
         drop(blocker);
         std::net::TcpListener::bind(replication_address).unwrap();
         running.shutdown();
@@ -2471,9 +2465,9 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("commit-ambiguity");
         let resource_uid = ResourceUid::new("preview-commit-ambiguity");
-        let preview = PublicOperationPreviewIdentity::public_v1(8);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(8);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -2509,7 +2503,7 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
@@ -2518,7 +2512,7 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_incarnation(replica()),
@@ -2547,7 +2541,7 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
             },
         )
         .await;
-        let ready = handle.stateless_preview_report().await.unwrap();
+        let ready = handle.public_v1_report().await.unwrap();
         assert_eq!(
             ready.write_status,
             kuberic_runtime::protocol::types::AccessStatus::Granted
@@ -2570,7 +2564,7 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
                 committed_lsn: 0,
             }
         );
-        let fenced = handle.stateless_preview_report().await.unwrap();
+        let fenced = handle.public_v1_report().await.unwrap();
         assert_eq!(
             fenced.read_status,
             kuberic_runtime::protocol::types::AccessStatus::NotPrimary
@@ -2589,7 +2583,7 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
 
         DurableState::commit(storage.as_ref(), 1).await.unwrap();
         handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 handle.process_session_id(),
                 5,
@@ -2598,7 +2592,7 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
             ))
             .await
             .unwrap();
-        let still_fenced = handle.stateless_preview_report().await.unwrap();
+        let still_fenced = handle.public_v1_report().await.unwrap();
         assert_eq!(still_fenced.progress.first, 1);
         assert_eq!(still_fenced.progress.last, 1);
         assert_eq!(
@@ -2646,9 +2640,9 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
         connection.pragma_update(None, "user_version", 6).unwrap();
         drop(connection);
         let replication_address = free_address();
-        let preview = PublicOperationPreviewIdentity::public_v1(2);
-        let binding = PreviewLifecycleBinding {
-            preview,
+        let preview = PublicV1Identity::new(2);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview,
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -2675,7 +2669,7 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await;
         assert!(result.is_err(), "schema 6 must not fall back to legacy");
@@ -2691,9 +2685,9 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("fresh-schema11");
         let resource_uid = ResourceUid::new("preview-fresh-schema11");
-        let preview = PublicOperationPreviewIdentity::public_v1(6);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(6);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -2722,7 +2716,7 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
                 ApplicationStorageState::FreshEmpty,
                 Arc::new(Resolver),
             )
-            .with_stateless_preview(binding)
+            .with_public_v1_binding(binding)
             .start(),
         );
         let mut client = loop {
@@ -2814,7 +2808,7 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
 }
 
 #[tokio::test]
-async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
+async fn hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome() {
     #[derive(Clone, Copy)]
     enum Outcome {
         Unchanged,
@@ -2835,7 +2829,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
         {
             let resource_uid = ResourceUid::new(format!("preview-data-loss-{index}"));
             let generation_number = 30 + u64::try_from(index).unwrap();
-            let preview = PublicOperationPreviewIdentity::public_v1(generation_number);
+            let preview = PublicV1Identity::new(generation_number);
             let mut replica = HostedMemoryReplica::start(
                 &format!("data-loss-{index}"),
                 &resource_uid,
@@ -2851,7 +2845,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
                 .await;
             replica
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     replica.handle().process_session_id(),
                     1,
@@ -2863,7 +2857,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
                 ))
                 .await
                 .unwrap();
-            let before = replica.handle().stateless_preview_report().await.unwrap();
+            let before = replica.handle().public_v1_report().await.unwrap();
             assert_eq!(before.write_status, AccessStatus::NotPrimary);
 
             let authorization_id = OperationId::new(format!("authorize-data-loss-{index}"));
@@ -2889,7 +2883,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
             };
             let endpoint = replica
                 .handle()
-                .stateless_preview_process_endpoint(ReplicaRole::None)
+                .public_v1_process_endpoint(ReplicaRole::None)
                 .await
                 .unwrap();
             let recovery_epoch = Epoch::new(proposed.data_loss_number, 1);
@@ -2991,8 +2985,8 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
                 )
                 .unwrap(),
             );
-            let adapter = HostedPublicV1Adapter::new(
-                vec![HostedPreviewReplica {
+            let adapter = HostedPublicV1Harness::new(
+                vec![HostedPublicV1Replica {
                     identity: replica.identity.clone(),
                     replication_address: format!("http://{}", replica.address),
                     handle: replica.handle(),
@@ -3021,7 +3015,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
             missing.lifecycle.as_mut().unwrap().data_loss_recovery = None;
             missing.input_digest = missing.lifecycle.as_ref().unwrap().digest();
             assert!(missing.validate().is_err());
-            let unchanged = replica.handle().stateless_preview_report().await.unwrap();
+            let unchanged = replica.handle().public_v1_report().await.unwrap();
             assert_eq!(unchanged.history, before.history);
             assert_eq!(unchanged.process_session_id, before.process_session_id);
             assert_eq!(unchanged.read_status, before.read_status);
@@ -3136,10 +3130,10 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
 }
 
 #[tokio::test]
-async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement() {
+async fn hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_retirement() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let resource_uid = ResourceUid::new("preview-unreachable-survivor");
-        let preview = PublicOperationPreviewIdentity::public_v1(40);
+        let preview = PublicV1Identity::new(40);
         let mut primary =
             HostedMemoryReplica::start("fault-primary", &resource_uid, &preview, 1).await;
         let mut survivor =
@@ -3220,11 +3214,11 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
             1
         );
         let exact_survivor_session = survivor.handle().process_session_id();
-        primary.handle().fence_stateless_preview_access().await;
+        primary.handle().fence_public_v1_access().await;
         assert_eq!(
             primary
                 .handle()
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -3232,7 +3226,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
         );
         primary
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 primary.handle().process_session_id(),
                 5,
@@ -3264,7 +3258,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
             2
         );
 
-        primary.handle().fence_stateless_preview_access().await;
+        primary.handle().fence_public_v1_access().await;
         let removal_program = PublicOperationProgram::Remove(PublicBuildInput {
             attempt: OperationId::new("retire-unreachable-survivor"),
             epoch,
@@ -3399,7 +3393,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
         );
         primary
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 primary.handle().process_session_id(),
                 6,
@@ -3412,7 +3406,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
             .unwrap();
         primary
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 primary.handle().process_session_id(),
                 7,
@@ -3426,7 +3420,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
             .unwrap();
         primary
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 primary.handle().process_session_id(),
                 8,
@@ -3458,7 +3452,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
             .await;
         replacement
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 replacement.handle().process_session_id(),
                 1,
@@ -3503,7 +3497,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
         assert_eq!(
             primary
                 .handle()
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -3521,12 +3515,12 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
 }
 
 #[tokio::test]
-async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion() {
+async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let resource_uid = ResourceUid::new("preview-two-replica");
-        let preview = PublicOperationPreviewIdentity::public_v1(4);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(4);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -3590,7 +3584,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -3611,7 +3605,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
@@ -3621,7 +3615,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         primary_handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_named(
@@ -3633,7 +3627,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             .await
             .unwrap();
         secondary_handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_named(
@@ -3726,7 +3720,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         secondary_state.commit_entered.notified().await;
         assert_eq!(secondary_state.progress.lock().unwrap().applied_lsn, 1);
         assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 0);
-        let applied_only = secondary_handle.stateless_preview_report().await.unwrap();
+        let applied_only = secondary_handle.public_v1_report().await.unwrap();
         assert_eq!(
             applied_only.progress.role,
             kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery
@@ -3748,7 +3742,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         })
         .await
         .expect("secondary did not receive committed watermark");
-        let committed = secondary_handle.stateless_preview_report().await.unwrap();
+        let committed = secondary_handle.public_v1_report().await.unwrap();
         assert_eq!(
             committed.progress.role,
             kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary
@@ -3809,7 +3803,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 committed_lsn: 1,
             }
         );
-        let lost = secondary_handle.stateless_preview_report().await.unwrap();
+        let lost = secondary_handle.public_v1_report().await.unwrap();
         assert_eq!(lost.progress.first, 1);
         assert_eq!(lost.progress.last, 2);
         assert_eq!(
@@ -3824,7 +3818,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             2,
         );
         primary_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 primary_handle.process_session_id(),
                 5,
@@ -3992,19 +3986,19 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         let hosted_replicas = || {
             vec![
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: primary_identity.clone(),
                     replication_address: format!("http://{primary_address}"),
                     handle: primary_handle.clone(),
                 },
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: secondary_identity.clone(),
                     replication_address: format!("http://{secondary_address}"),
                     handle: secondary_handle.clone(),
                 },
             ]
         };
-        let adapter = HostedPublicV1Adapter::new(
+        let adapter = HostedPublicV1Harness::new(
             hosted_replicas(),
             Some(accepted.clone()),
             None,
@@ -4052,7 +4046,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         assert_eq!(
             primary_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -4060,7 +4054,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         assert_eq!(
             secondary_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -4069,12 +4063,12 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         let partial_configuration_id =
             OperationId::new("planned-switchover-target-configuration-2");
         let partial_configuration = secondary_handle
-            .stateless_preview_operation_intent(&partial_configuration_id)
+            .public_v1_operation_intent(&partial_configuration_id)
             .await
             .unwrap()
             .expect("partial switchover configuration was not durable");
         drop(adapter);
-        let adapter = HostedPublicV1Adapter::new(
+        let adapter = HostedPublicV1Harness::new(
             hosted_replicas(),
             Some(accepted.clone()),
             None,
@@ -4086,7 +4080,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             .unwrap();
         assert_eq!(
             secondary_handle
-                .stateless_preview_operation_intent(&partial_configuration_id)
+                .public_v1_operation_intent(&partial_configuration_id)
                 .await
                 .unwrap(),
             Some(partial_configuration),
@@ -4097,21 +4091,21 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             reconcile_public_v1_consumer(&adapter, &test_scope(&resource_uid), &switchover_report)
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
             reconcile_public_v1_consumer(&adapter, &test_scope(&resource_uid), &switchover_report)
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EffectApplied
         );
         assert_eq!(evidence.effects().len(), 1);
         assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 3);
         assert_eq!(
             primary_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -4119,18 +4113,18 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         assert_eq!(
             secondary_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
             kuberic_runtime::protocol::types::AccessStatus::Granted
         );
         let next_revision = secondary_handle
-            .stateless_preview_next_operation_revision()
+            .public_v1_next_operation_revision()
             .await
             .unwrap();
         secondary_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
                 next_revision,
@@ -4154,11 +4148,11 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         .await
         .expect("new primary write did not reach old primary");
         let primary_predecessor = primary_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         let secondary_predecessor = secondary_handle
-            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
 
@@ -4188,8 +4182,8 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             secondary_state.clone(),
             format!("http://{secondary_address}"),
         ));
-        let restart_binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let restart_binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -4211,7 +4205,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(restart_binding.clone())
+        .with_public_v1_binding(restart_binding.clone())
         .start()
         .await
         .unwrap();
@@ -4232,25 +4226,25 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(restart_binding)
+        .with_public_v1_binding(restart_binding)
         .start()
         .await
         .unwrap();
         let restarted_primary_handle = restarted_primary.handle();
         let restarted_secondary_handle = restarted_secondary.handle();
         assert_eq!(
-            restarted_primary_handle.stateless_preview_provider_writer_count(),
+            restarted_primary_handle.public_v1_provider_writer_count(),
             0
         );
         assert_eq!(
-            restarted_secondary_handle.stateless_preview_provider_writer_count(),
+            restarted_secondary_handle.public_v1_provider_writer_count(),
             0
         );
         assert_eq!(primary_restart_app.opens.load(Ordering::SeqCst), 0);
         assert_eq!(secondary_restart_app.opens.load(Ordering::SeqCst), 0);
         assert_eq!(
             restarted_primary_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -4258,7 +4252,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         assert_eq!(
             restarted_secondary_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -4301,12 +4295,12 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         let hosted_replicas = || {
             vec![
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: primary_identity.clone(),
                     replication_address: format!("http://{primary_address}"),
                     handle: restarted_primary_handle.clone(),
                 },
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: secondary_identity.clone(),
                     replication_address: format!("http://{secondary_address}"),
                     handle: restarted_secondary_handle.clone(),
@@ -4329,7 +4323,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             replicator_creation_id: ReplicatorCreationId::new("renew-primary-process-creation"),
             role: ReplicaRole::None,
         };
-        let primary_renewal = HostedPublicV1Adapter::new(
+        let primary_renewal = HostedPublicV1Harness::new(
             hosted_replicas(),
             Some(transition.evidence.clone()),
             None,
@@ -4337,7 +4331,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         )
         .unwrap();
         let primary_report = restarted_primary_handle
-            .stateless_preview_report()
+            .public_v1_report()
             .await
             .unwrap();
         execute_public_v1_session_renewal(
@@ -4381,7 +4375,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             .await
             .unwrap();
         let renewed_primary = restarted_primary_handle
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
 
@@ -4392,7 +4386,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             replicator_creation_id: ReplicatorCreationId::new("renew-secondary-process-creation"),
             role: ReplicaRole::None,
         };
-        let secondary_renewal = HostedPublicV1Adapter::new(
+        let secondary_renewal = HostedPublicV1Harness::new(
             hosted_replicas(),
             Some(transition.evidence.clone()),
             None,
@@ -4400,7 +4394,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         )
         .unwrap();
         let secondary_report = restarted_secondary_handle
-            .stateless_preview_report()
+            .public_v1_report()
             .await
             .unwrap();
         execute_public_v1_session_renewal(
@@ -4470,12 +4464,12 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 );
                 let barrier_id = OperationId::new("renew-secondary-process-barrier-1");
                 let durable_barrier = restarted_primary_handle
-                    .stateless_preview_operation_intent(&barrier_id)
+                    .public_v1_operation_intent(&barrier_id)
                     .await
                     .unwrap()
                     .expect("renewal barrier was not durable at the injected cut");
                 drop(secondary_renewal);
-                let secondary_renewal = HostedPublicV1Adapter::new(
+                let secondary_renewal = HostedPublicV1Harness::new(
                     hosted_replicas(),
                     Some(transition.evidence.clone()),
                     Some(accepted),
@@ -4487,7 +4481,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                     .unwrap();
                 assert_eq!(
                     restarted_primary_handle
-                        .stateless_preview_operation_intent(&barrier_id)
+                        .public_v1_operation_intent(&barrier_id)
                         .await
                         .unwrap(),
                     Some(durable_barrier),
@@ -4526,11 +4520,11 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             data_loss_recovery: None,
         };
         let failover_revision = restarted_secondary_handle
-            .stateless_preview_next_operation_revision()
+            .public_v1_next_operation_revision()
             .await
             .unwrap();
-        let failover_intent = plan_public_lifecycle(
-            &PublicOperationPreviewEvaluationConfig::new(
+        let failover_intent = plan_public_v1_lifecycle(
+            &PublicV1EvaluationConfig::new(
                 preview.clone(),
                 Default::default(),
             ),
@@ -4538,7 +4532,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             failover_revision,
             restarted_secondary_handle.process_session_id(),
             failover_lifecycle,
-            PreviewTransition::Ordinary,
+            PublicV1LifecycleTransition::Ordinary,
         )
         .unwrap();
         let failover_accepted = PublicV1AcceptedStatus {
@@ -4596,14 +4590,14 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             )
             .unwrap(),
         );
-        let restart_adapter = HostedPublicV1Adapter::new(
+        let restart_adapter = HostedPublicV1Harness::new(
             vec![
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: primary_identity.clone(),
                     replication_address: format!("http://{primary_address}"),
                     handle: restarted_primary_handle.clone(),
                 },
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: secondary_identity.clone(),
                     replication_address: format!("http://{secondary_address}"),
                     handle: restarted_secondary_handle.clone(),
@@ -4623,23 +4617,23 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             reconcile_public_v1_operation(&restart_adapter, &test_scope(&resource_uid), failover_command.clone())
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
             reconcile_public_v1_operation(&restart_adapter, &test_scope(&resource_uid), failover_command)
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EffectApplied
         );
         assert_eq!(failover_evidence.effects().len(), 1);
         let old_primary_report = restarted_primary_handle
-            .stateless_preview_report()
+            .public_v1_report()
             .await
             .unwrap();
         let new_primary_report = restarted_secondary_handle
-            .stateless_preview_report()
+            .public_v1_report()
             .await
             .unwrap();
         assert_eq!(
@@ -4684,12 +4678,12 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
 }
 
 #[tokio::test]
-async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion() {
+async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion() {
     tokio::time::timeout(Duration::from_secs(150), async {
         let resource_uid = ResourceUid::new("preview-build");
-        let preview = PublicOperationPreviewIdentity::public_v1(8);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
+        let preview = PublicV1Identity::new(8);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -4753,7 +4747,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding.clone())
+        .with_public_v1_binding(binding.clone())
         .start()
         .await
         .unwrap();
@@ -4774,7 +4768,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(binding)
+        .with_public_v1_binding(binding)
         .start()
         .await
         .unwrap();
@@ -4784,7 +4778,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         let initialization = derive_history_initialization_id(&resource_uid, generation);
         let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
         source_handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_named(
@@ -4796,7 +4790,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .await
             .unwrap();
         target_handle
-            .initialize_stateless_preview_history(
+            .initialize_public_v1_history(
                 &initialization,
                 &history,
                 &storage_named(
@@ -4855,7 +4849,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             ),
         ] {
             target_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     target_session.clone(),
                     revision,
@@ -4960,7 +4954,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             let authority = authority_classified.clone();
             async move {
                 target_handle
-                    .install_stateless_preview_inbound_build_authority(&authority)
+                    .install_public_v1_inbound_build_authority(&authority)
                     .await
             }
         });
@@ -4989,7 +4983,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             let target_session = target_session.clone();
             async move {
                 target_handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         target_session,
                         4,
@@ -5028,7 +5022,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             )
             .unwrap();
         let durable: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let preview_state = &durable["publicOperationPreview"];
+        let preview_state = &durable["publicV1OperationState"];
         assert!(
             preview_state["currentInboundBuildAuthority"].is_null(),
             "classified successor survived completed configuration revocation"
@@ -5063,7 +5057,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         assert!(target_state.operations.lock().unwrap().is_empty());
 
         target_handle
-            .install_stateless_preview_inbound_build_authority(&authority_a)
+            .install_public_v1_inbound_build_authority(&authority_a)
             .await
             .unwrap();
         let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
@@ -5106,7 +5100,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         });
         target_state.finish_copy_entered.notified().await;
         target_handle
-            .install_stateless_preview_inbound_build_authority(&authority_b)
+            .install_public_v1_inbound_build_authority(&authority_b)
             .await
             .unwrap();
         assert!(
@@ -5170,13 +5164,13 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         .expect("B did not enter the target provider");
         assert!(
             target_handle
-                .install_stateless_preview_inbound_build_authority(&authority_a)
+                .install_public_v1_inbound_build_authority(&authority_a)
                 .await
                 .is_err(),
             "stale authority A unexpectedly replaced in-flight authority B"
         );
         target_handle
-            .install_stateless_preview_inbound_build_authority(&authority_b)
+            .install_public_v1_inbound_build_authority(&authority_b)
             .await
             .unwrap();
         target_state.release_finish_copy.notify_one();
@@ -5263,14 +5257,14 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .unwrap(),
         );
         let build_adapter = Arc::new(
-            HostedPublicV1Adapter::new(
+            HostedPublicV1Harness::new(
                 vec![
-                    HostedPreviewReplica {
+                    HostedPublicV1Replica {
                         identity: source_identity.clone(),
                         replication_address: format!("http://{source_address}"),
                         handle: source_handle.clone(),
                     },
-                    HostedPreviewReplica {
+                    HostedPublicV1Replica {
                         identity: target_identity.clone(),
                         replication_address: format!("http://{target_address}"),
                         handle: target_handle.clone(),
@@ -5389,14 +5383,14 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             reconcile_public_v1_consumer(build_adapter.as_ref(), &test_scope(&resource_uid), &build_report)
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
             reconcile_public_v1_consumer(build_adapter.as_ref(), &test_scope(&resource_uid), &build_report)
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EffectApplied
         );
         assert_eq!(build_evidence.effects().len(), 1);
@@ -5505,7 +5499,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             2,
         );
         target_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 target_session.clone(),
                 7,
@@ -5518,7 +5512,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .await
             .unwrap();
         target_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 target_session.clone(),
                 8,
@@ -5542,7 +5536,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .await
             .unwrap();
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 6,
@@ -5580,7 +5574,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         .await
         .expect("admitted build target did not observe committed write");
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 6,
@@ -5599,7 +5593,7 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             1,
         );
         source_handle
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
                 8,
@@ -5632,10 +5626,10 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
 }
 
 #[tokio::test]
-async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close() {
+async fn hosted_public_v1_supersession_cancels_build_root_and_drains_descendant_before_close() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let resource_uid = ResourceUid::new("preview-close-cancels-build");
-        let preview = PublicOperationPreviewIdentity::public_v1(13);
+        let preview = PublicV1Identity::new(13);
         let mut source =
             HostedMemoryReplica::start("close-build-source", &resource_uid, &preview, 1).await;
         let generation = PublicProtocolGeneration::new(13);
@@ -5708,7 +5702,7 @@ async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_be
         let copy_entered = source.state.copy_entered.notified();
         let mut build = tokio::spawn({
             let handle = source.handle();
-            async move { handle.execute_stateless_preview(build_intent).await }
+            async move { handle.execute_public_v1(build_intent).await }
         });
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
@@ -5731,7 +5725,7 @@ async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_be
             let preview = preview.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         5,
@@ -5771,7 +5765,7 @@ async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_be
             .unwrap();
         source
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source.handle().process_session_id(),
                 6,
@@ -5811,7 +5805,7 @@ async fn hosted_preview_supersession_cancels_build_root_and_drains_descendant_be
 async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let resource_uid = ResourceUid::new("hung-build-peer");
-        let preview = PublicOperationPreviewIdentity::public_v1(753);
+        let preview = PublicV1Identity::new(753);
         let mut source =
             HostedMemoryReplica::start("hung-build-source", &resource_uid, &preview, 1).await;
         let generation = PublicProtocolGeneration::new(753);
@@ -5871,7 +5865,7 @@ async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
             let configuration_id = configuration.configuration_id.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         4,
@@ -5912,7 +5906,7 @@ async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
             let preview = preview.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         5,
@@ -5929,7 +5923,7 @@ async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
             .unwrap();
         tokio::time::timeout(
             Duration::from_secs(10),
-            source.handle().execute_stateless_preview(intent(
+            source.handle().execute_public_v1(intent(
                 &preview,
                 source.handle().process_session_id(),
                 6,
@@ -5953,7 +5947,7 @@ async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
 async fn build_retained_gap_corruption_replaces_source_without_contacting_target() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let resource_uid = ResourceUid::new("build-source-gap-corruption");
-        let preview = PublicOperationPreviewIdentity::public_v1(754);
+        let preview = PublicV1Identity::new(754);
         let mut source =
             HostedMemoryReplica::start("build-gap-source", &resource_uid, &preview, 1).await;
         let generation = PublicProtocolGeneration::new(754);
@@ -6005,7 +5999,7 @@ async fn build_retained_gap_corruption_replaces_source_without_contacting_target
             let target = target.clone();
             async move {
                 handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         handle.process_session_id(),
                         4,
@@ -6079,7 +6073,7 @@ async fn build_retained_gap_corruption_replaces_source_without_contacting_target
         );
         source
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source.handle().process_session_id(),
                 5,
@@ -6096,7 +6090,7 @@ async fn build_retained_gap_corruption_replaces_source_without_contacting_target
             partition.get_write_status().await.unwrap(),
             AccessStatus::NotPrimary
         );
-        let report = source.handle().stateless_preview_report().await.unwrap();
+        let report = source.handle().public_v1_report().await.unwrap();
         let completion = report
             .completed_operations
             .iter()
@@ -6122,10 +6116,10 @@ async fn build_retained_gap_corruption_replaces_source_without_contacting_target
 }
 
 #[tokio::test]
-async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session() {
+async fn hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let resource_uid = ResourceUid::new("preview-removal-drain");
-        let preview = PublicOperationPreviewIdentity::public_v1(9);
+        let preview = PublicV1Identity::new(9);
         let mut source =
             HostedMemoryReplica::start("removal-source", &resource_uid, &preview, 1).await;
         let mut target =
@@ -6184,7 +6178,7 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         ] {
             target
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     target_session.clone(),
                     revision,
@@ -6229,7 +6223,7 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         );
         target
             .handle()
-            .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
                 operation_id: OperationId::new("active-build-to-remove"),
                 operation_revision: 4,
                 attempt: PublicBuildAttemptReference {
@@ -6252,7 +6246,7 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         let copy_entered = source.state.copy_entered.notified();
         let mut build = tokio::spawn({
             let handle = source.handle();
-            async move { handle.execute_stateless_preview(build_intent).await }
+            async move { handle.execute_public_v1(build_intent).await }
         });
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
@@ -6346,14 +6340,14 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
             .unwrap(),
         );
         let adapter = Arc::new(
-            HostedPublicV1Adapter::new(
+            HostedPublicV1Harness::new(
                 vec![
-                    HostedPreviewReplica {
+                    HostedPublicV1Replica {
                         identity: source.identity.clone(),
                         replication_address: format!("http://{}", source.address),
                         handle: source.handle(),
                     },
-                    HostedPreviewReplica {
+                    HostedPublicV1Replica {
                         identity: target.identity.clone(),
                         replication_address: format!("http://{}", target.address),
                         handle: target.handle(),
@@ -6408,19 +6402,18 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
             reconcile_public_v1_consumer(adapter.as_ref(), &test_scope(&resource_uid), &report)
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
             reconcile_public_v1_consumer(adapter.as_ref(), &test_scope(&resource_uid), &report)
                 .await
                 .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
-                EffectApplied
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::EffectApplied
         );
         assert!(matches!(
             evidence.effects().as_slice(),
-            [kuberic_controller::evaluator::test_bridge::PublicV1EvidenceEffect::Retired {
+            [kuberic_controller::evaluator::testing::PublicV1EvidenceEffect::Retired {
                 consumer: PublicV1EvidenceConsumer::Removal,
                 operation_id,
                 revision: 4,
@@ -6485,10 +6478,10 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
 }
 
 #[tokio::test]
-async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
+async fn hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement() {
     tokio::time::timeout(Duration::from_secs(180), async {
         let resource_uid = ResourceUid::new("preview-controller-replacement");
-        let preview = PublicOperationPreviewIdentity::public_v1(60);
+        let preview = PublicV1Identity::new(60);
         let mut source =
             HostedMemoryReplica::start("controller-source", &resource_uid, &preview, 1).await;
         let mut stale =
@@ -6547,7 +6540,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         ] {
             stale
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     stale_session.clone(),
                     revision,
@@ -6664,14 +6657,14 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             )
             .unwrap(),
         );
-        let build_adapter = HostedPublicV1Adapter::new(
+        let build_adapter = HostedPublicV1Harness::new(
             vec![
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: source.identity.clone(),
                     replication_address: format!("http://{}", source.address),
                     handle: source.handle(),
                 },
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: stale.identity.clone(),
                     replication_address: format!("http://{}", stale.address),
                     handle: stale.handle(),
@@ -6694,25 +6687,32 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         .await
         .unwrap_err();
         let rebuild_report = build_adapter.report(&source.identity).await.unwrap();
-        let rebuild_outcome = reconcile_public_v1_consumer(&build_adapter, &test_scope(&resource_uid), &rebuild_report)
-            .await
-            .unwrap();
+        let rebuild_outcome = reconcile_public_v1_consumer(
+            &build_adapter,
+            &test_scope(&resource_uid),
+            &rebuild_report,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rebuild_outcome,
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
                 EvidencePersisted,
             "build error: {build_error}; unexpected rebuild report: {rebuild_report:#?}"
         );
         assert_eq!(
-            reconcile_public_v1_consumer(&build_adapter, &test_scope(&resource_uid), &rebuild_report)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
-                EffectApplied
+            reconcile_public_v1_consumer(
+                &build_adapter,
+                &test_scope(&resource_uid),
+                &rebuild_report
+            )
+            .await
+            .unwrap(),
+            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::EffectApplied
         );
         assert!(matches!(
             build_evidence.effects().as_slice(),
-            [kuberic_controller::evaluator::test_bridge::PublicV1EvidenceEffect::Replacement {
+            [kuberic_controller::evaluator::testing::PublicV1EvidenceEffect::Replacement {
                 storage,
                 ..
             }] if storage.as_ref() == &stale.storage
@@ -6768,14 +6768,14 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             PublicV1EvidenceState::new(removal_transition.clone(), build_evidence.resources())
                 .unwrap(),
         );
-        let removal_adapter = HostedPublicV1Adapter::new(
+        let removal_adapter = HostedPublicV1Harness::new(
             vec![
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: source.identity.clone(),
                     replication_address: format!("http://{}", source.address),
                     handle: source.handle(),
                 },
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: stale.identity.clone(),
                     replication_address: format!("http://{}", stale.address),
                     handle: stale.handle(),
@@ -6798,12 +6798,20 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         .await
         .unwrap();
         let removal_report = removal_adapter.report(&source.identity).await.unwrap();
-        reconcile_public_v1_consumer(&removal_adapter, &test_scope(&resource_uid), &removal_report)
-            .await
-            .unwrap();
-        reconcile_public_v1_consumer(&removal_adapter, &test_scope(&resource_uid), &removal_report)
-            .await
-            .unwrap();
+        reconcile_public_v1_consumer(
+            &removal_adapter,
+            &test_scope(&resource_uid),
+            &removal_report,
+        )
+        .await
+        .unwrap();
+        reconcile_public_v1_consumer(
+            &removal_adapter,
+            &test_scope(&resource_uid),
+            &removal_report,
+        )
+        .await
+        .unwrap();
         let retired = removal_evidence
             .resources()
             .into_iter()
@@ -6830,7 +6838,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         assert!(
             source
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source.handle().process_session_id(),
                     5,
@@ -6867,7 +6875,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         assert!(
             source
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source.handle().process_session_id(),
                     5,
@@ -6910,7 +6918,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         ] {
             fresh
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     fresh_session.clone(),
                     revision,
@@ -6922,7 +6930,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         }
         source
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source.handle().process_session_id(),
                 7,
@@ -6947,7 +6955,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         };
         fresh
             .handle()
-            .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
                 operation_id: OperationId::new("controller-fresh-build"),
                 operation_revision: 7,
                 attempt: PublicBuildAttemptReference {
@@ -6969,7 +6977,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             .unwrap();
         source
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source.handle().process_session_id(),
                 7,
@@ -7043,7 +7051,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             ),
         ] {
             handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     handle.process_session_id(),
                     revision,
@@ -7055,7 +7063,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         }
         source
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source.handle().process_session_id(),
                 11,
@@ -7080,7 +7088,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             .unwrap();
         fresh
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 fresh.handle().process_session_id(),
                 6,
@@ -7106,7 +7114,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         assert_eq!(
             source
                 .handle()
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -7115,7 +7123,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         assert_eq!(
             fresh
                 .handle()
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -7139,7 +7147,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
 
         let predecessor = fresh
             .handle()
-            .stateless_preview_process_endpoint(ReplicaRole::Primary)
+            .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
         let predecessor_session = predecessor.process_session_id.clone();
@@ -7170,8 +7178,8 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(PreviewLifecycleBinding {
-            preview: preview.clone(),
+        .with_public_v1_binding(PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -7183,7 +7191,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         let renewal_epoch = Epoch::new(0, 3);
         let source_endpoint = source
             .handle()
-            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
         let renewal_configuration = ConfigurationDescriptor::new(
@@ -7202,7 +7210,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             2,
         );
         restarted_handle
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("controller-fresh-restart"),
                 reason: ProcessSessionRenewalReason::PrimaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -7228,7 +7236,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             .unwrap();
         source
             .handle()
-            .execute_stateless_preview(intent(
+            .execute_public_v1(intent(
                 &preview,
                 source.handle().process_session_id(),
                 12,
@@ -7284,7 +7292,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             ),
         ] {
             restarted_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     restarted_handle.process_session_id(),
                     revision,
@@ -7296,7 +7304,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         }
         assert_eq!(
             restarted_handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .unwrap()
                 .write_status,
@@ -7315,7 +7323,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         let before = *fresh_state.progress.lock().unwrap();
         assert!(
             restarted_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     predecessor_session,
                     11,
@@ -7353,7 +7361,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
 
         let source_predecessor = source
             .handle()
-            .stateless_preview_process_endpoint(ReplicaRole::ActiveSecondary)
+            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
         let source_root = source.root.clone();
@@ -7381,8 +7389,8 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .with_stateless_preview(PreviewLifecycleBinding {
-            preview: preview.clone(),
+        .with_public_v1_binding(PublicV1LifecycleBinding {
+            identity: preview.clone(),
             resource_uid: resource_uid.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
@@ -7408,7 +7416,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         );
         source
             .handle()
-            .authorize_stateless_preview_session_renewal(ProcessSessionRenewalRequired {
+            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
                 operation_id: OperationId::new("controller-source-restart"),
                 reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
                 resource_uid: resource_uid.clone(),
@@ -7427,7 +7435,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
                 }),
                 surviving_sessions: vec![
                     restarted_handle
-                        .stateless_preview_process_endpoint(ReplicaRole::Primary)
+                        .public_v1_process_endpoint(ReplicaRole::Primary)
                         .await
                         .unwrap(),
                 ],
@@ -7437,14 +7445,14 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             })
             .await
             .unwrap();
-        let post_restart_adapter = HostedPublicV1Adapter::new(
+        let post_restart_adapter = HostedPublicV1Harness::new(
             vec![
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: source.identity.clone(),
                     replication_address: format!("http://{}", source.address),
                     handle: source.handle(),
                 },
-                HostedPreviewReplica {
+                HostedPublicV1Replica {
                     identity: fresh_identity.clone(),
                     replication_address: format!("http://{restarted_address}"),
                     handle: restarted_handle.clone(),
@@ -7485,7 +7493,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         assert!(
             source
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source.handle().process_session_id(),
                     u64::MAX - 2,
@@ -7535,7 +7543,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         assert!(
             source
                 .handle()
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     source.handle().process_session_id(),
                     u64::MAX - 2,
@@ -7567,9 +7575,9 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
             ("unverifiable", false, false, true),
         ] {
             let resource_uid = ResourceUid::new(format!("suffix-{case}"));
-            let preview = PublicOperationPreviewIdentity::public_v1(12);
-            let binding = PreviewLifecycleBinding {
-                preview: preview.clone(),
+            let preview = PublicV1Identity::new(12);
+            let binding = PublicV1LifecycleBinding {
+                identity: preview.clone(),
                 resource_uid: resource_uid.clone(),
                 spec_generation: 1,
                 state_persistence: StatePersistence::Persisted,
@@ -7639,7 +7647,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 ApplicationStorageState::FreshEmpty,
                 Arc::new(Resolver),
             )
-            .with_stateless_preview(binding.clone())
+            .with_public_v1_binding(binding.clone())
             .start()
             .await
             .unwrap();
@@ -7663,7 +7671,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 ApplicationStorageState::FreshEmpty,
                 Arc::new(Resolver),
             )
-            .with_stateless_preview(binding)
+            .with_public_v1_binding(binding)
             .start()
             .await
             .unwrap();
@@ -7691,7 +7699,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 ),
             ] {
                 handle
-                    .initialize_stateless_preview_history(
+                    .initialize_public_v1_history(
                         &initialization,
                         &history,
                         &storage_named(identity, pod.as_str(), pvc.as_str()),
@@ -7821,7 +7829,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 secondary.wait().await.unwrap();
             }
             primary_handle
-                .execute_stateless_preview(intent(
+                .execute_public_v1(intent(
                     &preview,
                     primary_handle.process_session_id(),
                     5,
@@ -7849,7 +7857,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 .await
                 .unwrap();
             let settlement = primary_app.wait_for_write_quorum().await;
-            let report = primary_handle.stateless_preview_report().await.unwrap();
+            let report = primary_handle.public_v1_report().await.unwrap();
             if divergent {
                 assert!(matches!(
                     settlement,
@@ -7903,7 +7911,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 2);
                 assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 3);
                 primary_handle
-                    .execute_stateless_preview(intent(
+                    .execute_public_v1(intent(
                         &preview,
                         primary_handle.process_session_id(),
                         6,
@@ -7912,7 +7920,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                     ))
                     .await
                     .unwrap();
-                let report = primary_handle.stateless_preview_report().await.unwrap();
+                let report = primary_handle.public_v1_report().await.unwrap();
                 assert_eq!(
                     report.write_status,
                     kuberic_runtime::protocol::types::AccessStatus::Granted
@@ -7934,7 +7942,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
 }
 
 #[tokio::test]
-async fn production_config_has_no_preview_selector_and_stateless_source_has_no_legacy_store_or_auth()
+async fn production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth()
  {
     tokio::time::timeout(Duration::from_secs(30), async {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

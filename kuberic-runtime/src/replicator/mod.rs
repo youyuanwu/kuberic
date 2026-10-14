@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::application::{INVALID_LSN, Lsn, OperationData, StateProvider};
 use crate::engine::DurableState;
 use crate::host::store::PublicInboundBuildAdmission;
-use crate::protocol::public_operations::PreviewLifecycleBinding;
+use crate::protocol::public_operations::PublicV1LifecycleBinding;
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 use crate::protocol::public_operations::{PublicInboundBuildAuthority, PublicInboundBuildReceipt};
 use crate::{Result, RuntimeError};
@@ -205,7 +205,6 @@ impl From<ConfigurationDescriptor> for ReplicaSetConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplicatorSettings {
     pub replication_address: String,
-    pub public_v1: bool,
 }
 
 impl ReplicatorSettings {
@@ -220,32 +219,6 @@ pub struct ReplicatorInterfaces {
     state_replicator: Option<Arc<dyn StateReplicator>>,
     primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
     creation: Arc<ReplicatorCreation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReplicatorEngineSelection {
-    binding: PreviewLifecycleBinding,
-    replication_address: std::net::SocketAddr,
-}
-
-impl ReplicatorEngineSelection {
-    pub(crate) fn public_v1(
-        binding: PreviewLifecycleBinding,
-        replication_address: std::net::SocketAddr,
-    ) -> Self {
-        Self {
-            binding,
-            replication_address,
-        }
-    }
-
-    pub(crate) fn replacement_binding(&self) -> &PreviewLifecycleBinding {
-        &self.binding
-    }
-
-    pub(crate) fn replacement_replication_address(&self) -> std::net::SocketAddr {
-        self.replication_address
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,12 +311,9 @@ impl ReplicatorCreation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = bound.as_ref() {
-            if existing.identity != identity
-                || existing.owner != owner
-                || existing.settings.public_v1 != settings.public_v1
-            {
+            if existing.identity != identity || existing.owner != owner {
                 return Err(RuntimeError::Application(
-                    "replicator registration cannot change identity or public protocol".into(),
+                    "replicator registration cannot change identity".into(),
                 ));
             }
             return Ok(());
@@ -365,11 +335,12 @@ impl ReplicatorCreation {
             RuntimeError::Application("replicator settings are not registration-bound".into())
         })?;
         settings.validate()?;
-        if existing.settings.public_v1 != settings.public_v1 {
+        if existing.settings.replication_address != settings.replication_address {
             return Err(RuntimeError::Application(
-                "replicator settings cannot change the public protocol".into(),
+                "replicator settings cannot change the replication address".into(),
             ));
         }
+
         Ok(settings)
     }
 
@@ -631,7 +602,8 @@ pub struct ReplicatorFactoryContext {
     process_session_id: ProcessSessionId,
     access: Arc<dyn PartitionAccessView>,
     reservation: Option<ReplicatorCreationReservation>,
-    pub(crate) engine_selection: ReplicatorEngineSelection,
+    public_v1_binding: PublicV1LifecycleBinding,
+    public_v1_replication_address: std::net::SocketAddr,
 }
 
 impl ReplicatorFactoryContext {
@@ -641,14 +613,16 @@ impl ReplicatorFactoryContext {
         identity: ReplicaIdentity,
         process_session_id: ProcessSessionId,
         access: Arc<dyn PartitionAccessView>,
-        engine_selection: ReplicatorEngineSelection,
+        public_v1_binding: PublicV1LifecycleBinding,
+        public_v1_replication_address: std::net::SocketAddr,
     ) -> Self {
         Self {
             identity,
             process_session_id,
             access,
             reservation: None,
-            engine_selection,
+            public_v1_binding,
+            public_v1_replication_address,
         }
     }
 
@@ -689,12 +663,12 @@ impl ReplicatorFactoryContext {
         context
     }
 
-    pub(crate) fn replacement_binding(&self) -> &PreviewLifecycleBinding {
-        self.engine_selection.replacement_binding()
+    pub(crate) fn public_v1_binding(&self) -> &PublicV1LifecycleBinding {
+        &self.public_v1_binding
     }
 
-    pub(crate) fn replacement_replication_address(&self) -> std::net::SocketAddr {
-        self.engine_selection.replacement_replication_address()
+    pub(crate) fn public_v1_replication_address(&self) -> std::net::SocketAddr {
+        self.public_v1_replication_address
     }
 
     pub(crate) async fn publish_replacement_progress(
@@ -998,9 +972,8 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         let mut settings = settings;
-        settings.public_v1 = true;
         settings.replication_address =
-            format!("http://{}", context.replacement_replication_address());
+            format!("http://{}", context.public_v1_replication_address());
         stateless::StatelessReplicatorFactory::new(self.storage.clone())
             .create_replicator(context, state_provider, settings)
             .await

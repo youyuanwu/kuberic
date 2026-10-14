@@ -17,7 +17,7 @@ use crate::application::{CopyChunk, Operation, OperationData, StateProvider};
 use crate::control::proto;
 use crate::engine::DurableState;
 use crate::protocol::public_operations::{
-    LocalProviderRebuildRequired, PUBLIC_V1_PREVIEW_PROTOCOL_VERSION, ProviderReplicaIdentity,
+    LocalProviderRebuildRequired, PUBLIC_V1_PROTOCOL_VERSION, ProviderReplicaIdentity,
     PublicInboundBuildAuthority, PublicInboundBuildReceipt, RemoteBuildTargetRebuildRequired,
     ReplicaRebuildReason, ReplicaRebuildRequired,
 };
@@ -177,8 +177,8 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        let binding = context.replacement_binding().clone();
-        if !binding.preview.is_public_v1() || !settings.public_v1 {
+        let binding = context.public_v1_binding().clone();
+        if !binding.identity.is_public_v1() {
             return Err(RuntimeError::Application(
                 "stateless replacement requires exact Public V1 process authority".into(),
             ));
@@ -189,7 +189,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
             ));
         }
         if parse_bind_address(&settings.replication_address)?
-            != context.replacement_replication_address()
+            != context.public_v1_replication_address()
         {
             return Err(RuntimeError::Application(
                 "stateless replacement listener differs from process authority".into(),
@@ -672,7 +672,7 @@ impl StatelessReplicator {
         item: proto::ReplicationItem,
     ) -> std::result::Result<proto::ReplicationAck, Status> {
         let _effect = self.provider_effect_gate.lock().await;
-        if item.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION {
+        if item.protocol_version != PUBLIC_V1_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
                 "stateless replacement requires Public V1",
             ));
@@ -774,7 +774,7 @@ impl StatelessReplicator {
                 ));
             }
             return Ok(proto::ReplicationAck {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 sender: Some(sender.into()),
                 receiver: Some(receiver.into()),
                 epoch: Some(epoch.into()),
@@ -911,7 +911,7 @@ impl StatelessReplicator {
             ));
         }
         Ok(proto::ReplicationAck {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             sender: Some(sender.into()),
             receiver: Some(receiver.into()),
             epoch: Some(epoch.into()),
@@ -969,7 +969,7 @@ impl StatelessReplicator {
                     .await
                     .map_err(|error| ReplicationSendFailure::Unavailable(error.to_string()))?;
             let item = proto::ReplicationItem {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 sender: Some(self.identity.clone().into()),
                 receiver: Some(peer.identity.clone().into()),
                 epoch: Some(authority.epoch.into()),
@@ -1025,7 +1025,7 @@ impl StatelessReplicator {
                 .epoch
                 .ok_or_else(|| ReplicationSendFailure::Rejected("ACK epoch is absent".into()))?
                 .into();
-            if acknowledgement.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+            if acknowledgement.protocol_version != PUBLIC_V1_PROTOCOL_VERSION
                 || acknowledgement_sender != self.identity
                 || acknowledgement_receiver != peer.identity
                 || acknowledgement_epoch != authority.epoch
@@ -1393,7 +1393,7 @@ impl StatelessReplicator {
         let mut sequence = 0_u64;
         while let Some(chunk) = copy.next().await {
             items.push(proto::CopyItem {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 build_id: replica.build_id.to_string(),
                 sender: Some(self.identity.clone().into()),
                 receiver: Some(replica.identity.clone().into()),
@@ -1423,7 +1423,7 @@ impl StatelessReplicator {
             sequence = sequence.saturating_add(1);
         }
         items.push(proto::CopyItem {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             build_id: replica.build_id.to_string(),
             sender: Some(self.identity.clone().into()),
             receiver: Some(replica.identity.clone().into()),
@@ -1472,7 +1472,7 @@ impl StatelessReplicator {
                     return Err(self.local_rebuild_required());
                 }
                 items.push(proto::CopyItem {
-                    protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                    protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                     build_id: replica.build_id.to_string(),
                     sender: Some(self.identity.clone().into()),
                     receiver: Some(replica.identity.clone().into()),
@@ -1507,7 +1507,7 @@ impl StatelessReplicator {
             }
         }
         items.push(proto::CopyItem {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             build_id: replica.build_id.to_string(),
             sender: Some(self.identity.clone().into()),
             receiver: Some(replica.identity.clone().into()),
@@ -1567,7 +1567,7 @@ impl StatelessReplicator {
             let mut final_ack = None;
             while let Some(acknowledgement) = acknowledgements.next().await {
                 let acknowledgement = acknowledgement.map_err(|_| remote_conflict())?;
-                if acknowledgement.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+                if acknowledgement.protocol_version != PUBLIC_V1_PROTOCOL_VERSION
                     || acknowledgement.build_id != replica.build_id.as_str()
                     || acknowledgement.sender_session_id != replica.process_session_id.as_str()
                     || acknowledgement.receiver_session_id != self.process_session.as_str()
@@ -1612,7 +1612,7 @@ impl StatelessReplicator {
         item: proto::CopyItem,
     ) -> std::result::Result<proto::CopyAck, Status> {
         let _effect = self.provider_effect_gate.lock().await;
-        if item.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION {
+        if item.protocol_version != PUBLIC_V1_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
                 "stateless replacement requires Public V1",
             ));
@@ -1701,7 +1701,7 @@ impl StatelessReplicator {
                 ));
             }
             return Ok(proto::CopyAck {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 build_id: build_id.to_string(),
                 sender: Some(receiver.into()),
                 receiver: Some(sender.into()),
@@ -2012,7 +2012,7 @@ impl StatelessReplicator {
             .await
             .map_err(runtime_status)?;
         Ok(proto::CopyAck {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             build_id: build_id.to_string(),
             sender: Some(receiver.into()),
             receiver: Some(sender.into()),
@@ -2746,11 +2746,6 @@ impl StateReplicator for StatelessReplicator {
     }
 
     async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()> {
-        if !settings.public_v1 {
-            return Err(RuntimeError::Application(
-                "stateless replacement cannot disable Public V1".into(),
-            ));
-        }
         let mut current = self.settings.write().await;
         if self.state.lock().await.opened
             && current.replication_address != settings.replication_address

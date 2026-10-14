@@ -5,7 +5,7 @@ use kuberic_runtime::control::{
     normalize_public_v1_agent_status_report, public_v1_agent_status_to_proto,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationPreviewIdentity, PublicProgress, PublicProgressRole,
+    PublicProgress, PublicProgressRole, PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, EffectivePolicy, InitializationId, PodUid, ProcessSessionId,
@@ -182,7 +182,7 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
     let path = SqliteStore::metadata_database_path(&root);
     let resource_uid = ResourceUid::new("evidence-resource");
     let generation = PublicProtocolGeneration::new(42);
-    let preview = PublicOperationPreviewIdentity::public_v1(generation.value());
+    let preview = PublicV1Identity::new(generation.value());
     let replica = replica();
     let store = SqliteStore::create_public_v1(
         &path,
@@ -226,7 +226,7 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
     let wire = public_v1_agent_status_to_proto(&report);
     assert_eq!(
         wire.protocol_version,
-        kuberic_runtime::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+        kuberic_runtime::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION
     );
     assert!(wire.public_v1.is_some());
     assert!(wire.public_v1.is_some());
@@ -239,7 +239,7 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
 
 #[test]
 fn public_v1_schema11_rejects_prior_preview_stores() {
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     for version in [8, 9, 10] {
         let root = test_root(&format!("reject-{version}"));
         let path = SqliteStore::metadata_database_path(&root);

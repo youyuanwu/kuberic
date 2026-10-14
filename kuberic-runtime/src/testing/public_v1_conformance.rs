@@ -137,6 +137,12 @@ const HOST_SERVICE: &str = include_str!("../host/service.rs");
 const SQLITE_STORE: &str = include_str!("../host/sqlite_store.rs");
 const STATELESS: &str = include_str!("../replicator/stateless/mod.rs");
 const CONTROL_CONVERT: &str = include_str!("../control/convert.rs");
+const PUBLIC_OPERATIONS: &str = include_str!("../protocol/public_operations.rs");
+const HOST_OPERATION: &str = include_str!("../host/operation.rs");
+const HOST_LIFECYCLE_PROGRAM: &str = include_str!("../host/public_lifecycle_program.rs");
+const CONTROLLER_LIB: &str = include_str!("../../../kuberic-controller/src/lib.rs");
+const CONTROLLER_EVALUATOR: &str = include_str!("../../../kuberic-controller/src/evaluator.rs");
+const CONTROLLER_CLUSTER_API: &str = include_str!("../../../kuberic-controller/src/cluster_api.rs");
 
 fn contract_gate() {}
 
@@ -148,6 +154,8 @@ pub struct ReplacementOwnershipInventory {
     pub report_branches: Vec<String>,
     pub store_tables: Vec<String>,
     pub startup_owners: Vec<String>,
+    pub protocol_versions: Vec<String>,
+    pub controller_modules: Vec<String>,
 }
 
 struct ProductionSources<'a> {
@@ -158,6 +166,12 @@ struct ProductionSources<'a> {
     service: &'a str,
     sqlite_store: &'a str,
     control_convert: &'a str,
+    public_operations: &'a str,
+    host_operation: &'a str,
+    host_lifecycle_program: &'a str,
+    controller_lib: &'a str,
+    controller_evaluator: &'a str,
+    controller_cluster_api: &'a str,
 }
 
 fn production_sources() -> ProductionSources<'static> {
@@ -169,6 +183,12 @@ fn production_sources() -> ProductionSources<'static> {
         service: HOST_SERVICE,
         sqlite_store: SQLITE_STORE,
         control_convert: CONTROL_CONVERT,
+        public_operations: PUBLIC_OPERATIONS,
+        host_operation: HOST_OPERATION,
+        host_lifecycle_program: HOST_LIFECYCLE_PROGRAM,
+        controller_lib: CONTROLLER_LIB,
+        controller_evaluator: CONTROLLER_EVALUATOR,
+        controller_cluster_api: CONTROLLER_CLUSTER_API,
     }
 }
 
@@ -279,6 +299,24 @@ fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipIn
     if sources.process.contains(".serve_control_only(") {
         startup_owners.push("serve_control_only".into());
     }
+    let protocol_versions = discover_after(sources.public_operations, "pub const ", |character| {
+        !character.is_ascii_alphanumeric() && character != '_'
+    })
+    .into_iter()
+    .filter(|name| name.ends_with("_PROTOCOL_VERSION"))
+    .collect();
+    let controller_modules = [
+        sources.controller_lib,
+        sources.controller_evaluator,
+        sources.controller_cluster_api,
+    ]
+    .into_iter()
+    .flat_map(|source| {
+        discover_after(source, "mod ", |character| {
+            !character.is_ascii_alphanumeric() && character != '_'
+        })
+    })
+    .collect();
     ReplacementOwnershipInventory {
         factories,
         services,
@@ -286,6 +324,8 @@ fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipIn
         report_branches: discover_report_branches(sources.control_convert),
         store_tables,
         startup_owners: sorted_unique(startup_owners),
+        protocol_versions: sorted_unique(protocol_versions),
+        controller_modules: sorted_unique(controller_modules),
     }
 }
 
@@ -300,6 +340,25 @@ pub fn replacement_ownership_inventory_with_extra_endpoint_fixture() -> Replacem
     );
     discover_inventory(&ProductionSources {
         service: &service,
+        ..production_sources()
+    })
+}
+
+pub fn replacement_ownership_inventory_with_alternate_protocol_fixture()
+-> ReplacementOwnershipInventory {
+    let public_operations =
+        format!("{PUBLIC_OPERATIONS}\npub const ALTERNATE_PROTOCOL_VERSION: u32 = 10;");
+    discover_inventory(&ProductionSources {
+        public_operations: &public_operations,
+        ..production_sources()
+    })
+}
+
+pub fn replacement_ownership_inventory_with_alternate_controller_fixture()
+-> ReplacementOwnershipInventory {
+    let controller_lib = format!("{CONTROLLER_LIB}\npub mod alternate_controller_owner;");
+    discover_inventory(&ProductionSources {
+        controller_lib: &controller_lib,
         ..production_sources()
     })
 }
@@ -360,16 +419,63 @@ pub fn validate_replacement_ownership_inventory(
     {
         return reject("startup owner", &inventory.startup_owners);
     }
+    if inventory.protocol_versions.as_slice() != ["PUBLIC_V1_PROTOCOL_VERSION"] {
+        return reject("protocol version", &inventory.protocol_versions);
+    }
+    if inventory.controller_modules.as_slice()
+        != [
+            "cluster_api",
+            "crd",
+            "error",
+            "evaluator",
+            "executor",
+            "observation",
+            "public_v1_evidence",
+            "public_v1_history",
+            "public_v1_lifecycle",
+            "public_v1_normalize",
+            "public_v1_operations",
+            "public_v1_reconciliation",
+            "public_v1_service",
+            "public_v1_session_renewal",
+            "reconciler",
+            "testing",
+            "tests",
+        ]
+    {
+        return reject("controller module", &inventory.controller_modules);
+    }
     if REPLICATOR.contains("LegacyManaged")
         || REPLICATOR.contains("pub struct DefaultReplicator {")
         || !REPLICATOR.contains("stateless::StatelessReplicatorFactory::new")
         || PUBLIC_LIFECYCLE.contains("ManagedReplicatorCapabilities")
         || HOST_PROCESS.contains("run_outbound(")
         || HOST_PROCESS.contains("run_peer_discovery(")
+        || sources_contain_alternate_protocol(&production_sources())
     {
         return Err("legacy replacement owner remains in production source".into());
     }
     Ok(())
+}
+
+fn sources_contain_alternate_protocol(sources: &ProductionSources<'_>) -> bool {
+    [
+        sources.public_operations,
+        sources.host_operation,
+        sources.host_lifecycle_program,
+        sources.controller_lib,
+        sources.controller_evaluator,
+        sources.controller_cluster_api,
+    ]
+    .into_iter()
+    .any(|source| {
+        source.contains("is_legacy_preview")
+            || source.contains("PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION")
+            || source.contains("protocol-10")
+            || source.contains("PreviewServiceApi")
+            || source.contains("execute_preview_service_location")
+            || source.contains("HostedPublicV1Adapter")
+    })
 }
 
 fn replacement_ownership_gate() {
@@ -384,7 +490,7 @@ const GATES: [Gate; 16] = [
         owner: "lifecycle",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "primary role completes before primary configuration",
         eligibility: contract_gate,
@@ -395,7 +501,7 @@ const GATES: [Gate; 16] = [
         owner: "recovery",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_preview_authorized_data_loss_maps_only_the_effective_outcome",
+            "hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome",
         ],
         expected: "logical authorization distinguishes every callback outcome",
         eligibility: contract_gate,
@@ -406,7 +512,7 @@ const GATES: [Gate; 16] = [
         owner: "lifecycle",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "same-role epoch renewal fences predecessor traffic",
         eligibility: contract_gate,
@@ -417,7 +523,7 @@ const GATES: [Gate; 16] = [
         owner: "configuration",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "configuration contains only exact ready remote peers",
         eligibility: contract_gate,
@@ -428,7 +534,7 @@ const GATES: [Gate; 16] = [
         owner: "build",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion",
+            "hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion",
         ],
         expected: "build target is idle, outside PC/CC, and has invalid progress",
         eligibility: contract_gate,
@@ -440,8 +546,8 @@ const GATES: [Gate; 16] = [
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
             "hung_build_peer_is_bounded_and_drained_before_successor_close",
-            "hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion",
-            "hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session",
+            "hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion",
+            "hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session",
         ],
         expected: "build root and descendants drain before removal",
         eligibility: contract_gate,
@@ -452,7 +558,7 @@ const GATES: [Gate; 16] = [
         owner: "swap",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "specific quorum and fallback are captured replay inputs",
         eligibility: contract_gate,
@@ -465,7 +571,7 @@ const GATES: [Gate; 16] = [
         replacement_scenarios: &[
             "public_v1_history_partition_seed_is_shared",
             "ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress",
-            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "numeric progress is comparable only inside one history",
         eligibility: contract_gate,
@@ -476,7 +582,7 @@ const GATES: [Gate; 16] = [
         owner: "construction",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "production_config_has_no_preview_selector_and_stateless_source_has_no_legacy_store_or_auth",
+            "production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth",
         ],
         expected: "stateless Public V1 is the sole built-in default",
         eligibility: replacement_ownership_gate,
@@ -486,7 +592,9 @@ const GATES: [Gate; 16] = [
         name: "replicator_open_owns_endpoint_lifetime",
         owner: "transport",
         postgres_scenarios: &[],
-        replacement_scenarios: &["preview_open_owns_registration_listener_and_writer_exactly_once"],
+        replacement_scenarios: &[
+            "public_v1_open_owns_registration_listener_and_writer_exactly_once",
+        ],
         expected: "public endpoint lifetime follows Replicator lifecycle",
         eligibility: replacement_ownership_gate,
     },
@@ -495,7 +603,7 @@ const GATES: [Gate; 16] = [
         name: "role_address_is_published_and_cleared",
         owner: "reporting",
         postgres_scenarios: &[],
-        replacement_scenarios: &["hosted_preview_role_address_publishes_replaces_and_clears"],
+        replacement_scenarios: &["hosted_public_v1_role_address_publishes_replaces_and_clears"],
         expected: "exact role completion publishes and clears address",
         eligibility: contract_gate,
     },
@@ -505,7 +613,7 @@ const GATES: [Gate; 16] = [
         owner: "operation",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close",
+            "hosted_public_v1_supersession_cancels_build_root_and_drains_descendant_before_close",
         ],
         expected: "supersession contains callback roots and descendants",
         eligibility: contract_gate,
@@ -516,9 +624,9 @@ const GATES: [Gate; 16] = [
         owner: "fault",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement",
-            "hosted_preview_rebuild_retires_and_restarts_fresh_replacement",
-            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_retirement",
+            "hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement",
+            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "fault closes access and targets one exact incarnation",
         eligibility: contract_gate,
@@ -529,7 +637,7 @@ const GATES: [Gate; 16] = [
         owner: "close",
         postgres_scenarios: &["public_v1_postgres_contained_close"],
         replacement_scenarios: &[
-            "hosted_preview_contained_close_restarts_without_replaying_interrupted_children",
+            "hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children",
         ],
         expected: "child diagnostics do not change normalized outer close",
         eligibility: contract_gate,
@@ -540,7 +648,7 @@ const GATES: [Gate; 16] = [
         owner: "replay",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_preview_contained_close_restarts_without_replaying_interrupted_children",
+            "hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children",
             "public_v1_schema11_failed_build_containment_survives_reopen",
             "public_v1_schema11_rebuild_then_cancellation_survives_reopen",
             "public_v1_history_data_loss_attempt_renews_higher_epoch",

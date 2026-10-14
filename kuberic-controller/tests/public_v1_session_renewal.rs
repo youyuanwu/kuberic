@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use kuberic_controller::cluster_api::PublicV1Scope;
-use kuberic_controller::evaluator::test_bridge::{
+use kuberic_controller::evaluator::testing::{
     PublicV1SessionRenewalApi, PublicV1SessionRenewalPlan, accept_public_v1_session_access_closed,
     accept_public_v1_session_epoch_updated, accept_public_v1_session_renewal,
     accept_public_v1_survivor_retired, execute_public_v1_session_renewal,
@@ -11,9 +11,8 @@ use kuberic_runtime::protocol::command::{
     ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
-    ProcessSessionRenewalRequired, PublicOperationPreviewIdentity, PublicProgress,
-    PublicProgressRole, PublicSessionRenewalStage, PublicV1AgentReport,
-    PublicV1SessionRenewalStatus,
+    ProcessSessionRenewalRequired, PublicProgress, PublicProgressRole, PublicSessionRenewalStage,
+    PublicV1AgentReport, PublicV1Identity, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch,
@@ -179,7 +178,7 @@ fn requirement(reason: ProcessSessionRenewalReason) -> ProcessSessionRenewalRequ
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
-        identity: PublicOperationPreviewIdentity::public_v1(42),
+        identity: PublicV1Identity::new(42),
         resource_uid: required.resource_uid.clone(),
         replica: replacement.identity.clone(),
         process_session_id: replacement.process_session_id.clone(),
@@ -299,7 +298,7 @@ fn public_v1_primary_and_secondary_replacements_obey_epoch_ordering() {
 }
 
 #[tokio::test]
-async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement() {
+async fn hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_retirement() {
     tokio::time::timeout(std::time::Duration::from_secs(270), async {
         let required = requirement(ProcessSessionRenewalReason::PrimaryReplacement);
         let pending = pending_barriers(required.clone());

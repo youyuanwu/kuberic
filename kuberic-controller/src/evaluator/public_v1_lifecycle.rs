@@ -1,4 +1,4 @@
-//! Selected repository preview only; no production Plan or AcceptedStatus variant.
+//! Public V1 lifecycle planning used by the hosted verification harness.
 
 use k8s_openapi::api::core::v1::Service;
 use kuberic_runtime::protocol::public_operations::{
@@ -10,25 +10,25 @@ use kuberic_runtime::protocol::types::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::test_bridge::PublicOperationPreviewEvaluationConfig;
+use super::testing::PublicV1EvaluationConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewTransition {
+pub enum PublicV1LifecycleTransition {
     Ordinary,
     PossibleDataLoss,
 }
 
-pub fn plan_public_lifecycle(
-    config: &PublicOperationPreviewEvaluationConfig,
+pub fn plan_public_v1_lifecycle(
+    config: &PublicV1EvaluationConfig,
     operation_id: OperationId,
     revision: u64,
     source_session: ProcessSessionId,
     mut input: PublicLifecycleInput,
-    transition: PreviewTransition,
+    transition: PublicV1LifecycleTransition,
 ) -> Result<PublicOperationIntent, String> {
     input.possible_data_loss = match transition {
-        PreviewTransition::Ordinary => PossibleDataLossIntent::NotPossible,
-        PreviewTransition::PossibleDataLoss => PossibleDataLossIntent::Possible,
+        PublicV1LifecycleTransition::Ordinary => PossibleDataLossIntent::NotPossible,
+        PublicV1LifecycleTransition::PossibleDataLoss => PossibleDataLossIntent::Possible,
     };
     let intent = PublicOperationIntent {
         preview: config.identity.clone(),
@@ -80,7 +80,7 @@ pub struct ServiceLocationProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum PreviewServiceLocationStage {
+pub enum PublicV1ServiceLocationStage {
     #[default]
     None,
     Pending(ServiceLocationProjection),
@@ -88,18 +88,18 @@ pub enum PreviewServiceLocationStage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct PreviewAcceptedStatus {
-    pub service_location_projection: PreviewServiceLocationStage,
+pub struct PublicV1LifecycleStatus {
+    pub service_location_projection: PublicV1ServiceLocationStage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreviewServiceLocationPlan {
+pub enum PublicV1ServiceLocationPlan {
     PersistStatus {
-        expected: PreviewAcceptedStatus,
-        next: PreviewAcceptedStatus,
+        expected: PublicV1LifecycleStatus,
+        next: PublicV1LifecycleStatus,
     },
     WriteService {
-        expected_status: PreviewAcceptedStatus,
+        expected_status: PublicV1LifecycleStatus,
         expected_uid: String,
         expected_version: String,
         projection: ServiceLocationProjection,
@@ -108,13 +108,13 @@ pub enum PreviewServiceLocationPlan {
 }
 
 pub fn evaluate_service_location(
-    config: &PublicOperationPreviewEvaluationConfig,
+    config: &PublicV1EvaluationConfig,
     resource_uid: &ResourceUid,
     authority: &PublicOperationIntent,
     report: Option<&PublicLifecycleReport>,
-    status: &PreviewAcceptedStatus,
+    status: &PublicV1LifecycleStatus,
     service: &Service,
-) -> Result<PreviewServiceLocationPlan, String> {
+) -> Result<PublicV1ServiceLocationPlan, String> {
     config.validate_identity(&authority.preview)?;
     authority.validate()?;
     if let Some(report) = report
@@ -135,9 +135,9 @@ pub fn evaluate_service_location(
         .filter(|version| !version.is_empty())
         .ok_or("Service resourceVersion required")?;
     let existing = match &status.service_location_projection {
-        PreviewServiceLocationStage::None => None,
-        PreviewServiceLocationStage::Pending(projection)
-        | PreviewServiceLocationStage::Published(projection) => Some(projection),
+        PublicV1ServiceLocationStage::None => None,
+        PublicV1ServiceLocationStage::Pending(projection)
+        | PublicV1ServiceLocationStage::Published(projection) => Some(projection),
     };
     if let Some(existing) = existing {
         validate_projection(config, existing)?;
@@ -148,7 +148,9 @@ pub fn evaluate_service_location(
             return Err("stale service-location authority".into());
         }
     }
-    let location = crate::normalize::normalize_public_service_location(config, authority, report)?;
+    let location = crate::public_v1_normalize::normalize_public_v1_lifecycle_service_location(
+        config, authority, report,
+    )?;
     let primary = authority
         .lifecycle
         .as_ref()
@@ -177,59 +179,59 @@ pub fn evaluate_service_location(
         deferred_location,
     };
     if existing.is_none_or(|existing| !same_projection(existing, &desired)) {
-        return Ok(PreviewServiceLocationPlan::PersistStatus {
+        return Ok(PublicV1ServiceLocationPlan::PersistStatus {
             expected: status.clone(),
-            next: PreviewAcceptedStatus {
-                service_location_projection: PreviewServiceLocationStage::Pending(desired),
+            next: PublicV1LifecycleStatus {
+                service_location_projection: PublicV1ServiceLocationStage::Pending(desired),
             },
         });
     }
     let existing = existing.expect("projection exists after semantic match");
     if matches!(
         status.service_location_projection,
-        PreviewServiceLocationStage::Published(_)
+        PublicV1ServiceLocationStage::Published(_)
     ) {
-        if !crate::cluster_api::preview_service_matches(service, &desired)
+        if !crate::cluster_api::public_v1_service_matches(service, &desired)
             || existing.service_uid != service_uid
             || existing.service_resource_version != service_resource_version
         {
-            return Ok(PreviewServiceLocationPlan::PersistStatus {
+            return Ok(PublicV1ServiceLocationPlan::PersistStatus {
                 expected: status.clone(),
-                next: PreviewAcceptedStatus {
-                    service_location_projection: PreviewServiceLocationStage::Pending(desired),
+                next: PublicV1LifecycleStatus {
+                    service_location_projection: PublicV1ServiceLocationStage::Pending(desired),
                 },
             });
         }
-        return Ok(PreviewServiceLocationPlan::Stable);
+        return Ok(PublicV1ServiceLocationPlan::Stable);
     }
-    if !crate::cluster_api::preview_service_matches(service, &desired) {
+    if !crate::cluster_api::public_v1_service_matches(service, &desired) {
         if existing.service_uid != service_uid
             || existing.service_resource_version != service_resource_version
         {
-            return Ok(PreviewServiceLocationPlan::PersistStatus {
+            return Ok(PublicV1ServiceLocationPlan::PersistStatus {
                 expected: status.clone(),
-                next: PreviewAcceptedStatus {
-                    service_location_projection: PreviewServiceLocationStage::Pending(desired),
+                next: PublicV1LifecycleStatus {
+                    service_location_projection: PublicV1ServiceLocationStage::Pending(desired),
                 },
             });
         }
-        return Ok(PreviewServiceLocationPlan::WriteService {
+        return Ok(PublicV1ServiceLocationPlan::WriteService {
             expected_status: status.clone(),
             expected_uid: existing.service_uid.clone(),
             expected_version: existing.service_resource_version.clone(),
             projection: existing.clone(),
         });
     }
-    Ok(PreviewServiceLocationPlan::PersistStatus {
+    Ok(PublicV1ServiceLocationPlan::PersistStatus {
         expected: status.clone(),
-        next: PreviewAcceptedStatus {
-            service_location_projection: PreviewServiceLocationStage::Published(desired),
+        next: PublicV1LifecycleStatus {
+            service_location_projection: PublicV1ServiceLocationStage::Published(desired),
         },
     })
 }
 
 fn validate_projection(
-    config: &PublicOperationPreviewEvaluationConfig,
+    config: &PublicV1EvaluationConfig,
     projection: &ServiceLocationProjection,
 ) -> Result<(), String> {
     config.validate_identity(&projection.authority.preview)?;
@@ -287,7 +289,7 @@ fn same_projection(
 
 fn projection_locations(
     existing: Option<&ServiceLocationProjection>,
-    status: &PreviewAcceptedStatus,
+    status: &PublicV1LifecycleStatus,
     service: &Service,
     authority: &PublicOperationIntent,
     location: Option<ServiceLocation>,
@@ -364,14 +366,14 @@ fn projection_revoked(
 }
 
 fn projection_is_published(
-    status: &PreviewAcceptedStatus,
+    status: &PublicV1LifecycleStatus,
     service: &Service,
     projection: &ServiceLocationProjection,
 ) -> bool {
     matches!(
         status.service_location_projection,
-        PreviewServiceLocationStage::Published(_)
-    ) && crate::cluster_api::preview_service_matches(service, projection)
+        PublicV1ServiceLocationStage::Published(_)
+    ) && crate::cluster_api::public_v1_service_matches(service, projection)
         && service.metadata.uid.as_ref() == Some(&projection.service_uid)
         && service.metadata.resource_version.as_ref() == Some(&projection.service_resource_version)
 }

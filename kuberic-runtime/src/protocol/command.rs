@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::public_operations::{
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicSessionEpochBarrierStage,
-    PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1SessionRenewalStatus,
+    PublicOperationIntent, PublicSessionEpochBarrierStage, PublicSessionRenewalStage,
+    PublicV1AcceptedStatus, PublicV1Identity, PublicV1SessionRenewalStatus,
 };
 use crate::protocol::types::{
     AgentGeneration, BuildAuthority, ConfigurationDescriptor, EffectivePolicy, Epoch,
@@ -167,7 +167,7 @@ pub struct AcceptSecondaryRemovalCommit {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PublicV1HistoryCommand {
     Initialize {
-        preview: PublicOperationPreviewIdentity,
+        preview: PublicV1Identity,
         accepted: PublicV1AcceptedStatus,
         storage: ReplicaStorageIncarnationContext,
     },

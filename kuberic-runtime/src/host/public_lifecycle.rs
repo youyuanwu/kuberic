@@ -14,8 +14,8 @@ use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
     PublicBuildInput, PublicCatchUpMode, PublicLifecycleInput, PublicLifecycleRecipe,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram, PublicProgress,
-    PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
+    PublicOperationIntent, PublicOperationProgram, PublicProgress, PublicV1AgentReport,
+    PublicV1CallKind, PublicV1Identity, PublicV1OperationCompletion, PublicV1OperationResult,
     ReplicaRebuildRequired, ServiceLocation,
 };
 use crate::protocol::types::{
@@ -94,9 +94,6 @@ impl PublicLifecycleCallbacks {
     }
 
     fn validate_intent_capabilities(&self, intent: &PublicOperationIntent) -> Result<()> {
-        if !intent.preview.is_public_v1() {
-            return Ok(());
-        }
         if let Some(PublicOperationProgram::Swap {
             catch_up_specific_quorum,
             ..
@@ -693,7 +690,7 @@ fn public_v1_completion_authority(
 
 pub(crate) async fn public_v1_report(
     store: &dyn AgentStore,
-    identity: &PublicOperationPreviewIdentity,
+    identity: &PublicV1Identity,
     projection: PublicV1ReportProjection,
 ) -> Result<PublicV1AgentReport> {
     if !identity.is_public_v1() {
@@ -702,7 +699,7 @@ pub(crate) async fn public_v1_report(
         ));
     }
     let state = store.load_state().await?;
-    let preview = state.public_operation_preview.ok_or_else(|| {
+    let preview = state.public_v1_operation_state.ok_or_else(|| {
         HostError::CommandRejected("Public V1 report requires replacement state".into())
     })?;
     if &preview.identity != identity {

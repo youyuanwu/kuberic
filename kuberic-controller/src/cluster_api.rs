@@ -14,8 +14,6 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client, Resource, ResourceExt};
 use kuberic_runtime::control::proto;
-#[cfg(feature = "runtime-test-bridge")]
-use kuberic_runtime::protocol::command::ScaleDownResource;
 use kuberic_runtime::protocol::command::{InitializeAgentStore, ProtocolCommand};
 use kuberic_runtime::protocol::observation::ReplicaObservationKey;
 use kuberic_runtime::protocol::public_operations::{
@@ -39,8 +37,6 @@ use crate::crd::{
 use crate::evaluator::public_v1_evidence::{
     PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
 };
-#[cfg(feature = "runtime-test-bridge")]
-use crate::observation::{ExactLookup, RawScaleDownResources};
 use crate::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
 use crate::{ControllerError, Result};
 
@@ -49,18 +45,10 @@ const REPLICATION_PORT: i32 = 50052;
 const LIVE_TEST_COPY_GATE_ANNOTATION: &str = "testing.kuberic.io/live-copy-gate";
 const LIVE_TEST_COPY_GATE_ADDRESS: &str = "0.0.0.0:18080";
 #[cfg(feature = "runtime-test-bridge")]
-pub(crate) const PREVIEW_SERVICE_LOCATION_ANNOTATION: &str =
-    "operator.kuberic.io/preview-service-location";
-
+pub(crate) const PUBLIC_V1_SERVICE_LOCATION_ANNOTATION: &str =
+    "operator.kuberic.io/public-v1-service-location";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
-    #[cfg(feature = "runtime-test-bridge")]
-    DeleteScaleDownResource {
-        resource: ScaleDownResource,
-        name: String,
-        uid: String,
-        resource_version: String,
-    },
     EnsureReplicaSupport,
     EnsureScaffolding(Vec<ReplicaId>),
     EnsureReplacement(ReplicaIdentity),
@@ -68,19 +56,7 @@ pub enum EffectRecord {
         pod_name: Option<String>,
         pvc_name: Option<String>,
     },
-    DeleteExactPod {
-        pod_name: String,
-        pod_uid: PodUid,
-    },
-    DeleteExactService {
-        name: String,
-        uid: String,
-        resource_version: String,
-    },
-    EnsureWriteRoutingService,
     ReplaceStatus,
-    RemoveWriteRouting,
-    PublishWriteRouting(ReplicaIdentity),
     Execute(ProtocolCommand),
 }
 
@@ -111,27 +87,12 @@ pub trait AgentApi: Send + Sync {
 pub trait ClusterApi: Send + Sync {
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation>;
 
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_scale_down_resource(
-        &self,
-        observation: &RawObservation,
-        resource: ScaleDownResource,
-        name: &str,
-        uid: &str,
-        resource_version: &str,
-    ) -> Result<()>;
-
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
     async fn ensure_replica_scaffolding(
         &self,
         observation: &RawObservation,
         replica_ids: &[ReplicaId],
     ) -> Result<()>;
 
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
     async fn ensure_replica_support(&self, observation: &RawObservation) -> Result<()>;
 
     async fn ensure_replacement_scaffolding(
@@ -148,49 +109,6 @@ pub trait ClusterApi: Send + Sync {
         pod_uid: Option<&PodUid>,
         pvc_name: Option<&str>,
         pvc_uid: Option<&PvcUid>,
-    ) -> Result<()>;
-
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_replica_endpoint(
-        &self,
-        observation: &RawObservation,
-        identity: &ReplicaIdentity,
-    ) -> Result<()>;
-
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_exact_pod(
-        &self,
-        observation: &RawObservation,
-        pod_name: &str,
-        pod_uid: &PodUid,
-    ) -> Result<()>;
-
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_exact_service(
-        &self,
-        observation: &RawObservation,
-        name: &str,
-        uid: &str,
-        resource_version: &str,
-    ) -> Result<()>;
-
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()>;
-
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()>;
-
-    #[cfg(feature = "runtime-test-bridge")]
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn publish_write_routing(
-        &self,
-        observation: &RawObservation,
-        primary: &ReplicaIdentity,
     ) -> Result<()>;
 
     async fn execute_command(
@@ -384,47 +302,6 @@ impl<A> ClusterApi for KubeClusterApi<A>
 where
     A: AgentApi + 'static,
 {
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_scale_down_resource(
-        &self,
-        observation: &RawObservation,
-        resource: ScaleDownResource,
-        name: &str,
-        uid: &str,
-        resource_version: &str,
-    ) -> Result<()> {
-        let params = scale_down_delete_params(observation, resource, name, uid, resource_version)?;
-        let namespace = observation
-            .set
-            .namespace()
-            .ok_or(ControllerError::ObservationStale)?;
-        match resource {
-            ScaleDownResource::Pod => {
-                delete_scale_down_exact(
-                    &Api::<Pod>::namespaced(self.client.clone(), &namespace),
-                    name,
-                    &params,
-                )
-                .await
-            }
-            ScaleDownResource::Pvc => {
-                delete_scale_down_exact(
-                    &Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), &namespace),
-                    name,
-                    &params,
-                )
-                .await
-            }
-            ScaleDownResource::Endpoint => {
-                delete_scale_down_exact(
-                    &Api::<Service>::namespaced(self.client.clone(), &namespace),
-                    name,
-                    &params,
-                )
-                .await
-            }
-        }
-    }
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation> {
         self.require_installation_namespace(namespace)?;
         let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), namespace);
@@ -458,8 +335,6 @@ where
             secrets,
             failures,
             agents: BTreeMap::new(),
-            #[cfg(feature = "runtime-test-bridge")]
-            exact_resources: Vec::new(),
             now_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| ControllerError::Observation(error.to_string()))?
@@ -497,7 +372,6 @@ where
         Ok(raw)
     }
 
-    #[cfg(feature = "runtime-test-bridge")]
     async fn ensure_replica_scaffolding(
         &self,
         observation: &RawObservation,
@@ -526,66 +400,6 @@ where
         ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await?;
         let image = effective_replica_image(observation)?;
         for replica_id in replica_ids {
-            let allocation_operation_id =
-                scale_up_allocation_operation_id(&observation.set, *replica_id);
-            let configured_identity = observation
-                .set
-                .status
-                .as_ref()
-                .and_then(|status| {
-                    status
-                        .authority
-                        .transition
-                        .as_ref()
-                        .map(|transition| &transition.current_configuration)
-                        .or_else(|| {
-                            status
-                                .authority
-                                .topology
-                                .as_ref()
-                                .map(|topology| &topology.configuration)
-                        })
-                })
-                .and_then(|configuration| {
-                    configuration
-                        .members
-                        .iter()
-                        .find(|member| member.identity.replica_id == *replica_id)
-                })
-                .map(|member| &member.identity);
-            if let Some(identity) = configured_identity
-                && let Some(pod) = observation
-                    .pods
-                    .iter()
-                    .find(|pod| pod.uid().as_deref() == Some(identity.instance_id.as_str()))
-            {
-                let pvc_name = pod.spec.as_ref().and_then(|spec| {
-                    spec.volumes
-                        .as_ref()?
-                        .iter()
-                        .find(|volume| volume.name == "data")?
-                        .persistent_volume_claim
-                        .as_ref()
-                        .map(|claim| claim.claim_name.as_str())
-                });
-                let pvc = pvc_name
-                    .and_then(|name| observation.pvcs.iter().find(|pvc| pvc.name_any() == name));
-                let Some(pvc) = pvc else {
-                    return Err(ControllerError::ObservationStale);
-                };
-                ensure_exact_peer_endpoint(
-                    self.client.clone(),
-                    observation,
-                    &namespace,
-                    &uid,
-                    &owner,
-                    pod,
-                    pvc,
-                    *replica_id,
-                )
-                .await?;
-                continue;
-            }
             let pod_name = replica_name(&observation.set, *replica_id);
             let pvc_name = format!("{pod_name}-data");
             let pvc = observation
@@ -596,50 +410,17 @@ where
                 create_exact(
                     &pvcs,
                     &pvc_name,
-                    &replica_pvc(
-                        &observation.set,
-                        *replica_id,
-                        &uid,
-                        &owner,
-                        allocation_operation_id,
-                    ),
+                    &replica_pvc(&observation.set, *replica_id, &uid, &owner),
                 )
                 .await?;
                 continue;
             };
             let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
-            if let Some(operation_id) = allocation_operation_id
-                && (!pvc_matches_allocation(pvc, operation_id)
-                    || observation
-                        .set
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
-                        .and_then(|allocation| allocation.pvc_uid.as_ref())
-                        .is_some_and(|frozen| frozen.as_str() != pvc_uid))
-            {
-                return Err(ControllerError::ObservationStale);
-            }
             if !observation
                 .pods
                 .iter()
                 .any(|pod| pod.name_any() == pod_name)
             {
-                let pvc = authoritative_pvc_for_pod_create(
-                    &pvcs,
-                    pvc,
-                    &observation.set,
-                    *replica_id,
-                    allocation_operation_id,
-                    observation
-                        .set
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
-                        .and_then(|allocation| allocation.pvc_uid.as_ref()),
-                )
-                .await?;
-                let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
                 create_exact(
                     &pods,
                     &pod_name,
@@ -651,7 +432,6 @@ where
                         &pvc_name,
                         &pvc_uid,
                         &image,
-                        allocation_operation_id,
                     ),
                 )
                 .await?;
@@ -662,22 +442,6 @@ where
                 .iter()
                 .find(|pod| pod.name_any() == pod_name)
                 .expect("observed existing replica Pod");
-            if let Some(operation_id) = allocation_operation_id
-                && (!pod_matches_allocation(pod, operation_id)
-                    || !crate::exact_resources::pod_matches_scale_up_allocation_metadata(
-                        &observation.set,
-                        pod,
-                        *replica_id,
-                        observation
-                            .set
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.authority.scale_up_allocation.as_ref())
-                            .and_then(|allocation| allocation.pvc_uid.as_ref()),
-                    ))
-            {
-                return Err(ControllerError::ObservationStale);
-            }
             ensure_exact_peer_endpoint(
                 self.client.clone(),
                 observation,
@@ -819,107 +583,6 @@ where
         Ok(())
     }
 
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_exact_pod(
-        &self,
-        observation: &RawObservation,
-        pod_name: &str,
-        pod_uid: &PodUid,
-    ) -> Result<()> {
-        if crate::exact_resources::protected_from_exact_pod_fence(
-            observation,
-            Some(pod_name),
-            Some(pod_uid.as_str()),
-        ) {
-            return Err(ControllerError::ObservationStale);
-        }
-
-        let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
-        let namespace = observation
-            .set
-            .namespace()
-            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
-        match pods.delete(pod_name, &params).await {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
-            Err(error) => Err(map_kube_effect_error(error)),
-        }
-    }
-
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_exact_service(
-        &self,
-        observation: &RawObservation,
-        name: &str,
-        uid: &str,
-        resource_version: &str,
-    ) -> Result<()> {
-        let namespace = observation
-            .set
-            .namespace()
-            .ok_or(ControllerError::ObservationStale)?;
-        let observed = observation
-            .services
-            .iter()
-            .find(|service| service.name_any() == name);
-        match observed {
-            None => return Ok(()),
-            Some(service)
-                if service.uid().as_deref() != Some(uid)
-                    || service.resource_version().as_deref() != Some(resource_version) =>
-            {
-                return Err(ControllerError::ObservationStale);
-            }
-            Some(_) => {}
-        }
-        let params = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.into()),
-                resource_version: Some(resource_version.into()),
-            }),
-            ..Default::default()
-        };
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
-        match services.delete(name, &params).await {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
-            Err(error) => Err(map_kube_effect_error(error)),
-        }
-    }
-
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn delete_replica_endpoint(
-        &self,
-        observation: &RawObservation,
-        identity: &ReplicaIdentity,
-    ) -> Result<()> {
-        let namespace = observation
-            .set
-            .namespace()
-            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
-        let resource_uid = observation
-            .set
-            .uid()
-            .map(ResourceUid::new)
-            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
-        let name = derive_replica_endpoint_name(&resource_uid, identity);
-        if crate::exact_resources::protected(observation, Some(&name), None) {
-            return Err(ControllerError::ObservationStale);
-        }
-        let Some(service) = observation
-            .services
-            .iter()
-            .find(|service| service.name_any() == name)
-        else {
-            return Ok(());
-        };
-        let uid = service.uid().ok_or(ControllerError::ObservationStale)?;
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
-        delete_exact(&services, &name, &uid).await
-    }
-
-    #[cfg(feature = "runtime-test-bridge")]
     async fn ensure_replica_support(&self, observation: &RawObservation) -> Result<()> {
         let namespace = observation
             .set
@@ -940,74 +603,6 @@ where
         )
         .await?;
         ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await
-    }
-
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()> {
-        if service_observation_failed(observation) {
-            return Err(ControllerError::Observation(
-                "cannot converge write routing after Service observation failed".to_string(),
-            ));
-        }
-        let namespace = observation
-            .set
-            .namespace()
-            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
-        let uid = observation
-            .set
-            .uid()
-            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
-        let owner = owner_reference(&observation.set)?;
-        ensure_write_service(self.client.clone(), observation, &namespace, &uid, &owner).await
-    }
-
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()> {
-        if service_observation_failed(observation) {
-            return Err(ControllerError::Observation(
-                "cannot confirm write routing absence after Service observation failed".to_string(),
-            ));
-        }
-        let service_name = format!("{}-write", observation.set.name_any());
-        if !observation
-            .services
-            .iter()
-            .any(|service| service.name_any() == service_name)
-        {
-            return Ok(());
-        }
-        patch_write_service(self.client.clone(), observation, "disabled", true).await
-    }
-
-    #[cfg(feature = "runtime-test-bridge")]
-    async fn publish_write_routing(
-        &self,
-        observation: &RawObservation,
-        primary: &ReplicaIdentity,
-    ) -> Result<()> {
-        let namespace = observation
-            .set
-            .namespace()
-            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
-        let pod = observation
-            .pods
-            .iter()
-            .find(|pod| pod.uid().as_deref() == Some(primary.instance_id.as_str()))
-            .ok_or(ControllerError::ObservationStale)?;
-        patch_pod_instance(
-            self.client.clone(),
-            &namespace,
-            pod,
-            primary.instance_id.as_str(),
-        )
-        .await?;
-        patch_write_service(
-            self.client.clone(),
-            observation,
-            primary.instance_id.as_str(),
-            false,
-        )
-        .await
     }
 
     async fn execute_command(
@@ -1151,14 +746,6 @@ where
     }
 }
 
-#[cfg(feature = "runtime-test-bridge")]
-fn service_observation_failed(observation: &RawObservation) -> bool {
-    observation
-        .failures
-        .iter()
-        .any(|failure| failure.source == "services")
-}
-
 async fn create_exact<K>(api: &Api<K>, name: &str, object: &K) -> Result<()>
 where
     K: Clone
@@ -1201,33 +788,23 @@ fn base_labels(
     labels
 }
 
-#[cfg(feature = "runtime-test-bridge")]
 fn replica_name(set: &KubericSet, replica_id: ReplicaId) -> String {
     format!("{}-{}", set.name_any(), replica_id.value())
 }
 
-#[cfg(feature = "runtime-test-bridge")]
 fn replica_pvc(
     set: &KubericSet,
     replica_id: ReplicaId,
     uid: &str,
     owner: &OwnerReference,
-    allocation_operation_id: Option<&OperationId>,
 ) -> PersistentVolumeClaim {
-    let mut pvc = replica_pvc_named(
+    replica_pvc_named(
         set,
         replica_id,
         uid,
         owner,
         &format!("{}-data", replica_name(set, replica_id)),
-    );
-    if let Some(operation_id) = allocation_operation_id {
-        pvc.metadata.annotations = Some(BTreeMap::from([(
-            SCALE_UP_ALLOCATION_ANNOTATION.to_string(),
-            operation_id.to_string(),
-        )]));
-    }
-    pvc
+    )
 }
 
 fn replica_pvc_named(
@@ -1259,91 +836,6 @@ fn replica_pvc_named(
     }
 }
 
-#[cfg(feature = "runtime-test-bridge")]
-fn scale_up_allocation_operation_id(
-    set: &KubericSet,
-    replica_id: ReplicaId,
-) -> Option<&OperationId> {
-    set.status
-        .as_ref()?
-        .authority
-        .scale_up_allocation
-        .as_ref()
-        .filter(|allocation| {
-            allocation.target_replica_id == replica_id
-                && allocation.scaffolding_requested
-                && !allocation.cancellation_started
-        })
-        .map(|allocation| &allocation.operation_id)
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-fn pvc_matches_allocation(pvc: &PersistentVolumeClaim, operation_id: &OperationId) -> bool {
-    pvc.annotations()
-        .get(SCALE_UP_ALLOCATION_ANNOTATION)
-        .map(String::as_str)
-        == Some(operation_id.as_str())
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-fn pod_matches_allocation(pod: &Pod, operation_id: &OperationId) -> bool {
-    pod.annotations()
-        .get(SCALE_UP_ALLOCATION_ANNOTATION)
-        .map(String::as_str)
-        == Some(operation_id.as_str())
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-async fn authoritative_pvc_for_pod_create(
-    pvcs: &Api<PersistentVolumeClaim>,
-    observed: &PersistentVolumeClaim,
-    set: &KubericSet,
-    replica_id: ReplicaId,
-    allocation_operation_id: Option<&OperationId>,
-    frozen_pvc_uid: Option<&PvcUid>,
-) -> Result<PersistentVolumeClaim> {
-    let expected_name = format!("{}-{}-data", set.name_any(), replica_id.value());
-    let set_uid = set.uid().ok_or(ControllerError::ObservationStale)?;
-    let owner = owner_reference(set)?;
-    let live = pvcs.get(&expected_name).await.map_err(|error| {
-        tracing::warn!(
-            %error,
-            pvc = %expected_name,
-            "authoritative PVC revalidation failed before Pod creation"
-        );
-        ControllerError::ObservationStale
-    })?;
-    let live_uid = live.uid().ok_or(ControllerError::ObservationStale)?;
-    let expected_uid = observed.uid().ok_or(ControllerError::ObservationStale)?;
-    let live_resource_version = live
-        .resource_version()
-        .ok_or(ControllerError::ObservationStale)?;
-    let expected_resource_version = observed
-        .resource_version()
-        .ok_or(ControllerError::ObservationStale)?;
-    let expected_replica_id = replica_id.to_string();
-    let owned = live
-        .owner_references()
-        .iter()
-        .any(|candidate| candidate == &owner);
-    let provenance_matches = allocation_operation_id
-        .is_none_or(|operation_id| pvc_matches_allocation(&live, operation_id));
-    if live.name_any() != expected_name
-        || live_uid != expected_uid
-        || live_resource_version != expected_resource_version
-        || frozen_pvc_uid.is_some_and(|frozen| frozen.as_str() != live_uid)
-        || live.labels().get(SET_UID_LABEL).map(String::as_str) != Some(set_uid.as_str())
-        || live.labels().get(REPLICA_ID_LABEL).map(String::as_str)
-            != Some(expected_replica_id.as_str())
-        || !owned
-        || !provenance_matches
-    {
-        return Err(ControllerError::ObservationStale);
-    }
-    Ok(live)
-}
-
-#[cfg(feature = "runtime-test-bridge")]
 #[allow(clippy::too_many_arguments)]
 fn replica_pod(
     set: &KubericSet,
@@ -1353,7 +845,6 @@ fn replica_pod(
     pvc_name: &str,
     pvc_uid: &str,
     image: &str,
-    allocation_operation_id: Option<&OperationId>,
 ) -> Pod {
     replica_pod_named(
         set,
@@ -1364,7 +855,7 @@ fn replica_pod(
         pvc_name,
         pvc_uid,
         image,
-        allocation_operation_id,
+        None,
     )
 }
 
@@ -1618,7 +1109,6 @@ async fn ensure_exact_peer_endpoint(
     .await
 }
 
-#[cfg(feature = "runtime-test-bridge")]
 async fn ensure_write_service(
     client: Client,
     observation: &RawObservation,
@@ -1666,7 +1156,6 @@ fn agent_credential_name(set: &KubericSet) -> String {
     format!("{}-agent-credentials", set.name_any())
 }
 
-#[cfg(feature = "runtime-test-bridge")]
 async fn ensure_agent_credentials(
     client: Client,
     observation: &RawObservation,
@@ -1714,7 +1203,6 @@ async fn ensure_agent_credentials(
     }
 }
 
-#[cfg(feature = "runtime-test-bridge")]
 async fn ensure_peer_service(
     client: Client,
     observation: &RawObservation,
@@ -1842,57 +1330,6 @@ async fn patch_pod_instance(
     .await
     .map(|_| ())
     .map_err(map_kube_effect_error)
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-async fn patch_write_service(
-    client: Client,
-    observation: &RawObservation,
-    instance: &str,
-    clear_preview_location: bool,
-) -> Result<()> {
-    let namespace = observation
-        .set
-        .namespace()
-        .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
-    let service_name = format!("{}-write", observation.set.name_any());
-    let service = observation
-        .services
-        .iter()
-        .find(|service| service.name_any() == service_name)
-        .ok_or(ControllerError::ObservationStale)?;
-    let uid = service.uid().ok_or(ControllerError::ObservationStale)?;
-    let resource_version = service
-        .resource_version()
-        .ok_or(ControllerError::ObservationStale)?;
-    let mut patch = vec![
-        serde_json::json!({"op": "test", "path": "/metadata/uid", "value": uid}),
-        serde_json::json!({"op": "test", "path": "/metadata/resourceVersion", "value": resource_version}),
-        serde_json::json!({"op": "add", "path": "/spec/selector", "value": {INSTANCE_LABEL: instance}}),
-    ];
-    if clear_preview_location
-        && service
-            .annotations()
-            .contains_key(PREVIEW_SERVICE_LOCATION_ANNOTATION)
-    {
-        patch.push(serde_json::json!({
-            "op": "remove",
-            "path": "/metadata/annotations/operator.kuberic.io~1preview-service-location"
-        }));
-    }
-    let services: Api<Service> = Api::namespaced(client, &namespace);
-    services
-        .patch(
-            &service_name,
-            &PatchParams::default(),
-            &Patch::<serde_json::Value>::Json(
-                serde_json::from_value(serde_json::Value::Array(patch))
-                    .map_err(|error| ControllerError::Effect(error.to_string()))?,
-            ),
-        )
-        .await
-        .map(|_| ())
-        .map_err(map_kube_effect_error)
 }
 
 fn agent_endpoint(pod: &Pod) -> Option<String> {
@@ -2541,8 +1978,6 @@ struct InMemoryState {
     observation_delay: Duration,
     unavailable_next_execute: bool,
     lost_next_create_reply: bool,
-    lost_next_delete_reply: bool,
-    exact_lookup_failures: BTreeMap<String, String>,
     next_resource_uid: u64,
 }
 
@@ -2560,8 +1995,6 @@ impl InMemoryClusterApi {
                 observation_delay: Duration::ZERO,
                 unavailable_next_execute: false,
                 lost_next_create_reply: false,
-                lost_next_delete_reply: false,
-                exact_lookup_failures: BTreeMap::new(),
                 next_resource_uid: 1,
             })),
         }
@@ -2587,19 +2020,6 @@ impl InMemoryClusterApi {
         self.state.lock().await.lost_next_create_reply = true;
     }
 
-    pub async fn lose_next_delete_reply(&self) {
-        self.state.lock().await.lost_next_delete_reply = true;
-    }
-
-    pub async fn fail_exact_lookup(&self, kind_and_name: String, message: Option<String>) {
-        let mut state = self.state.lock().await;
-        if let Some(message) = message {
-            state.exact_lookup_failures.insert(kind_and_name, message);
-        } else {
-            state.exact_lookup_failures.remove(&kind_and_name);
-        }
-    }
-
     pub async fn effects(&self) -> Vec<EffectRecord> {
         self.state.lock().await.effects.clone()
     }
@@ -2620,39 +2040,6 @@ impl InMemoryClusterApi {
 #[async_trait]
 #[cfg(feature = "runtime-test-bridge")]
 impl ClusterApi for InMemoryClusterApi {
-    async fn delete_scale_down_resource(
-        &self,
-        observation: &RawObservation,
-        resource: ScaleDownResource,
-        name: &str,
-        uid: &str,
-        resource_version: &str,
-    ) -> Result<()> {
-        let params = scale_down_delete_params(observation, resource, name, uid, resource_version)?;
-        let mut state = self.state.lock().await;
-        if state.observation.set.resource_version() != observation.set.resource_version() {
-            return Err(ControllerError::ObservationStale);
-        }
-        match resource {
-            ScaleDownResource::Pod => memory_delete(&mut state.observation.pods, name, &params)?,
-            ScaleDownResource::Pvc => memory_delete(&mut state.observation.pvcs, name, &params)?,
-            ScaleDownResource::Endpoint => {
-                memory_delete(&mut state.observation.services, name, &params)?
-            }
-        }
-        state.effects.push(EffectRecord::DeleteScaleDownResource {
-            resource,
-            name: name.into(),
-            uid: uid.into(),
-            resource_version: resource_version.into(),
-        });
-        if state.lost_next_delete_reply {
-            state.lost_next_delete_reply = false;
-            return Err(ControllerError::ObservationStale);
-        }
-        Ok(())
-    }
-
     async fn observe(&self, _namespace: &str, _name: &str) -> Result<RawObservation> {
         let delay = {
             let mut state = self.state.lock().await;
@@ -2665,9 +2052,7 @@ impl ClusterApi for InMemoryClusterApi {
         tokio::time::sleep(delay).await;
         let mut state = self.state.lock().await;
         state.active_observations -= 1;
-        let physical = &state.observation;
-        let mut raw = physical.clone();
-        raw.exact_resources.clear();
+        let mut raw = state.observation.clone();
         let uid = raw.set.uid().unwrap_or_default();
         raw.pods
             .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
@@ -2675,37 +2060,6 @@ impl ClusterApi for InMemoryClusterApi {
             .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
         raw.services
             .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
-        for (target, identity, frozen) in crate::exact_resources::requests(&raw) {
-            let pod = memory_lookup(
-                &physical.pods,
-                "Pod",
-                crate::exact_resources::name(&identity.pod),
-                &state.exact_lookup_failures,
-            );
-            let pvc = memory_lookup(
-                &physical.pvcs,
-                "PVC",
-                crate::exact_resources::name(&identity.pvc),
-                &state.exact_lookup_failures,
-            );
-            let endpoint = memory_lookup(
-                &physical.services,
-                "Service",
-                crate::exact_resources::name(&identity.endpoint),
-                &state.exact_lookup_failures,
-            );
-            crate::exact_resources::finish(
-                &mut raw,
-                RawScaleDownResources {
-                    target,
-                    identity,
-                    pod,
-                    pvc,
-                    endpoint,
-                },
-                frozen,
-            );
-        }
         Ok(raw)
     }
 
@@ -2725,8 +2079,6 @@ impl ClusterApi for InMemoryClusterApi {
             return Err(ControllerError::ObservationStale);
         }
         for replica_id in replica_ids {
-            let allocation_operation_id =
-                scale_up_allocation_operation_id(&observation.set, *replica_id);
             let pod_name = replica_name(&observation.set, *replica_id);
             let pvc_name = format!("{pod_name}-data");
             let Some(pvc) = state
@@ -2738,13 +2090,7 @@ impl ClusterApi for InMemoryClusterApi {
             else {
                 let resource_number = state.next_resource_uid;
                 state.next_resource_uid += 1;
-                let mut pvc = replica_pvc(
-                    &observation.set,
-                    *replica_id,
-                    &uid,
-                    &owner,
-                    allocation_operation_id,
-                );
+                let mut pvc = replica_pvc(&observation.set, *replica_id, &uid, &owner);
                 pvc.metadata.namespace = observation.set.namespace();
                 pvc.metadata.uid = Some(format!(
                     "in-memory-pvc-{}-{resource_number}",
@@ -2762,18 +2108,6 @@ impl ClusterApi for InMemoryClusterApi {
                 return Ok(());
             };
             let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
-            if let Some(operation_id) = allocation_operation_id
-                && (!pvc_matches_allocation(&pvc, operation_id)
-                    || observation
-                        .set
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
-                        .and_then(|allocation| allocation.pvc_uid.as_ref())
-                        .is_some_and(|frozen| frozen.as_str() != pvc_uid))
-            {
-                return Err(ControllerError::ObservationStale);
-            }
             let Some(pod) = state
                 .observation
                 .pods
@@ -2791,7 +2125,6 @@ impl ClusterApi for InMemoryClusterApi {
                     &pvc_name,
                     &pvc_uid,
                     &image,
-                    allocation_operation_id,
                 );
                 pod.metadata.namespace = observation.set.namespace();
                 pod.metadata.uid = Some(format!(
@@ -2823,22 +2156,6 @@ impl ClusterApi for InMemoryClusterApi {
                 return Ok(());
             };
             let pod_uid = pod.uid().ok_or(ControllerError::ObservationStale)?;
-            if let Some(operation_id) = allocation_operation_id
-                && (!pod_matches_allocation(&pod, operation_id)
-                    || !crate::exact_resources::pod_matches_scale_up_allocation_metadata(
-                        &observation.set,
-                        &pod,
-                        *replica_id,
-                        observation
-                            .set
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.authority.scale_up_allocation.as_ref())
-                            .and_then(|allocation| allocation.pvc_uid.as_ref()),
-                    ))
-            {
-                return Err(ControllerError::ObservationStale);
-            }
             if pod.labels().get(INSTANCE_LABEL).map(String::as_str) != Some(pod_uid.as_str()) {
                 state
                     .observation
@@ -2907,6 +2224,40 @@ impl ClusterApi for InMemoryClusterApi {
                     ..Default::default()
                 });
             }
+        }
+        let write_service_name = format!("{}-write", observation.set.name_any());
+        if !state
+            .observation
+            .services
+            .iter()
+            .any(|service| service.name_any() == write_service_name)
+        {
+            let resource_number = state.next_resource_uid;
+            state.next_resource_uid += 1;
+            state.observation.services.push(Service {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(write_service_name),
+                    namespace: observation.set.namespace(),
+                    uid: Some(format!("in-memory-write-service-{resource_number}")),
+                    resource_version: Some(resource_number.to_string()),
+                    labels: Some(base_labels(&observation.set, None, &uid)),
+                    owner_references: Some(vec![owner]),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    selector: Some(BTreeMap::from([(
+                        INSTANCE_LABEL.to_string(),
+                        "disabled".to_string(),
+                    )])),
+                    ports: Some(vec![ServicePort {
+                        name: Some("application".to_string()),
+                        port: 80,
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
         }
         state
             .effects
@@ -3149,32 +2500,22 @@ impl ClusterApi for InMemoryClusterApi {
         pvc_name: Option<&str>,
         pvc_uid: Option<&PvcUid>,
     ) -> Result<()> {
-        if crate::exact_resources::protected(observation, pod_name, pod_uid.map(PodUid::as_str))
-            || crate::exact_resources::protected(observation, pvc_name, pvc_uid.map(PvcUid::as_str))
-        {
-            return Err(ControllerError::ObservationStale);
-        }
         let service = pod_uid.and_then(|pod_uid| {
-            observation.services.iter().find(|service| {
-                service.spec.as_ref().is_some_and(|spec| {
-                    spec.selector.as_ref().is_some_and(|selector| {
-                        selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
+            observation
+                .services
+                .iter()
+                .find(|service| {
+                    service.spec.as_ref().is_some_and(|spec| {
+                        spec.selector.as_ref().is_some_and(|selector| {
+                            selector.get(INSTANCE_LABEL).map(String::as_str)
+                                == Some(pod_uid.as_str())
+                        })
                     })
                 })
-            })
+                .cloned()
         });
-        if let Some(service) = service {
-            let service_uid = service.uid().ok_or(ControllerError::ObservationStale)?;
-            if crate::exact_resources::protected(
-                observation,
-                Some(&service.name_any()),
-                Some(&service_uid),
-            ) {
-                return Err(ControllerError::ObservationStale);
-            }
-        }
         let mut state = self.state.lock().await;
-        if let Some(service) = service {
+        if let Some(service) = service.as_ref() {
             let name = service.name_any();
             let uid = service.uid().ok_or(ControllerError::ObservationStale)?;
             state.observation.services.retain(|candidate| {
@@ -3222,201 +2563,6 @@ impl ClusterApi for InMemoryClusterApi {
         Ok(())
     }
 
-    async fn delete_exact_pod(
-        &self,
-        observation: &RawObservation,
-        pod_name: &str,
-        pod_uid: &PodUid,
-    ) -> Result<()> {
-        if crate::exact_resources::protected_from_exact_pod_fence(
-            observation,
-            Some(pod_name),
-            Some(pod_uid.as_str()),
-        ) {
-            return Err(ControllerError::ObservationStale);
-        }
-
-        let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
-        let mut state = self.state.lock().await;
-        if let Some(pod) = state
-            .observation
-            .pods
-            .iter()
-            .find(|pod| pod.name_any() == pod_name)
-        {
-            let preconditions = params.preconditions.unwrap();
-            if pod.uid() != preconditions.uid
-                || pod.resource_version() != preconditions.resource_version
-            {
-                return Err(ControllerError::ObservationStale);
-            }
-            state
-                .observation
-                .pods
-                .retain(|pod| pod.uid().as_deref() != Some(pod_uid.as_str()));
-        }
-        state.effects.push(EffectRecord::DeleteExactPod {
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.clone(),
-        });
-        Ok(())
-    }
-
-    async fn delete_exact_service(
-        &self,
-        observation: &RawObservation,
-        name: &str,
-        uid: &str,
-        resource_version: &str,
-    ) -> Result<()> {
-        let mut state = self.state.lock().await;
-        if state.observation.set.resource_version() != observation.set.resource_version() {
-            return Err(ControllerError::ObservationStale);
-        }
-        let current = state
-            .observation
-            .services
-            .iter()
-            .position(|service| service.name_any() == name);
-        let Some(index) = current else {
-            return Ok(());
-        };
-        let service = &state.observation.services[index];
-        if service.uid().as_deref() != Some(uid)
-            || service.resource_version().as_deref() != Some(resource_version)
-        {
-            return Err(ControllerError::ObservationStale);
-        }
-        state.observation.services.remove(index);
-        state.effects.push(EffectRecord::DeleteExactService {
-            name: name.into(),
-            uid: uid.into(),
-            resource_version: resource_version.into(),
-        });
-        Ok(())
-    }
-
-    async fn delete_replica_endpoint(
-        &self,
-        observation: &RawObservation,
-        identity: &ReplicaIdentity,
-    ) -> Result<()> {
-        let resource_uid = observation
-            .set
-            .uid()
-            .map(ResourceUid::new)
-            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
-        let name = derive_replica_endpoint_name(&resource_uid, identity);
-        let mut state = self.state.lock().await;
-        if crate::exact_resources::protected(observation, Some(&name), None) {
-            return Err(ControllerError::ObservationStale);
-        }
-        state
-            .observation
-            .services
-            .retain(|service| service.name_any() != name);
-        Ok(())
-    }
-
-    async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()> {
-        if service_observation_failed(observation) {
-            return Err(ControllerError::Observation(
-                "cannot converge write routing after Service observation failed".to_string(),
-            ));
-        }
-        let mut state = self.state.lock().await;
-        let service_name = format!("{}-write", observation.set.name_any());
-        if !state
-            .observation
-            .services
-            .iter()
-            .any(|service| service.name_any() == service_name)
-        {
-            state.observation.services.push(Service {
-                metadata: kube::core::ObjectMeta {
-                    name: Some(service_name),
-                    uid: Some("in-memory-write-service".to_string()),
-                    resource_version: Some("1".to_string()),
-                    labels: observation
-                        .set
-                        .uid()
-                        .map(|uid| BTreeMap::from([(SET_UID_LABEL.to_string(), uid)])),
-                    ..Default::default()
-                },
-                spec: Some(ServiceSpec {
-                    selector: Some(BTreeMap::from([(
-                        INSTANCE_LABEL.to_string(),
-                        "disabled".to_string(),
-                    )])),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-        state.effects.push(EffectRecord::EnsureWriteRoutingService);
-        Ok(())
-    }
-
-    async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()> {
-        if service_observation_failed(observation) {
-            return Err(ControllerError::Observation(
-                "cannot confirm write routing absence after Service observation failed".to_string(),
-            ));
-        }
-        let mut state = self.state.lock().await;
-        if let Some(service) = state
-            .observation
-            .services
-            .iter_mut()
-            .find(|service| service.name_any().ends_with("-write"))
-            && let Some(spec) = service.spec.as_mut()
-        {
-            spec.selector = Some(BTreeMap::from([(
-                INSTANCE_LABEL.to_string(),
-                "disabled".to_string(),
-            )]));
-            service
-                .metadata
-                .annotations
-                .get_or_insert_default()
-                .remove(PREVIEW_SERVICE_LOCATION_ANNOTATION);
-        }
-        state.effects.push(EffectRecord::RemoveWriteRouting);
-        Ok(())
-    }
-
-    async fn publish_write_routing(
-        &self,
-        _observation: &RawObservation,
-        primary: &ReplicaIdentity,
-    ) -> Result<()> {
-        let mut state = self.state.lock().await;
-        let pod = state
-            .observation
-            .pods
-            .iter_mut()
-            .find(|pod| pod.uid().as_deref() == Some(primary.instance_id.as_str()))
-            .ok_or(ControllerError::ObservationStale)?;
-        pod.metadata
-            .labels
-            .get_or_insert_default()
-            .insert(INSTANCE_LABEL.to_string(), primary.instance_id.to_string());
-        let service = state
-            .observation
-            .services
-            .iter_mut()
-            .find(|service| service.name_any().ends_with("-write"))
-            .ok_or(ControllerError::ObservationStale)?;
-        service.spec.get_or_insert_default().selector = Some(BTreeMap::from([(
-            INSTANCE_LABEL.to_string(),
-            primary.instance_id.to_string(),
-        )]));
-        state
-            .effects
-            .push(EffectRecord::PublishWriteRouting(primary.clone()));
-        Ok(())
-    }
-
     async fn execute_command(
         &self,
         observation: &RawObservation,
@@ -3451,116 +2597,6 @@ impl ClusterApi for InMemoryClusterApi {
         }
         Ok(())
     }
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-fn memory_lookup<K: ResourceExt + Clone>(
-    objects: &[K],
-    kind: &str,
-    name: &str,
-    failures: &BTreeMap<String, String>,
-) -> ExactLookup<K> {
-    if let Some(message) = failures.get(&format!("{kind}/{name}")) {
-        ExactLookup::Failed(message.clone())
-    } else {
-        objects
-            .iter()
-            .find(|o| o.name_any() == name)
-            .cloned()
-            .map(ExactLookup::Present)
-            .unwrap_or(ExactLookup::NotFound)
-    }
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-fn memory_delete<K: ResourceExt>(
-    objects: &mut Vec<K>,
-    name: &str,
-    params: &DeleteParams,
-) -> Result<()> {
-    let object = objects
-        .iter()
-        .find(|o| o.name_any() == name)
-        .ok_or(ControllerError::ObservationStale)?;
-    let conditions = params
-        .preconditions
-        .as_ref()
-        .ok_or(ControllerError::ObservationStale)?;
-    if object.uid() != conditions.uid
-        || (conditions.resource_version.is_some()
-            && object.resource_version() != conditions.resource_version)
-    {
-        return Err(ControllerError::ObservationStale);
-    }
-    if object.meta().finalizers.as_ref().is_none_or(Vec::is_empty) {
-        objects.retain(|o| o.name_any() != name);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-fn scale_down_delete_params(
-    _observation: &RawObservation,
-    resource: ScaleDownResource,
-    name: &str,
-    uid: &str,
-    resource_version: &str,
-) -> Result<DeleteParams> {
-    let _ = (resource, name);
-    Ok(DeleteParams {
-        preconditions: Some(Preconditions {
-            uid: Some(uid.into()),
-            resource_version: Some(resource_version.into()),
-        }),
-        ..Default::default()
-    })
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-async fn delete_scale_down_exact<K>(api: &Api<K>, name: &str, params: &DeleteParams) -> Result<()>
-where
-    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned + kube::Resource<DynamicType = ()>,
-{
-    match api.delete(name, params).await {
-        Ok(_) => Ok(()),
-        // A racing 404 or an ambiguous response requires another exact GET.
-        Err(kube::Error::Api(response))
-            if matches!(response.code, 404 | 408 | 409 | 412 | 422 | 429 | 500..=599) =>
-        {
-            Err(ControllerError::ObservationStale)
-        }
-        Err(error @ kube::Error::Api(_)) => Err(map_kube_effect_error(error)),
-        Err(error) => {
-            tracing::warn!(%error, %name, "exact deletion reply is unconfirmed; re-observe");
-            Err(ControllerError::ObservationStale)
-        }
-    }
-}
-
-#[cfg(feature = "runtime-test-bridge")]
-fn exact_pod_delete_params(
-    observation: &RawObservation,
-    pod_name: &str,
-    pod_uid: &PodUid,
-) -> Result<DeleteParams> {
-    // Pod-only safety fencing is distinct from generic candidate cleanup. The
-    // executor already selected this effect from the immutable plan; fence the
-    // exact observed incarnation while retaining its PVC and receipt evidence.
-    let pod = observation
-        .pods
-        .iter()
-        .find(|pod| pod.name_any() == pod_name && pod.uid().as_deref() == Some(pod_uid.as_str()))
-        .ok_or(ControllerError::ObservationStale)?;
-    let resource_version = pod
-        .resource_version()
-        .ok_or(ControllerError::ObservationStale)?;
-    Ok(DeleteParams {
-        preconditions: Some(Preconditions {
-            uid: Some(pod_uid.to_string()),
-            resource_version: Some(resource_version),
-        }),
-        ..Default::default()
-    })
 }
 
 #[allow(dead_code)]
@@ -3896,15 +2932,17 @@ async fn clear_in_memory_public_v1_transition(
 }
 
 #[cfg(feature = "runtime-test-bridge")]
-mod public_lifecycle;
+mod public_v1_service;
 #[cfg(feature = "runtime-test-bridge")]
-pub use public_lifecycle::{PreviewServiceApi, preview_service_matches, preview_service_update};
+pub use public_v1_service::{
+    PublicV1ServiceApi, public_v1_service_matches, public_v1_service_update,
+};
 mod public_v1_history;
 pub use public_v1_history::{PublicV1HistoryApi, PublicV1Scope, PublicV1SessionRenewalApi};
 pub(crate) mod public_v1_operations;
 pub use public_v1_operations::PublicV1OperationApi;
 #[cfg(feature = "runtime-test-bridge")]
-pub use public_v1_operations::{HostedPreviewReplica, HostedPublicV1Adapter};
+pub use public_v1_operations::{HostedPublicV1Harness, HostedPublicV1Replica};
 mod public_v1_evidence;
 pub use public_v1_evidence::{
     PublicV1EvidenceApi, PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState,

@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::application::{OpenContext, OpenMode, StateProvider, StatefulServiceReplica};
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::protocol::public_operations::{
-    PublicOperationClass, PublicOperationIntent, PublicOperationPreviewIdentity,
+    PublicOperationClass, PublicOperationIntent, PublicV1Identity,
 };
 use crate::protocol::types::{
     AccessStatus, Epoch, FaultType, LoadMetric, OperationId, PartitionId, PartitionInformation,
@@ -18,8 +18,8 @@ use crate::protocol::types::{
 };
 use crate::replicator::{
     PartitionAccessView, PrimaryReplicator, Replicator, ReplicatorAttachment,
-    ReplicatorCapabilities, ReplicatorCreationReservation, ReplicatorEngineSelection,
-    ReplicatorFactoryContext, ReplicatorRegistration, StatefulServicePartition,
+    ReplicatorCapabilities, ReplicatorCreationReservation, ReplicatorFactoryContext,
+    ReplicatorRegistration, StatefulServicePartition,
 };
 use crate::{Result, RuntimeError};
 
@@ -102,7 +102,8 @@ struct RuntimeHost {
     replica_session: OnceLock<(crate::protocol::types::ResourceUid, ProcessSessionId)>,
     identity: ReplicaIdentity,
     application: Arc<dyn StatefulServiceReplica>,
-    engine_selection: ReplicatorEngineSelection,
+    public_v1_binding: crate::protocol::public_operations::PublicV1LifecycleBinding,
+    public_v1_replication_address: std::net::SocketAddr,
     state: RwLock<HostState>,
     registered: OnceLock<RegisteredReplicator>,
     replicator_creation: StdMutex<ReplicatorCreationState>,
@@ -217,7 +218,7 @@ impl PodRuntime {
         identity: ReplicaIdentity,
         application: Arc<A>,
         _store: Arc<S>,
-        binding: crate::protocol::public_operations::PreviewLifecycleBinding,
+        binding: crate::protocol::public_operations::PublicV1LifecycleBinding,
         replication_address: std::net::SocketAddr,
     ) -> Self
     where
@@ -231,10 +232,8 @@ impl PodRuntime {
             host: Arc::new_cyclic(|_weak_self| RuntimeHost {
                 identity,
                 application,
-                engine_selection: ReplicatorEngineSelection::public_v1(
-                    binding,
-                    replication_address,
-                ),
+                public_v1_binding: binding,
+                public_v1_replication_address: replication_address,
                 state: RwLock::new(HostState {
                     projection: HostProjection::new(),
                     partition_information: PartitionInformation { partition_id },
@@ -267,7 +266,8 @@ impl PodRuntime {
                 host: Arc::downgrade(&self.host),
                 partition_information: self.host.state.read().await.partition_information.clone(),
             }),
-            self.host.engine_selection.clone(),
+            self.host.public_v1_binding.clone(),
+            self.host.public_v1_replication_address,
         );
         OpenContext {
             identity: self.host.identity.clone(),
@@ -368,7 +368,7 @@ impl PodRuntime {
             .load_state()
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        let preview = persisted.public_operation_preview.ok_or_else(|| {
+        let preview = persisted.public_v1_operation_state.ok_or_else(|| {
             RuntimeError::Application("Public V1 requires replacement state".into())
         })?;
         let mut open = false;
@@ -610,7 +610,7 @@ impl PodRuntime {
         &self,
         store: Arc<dyn crate::host::store::AgentStore>,
         registry: Arc<crate::host::operation::PartitionOperationRegistry>,
-        preview: PublicOperationPreviewIdentity,
+        preview: PublicV1Identity,
         process_session: ProcessSessionId,
     ) -> Result<()> {
         let mut bridge = self.host.replacement_fault_bridge.lock().await;
@@ -725,7 +725,7 @@ struct HostAccessView {
 struct ReplacementFaultBridge {
     store: Arc<dyn crate::host::store::AgentStore>,
     registry: Arc<crate::host::operation::PartitionOperationRegistry>,
-    preview: PublicOperationPreviewIdentity,
+    preview: PublicV1Identity,
     process_session: ProcessSessionId,
     admission: Mutex<()>,
 }
@@ -738,7 +738,7 @@ impl ReplacementFaultBridge {
     async fn report(&self, fault: FaultType) -> crate::host::Result<()> {
         let _admission = self.admission.lock().await;
         let state = self.store.load_state().await?;
-        let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+        let preview = state.public_v1_operation_state.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
                 "public fault requires replacement state".into(),
             )

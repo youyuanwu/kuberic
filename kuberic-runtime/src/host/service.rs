@@ -27,7 +27,7 @@ use crate::protocol::command::{
     ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
 };
 use crate::protocol::public_operations::{
-    PreviewLifecycleBinding, PublicOperationIntent, PublicOperationProgram,
+    PublicOperationIntent, PublicOperationProgram, PublicV1LifecycleBinding,
 };
 use crate::protocol::types::{
     ProcessSessionId, ReplicaId, TransitionIntent, TransitionKind, derive_transition_id,
@@ -45,7 +45,7 @@ pub(crate) struct InitializationService {
     initialized: watch::Sender<bool>,
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
-    binding: Option<PreviewLifecycleBinding>,
+    binding: Option<PublicV1LifecycleBinding>,
 }
 
 impl InitializationService {
@@ -84,9 +84,9 @@ impl InitializationService {
         self
     }
 
-    pub(crate) fn with_replacement_binding(
+    pub(crate) fn with_public_v1_binding(
         mut self,
-        binding: Option<PreviewLifecycleBinding>,
+        binding: Option<PublicV1LifecycleBinding>,
     ) -> Self {
         self.binding = binding;
         self
@@ -122,8 +122,7 @@ impl InitializationService {
 
     fn report(&self) -> proto::AgentStatusReport {
         proto::AgentStatusReport {
-            protocol_version:
-                crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
             resource_uid: self.observed.resource_uid.to_string(),
             process_session_id: self.session.id().to_string(),
             storage_state: if self.fresh_application_state {
@@ -149,7 +148,7 @@ impl InitializationService {
         request: &proto::GetAgentStatusRequest,
     ) -> std::result::Result<(), Status> {
         if request.protocol_version
-            != crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+            != crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION
         {
             return Err(Status::failed_precondition("unsupported protocol version"));
         }
@@ -249,8 +248,7 @@ impl InitializationService {
         }
         self.initialized.send_replace(true);
         Ok(proto::ExecuteCommandResponse {
-            protocol_version:
-                crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
             observation: Some(self.report()),
         })
     }
@@ -372,7 +370,7 @@ where
 
     pub(crate) async fn public_operation_runtime(
         &self,
-        preview: crate::protocol::public_operations::PublicOperationPreviewIdentity,
+        preview: crate::protocol::public_operations::PublicV1Identity,
     ) -> Result<Arc<crate::host::operation::PartitionOperationRegistry>> {
         let registry = crate::host::operation::PartitionOperationRegistry::new(
             self.store.clone(),
@@ -437,7 +435,7 @@ where
 
     async fn public_report(&self) -> Result<proto::AgentStatusReport> {
         let state = self.store.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected(
                 "Public V1 report requires replacement state".into(),
             )
@@ -562,7 +560,7 @@ where
             .store
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .and_then(|preview| preview.session_renewal)
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
@@ -671,8 +669,7 @@ where
             }
         }
         Ok(proto::ExecuteCommandResponse {
-            protocol_version:
-                crate::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
             observation: Some(self.public_report().await.map_err(status_from_agent)?),
         })
     }

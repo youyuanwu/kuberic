@@ -349,14 +349,6 @@ impl PgReplicator {
         identity: ReplicaIdentity,
         process_session_id: ProcessSessionId,
     ) -> Result<()> {
-        if !settings.public_v1 {
-            if self.is_public_v1() {
-                return Err(application_error(
-                    "cannot downgrade immutable PostgreSQL construction",
-                ));
-            }
-            return Ok(());
-        }
         if settings.replication_address != self.coordination.local_endpoint {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }

@@ -1,5 +1,5 @@
 use kuberic_controller::cluster_api::PublicV1Scope;
-use kuberic_controller::evaluator::test_bridge::{
+use kuberic_controller::evaluator::testing::{
     PublicV1ElectionStatus, PublicV1HistoryApi, compare_public_v1_election_progress,
     compare_public_v1_election_reports, ensure_public_v1_bootstrap_history,
     execute_public_v1_history, invalidate_public_v1_for_data_loss,
@@ -11,9 +11,9 @@ use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, DataLossReplay, PossibleDataLossIntent,
     ProcessAttemptContext, ProviderProgressReset, PublicDataLossRecoveryInput,
     PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
-    PublicOperationPreviewIdentity, PublicOperationProgram, PublicOperationReplayDisposition,
-    PublicProgress, PublicProgressRole, PublicV1AcceptedStatus, PublicV1AgentReport,
-    PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
+    PublicOperationProgram, PublicOperationReplayDisposition, PublicProgress, PublicProgressRole,
+    PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1Identity,
+    PublicV1OperationCompletion, PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
@@ -49,14 +49,14 @@ fn storage() -> ReplicaStorageIncarnationContext {
 #[test]
 fn public_v1_history_bootstrap_decision_is_partition_wide_and_stable() {
     let resource_uid = ResourceUid::new("resource-1");
-    let identity = PublicOperationPreviewIdentity::public_v1(42);
+    let identity = PublicV1Identity::new(42);
     let accepted = ensure_public_v1_bootstrap_history(None, &resource_uid, &identity).unwrap();
     let retried =
         ensure_public_v1_bootstrap_history(Some(accepted.clone()), &resource_uid, &identity)
             .unwrap();
     assert_eq!(accepted, retried);
 
-    let changed = PublicOperationPreviewIdentity::public_v1(43);
+    let changed = PublicV1Identity::new(43);
     assert!(ensure_public_v1_bootstrap_history(Some(accepted), &resource_uid, &changed).is_err());
 }
 
@@ -82,7 +82,7 @@ fn public_v1_history_election_rejects_incomparable_numeric_progress() {
 #[test]
 fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
     let resource_uid = ResourceUid::new("resource-1");
-    let identity = PublicOperationPreviewIdentity::public_v1(42);
+    let identity = PublicV1Identity::new(42);
     let mut accepted = ensure_public_v1_bootstrap_history(None, &resource_uid, &identity).unwrap();
     let old_program = PublicOperationProgram::Abort;
     accepted.completed_operations.push(
@@ -176,7 +176,7 @@ fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
 #[test]
 fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() {
     let resource_uid = ResourceUid::new("resource-1");
-    let identity = PublicOperationPreviewIdentity::public_v1(42);
+    let identity = PublicV1Identity::new(42);
     let accepted = ensure_public_v1_bootstrap_history(None, &resource_uid, &identity).unwrap();
     let storage = storage();
     let authorization_id = OperationId::new("data-loss");
@@ -271,7 +271,7 @@ fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() 
 #[test]
 fn public_v1_all_survivor_election_requires_history_and_storage_admission() {
     let resource_uid = ResourceUid::new("resource-1");
-    let identity = PublicOperationPreviewIdentity::public_v1(42);
+    let identity = PublicV1Identity::new(42);
     let accepted = ensure_public_v1_bootstrap_history(None, &resource_uid, &identity).unwrap();
     let first_storage = storage();
     let mut second_storage = first_storage.clone();
@@ -402,7 +402,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
     let directory = tempfile::tempdir().unwrap();
     let path = TestingSqliteStore::metadata_database_path(directory.path());
     let resource_uid = ResourceUid::new("resource-1");
-    let identity = PublicOperationPreviewIdentity::public_v1(42);
+    let identity = PublicV1Identity::new(42);
     let storage = storage();
     let local = storage.replica.clone();
     let store = Arc::new(
@@ -587,7 +587,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
     assert_eq!(normalized, report);
     assert!(matches!(
         plan_public_v1_recovery_report(&invalidated, &normalized).unwrap(),
-        kuberic_controller::evaluator::test_bridge::PublicV1HistoryPlan::Stable
+        kuberic_controller::evaluator::testing::PublicV1HistoryPlan::Stable
     ));
     let mut changed_epoch = normalized.clone();
     changed_epoch
@@ -819,7 +819,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         kuberic_runtime::control::normalize_public_v1_agent_status_report(renewed_wire).unwrap();
     assert!(matches!(
         plan_public_v1_recovery_report(&renewed, &renewed_normalized).unwrap(),
-        kuberic_controller::evaluator::test_bridge::PublicV1HistoryPlan::Stable
+        kuberic_controller::evaluator::testing::PublicV1HistoryPlan::Stable
     ));
     assert_eq!(api.dispatched.lock().unwrap().len(), 3);
 }

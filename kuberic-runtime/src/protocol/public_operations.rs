@@ -1,4 +1,4 @@
-//! Dormant public-operation preview identities and admission inputs.
+//! Public V1 operation identities and admission inputs.
 
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, HistoryContext,
@@ -9,40 +9,32 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION: u32 = 10;
-pub const PUBLIC_V1_PREVIEW_PROTOCOL_VERSION: u32 = 11;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 11;
 pub const INVALID_LSN: i64 = -1;
 
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "camelCase")]
-pub struct PublicOperationPreviewIdentity {
+pub struct PublicV1Identity {
     pub protocol_version: u32,
     pub generation: u64,
 }
 
-impl PublicOperationPreviewIdentity {
+impl PublicV1Identity {
     pub const fn new(generation: u64) -> Self {
         Self {
-            protocol_version: PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             generation,
         }
-    }
-
-    pub const fn public_v1(generation: u64) -> Self {
-        Self {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
-            generation,
-        }
-    }
-
-    pub const fn is_legacy_preview(&self) -> bool {
-        self.protocol_version == PUBLIC_OPERATION_PREVIEW_PROTOCOL_VERSION && self.generation > 0
     }
 
     pub const fn is_public_v1(&self) -> bool {
-        self.protocol_version == PUBLIC_V1_PREVIEW_PROTOCOL_VERSION && self.generation > 0
+        self.protocol_version == PUBLIC_V1_PROTOCOL_VERSION && self.generation > 0
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        self.is_public_v1()
     }
 }
 
@@ -55,23 +47,23 @@ pub enum StatePersistence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct PreviewLifecycleBinding {
-    pub preview: PublicOperationPreviewIdentity,
+pub struct PublicV1LifecycleBinding {
+    pub identity: PublicV1Identity,
     pub resource_uid: ResourceUid,
     pub spec_generation: u64,
     pub state_persistence: StatePersistence,
 }
 
-impl PreviewLifecycleBinding {
+impl PublicV1LifecycleBinding {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !self.preview.is_valid() {
-            return Err("invalid public-operation preview identity");
+        if !self.identity.is_valid() {
+            return Err("invalid Public V1 identity");
         }
         if self.resource_uid.is_empty() {
-            return Err("preview lifecycle resource UID is empty");
+            return Err("Public V1 lifecycle resource UID is empty");
         }
         if self.spec_generation == 0 {
-            return Err("preview lifecycle spec generation must be positive");
+            return Err("Public V1 lifecycle spec generation must be positive");
         }
         Ok(())
     }
@@ -101,7 +93,7 @@ pub struct FrozenReplicaResources {
 pub struct PublicFaultAction {
     pub action_id: OperationId,
     pub fault_operation_id: OperationId,
-    pub binding: PreviewLifecycleBinding,
+    pub binding: PublicV1LifecycleBinding,
     pub target: ReplicaIdentity,
     pub resources: FrozenReplicaResources,
     pub predecessor_session: ProcessSessionId,
@@ -134,8 +126,8 @@ impl PublicFaultAction {
                 fault_operation_id = self.fault_operation_id,
                 persistence = self.binding.state_persistence,
                 resource_uid = self.binding.resource_uid,
-                protocol_version = self.binding.preview.protocol_version,
-                preview_generation = self.binding.preview.generation,
+                protocol_version = self.binding.identity.protocol_version,
+                preview_generation = self.binding.identity.generation,
                 spec_generation = self.binding.spec_generation,
                 replica_id = self.target.replica_id,
                 instance_id = self.target.instance_id,
@@ -227,12 +219,6 @@ pub struct RestartActionRecord {
     pub successor_process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce: Option<String>,
-}
-
-impl PublicOperationPreviewIdentity {
-    pub const fn is_valid(&self) -> bool {
-        self.is_legacy_preview() || self.is_public_v1()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -350,7 +336,7 @@ pub enum PublicOperationReplayDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicOperationIntent {
-    pub preview: PublicOperationPreviewIdentity,
+    pub preview: PublicV1Identity,
     pub operation_id: OperationId,
     pub revision: u64,
     pub process_session_id: ProcessSessionId,
@@ -366,9 +352,8 @@ pub struct PublicOperationIntent {
 impl PublicOperationIntent {
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.preview.is_valid() {
-            return Err("invalid public-operation preview identity");
+            return Err("invalid Public V1 identity");
         }
-        let public_v1 = self.preview.is_public_v1();
         if self.operation_id.is_empty() {
             return Err("public-operation ID is empty");
         }
@@ -386,57 +371,46 @@ impl PublicOperationIntent {
             if self.class != PublicOperationClass::Authority {
                 return Err("lifecycle input requires authority operation");
             }
-            input.validate_for_preview(public_v1)?;
+            input.validate()?;
             if self.input_digest != input.digest() {
                 return Err("lifecycle digest does not match frozen input");
             }
-            if public_v1 {
-                match input.possible_data_loss {
-                    PossibleDataLossIntent::NotPossible
-                        if self.replay_disposition
-                            != PublicOperationReplayDisposition::Convergent =>
-                    {
-                        return Err("ordinary lifecycle replay disposition changed");
-                    }
-                    PossibleDataLossIntent::Possible
-                        if !matches!(
-                            self.replay_disposition,
-                            PublicOperationReplayDisposition::DataLoss(_)
-                        ) =>
-                    {
-                        return Err("data-loss lifecycle requires captured replay capability");
-                    }
-                    _ => {}
-                }
-                if let Some(recovery) = &input.data_loss_recovery
-                    && (recovery.attempt.process.process_session_id != self.process_session_id
-                        || recovery.attempt.attempt_id != self.operation_id
-                        || recovery.attempt.process.attempt_revision != self.revision
-                        || self.replay_disposition
-                            != PublicOperationReplayDisposition::DataLoss(
-                                recovery.authorization.replay_disposition,
-                            ))
+            match input.possible_data_loss {
+                PossibleDataLossIntent::NotPossible
+                    if self.replay_disposition != PublicOperationReplayDisposition::Convergent =>
                 {
-                    return Err(
-                        "data-loss attempt session or replay differs from captured operation",
-                    );
+                    return Err("ordinary lifecycle replay disposition changed");
                 }
+                PossibleDataLossIntent::Possible
+                    if !matches!(
+                        self.replay_disposition,
+                        PublicOperationReplayDisposition::DataLoss(_)
+                    ) =>
+                {
+                    return Err("data-loss lifecycle requires captured replay capability");
+                }
+                _ => {}
+            }
+            if let Some(recovery) = &input.data_loss_recovery
+                && (recovery.attempt.process.process_session_id != self.process_session_id
+                    || recovery.attempt.attempt_id != self.operation_id
+                    || recovery.attempt.process.attempt_revision != self.revision
+                    || self.replay_disposition
+                        != PublicOperationReplayDisposition::DataLoss(
+                            recovery.authorization.replay_disposition,
+                        ))
+            {
+                return Err("data-loss attempt session or replay differs from captured operation");
             }
         }
         if let Some(program) = &self.program {
-            program.validate(&self.class, &self.operation_id, public_v1)?;
+            program.validate(&self.class, &self.operation_id)?;
             if self.input_digest != program.digest() {
                 return Err("program digest does not match frozen input");
             }
-            if public_v1 && self.replay_disposition != program.replay_disposition() {
+            if self.replay_disposition != program.replay_disposition() {
                 return Err("program replay disposition does not match frozen input");
             }
-        }
-        if !public_v1
-            && (self.lifecycle.is_some() || self.program.is_some())
-            && self.replay_disposition != PublicOperationReplayDisposition::Convergent
-        {
-            return Err("protocol-10 operation cannot use public-v1 replay disposition");
         }
         Ok(())
     }
@@ -523,18 +497,6 @@ impl PublicConfiguration {
             }
         }
         Ok(())
-    }
-
-    fn validate_for_preview(&self, public_v1: bool) -> Result<(), &'static str> {
-        if public_v1 {
-            self.validate()
-        } else {
-            self.validate_descriptors()?;
-            if !self.replicas.is_empty() {
-                return Err("protocol-10 configuration cannot carry public-v1 descriptors");
-            }
-            Ok(())
-        }
     }
 
     pub fn validate_for_local(&self, local_replica_id: ReplicaId) -> Result<(), &'static str> {
@@ -874,12 +836,7 @@ impl PublicOperationProgram {
         }
     }
 
-    fn validate(
-        &self,
-        class: &PublicOperationClass,
-        id: &OperationId,
-        public_v1: bool,
-    ) -> Result<(), &'static str> {
+    fn validate(&self, class: &PublicOperationClass, id: &OperationId) -> Result<(), &'static str> {
         let expected = match self {
             Self::Swap {
                 starting,
@@ -888,38 +845,31 @@ impl PublicOperationProgram {
                 handoff,
                 catch_up_specific_quorum,
                 mode,
-                controller_composed,
+                controller_composed: _,
             } => {
-                starting.validate_for_preview(public_v1)?;
-                refreshed.validate_for_preview(public_v1)?;
+                starting.validate()?;
+                refreshed.validate()?;
                 if starting.current.epoch >= *epoch
                     || refreshed.current.epoch != *epoch
                     || !matches!(handoff, ReplicaRole::ActiveSecondary | ReplicaRole::None)
                 {
                     return Err("invalid swap epoch or handoff");
                 }
-                if public_v1 {
-                    let expected_mode = if *catch_up_specific_quorum {
-                        PublicCatchUpMode::WriteQuorum
-                    } else {
-                        PublicCatchUpMode::All
-                    };
-                    if *mode != expected_mode || starting.successor() != refreshed.successor() {
-                        return Err("swap capability, successor, or catch-up mode changed");
-                    }
-                    if *catch_up_specific_quorum && starting.successor().is_none() {
-                        return Err("specific-quorum swap lacks a must-catchup successor");
-                    }
-                } else if *catch_up_specific_quorum {
-                    return Err("protocol-10 swap cannot carry public-v1 capability metadata");
+                let expected_mode = if *catch_up_specific_quorum {
+                    PublicCatchUpMode::WriteQuorum
+                } else {
+                    PublicCatchUpMode::All
+                };
+                if *mode != expected_mode || starting.successor() != refreshed.successor() {
+                    return Err("swap capability, successor, or catch-up mode changed");
                 }
-                if *controller_composed && !public_v1 {
-                    return Err("protocol-10 swap cannot be controller composed");
+                if *catch_up_specific_quorum && starting.successor().is_none() {
+                    return Err("specific-quorum swap lacks a must-catchup successor");
                 }
                 PublicOperationClass::PlannedSwap
             }
             Self::Configuration(configuration) | Self::CatchUp { configuration, .. } => {
-                configuration.validate_for_preview(public_v1)?;
+                configuration.validate()?;
                 PublicOperationClass::Authority
             }
             Self::Build(build) | Self::Remove(build) => {
@@ -935,24 +885,19 @@ impl PublicOperationProgram {
                 if build.target_storage.replica != build.replica {
                     return Err("build target storage differs from target replica");
                 }
-                if public_v1 {
-                    let history = build
-                        .history
-                        .as_ref()
-                        .ok_or("public-v1 build lacks exact history")?;
-                    history.validate()?;
-                    if build.epoch.data_loss_number != history.data_loss_number {
-                        return Err("public-v1 build epoch differs from exact history");
-                    }
-                } else if build.history.is_some() {
-                    return Err("protocol-10 build cannot carry public-v1 history");
+                let history = build
+                    .history
+                    .as_ref()
+                    .ok_or("public-v1 build lacks exact history")?;
+                history.validate()?;
+                if build.epoch.data_loss_number != history.data_loss_number {
+                    return Err("public-v1 build epoch differs from exact history");
                 }
                 if matches!(self, Self::Build(_)) {
-                    if public_v1
-                        && build
-                            .current_configuration_id
-                            .as_ref()
-                            .is_none_or(ConfigurationId::is_empty)
+                    if build
+                        .current_configuration_id
+                        .as_ref()
+                        .is_none_or(ConfigurationId::is_empty)
                     {
                         return Err("public-v1 build lacks exact current configuration");
                     }
@@ -1854,7 +1799,7 @@ impl PublicDataLossRecoveryStatus {
 
     fn validate_for_report(
         &self,
-        identity: &PublicOperationPreviewIdentity,
+        identity: &PublicV1Identity,
         resource_uid: &ResourceUid,
         replica: &ReplicaIdentity,
         storage_incarnation: &ReplicaStorageIncarnationContext,
@@ -1959,10 +1904,6 @@ impl PublicLifecycleInput {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        self.validate_for_preview(true)
-    }
-
-    fn validate_for_preview(&self, public_v1: bool) -> Result<(), &'static str> {
         if self.current.epoch != self.epoch {
             return Err("lifecycle epoch does not match configuration");
         }
@@ -1999,11 +1940,7 @@ impl PublicLifecycleInput {
             previous: self.previous.clone(),
             replicas: self.replicas.clone(),
         };
-        if public_v1 {
-            configuration.validate_for_local(self.replica.replica_id)?;
-        } else {
-            configuration.validate_for_preview(false)?;
-        }
+        configuration.validate_for_local(self.replica.replica_id)?;
         let role = if self.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
             if self.possible_data_loss != PossibleDataLossIntent::NotPossible {
                 return Err("secondary epoch update cannot request data loss");
@@ -2026,8 +1963,8 @@ impl PublicLifecycleInput {
         if self.recipe == PublicLifecycleRecipe::FailoverPromotion && self.previous.is_none() {
             return Err("failover requires frozen previous configuration");
         }
-        match (public_v1, self.possible_data_loss, &self.data_loss_recovery) {
-            (true, PossibleDataLossIntent::Possible, Some(recovery)) => {
+        match (self.possible_data_loss, &self.data_loss_recovery) {
+            (PossibleDataLossIntent::Possible, Some(recovery)) => {
                 let previous_configuration_number = self
                     .previous
                     .as_ref()
@@ -2039,14 +1976,11 @@ impl PublicLifecycleInput {
                     return Err("data-loss recovery target or attempt epoch changed");
                 }
             }
-            (true, PossibleDataLossIntent::Possible, None) => {
+            (PossibleDataLossIntent::Possible, None) => {
                 return Err("public-v1 data loss requires typed authorization");
             }
-            (_, PossibleDataLossIntent::NotPossible, Some(_)) => {
+            (PossibleDataLossIntent::NotPossible, Some(_)) => {
                 return Err("ordinary lifecycle cannot carry data-loss authorization");
-            }
-            (false, _, Some(_)) => {
-                return Err("protocol-10 lifecycle cannot carry public-v1 recovery");
             }
             _ => {}
         }
@@ -2103,7 +2037,7 @@ pub enum ReplicaRebuildRequired {
 #[serde(rename_all = "camelCase")]
 pub struct CapturedPublicOperationIdentity {
     pub resource_uid: ResourceUid,
-    pub preview: PublicOperationPreviewIdentity,
+    pub preview: PublicV1Identity,
     pub epoch: Epoch,
     pub operation_id: OperationId,
     pub revision: u64,
@@ -2180,7 +2114,7 @@ impl CanonicalReplicaRebuildRequired {
         &self,
         completion_id: &OperationId,
         completion_revision: u64,
-        report_identity: &PublicOperationPreviewIdentity,
+        report_identity: &PublicV1Identity,
         report_resource_uid: &ResourceUid,
         report_replica: &ReplicaIdentity,
         report_session: &ProcessSessionId,
@@ -2313,7 +2247,7 @@ pub struct PublicV1OperationCompletion {
 impl PublicV1OperationCompletion {
     pub fn validate_for_status(
         &self,
-        identity: &PublicOperationPreviewIdentity,
+        identity: &PublicV1Identity,
         history: &HistoryContext,
     ) -> Result<(), &'static str> {
         if self.operation_id.is_empty()
@@ -2353,7 +2287,7 @@ impl PublicV1OperationCompletion {
 
     fn validate(
         &self,
-        report_identity: &PublicOperationPreviewIdentity,
+        report_identity: &PublicV1Identity,
         report_resource_uid: &ResourceUid,
         report_replica: &ReplicaIdentity,
         report_session: &ProcessSessionId,
@@ -2415,7 +2349,7 @@ pub struct PublicV1Extensions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1AgentReport {
-    pub identity: PublicOperationPreviewIdentity,
+    pub identity: PublicV1Identity,
     pub resource_uid: ResourceUid,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
@@ -2761,7 +2695,7 @@ impl PublicV1AcceptedOperationCompletion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1AcceptedStatus {
-    pub identity: PublicOperationPreviewIdentity,
+    pub identity: PublicV1Identity,
     pub history_initialization_id: crate::protocol::types::HistoryInitializationId,
     pub history: HistoryContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2842,7 +2776,7 @@ impl PublicV1AcceptedStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceLocation {
-    pub preview: PublicOperationPreviewIdentity,
+    pub preview: PublicV1Identity,
     pub resource_uid: ResourceUid,
     pub operation_id: OperationId,
     pub replica: ReplicaIdentity,
@@ -2855,9 +2789,9 @@ pub struct ServiceLocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicLifecycleReport {
-    pub preview: PublicOperationPreviewIdentity,
+    pub preview: PublicV1Identity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding: Option<PreviewLifecycleBinding>,
+    pub binding: Option<PublicV1LifecycleBinding>,
     pub resource_uid: ResourceUid,
     pub replica: ReplicaIdentity,
     pub process_session_id: ProcessSessionId,
