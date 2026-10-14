@@ -1,14 +1,13 @@
-# PostgreSQL: Native Replication on Kuberic V2
+# PostgreSQL: Native Replication on Kuberic Public V1
 
-The existing `postgres-replicated` package is **migrated in place** to the
-level-triggered v2 runtime. PostgreSQL Workstream 4 is complete with unit and
+The `postgres-replicated` package uses the level-triggered Public V1 runtime.
+PostgreSQL Workstream 4 is complete with unit and
 host-local subprocess validation. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
-Use a **fresh deployment** with protocol 9 / agent schema 6. There is no older
-agent-metadata migration, v1 data import, mixed-version operation or
-rolling-upgrade contract.
+Use fresh protocol-11 / agent-schema-12 state. Prior agent/provider formats
+reject unchanged; there is no import, mixed-version, or rolling mode.
 
 The current implementation uses a separate checksummed PostgreSQL metadata
 store. Its removal is blocked on the application-neutral reconfiguration work
@@ -52,7 +51,7 @@ catch-up capability reports the beginning of retained WAL. A raw peer scalar,
 process readiness or successful backup cannot mint quorum/build credit.
 PostgreSQL validates its own lineage and completion evidence before callbacks
 complete. Generic reports and controller status contain no PostgreSQL recovery
-certificates. Protocol 9 advertises the custom replicator's actual endpoint;
+certificates. Public V1 advertises the custom replicator's actual endpoint;
 database evidence travels only over application-owned `pgdata.v2`.
 
 ## SQL Access and Acknowledged Writes
@@ -361,7 +360,7 @@ same-runner four-way mode is not used. The 172-test inventory consists of 170
 directly partitioned tests and two subprocess helpers reached through their
 mapped parent tests. PostgreSQL is absent from KinD/live jobs and selectors.
 Shared regressions, partition validation and guard commands are in the
-[testing guide](../kuberic/testing.md#postgresql-v2-host-local-validation).
+[testing guide](../kuberic/testing.md#postgresql).
 
 ## Limitations and Future Work
 
@@ -378,6 +377,6 @@ Shared regressions, partition validation and guard commands are in the
   count, throughput guarantee or complete failure-interleaving model. Fencing,
   catch-up, restart and handoff may interrupt service without a duration promise.
 
-See the [v1 removal record](../../proposal/v1-retirement-plan.md#workstream-4-postgresql-on-v2),
+See the [v1 removal record](../../proposal/v1-retirement-plan.md#workstream-4-postgresql),
 [SF callback reference](../../background/service-fabric/references.md) and
 [runtime interface boundary](../../../kuberic-runtime/README.md).

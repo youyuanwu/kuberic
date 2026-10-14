@@ -1,627 +1,91 @@
-# Replicator boundary and native proof
+# Replicator Boundary
 
-Kuberic hosts built-in and application-owned replicators through the same
-Service Fabric-shaped public interfaces. Standard lifecycle and primary
-operations always cross `Replicator` or `PrimaryReplicator`; the built-in
-engine additionally supplies an unpublished native capability for durable
-replication proof.
+Kuberic hosts built-in and application-owned Replicators through the same
+Service Fabric-shaped public interfaces.
 
-The forward-looking comparison and phased simplification plan are documented
-in [Service Fabric Alignment and Runtime Simplification](service-fabric-alignment.md).
+## Public Interfaces
 
-The unpublished native capability describes the current implementation, not
-the target contract. Runtime-to-replicator interaction must use only public
-interfaces. The stateless default-replicator migration removes the private
-managed lifecycle, data-plane, observation and receipt attachment and hosts
-the built-in default through the same public bundle shape as an
-application-provided replicator. See
-[Stateless Default Replicator](stateless-default-replicator.md).
-The replacement is built beside the current engine; the private attachment is
-deleted only at the final cutover rather than incrementally refactored.
-Process launch selects the legacy or preview transport owner before any
-replication listener is bound. The selection is immutable, exposed through
-public construction, and never falls back after replacement Open failure.
+- `ReplicatorFactory` / `ReplicatorFactoryContext`;
+- `Replicator` / `PrimaryReplicator`;
+- optional `StateReplicator`;
+- optional `StateProvider`;
+- built-in persistence adapter `DurableState`.
 
-The target evidence model is also public-only: the runtime records exact
-completion of public lifecycle/primary calls and reports only public current
-progress and catch-up capability. Copy boundaries, ACK sets, quorum positions,
-transport sessions and provider progress remain inside the Replicator. The
-controller must stop depending on those current native observation fields
-before the private capability is removed.
+The protected method sets are unchanged. Applications receive no agent store,
+authority setter, Kubernetes client, or private lifecycle capability.
 
-After `on_data_loss`, the Replicator validates exact provider/peer history
-rather than trusting the callback boolean. Incompatible history returns a
-public rebuild-required error. The faulted incarnation is permanently retired;
-corrective copy targets a new empty replica/storage/PVC incarnation without
-adding a runtime backchannel.
+## Sole Built-In Path
 
-During recovery, public progress exposes the provider's durable applied tail
-for election while access remains closed. Serving readiness still requires
-completion of public configuration, catch-up and data-loss processing.
+`DefaultReplicatorFactory` constructs the stateless Public V1 engine. There is
+no managed factory, engine selector, preview selector, or fallback.
 
-Build requirement, exact source/target/session authorization and terminal
-public completion remain agent-owned in a public build store. Engine copy
-cursors and partial stream progress are not persisted.
+One creation reservation binds:
 
-## Ownership
+- exact replica and process identity;
+- one public interface bundle;
+- one replication listener;
+- at most one provider writer;
+- one cancellation/abort lifetime.
 
-The agent owns desired-state ordering, durable effect intent and completion,
-process/session admission, peer transport, endpoint ownership, and the
-externally visible read/write projection. The built-in replicator owns local
-write journals, quorum commitment, copy progress, pending-write recovery,
-committed-prefix reconciliation, native topology evidence, and local write
-fencing.
+Crossed identities, duplicate registration, listener mismatch, or abandoned
+Open abort the creation.
 
-Those facts are exposed internally through explicit owner types. Durable
-`AgentState` is wrapped as `DurableAgentObservation`; process-local
-adapter-local `ReplicaRuntimeState` produces `HostProxyObservation`; and
-managed/native progress
-is exposed as `ReplicationEngineObservation`. `ReportObservation` composes the
-host and engine owners without becoming durable state
-(`kuberic-runtime/src/host/observation.rs:1-244`).
+## Durable Ownership
 
-Phase 4.1 adds a separate dormant public-operation preview boundary. A
-`PartitionOperationRegistry` admits exact preview intents and retains each
-`PartitionOperation` independently of the waiting caller. The live owner holds
-only callback tasks, cancellation and containment state; exact intent, stage,
-input digest, blockers, callback-applied evidence, containment state and
-terminal disposition remain in the agent store.
-`PartitionOperationRecoveryOwner` reconstructs unfinished durable obligations
-without replaying predecessor authority into a new process session
-(`kuberic-runtime/src/host/operation.rs`;
-`kuberic-runtime/src/host/operation_recovery.rs`;
-`kuberic-runtime/src/host/state.rs`).
+The local agent persists identity, Public V1 lifecycle/operation authority,
+history, build/removal/retirement requirements, and terminal completion.
 
-This preview uses a distinct immutable protocol identity and schema-7
-preview-marked store state. Schema-6 legacy readers reject it before state
-deserialization, preview openers reject legacy or mismatched preview state, and
-the operation modules are compiled only for tests or the repository `testing`
-feature. A preview runtime owner joins registry coordination/root tasks during
-shutdown; object-owned work remains pending until explicit containment. No
-legacy coordinator, production protocol command or current persisted effect
-selects the preview owner (`kuberic-runtime/src/protocol/public_operations.rs`;
-`kuberic-runtime/src/host/sqlite_store.rs`;
-`kuberic-runtime/src/host/mod.rs`).
+The provider persists application state, applied/committed progress, retained
+operations, and copy snapshots.
 
-Phase 4.2 implements distinct initial-primary, failover-promotion and
-same-role-secondary epoch recipes inside that boundary. The controller preview
-planner freezes `PossibleDataLossIntent` with the exact operation/session,
-epoch, replica and revision. Ordinary planning always selects `NotPossible`;
-only the explicit preview transition selects `Possible`. Every possible-loss
-operation retains a durable history-admission barrier, including `false`,
-`true`, callback error and interrupted/unrecorded outcomes. A later ordinary
-request cannot remove it; Close/Abort/fault may retire, but never clear, it.
+The Replicator owns live queues, peers, ACK aggregation, copy/replication
+streams, and authority-scoped tasks. Those process-local objects are rebuilt
+after restart.
 
-Application role completion retains its exact optional address independently
-of the Replicator endpoint. A preview report exposes it only after the exact
-current primary operation completes with write permission. The controller
-preview uses a separate accepted-status projection, persists `Pending`, writes
-the write-Service selector and opaque `operator.kuberic.io/preview-service-location`
-annotation together, then records `Published` after exact reobservation.
-Supersession and terminal admission fence the local projection without waiting
-for Kubernetes. This is a repository-only Service model, not production
-`AcceptedStatus`, routing or CRD activation. The existing custom-authority
-and legacy access engines remain unchanged.
+## Public Completion Evidence
 
-Phase 4.3 extends the same dormant owner with exact public-operation programs.
-A planned swap durably installs the captured starting PC/CC configuration
-before its first wait, revokes preview writes/location, applies the swap epoch,
-installs the refreshed configuration, repeats the same caller-selected
-catch-up mode, and hands off Replicator role before application role. Recovery
-reinstalls the exact captured configuration before reevaluating an interrupted
-wait, so an incidental previously installed topology cannot satisfy the
-operation.
+Successful public calls certify their documented postconditions. Kuberic may
+persist that an exact call completed, but it does not promote private
+transport state into controller evidence.
 
-Build state is keyed by exact attempt identity. Same-target removal supersedes
-and drains the owned build root and provider descendants before
-`remove_replica`, then durably records that exact attempt absent. Ambiguous
-build execution remains fenced until the attempt is contained and retired;
-late completion cannot remove or publish a successor attempt.
+- configuration completion means the exact PC/CC description is installed;
+- catch-up completion means the requested predicate holds;
+- build completion means copy plus retained catch-up completed;
+- remove completion means the exact idle target is released;
+- data-loss completion is validated against exact history/provider evidence;
+- Close/Abort drain or contain descendants.
 
-Preview Close and Abort are also operation programs. Close revokes publication,
-drains blockers, closes Replicator before application, and waits for descendant
-containment. A child close error invokes Replicator-before-application abort,
-continues cleanup, retains typed child diagnostics, and normalizes the outer
-result only after containment. Abort fences synchronously and invokes those
-abort callbacks once while durable cleanup remains registry-owned. The replay
-table distinguishes repeatable convergent callbacks, read-only progress,
-non-repeatable ambiguous build/data-loss work, exact removal, and terminal
-containment; a fresh process session never executes predecessor program state.
+Incomparable histories return no ordering. Numeric progress cannot substitute
+for history identity.
 
-Phase 4.4 binds reported faults to explicit persisted/volatile preview
-classification and one frozen controller action identity. Fault admission
-commits the terminal preview/write fence before reporting returns. The
-repository-only controller path excludes the exact incarnation from
-readiness, routing, election and stable completion, persists the action,
-removes routing and then dispatches.
+## Provider Writer
 
-Persisted restart records `Accepted`, `PredecessorContained` and
-`SuccessorStarted` in the agent aggregate. The process supervisor requires
-exact predecessor termination before same-PVC child re-exec, and quarantine
-clears executable role, PC/CC, access and peer/build authority before storage
-reuse. A new session constructs fresh application/Replicator objects but
-remains unassigned and access-closed. Volatile and permanent actions remain
-controller-owned: endpoint, Pod and PVC identities are frozen before deletion,
-and replacement scaffolding does not imply history/build/serving completion.
-Production construction and dispatch cannot select either preview action.
+The host owns an exactly-one-writer reservation for the provider. The count is
+zero before admitted Open, one after current Open, unchanged by replay, and
+zero after stale/superseded containment.
 
-Phase 5.1 introduces a second, incompatible dormant preview identity for the
-Public V1 contract. Protocol 11 uses schema 8 while production remains on
-protocol 9/schema 6 and the Phase 4 preview remains on protocol 10/schema 7.
-The preview has no storage-migration contract: legacy and Phase 4 readers
-reject schema 8, the Public V1 opener rejects older schemas, and later dormant
-schema changes may require a fresh preview store. No production or application
-data is migrated through this boundary.
+This local ownership mechanism is not a Kubernetes Lease and is unrelated to
+production cutover.
 
-Public V1 operation inputs use versioned, domain-separated canonical binary
-digests rather than Rust diagnostic formatting. The digest version remains
-part of the retained operation evidence. Protocol 11 also has a structurally
-separate report and accepted-status branch containing only public identity,
-role/access, first/last progress, and exact public-operation completion. It
-cannot carry the managed engine's verified, committed, quorum, ACK,
-copy-boundary, topology, or build-cursor evidence. Production normalization
-and evaluation reject this branch.
+## Transport Boundary
 
-`ReplicaInformation` now distinguishes an idle build target from an active
-remote peer. Unknown or inapplicable progress is `INVALID_LSN` (`-1`); zero
-remains a valid empty-history position. Active public configuration entries
-are exact remote, ready secondaries and may identify one `must_catchup`
-successor. Immutable `ReplicatorCapabilities` are bound to the coherent
-`ReplicatorInterfaces` creation identity, survive wrapping and attachment, and
-cannot manufacture managed provenance. They freeze specific-quorum support
-and the data-loss replay disposition used by durable operations.
+The Replicator owns its replication endpoint lifetime. Public V1 transport is
+credential-free. Identity/session/epoch/history/storage/build values fence
+correctness but are not authentication.
 
-Typed rebuild-required results preserve the public/provider-visible reason
-without exposing agent workflow state through a callback. The operation owner
-enriches a local result from the exact captured operation, storage, epoch,
-revision, and process session; delayed completion is never enriched from
-current state. Remote build failures retain the target identity, target
-session, epoch and reason; the operation owner enriches them with the captured
-resource, operation and source session. This two-level construction
-does not change the protected Replicator, PrimaryReplicator, StateReplicator,
-StateProvider, or DurableState method sets and adds no host-only callback.
+The bearer token protects the separate agent command endpoint. Kubernetes
+namespace RBAC protects controller resource mutation.
 
-The Public V1 replay table is operation-specific: lifecycle, configuration,
-settings, and exact removal converge; progress is a repeatable read; catch-up
-reevaluates its captured predicate; terminal build success is retained while
-ambiguity retires the attempt; data-loss ambiguity follows the creation's
-frozen disposition; and Close, Abort, and fault containment are idempotent.
-All of this remains repository-only and dormant. Phase 5 has not selected a
-replacement Replicator or changed the legacy production path.
+## Custom Replicators
 
-Phase 5.2 replaces the disposable Public V1 schema-8 store with a fresh,
-incompatible schema-9 store. There is no conversion or absent-field fallback:
-production schema 6, the Phase 4 schema-7 preview, and the earlier Public V1
-schema are rejected before state decoding. The controller owns one
-partition-wide `HistoryInitializationId` per resource and Public V1 protocol
-generation. Every initial replica receives that accepted value and derives the
-same domain-separated bootstrap history; local initialization, Pod/PVC
-identity, process session, epoch and LSN do not define partition history.
+Custom Replicators use the same public lifecycle bundle and may own their own
+transport and durable formats. PostgreSQL is the repository example.
 
-History, storage and process identity remain separate. `HistoryContext` binds
-resource, Public V1 generation, opaque history and data-loss number.
-`ReplicaStorageIncarnationContext` binds the exact logical replica and
-persistent or volatile storage generation without a process session.
-`ProcessAttemptContext` binds one process session and Replicator creation to an
-epoch and attempt revision. Numeric progress is comparable only within the
-same resource, Public V1 generation, history and data-loss number. Recovery
-progress may identify an access-closed provisional primary, but it is not
-health, routing, quorum, catch-up or serving evidence.
+Custom implementations must:
 
-One immutable `DataLossAuthorization` names the predecessor and deterministic
-successor history, provisional primary storage, progress-reset scope and
-captured replay disposition. Renewable `DataLossAttempt` values bind that
-logical decision to process-local creation capabilities. A convergent
-successor requires durable predecessor containment, a different process
-session and a strictly higher configuration number while preserving the same
-authorization and storage. If the replacement creation declares
-`ReplaceOnAmbiguity`, a captured convergent authorization retires without
-callback invocation; a captured `ReplaceOnAmbiguity` authorization is
-terminal and cannot be upgraded by a convergent replacement. These outcomes
-remain distinct in durable/report state as `Retired` versus
-`ReplacementRequired`. Every ordinary Public V1 lifecycle/program epoch is
-fenced to the current history data-loss number; only the exact recovery
-authorization may admit the one specified increment. Public V1 build/removal
-inputs carry the exact current `HistoryContext`, so build attempts cannot
-escape the history fence.
+- honor partition read/write status;
+- reject stale authority and unsupported provider state;
+- preserve exact process/session/storage fencing;
+- return the same coherent public interface allocation.
 
-After ambiguous predecessor containment, the controller conditionally replaces
-the accepted process attempt with the exact higher-epoch successor before
-dispatch. Subsequent command and report acceptance require that successor
-attempt byte-for-byte; a predecessor attempt cannot resume through the new
-process.
-
-Recovery begins with two separately fenced owner-local commits. The controller
-conditionally persists bootstrap or invalidated accepted status before a
-feature-gated `PublicV1History` command can dispatch. The agent command journal
-then atomically revokes executable access, clears prior operation completions
-and old-history build/configuration state, and records the full logical
-authorization plus exact process attempt before callback execution. This is
-not a distributed transaction: every command and report revalidates resource,
-operation, history, storage, reset scope, replay disposition, creation
-capabilities and process identity. The attempt's public creation ID is derived
-from the actually attached `ReplicatorAttachment` identity and must match it
-exactly before admission.
-
-The agent then orders Replicator primary role, explicit epoch, application
-primary role, `on_data_loss`, fresh progress, proposed-history configuration
-and catch-up, explicit history admission, and finally access. Callback
-`false`, `true`, typed failure, rebuild-required and lost-result ambiguity
-remain distinct; none is itself a history certificate. Pending reports carry
-the exact predecessor history and immutable authorization fields, while
-admitted reports carry the exact proposed history. Recovery progress is valid
-only with nonterminal recovery authority; failed, replacement-required and
-retired state is election-ineligible. Production normalization, gRPC dispatch
-and evaluation still reject the feature-gated protocol-11 path.
-
-Phase 5.3 replaces the disposable schema-9 store with a fresh exact schema-10
-store. Schemas 6, 7, 8 and 9 are rejected before decoding; there is no
-migration, absent-field fallback or retained database fixture. Schema 10 adds
-process-session renewal barriers while protocol 11 remains repository-only.
-
-Build and peer descriptors carry exact replica identities, process sessions,
-addresses, epochs and current/previous configuration IDs. These values support
-lifecycle fencing and stale-result rejection, but they are not credentials and
-do not authenticate the remote process. Primary/secondary replacement or peer
-withdrawal advances the configuration epoch, closes affected access, freezes
-the survivor set, completes or explicitly excludes every survivor epoch
-barrier, replays the replacement role when applicable, and only then installs
-fresh configuration. An unreachable survivor is waited for or retired;
-same-epoch primary-session substitution is invalid. Data-loss replacement
-preserves the Phase 5.2 logical authorization and still enforces exact captured
-replay capability before any callback.
-
-Public V1 has no transport authentication or peer-authorization contract by
-design. The PostgreSQL oracle uses an unauthenticated lifecycle-owned gateway
-and the public coordination RPC accepts no Public V1 token. TLS identity,
-workload identity or an explicit token protocol may be designed later as a
-separate transport-security feature. Exact descriptor and session checks are
-correctness fences, not credentials or proof of the peer's identity, and
-transport authentication is not a production-activation requirement.
-
-Phase 5.4 replaces the disposable schema-10 store with the final fresh
-schema-11 Public V1 store. Schemas 8, 9 and 10 are rejected before record
-decoding. Each completed protocol-11 call reports its exact call kind,
-canonical input digest, replay disposition, accepted history/storage/process
-session, applicable PC/CC IDs, and catch-up mode/capability without native
-committed/quorum/ACK/copy evidence.
-
-Schema 11 owns one public build record per admitted attempt. The record retains
-the source and target identities, process sessions and address, history, epoch,
-admission revision, terminal public result and retirement disposition. It
-never stores a transport credential, engine cursor, copy sequence, snapshot or
-catch-up boundary, durable target LSN, ACK/quorum state, or a Replicator store
-handle. Callback ambiguity requires retirement, successful removal retires the
-exact record, and malformed or incompletely bound current-schema records fail
-on reopen.
-
-The dormant controller stores a structural, lossless shadow of each exact
-public completion before using it. The shadow preserves call kind, canonical
-input identity, replay disposition, accepted history/storage/process session,
-PC/CC IDs, capability/mode, typed failure detail and typed local/remote rebuild
-identity. Failover, switchover, repair/replacement, scale-up/down, removal,
-data loss and session renewal all use the same conditional evidence gate.
-Missing completion waits; changed history/session/incarnation/configuration
-fails closed; typed failure retires the exact incarnation and typed rebuild
-identity provisions only the captured replacement.
-
-The final Public V1 conformance catalog contains exactly KSF-01 through
-KSF-16. The strict custom fixture and four bounded real PostgreSQL scenarios
-execute row-keyed assertions from the same catalog. KSF-09, KSF-10 and KSF-16
-retain negative activation checks: the current managed attachment,
-agent-owned production replication listener and legacy continuation stores
-remain inventoried and therefore keep production cutover ineligible. KSF-10
-also proves Replicator-owned endpoint lifetime in the dormant strict custom
-fixture; PostgreSQL explicitly remains inapplicable because its test transport
-listener is externally owned. Passing the negative checks does not claim that
-the Phase 6 engine or Phase 7 replacement-only artifact exists.
-
-These responsibilities do not move at a standard-operation boundary.
-Successful public catch-up, build, and ordinary removal completion is the
-built-in engine's durable completion contract. The agent validates that its
-authority, sessions, target, and attempt are still current, then commits the
-common effect; it does not fetch a second native receipt.
-
-## Coherent interface bundle
-
-`ReplicatorInterfaces` binds public control, optional primary/state interfaces,
-and optional host-only capabilities to one creation identity. Cancellation,
-failed attachment, or an Open identity mismatch abandons the whole creation.
-Wrappers that retain the built-in engine must consume the original bundle with
-`wrap_primary`; rebuilding a bundle with `primary` intentionally creates an
-independent public bundle without the original native provenance.
-
-Independent custom replicators return only the public interfaces they
-implement. A custom `StateReplicator` does not imply the presence of the
-built-in native capability.
-
-## Standard operation routing
-
-Open, role, epoch, Close, progress, data-loss, configuration, catch-up, build,
-and removal use the public interfaces. Hosted build/remove transport remains
-agent-owned:
-
-- one admitted build invokes the returned public primary once;
-- built-in copy delivery and public completion must both succeed;
-- cancellation or either branch failing cancels the exact build attempt;
-- native copy progress alone is not host-accepted completion;
-- remove invokes the public primary before the common Remove dispatch.
-
-Private lifecycle work is divided into consumer-specific process, authority,
-access, build, cancellation, topology, observation and outbound capabilities.
-Registration projects those capabilities from one shared managed or independent
-owner. Reporting, build dispatch, peer discovery, cleanup, topology effects and
-recovery receive opaque narrow views rather than a universal lifecycle facade.
-The split changes reachability, not synchronization: authority, sessions,
-generations, cleanup claims and the outbound queue remain shared.
-
-The managed capability exposes explicit replication operations for executable
-configuration, peer sessions, build proof, progress refresh, acknowledgement,
-access, certified-prefix settlement, switchover, every secondary-removal stage
-and retirement. Each removal and retirement stage has a distinct outcome type
-containing only that stage's evidence. There is no all-capability supertrait,
-generic lifecycle action hook,
-backend operation enum, compatibility dispatcher or getter that reconstructs
-the complete owner. Application role, replicator role and epoch remain separate
-application/public operations; access retains its private prepare/publish/
-decision protocol.
-
-Durable `AdmittedAuthority` is host-owned. Before managed admission, the host
-derives `ManagedReplicaConfiguration`, which contains only executable current/
-previous configuration and replication-required handoff, removal and scale-up
-evidence plus explicit executable build policy. The engine, replication log
-and quorum tracker do not import
-controller effects, transition kinds, durable authority or broad runtime
-snapshots. A narrow managed store view projects the already-durable
-configuration and exposes only replication-specific removal and retirement
-persistence.
-
-## Native topology receipts
-
-Only Kuberic-specific topology operations retain private durable receipts:
-certified-prefix settlement, switchover preparation, secondary removal, and
-retirement. `TopologyReceipt` stores those canonical payloads directly in an
-effect result. There is no catch-up/build/removal receipt layer and no generic
-operation-evidence wrapper duplicating the same payload.
-
-The engine returns transient operation-specific outcomes fenced by executable
-configuration, engine session and engine generation. The host binds the outcome
-to the exact captured durable authority, reconstructs the existing durable
-receipt/token shape and revalidates it against the intent. Standard-operation
-staleness is validated from host admission plus the typed native fence captured
-around the public call.
-
-## Access publication
-
-Native access admission does not itself grant application access. The host
-reserves one common projection generation, validates public progress, publishes
-native access, and atomically updates the common and external projection. One
-already-running access task owns native/common fencing, final owner validation,
-host-memory completion, and projection cleanup. Its ready transaction is
-consumed exactly once to obtain an accepted transaction; that accepted owner is
-then committed or rejected exactly once. If the caller disappears before a
-decision, the task observes the closed channel and performs rollback. No
-`Drop` implementation starts asynchronous correctness work.
-
-Durable access effects persist applied and completed stages through the
-intent-first protocol before authorizing the accepted transaction. Direct
-lifecycle restoration, reconciliation, and Close use the same accepted owner
-without creating another effect journal entry. A positive durable decision
-transfers the exact applied effect to the access task, so cancellation of the
-waiting observer cannot suppress host-memory recording after successful final
-validation.
-
-Durable completion and runtime commit remain distinct. Abort or supersession
-can invalidate the owner after completion is retained but before final commit.
-That execution returns an explicit error, cleans only its own publication, and
-does not record host-memory success. The retained exact result remains
-replayable without publishing another access generation.
-
-Cancellation, publication failure, or configuration invalidation fences native
-writes and clears an unaccepted projection. Rollback is generation-scoped, so
-it cannot revoke a newer accepted grant. Final effect acceptance is serialized
-with projection invalidation. Common ownership validates authority,
-configuration, peer sessions, role, and access generations. The built-in engine
-also validates its executable configuration, native session, generation,
-progress, and fence. An access preparation contains no durable authority.
-Independent custom implementations instead complete their public progress/
-revocation callback contract; they do not acquire managed-native receipts.
-
-## Custom authority admission
-
-Independent custom replicators use the existing current/joint configuration
-callbacks to accept an exact proposed topology before the host persists its
-authority. Those callbacks apply configuration and can mutate live or durable
-application state. They are not pure validation operations, and the interfaces
-provide neither an atomic application/authority-store transaction nor rollback.
-No new replicator method, capability, registration or wrapper requirement is
-introduced.
-
-Each runtime host owns one `CustomAuthorityContainment`. It contains the
-independent authorization latch, exact pending recovery, and the shared
-configuration-callback and recovery-restoration serialization locks. Each
-admission creates a short-lived `CustomAuthorityAttempt`; nested staging and
-host effect completion share the same entered-attempt state so invalidation or
-caller loss cannot publish or record stale success
-(`kuberic-runtime/src/host/custom/authority.rs:17-117,358-399`,
-`kuberic-runtime/src/host/hosting.rs:2379-2385,2641-2648`).
-
-The containment owner first checks structural, durable-conflict and required
-build evidence. It then invalidates old work and saved grants, explicitly
-closes both read/write projections, and completes bounded native access
-revocation before calling the application. This also interrupts
-identical-authority replay and same-primary scale-up access. Deferred
-restoration accepted earlier is serialized before staging; its host-owned
-continuation retains ownership even if the requesting recovery observer is
-dropped.
-Already-entered incidental configuration callbacks likewise finish before
-candidate application. Independent direct and deferred configuration share the
-containment callback owner; dropping a peer-discovery observer does not release
-a stateful callback into a newer authority. Subsequent stale restoration cannot
-reopen access
-(`kuberic-runtime/src/host/custom/authority.rs:119-327`,
-`kuberic-runtime/src/host/custom.rs:1929-1933,2020-2024`).
-Successful admission requires callback acceptance, authority-store success and
-owned generation/session-valid publication. It remains closed until fresh
-explicit access authorization.
-
-| Boundary | Authority and containment |
-|---|---|
-| Pre-application structural/conflict rejection | No candidate callback/admission; existing session need not abort. |
-| Callback rejection, including partial mutation | No candidate authority admission; entered attempt aborts with access closed. Application rollback is not claimed. |
-| Store error before write | Candidate may already be applied by the custom engine; host authority remains old/absent. Current session aborts. |
-| Store commits then returns an error | Candidate may be durable despite failure. Current session aborts; no read-back-as-success, authority erasure or compensating old configuration. |
-| Dropped entered attempt or stale completion | Synchronous Abort contains the session; late external mutation/durable commit is possible, but invalidated work cannot record host effect success. |
-| Host success followed by journal failure | Exact cached success can finish journal replay without another configuration callback in the same host. |
-
-Effect intent remains durable before staging. A fresh independent host with
-pending authority intent reconciles the exact candidate before applying obsolete
-stored configuration, reconstructs role/epoch/application state, then performs
-ordinary exact effect replay and journal completion. Startup access stays closed
-and an old persisted grant is not restored. Current/previous descriptors remain
-exact; process-session descriptions are fresh. Callbacks can repeat across
-recovery. A conflicting newer/same-epoch authority, missing required fresh build
-proof, or a custom engine refusing exact reconciliation fails closed rather than
-substituting a proposal or promising universal recovery liveness. Dropping an
-entered callback/store future leaves its recorded pending intent; a returned
-cancellation may instead cancel that intent under the existing adapter rules.
-
-Managed built-in admission uses an explicit prepared boundary. The engine first
-validates the executable candidate, replication progress, handoff/build proof
-and log epoch, then advances its native generation and returns one owned
-preparation. The host persists the exact durable authority, the engine consumes
-that exact preparation through prevalidated, non-fallible log/quorum mutation,
-then completes the remaining fallible public configuration callbacks under the
-existing exact-effect recovery contract. The host publishes common
-configuration and the engine synchronizes the final host generation. Dropping a
-preparation synchronously invalidates it and advances the native generation. A
-before-write
-store failure leaves the old durable authority and permits exact retry; an
-ambiguous post-write failure remains write-closed and leaves the durable
-candidate for recovery. Same-primary continuity preserves the access projection
-while generation fencing rejects obsolete completion. The custom containment
-policy does not weaken, replace or reorder this managed-only protocol.
-
-## Persistence, reporting, and recovery
-
-SQLite persists effect intent before execution. The applied marker then stores
-the exact action-specific canonical result, and completion commits only after
-that saved result, its exact action family and any variant-specific topology
-proof validate
-(`kuberic-runtime/src/effects.rs:250-619`;
-`kuberic-runtime/src/host/state.rs:17-63`;
-`kuberic-runtime/src/host/sqlite_store.rs:417-1003`). Schema 6 replaces the
-broad schema-5 result directly; schema 5 is rejected before agent-state
-deserialization and has no migration path
-(`kuberic-runtime/src/host/sqlite_store.rs:202-209,2413-2429`).
-
-Reporting is strictly read-only. `ReportRuntime` exposes only owner observation
-capture and live partition observation; it has no progress-refresh, access,
-retry, store-write or recovery capability. Both `GetAgentStatus` and the report
-appended to an accepted command use the same reporter
-(`kuberic-runtime/src/host/hosting.rs:466-527`;
-`kuberic-runtime/src/host/report.rs:14-246`;
-`kuberic-runtime/src/host/service.rs:816-946`).
-
-The reporter applies one composition rule per field:
-
-| Field group | Owner and composition |
-|---|---|
-| Protocol version, storage constants and reporter sequence | Protocol constants plus `AgentReporter::ProcessSession`; they are not host or engine lifecycle facts |
-| Identity, epoch, previous/current configuration, durable topology and retained work | Durable `AgentState` only |
-| Exact admitted authority | Durable `ReplicaAuthorityStore`; the host projection must match the complete stored authority, including transition, switchover, removal and scale-up evidence |
-| Address, actual application role/access, open state and authority projection | `HostProxyObservation` only |
-| Replication, verified, committed, quorum and catch-up progress | `ReplicationEngineObservation` only |
-| Builds | Live engine progress wins by build ID; durable fallback is admitted only for a still-live authority-free command or retained scale-up completion when the host is not in live-build-only mode; host receipt-currentness and retirement filtering decide whether live completion is reportable |
-| Peer sessions and addresses | Host/session registries own them; they fence report/recovery capture but are not copied into the local status except the reporter's own process session |
-| `healthy` | Live host fault, fail-closed immediately |
-| `reported_fault` and load | Durable state after background persistence |
-| Catch-up capability | Managed engines supply it directly with each engine observation; independent custom runtimes use the recovery-owner cache only while its observation fence remains current |
-
-Report capture links the host and managed engine through executable
-configuration, engine session/generation and the host generation acknowledged
-by the engine. Host lifecycle/generation/session fields and engine topology
-fences must remain stable across the capture; progress and builds may advance.
-An exact pending restoration may temporarily have durable desired access
-`Granted` while actual access remains `ReconfigurationPending`. Reporting emits
-the actual closed value and accepts that mismatch only while the desired pair,
-authority, configuration/access generations, peer sessions and engine fence
-remain exact. A role or build operation may also leave one denied access reason
-stricter than another (`ReconfigurationPending` versus `NotPrimary`); reporting
-accepts that mismatch because neither state grants access
-(`kuberic-runtime/src/host/observation.rs:135-244`;
-`kuberic-runtime/src/host/report.rs:199-303`).
-
-Lifecycle advancement belongs to service-owned background owners.
-`RecoveryOwner` reconciles exact access first when no effect or
-reconfiguration is pending, then maintains one separately cancellable
-diagnostic task for progress and catch-up capability. Retryable access and
-open independent-custom observation use a bounded 100 ms timer; idle managed
-replicas wait for explicit lifecycle revisions. It reloads selection around
-publication and compensates fail-closed after supersession. Managed peer
-discovery contributes a deferred exact restoration witness rather than
-publishing access from its observer task. `PartitionReportOwner` independently
-persists changed load/fault revisions so a stalled callback cannot starve
-observation durability
-(`kuberic-runtime/src/host/recovery.rs:14-192`;
-`kuberic-runtime/src/host/hosting.rs:1694-1927`).
-
-`RecoveryTaskOwner` retains access transactions, diagnostic work and peer
-recovery producers after their observing caller disappears. Deferred custom
-configuration separately retains an abort handle and join handle before its
-callback may start. Shutdown signals the background owners, closes descendant
-ingress, aborts diagnostic/peer helpers, cooperatively rolls back and joins
-access transactions, joins the owners, cancels and joins deferred
-configuration, quiesces partition-report producers,
-persists the final stable load/fault revision, and only then aborts the
-runtime. Startup failure drops reconstruction ownership before following the
-same descendant-cancellation and persistence ordering
-(`kuberic-runtime/src/host/hosting.rs:57-87,259-300,1600-1665`;
-`kuberic-runtime/src/host/service.rs:511-621`).
-
-Recovery still reconstructs authority and native stores, reissues or
-reobserves pending effects, and keeps access closed until public/native proof
-is accepted. A previously persisted granted value is never sufficient to
-reopen writes. Managed recovery validates the full durable authority in the
-host, derives executable configuration and reuses the same prepare/commit
-protocol before common restoration or access publication.
-
-`RuntimeSnapshot` remains only for diagnostics and opt-in testing.
-`RuntimeEffectOutcome` supplies typed role, epoch, access, catch-up, build and
-topology completion; unrelated diagnostic fields never enter its serialized
-identity. Report, build, peer-discovery, outbound and restart-inspection views
-carry owner observations or narrow projections
-(`kuberic-runtime/src/effects.rs:95-436`;
-`kuberic-runtime/src/host/observation.rs:50-377`;
-`kuberic-runtime/tests/lifecycle_capability_boundaries.rs:1518-1606`).
-
-## Compatibility
-
-The application-facing service, partition, factory, public replicator, primary,
-and optional state-replicator contracts remain SF-shaped. Native receipts are
-not requirements on independent custom replicators. The intentional wrapper
-migration boundary is limited to preserving the coherent factory-created
-bundle.
-
-The runtime source-public inventory and compile-fail API guards cover hidden
-bundle and receipt signatures. Stable Rust visibility lints and runtime-local
-Clippy restrictions enforce broad type ownership in ordinary builds. The
-focused lifecycle source test retains only relationship rules that those tools
-cannot express, including capability aggregation, escape paths, fixture gating
-and the single admitted-build coordinator.
-
-## Validation
-
-The repository validates this boundary through:
-
-```bash
-cargo test -p kuberic-runtime --test public_api_inventory
-cargo test -p kuberic-runtime --test lifecycle_capability_boundaries
-scripts/check_runtime_public_api.sh
-cargo nextest run --profile ordinary -p kuberic-runtime --features testing --lib \
-  -E 'test(/^host::tests::(runtime|store|coordinator|recovery|crash_boundaries)::/)'
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-```
-
-Use the repository `just nextest-*` recipes for the complete ordinary,
-PostgreSQL, archive-partition, and KinD matrices.
+They do not receive a compatibility adapter for the removed built-in engine.

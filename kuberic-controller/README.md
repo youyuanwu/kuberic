@@ -1,100 +1,61 @@
 # kuberic-controller
 
-Kubernetes Failover Manager-equivalent for the independent level-triggered
-Kuberic stack.
+Namespace-bound Kubernetes controller for the experimental Public V1 Kuberic
+stack.
 
 The controller watches `operator.kuberic.io/v1alpha1` `KubericSet` resources
-and their owned Pods, PVCs, Services, and Secrets. Each reconcile observes and
-normalizes the complete state, calls its pure `evaluator` API, applies
-independent resource convergence, and dispatches
-at most one fenced authority-changing command. Stable, waiting, and unsafe
-states all use bounded re-observation.
+and their owned Pods, PVCs, Services, and Secrets. It consumes shared Public V1
+contracts from `kuberic-runtime` with runtime host features disabled.
 
-`kuberic-controller` and `kuberic-runtime` are the two publishable production
-crates. The controller depends on runtime shared `protocol` and `control`
-contracts with `default-features = false`; replica host implementation features
-are not needed by the control plane.
+## Reconciliation
 
-The controller owns configuration selection, failure timing, routing fences,
-replacement provisioning, status projection, and optimistic-concurrency
-acceptance. It does not own replica-local effect sequencing, replication
-quorum credit, application durability, or a workflow phase journal.
+Each reconcile:
 
-A feature-gated dormant Public V1 evaluator path consumes protocol-11 public
-history, role-correct progress and exact durable callback completion. It
-rejects stale revisions, predecessor sessions, substituted storage or
-configuration identity and proof-free Kubernetes scaffolding. Consumer-specific
-accepted intent derives the frozen requirement for failover, switchover,
-repair/replacement, scale, removal, data loss and session renewal. Conditional
-effects are atomically deduplicated, and build retirement/replacement targets
-the captured target storage incarnation rather than the reporting source.
-Protocol-11 role locations are normalized only from the exact successful role
-completion. Production evaluation remains protocol 9; the Phase 6 replacement
-engine and Phase 7 cutover artifact do not exist yet.
+1. observes the complete namespaced resource set and agent reports;
+2. validates accepted Public V1 status;
+3. converges missing support/replica resources;
+4. applies history, session-renewal, operation, or evidence work;
+5. requeues for observation.
 
-Planned switchover uses `spec.switchover.requestId` and
-`spec.switchover.targetReplicaId` (a committed logical secondary ID). Acceptance
-freezes exact identities in `status.transition.switchover`; the active request
-cannot be cancelled or retargeted. `status.lastSwitchover` retains the latest
-terminal receipt; admission rejections use `SwitchoverRejected` conditions.
-Authority acceptance precedes write grant and exact-Pod routing publication.
-Restoration, newer-epoch compensation, and Unsafe closure remain evidence-gated.
+Fresh bootstrap creates credentials, peer/write Services, PVCs, Pods, and exact
+per-Pod endpoints before consuming reports. A preseeded report cannot skip
+resource convergence.
 
-Lowering `spec.replicas` enables SF-inspired secondary scale-down using PC/CC
-quorum principles, with Kuberic-specific target/minimum coupling, deterministic
-selection, write closure, sequential cleanup, and Kubernetes resource deletion.
-Desired count is target and minimum (floor one): a Kuberic policy choice, not
-general SF semantics; SF target and minimum are independently configurable.
-One frozen highest-ID committed secondary is removed at a time. Before intent,
-routing removal, or write closure, retained exact members must provide the
-previous read quorum under stable accepted current-only authority and fresh
-exact sessions. `ScaleDownRetainedReadQuorumUnavailable` preserves existing
-routing/access with bounded re-observation, without preparation, replacement,
-or another target; after heal the same highest-ID target is selected. For 2→1
-the primary alone suffices. Post-freeze previous-read/reduced-write evidence precedes atomic reduced
-topology/policy and `secondaryScaleDownCleanup` acceptance. Separate local commit,
-write grant, and routing can restore service while cleanup is pending.
-Exact-name GETs and frozen UID/fresh resource-version deletes enforce
-endpoint→Pod→PVC cleanup. An unreachable target is fenced only after commit
-by exact Pod deletion; PVC object deletion waits for observed Pod absence, with
-no retention or import path and no physical storage erasure guarantee.
-Exact original PVC provenance must be reconstructable before admission. If Pod
-and PVC already disappeared and their mapping/generation cannot be reconstructed,
-scale-down waits/fails closed; list omission is not absence. Unavailable-target
-support requires frozen or reconstructable exact cleanup identity.
-`lastSecondaryRemoval` retains convergence proof, never deletion authority.
-Before replacing that bounded receipt, every retained member needs its original
-completed current-only witness or fresh proof of completed local acceptance.
+## Configuration
 
-Replacement freezes `pendingReplacementCleanup` before provisioning and moves
-it unchanged to `lastReplacement` at commit. Both replacement and scale-down
-serialize subsequent operations until exact cleanup completes; label loss,
-finalizers, and ambiguous replies cannot overwrite the obligation or authorize
-deletion of same-name replacement UIDs.
+The binary requires:
 
-Protocol 9 and agent store schema 6 require a fresh coordinated deployment.
-The production controller configuration enables sequential scale-up: it
-persists one allocation, creates/freeze the annotated canonical PVC before the
-bound Pod, builds from the exact accepted primary through a post-enumeration
-catch-up boundary, and admits one fresh ordinal through independent PC/CC
-policies. Cancellation before admission and exact endpoint→Pod→PVC cleanup use
-frozen provenance; after admission, accepted authority rolls forward.
-Primary/explicit-target removal, independent target and
-minimum counts, a validated maximum replica-count budget, and active-removal
-cancellation are unsupported. There is no maximum write-interruption guarantee.
-Frozen-primary loss during removal or cleanup can cause indefinite outage;
-there is no overlapping failover even after membership commit.
-See the [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
-for provenance, status/API redesign, helper refactors and recovery/policy expansion.
+- `KUBERIC_INSTALLATION_NAMESPACE`;
+- `KUBERIC_AGENT_BEARER_TOKEN`.
 
-Deployment assets are under `deploy/`. The controller and sample images are
-development/CI artifacts and are not currently published release targets. The
-removed classic `kuberic.io/v1` stack has no compatibility or migration path.
+The installation namespace must be one DNS label. Kubernetes clients and
+watches are namespaced. Deployment RBAC uses `Role`/`RoleBinding`.
 
-See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
-for the CRD, deployment, supported operations, diagnostics, and limitations.
-The guide includes the [request example and retry contract](../docs/features/kuberic/level-triggered-operator.md#planned-switchover).
-See also [secondary scale-down usage and conditions](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down).
-See [sequential scale-up usage and diagnostics](../docs/features/kuberic/level-triggered-operator.md#sequential-scale-up)
-for fresh-incarnation restoration, write-availability boundaries, failover,
-cleanup, and limitations.
+## Status and Protocol
+
+CRD status is structurally typed and contains:
+
+- Public V1 authority;
+- session renewal;
+- transition;
+- operation.
+
+Protocol version 11 is the only production command/report path. Old and
+partial controller state rejects before planning or mutation.
+
+## Deployment
+
+Assets are under `deploy/`. They are development/CI assets, not published
+release targets.
+
+```bash
+just level-triggered-images
+just level-triggered-install
+just level-triggered-kind-test bootstrap replacement failover
+```
+
+There is no migration, compatibility mode, Kubernetes cutover Lease, image
+publication, or production-activation procedure.
+
+See the [operator guide](../docs/features/kuberic/level-triggered-operator.md)
+and [test strategy](../docs/features/kuberic/testing.md).

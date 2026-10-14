@@ -5,9 +5,9 @@
 > and a supported release installation are not available yet.
 
 Kuberic is a stateful replication framework for Kubernetes. The current
-level-triggered stack provides quorum replication, automatic failover, planned
-switchover, copy-based replica building, sequential scale-up, secondary
-scale-down, and epoch/session fencing.
+level-triggered stack provides the Public V1 replication, copy, history,
+session, fencing, and lifecycle contracts plus an experimental namespace-bound
+controller and owned-cluster validation harness.
 
 ## Repository
 
@@ -18,8 +18,8 @@ kuberic-level-tests/       Unpublished isolated KinD scenario harness
 kuberic-dex/               Unpublished durable execution and checkpoint kernel
 
 examples/kvstore2/         Level-triggered conformance application
-examples/sqlite/           SQLite v2 application
-examples/postgres/         PostgreSQL-native v2 custom replicator
+examples/sqlite/           SQLite Public V1 application
+examples/postgres/         PostgreSQL-native Public V1 custom replicator
 ```
 
 There are exactly two public production crates: `kuberic-runtime` and
@@ -100,22 +100,24 @@ cluster/context/kubeconfig tuple before every mutation and deletion.
 ### KVStore2
 
 The conformance application exercises the complete level-triggered controller,
-agent and runtime path through an HTTP key/value API. Its isolated live matrix
-covers bootstrap, replacement, failover, quorum loss, planned switchover,
-secondary scale-down, sequential scale-up and adversarial recovery.
+agent and runtime path through an HTTP key/value API. Its retained isolated
+live scenarios cover fresh bootstrap, replacement, and failover; the broader
+behavioral matrix runs in the cluster-free runtime/provider tiers.
 
 ### SQLite
 
 `sqlite-replicated` uses quorum-before-publication WAL-frame replication,
-committed snapshots and retained catch-up. Fresh v2 storage is required; no
-classic data is imported. See the [SQLite design](docs/features/sqlite/design.md).
+committed snapshots and retained catch-up through Public V1. Fresh replacement
+storage is required; prior provider state is rejected unchanged. See the
+[SQLite design](docs/features/sqlite/design.md).
 
 ### PostgreSQL
 
 `postgres-replicated` is an application-owned custom replicator.
 PostgreSQL owns WAL streaming, physical recovery, synchronous policy and
 promotion while Kuberic owns generic authority and lifecycle choreography.
-Fresh protocol-9/agent-schema-6 storage is required. See the
+It uses the Public V1 lifecycle and owns rejection of its prior provider
+formats. See the
 [PostgreSQL design](docs/features/postgres/design.md).
 
 ## Distribution Status
@@ -131,6 +133,8 @@ the isolated development/CI assets above.
 ## Documentation
 
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
+- [Stateless default Replicator](docs/features/kuberic/stateless-default-replicator.md)
+- [Service Fabric alignment](docs/features/kuberic/service-fabric-alignment.md)
 - [Replicator boundary and native proof](docs/features/kuberic/replicator-boundary.md)
 - [Testing strategy](docs/features/kuberic/testing.md)
 - [SQLite design](docs/features/sqlite/design.md)

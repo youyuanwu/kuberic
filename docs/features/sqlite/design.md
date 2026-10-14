@@ -1,12 +1,12 @@
-# SQLite: Replicated SQLite on Kuberic V2
+# SQLite: Replicated SQLite on Kuberic Public V1
 
-The existing `examples/sqlite` application (`sqlite-replicated`) is migrated
-in place to the level-triggered v2 stack. There is no second SQLite application
-and no classic runtime/operator dependency. The primary serves SQL over gRPC;
+The `examples/sqlite` application (`sqlite-replicated`) uses the level-triggered
+Public V1 stack. There is no second SQLite application or classic
+runtime/operator dependency. The primary serves SQL over gRPC;
 secondaries retain durable WAL-frame history but do not serve client SQL.
 
-Here, "v2 stack" means Kuberic's current level-triggered runtime and agent
-architecture. It does not mean an SF-style V2 Transactional Replicator. A
+Here, "level-triggered stack" means Kuberic's current Public V1 runtime and
+agent architecture. It does not mean an SF-style V2 Transactional Replicator. A
 proposal to move SQLite's application-owned durable frame log into such a
 future layer is documented in
 [SQLite on a V2 Transactional Replicator](v2-transactional-replicator.md).
@@ -17,10 +17,10 @@ specific commit-barrier implementation is its private `commit_barrier` module
 under `examples/sqlite/src/commit_barrier`. Its opt-in
 `testing` feature uses runtime's isolated fixture API, not private capabilities.
 
-This is an experimental source/runtime migration, not a deployed-data upgrade.
-Use fresh v2 storage with protocol 9 / agent schema 6. There is no older agent
-metadata migration and no v1 data,
-authority, or metadata import path. SQLite-specific images, manifests, published
+This is an experimental source example, not a deployed-data upgrade.
+Use fresh Public V1 provider state with protocol 11 / agent schema 12. Prior
+provider or agent state rejects unchanged; there is no import path.
+SQLite-specific images, manifests, published
 deployment assets, and live-cluster validation remain separate distribution work.
 
 ---
@@ -220,7 +220,7 @@ These SQLite selections require no KinD, Kubernetes API, container runtime, or c
 process launched by a test. The separate `relative_root` target owns its temporary
 working directory so parallel library tests are unaffected. Runtime host/protocol
 selections excluding their existing subprocess tests are documented in the
-[testing guide](../kuberic/testing.md#sqlite-v2-unit-and-in-process-validation).
+[testing guide](../kuberic/testing.md#ordinary-tier).
 
 Runtime's opt-in `testing::InProcessTransport` binds full replica identities
 and sessions, separates received/applied ACKs, routes copy ACKs, and surfaces
@@ -233,7 +233,7 @@ controls are absent from production-default builds.
 There is no `--demo` or application-owned self-promotion. `ReplicaHost` needs
 agent-authorized fresh initialization or matching established metadata; running
 the binary does not grant SQL access. Startup classifies application storage
-without creating files and constructs a deferred service. Only its v2 `Open`
+without creating files and constructs a deferred service. Only its Public V1 `Open`
 callback opens SQLite persistence, after `ReplicaHost` has initialized or
 validated agent metadata. An interruption while waiting for
 `InitializeAgentStore` therefore leaves fresh application storage empty and
@@ -245,7 +245,7 @@ Pod/PVC identity, namespace, advertised Pod IP, bearer token, data root and
 control/replication/application listener settings. Listener defaults are
 50051/50052/8080; the last is SQL gRPC, not KVStore2 HTTP.
 
-- Fresh/no-import storage only; no rolling mixed-version or v1 conversion promise.
+- Fresh/no-import storage only; no rolling or mixed-version mode.
 - One SQLite connection per replica, one database/partition, no multi-writer SQL.
 - Retained history and exact copy-retry evidence have no compaction/retention
   policy. Whole transactions and snapshots are buffered; large RPC/message-size
@@ -254,12 +254,12 @@ control/replication/application listener settings. Listener defaults are
 - Direct primary removal, placement policy, destructive data-loss recovery,
   and PostgreSQL deployment are separate work.
 - Image publication, SQLite deployment assets, and SQLite live-cluster tests are
-  not provided by this migration.
+  not provided by this example.
 
 ## References
 
 - [SQLite on a V2 Transactional Replicator](v2-transactional-replicator.md)
-- [V2 runtime interfaces](../../../kuberic-runtime/README.md)
+- [Public V1 runtime interfaces](../../../kuberic-runtime/README.md)
 - [Replica hosting and opt-in transport](../../../kuberic-runtime/README.md)
 - [Example-owned commit-barrier VFS](../../../examples/sqlite/src/commit_barrier/mod.rs)
 - [SQLite WAL format](https://sqlite.org/walformat.html)
