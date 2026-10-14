@@ -8,7 +8,7 @@
 ### P7D-01: Image publication and production cutover
 - Status: DEFERRED
 - Reason: Phase 7A proves the exact replacement-only artifact by applying its generated test overlay only to a disposable owned verification cluster. Publishing or applying it elsewhere and activating it in production are irreversible operational actions requiring separate approval and fresh deployment state.
-- MVP alternative: Produce digest-addressed OCI layouts, a digest-pinned deployment overlay and verification evidence; permit application only in the disposable owned verification cluster, without image publication, cutover Lease acquisition, production mutation, destructive storage action or traffic enablement.
+- MVP alternative: Produce digest-addressed OCI layouts, a digest-pinned deployment overlay and verification evidence; permit application only in the disposable owned verification cluster, without image publication, production mutation, destructive storage action or traffic enablement.
 - Revisit when: A separate explicit irreversible-cutover approval confirms required application exports completed or no old data is retained, and fresh controller, agent, application, namespace and resource state is ready.
 - Evidence: `docs/features/kuberic/stateless-default-replicator.md` separates replacement artifact finalization and test validation from the offline atomic production cutover; `docs/features/kuberic/service-fabric-alignment.md` requires an explicit irreversible approval before activation.
 
@@ -22,7 +22,7 @@
 ### P7D-03: Public V1 transport authentication or peer authorization
 - Status: DEFERRED
 - Reason: Public V1 intentionally has no transport credential contract. Replica identity, session, epoch, history, storage, build and operation values are correctness fences rather than credentials.
-- MVP alternative: Preserve exact lifecycle fencing and use the controller command credential, cutover Lease, resource identity and Kubernetes RBAC only as separate control-plane cutover fences.
+- MVP alternative: Preserve exact lifecycle fencing and use the controller command credential, resource identity and Kubernetes RBAC only as separate control-plane fences.
 - Revisit when: A separately approved security requirement defines TLS identity, workload identity, tokens or another replication-transport credential model.
 - Evidence: `docs/features/kuberic/replicator-boundary.md` and `docs/features/kuberic/stateless-default-replicator.md` document the unauthenticated Public V1 boundary.
 
