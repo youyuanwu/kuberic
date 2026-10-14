@@ -216,7 +216,7 @@ pub enum ReplicaStorageIdentity {
 
 #[allow(dead_code)]
 #[derive(JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct ReplicaStorageIdentitySchema {
     kind: String,
     pod_uid: Option<PodUid>,

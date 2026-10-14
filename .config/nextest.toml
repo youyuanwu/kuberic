@@ -13,6 +13,12 @@ fail-fast = false
 retries = 0
 slow-timeout = { period = "270s", terminate-after = 1 }
 
+[profile.ci.archive]
+include = [
+    { path = "debug/postgres-replicated", relative-to = "target", on-missing = "ignore" },
+    { path = "x86_64-unknown-linux-gnu/debug/postgres-replicated", relative-to = "target", on-missing = "ignore" },
+]
+
 [profile.ordinary]
 inherits = "ci"
 default-filter = 'not package(=postgres-replicated) and not binary(=kubernetes_checkpoint_real) and not binary_id(=kuberic-runtime::public_api_privacy)'

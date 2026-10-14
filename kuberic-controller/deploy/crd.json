@@ -235,11 +235,11 @@
                               "kind": {
                                 "type": "string"
                               },
-                              "podUid": {
+                              "pod_uid": {
                                 "nullable": true,
                                 "type": "string"
                               },
-                              "pvcUid": {
+                              "pvc_uid": {
                                 "nullable": true,
                                 "type": "string"
                               }
@@ -294,11 +294,11 @@
                               "kind": {
                                 "type": "string"
                               },
-                              "podUid": {
+                              "pod_uid": {
                                 "nullable": true,
                                 "type": "string"
                               },
-                              "pvcUid": {
+                              "pvc_uid": {
                                 "nullable": true,
                                 "type": "string"
                               }
@@ -475,11 +475,11 @@
                                     "kind": {
                                       "type": "string"
                                     },
-                                    "podUid": {
+                                    "pod_uid": {
                                       "nullable": true,
                                       "type": "string"
                                     },
-                                    "pvcUid": {
+                                    "pvc_uid": {
                                       "nullable": true,
                                       "type": "string"
                                     }
@@ -630,11 +630,11 @@
                               "kind": {
                                 "type": "string"
                               },
-                              "podUid": {
+                              "pod_uid": {
                                 "nullable": true,
                                 "type": "string"
                               },
-                              "pvcUid": {
+                              "pvc_uid": {
                                 "nullable": true,
                                 "type": "string"
                               }

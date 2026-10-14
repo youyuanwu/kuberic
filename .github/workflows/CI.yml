@@ -62,6 +62,7 @@ jobs:
 
       - name: Build reusable test archive
         run: |
+          cargo build -p postgres-replicated --bin postgres-replicated --all-features
           mkdir -p "$(dirname "$NEXTEST_ARCHIVE")"
           cargo nextest archive --workspace --all-features --profile ci \
             --archive-file "$NEXTEST_ARCHIVE"

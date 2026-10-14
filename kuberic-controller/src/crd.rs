@@ -537,6 +537,33 @@ mod tests {
                 status[field]
             );
         }
+
+        let storage_schema = &status["publicV1Transition"]["properties"]["sourceStorage"]["properties"]
+            ["storage"]["properties"];
+        let persistent = serde_json::to_value(
+            kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+                pod_uid: kuberic_runtime::protocol::types::PodUid::new("pod"),
+                pvc_uid: kuberic_runtime::protocol::types::PvcUid::new("pvc"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            persistent
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            storage_schema
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| persistent.get(*key).is_some())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(storage_schema.get("pod_uid").is_some());
+        assert!(storage_schema.get("pvc_uid").is_some());
+        assert!(storage_schema.get("podUid").is_none());
+        assert!(storage_schema.get("pvcUid").is_none());
     }
 
     #[test]
