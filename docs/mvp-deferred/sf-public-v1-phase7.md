@@ -67,3 +67,10 @@
 - MVP alternative: Maintain exact source, artifact and runtime-registration allowlists and one differently named extra-owner or endpoint mutation fixture that must fail eligibility.
 - Revisit when: A regression escapes the allowlist model or the replacement capability surface expands enough that one representative mutation no longer validates the oracle.
 - Evidence: `docs/features/kuberic/service-fabric-alignment.md` defines KSF-16 as the legacy-continuation guard; the existing project test strategy favors bounded, risk-specific checks over a new general framework.
+
+### P7D-10: Kubernetes cutover Lease
+- Status: REJECTED
+- Reason: The replacement-only artifact does not implement migration, compatibility or production cutover. A prebuilt Lease and `coordination.k8s.io` RBAC add control-plane machinery that does not validate the Phase 7A outcome.
+- MVP alternative: Confine the controller through one installation namespace and namespace-scoped Role/RoleBinding permissions; keep any future production activation procedure outside this artifact.
+- Revisit when: Only if a separately approved production-activation design demonstrates that a Kubernetes Lease is necessary rather than relying on offline operational sequencing.
+- Evidence: User decision on 2026-10-14: “Why there are leases? We don't care about compatibility and migrationa”; Phase 7A specification and implementation plan contain no Lease requirement.
