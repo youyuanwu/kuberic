@@ -13,11 +13,11 @@
 - Evidence: `kuberic-controller/src/evaluator/public_v1_session_renewal.rs` defines the acceptance wrappers, and `kuberic-controller/src/evaluator/test_bridge.rs` exposes them to cross-crate tests.
 
 ### PVS-02: Flatten PostgreSQL Public V1 dispatch into the legacy implementation
-- Status: DEFERRED
-- Reason: The branches preserve independent engines and exact protected callback dispatch. Flattening before cutover could change lifecycle and failure semantics rather than remove a behavior-free layer.
-- MVP alternative: Keep the explicit protocol-selection branches.
-- Revisit when: Phase 7 explicitly authorizes removal of the legacy engine or characterization proves callback-by-callback equivalence.
-- Evidence: `examples/postgres/src/adapter.rs` contains the protected callback dispatch, while `examples/postgres/src/service.rs` owns the protocol-selection boundary.
+- Status: IMPLEMENTED
+- Reason: The service no longer selects a legacy/Public V1 mode. PostgreSQL remains an independent custom Replicator on the ordinary Public V1 lifecycle.
+- MVP alternative: None.
+- Revisit when: Only for behavior-preserving custom-Replicator simplification with measured value.
+- Evidence: `examples/postgres/src/service.rs` always constructs the Public V1 settings path.
 
 ### PVS-03: Merge Public V1 report authority derivation with callback-program selection
 - Status: DEFERRED
@@ -27,16 +27,16 @@
 - Evidence: `kuberic-runtime/src/host/public_lifecycle_program.rs` selects execution instructions, while `kuberic-runtime/src/host/public_lifecycle.rs` derives completion evidence.
 
 ### PVS-04: Change schema-11 AgentState JSON layout or split Public V1 records into dedicated tables
-- Status: DEFERRED
-- Reason: The user confirmed that the schema-11 internal design is not fixed and compatibility is not required. A layout change is therefore allowed, but it still needs evidence that it reduces total implementation, verification, and operational complexity rather than merely moving it.
-- MVP alternative: Keep the current layout until a measured simplification candidate is identified.
-- Revisit when: Code research identifies a bounded layout change with a measurable reduction and explicit fresh-store or migration handling.
-- Evidence: `kuberic-runtime/src/host/state.rs` defines the serialized state and `kuberic-runtime/src/host/sqlite_store.rs` enforces schema-11 storage boundaries.
+- Status: IMPLEMENTED
+- Reason: The replacement uses one schema-12 `agent_state` layout and removed the migration API, migration ledger, and managed continuation tables.
+- MVP alternative: None.
+- Revisit when: A future fresh-state layout measurably reduces complexity.
+- Evidence: `kuberic-runtime/src/host/state.rs` and `kuberic-runtime/src/host/sqlite_store.rs`.
 - Decision update: On 2026-10-12, the user stated that the design is not fixed and compatibility is not required.
 
 ### PVS-05: Remove apparently test-only Public V1 controller or runtime surfaces
-- Status: DEFERRED
-- Reason: The surfaces are deliberate feature and configuration entry points consumed by cross-crate tests, generated protocol code, PostgreSQL, and the Phase 6 boundary. Dormancy is not evidence that they are unused.
-- MVP alternative: Retain dormant feature gates and negative activation guards.
-- Revisit when: Explicit feature-removal authorization or Phase 7 completion eliminates every configuration, generated, test, and external consumer.
-- Evidence: `kuberic-runtime/src/testing/sqlite_store.rs` and `kuberic-controller/src/evaluator/test_bridge.rs` provide test consumers; `kuberic-runtime/build.rs` and `kuberic-controller/src/bin/crdgen.rs` provide generated-code consumers.
+- Status: IMPLEMENTED
+- Reason: Obsolete preview/legacy controller modules, endpoints, selectors, and production branches were removed. Retained helpers are explicitly Public V1-named testing harnesses and are not production-selected.
+- MVP alternative: None.
+- Revisit when: A retained testing helper loses a concrete defect-sensitive consumer.
+- Evidence: `kuberic-controller/src/evaluator/testing.rs`, `kuberic-controller/tests/public_api.rs`, and the KSF controller-module inventory.

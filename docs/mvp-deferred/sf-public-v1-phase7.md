@@ -7,23 +7,23 @@
 
 ### P7D-01: Image publication and production cutover
 - Status: DEFERRED
-- Reason: Phase 7A validates the replacement-only build by applying the existing repository manifests only to a disposable owned verification cluster. Publishing or applying it elsewhere and activating it in production are irreversible operational actions requiring separate approval and fresh deployment state.
+- Reason: Phase 7 validates source, archives, manifests, and owned-cluster workflows. Publishing images or activating production traffic is a separate operational product decision.
 - MVP alternative: Build the ordinary controller/provider images and manifests through existing repository paths, apply them only in the disposable owned verification cluster, and avoid image publication, production mutation, destructive storage action or traffic enablement.
-- Revisit when: A separate explicit irreversible-cutover approval confirms required application exports completed or no old data is retained, and fresh controller, agent, application, namespace and resource state is ready.
-- Evidence: `docs/features/kuberic/stateless-default-replicator.md` separates replacement artifact finalization and test validation from the offline atomic production cutover; `docs/features/kuberic/service-fabric-alignment.md` requires an explicit irreversible approval before activation.
+- Revisit when: A separately scoped production-distribution and fresh-deployment project is approved.
+- Evidence: `README.md` and `docs/features/kuberic/stateless-default-replicator.md`.
 
 ### P7D-02: Old-state migration and rolling compatibility
-- Status: DEFERRED
+- Status: REJECTED
 - Reason: The replacement-only release is validated from fresh state and intentionally rejects old controller and agent state plus every supported in-repository provider format rather than interpreting or enrolling it. Independent custom Replicators own classification and rejection of their provider storage because the protected public interfaces expose no generic storage-format introspection.
 - MVP alternative: Initialize only the replacement schema, fail closed on old controller/agent and supported-provider state, and require each independent custom Replicator to reject its own prior provider storage before participation.
-- Revisit when: A production adoption requirement explicitly requires retained data, backup restoration, enrollment, rolling upgrades or mixed-version operation.
+- Revisit when: Only through a separately approved product decision that changes the no-compatibility design.
 - Evidence: `docs/features/kuberic/stateless-default-replicator.md` defines fresh-storage activation, provider-owned application durability and no generic migration contract; `docs/features/kuberic/service-fabric-alignment.md` excludes preservation and mixed-version operation.
 
 ### P7D-03: Public V1 transport authentication or peer authorization
-- Status: DEFERRED
+- Status: REJECTED
 - Reason: Public V1 intentionally has no transport credential contract. Replica identity, session, epoch, history, storage, build and operation values are correctness fences rather than credentials.
 - MVP alternative: Preserve exact lifecycle fencing and use the controller command credential, resource identity and Kubernetes RBAC only as separate control-plane fences.
-- Revisit when: A separately approved security requirement defines TLS identity, workload identity, tokens or another replication-transport credential model.
+- Revisit when: Only if the credential-free transport design is explicitly replaced.
 - Evidence: `docs/features/kuberic/replicator-boundary.md` and `docs/features/kuberic/stateless-default-replicator.md` document the unauthenticated Public V1 boundary.
 
 ### P7D-04: Transparent completion of crash-interrupted client requests
@@ -37,7 +37,7 @@
 - Status: DEFERRED
 - Reason: Provider-owned Public V1 application durability is sufficient for the replacement-only release and its fresh-state acceptance boundary.
 - MVP alternative: Keep state providers authoritative for application bytes, progress, retained history and copy state.
-- Revisit when: A selected consumer requires the V2 transactional contract after the public-only V1 replacement is stable and activated.
+- Revisit when: A selected consumer requires the V2 transactional contract after the public-only V1 replacement is stable.
 - Evidence: `docs/features/kuberic/service-fabric-alignment.md` places optional V2 after the Phase 7 public-only V1 replacement.
 
 ### P7D-06: Dedicated reproducible-build or attestation infrastructure
@@ -45,7 +45,7 @@
 - Reason: Phase 7A needs reviewable source, build and runtime test results, but it does not publish images or promise an external supply-chain attestation contract.
 - MVP alternative: Use the existing checked-out revision, Cargo/nextest archive, Docker image build, CI results and owned KinD verification without adding a separate release builder or evidence format.
 - Revisit when: Phase 7B publication or a separately approved provenance, SBOM or external-attestation requirement needs independent verification outside repository CI.
-- Evidence: `README.md` documents source/local-CI distribution rather than published images; `docs/features/kuberic/stateless-default-replicator.md` requires immutable cutover evidence without prescribing a new attestation framework.
+- Evidence: `README.md` documents source/local-CI distribution rather than published images; existing Cargo, nextest, Docker, Kustomize, CI, and owned-KinD paths remain the only verification machinery.
 
 ### P7D-07: Generic host-side custom-provider storage introspection
 - Status: DEFERRED
@@ -57,7 +57,7 @@
 ### P7D-08: Full Phase 6 behavioral matrix inside KinD
 - Status: DEFERRED
 - Reason: Repeating every mature source/provider test inside a cluster would duplicate coverage and materially increase runtime without proving a distinct deployment-specific failure for each case.
-- MVP alternative: Run the complete Phase 6 boundary through existing nextest/provider tiers and the defined startup, lifecycle, failover, replacement-build, capability, transport and shutdown subset through the existing owned KinD workflow.
+- MVP alternative: Run the complete replacement boundary through existing nextest/provider tiers and retain bootstrap, replacement, and failover as the owned KinD deployment scenarios.
 - Revisit when: A demonstrated defect shows that an additional material-bound behavior has a distinct image or deployment failure mode not covered by the representative exact-OCI journey.
 - Evidence: `docs/features/kuberic/testing.md` separates source/provider, PostgreSQL and live-cluster tiers; `docs/features/kuberic/stateless-default-replicator.md` requires exact release evidence while preserving bounded verification.
 

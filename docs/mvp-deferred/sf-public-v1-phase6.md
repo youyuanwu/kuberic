@@ -6,18 +6,18 @@
 ## Decisions
 
 ### P6D-01: Production activation and legacy-engine removal
-- Status: DEFERRED
-- Reason: Phase 6 validates a dormant preview. Removing the managed engine, closing KSF-16 and activating the replacement require the separately reviewed replacement-only artifact and atomic cutover boundary.
-- MVP alternative: Keep protocol 9/schema 6 and the legacy engine as the ordinary production selection while the preview is explicitly test-selected.
-- Revisit when: Every Phase 6 acceptance gate passes and Phase 7 production cutover is authorized.
-- Evidence: `docs/features/kuberic/service-fabric-alignment.md` separates Phase 6 preview validation from Phase 7 replacement-only release and activation.
+- Status: IMPLEMENTED
+- Reason: Phase 7 removed the legacy engine, selectors, private attachments, continuation stores, old protocol/controller branches, and fallback. Public V1 is now the sole built-in path.
+- MVP alternative: None; the direct replacement is complete.
+- Revisit when: Never for compatibility. Production activation remains a separate fresh-state operational decision.
+- Evidence: `docs/features/kuberic/stateless-default-replicator.md` and `docs/features/kuberic/service-fabric-alignment.md` describe the as-built one-path replacement.
 
 ### P6D-02: Pre-cutover state migration and rolling compatibility
-- Status: DEFERRED
-- Reason: The approved Phase 6 journey starts from fresh preview state and does not need to preserve or enroll pre-cutover agent or application storage.
-- MVP alternative: Use fresh preview stores, reject incompatible state and keep mixed-version participation unsupported.
-- Revisit when: A production adoption requirement explicitly requires retained data, rolling upgrades or mixed-version operation.
-- Evidence: `docs/features/kuberic/stateless-default-replicator.md` defines fresh-storage activation and lists rolling or mixed-version migration as a non-goal.
+- Status: REJECTED
+- Reason: The direct replacement intentionally supports only fresh schema-12/controller/provider state. Old and partial state rejects unchanged.
+- MVP alternative: Fresh deployment with explicit prior-state rejection.
+- Revisit when: Only through a separately approved product decision that changes the no-compatibility design.
+- Evidence: Phase 7 immutable rejection tests and `docs/features/kuberic/stateless-default-replicator.md`.
 
 ### P6D-03: Transparent completion of crash-interrupted client requests
 - Status: DEFERRED
@@ -41,8 +41,8 @@
 - Evidence: `docs/features/kuberic/service-fabric-alignment.md` places optional V2 after the public-only V1 replacement.
 
 ### P6D-06: Eagerly reap completed transport task handles
-- Status: DEFERRED
-- Reason: The dormant preview retains completed inbound RPC abort handles until Close or Abort. Existing lifecycle shutdown drains them, and Phase 6 tests have bounded lifetimes; changing active-task bookkeeping is not required for the accepted correctness outcome.
-- MVP alternative: Retain complete Close/Abort drainage and bounded preview test lifetimes.
-- Revisit when: Before Phase 7 production activation, or earlier if a sustained many-write soak demonstrates material process-memory growth.
-- Evidence: Final review finding ASTRA-11 identified cumulative completed-handle retention as resource hygiene rather than a Phase 6 correctness blocker.
+- Status: IMPLEMENTED
+- Reason: Completion-aware inbound and outbound registries remove finished entries during ordinary operation while preserving authority cancellation and Close/Abort drainage.
+- MVP alternative: None.
+- Revisit when: A measured task-lifecycle regression appears.
+- Evidence: Public V1 recovery tests run two 1,000-RPC batches and assert raw retained cardinality returns to baseline.
