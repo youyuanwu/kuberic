@@ -7,8 +7,8 @@
 
 ### P7D-01: Image publication and production cutover
 - Status: DEFERRED
-- Reason: Phase 7A proves the exact replacement-only artifact by applying its generated test overlay only to a disposable owned verification cluster. Publishing or applying it elsewhere and activating it in production are irreversible operational actions requiring separate approval and fresh deployment state.
-- MVP alternative: Produce digest-addressed OCI layouts, a digest-pinned deployment overlay and verification evidence; permit application only in the disposable owned verification cluster, without image publication, production mutation, destructive storage action or traffic enablement.
+- Reason: Phase 7A validates the replacement-only build by applying the existing repository manifests only to a disposable owned verification cluster. Publishing or applying it elsewhere and activating it in production are irreversible operational actions requiring separate approval and fresh deployment state.
+- MVP alternative: Build the ordinary controller/provider images and manifests through existing repository paths, apply them only in the disposable owned verification cluster, and avoid image publication, production mutation, destructive storage action or traffic enablement.
 - Revisit when: A separate explicit irreversible-cutover approval confirms required application exports completed or no old data is retained, and fresh controller, agent, application, namespace and resource state is ready.
 - Evidence: `docs/features/kuberic/stateless-default-replicator.md` separates replacement artifact finalization and test validation from the offline atomic production cutover; `docs/features/kuberic/service-fabric-alignment.md` requires an explicit irreversible approval before activation.
 
@@ -42,8 +42,8 @@
 
 ### P7D-06: Dedicated reproducible-build or attestation infrastructure
 - Status: DEFERRED
-- Reason: Phase 7A needs one verifiable material identity and immutable artifact evidence, but it does not publish images or promise an external supply-chain attestation contract.
-- MVP alternative: Materialize one tracked-file build/test tree and bind its content digest, test archive, OCI layouts, manifests, results and canonical evidence through the repository's standard-library release script.
+- Reason: Phase 7A needs reviewable source, build and runtime test results, but it does not publish images or promise an external supply-chain attestation contract.
+- MVP alternative: Use the existing checked-out revision, Cargo/nextest archive, Docker image build, CI results and owned KinD verification without adding a separate release builder or evidence format.
 - Revisit when: Phase 7B publication or a separately approved provenance, SBOM or external-attestation requirement needs independent verification outside repository CI.
 - Evidence: `README.md` documents source/local-CI distribution rather than published images; `docs/features/kuberic/stateless-default-replicator.md` requires immutable cutover evidence without prescribing a new attestation framework.
 
@@ -57,7 +57,7 @@
 ### P7D-08: Full Phase 6 behavioral matrix inside KinD
 - Status: DEFERRED
 - Reason: Repeating every mature source/provider test inside a cluster would duplicate coverage and materially increase runtime without proving a distinct deployment-specific failure for each case.
-- MVP alternative: Run the complete Phase 6 boundary from one canonical tracked-material test archive and run the defined startup, lifecycle, failover, replacement-build, capability, transport and shutdown subset against the exact OCI images.
+- MVP alternative: Run the complete Phase 6 boundary through existing nextest/provider tiers and the defined startup, lifecycle, failover, replacement-build, capability, transport and shutdown subset through the existing owned KinD workflow.
 - Revisit when: A demonstrated defect shows that an additional material-bound behavior has a distinct image or deployment failure mode not covered by the representative exact-OCI journey.
 - Evidence: `docs/features/kuberic/testing.md` separates source/provider, PostgreSQL and live-cluster tiers; `docs/features/kuberic/stateless-default-replicator.md` requires exact release evidence while preserving bounded verification.
 
@@ -74,3 +74,31 @@
 - MVP alternative: Confine the controller through one installation namespace and namespace-scoped Role/RoleBinding permissions; keep any future production activation procedure outside this artifact.
 - Revisit when: Only if a separately approved production-activation design demonstrates that a Kubernetes Lease is necessary rather than relying on offline operational sequencing.
 - Evidence: User decision on 2026-10-14: “Why there are leases? We don't care about compatibility and migrationa”; Phase 7A specification and implementation plan contain no Lease requirement.
+
+### P7D-11: Schema migration API and migration ledger
+- Status: REJECTED
+- Reason: The replacement accepts only fresh schema-12 state and rejects every earlier or partial schema. A no-op migration API and `schema_migrations` ledger add compatibility machinery with no production caller.
+- MVP alternative: Keep one exact create/reopen path plus immutable old-state rejection tests that prove bytes and provider files remain unchanged.
+- Revisit when: Only if a separately approved requirement introduces an actual supported schema migration.
+- Evidence: User selected simplification candidate P7-SIM-01 on 2026-10-14; current plan explicitly excludes migration and compatibility.
+
+### P7D-12: Duplicate cutover-oriented KSF inventories
+- Status: REJECTED
+- Reason: Separate future-cutover obligations and duplicate synthetic inventories obscure the ordinary replacement ownership contract.
+- MVP alternative: Maintain one canonical KSF-09/10/16 ownership inventory and one differently named extra-owner/endpoint fixture that exercises the same eligibility oracle.
+- Revisit when: The replacement capability surface materially expands and needs a new distinct ownership dimension.
+- Evidence: User selected simplification candidate P7-SIM-02 on 2026-10-14; KSF-16 remains required as a replacement correctness guard.
+
+### P7D-13: Transitional managed/preview adapters
+- Status: REJECTED
+- Reason: Adapters, dual selectors and compatibility bridges would preserve paths whose removal is the Phase 7A outcome and create non-final intermediate behavior.
+- MVP alternative: Retain the verified partial implementation and finish the direct one-path deletion of managed, preview and old-protocol branches.
+- Revisit when: None for this replacement; rollback is a pre-merge source revert rather than retained runtime compatibility.
+- Evidence: User selected P7-SIM-03 and chose to retain/revise the current implementation on 2026-10-14.
+
+### P7D-14: Operational migration/cutover/release documentation
+- Status: REJECTED
+- Reason: Detailed Lease, digest-bundle, namespace-quarantine, export/reimport and activation procedures describe machinery that this project phase does not support or intend to implement.
+- MVP alternative: Document fresh-state replacement, explicit old-state rejection, ordinary repository verification and a concise statement that any production activation is separately approved.
+- Revisit when: A concrete production-activation project is separately scoped and approved.
+- Evidence: User selected simplification candidate P7-SIM-04 on 2026-10-14 and explicitly requested an audit of all migration and compatibility content.
