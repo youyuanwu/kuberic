@@ -43,17 +43,17 @@ Promotion -> authority-certified commit -> committed database materialization
 ```
 
 [`SqliteService`](../../../examples/sqlite/src/service.rs) implements the public
-v2 lifecycle and creates the default replicator with a separate
+Public V1 lifecycle and creates the sole built-in Replicator through
+`DefaultReplicatorFactory` with a separate
 [`SqlitePersistence`](../../../examples/sqlite/src/state.rs). The
 [`ReplicaHost` entry point](../../../examples/sqlite/src/main.rs) owns agent
 startup and recovery; the application owns the SQL listener. Applications never
 select their own membership, verified prefix, or write grant.
 
-The default engine registers private lifecycle proof and replication/copy
-capabilities separately. SQLite uses both: common agent hosting owns lifecycle
-authority, access, builds, removal and restart, while the default data plane
-retains the existing WAL-frame replication, copy, acknowledgement and quorum
-behavior. The public SQLite service/factory call sites are unchanged.
+Common agent hosting owns lifecycle authority and access. SQLite supplies its
+provider to the public factory and consumes the returned `StateReplicator`
+streams; the built-in data plane owns WAL-frame replication, copy,
+acknowledgement, and quorum behavior.
 
 Each service instance registers a process-unique VFS name, including in-process
 restarts. Barrier sender, receipt, cancellation, and same-process fence state are
@@ -67,7 +67,7 @@ recoverable. It calls the barrier when the complete commit frame arrives, not
 from a post-commit WAL hook. The synchronous SQL thread waits for an asynchronous
 replication worker without holding the application-persistence lock.
 
-The worker checks v2 write access, durably records reconciliation intent, then
+The worker checks current partition write access, then
 dispatches immutable transaction bytes to `StateReplicator`. The agent reserves
 the exact operation identity/LSN before application acceptance. Successful
 replication requires durable local acceptance, every admitted configuration's
@@ -113,7 +113,7 @@ Changing epochs does not discard retained bytes or unresolved reservations.
 
 | Durable state | Meaning and recovery |
 |---|---|
-| Healthy | SQL still requires accepted v2 access and an active primary application. |
+| Healthy | SQL still requires accepted Public V1 write authority and an active primary application. |
 | Reconciliation required | Dispatched write/publication outcome is unresolved, or committed history must be rematerialized. A failure makes the current instance sticky-fenced. Reopen resolves the exact agent journal and rematerializes committed state before clearing reconciliation. |
 | Rebuild required | Acknowledged application content is missing/corrupt. Ordinary reopen or reconciliation cannot clear it. |
 | Rebuilding | An accepted snapshot is installed but required recovery progress is not restored. Remain SQL-fenced until contiguous catch-up and commitment satisfy the retained recovery floors. |

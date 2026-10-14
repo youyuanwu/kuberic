@@ -316,15 +316,12 @@ The smoke inventory requires four exact Public V1 scenario tests before
 PostgreSQL starts: primary lifecycle/joint configuration, build
 cancellation/retirement, data-loss history/replay and contained close. Each
 scenario records its applicable KSF rows and remains independently bounded
-below the five-minute nextest limit. The smoke recipe runs those four tests in
-a package-only pass before compiling/running the seven broader workspace smoke
-tests, preventing workspace build I/O from consuming a scenario's runtime
-budget. Public V1 fixtures use
+below the five-minute nextest limit. The smoke recipe builds the owned command
+binary, then runs exactly those four tests serially in one package-only pass.
+Public V1 fixtures use
 `KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set; the smoke recipe otherwise uses
 `/dev/shm` when at least 2 GiB is available and falls back to `/tmp`. The
-second pass exercises representative real PostgreSQL
-bootstrap/fencing, native build, failover, planned switchover, scaling and
-explicit failure handling. The full target is reserved for the dedicated
+full target is reserved for the dedicated
 resource-owning validation path or explicit requests.
 
 PostgreSQL deliberately does not claim KSF-02's complete
@@ -356,9 +353,9 @@ are skipped, never removed to allocate a new fixture.
 CI builds one all-features nextest archive, then runs four deterministic hash
 partitions on isolated runners. The `postgres` profile and test group both
 enforce one test process at a time within each runner; the measured unsafe
-same-runner four-way mode is not used. The 172-test inventory consists of 170
-directly partitioned tests and two subprocess helpers reached through their
-mapped parent tests. PostgreSQL is absent from KinD/live jobs and selectors.
+same-runner four-way mode is not used. The current PostgreSQL inventory is 20
+tests with partition counts `6, 6, 5, 3`. PostgreSQL is absent from KinD/live
+jobs and selectors.
 Shared regressions, partition validation and guard commands are in the
 [testing guide](../kuberic/testing.md#postgresql).
 
