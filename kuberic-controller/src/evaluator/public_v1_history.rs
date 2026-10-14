@@ -138,7 +138,7 @@ pub fn plan_bootstrap_history(
         });
     }
     let command = PublicV1HistoryCommand::Initialize {
-        preview: identity.clone(),
+        identity: identity.clone(),
         accepted: next.clone(),
         storage,
     };

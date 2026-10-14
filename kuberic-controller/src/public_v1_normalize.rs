@@ -11,7 +11,7 @@ pub(crate) fn normalize_public_v1_lifecycle_service_location(
     let Some(report) = report else {
         return Ok(None);
     };
-    config.validate_identity(&report.preview)?;
+    config.validate_identity(&report.identity)?;
     let Some(input) = &authority.lifecycle else {
         return Ok(None);
     };
@@ -30,7 +30,7 @@ pub(crate) fn normalize_public_v1_lifecycle_service_location(
     let Some(location) = &report.service_location else {
         return Ok(None);
     };
-    if location.preview != authority.preview
+    if location.identity != authority.identity
         || location.resource_uid != report.resource_uid
         || location.replica != input.replica
         || location.process_session_id != authority.process_session_id
@@ -61,7 +61,7 @@ pub fn normalize_public_v1_service_location(
     };
     report.validate().map_err(str::to_owned)?;
     config.validate_identity(&report.identity)?;
-    if authority.preview != report.identity
+    if authority.identity != report.identity
         || authority.process_session_id != report.process_session_id
         || report.role != ReplicaRole::Primary
         || report.write_status != AccessStatus::Granted

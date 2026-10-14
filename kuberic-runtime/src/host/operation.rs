@@ -695,7 +695,7 @@ struct RegistryState {
 
 pub(crate) struct PartitionOperationRegistry {
     store: Arc<dyn AgentStore>,
-    preview: PublicV1Identity,
+    identity: PublicV1Identity,
     process_session_id: ProcessSessionId,
     admission: Mutex<()>,
     state: Mutex<RegistryState>,
@@ -726,7 +726,7 @@ impl PartitionOperationRegistry {
         let (revision, _) = watch::channel(0);
         Ok(Arc::new(Self {
             store,
-            preview,
+            identity: preview,
             process_session_id,
             admission: Mutex::new(()),
             state: Mutex::new(RegistryState::default()),
@@ -806,7 +806,8 @@ impl PartitionOperationRegistry {
                 "preview is synchronously fenced".into(),
             ));
         }
-        if intent.preview != self.preview || intent.process_session_id != self.process_session_id {
+        if intent.identity != self.identity || intent.process_session_id != self.process_session_id
+        {
             return Err(HostError::IdentityMismatch(
                 "public-operation preview or process session changed".into(),
             ));
@@ -856,7 +857,7 @@ impl PartitionOperationRegistry {
                 .public_v1_operation_state
                 .is_some_and(|preview| !preview.history_barriers.is_empty());
         if has_history_barrier
-            && intent.preview.is_public_v1()
+            && intent.identity.is_public_v1()
             && intent.lifecycle.as_ref().is_some_and(|input| {
                 input.possible_data_loss
                     == crate::protocol::public_operations::PossibleDataLossIntent::Possible
@@ -1439,7 +1440,7 @@ mod tests {
 
     fn intent(class: PublicOperationClass, revision: u64) -> PublicOperationIntent {
         PublicOperationIntent {
-            preview: PublicV1Identity::new(1),
+            identity: PublicV1Identity::new(1),
             operation_id: OperationId::new(format!("operation-{revision}-{class:?}")),
             revision,
             process_session_id: ProcessSessionId::new("session"),

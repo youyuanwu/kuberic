@@ -520,7 +520,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         }),
     };
     let intent = PublicOperationIntent {
-        preview: identity.clone(),
+        identity: identity.clone(),
         operation_id: attempt.attempt_id.clone(),
         revision: attempt.process.attempt_revision,
         process_session_id: process_session_id.clone(),
@@ -709,7 +709,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         }),
     };
     let successor_intent = PublicOperationIntent {
-        preview: identity.clone(),
+        identity: identity.clone(),
         operation_id: successor_attempt.attempt_id.clone(),
         revision: successor_attempt.process.attempt_revision,
         process_session_id: successor_attempt.process.process_session_id.clone(),

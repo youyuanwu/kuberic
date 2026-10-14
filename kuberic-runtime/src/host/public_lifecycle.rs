@@ -439,7 +439,7 @@ fn captured_operation(
 ) -> CapturedPublicOperationIdentity {
     CapturedPublicOperationIdentity {
         resource_uid: identity.resource_uid.clone(),
-        preview: intent.preview.clone(),
+        identity: intent.identity.clone(),
         epoch,
         operation_id: intent.operation_id.clone(),
         revision: intent.revision,
@@ -797,7 +797,7 @@ pub(crate) async fn public_v1_report(
                     }
                 })?;
                 Some(ServiceLocation {
-                    preview: identity.clone(),
+                    identity: identity.clone(),
                     resource_uid: state.identity.resource_uid.clone(),
                     operation_id: record.intent.operation_id.clone(),
                     replica: state.identity.local_identity.clone(),

@@ -51,10 +51,13 @@ fn accepted() -> kuberic_runtime::protocol::public_operations::PublicV1AcceptedS
 fn public_v1_history_command_round_trips_with_exact_envelope_fences() {
     let accepted = accepted();
     let command = PublicV1HistoryCommand::Initialize {
-        preview: accepted.identity.clone(),
+        identity: accepted.identity.clone(),
         accepted,
         storage: storage(),
     };
+    let serialized = serde_json::to_value(&command).unwrap();
+    assert!(serialized.get("identity").is_some());
+    assert!(serialized.get("preview").is_none());
     let request = proto::ExecuteCommandRequest {
         protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         resource_uid: "resource-1".into(),
@@ -80,7 +83,7 @@ fn public_v1_history_command_round_trips_with_exact_envelope_fences() {
 fn public_v1_operation_command_round_trips_and_rejects_partial_or_crossed_input() {
     let program = PublicOperationProgram::Abort;
     let intent = PublicOperationIntent {
-        preview: PublicV1Identity::new(1),
+        identity: PublicV1Identity::new(1),
         operation_id: OperationId::new("operation-1"),
         revision: 1,
         process_session_id: kuberic_runtime::protocol::types::ProcessSessionId::new("session-1"),
@@ -91,11 +94,14 @@ fn public_v1_operation_command_round_trips_and_rejects_partial_or_crossed_input(
         program: Some(program),
     };
     let mut legacy_intent = intent.clone();
-    legacy_intent.preview.protocol_version = 10;
+    legacy_intent.identity.protocol_version = 10;
     assert!(
         legacy_intent.validate().is_err(),
         "protocol 10 must not enter the Public V1 operation path"
     );
+    let serialized = serde_json::to_value(&intent).unwrap();
+    assert!(serialized.get("identity").is_some());
+    assert!(serialized.get("preview").is_none());
     let command = PublicV1OperationCommand {
         target: identity(),
         intent,

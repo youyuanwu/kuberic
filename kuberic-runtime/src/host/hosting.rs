@@ -622,7 +622,7 @@ impl PodRuntime {
         *bridge = Some(Arc::new(ReplacementFaultBridge {
             store,
             registry,
-            preview,
+            identity: preview,
             process_session,
             admission: Mutex::new(()),
         }));
@@ -725,7 +725,7 @@ struct HostAccessView {
 struct ReplacementFaultBridge {
     store: Arc<dyn crate::host::store::AgentStore>,
     registry: Arc<crate::host::operation::PartitionOperationRegistry>,
-    preview: PublicV1Identity,
+    identity: PublicV1Identity,
     process_session: ProcessSessionId,
     admission: Mutex<()>,
 }
@@ -743,7 +743,7 @@ impl ReplacementFaultBridge {
                 "public fault requires replacement state".into(),
             )
         })?;
-        if preview.identity != self.preview
+        if preview.identity != self.identity
             || preview.binding.is_none()
             || state.identity.resource_uid
                 != preview
@@ -786,7 +786,7 @@ impl ReplacementFaultBridge {
                 crate::host::HostError::CommandRejected("public fault revision overflow".into())
             })?;
         let intent = PublicOperationIntent {
-            preview: self.preview.clone(),
+            identity: self.identity.clone(),
             operation_id: OperationId::new(format!(
                 "fault-{}-{revision}-{fault:?}",
                 self.process_session

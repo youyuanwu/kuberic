@@ -336,7 +336,7 @@ pub enum PublicOperationReplayDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicOperationIntent {
-    pub preview: PublicV1Identity,
+    pub identity: PublicV1Identity,
     pub operation_id: OperationId,
     pub revision: u64,
     pub process_session_id: ProcessSessionId,
@@ -351,7 +351,7 @@ pub struct PublicOperationIntent {
 
 impl PublicOperationIntent {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !self.preview.is_valid() {
+        if !self.identity.is_valid() {
             return Err("invalid Public V1 identity");
         }
         if self.operation_id.is_empty() {
@@ -2037,7 +2037,7 @@ pub enum ReplicaRebuildRequired {
 #[serde(rename_all = "camelCase")]
 pub struct CapturedPublicOperationIdentity {
     pub resource_uid: ResourceUid,
-    pub preview: PublicV1Identity,
+    pub identity: PublicV1Identity,
     pub epoch: Epoch,
     pub operation_id: OperationId,
     pub revision: u64,
@@ -2047,7 +2047,7 @@ pub struct CapturedPublicOperationIdentity {
 impl CapturedPublicOperationIdentity {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.resource_uid.is_empty()
-            || !self.preview.is_public_v1()
+            || !self.identity.is_public_v1()
             || self.epoch.data_loss_number < 0
             || self.epoch.configuration_number < 0
             || self.operation_id.is_empty()
@@ -2127,7 +2127,7 @@ impl CanonicalReplicaRebuildRequired {
         };
         if &operation.operation_id != completion_id
             || operation.revision != completion_revision
-            || &operation.preview != report_identity
+            || &operation.identity != report_identity
             || &operation.resource_uid != report_resource_uid
             || &operation.detecting_session != report_session
         {
@@ -2448,7 +2448,7 @@ impl PublicV1AgentReport {
         if let Some(location) = &self.service_location
             && (self.role != ReplicaRole::Primary
                 || self.write_status != AccessStatus::Granted
-                || location.preview != self.identity
+                || location.identity != self.identity
                 || location.resource_uid != self.resource_uid
                 || location.replica != self.replica
                 || location.process_session_id != self.process_session_id
@@ -2740,7 +2740,7 @@ impl PublicV1AcceptedStatus {
                 rebuild.validate()?;
                 if rebuild.operation.operation_id != completion.operation_id
                     || rebuild.operation.revision != completion.revision
-                    || rebuild.operation.preview != self.identity
+                    || rebuild.operation.identity != self.identity
                     || rebuild.operation.resource_uid != self.history.resource_uid
                     || rebuild.operation.detecting_session != completion.process_session_id
                 {
@@ -2776,7 +2776,7 @@ impl PublicV1AcceptedStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceLocation {
-    pub preview: PublicV1Identity,
+    pub identity: PublicV1Identity,
     pub resource_uid: ResourceUid,
     pub operation_id: OperationId,
     pub replica: ReplicaIdentity,
@@ -2789,7 +2789,7 @@ pub struct ServiceLocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicLifecycleReport {
-    pub preview: PublicV1Identity,
+    pub identity: PublicV1Identity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<PublicV1LifecycleBinding>,
     pub resource_uid: ResourceUid,

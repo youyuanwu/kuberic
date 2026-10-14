@@ -266,7 +266,7 @@ pub fn normalize_public_v1_agent_status_report(
         .service_location
         .map(|location| {
             Ok(ServiceLocation {
-                preview: PublicV1Identity {
+                identity: PublicV1Identity {
                     protocol_version: location.protocol_version,
                     generation: location.generation,
                 },
@@ -363,8 +363,8 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
                 .map(public_v1_recovery_to_proto),
             service_location: report.service_location.as_ref().map(|location| {
                 proto::PublicV1ServiceLocation {
-                    protocol_version: location.preview.protocol_version,
-                    generation: location.preview.generation,
+                    protocol_version: location.identity.protocol_version,
+                    generation: location.identity.generation,
                     resource_uid: location.resource_uid.as_str().to_string(),
                     operation_id: location.operation_id.as_str().to_string(),
                     replica: Some(location.replica.clone().into()),
@@ -840,7 +840,7 @@ fn captured_operation_from_proto(
         .into();
     let identity = CapturedPublicOperationIdentity {
         resource_uid: ResourceUid::new(value.resource_uid),
-        preview: PublicV1Identity {
+        identity: PublicV1Identity {
             protocol_version: value.protocol_version,
             generation: value.generation,
         },
@@ -860,8 +860,8 @@ fn captured_operation_to_proto(
 ) -> proto::PublicV1CapturedOperationIdentity {
     proto::PublicV1CapturedOperationIdentity {
         resource_uid: value.resource_uid.as_str().to_string(),
-        protocol_version: value.preview.protocol_version,
-        generation: value.preview.generation,
+        protocol_version: value.identity.protocol_version,
+        generation: value.identity.generation,
         epoch: Some(value.epoch.into()),
         operation_id: value.operation_id.as_str().to_string(),
         revision: value.revision,
@@ -1341,7 +1341,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
             let command = public_v1_operation_command_from_proto(command.clone())?;
             if command.target != target
                 || command.intent.process_session_id.as_str() != request.expected_process_session_id
-                || command.intent.preview.protocol_version != request.protocol_version
+                || command.intent.identity.protocol_version != request.protocol_version
             {
                 return Err(WireError::InvalidAuthority(
                     "public-v1 operation differs from execute envelope".into(),

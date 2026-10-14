@@ -648,7 +648,7 @@ impl AgentStore for SqliteStore {
                     "public-operation preview is not enabled for this store".into(),
                 )
             })?;
-            if preview.identity != intent.preview {
+            if preview.identity != intent.identity {
                 return Err(crate::host::HostError::IdentityMismatch(
                     "public-operation preview identity changed".into(),
                 ));
@@ -777,7 +777,7 @@ impl AgentStore for SqliteStore {
                 ));
             }
             use crate::protocol::public_operations::PublicOperationProgram;
-            if intent.preview.is_public_v1() {
+            if intent.identity.is_public_v1() {
                 let history = preview.history.as_ref().ok_or_else(|| {
                     crate::host::HostError::CommandRejected(
                         "public-v1 operation requires initialized history".into(),
@@ -808,7 +808,7 @@ impl AgentStore for SqliteStore {
             }
             match &intent.program {
                 Some(PublicOperationProgram::Build(build)) => {
-                    let source_storage = if intent.preview.is_public_v1() {
+                    let source_storage = if intent.identity.is_public_v1() {
                         Some(preview.storage_incarnation.clone().ok_or_else(|| {
                             crate::host::HostError::CommandRejected(
                                 "public-v1 build lacks source storage incarnation".into(),
@@ -882,7 +882,7 @@ impl AgentStore for SqliteStore {
                     preview
                         .active_builds
                         .insert(build.replica.replica_id, build.clone());
-                    if intent.preview.is_public_v1() {
+                    if intent.identity.is_public_v1() {
                         let build_record = PublicV1BuildRecord {
                             operation_id: intent.operation_id.clone(),
                             build_id: build.attempt.clone(),
@@ -956,7 +956,7 @@ impl AgentStore for SqliteStore {
                 _ => {}
             }
             if let Some(input) = &intent.lifecycle {
-                if intent.preview.is_public_v1()
+                if intent.identity.is_public_v1()
                     && (preview.history_initialization_id.is_none()
                         || preview.history.is_none()
                         || preview.storage_incarnation.is_none())
@@ -991,7 +991,7 @@ impl AgentStore for SqliteStore {
                 if input.possible_data_loss
                     == crate::protocol::public_operations::PossibleDataLossIntent::Possible
                 {
-                    if intent.preview.is_public_v1() {
+                    if intent.identity.is_public_v1() {
                         let recovery = input.data_loss_recovery.as_ref().ok_or_else(|| {
                             crate::host::HostError::CommandRejected(
                                 "public-v1 data loss requires typed recovery".into(),
@@ -1166,7 +1166,7 @@ impl AgentStore for SqliteStore {
                 "public-v1 data-loss renewal requires typed recovery".into(),
             )
         })?;
-        if !intent.preview.is_public_v1()
+        if !intent.identity.is_public_v1()
             || input.possible_data_loss != PossibleDataLossIntent::Possible
         {
             return Err(crate::host::HostError::CommandRejected(
@@ -1179,7 +1179,7 @@ impl AgentStore for SqliteStore {
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("replacement store required".into())
             })?;
-            if preview.identity != intent.preview {
+            if preview.identity != intent.identity {
                 return Err(crate::host::HostError::IdentityMismatch(
                     "public-operation preview identity changed".into(),
                 ));
@@ -1533,7 +1533,7 @@ impl AgentStore for SqliteStore {
                     "public-operation preview is not enabled for this store".into(),
                 )
             })?;
-            if preview.identity != intent.preview {
+            if preview.identity != intent.identity {
                 return Err(crate::host::HostError::IdentityMismatch(
                     "public-operation preview identity changed".into(),
                 ));
@@ -1642,7 +1642,7 @@ impl AgentStore for SqliteStore {
                     crate::host::HostError::CommandRejected("unknown replacement operation".into())
                 })?;
             if &record.intent != intent
-                || preview.identity != intent.preview
+                || preview.identity != intent.identity
                 || record.stage != PublicOperationStage::Running
                 || record.superseded_by.is_some()
                 || ((intent.class
@@ -1897,7 +1897,7 @@ impl AgentStore for SqliteStore {
                         }
                         preview.active_builds.remove(&build.replica.replica_id);
                         preview.absent_builds.insert(build.attempt.clone());
-                        if intent.preview.is_public_v1()
+                        if intent.identity.is_public_v1()
                             && !preview
                                 .retired_storage_incarnations
                                 .contains(&build.target_storage)
@@ -1925,7 +1925,7 @@ impl AgentStore for SqliteStore {
                             })?;
                         }
                     }
-                    if intent.preview.is_public_v1()
+                    if intent.identity.is_public_v1()
                         && matches!(
                             intent.program,
                             Some(

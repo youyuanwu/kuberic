@@ -100,7 +100,7 @@ fn intent(
         _ => PublicOperationClass::Authority,
     };
     PublicOperationIntent {
-        preview: preview.clone(),
+        identity: preview.clone(),
         operation_id: OperationId::new(name),
         revision,
         process_session_id: session,
@@ -120,7 +120,7 @@ fn lifecycle_intent(
     lifecycle: PublicLifecycleInput,
 ) -> PublicOperationIntent {
     PublicOperationIntent {
-        preview: preview.clone(),
+        identity: preview.clone(),
         operation_id: OperationId::new(name),
         revision,
         process_session_id: session,

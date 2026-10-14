@@ -167,7 +167,7 @@ pub struct AcceptSecondaryRemovalCommit {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PublicV1HistoryCommand {
     Initialize {
-        preview: PublicV1Identity,
+        identity: PublicV1Identity,
         accepted: PublicV1AcceptedStatus,
         storage: ReplicaStorageIncarnationContext,
     },
@@ -296,16 +296,16 @@ impl PublicV1HistoryCommand {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Initialize {
-                preview,
+                identity,
                 accepted,
                 storage,
             } => {
                 storage.validate()?;
-                if !preview.is_public_v1()
-                    || accepted.identity != *preview
+                if !identity.is_public_v1()
+                    || accepted.identity != *identity
                     || accepted.data_loss_recovery.is_some()
                     || accepted.history.resource_uid.is_empty()
-                    || accepted.history.protocol_generation.value() != preview.generation
+                    || accepted.history.protocol_generation.value() != identity.generation
                     || accepted.history
                         != derive_bootstrap_history(
                             &accepted.history.resource_uid,
@@ -327,7 +327,7 @@ impl PublicV1HistoryCommand {
                     .as_ref()
                     .and_then(|input| input.data_loss_recovery.as_ref())
                     .ok_or("public-v1 recovery command lacks typed lifecycle recovery")?;
-                if accepted.identity != intent.preview
+                if accepted.identity != intent.identity
                     || recovery.stage
                         != crate::protocol::public_operations::PublicDataLossRecoveryStage::Invalidated
                     || recovery.logical_authorization() != input.authorization

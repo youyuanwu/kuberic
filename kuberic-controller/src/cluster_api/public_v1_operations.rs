@@ -233,7 +233,7 @@ impl HostedPublicV1Harness {
             .await
             .map_err(|error| error.to_string())?
         {
-            if durable.preview
+            if durable.identity
                 != kuberic_runtime::protocol::public_operations::PublicV1Identity::new(
                     preview_generation,
                 )
@@ -255,7 +255,7 @@ impl HostedPublicV1Harness {
                 .await
                 .map_err(|error| error.to_string())?;
             let intent = PublicOperationIntent {
-                preview: kuberic_runtime::protocol::public_operations::PublicV1Identity::new(
+                identity: kuberic_runtime::protocol::public_operations::PublicV1Identity::new(
                     preview_generation,
                 ),
                 operation_id,
@@ -474,7 +474,7 @@ impl HostedPublicV1Harness {
                 .await;
             self.execute_authority_program(
                 &member.identity,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!(
                     "{}-predecessor-epoch-{}",
                     operation.intent.operation_id, member.identity.replica_id
@@ -486,7 +486,7 @@ impl HostedPublicV1Harness {
             .await?;
             self.execute_authority_program(
                 &member.identity,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!(
                     "{}-predecessor-role-{}",
                     operation.intent.operation_id, member.identity.replica_id
@@ -503,7 +503,7 @@ impl HostedPublicV1Harness {
             configuration.previous = lifecycle.previous.clone();
             self.execute_authority_program(
                 &member.identity,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!(
                     "{}-predecessor-configuration-{}",
                     operation.intent.operation_id, member.identity.replica_id
@@ -604,7 +604,7 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
         if let Some(PublicOperationProgram::Remove(build)) = operation.intent.program.as_ref() {
             self.execute_authority_program(
                 &build.replica,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!("{}-revoke-target", operation.intent.operation_id)),
                 PublicOperationProgram::Role {
                     epoch: build.epoch,
@@ -631,7 +631,7 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
             self.replica(&operation.target)?
                 .handle
                 .execute_public_v1(PublicOperationIntent {
-                    preview: operation.intent.preview.clone(),
+                    identity: operation.intent.identity.clone(),
                     operation_id: OperationId::new(format!(
                         "{}-first-catch-up",
                         operation.intent.operation_id
@@ -658,7 +658,7 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
                     .await;
                 self.execute_authority_program(
                     &member.identity,
-                    operation.intent.preview.generation,
+                    operation.intent.identity.generation,
                     OperationId::new(format!(
                         "{}-target-epoch-{}",
                         operation.intent.operation_id, member.identity.replica_id
@@ -670,7 +670,7 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
                 .await?;
                 self.execute_authority_program(
                     &member.identity,
-                    operation.intent.preview.generation,
+                    operation.intent.identity.generation,
                     OperationId::new(format!(
                         "{}-target-role-{}",
                         operation.intent.operation_id, member.identity.replica_id
@@ -687,7 +687,7 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
                 );
                 self.execute_authority_program(
                     &member.identity,
-                    operation.intent.preview.generation,
+                    operation.intent.identity.generation,
                     OperationId::new(format!(
                         "{}-target-configuration-{}",
                         operation.intent.operation_id, member.identity.replica_id

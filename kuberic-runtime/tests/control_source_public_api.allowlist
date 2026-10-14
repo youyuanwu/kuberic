@@ -694,7 +694,7 @@ public-path documented variant crate::protocol::command::KubernetesChange::Remov
 public-path documented variant crate::protocol::command::ProtocolCommand::InitializeAgentStore((Box < InitializeAgentStore >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1History((Box < PublicV1HistoryCommand >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1Operation((Box < PublicV1OperationCommand >))
-public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Initialize { { preview : PublicV1Identity , accepted : PublicV1AcceptedStatus , storage : ReplicaStorageIncarnationContext , } }
+public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Initialize { { identity : PublicV1Identity , accepted : PublicV1AcceptedStatus , storage : ReplicaStorageIncarnationContext , } }
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Recover { { accepted : PublicV1AcceptedStatus , intent : Box < PublicOperationIntent > , } }
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::SessionRenewal((Box < PublicV1SessionRenewalCommand >))
 public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::CloseAccessAndIngress { { accepted : PublicV1SessionRenewalStatus , } }
@@ -869,8 +869,8 @@ public-path hidden enum crate::protocol::public_operations::StatePersistence
 public-path hidden field crate::protocol::public_operations::CanonicalOperationInputDigestV1::sha256: String
 public-path hidden field crate::protocol::public_operations::CapturedPublicOperationIdentity::detecting_session: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::CapturedPublicOperationIdentity::epoch: Epoch
+public-path hidden field crate::protocol::public_operations::CapturedPublicOperationIdentity::identity: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::CapturedPublicOperationIdentity::operation_id: OperationId
-public-path hidden field crate::protocol::public_operations::CapturedPublicOperationIdentity::preview: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::CapturedPublicOperationIdentity::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::CapturedPublicOperationIdentity::revision: u64
 public-path hidden field crate::protocol::public_operations::DataLossAttempt::attempt_id: OperationId
@@ -974,8 +974,8 @@ public-path hidden field crate::protocol::public_operations::PublicLifecycleInpu
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::replicas: Vec < PublicReplicaDescriptor >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::binding: Option < PublicV1LifecycleBinding >
+public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::identity: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::operation_id: Option < OperationId >
-public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::preview: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::process_id: u32
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::replica: ReplicaIdentity
@@ -985,10 +985,10 @@ public-path hidden field crate::protocol::public_operations::PublicLifecycleRepo
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::service_location: Option < ServiceLocation >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleReport::write_access: bool
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::class: PublicOperationClass
+public-path hidden field crate::protocol::public_operations::PublicOperationIntent::identity: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::input_digest: CanonicalOperationInputDigest
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::lifecycle: Option < PublicLifecycleInput >
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::operation_id: OperationId
-public-path hidden field crate::protocol::public_operations::PublicOperationIntent::preview: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::program: Option < PublicOperationProgram >
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::replay_disposition: PublicOperationReplayDisposition
@@ -1095,8 +1095,8 @@ public-path hidden field crate::protocol::public_operations::RestartActionRecord
 public-path hidden field crate::protocol::public_operations::RestartActionRecord::successor_session: Option < ProcessSessionId >
 public-path hidden field crate::protocol::public_operations::ServiceLocation::address: String
 public-path hidden field crate::protocol::public_operations::ServiceLocation::epoch: Epoch
+public-path hidden field crate::protocol::public_operations::ServiceLocation::identity: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::ServiceLocation::operation_id: OperationId
-public-path hidden field crate::protocol::public_operations::ServiceLocation::preview: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::ServiceLocation::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::ServiceLocation::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::ServiceLocation::resource_uid: ResourceUid

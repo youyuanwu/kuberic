@@ -266,7 +266,7 @@ fn operation_intent(
         _ => PublicOperationClass::Authority,
     };
     PublicOperationIntent {
-        preview: accepted.identity.clone(),
+        identity: accepted.identity.clone(),
         operation_id: OperationId::new(name),
         revision: 1,
         process_session_id: ProcessSessionId::new("source-session"),
@@ -619,7 +619,7 @@ fn rebuild(
         },
         operation: CapturedPublicOperationIdentity {
             resource_uid: accepted.history.resource_uid.clone(),
-            preview: accepted.identity.clone(),
+            identity: accepted.identity.clone(),
             epoch: Epoch::new(0, 7),
             operation_id: OperationId::new(operation_id),
             revision: 3,

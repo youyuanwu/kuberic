@@ -31,7 +31,7 @@ pub fn plan_public_v1_lifecycle(
         PublicV1LifecycleTransition::PossibleDataLoss => PossibleDataLossIntent::Possible,
     };
     let intent = PublicOperationIntent {
-        preview: config.identity.clone(),
+        identity: config.identity.clone(),
         operation_id,
         revision,
         process_session_id: source_session,
@@ -115,7 +115,7 @@ pub fn evaluate_service_location(
     status: &PublicV1LifecycleStatus,
     service: &Service,
 ) -> Result<PublicV1ServiceLocationPlan, String> {
-    config.validate_identity(&authority.preview)?;
+    config.validate_identity(&authority.identity)?;
     authority.validate()?;
     if let Some(report) = report
         && &report.resource_uid != resource_uid
@@ -234,7 +234,7 @@ fn validate_projection(
     config: &PublicV1EvaluationConfig,
     projection: &ServiceLocationProjection,
 ) -> Result<(), String> {
-    config.validate_identity(&projection.authority.preview)?;
+    config.validate_identity(&projection.authority.identity)?;
     projection.authority.validate()?;
     if projection
         .authority
@@ -357,7 +357,7 @@ fn projection_revoked(
                 && (projection.revoked || (projection.location.is_some() && location.is_none()))
         })
         || report.is_some_and(|report| {
-            report.preview != authority.preview
+            report.identity != authority.identity
                 || report.process_session_id != authority.process_session_id
                 || report.revision != authority.revision
                 || report.operation_id.as_ref() != Some(&authority.operation_id)
@@ -382,7 +382,7 @@ fn location_matches_projection(
     location: &ServiceLocation,
     projection: &ServiceLocationProjection,
 ) -> bool {
-    location.preview == projection.authority.preview
+    location.identity == projection.authority.identity
         && location.resource_uid == projection.resource_uid
         && location.operation_id == projection.authority.operation_id
         && location.replica == projection.primary

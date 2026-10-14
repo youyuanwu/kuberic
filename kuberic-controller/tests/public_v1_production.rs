@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kube::ResourceExt;
-use kuberic_controller::cluster_api::InMemoryClusterApi;
+use kuberic_controller::cluster_api::{EffectRecord, InMemoryClusterApi};
 use kuberic_controller::crd::{INSTANCE_LABEL, KubericSet, KubericSetSpec};
 use kuberic_controller::observation::{RawAgentObservation, RawObservation};
 use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
@@ -97,6 +97,13 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
     report
 }
 
+fn resources_ready(observation: &RawObservation) -> bool {
+    observation.pods.len() == 1
+        && observation.pvcs.len() == 1
+        && observation.services.len() == 3
+        && observation.secrets.len() == 1
+}
+
 #[tokio::test]
 async fn production_reconciler_bootstraps_then_stabilizes_on_public_v1_reports() {
     tokio::time::timeout(Duration::from_secs(270), async {
@@ -109,31 +116,35 @@ async fn production_reconciler_bootstraps_then_stabilizes_on_public_v1_reports()
             let action = reconciler.reconcile("default", "sample").await.unwrap();
             assert_eq!(action.kind, ReconcileKind::Executed);
             let observed = api.observation().await;
-            if observed.pods.len() == 1
-                && observed.pvcs.len() == 1
-                && observed.services.len() == 3
-                && observed.secrets.len() == 1
-            {
+            assert!(
+                observed.agents.is_empty(),
+                "fresh bootstrap must not manufacture or preseed agent reports"
+            );
+            if resources_ready(&observed) {
                 break;
             }
         }
         let mut observed = api.observation().await;
-        assert_eq!(observed.pods.len(), 1);
-        assert_eq!(observed.pvcs.len(), 1);
-        assert_eq!(observed.services.len(), 3);
-        assert_eq!(observed.secrets.len(), 1);
+        assert!(resources_ready(&observed));
+        assert!(observed.agents.is_empty());
         let pod_uid = observed.pods[0].uid().expect("bootstrap Pod UID");
         assert_eq!(
             observed.pods[0].labels().get(INSTANCE_LABEL),
             Some(&pod_uid)
         );
         let report = report_for(&observed);
-        observed.agents.insert(
-            ReplicaObservationKey::new(
-                report.replica.replica_id,
-                report.replica.instance_id.clone(),
-            ),
-            RawAgentObservation::PublicV1Report(Box::new(report)),
+        assert!(
+            observed
+                .agents
+                .insert(
+                    ReplicaObservationKey::new(
+                        report.replica.replica_id,
+                        report.replica.instance_id.clone(),
+                    ),
+                    RawAgentObservation::PublicV1Report(Box::new(report)),
+                )
+                .is_none(),
+            "bootstrap report injection replaced preseeded evidence"
         );
         api.set_observation(observed).await;
         assert_eq!(
@@ -155,4 +166,84 @@ async fn production_reconciler_bootstraps_then_stabilizes_on_public_v1_reports()
     })
     .await
     .expect("public-v1 production reconciliation exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_defers_preseeded_reports_until_resources_exist() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let source_api = Arc::new(InMemoryClusterApi::new(empty_observation()));
+        let source_reconciler = Reconciler::new(
+            source_api.clone(),
+            kuberic_controller::production_evaluation_config(30, 5, 30),
+        );
+        for _ in 0..8 {
+            assert_eq!(
+                source_reconciler
+                    .reconcile("default", "sample")
+                    .await
+                    .unwrap()
+                    .kind,
+                ReconcileKind::Executed
+            );
+            if resources_ready(&source_api.observation().await) {
+                break;
+            }
+        }
+        let report = report_for(&source_api.observation().await);
+        let mut preseeded = empty_observation();
+        preseeded.agents.insert(
+            ReplicaObservationKey::new(
+                report.replica.replica_id,
+                report.replica.instance_id.clone(),
+            ),
+            RawAgentObservation::PublicV1Report(Box::new(report)),
+        );
+
+        let api = Arc::new(InMemoryClusterApi::new(preseeded));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(30, 5, 30),
+        );
+        for _ in 0..8 {
+            assert_eq!(
+                reconciler
+                    .reconcile("default", "sample")
+                    .await
+                    .unwrap()
+                    .kind,
+                ReconcileKind::Executed,
+                "preseeded evidence was consumed before resource convergence"
+            );
+            let effects = api.effects().await;
+            assert!(
+                effects.iter().all(|effect| !matches!(
+                    effect,
+                    EffectRecord::ReplaceStatus | EffectRecord::Execute(_)
+                )),
+                "preseeded evidence persisted or dispatched before resource convergence"
+            );
+            let observed = api.observation().await;
+            assert_eq!(observed.agents.len(), 1);
+            if resources_ready(&observed) {
+                break;
+            }
+        }
+        assert!(resources_ready(&api.observation().await));
+        assert!(
+            api.effects()
+                .await
+                .iter()
+                .any(|effect| matches!(effect, EffectRecord::EnsureScaffolding(_)))
+        );
+        assert_eq!(
+            reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+    })
+    .await
+    .expect("preseeded-report bootstrap reconciliation exceeded 270 seconds");
 }

@@ -51,7 +51,7 @@ filter = 'package(=sqlite-replicated)'
 test-group = 'sqlite'
 
 [[profile.default.overrides]]
-filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=built_in_preview_ksf_mappings_require_each_authorized_observation)'
+filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=built_in_replacement_ksf_mappings_require_each_authorized_observation)'
 slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 

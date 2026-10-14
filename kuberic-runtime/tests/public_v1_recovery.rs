@@ -1,6 +1,6 @@
 #![cfg(feature = "testing")]
 
-// Hosted Public V1 preview lifecycle and recovery journeys.
+// Hosted Public V1 replacement lifecycle and recovery journeys.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -846,7 +846,7 @@ fn intent(
         _ => PublicOperationClass::Authority,
     };
     PublicOperationIntent {
-        preview: preview.clone(),
+        identity: preview.clone(),
         operation_id: OperationId::new(name),
         revision,
         process_session_id: session,
@@ -1011,7 +1011,7 @@ impl HostedMemoryReplica {
 }
 
 struct AuthorizedHostedPair {
-    preview: PublicV1Identity,
+    identity: PublicV1Identity,
     epoch: Epoch,
     primary: HostedMemoryReplica,
     secondary: HostedMemoryReplica,
@@ -1097,7 +1097,7 @@ impl AuthorizedHostedPair {
         )
         .await;
         Self {
-            preview,
+            identity: preview,
             epoch,
             primary,
             secondary,
@@ -1573,7 +1573,7 @@ async fn primary_write_revocation_fences_provider_apply_and_peer_ack_interleavin
         apply_pair.primary.state.apply_entered.notified().await;
         let demotion = tokio::spawn({
             let handle = apply_pair.primary.handle();
-            let preview = apply_pair.preview.clone();
+            let preview = apply_pair.identity.clone();
             let epoch = apply_pair.epoch;
             async move {
                 handle
@@ -1625,7 +1625,7 @@ async fn primary_write_revocation_fences_provider_apply_and_peer_ack_interleavin
         ack_pair.secondary.state.apply_entered.notified().await;
         let demotion = tokio::spawn({
             let handle = ack_pair.primary.handle();
-            let preview = ack_pair.preview.clone();
+            let preview = ack_pair.identity.clone();
             let epoch = ack_pair.epoch;
             async move {
                 handle
@@ -1678,7 +1678,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
         close_pair.primary.state.commit_entered.notified().await;
         let close = tokio::spawn({
             let handle = close_pair.primary.handle();
-            let preview = close_pair.preview.clone();
+            let preview = close_pair.identity.clone();
             async move {
                 handle
                     .execute_public_v1(intent(
@@ -1719,7 +1719,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
         let next_epoch = Epoch::new(0, 2);
         let epoch_update = tokio::spawn({
             let handle = epoch_pair.primary.handle();
-            let preview = epoch_pair.preview.clone();
+            let preview = epoch_pair.identity.clone();
             async move {
                 handle
                     .execute_public_v1(intent(
@@ -2001,7 +2001,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
         pair.primary
             .handle()
             .execute_public_v1(intent(
-                &pair.preview,
+                &pair.identity,
                 pair.primary.handle().process_session_id(),
                 5,
                 "hung-minority-primary-configuration",
@@ -2039,7 +2039,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
         pair.secondary
             .handle()
             .execute_public_v1(intent(
-                &pair.preview,
+                &pair.identity,
                 pair.secondary.handle().process_session_id(),
                 5,
                 "hung-minority-secondary-configuration",
@@ -2177,7 +2177,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
         close_pair.secondary.state.apply_entered.notified().await;
         let close = tokio::spawn({
             let handle = close_pair.primary.handle();
-            let preview = close_pair.preview.clone();
+            let preview = close_pair.identity.clone();
             async move {
                 handle
                     .execute_public_v1(intent(
@@ -2683,8 +2683,8 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
 #[tokio::test]
 async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let root = test_root("fresh-schema11");
-        let resource_uid = ResourceUid::new("preview-fresh-schema11");
+        let root = test_root("fresh-replacement_schema");
+        let resource_uid = ResourceUid::new("preview-fresh-replacement_schema");
         let preview = PublicV1Identity::new(6);
         let binding = PublicV1LifecycleBinding {
             identity: preview.clone(),
@@ -2927,7 +2927,7 @@ async fn hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome()
                 }),
             };
             let recovery_intent = PublicOperationIntent {
-                preview: preview.clone(),
+                identity: preview.clone(),
                 operation_id: attempt.attempt_id.clone(),
                 revision: attempt.process.attempt_revision,
                 process_session_id: attempt.process.process_session_id.clone(),

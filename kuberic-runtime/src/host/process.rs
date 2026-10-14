@@ -204,7 +204,7 @@ impl ReplicaHandle {
                 "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
-        if intent.preview != preview.binding.identity
+        if intent.identity != preview.binding.identity
             || intent.process_session_id.as_str() != self.process_session.as_ref()
         {
             return Err(crate::host::HostError::IdentityMismatch(
