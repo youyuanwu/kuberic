@@ -65,6 +65,13 @@ pub(crate) struct RenewPublicDataLossAttempt {
     pub(crate) successor: Option<PublicOperationRecord>,
 }
 
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicInboundBuildAdmission {
+    Current,
+    Successor,
+}
+
 #[async_trait]
 pub(crate) trait AgentStore: Send + Sync {
     async fn identity(&self) -> Result<StorageIdentity>;
@@ -215,6 +222,16 @@ pub(crate) trait AgentStore: Send + Sync {
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
             "public-operation preview is not enabled for this store".into(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn classify_public_v1_inbound_build_authority(
+        &self,
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission> {
+        Err(crate::host::HostError::CommandRejected(
+            "public-v1 inbound build authority is not enabled for this store".into(),
         ))
     }
 

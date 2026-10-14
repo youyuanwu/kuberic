@@ -34,6 +34,8 @@ use crate::authority::{
 use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
 #[cfg(feature = "testing")]
+use crate::host::store::PublicInboundBuildAdmission;
+#[cfg(feature = "testing")]
 use crate::protocol::public_operations::PreviewLifecycleBinding;
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 #[cfg(feature = "testing")]
@@ -1169,6 +1171,16 @@ impl ReplicatorFactoryContext {
     }
 
     #[cfg(feature = "testing")]
+    pub(crate) async fn classify_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission> {
+        self.access
+            .classify_preview_inbound_build_authority(authority)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
     pub(crate) async fn install_preview_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
@@ -1242,6 +1254,12 @@ pub(crate) trait PartitionAccessView: Send + Sync {
         &self,
         build_id: &OperationId,
     ) -> Result<Option<PublicInboundBuildAuthority>>;
+
+    #[cfg(feature = "testing")]
+    async fn classify_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission>;
 
     #[cfg(feature = "testing")]
     async fn install_preview_inbound_build_authority(

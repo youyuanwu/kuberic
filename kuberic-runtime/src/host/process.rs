@@ -1052,6 +1052,27 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn stateless_preview_operation_intent(
+        &self,
+        operation_id: &crate::protocol::types::OperationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicOperationIntent>> {
+        let preview = self
+            .store
+            .load_state()
+            .await?
+            .public_operation_preview
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview requires schema-11 operation state".into(),
+                )
+            })?;
+        Ok(preview
+            .operations
+            .get(operation_id)
+            .map(|record| record.intent.clone()))
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn authorize_stateless_preview_session_renewal(
         &self,
         required: crate::protocol::public_operations::ProcessSessionRenewalRequired,

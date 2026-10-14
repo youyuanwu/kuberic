@@ -42,6 +42,15 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
+        let _admission = self.inbound_build_admission_gate.lock().await;
+        match self
+            .context
+            .classify_preview_inbound_build_authority(authority)
+            .await?
+        {
+            crate::host::store::PublicInboundBuildAdmission::Current => return Ok(()),
+            crate::host::store::PublicInboundBuildAdmission::Successor => {}
+        }
         self.revoke_generation();
         self.cancel_inbound_effects();
         let _effect_drain = self.provider_effect_gate.lock().await;
@@ -219,6 +228,7 @@ pub struct StatelessReplicator {
     open_gate: Mutex<()>,
     write_gate: Mutex<()>,
     provider_effect_gate: Mutex<()>,
+    inbound_build_admission_gate: Mutex<()>,
     listener: StdMutex<Option<ListenerOwner>>,
     descendants: StdMutex<Vec<tokio::task::AbortHandle>>,
     inbound_descendants: StdMutex<Vec<tokio::task::AbortHandle>>,
@@ -265,6 +275,7 @@ impl StatelessReplicator {
             open_gate: Mutex::new(()),
             write_gate: Mutex::new(()),
             provider_effect_gate: Mutex::new(()),
+            inbound_build_admission_gate: Mutex::new(()),
             listener: StdMutex::new(None),
             descendants: StdMutex::new(Vec::new()),
             inbound_descendants: StdMutex::new(Vec::new()),

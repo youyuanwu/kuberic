@@ -46,7 +46,9 @@ use crate::host::state::{
 };
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
 #[cfg(any(test, feature = "testing"))]
-use crate::host::store::{BeginPublicOperation, RenewPublicDataLossAttempt};
+use crate::host::store::{
+    BeginPublicOperation, PublicInboundBuildAdmission, RenewPublicDataLossAttempt,
+};
 
 fn switchover_receipt_matches(
     receipt: &crate::receipts::SwitchoverReceipt,
@@ -651,6 +653,58 @@ impl SqliteStore {
         let result = action(&transaction)?;
         transaction.commit().map_err(contract_sqlite_error)?;
         Ok(result)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn classify_public_v1_inbound_build_authority(
+    state: &AgentState,
+    authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+) -> Result<PublicInboundBuildAdmission> {
+    authority
+        .validate()
+        .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+    let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+        crate::host::HostError::CommandRejected(
+            "inbound build authority requires a public-v1 store".into(),
+        )
+    })?;
+    if !preview.identity.is_public_v1()
+        || authority.attempt.target != state.identity.local_identity
+        || preview.history.as_ref() != Some(&authority.history)
+        || preview.storage_incarnation.as_ref() != Some(&authority.attempt.target_storage)
+        || preview
+            .retired_storage_incarnations
+            .contains(&authority.attempt.target_storage)
+    {
+        return Err(crate::host::HostError::IdentityMismatch(
+            "inbound build authority differs from durable target authority".into(),
+        ));
+    }
+    if let Some(receipt) = preview
+        .terminal_inbound_build_receipts
+        .get(&authority.attempt.build_id)
+    {
+        if &receipt.authority != authority {
+            return Err(crate::host::HostError::DurableEffectConflict(
+                "completed inbound build changed exact authority".into(),
+            ));
+        }
+        return Ok(PublicInboundBuildAdmission::Current);
+    }
+    match &preview.current_inbound_build_authority {
+        Some(existing) if existing == authority => Ok(PublicInboundBuildAdmission::Current),
+        Some(existing) if authority.operation_revision <= existing.operation_revision => {
+            Err(crate::host::HostError::StaleEffectCompletion(
+                "inbound build authority did not supersede the accepted attempt".into(),
+            ))
+        }
+        _ if authority.operation_revision <= preview.inbound_build_generation => {
+            Err(crate::host::HostError::StaleEffectCompletion(
+                "inbound build authority revision is no longer current".into(),
+            ))
+        }
+        _ => Ok(PublicInboundBuildAdmission::Successor),
     }
 }
 
@@ -3459,57 +3513,28 @@ impl AgentStore for SqliteStore {
     }
 
     #[cfg(any(test, feature = "testing"))]
+    async fn classify_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission> {
+        classify_public_v1_inbound_build_authority(&self.load_state().await?, authority)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
     async fn install_public_v1_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
-        authority
-            .validate()
-            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
-            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
-                crate::host::HostError::CommandRejected(
-                    "inbound build authority requires a public-v1 store".into(),
-                )
-            })?;
-            if !preview.identity.is_public_v1()
-                || authority.attempt.target != state.identity.local_identity
-                || preview.history.as_ref() != Some(&authority.history)
-                || preview.storage_incarnation.as_ref() != Some(&authority.attempt.target_storage)
-                || preview
-                    .retired_storage_incarnations
-                    .contains(&authority.attempt.target_storage)
-            {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "inbound build authority differs from durable target authority".into(),
-                ));
+            match classify_public_v1_inbound_build_authority(&state, authority)? {
+                PublicInboundBuildAdmission::Current => return Ok(()),
+                PublicInboundBuildAdmission::Successor => {}
             }
-            if let Some(receipt) = preview
-                .terminal_inbound_build_receipts
-                .get(&authority.attempt.build_id)
-            {
-                if &receipt.authority != authority {
-                    return Err(crate::host::HostError::DurableEffectConflict(
-                        "completed inbound build changed exact authority".into(),
-                    ));
-                }
-                return Ok(());
-            }
-            match &preview.current_inbound_build_authority {
-                Some(existing) if existing == authority => return Ok(()),
-                Some(existing) if authority.operation_revision <= existing.operation_revision => {
-                    return Err(crate::host::HostError::StaleEffectCompletion(
-                        "inbound build authority did not supersede the accepted attempt".into(),
-                    ));
-                }
-                _ if authority.operation_revision <= preview.inbound_build_generation => {
-                    return Err(crate::host::HostError::StaleEffectCompletion(
-                        "inbound build authority revision is no longer current".into(),
-                    ));
-                }
-                _ => {}
-            }
+            let preview = state
+                .public_operation_preview
+                .as_mut()
+                .expect("classified public-v1 state");
             preview.inbound_build_generation = authority.operation_revision;
             preview.current_inbound_build_authority = Some(authority.clone());
             write_agent_state(transaction, &state)

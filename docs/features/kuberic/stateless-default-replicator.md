@@ -1321,13 +1321,18 @@ Exact commands and the documentation-phase verification record are in
 [Kuberic Test Strategy](testing.md#service-fabric-public-v1-phase-6-preview).
 
 Inbound build-authority replacement is itself a containment boundary: the
-accepted successor advances the target generation, cancels ingress, drains
-the provider-effect gate and clears the old cursor before admission returns.
+target serializes admission and classifies it against current durable
+authority first. Stale or conflicting authority is rejected without volatile
+containment, an exact current reinstall is a no-op, and only a genuine
+successor advances the target generation, cancels ingress, drains the
+provider-effect gate and clears the old cursor before admission returns.
 Local source retained-history corruption similarly closes read/write access
 before rebuild-required is surfaced and remains closed through ordinary
 progress/report observation. Hosted composed operations allocate exact
-suboperation revisions from durable agent state and replay the captured intent
-unchanged; no process-global synthetic revision sequence is used.
+suboperation revisions from durable agent state. On adapter recreation they
+recover the exact durable intent by stable operation ID and replay its
+revision, digest and program unchanged; no process-global synthetic revision
+sequence is used.
 
 ## Testing Strategy
 

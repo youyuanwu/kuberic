@@ -3142,6 +3142,25 @@ impl PartitionAccessView for HostAccessView {
     }
 
     #[cfg(feature = "testing")]
+    async fn classify_preview_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<crate::host::store::PublicInboundBuildAdmission> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = host
+            .preview_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        bridge
+            .store
+            .classify_public_v1_inbound_build_authority(authority)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
     async fn install_preview_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,

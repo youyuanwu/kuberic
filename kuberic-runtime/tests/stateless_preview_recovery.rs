@@ -4001,7 +4001,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             )
             .unwrap(),
         );
-        let adapter = HostedPublicV1Adapter::new(
+        let hosted_replicas = || {
             vec![
                 HostedPreviewReplica {
                     identity: primary_identity.clone(),
@@ -4013,7 +4013,10 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                     replication_address: format!("http://{secondary_address}"),
                     handle: secondary_handle.clone(),
                 },
-            ],
+            ]
+        };
+        let adapter = HostedPublicV1Adapter::new(
+            hosted_replicas(),
             Some(accepted.clone()),
             None,
             evidence.clone(),
@@ -4050,16 +4053,55 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 .iter()
                 .all(|completion| completion.operation_id != transition.intent.operation_id)
         );
-        adapter.cut_after_hosted_suboperations(1);
+        adapter.cut_after_hosted_suboperations(3);
         assert!(
             execute_public_v1_operation(&adapter, &transition, command.clone())
                 .await
                 .unwrap_err()
                 .contains("injected cut after hosted suboperation completion")
         );
+        assert_eq!(
+            primary_handle
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            kuberic_runtime::protocol::types::AccessStatus::Granted
+        );
+        assert_eq!(
+            secondary_handle
+                .stateless_preview_report()
+                .await
+                .unwrap()
+                .write_status,
+            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+        );
+        let partial_configuration_id =
+            OperationId::new("planned-switchover-target-configuration-2");
+        let partial_configuration = secondary_handle
+            .stateless_preview_operation_intent(&partial_configuration_id)
+            .await
+            .unwrap()
+            .expect("partial switchover configuration was not durable");
+        drop(adapter);
+        let adapter = HostedPublicV1Adapter::new(
+            hosted_replicas(),
+            Some(accepted.clone()),
+            None,
+            evidence.clone(),
+        )
+        .unwrap();
         execute_public_v1_operation(&adapter, &transition, command)
             .await
             .unwrap();
+        assert_eq!(
+            secondary_handle
+                .stateless_preview_operation_intent(&partial_configuration_id)
+                .await
+                .unwrap(),
+            Some(partial_configuration),
+            "adapter recreation changed the durable switchover configuration intent"
+        );
         let switchover_report = adapter.report(&primary_identity).await.unwrap();
         assert_eq!(
             reconcile_public_v1_consumer(&adapter, &switchover_report)
@@ -4431,18 +4473,40 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                         .observe_public_v1_session_renewal()
                         .await
                         .unwrap(),
-                    Some(accepted)
+                    Some(accepted.clone())
                 );
+                let barrier_id = OperationId::new("renew-secondary-process-barrier-1");
+                let durable_barrier = restarted_primary_handle
+                    .stateless_preview_operation_intent(&barrier_id)
+                    .await
+                    .unwrap()
+                    .expect("renewal barrier was not durable at the injected cut");
+                drop(secondary_renewal);
+                let secondary_renewal = HostedPublicV1Adapter::new(
+                    hosted_replicas(),
+                    Some(transition.evidence.clone()),
+                    Some(accepted),
+                    evidence.clone(),
+                )
+                .unwrap();
                 execute_public_v1_session_renewal(&secondary_renewal, plan)
                     .await
                     .unwrap();
+                assert_eq!(
+                    restarted_primary_handle
+                        .stateless_preview_operation_intent(&barrier_id)
+                        .await
+                        .unwrap(),
+                    Some(durable_barrier),
+                    "adapter recreation changed the durable renewal barrier intent"
+                );
+                drive_session_renewal(&secondary_renewal, &[], false).await;
                 break;
             }
             execute_public_v1_session_renewal(&secondary_renewal, plan)
                 .await
                 .unwrap();
         }
-        drive_session_renewal(&secondary_renewal, &[], false).await;
         let primary_restart_progress = primary_state.progress.lock().unwrap().committed_lsn;
         let failover_lifecycle = PublicLifecycleInput {
             recipe: PublicLifecycleRecipe::FailoverPromotion,
@@ -4950,22 +5014,76 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         target_state
             .block_finish_copy
             .store(false, Ordering::Release);
+        let mut first_b_frame = copy_frame(&authority_b, 0, true, false);
+        first_b_frame.lsn = 0;
+        first_b_frame.committed_lsn = 0;
+        first_b_frame.replication_boundary_lsn = 0;
         let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
             "http://{target_address}"
         ))
         .await
         .unwrap();
         let mut first_b = client
-            .build(Request::new(stream::iter([copy_frame(
-                &authority_b,
-                0,
-                true,
-                false,
-            )])))
+            .build(Request::new(stream::iter([first_b_frame])))
             .await
             .unwrap()
             .into_inner();
         assert!(!first_b.next().await.unwrap().unwrap().final_item);
+        target_state.block_finish_copy();
+        let mut held_b = tokio::spawn({
+            let target_address = target_address;
+            let mut frame = copy_frame(&authority_b, 1, false, false);
+            frame.lsn = 0;
+            frame.committed_lsn = 0;
+            frame.replication_boundary_lsn = 0;
+            async move {
+                let mut client = proto::replication_data_client::ReplicationDataClient::connect(
+                    format!("http://{target_address}"),
+                )
+                .await
+                .unwrap();
+                client
+                    .build(Request::new(stream::iter([frame])))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .next()
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = target_state.finish_copy_entered.notified() => {}
+                result = &mut held_b => panic!("B completed before entering provider: {result:?}"),
+            }
+        })
+        .await
+        .expect("B did not enter the target provider");
+        assert!(
+            target_handle
+                .install_stateless_preview_inbound_build_authority(&authority_a)
+                .await
+                .is_err(),
+            "stale authority A unexpectedly replaced in-flight authority B"
+        );
+        target_handle
+            .install_stateless_preview_inbound_build_authority(&authority_b)
+            .await
+            .unwrap();
+        target_state.release_finish_copy.notify_one();
+        let continued_b = tokio::time::timeout(Duration::from_secs(5), held_b)
+            .await
+            .expect("in-flight B did not continue after stale/exact admission")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(continued_b.sequence, 1);
+        assert!(!continued_b.final_item);
+        assert_eq!(
+            *target_state.progress.lock().unwrap(),
+            DurableApplicationProgress::default(),
+            "stale or exact admission reset B into a provider progress mutation"
+        );
         source_state.block_copy();
         let build_program = PublicOperationProgram::Build(build_input.clone());
         let build_intent = intent(

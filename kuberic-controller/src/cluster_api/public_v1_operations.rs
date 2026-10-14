@@ -211,6 +211,26 @@ impl HostedPublicV1Adapter {
         let existing = self.suboperations.lock().unwrap().get(&key).cloned();
         let intent = if let Some(existing) = existing {
             existing
+        } else if let Some(durable) = replica
+            .handle
+            .stateless_preview_operation_intent(&operation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if durable.preview
+                != kuberic_runtime::protocol::public_operations::
+                    PublicOperationPreviewIdentity::public_v1(preview_generation)
+                || durable.process_session_id != process_session_id
+                || durable.class != PublicOperationClass::Authority
+            {
+                return Err("durable hosted suboperation changed accepted authority".into());
+            }
+            self.suboperations
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_insert_with(|| durable.clone())
+                .clone()
         } else {
             let revision = replica
                 .handle
