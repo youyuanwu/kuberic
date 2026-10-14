@@ -36,6 +36,92 @@ enum ReplicationSendFailure {
     Rejected(String),
 }
 
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct InboundBuildClassificationPause {
+    operation_id: crate::protocol::types::OperationId,
+    entered: Arc<tokio::sync::Notify>,
+    boundary_waiting: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "testing")]
+impl InboundBuildClassificationPause {
+    pub async fn wait_until_classified(&self) {
+        self.entered.notified().await;
+    }
+
+    pub async fn wait_until_boundary_waiting(&self) {
+        self.boundary_waiting.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(feature = "testing")]
+static INBOUND_BUILD_CLASSIFICATION_PAUSE: OnceLock<
+    StdMutex<Option<InboundBuildClassificationPause>>,
+> = OnceLock::new();
+
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn testing_pause_inbound_build_after_classification(
+    operation_id: crate::protocol::types::OperationId,
+) -> InboundBuildClassificationPause {
+    let pause = InboundBuildClassificationPause {
+        operation_id,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        boundary_waiting: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let previous = INBOUND_BUILD_CLASSIFICATION_PAUSE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(pause.clone());
+    assert!(
+        previous.is_none(),
+        "an inbound build classification pause is already armed"
+    );
+    pause
+}
+
+#[cfg(feature = "testing")]
+async fn pause_inbound_build_after_classification(authority: &PublicInboundBuildAuthority) {
+    let pause = INBOUND_BUILD_CLASSIFICATION_PAUSE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|pause| pause.operation_id == authority.operation_id)
+        .cloned();
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        pause.release.notified().await;
+        INBOUND_BUILD_CLASSIFICATION_PAUSE
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|active| active.operation_id == authority.operation_id);
+    }
+}
+
+#[cfg(feature = "testing")]
+fn notify_inbound_build_boundary_waiting() {
+    if let Some(pause) = INBOUND_BUILD_CLASSIFICATION_PAUSE
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .cloned()
+    {
+        pause.boundary_waiting.notify_one();
+    }
+}
+
 #[async_trait]
 impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
     async fn install_inbound_build_authority(
@@ -43,6 +129,9 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
         let _admission = self.inbound_build_admission_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) || self.state.lock().await.closed {
+            return Err(RuntimeError::Closed);
+        }
         match self
             .context
             .classify_preview_inbound_build_authority(authority)
@@ -51,6 +140,8 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
             crate::host::store::PublicInboundBuildAdmission::Current => return Ok(()),
             crate::host::store::PublicInboundBuildAdmission::Successor => {}
         }
+        #[cfg(feature = "testing")]
+        pause_inbound_build_after_classification(authority).await;
         self.revoke_generation();
         self.cancel_inbound_effects();
         let _effect_drain = self.provider_effect_gate.lock().await;
@@ -1993,6 +2084,9 @@ impl Replicator for StatelessReplicator {
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        #[cfg(feature = "testing")]
+        notify_inbound_build_boundary_waiting();
+        let _admission = self.inbound_build_admission_gate.lock().await;
         {
             let mut state = self.state.lock().await;
             if self.closed.load(Ordering::Acquire) || state.closed {
@@ -2043,6 +2137,9 @@ impl Replicator for StatelessReplicator {
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        #[cfg(feature = "testing")]
+        notify_inbound_build_boundary_waiting();
+        let _admission = self.inbound_build_admission_gate.lock().await;
         {
             let mut state = self.state.lock().await;
             if self.closed.load(Ordering::Acquire) || state.closed {
@@ -2081,6 +2178,9 @@ impl Replicator for StatelessReplicator {
 
     async fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
+        #[cfg(feature = "testing")]
+        notify_inbound_build_boundary_waiting();
+        let _admission = self.inbound_build_admission_gate.lock().await;
         self.revoke_generation();
         {
             let mut state = self.state.lock().await;
@@ -2380,6 +2480,9 @@ impl StatelessReplicator {
             previous: previous.map(|previous| previous.configuration),
             peers,
         };
+        #[cfg(feature = "testing")]
+        notify_inbound_build_boundary_waiting();
+        let _admission = self.inbound_build_admission_gate.lock().await;
         {
             let mut state = self.state.lock().await;
             if state.authority.as_ref() == Some(&authority) {

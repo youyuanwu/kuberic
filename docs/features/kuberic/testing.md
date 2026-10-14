@@ -102,7 +102,7 @@ reproducible focused boundary.
 
 ### Runtime ownership, hosted recovery and conformance
 
-The inventory is exactly 20 direct recovery tests, two ordinary structural
+The inventory is exactly 23 direct recovery tests, two ordinary structural
 catalog tests and one ignored bounded execution gate:
 
 ```bash

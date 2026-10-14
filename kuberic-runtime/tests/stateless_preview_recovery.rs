@@ -52,7 +52,9 @@ use kuberic_runtime::protocol::types::{
     derive_bootstrap_history, derive_data_loss_history, derive_history_initialization_id,
     derive_initialization_id,
 };
-use kuberic_runtime::replicator::stateless::StatelessReplicatorFactory;
+use kuberic_runtime::replicator::stateless::{
+    StatelessReplicatorFactory, testing_pause_inbound_build_after_classification,
+};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorFactoryContext,
     ReplicatorInterfaces, ReplicatorSettings, StateReplicator, StatefulServicePartition,
@@ -4923,12 +4925,13 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
                 current_configuration_id: source_configuration.configuration_id.clone(),
                 target_address: format!("http://{target_address}"),
             };
+        let authority_classified = build_authority(
+            "classified-configuration-successor",
+            1,
+            "classified-successor",
+        );
         let authority_a = build_authority("superseded-build-a", 2, "superseded-build-a");
         let authority_b = build_authority("held-build-b", 3, "held-build-b");
-        target_handle
-            .install_stateless_preview_inbound_build_authority(&authority_a)
-            .await
-            .unwrap();
         let copy_frame = |authority: &PublicInboundBuildAuthority,
                           sequence,
                           snapshot_chunk,
@@ -4958,6 +4961,120 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             history: Some(history_proto(&history)),
             target_address: format!("http://{target_address}"),
         };
+        let classification_pause = testing_pause_inbound_build_after_classification(
+            authority_classified.operation_id.clone(),
+        );
+        let classified_install = tokio::spawn({
+            let target_handle = target_handle.clone();
+            let authority = authority_classified.clone();
+            async move {
+                target_handle
+                    .install_stateless_preview_inbound_build_authority(&authority)
+                    .await
+            }
+        });
+        classification_pause.wait_until_classified().await;
+        let target_configuration = ConfigurationDescriptor::new(
+            epoch,
+            source_identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source_identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target_identity.clone(),
+                    role: ReplicaRole::IdleSecondary,
+                },
+            ],
+            1,
+        );
+        let boundary_source_identity = source_identity.clone();
+        let boundary_source_session = source_handle.process_session_id();
+        let boundary_source_storage = source_storage.clone();
+        let configuration_boundary = tokio::spawn({
+            let target_handle = target_handle.clone();
+            let preview = preview.clone();
+            let target_session = target_session.clone();
+            async move {
+                target_handle
+                    .execute_stateless_preview(intent(
+                        &preview,
+                        target_session,
+                        4,
+                        "classified-successor-configuration-boundary",
+                        PublicOperationProgram::Configuration(PublicConfiguration {
+                            current: target_configuration,
+                            previous: None,
+                            replicas: vec![PublicReplicaDescriptor {
+                                build_id: OperationId::default(),
+                                identity: boundary_source_identity,
+                                replication_address: format!("http://{source_address}"),
+                                process_session_id: boundary_source_session,
+                                storage_incarnation: Some(boundary_source_storage),
+                                role: ReplicaRole::Primary,
+                                current_progress: 1,
+                                catch_up_capability: 1,
+                                must_catchup: false,
+                            }],
+                        }),
+                    ))
+                    .await
+            }
+        });
+        classification_pause.wait_until_boundary_waiting().await;
+        classification_pause.release();
+        classified_install.await.unwrap().unwrap();
+        configuration_boundary.await.unwrap().unwrap();
+
+        let connection =
+            rusqlite::Connection::open(SqliteStore::metadata_database_path(&target_root)).unwrap();
+        let json: String = connection
+            .query_row(
+                "SELECT state_json FROM agent_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let durable: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let preview_state = &durable["publicOperationPreview"];
+        assert!(
+            preview_state["currentInboundBuildAuthority"].is_null(),
+            "classified successor survived completed configuration revocation"
+        );
+        assert_eq!(preview_state["inboundBuildGeneration"], 1);
+        drop(connection);
+
+        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{target_address}"
+        ))
+        .await
+        .unwrap();
+        let mut stale_classified = client
+            .build(Request::new(stream::iter([copy_frame(
+                &authority_classified,
+                0,
+                true,
+                false,
+            )])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            stale_classified.next().await.unwrap().is_err(),
+            "revoked classified successor retained an inbound task or cursor"
+        );
+        assert_eq!(
+            *target_state.progress.lock().unwrap(),
+            DurableApplicationProgress::default()
+        );
+        assert!(target_state.copy_chunks.lock().unwrap().is_empty());
+        assert!(target_state.operations.lock().unwrap().is_empty());
+
+        target_handle
+            .install_stateless_preview_inbound_build_authority(&authority_a)
+            .await
+            .unwrap();
         let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
             "http://{target_address}"
         ))
@@ -4973,7 +5090,10 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
             .await
             .unwrap()
             .into_inner();
-        assert!(!first_a.next().await.unwrap().unwrap().final_item);
+        assert!(
+            !first_a.next().await.unwrap().unwrap().final_item,
+            "fresh post-boundary authority did not start from an empty cursor"
+        );
 
         target_state.block_finish_copy();
         let held_finish = tokio::spawn({
