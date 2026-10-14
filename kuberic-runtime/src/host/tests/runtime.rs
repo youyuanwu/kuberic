@@ -306,22 +306,22 @@ mod in_process_transport_tests {
             .unwrap();
         let raw = pending.replication_items[0].clone();
         assert!(matches!(
-            transport.enqueue(Message::Replication(raw.clone())),
+            transport.enqueue(Message::Replication(Box::new(raw.clone()))),
             Err(TransportError::StaleSession { .. })
         ));
         let mut absent = raw.clone();
         absent.receiver = Some(identity(2, "unregistered-incarnation").into());
         assert!(matches!(
-            transport.bind(Message::Replication(absent)),
+            transport.bind(Message::Replication(Box::new(absent))),
             Err(TransportError::Unregistered(_))
         ));
         let mut wrong_generation = raw.clone();
         wrong_generation.receiver.as_mut().unwrap().agent_generation = "obsolete-generation".into();
         assert!(matches!(
-            transport.bind(Message::Replication(wrong_generation)),
+            transport.bind(Message::Replication(Box::new(wrong_generation))),
             Err(TransportError::Unregistered(_))
         ));
-        let bound = transport.bind(Message::Replication(raw)).unwrap();
+        let bound = transport.bind(Message::Replication(Box::new(raw))).unwrap();
         for sender in [false, true] {
             let Message::Replication(mut stale) = bound.clone() else {
                 unreachable!()
@@ -372,7 +372,7 @@ mod in_process_transport_tests {
             })
             .await
             .unwrap();
-        let raw = Message::Replication(pending.replication_items[0].clone());
+        let raw = Message::Replication(Box::new(pending.replication_items[0].clone()));
         let delayed = transport.bind(raw.clone()).unwrap();
         let ticket = transport.enqueue(delayed.clone()).unwrap();
         event(&mut transport, |e| {
@@ -443,9 +443,9 @@ mod in_process_transport_tests {
             .await
             .unwrap();
         let delayed = transport
-            .bind(Message::Replication(
+            .bind(Message::Replication(Box::new(
                 unfinished.replication_items[0].clone(),
-            ))
+            )))
             .unwrap();
         let ticket = transport.enqueue(delayed.clone()).unwrap();
         let recovered_app = Arc::new(TestApplication::default());
@@ -542,7 +542,11 @@ mod in_process_transport_tests {
         let mut stream = target_app.held_streams.lock().unwrap().remove(1);
         for item in &items {
             let id = transport
-                .enqueue(transport.bind(Message::Copy(item.clone())).unwrap())
+                .enqueue(
+                    transport
+                        .bind(Message::Copy(Box::new(item.clone())))
+                        .unwrap(),
+                )
                 .unwrap();
             let report = transport.pump();
             assert_eq!(report.in_flight, 1);

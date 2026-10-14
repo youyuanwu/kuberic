@@ -30,13 +30,14 @@ mod program;
 #[allow(unused_imports)]
 pub(crate) use program::{abort, operation_instructions, repeatable, replayable};
 
+type ApplicationControlMatch = Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) application: Arc<dyn StatefulServiceReplica>,
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
-    pub(crate) application_control_match:
-        Option<Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>>,
+    pub(crate) application_control_match: Option<ApplicationControlMatch>,
     pub(crate) capabilities: ReplicatorCapabilities,
     pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,

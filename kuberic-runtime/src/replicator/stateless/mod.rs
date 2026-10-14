@@ -622,7 +622,6 @@ impl StatelessReplicator {
             })?;
         let epoch: Epoch = item
             .epoch
-            .clone()
             .ok_or_else(|| Status::invalid_argument("missing epoch"))?
             .into();
         if receiver != self.identity
@@ -951,7 +950,6 @@ impl StatelessReplicator {
                 })?;
             let acknowledgement_epoch: Epoch = acknowledgement
                 .epoch
-                .clone()
                 .ok_or_else(|| ReplicationSendFailure::Rejected("ACK epoch is absent".into()))?
                 .into();
             if acknowledgement.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
@@ -1565,7 +1563,6 @@ impl StatelessReplicator {
             })?;
         let epoch: Epoch = item
             .epoch
-            .clone()
             .ok_or_else(|| Status::invalid_argument("missing build epoch"))?
             .into();
         let source_storage = crate::control::convert::public_v1_storage_from_proto(
@@ -2565,9 +2562,7 @@ impl StateReplicator for StatelessReplicator {
             state.applied_lsn = state.applied_lsn.max(applied.applied_lsn);
             state.ambiguous_suffix = state.applied_lsn > state.committed_lsn;
         }
-        if let Err(error) = self.publish_progress(true).await {
-            return Err(error);
-        }
+        self.publish_progress(true).await?;
         let mut acknowledgements = std::collections::BTreeSet::from([self.identity.clone()]);
         let quorum = |acknowledgements: &BTreeSet<ReplicaIdentity>,
                       configuration: &ConfigurationDescriptor| {
@@ -2654,10 +2649,11 @@ impl StateReplicator for StatelessReplicator {
             self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
                 RuntimeError::Application("preview creation is unattached".into())
             })?;
-        for peer in authority.peers.values().cloned() {
+        for peer in authority.peers.values() {
             let engine = engine.clone();
             let authority = authority.clone();
             let operation = operation.clone();
+            let peer = peer.clone();
             let task = tokio::spawn(async move {
                 let _ = engine
                     .send_replication(&authority, &peer, &operation, lsn)

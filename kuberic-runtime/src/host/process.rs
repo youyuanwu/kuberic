@@ -876,7 +876,7 @@ impl ReplicaHandle {
         self.runtime
             .install_stateless_preview_inbound_build_authority(authority)
             .await
-            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string().into()))
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
     }
 
     #[cfg(feature = "testing")]

@@ -586,6 +586,7 @@ struct PreviewApplication {
     replication_address: String,
     control: RwLock<Option<Arc<dyn Replicator>>>,
     state_replicator: RwLock<Option<Arc<dyn StateReplicator>>>,
+    #[allow(clippy::disallowed_types)]
     primary: RwLock<Option<Arc<dyn kuberic_runtime::replicator::PrimaryReplicator>>>,
     partition: RwLock<Option<StatefulServicePartition>>,
     legacy_factory: bool,
@@ -4378,7 +4379,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         .unwrap();
         drive_session_renewal(
             &primary_renewal,
-            &[secondary_predecessor.process_session_id.clone()],
+            std::slice::from_ref(&secondary_predecessor.process_session_id),
             true,
         )
         .await;
@@ -5097,7 +5098,6 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
 
         target_state.block_finish_copy();
         let held_finish = tokio::spawn({
-            let target_address = target_address;
             let frame = copy_frame(&authority_a, 1, false, false);
             async move {
                 let mut client = proto::replication_data_client::ReplicationDataClient::connect(
@@ -5151,7 +5151,6 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         assert!(!first_b.next().await.unwrap().unwrap().final_item);
         target_state.block_finish_copy();
         let mut held_b = tokio::spawn({
-            let target_address = target_address;
             let mut frame = copy_frame(&authority_b, 1, false, false);
             frame.lsn = 0;
             frame.committed_lsn = 0;

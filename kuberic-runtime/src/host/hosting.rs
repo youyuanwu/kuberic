@@ -359,7 +359,7 @@ pub(crate) struct PreparedCopy {
 #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
 pub(crate) enum OutboundReplication {
     Replication(proto::ReplicationItem),
-    Copy(proto::CopyItem),
+    Copy(Box<proto::CopyItem>),
     Build(ReplicaEndpoint),
     Remove(crate::protocol::types::ReplicaId),
     Evict(ReplicaIdentity),
@@ -2317,7 +2317,9 @@ impl RuntimeDataPlane {
             OutboundOperation::Replication(item) => {
                 OutboundReplication::Replication(replication_to_proto(item))
             }
-            OutboundOperation::Copy(item) => OutboundReplication::Copy(copy_to_proto(item)),
+            OutboundOperation::Copy(item) => {
+                OutboundReplication::Copy(Box::new(copy_to_proto(item)))
+            }
             OutboundOperation::Build(replica) => OutboundReplication::Build(replica),
             OutboundOperation::Remove(replica_id) => OutboundReplication::Remove(replica_id),
             OutboundOperation::Evict(identity) => OutboundReplication::Evict(identity),
