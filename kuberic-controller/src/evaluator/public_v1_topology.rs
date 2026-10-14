@@ -30,6 +30,9 @@ pub enum PublicV1TopologyPlan {
         expected: Option<ConfigurationId>,
         next: Box<ConfigurationDescriptor>,
     },
+    RoutePrimary {
+        primary: kuberic_runtime::protocol::types::ReplicaIdentity,
+    },
     Wait,
     Stable,
 }
@@ -40,6 +43,7 @@ pub fn plan_public_v1_topology(
     replicas: &[PublicV1TopologyReplica],
     desired_replicas: u32,
     switchover_target: Option<ReplicaId>,
+    routed_primary: Option<ReplicaId>,
     resource_version: &str,
 ) -> Result<PublicV1TopologyPlan, String> {
     accepted.validate_evidence().map_err(str::to_owned)?;
@@ -75,17 +79,83 @@ pub fn plan_public_v1_topology(
 
     let primary_id = choose_primary(current, &eligible, switchover_target)?;
     let next = desired_configuration(current, &eligible, primary_id)?;
+    let transfer = current
+        .filter(|configuration| {
+            configuration.primary_id != next.primary_id
+                && !next
+                    .members
+                    .iter()
+                    .any(|member| member.identity.replica_id == configuration.primary_id)
+                && observed
+                    .iter()
+                    .any(|replica| replica.report.replica.replica_id == configuration.primary_id)
+        })
+        .map(|configuration| {
+            let members = configuration
+                .members
+                .iter()
+                .cloned()
+                .map(|mut member| {
+                    member.role = if member.identity.replica_id == next.primary_id {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    };
+                    member
+                })
+                .collect();
+            ConfigurationDescriptor::new(
+                Epoch::new(
+                    configuration.epoch.data_loss_number,
+                    configuration.epoch.configuration_number + 1,
+                ),
+                next.primary_id,
+                members,
+                configuration.write_quorum,
+            )
+        });
+    let operational_next = transfer.as_ref().unwrap_or(&next);
+    let operational_replicas = if transfer.is_some() {
+        &observed
+    } else {
+        &eligible
+    };
     if let Some(current) = current
-        && switchover_target.is_some()
-        && current.primary_id != next.primary_id
-    {
-        let source = observed
+        && current.primary_id != operational_next.primary_id
+        && let Some(source) = observed
             .iter()
             .find(|replica| replica.report.replica.replica_id == current.primary_id)
-            .ok_or_else(|| "planned switchover source is unavailable".to_string())?;
+    {
+        let catch_up_id = OperationId::new(format!(
+            "topology-{}-catch-up-{}",
+            current.configuration_id, operational_next.primary_id
+        ));
+        if !accepted.completed_operations.iter().any(|completion| {
+            completion.operation_id == catch_up_id
+                && completion.result == PublicV1AcceptedResult::Succeeded
+        }) {
+            return begin_operation(
+                accepted,
+                source,
+                PublicOperationProgram::CatchUp {
+                    configuration: public_configuration(
+                        &source.report.replica,
+                        &observed,
+                        current,
+                    )?,
+                    mode: PublicCatchUpMode::All,
+                },
+                catch_up_id,
+                resource_version,
+            )
+            .map(|(transition, command)| PublicV1TopologyPlan::Begin {
+                transition: Box::new(transition),
+                command: Box::new(command),
+            });
+        }
         let swap_id = OperationId::new(format!(
             "topology-{}-swap-{}",
-            current.configuration_id, next.primary_id
+            current.configuration_id, operational_next.primary_id
         ));
         if !accepted.completed_operations.iter().any(|completion| {
             completion.operation_id == swap_id
@@ -94,7 +164,7 @@ pub fn plan_public_v1_topology(
             return begin_swap(
                 accepted,
                 current,
-                &next,
+                operational_next,
                 &observed,
                 source,
                 swap_id,
@@ -146,11 +216,12 @@ pub fn plan_public_v1_topology(
             });
         }
     }
-    for replica in &eligible {
-        for (step, program) in operation_sequence(replica, &eligible, &next)? {
+    for replica in operational_replicas {
+        for (step, program) in operation_sequence(replica, operational_replicas, operational_next)?
+        {
             let operation_id = OperationId::new(format!(
                 "topology-{}-{}-{}-{}",
-                next.configuration_id,
+                operational_next.configuration_id,
                 replica.report.replica.replica_id,
                 replica.report.process_session_id,
                 step
@@ -168,6 +239,40 @@ pub fn plan_public_v1_topology(
                     command: Box::new(command),
                 });
         }
+    }
+
+    if let Some(current) = current
+        && current.primary_id != operational_next.primary_id
+    {
+        let primary = operational_replicas
+            .iter()
+            .find(|replica| replica.report.replica.replica_id == operational_next.primary_id)
+            .ok_or_else(|| "public-v1 transfer target is unavailable".to_string())?;
+        if primary.report.role != ReplicaRole::Primary
+            || primary.report.write_status
+                != kuberic_runtime::protocol::types::AccessStatus::Granted
+            || observed.iter().any(|replica| {
+                replica.report.replica.replica_id != next.primary_id
+                    && replica.report.write_status
+                        == kuberic_runtime::protocol::types::AccessStatus::Granted
+            })
+        {
+            return Ok(PublicV1TopologyPlan::Wait);
+        }
+        if routed_primary != Some(operational_next.primary_id) {
+            return Ok(PublicV1TopologyPlan::RoutePrimary {
+                primary: primary.report.replica.clone(),
+            });
+        }
+    }
+
+    if let Some(transfer) = transfer
+        && current != Some(&transfer)
+    {
+        return Ok(PublicV1TopologyPlan::PersistTopology {
+            expected: current.map(|configuration| configuration.configuration_id.clone()),
+            next: Box::new(transfer),
+        });
     }
 
     if let Some(current) = current
@@ -705,6 +810,10 @@ fn begin_operation(
     intent.validate().map_err(str::to_owned)?;
     let call_kind = call_kind(&intent)?;
     let (previous_configuration_id, current_configuration_id) = configuration_ids(&intent);
+    let (catch_up_mode, catch_up_specific_quorum) = match intent.program.as_ref() {
+        Some(PublicOperationProgram::CatchUp { mode, .. }) => (Some(*mode), None),
+        _ => (None, None),
+    };
     let transition = PublicV1AcceptedTransitionStatus {
         resource_version: resource_version.to_string(),
         evidence: accepted.clone(),
@@ -724,8 +833,8 @@ fn begin_operation(
             replay_disposition: intent.replay_disposition,
             previous_configuration_id,
             current_configuration_id,
-            catch_up_mode: None,
-            catch_up_specific_quorum: None,
+            catch_up_mode,
+            catch_up_specific_quorum,
         },
     };
     transition.validate()?;

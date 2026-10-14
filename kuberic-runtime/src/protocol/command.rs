@@ -299,6 +299,35 @@ impl PublicV1SessionRenewalCommand {
             }
         }
     }
+
+    pub fn expected_endpoint(&self) -> &crate::protocol::types::ProcessSessionEndpoint {
+        match self {
+            Self::CloseAccessAndIngress { accepted }
+            | Self::ReplayReplacementRole { accepted, .. } => accepted
+                .required
+                .replacement
+                .as_ref()
+                .expect("validated session-renewal replacement"),
+            Self::UpdateEpochBarrier { survivor, .. } => survivor,
+            Self::InstallFreshConfiguration {
+                accepted,
+                configuration,
+            } => {
+                let primary = configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == configuration.primary_id)
+                    .expect("validated fresh configuration primary");
+                accepted
+                    .required
+                    .replacement
+                    .iter()
+                    .chain(accepted.required.surviving_sessions.iter())
+                    .find(|endpoint| endpoint.identity == primary.identity)
+                    .expect("validated fresh configuration endpoint")
+            }
+        }
+    }
 }
 
 impl PublicV1HistoryCommand {

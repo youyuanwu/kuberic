@@ -4,16 +4,19 @@ use kuberic_runtime::control::{
 };
 use kuberic_runtime::protocol::command::{
     ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
+    PublicV1SessionRenewalCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicBuildAttemptReference, PublicInboundBuildAuthority, PublicOperationClass,
-    PublicOperationIntent, PublicOperationProgram, PublicV1Identity,
+    ProcessSessionRenewalRequired, PublicBuildAttemptReference, PublicInboundBuildAuthority,
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1Identity,
+    PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
-    AgentGeneration, ConfigurationId, Epoch, OperationId, PodUid, ProcessSessionId,
-    PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration,
-    derive_bootstrap_history, derive_history_initialization_id,
+    AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch,
+    OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
+    PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
+    StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
 };
 
 fn identity() -> ReplicaIdentity {
@@ -62,6 +65,60 @@ fn accepted() -> kuberic_runtime::protocol::public_operations::PublicV1AcceptedS
         data_loss_recovery: None,
         completed_operations: Vec::new(),
         extensions: Default::default(),
+    }
+}
+
+fn renewal_required() -> ProcessSessionRenewalRequired {
+    let accepted = accepted();
+    let predecessor = ProcessSessionEndpoint {
+        identity: identity(),
+        storage_incarnation: storage(),
+        process_session_id: ProcessSessionId::new("session-old"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-old"),
+        role: ReplicaRole::Primary,
+    };
+    let replacement = ProcessSessionEndpoint {
+        process_session_id: ProcessSessionId::new("session-new"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-new"),
+        role: ReplicaRole::None,
+        ..predecessor.clone()
+    };
+    let survivor_storage = target_storage();
+    let survivor = ProcessSessionEndpoint {
+        identity: survivor_storage.replica.clone(),
+        storage_incarnation: survivor_storage,
+        process_session_id: ProcessSessionId::new("session-2"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-2"),
+        role: ReplicaRole::ActiveSecondary,
+    };
+    let renewal_epoch = Epoch::new(0, 2);
+    ProcessSessionRenewalRequired {
+        operation_id: OperationId::new("renewal-1"),
+        reason: ProcessSessionRenewalReason::PrimaryReplacement,
+        resource_uid: accepted.history.resource_uid.clone(),
+        history: accepted.history,
+        previous_epoch: Epoch::new(0, 1),
+        renewal_epoch,
+        predecessor,
+        replacement: Some(replacement),
+        surviving_sessions: vec![survivor.clone()],
+        fresh_configuration: ConfigurationDescriptor::new(
+            renewal_epoch,
+            ReplicaId::new(1),
+            vec![
+                ConfigurationMember {
+                    identity: identity(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: survivor.identity,
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            1,
+        ),
+        predecessor_contained: true,
+        data_loss: None,
     }
 }
 
@@ -197,6 +254,92 @@ fn public_v1_inbound_build_authority_commands_round_trip() {
         assert_eq!(
             normalize_execute_request(request).unwrap().command,
             ProtocolCommand::PublicV1History(Box::new(command))
+        );
+    }
+}
+
+#[test]
+fn public_v1_session_renewal_commands_round_trip_with_one_kind_per_layer() {
+    let required = PublicV1SessionRenewalStatus::required(renewal_required()).unwrap();
+    let closed = required.close_access().unwrap();
+    let frozen = closed.freeze_surviving_set().unwrap();
+    let barriers = frozen.begin_epoch_barriers().unwrap();
+    let survivor = barriers.required.surviving_sessions[0].clone();
+    let updated = barriers
+        .record_epoch_updated(&survivor, barriers.required.renewal_epoch)
+        .unwrap();
+    let role_pending = updated.finish_epoch_barriers().unwrap();
+    let configuration_pending = role_pending
+        .replay_replacement_role(
+            &role_pending
+                .required
+                .replacement
+                .as_ref()
+                .unwrap()
+                .process_session_id,
+            role_pending.required.renewal_epoch,
+            ReplicaRole::Primary,
+        )
+        .unwrap();
+    let commands = [
+        PublicV1SessionRenewalCommand::CloseAccessAndIngress { accepted: required },
+        PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+            epoch: barriers.required.renewal_epoch,
+            survivor,
+            accepted: barriers,
+        },
+        PublicV1SessionRenewalCommand::ReplayReplacementRole {
+            process_session_id: role_pending
+                .required
+                .replacement
+                .as_ref()
+                .unwrap()
+                .process_session_id
+                .clone(),
+            epoch: role_pending.required.renewal_epoch,
+            role: ReplicaRole::Primary,
+            accepted: role_pending,
+        },
+        PublicV1SessionRenewalCommand::InstallFreshConfiguration {
+            configuration: configuration_pending.required.fresh_configuration.clone(),
+            accepted: configuration_pending,
+        },
+    ];
+    for command in commands {
+        let expected_endpoint = command.expected_endpoint().clone();
+        let history = PublicV1HistoryCommand::SessionRenewal {
+            command: Box::new(command),
+        };
+        let json = serde_json::to_value(&history).unwrap();
+        assert_eq!(
+            json.get("kind").and_then(serde_json::Value::as_str),
+            Some("sessionRenewal")
+        );
+        assert_eq!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| key.as_str() == "kind")
+                .count(),
+            1
+        );
+        assert!(
+            json.get("command")
+                .and_then(|value| value.get("kind"))
+                .is_some()
+        );
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: "resource-1".into(),
+            target: Some(expected_endpoint.identity.into()),
+            expected_process_session_id: expected_endpoint.process_session_id.to_string(),
+            command: Some(proto::execute_command_request::Command::PublicV1History(
+                public_v1_history_command_to_proto(&history).unwrap(),
+            )),
+        };
+        assert_eq!(
+            normalize_execute_request(request).unwrap().command,
+            ProtocolCommand::PublicV1History(Box::new(history))
         );
     }
 }

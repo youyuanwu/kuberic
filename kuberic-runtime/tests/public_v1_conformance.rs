@@ -20,6 +20,12 @@ fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
         "KSF-16 mutation oracle accepted an extra owner/endpoint"
     );
     let mutation =
+        kuberic_runtime::testing::replacement_ownership_inventory_with_alternate_factory_fixture();
+    assert!(
+        kuberic_runtime::testing::validate_replacement_ownership_inventory(&mutation).is_err(),
+        "KSF-16 mutation oracle accepted an alternate factory"
+    );
+    let mutation =
         kuberic_runtime::testing::replacement_ownership_inventory_with_alternate_protocol_fixture();
     assert!(
         kuberic_runtime::testing::validate_replacement_ownership_inventory(&mutation).is_err(),

@@ -59,6 +59,32 @@ pub trait PublicV1OperationApi: Send + Sync {
         Err("public-v1 primary availability persistence is unsupported".into())
     }
 
+    async fn begin_public_v1_replacement(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_topology: &ConfigurationId,
+        _predecessor: &kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<(), String> {
+        Err("public-v1 replacement authority is unsupported".into())
+    }
+
+    async fn bind_public_v1_replacement(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_operation: &kuberic_runtime::protocol::types::OperationId,
+        _replacement: &kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<(), String> {
+        Err("public-v1 replacement binding is unsupported".into())
+    }
+
+    async fn complete_public_v1_replacement(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_operation: &kuberic_runtime::protocol::types::OperationId,
+    ) -> Result<(), String> {
+        Err("public-v1 replacement completion is unsupported".into())
+    }
+
     async fn begin_public_v1_operation(
         &self,
         _scope: &PublicV1Scope,

@@ -157,10 +157,10 @@ struct ProductionSources<'a> {
     public_operations: &'a str,
     host_operation: &'a str,
     host_lifecycle_program: &'a str,
-    controller_modules: &'a [&'a str],
-    control_services: &'a [&'a str],
-    data_services: &'a [&'a str],
-    factories: &'a [&'a str],
+    controller_modules: &'a [controller_registration::PublicV1ControllerRegistration],
+    control_services: &'a [crate::host::service::PublicV1ControlServiceRegistration],
+    data_services: &'a [crate::replicator::stateless::PublicV1DataServiceRegistration],
+    factories: &'a [crate::replicator::PublicV1FactoryRegistration],
     host_attachments: &'a [&'a str],
     report_branches: &'a [&'a str],
     store_tables: &'a [&'a str],
@@ -174,7 +174,7 @@ fn production_sources() -> ProductionSources<'static> {
         public_operations: PUBLIC_OPERATIONS,
         host_operation: HOST_OPERATION,
         host_lifecycle_program: HOST_LIFECYCLE_PROGRAM,
-        controller_modules: controller_registration::PUBLIC_V1_CONTROLLER_MODULES,
+        controller_modules: controller_registration::PUBLIC_V1_CONTROLLER_REGISTRATIONS,
         control_services: crate::host::service::PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS,
         data_services: crate::replicator::stateless::PUBLIC_V1_DATA_SERVICE_REGISTRATIONS,
         factories: crate::replicator::PUBLIC_V1_FACTORY_REGISTRATIONS,
@@ -198,17 +198,21 @@ fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipIn
         sources
             .factories
             .iter()
-            .map(|name| (*name).to_string())
+            .map(|registration| registration.name().to_string())
             .collect(),
     );
-    let services = sorted_unique(
+    let mut services = sources
+        .control_services
+        .iter()
+        .map(|registration| registration.name().to_string())
+        .collect::<Vec<_>>();
+    services.extend(
         sources
-            .control_services
+            .data_services
             .iter()
-            .chain(sources.data_services.iter())
-            .map(|name| (*name).to_string())
-            .collect(),
+            .map(|registration| registration.name().to_string()),
     );
+    let services = sorted_unique(services);
     let store_tables = sorted_unique(
         sources
             .store_tables
@@ -230,7 +234,7 @@ fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipIn
     let controller_modules = sources
         .controller_modules
         .iter()
-        .map(|name| (*name).to_string())
+        .map(|registration| registration.name().to_string())
         .collect();
     ReplacementOwnershipInventory {
         factories,
@@ -263,12 +267,25 @@ pub fn replacement_ownership_inventory() -> ReplacementOwnershipInventory {
 pub fn replacement_ownership_inventory_with_extra_endpoint_fixture() -> ReplacementOwnershipInventory
 {
     let control_services = [
-        "AgentControlServer",
-        "ReplicaPeerServer",
-        "AlternateContinuationServer",
+        crate::host::service::PublicV1ControlServiceRegistration::AgentControl,
+        crate::host::service::PublicV1ControlServiceRegistration::ReplicaPeer,
+        crate::host::service::PublicV1ControlServiceRegistration::Alternate,
     ];
     discover_inventory(&ProductionSources {
         control_services: &control_services,
+        ..production_sources()
+    })
+}
+
+pub fn replacement_ownership_inventory_with_alternate_factory_fixture()
+-> ReplacementOwnershipInventory {
+    let factories = [
+        crate::replicator::PublicV1FactoryRegistration::Default,
+        crate::replicator::PublicV1FactoryRegistration::Stateless,
+        crate::replicator::PublicV1FactoryRegistration::Alternate,
+    ];
+    discover_inventory(&ProductionSources {
+        factories: &factories,
         ..production_sources()
     })
 }
@@ -284,8 +301,10 @@ pub fn replacement_ownership_inventory_with_alternate_protocol_fixture()
 
 pub fn replacement_ownership_inventory_with_alternate_controller_fixture()
 -> ReplacementOwnershipInventory {
-    let mut controller_modules = controller_registration::PUBLIC_V1_CONTROLLER_MODULES.to_vec();
-    controller_modules.push("alternate_controller_owner");
+    let controller_modules = [
+        controller_registration::PublicV1ControllerRegistration::Reconciler,
+        controller_registration::PublicV1ControllerRegistration::Alternate,
+    ];
     discover_inventory(&ProductionSources {
         controller_modules: &controller_modules,
         ..production_sources()
@@ -351,28 +370,7 @@ pub fn validate_replacement_ownership_inventory(
     if inventory.protocol_versions.as_slice() != ["PUBLIC_V1_PROTOCOL_VERSION"] {
         return reject("protocol version", &inventory.protocol_versions);
     }
-    if inventory.controller_modules.as_slice()
-        != [
-            "cluster_api",
-            "crd",
-            "error",
-            "evaluator",
-            "executor",
-            "observation",
-            "public_v1_evidence",
-            "public_v1_history",
-            "public_v1_lifecycle",
-            "public_v1_normalize",
-            "public_v1_operations",
-            "public_v1_reconciliation",
-            "public_v1_service",
-            "public_v1_session_renewal",
-            "public_v1_topology",
-            "reconciler",
-            "testing",
-            "tests",
-        ]
-    {
+    if inventory.controller_modules.as_slice() != ["reconciler"] {
         return reject("controller module", &inventory.controller_modules);
     }
     if REPLICATOR.contains("LegacyManaged")
@@ -406,6 +404,22 @@ fn sources_contain_alternate_protocol(sources: &ProductionSources<'_>) -> bool {
 }
 
 fn replacement_ownership_gate() {
+    crate::replicator::validate_public_v1_factories(
+        crate::replicator::PUBLIC_V1_FACTORY_REGISTRATIONS,
+    )
+    .unwrap();
+    crate::host::service::validate_public_v1_control_services(
+        crate::host::service::PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS,
+    )
+    .unwrap();
+    crate::replicator::stateless::validate_public_v1_data_services(
+        crate::replicator::stateless::PUBLIC_V1_DATA_SERVICE_REGISTRATIONS,
+    )
+    .unwrap();
+    controller_registration::validate_public_v1_controller_registrations(
+        controller_registration::PUBLIC_V1_CONTROLLER_REGISTRATIONS,
+    )
+    .unwrap();
     let inventory = replacement_ownership_inventory();
     validate_replacement_ownership_inventory(&inventory).unwrap();
 }

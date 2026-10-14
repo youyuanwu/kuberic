@@ -4321,11 +4321,15 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             }],
             1,
         );
+        let primary_report = restarted_primary_handle
+            .public_v1_report()
+            .await
+            .unwrap();
         let primary_replacement = ProcessSessionEndpoint {
             identity: primary_predecessor.identity.clone(),
             storage_incarnation: primary_predecessor.storage_incarnation.clone(),
             process_session_id: restarted_primary_handle.process_session_id(),
-            replicator_creation_id: ReplicatorCreationId::new("renew-primary-process-creation"),
+            replicator_creation_id: primary_report.replicator_creation_id.clone(),
             role: ReplicaRole::None,
         };
         let primary_renewal = HostedPublicV1Harness::new(
@@ -4335,10 +4339,6 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             evidence.clone(),
         )
         .unwrap();
-        let primary_report = restarted_primary_handle
-            .public_v1_report()
-            .await
-            .unwrap();
         execute_public_v1_session_renewal(
             &primary_renewal,
             &test_scope(&resource_uid),
@@ -4384,11 +4384,15 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             .await
             .unwrap();
 
+        let secondary_report = restarted_secondary_handle
+            .public_v1_report()
+            .await
+            .unwrap();
         let secondary_replacement = ProcessSessionEndpoint {
             identity: secondary_predecessor.identity.clone(),
             storage_incarnation: secondary_predecessor.storage_incarnation.clone(),
             process_session_id: restarted_secondary_handle.process_session_id(),
-            replicator_creation_id: ReplicatorCreationId::new("renew-secondary-process-creation"),
+            replicator_creation_id: secondary_report.replicator_creation_id.clone(),
             role: ReplicaRole::None,
         };
         let secondary_renewal = HostedPublicV1Harness::new(
@@ -4398,10 +4402,6 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             evidence.clone(),
         )
         .unwrap();
-        let secondary_report = restarted_secondary_handle
-            .public_v1_report()
-            .await
-            .unwrap();
         execute_public_v1_session_renewal(
             &secondary_renewal,
             &test_scope(&resource_uid),

@@ -80,36 +80,87 @@ async fn cleanup_stale_scaffolding(
         return Ok(true);
     }
 
-    for member in &current.members {
-        let canonical_pvc_name = format!(
-            "{}-{}-data",
-            raw.set.name_any(),
-            member.identity.replica_id.value()
-        );
-        let canonical_pvc = raw
-            .pvcs
+    Ok(false)
+}
+
+async fn reconcile_replacement_cleanup(
+    raw: &crate::observation::RawObservation,
+    current: Option<&ConfigurationDescriptor>,
+    scope: &PublicV1Scope,
+    api: &dyn ProductionClusterApi,
+) -> Result<bool> {
+    let Some(replacement) = raw
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.public_v1_replacement.as_ref())
+    else {
+        return Ok(false);
+    };
+    replacement
+        .validate()
+        .map_err(ControllerError::InvalidAgentEvidence)?;
+    let Some(target) = replacement.replacement.as_ref() else {
+        return Ok(false);
+    };
+    let admitted = current.is_some_and(|configuration| {
+        configuration
+            .members
             .iter()
-            .find(|pvc| pvc.name_any() == canonical_pvc_name);
-        let current_pod_present = raw
-            .pods
+            .any(|member| member.identity == target.replica)
+    });
+    if !admitted {
+        return Ok(false);
+    }
+    let target_is_primary =
+        current.is_some_and(|configuration| configuration.primary_id == target.replica.replica_id);
+    if target_is_primary {
+        let routed = raw
+            .services
             .iter()
-            .any(|pod| pod.uid().as_deref() == Some(member.identity.instance_id.as_str()));
-        if canonical_pvc.is_some() && !current_pod_present {
-            let pvc_uid = canonical_pvc
-                .and_then(kube::ResourceExt::uid)
-                .map(PvcUid::new);
-            api.delete_replica_scaffolding(
-                raw,
-                None,
-                None,
-                Some(&canonical_pvc_name),
-                pvc_uid.as_ref(),
-            )
-            .await?;
-            return Ok(true);
+            .find(|service| service.name_any() == format!("{}-write", raw.set.name_any()))
+            .and_then(|service| service.spec.as_ref())
+            .and_then(|spec| spec.selector.as_ref())
+            .and_then(|selector| selector.get(crate::crd::INSTANCE_LABEL))
+            .is_some_and(|instance| instance == target.replica.instance_id.as_str());
+        if !routed {
+            return Ok(false);
         }
     }
-    Ok(false)
+    let (pod_uid, pvc_uid) = match &replacement.predecessor.storage {
+        kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+            pod_uid,
+            pvc_uid,
+        } => (Some(pod_uid), Some(pvc_uid)),
+        kuberic_runtime::protocol::types::ReplicaStorageIdentity::Volatile { .. } => (None, None),
+    };
+    let pod_name = pod_uid.and_then(|uid| {
+        raw.pods
+            .iter()
+            .find(|pod| pod.uid().as_deref() == Some(uid.as_str()))
+            .map(ResourceExt::name_any)
+    });
+    let pvc_name = pvc_uid.and_then(|uid| {
+        raw.pvcs
+            .iter()
+            .find(|pvc| pvc.uid().as_deref() == Some(uid.as_str()))
+            .map(ResourceExt::name_any)
+    });
+    if pod_name.is_some() || pvc_name.is_some() {
+        api.delete_replica_scaffolding(
+            raw,
+            pod_name.as_deref(),
+            pod_uid,
+            pvc_name.as_deref(),
+            pvc_uid,
+        )
+        .await?;
+        return Ok(true);
+    }
+    api.complete_public_v1_replacement(scope, &replacement.operation_id)
+        .await
+        .map_err(ControllerError::InvalidAgentEvidence)?;
+    Ok(true)
 }
 
 fn required_session_renewal(
@@ -129,6 +180,15 @@ fn required_session_renewal(
         }) else {
             continue;
         };
+        let session_changed =
+            replacement_report.process_session_id != predecessor.process_session_id;
+        let creation_changed =
+            replacement_report.replicator_creation_id != predecessor.replicator_creation_id;
+        if session_changed != creation_changed {
+            return Err(ControllerError::InvalidAgentEvidence(
+                "public-v1 process replacement changed only one session identity component".into(),
+            ));
+        }
         let mut surviving_sessions = Vec::with_capacity(topology.sessions.len().saturating_sub(1));
         for survivor in topology
             .sessions
@@ -252,6 +312,14 @@ impl Reconciler {
             .observe_public_v1_topology(&scope)
             .await
             .map_err(ControllerError::InvalidAgentEvidence)?;
+        if reconcile_replacement_cleanup(&raw, current_topology.as_ref(), &scope, self.api.as_ref())
+            .await?
+        {
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            });
+        }
         if cleanup_stale_scaffolding(&raw, current_topology.as_ref(), self.api.as_ref()).await? {
             return Ok(ReconcileAction {
                 requeue_after: Duration::ZERO,
@@ -278,43 +346,76 @@ impl Reconciler {
                 if member.identity.replica_id.value() > i64::from(raw.set.spec.replicas) {
                     return false;
                 }
-                let old_missing = !raw
-                    .pods
+                !raw.pods
                     .iter()
-                    .any(|pod| pod.uid().as_deref() == Some(member.identity.instance_id.as_str()));
-                let replacement = raw.pods.iter().find(|pod| {
-                    pod.labels()
-                        .get(crate::crd::REPLICA_ID_LABEL)
-                        .is_some_and(|value| value == &member.identity.replica_id.to_string())
-                        && pod.uid().as_deref() != Some(member.identity.instance_id.as_str())
+                    .any(|pod| pod.uid().as_deref() == Some(member.identity.instance_id.as_str()))
+            })
+        {
+            let replacement_state = raw
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref());
+            if replacement_state.is_none() {
+                let predecessor = raw
+                    .set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.public_v1_topology.as_ref())
+                    .and_then(|topology| {
+                        topology
+                            .sessions
+                            .iter()
+                            .find(|session| session.identity == member.identity)
+                    })
+                    .ok_or_else(|| {
+                        ControllerError::InvalidAgentEvidence(
+                            "admitted replacement loss lacks predecessor session".into(),
+                        )
+                    })?;
+                self.api
+                    .begin_public_v1_replacement(
+                        &scope,
+                        &configuration.configuration_id,
+                        &predecessor.storage_incarnation,
+                    )
+                    .await
+                    .map_err(ControllerError::InvalidAgentEvidence)?;
+                return Ok(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Applied,
                 });
-                let replacement_ready = replacement.is_some_and(|pod| {
-                    pod.uid().is_some_and(|pod_uid| {
+            }
+            let replacement_ready = raw.pods.iter().any(|pod| {
+                pod.labels()
+                    .get(crate::crd::REPLICA_ID_LABEL)
+                    .is_some_and(|value| value == &member.identity.replica_id.to_string())
+                    && pod.uid().as_deref() != Some(member.identity.instance_id.as_str())
+                    && pod.uid().is_some_and(|pod_uid| {
                         raw.services.iter().any(|service| {
                             service.spec.as_ref().is_some_and(|spec| {
                                 spec.selector.as_ref().is_some_and(|selector| {
                                     selector
                                         .get(crate::crd::INSTANCE_LABEL)
                                         .is_some_and(|selected| selected == &pod_uid)
-                                }) && spec.ports.as_ref().is_some_and(|ports| {
-                                    ports
-                                        .iter()
-                                        .any(|port| port.name.as_deref() == Some("replication"))
                                 })
                             })
                         })
                     })
-                });
-                old_missing && !replacement_ready
-            })
-        {
-            self.api
-                .ensure_replacement_scaffolding(&raw, member.identity.replica_id, &member.identity)
-                .await?;
-            return Ok(ReconcileAction {
-                requeue_after: Duration::ZERO,
-                kind: ReconcileKind::Executed,
             });
+            if !replacement_ready {
+                self.api
+                    .ensure_replacement_scaffolding(
+                        &raw,
+                        member.identity.replica_id,
+                        &member.identity,
+                    )
+                    .await?;
+                return Ok(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Executed,
+                });
+            }
         }
         if let Some(command) = next_initialization_command(&raw, &resource_uid, &replica_ids)? {
             self.api
@@ -347,6 +448,27 @@ impl Reconciler {
             })
             .collect::<Vec<_>>();
         let status = raw.set.status.as_ref();
+        if let Some(replacement) = status.and_then(|status| status.public_v1_replacement.as_ref())
+            && replacement.replacement.is_none()
+            && let Some(target) = reports.iter().find(|report| {
+                report.replica.replica_id == replacement.predecessor.replica.replica_id
+                    && report.replica != replacement.predecessor.replica
+                    && report.storage_incarnation != replacement.predecessor
+            })
+        {
+            self.api
+                .bind_public_v1_replacement(
+                    &scope,
+                    &replacement.operation_id,
+                    &target.storage_incarnation,
+                )
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Applied,
+            });
+        }
         if let Some(renewal) = status
             .and_then(|status| status.public_v1_session_renewal.as_ref())
             .map(crate::crd::PublicV1SessionRenewalState::renewal)
@@ -541,6 +663,19 @@ impl Reconciler {
             .switchover
             .as_ref()
             .map(|request| ReplicaId::new(i64::from(request.target_replica_id)));
+        let routed_primary = raw
+            .services
+            .iter()
+            .find(|service| service.name_any() == format!("{}-write", raw.set.name_any()))
+            .and_then(|service| service.spec.as_ref())
+            .and_then(|spec| spec.selector.as_ref())
+            .and_then(|selector| selector.get(crate::crd::INSTANCE_LABEL))
+            .and_then(|instance| {
+                reports
+                    .iter()
+                    .find(|report| report.replica.instance_id.as_str() == instance)
+            })
+            .map(|report| report.replica.replica_id);
         let resource_version = raw
             .set
             .resource_version()
@@ -551,6 +686,7 @@ impl Reconciler {
             &topology_replicas,
             raw.set.spec.replicas,
             switchover_target,
+            routed_primary,
             &resource_version,
         )
         .map_err(ControllerError::InvalidAgentEvidence)?
@@ -573,6 +709,15 @@ impl Reconciler {
                     .persist_public_v1_topology(&scope, expected.as_ref(), &next)
                     .await
                     .map_err(ControllerError::InvalidAgentEvidence)?;
+                Ok(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Applied,
+                })
+            }
+            PublicV1TopologyPlan::RoutePrimary { primary } => {
+                self.api
+                    .converge_public_v1_write_service(&raw, Some(&primary))
+                    .await?;
                 Ok(ReconcileAction {
                     requeue_after: Duration::ZERO,
                     kind: ReconcileKind::Applied,

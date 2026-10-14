@@ -259,17 +259,30 @@ def validate_kind_contract(root: Path) -> None:
     config = tomllib.loads((root / ".config/nextest.toml").read_text())
     validate_timeout_profiles(config)
     mutated = deepcopy(config)
-    mutated["profile"]["ci"]["slow-timeout"]["period"] = "300s"
+    mutated["profile"]["default"]["overrides"][0]["slow-timeout"] = {
+        "period": "300s",
+        "terminate-after": 1,
+    }
     try:
         validate_timeout_profiles(mutated)
     except ValueError:
         pass
     else:
-        raise ValueError("timeout validator accepted an inherited 300-second mutation")
+        raise ValueError("timeout validator accepted a 300-second override mutation")
 
 
 def validate_timeout_profiles(config: dict) -> None:
     profiles = config.get("profile", {})
+
+    def validate_timeout(label: str, timeout: dict) -> None:
+        period = timeout.get("period", "")
+        match = re.fullmatch(r"(\d+)(s|m)", period)
+        if match is None:
+            raise ValueError(f"{label} has an unsupported timeout: {period}")
+        seconds = int(match.group(1)) * (60 if match.group(2) == "m" else 1)
+        if seconds > 270 or timeout.get("terminate-after") != 1:
+            raise ValueError(f"{label} must terminate once within 270 seconds")
+
     for name in ["default", "ci", "ordinary", "build-only", "postgres", "kind", "dex-live"]:
         current = profiles.get(name, {})
         seen: set[str] = set()
@@ -279,16 +292,13 @@ def validate_timeout_profiles(config: dict) -> None:
                 raise ValueError(f"profile {name} has no terminating timeout")
             seen.add(inherited)
             current = profiles.get(inherited, {})
-        timeout = current["slow-timeout"]
-        period = timeout.get("period", "")
-        match = re.fullmatch(r"(\d+)(s|m)", period)
-        if match is None:
-            raise ValueError(f"profile {name} has an unsupported timeout: {period}")
-        seconds = int(match.group(1)) * (60 if match.group(2) == "m" else 1)
-        if seconds > 270 or timeout.get("terminate-after") != 1:
-            raise ValueError(
-                f"profile {name} timeout must terminate once within 270 seconds"
-            )
+        validate_timeout(f"profile {name} timeout", current["slow-timeout"])
+        for index, override in enumerate(profiles.get(name, {}).get("overrides", [])):
+            if "slow-timeout" in override:
+                validate_timeout(
+                    f"profile {name} override {index} timeout",
+                    override["slow-timeout"],
+                )
 
 
 def main() -> int:

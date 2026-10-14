@@ -67,7 +67,9 @@ struct Config {
 /// }
 /// ```
 pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    debug_assert!(public_v1_registration::PUBLIC_V1_CONTROLLER_MODULES.contains(&"reconciler"));
+    public_v1_registration::validate_public_v1_controller_registrations(
+        public_v1_registration::PUBLIC_V1_CONTROLLER_REGISTRATIONS,
+    )?;
     tracing_subscriber::fmt::init();
     let config = Config::parse();
     validate_installation_namespace(&config.installation_namespace)?;

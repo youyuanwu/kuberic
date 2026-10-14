@@ -179,7 +179,32 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
 }
 
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const PUBLIC_V1_DATA_SERVICE_REGISTRATIONS: &[&str] = &["ReplicationDataServer"];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicV1DataServiceRegistration {
+    ReplicationData,
+}
+
+impl PublicV1DataServiceRegistration {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::ReplicationData => "ReplicationDataServer",
+        }
+    }
+}
+
+pub(crate) const PUBLIC_V1_DATA_SERVICE_REGISTRATIONS: &[PublicV1DataServiceRegistration] =
+    &[PublicV1DataServiceRegistration::ReplicationData];
+
+pub(crate) fn validate_public_v1_data_services(
+    registrations: &[PublicV1DataServiceRegistration],
+) -> Result<()> {
+    if registrations != [PublicV1DataServiceRegistration::ReplicationData] {
+        return Err(RuntimeError::Application(
+            "Public V1 data service registrations changed".into(),
+        ));
+    }
+    Ok(())
+}
 
 pub struct StatelessReplicatorFactory {
     storage: Arc<dyn DurableState>,
@@ -2120,7 +2145,7 @@ impl Replicator for StatelessReplicator {
         let listener = TcpListener::bind(self.bind_address)
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        debug_assert_eq!(PUBLIC_V1_DATA_SERVICE_REGISTRATIONS.len(), 1);
+        validate_public_v1_data_services(PUBLIC_V1_DATA_SERVICE_REGISTRATIONS)?;
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let service = ReplacementReplicationService {
             engine: self.self_ref.get().cloned().ok_or_else(|| {

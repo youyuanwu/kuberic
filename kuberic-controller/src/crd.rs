@@ -66,6 +66,8 @@ pub struct KubericSetStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_session_renewal: Option<PublicV1SessionRenewalState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_v1_replacement: Option<PublicV1ReplacementState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_transition: Option<PublicV1TransitionState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_operation: Option<PublicV1OperationStatus>,
@@ -237,6 +239,64 @@ pub struct PublicV1SessionRenewalState {
     pub canonical_renewal_json: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicV1ReplacementState {
+    pub operation_id: OperationId,
+    pub predecessor: ReplicaStorageIncarnationContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<ReplicaStorageIncarnationContext>,
+}
+
+impl PublicV1ReplacementState {
+    pub fn new(
+        configuration_id: &ConfigurationId,
+        predecessor: ReplicaStorageIncarnationContext,
+    ) -> Result<Self, String> {
+        predecessor.validate().map_err(str::to_owned)?;
+        Ok(Self {
+            operation_id: OperationId::new(format!(
+                "replacement-{}-{}-{}",
+                configuration_id, predecessor.replica.replica_id, predecessor.replica.instance_id
+            )),
+            predecessor,
+            replacement: None,
+        })
+    }
+
+    pub fn bind(&self, replacement: ReplicaStorageIncarnationContext) -> Result<Self, String> {
+        self.validate()?;
+        replacement.validate().map_err(str::to_owned)?;
+        if self.replacement.is_some()
+            || replacement.replica.replica_id != self.predecessor.replica.replica_id
+            || replacement.replica == self.predecessor.replica
+            || replacement == self.predecessor
+        {
+            return Err("public-v1 replacement target differs from predecessor authority".into());
+        }
+        Ok(Self {
+            operation_id: self.operation_id.clone(),
+            predecessor: self.predecessor.clone(),
+            replacement: Some(replacement),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.predecessor.validate().map_err(str::to_owned)?;
+        if self.operation_id.is_empty()
+            || self.replacement.as_ref().is_some_and(|replacement| {
+                replacement.validate().is_err()
+                    || replacement.replica.replica_id != self.predecessor.replica.replica_id
+                    || replacement.replica == self.predecessor.replica
+                    || replacement == &self.predecessor
+            })
+        {
+            return Err("public-v1 replacement authority is invalid".into());
+        }
+        Ok(())
+    }
+}
+
 impl PublicV1SessionRenewalState {
     pub fn from_renewal(renewal: &PublicV1SessionRenewalStatus) -> Result<Self, String> {
         renewal.validate().map_err(str::to_owned)?;
@@ -376,6 +436,9 @@ impl KubericSetStatus {
             .as_ref()
             .map(PublicV1TransitionState::transition)
             .transpose()?;
+        if let Some(replacement) = &self.public_v1_replacement {
+            replacement.validate()?;
+        }
         if let Some(renewal) = &renewal
             && authority.as_ref().is_none_or(|accepted| {
                 accepted.history != renewal.required.history
@@ -449,6 +512,7 @@ mod tests {
             std::collections::BTreeSet::from([
                 "publicV1Authority",
                 "publicV1Operation",
+                "publicV1Replacement",
                 "publicV1SessionRenewal",
                 "publicV1Topology",
                 "publicV1Transition",

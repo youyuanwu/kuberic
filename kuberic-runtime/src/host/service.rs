@@ -35,8 +35,43 @@ use crate::protocol::types::{
 
 const AUTHORIZATION_HEADER: &str = "authorization";
 pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-pub(crate) const PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS: &[&str] =
-    &["AgentControlServer", "ReplicaPeerServer"];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicV1ControlServiceRegistration {
+    AgentControl,
+    ReplicaPeer,
+    Alternate,
+}
+
+impl PublicV1ControlServiceRegistration {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::AgentControl => "AgentControlServer",
+            Self::ReplicaPeer => "ReplicaPeerServer",
+            Self::Alternate => "AlternateContinuationServer",
+        }
+    }
+}
+
+pub(crate) const PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS: &[PublicV1ControlServiceRegistration] = &[
+    PublicV1ControlServiceRegistration::AgentControl,
+    PublicV1ControlServiceRegistration::ReplicaPeer,
+];
+
+pub(crate) fn validate_public_v1_control_services(
+    registrations: &[PublicV1ControlServiceRegistration],
+) -> Result<()> {
+    if registrations
+        != [
+            PublicV1ControlServiceRegistration::AgentControl,
+            PublicV1ControlServiceRegistration::ReplicaPeer,
+        ]
+    {
+        return Err(crate::host::HostError::CommandRejected(
+            "Public V1 control service registrations changed".into(),
+        ));
+    }
+    Ok(())
+}
 pub(crate) const PUBLIC_V1_AGENT_REPORT_BRANCHES: &[&str] = &["public_v1"];
 pub(crate) const PUBLIC_V1_SERVICE_STARTUP_OWNERS: &[&str] = &["PartitionOperationRuntime"];
 
@@ -103,7 +138,7 @@ impl InitializationService {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let listener = TcpListener::bind(control_address).await?;
-        debug_assert_eq!(PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS.len(), 2);
+        validate_public_v1_control_services(PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS)?;
         let control = self.clone();
         let peer = self;
         ready.send_replace(true);
@@ -438,6 +473,7 @@ where
         self.runtime
             .bind_replica_session(state.identity.resource_uid, self.session.id().clone())?;
         let listener = TcpListener::bind(control_address).await?;
+        validate_public_v1_control_services(PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS)?;
         let control = self.clone();
         let peer = self.clone();
         self.ready.store(true, Ordering::Release);
@@ -611,18 +647,38 @@ where
         command
             .validate()
             .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        let endpoint = command.expected_endpoint();
+        if endpoint.process_session_id != *self.session.id()
+            || endpoint.replicator_creation_id
+                != self.runtime.replacement_replicator_creation_id()?
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "session-renewal command targets another process endpoint".into(),
+            ));
+        }
         let accepted = command.accepted();
         let current = self
             .store
             .load_state()
             .await?
             .public_v1_operation_state
-            .and_then(|preview| preview.session_renewal)
-            .ok_or_else(|| {
-                crate::host::HostError::CommandRejected(
+            .and_then(|preview| preview.session_renewal);
+        let current = match current {
+            Some(current) => current,
+            None if accepted.stage
+                == crate::protocol::public_operations::PublicSessionRenewalStage::Required =>
+            {
+                self.store
+                    .persist_public_v1_session_renewal(None, accepted)
+                    .await?;
+                accepted.clone()
+            }
+            None => {
+                return Err(crate::host::HostError::CommandRejected(
                     "Public V1 session renewal is not durable".into(),
-                )
-            })?;
+                ));
+            }
+        };
         if &current != accepted {
             return Err(crate::host::HostError::StaleEffectCompletion(
                 "Public V1 session renewal command changed accepted state".into(),
@@ -857,15 +913,44 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::command::InitializeAgentStore;
+    use crate::application::{OpenContext, RoleChange, StatefulServiceReplica};
+    use crate::protocol::command::{
+        InitializeAgentStore, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
+    };
     use crate::protocol::public_operations::{
-        PublicV1Identity, PublicV1LifecycleBinding, StatePersistence,
+        ProcessSessionRenewalRequired, PublicSessionRenewalStage, PublicV1Identity,
+        PublicV1LifecycleBinding, PublicV1SessionRenewalStatus, StatePersistence,
     };
     use crate::protocol::types::{
         ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, InitializationId,
-        PodUid, PvcUid, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+        OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
+        PvcUid, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
+        ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, StorageGeneration,
         derive_agent_generation, derive_initialization_id,
     };
+    use crate::replicator::Replicator;
+
+    struct RenewalApplication;
+
+    #[async_trait::async_trait]
+    impl StatefulServiceReplica for RenewalApplication {
+        async fn open(
+            self: Arc<Self>,
+            _context: OpenContext,
+        ) -> crate::Result<Arc<dyn Replicator>> {
+            Err(crate::RuntimeError::NotOpen)
+        }
+
+        async fn change_role(&self, _role: ReplicaRole) -> crate::Result<RoleChange> {
+            Err(crate::RuntimeError::NotOpen)
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn abort(&self) {}
+    }
 
     #[tokio::test]
     async fn initialization_service_persists_bootstrap_history_before_restart() {
@@ -963,5 +1048,136 @@ mod tests {
         let history = public.history.expect("bootstrap history");
         assert_eq!(history.resource_uid, resource_uid);
         assert_eq!(history.protocol_generation.value(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_service_dispatches_initial_session_renewal_through_wire_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let resource_uid = ResourceUid::new("resource-renewal");
+        let local = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-renewal"),
+            agent_generation: crate::protocol::types::AgentGeneration::new("generation-renewal"),
+        };
+        let storage = ReplicaStorageIncarnationContext {
+            replica: local.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new("pod-renewal"),
+                pvc_uid: PvcUid::new("pvc-renewal"),
+            },
+            storage_generation: StorageGeneration::new("storage-renewal"),
+        };
+        let identity = PublicV1Identity::new(1);
+        let binding = PublicV1LifecycleBinding {
+            identity: identity.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let database = root.path().join("agent.sqlite3");
+        let store = Arc::new(
+            SqliteStore::create_replacement_authorized(
+                &database,
+                crate::host::state::AgentState::new(crate::host::state::StorageIdentity {
+                    schema_version: crate::host::state::SCHEMA_VERSION,
+                    resource_uid: resource_uid.clone(),
+                    pod_uid: PodUid::new("pod-renewal"),
+                    pvc_uid: PvcUid::new("pvc-renewal"),
+                    initialization_id: InitializationId::new("init-renewal"),
+                    local_identity: local.clone(),
+                    effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+                }),
+                binding.clone(),
+            )
+            .unwrap(),
+        );
+        let initialization = crate::protocol::types::derive_history_initialization_id(
+            &resource_uid,
+            crate::protocol::types::PublicProtocolGeneration::new(1),
+        );
+        let history = crate::protocol::types::derive_bootstrap_history(
+            &resource_uid,
+            crate::protocol::types::PublicProtocolGeneration::new(1),
+            &initialization,
+        );
+        store
+            .initialize_public_v1_history(&initialization, &history, &storage)
+            .await
+            .unwrap();
+        let runtime = Arc::new(PodRuntime::new_replacement(
+            local.clone(),
+            Arc::new(RenewalApplication),
+            store.clone(),
+            binding,
+            "127.0.0.1:0".parse().unwrap(),
+        ));
+        let service = AgentService::new(store.clone(), runtime.clone(), "test-token").unwrap();
+        runtime
+            .bind_replica_session(resource_uid.clone(), service.local_session().clone())
+            .unwrap();
+        let replacement = ProcessSessionEndpoint {
+            identity: local.clone(),
+            storage_incarnation: storage.clone(),
+            process_session_id: service.local_session().clone(),
+            replicator_creation_id: ReplicatorCreationId::new(format!(
+                "pending-{}",
+                service.local_session()
+            )),
+            role: ReplicaRole::None,
+        };
+        let renewal_epoch = Epoch::new(0, 2);
+        let accepted = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+            operation_id: OperationId::new("renewal-wire"),
+            reason: ProcessSessionRenewalReason::PrimaryReplacement,
+            resource_uid: resource_uid.clone(),
+            history,
+            previous_epoch: Epoch::new(0, 1),
+            renewal_epoch,
+            predecessor: ProcessSessionEndpoint {
+                process_session_id: ProcessSessionId::new("predecessor-session"),
+                replicator_creation_id: ReplicatorCreationId::new("predecessor-creation"),
+                role: ReplicaRole::Primary,
+                ..replacement.clone()
+            },
+            replacement: Some(replacement),
+            surviving_sessions: Vec::new(),
+            fresh_configuration: ConfigurationDescriptor::new(
+                renewal_epoch,
+                local.replica_id,
+                vec![ConfigurationMember {
+                    identity: local.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            predecessor_contained: true,
+            data_loss: None,
+        })
+        .unwrap();
+        let command = PublicV1HistoryCommand::SessionRenewal {
+            command: Box::new(PublicV1SessionRenewalCommand::CloseAccessAndIngress { accepted }),
+        };
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            resource_uid: resource_uid.to_string(),
+            target: Some(local.into()),
+            expected_process_session_id: service.local_session().to_string(),
+            command: Some(proto::execute_command_request::Command::PublicV1History(
+                crate::control::public_v1_history_command_to_proto(&command).unwrap(),
+            )),
+        };
+        service.execute_inner(request).await.unwrap();
+        assert_eq!(
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+                .session_renewal
+                .unwrap()
+                .stage,
+            PublicSessionRenewalStage::AccessClosed
+        );
     }
 }

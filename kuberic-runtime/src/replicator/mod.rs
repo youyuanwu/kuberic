@@ -1,7 +1,42 @@
 pub mod stateless;
 
-pub(crate) const PUBLIC_V1_FACTORY_REGISTRATIONS: &[&str] =
-    &["DefaultReplicatorFactory", "StatelessReplicatorFactory"];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicV1FactoryRegistration {
+    Default,
+    Stateless,
+    Alternate,
+}
+
+impl PublicV1FactoryRegistration {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "DefaultReplicatorFactory",
+            Self::Stateless => "StatelessReplicatorFactory",
+            Self::Alternate => "AlternateReplicatorFactory",
+        }
+    }
+}
+
+pub(crate) const PUBLIC_V1_FACTORY_REGISTRATIONS: &[PublicV1FactoryRegistration] = &[
+    PublicV1FactoryRegistration::Default,
+    PublicV1FactoryRegistration::Stateless,
+];
+
+pub(crate) fn validate_public_v1_factories(
+    registrations: &[PublicV1FactoryRegistration],
+) -> Result<()> {
+    if registrations
+        != [
+            PublicV1FactoryRegistration::Default,
+            PublicV1FactoryRegistration::Stateless,
+        ]
+    {
+        return Err(RuntimeError::Application(
+            "Public V1 factory registrations changed".into(),
+        ));
+    }
+    Ok(())
+}
 pub mod stream;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -978,7 +1013,7 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        debug_assert_eq!(PUBLIC_V1_FACTORY_REGISTRATIONS.len(), 2);
+        validate_public_v1_factories(PUBLIC_V1_FACTORY_REGISTRATIONS)?;
         stateless::StatelessReplicatorFactory::new(self.storage.clone())
             .create_replicator(context, state_provider, settings)
             .await

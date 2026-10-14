@@ -1363,6 +1363,7 @@ impl ProcessSessionRenewalRequired {
             || report.replica != replacement.identity
             || report.storage_incarnation != replacement.storage_incarnation
             || report.process_session_id != replacement.process_session_id
+            || report.replicator_creation_id != replacement.replicator_creation_id
             || report.history != self.history
             || report.role != ReplicaRole::None
             || report.read_status == AccessStatus::Granted

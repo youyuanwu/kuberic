@@ -531,6 +531,7 @@ public-path documented impl crate::protocol::command::PublicV1HistoryCommand::fn
 public-path documented impl crate::protocol::command::PublicV1HistoryCommand::fn validate (& self) -> Result < () , & 'static str >
 public-path documented impl crate::protocol::command::PublicV1OperationCommand::fn validate (& self) -> Result < () , & 'static str >
 public-path documented impl crate::protocol::command::PublicV1SessionRenewalCommand::fn accepted (& self) -> & PublicV1SessionRenewalStatus
+public-path documented impl crate::protocol::command::PublicV1SessionRenewalCommand::fn expected_endpoint (& self) -> & crate :: protocol :: types :: ProcessSessionEndpoint
 public-path documented impl crate::protocol::command::PublicV1SessionRenewalCommand::fn target (& self) -> & ReplicaIdentity
 public-path documented impl crate::protocol::command::PublicV1SessionRenewalCommand::fn validate (& self) -> Result < () , & 'static str >
 public-path documented impl crate::protocol::observation::KubernetesReplicaObservation::fn has_exact_scaffolding (& self) -> bool

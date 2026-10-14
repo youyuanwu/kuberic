@@ -196,6 +196,136 @@
                     ],
                     "type": "object"
                   },
+                  "publicV1Replacement": {
+                    "nullable": true,
+                    "properties": {
+                      "operationId": {
+                        "type": "string"
+                      },
+                      "predecessor": {
+                        "properties": {
+                          "replica": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          },
+                          "storage": {
+                            "properties": {
+                              "identity": {
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "kind": {
+                                "type": "string"
+                              },
+                              "podUid": {
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "pvcUid": {
+                                "nullable": true,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ],
+                            "type": "object"
+                          },
+                          "storageGeneration": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "replica",
+                          "storage",
+                          "storageGeneration"
+                        ],
+                        "type": "object"
+                      },
+                      "replacement": {
+                        "nullable": true,
+                        "properties": {
+                          "replica": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          },
+                          "storage": {
+                            "properties": {
+                              "identity": {
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "kind": {
+                                "type": "string"
+                              },
+                              "podUid": {
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "pvcUid": {
+                                "nullable": true,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ],
+                            "type": "object"
+                          },
+                          "storageGeneration": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "replica",
+                          "storage",
+                          "storageGeneration"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "operationId",
+                      "predecessor"
+                    ],
+                    "type": "object"
+                  },
                   "publicV1SessionRenewal": {
                     "nullable": true,
                     "properties": {

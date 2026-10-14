@@ -682,13 +682,17 @@ impl PodRuntime {
     pub(crate) fn replacement_replicator_creation_id(
         &self,
     ) -> Result<crate::protocol::types::ReplicatorCreationId> {
-        Ok(self
+        if let Some(registered) = self.host.registered.get() {
+            return Ok(registered.identity.to_public_id());
+        }
+        let (_, session) = self
             .host
-            .registered
+            .replica_session
             .get()
-            .ok_or(RuntimeError::NotOpen)?
-            .identity
-            .to_public_id())
+            .ok_or(RuntimeError::NotOpen)?;
+        Ok(crate::protocol::types::ReplicatorCreationId::new(format!(
+            "pending-{session}"
+        )))
     }
 
     pub(crate) async fn diagnostic_projection(

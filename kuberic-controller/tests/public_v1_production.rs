@@ -479,6 +479,29 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
             .pods
             .retain(|pod| pod.uid().as_deref() != Some(old.1.instance_id.as_str()));
         api.set_observation(observed).await;
+        assert_eq!(
+            reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+        let observed = api.observation().await;
+        let replacement_authority = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_replacement.as_ref())
+            .expect("replacement authority persisted before allocation");
+        assert_eq!(replacement_authority.predecessor.replica, old.1);
+        assert!(replacement_authority.replacement.is_none());
+        assert!(
+            observed
+                .pvcs
+                .iter()
+                .any(|pvc| pvc.metadata.name.as_deref() == Some("sample-2-data"))
+        );
 
         let mut stable = false;
         for iteration in 0..200 {
@@ -546,6 +569,13 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                 ))
                 .count(),
             1
+        );
+        assert!(
+            observed
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_replacement.is_none())
         );
     })
     .await
@@ -717,6 +747,151 @@ async fn production_reconciler_originates_desired_membership_changes() {
 }
 
 #[tokio::test]
+async fn production_reconciler_transfers_routing_before_removing_current_primary() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+        let mut reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        observed.set.spec.switchover =
+            Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+                request_id: "make-three-primary".into(),
+                target_replica_id: 3,
+            });
+        api.set_observation(observed).await;
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        observed.set.spec.switchover = None;
+        observed.set.spec.replicas = 2;
+        api.set_observation(observed).await;
+        let start = api.effects().await.len();
+        let mut restarted_after_swap = false;
+        let mut remove_seen = false;
+        for _ in 0..240 {
+            reconciler.reconcile("default", "sample").await.unwrap();
+            let effects = api.effects().await;
+            let new_effects = &effects[start..];
+            if !restarted_after_swap
+                && new_effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        EffectRecord::Execute(
+                            kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(
+                                command
+                            )
+                        ) if matches!(
+                            command.intent.program,
+                            Some(
+                                kuberic_runtime::protocol::public_operations::PublicOperationProgram::Swap { .. }
+                            )
+                        )
+                    )
+                })
+            {
+                reconciler = Reconciler::new(
+                    api.clone(),
+                    kuberic_controller::production_evaluation_config(0, 1, 1),
+                );
+                restarted_after_swap = true;
+            }
+            if new_effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    EffectRecord::Execute(
+                        kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(
+                            command
+                        )
+                    ) if matches!(
+                        command.intent.program,
+                        Some(
+                            kuberic_runtime::protocol::public_operations::PublicOperationProgram::Remove(_)
+                        )
+                    )
+                )
+            }) {
+                remove_seen = true;
+                let observed = api.observation().await;
+                let successor = observed
+                    .agents
+                    .values()
+                    .find_map(|agent| match agent {
+                        RawAgentObservation::PublicV1Report(report)
+                            if report.write_status == AccessStatus::Granted =>
+                        {
+                            Some(report.replica.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("accepted successor writer");
+                assert_ne!(successor.replica_id, ReplicaId::new(3));
+                let selector = observed
+                    .services
+                    .iter()
+                    .find(|service| service.name_any() == "sample-write")
+                    .and_then(|service| service.spec.as_ref())
+                    .and_then(|spec| spec.selector.as_ref())
+                    .and_then(|selector| selector.get(INSTANCE_LABEL));
+                assert_eq!(selector, Some(&successor.instance_id.to_string()));
+                assert_eq!(
+                    observed
+                        .agents
+                        .values()
+                        .filter(|agent| matches!(
+                            agent,
+                            RawAgentObservation::PublicV1Report(report)
+                                if report.write_status == AccessStatus::Granted
+                        ))
+                        .count(),
+                    1
+                );
+                break;
+            }
+        }
+        let effects = api.effects().await;
+        assert!(restarted_after_swap);
+        assert!(remove_seen);
+        assert!(effects[start..].iter().any(|effect| {
+            matches!(
+                effect,
+                EffectRecord::Execute(
+                    kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
+                ) if matches!(
+                    command.intent.program,
+                    Some(
+                        kuberic_runtime::protocol::public_operations::PublicOperationProgram::CatchUp { .. }
+                    )
+                )
+            )
+        }));
+    })
+    .await
+    .expect("Public V1 primary removal ordering exceeded 270 seconds");
+}
+
+#[tokio::test]
 async fn production_reconciler_originates_and_completes_session_renewal() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
@@ -736,6 +911,7 @@ async fn production_reconciler_originates_and_completes_session_renewal() {
             }
         }
         let mut observed = api.observation().await;
+        let stable_observation = observed.clone();
         let previous_epoch = observed
             .set
             .status
@@ -755,6 +931,31 @@ async fn production_reconciler_originates_and_completes_session_renewal() {
                 _ => None,
             })
             .expect("current primary report");
+        let original_report = restarted.clone();
+        let effects_before = api.effects().await.len();
+        let mut session_only = original_report.clone();
+        session_only.process_session_id =
+            kuberic_runtime::protocol::types::ProcessSessionId::new("session-only-change");
+        observed.agents.insert(
+            key.clone(),
+            RawAgentObservation::PublicV1Report(Box::new(session_only)),
+        );
+        api.set_observation(observed).await;
+        assert!(reconciler.reconcile("default", "sample").await.is_err());
+        assert_eq!(api.effects().await.len(), effects_before);
+
+        let mut creation_only_observation = stable_observation.clone();
+        let mut creation_only = original_report.clone();
+        creation_only.replicator_creation_id =
+            kuberic_runtime::protocol::types::ReplicatorCreationId::new("creation-only-change");
+        creation_only_observation.agents.insert(
+            key.clone(),
+            RawAgentObservation::PublicV1Report(Box::new(creation_only)),
+        );
+        api.set_observation(creation_only_observation).await;
+        assert!(reconciler.reconcile("default", "sample").await.is_err());
+        assert_eq!(api.effects().await.len(), effects_before);
+
         restarted.process_session_id =
             kuberic_runtime::protocol::types::ProcessSessionId::new("restarted-primary-session");
         restarted.replicator_creation_id =
@@ -768,11 +969,79 @@ async fn production_reconciler_originates_and_completes_session_renewal() {
         restarted.progress.role = PublicProgressRole::Recovery;
         restarted.service_location = None;
         restarted.completed_operations.clear();
-        observed.agents.insert(
-            key,
-            RawAgentObservation::PublicV1Report(Box::new(restarted)),
+        let mut valid_restart_observation = stable_observation;
+        valid_restart_observation.agents.insert(
+            key.clone(),
+            RawAgentObservation::PublicV1Report(Box::new(restarted.clone())),
         );
-        api.set_observation(observed).await;
+        api.set_observation(valid_restart_observation).await;
+        assert_eq!(
+            reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+        let accepted_renewal = api
+            .observation()
+            .await
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_session_renewal.as_ref())
+            .expect("accepted renewal")
+            .renewal()
+            .unwrap();
+        let mut replaced_again_observation = api.observation().await;
+        let mut replaced_again = restarted;
+        replaced_again.process_session_id =
+            kuberic_runtime::protocol::types::ProcessSessionId::new("second-restart-session");
+        replaced_again.replicator_creation_id =
+            kuberic_runtime::protocol::types::ReplicatorCreationId::new("second-restart-creation");
+        replaced_again_observation.agents.insert(
+            key.clone(),
+            RawAgentObservation::PublicV1Report(Box::new(replaced_again)),
+        );
+        api.set_observation(replaced_again_observation).await;
+        assert!(reconciler.reconcile("default", "sample").await.is_err());
+        assert_eq!(
+            api.observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_session_renewal.as_ref())
+                .unwrap()
+                .renewal()
+                .unwrap(),
+            accepted_renewal
+        );
+        let mut restored = api.observation().await;
+        restored.agents.insert(
+            key,
+            RawAgentObservation::PublicV1Report(Box::new(
+                accepted_renewal
+                    .required
+                    .replacement
+                    .as_ref()
+                    .map(|replacement| {
+                        let mut report = original_report;
+                        report.process_session_id = replacement.process_session_id.clone();
+                        report.replicator_creation_id = replacement.replicator_creation_id.clone();
+                        report.report_sequence = 1;
+                        report.role = ReplicaRole::None;
+                        report.read_status = AccessStatus::NotPrimary;
+                        report.write_status = AccessStatus::NotPrimary;
+                        report.progress.role = PublicProgressRole::Recovery;
+                        report.service_location = None;
+                        report.completed_operations.clear();
+                        report
+                    })
+                    .unwrap(),
+            )),
+        );
+        api.set_observation(restored).await;
 
         let mut stable = false;
         for _ in 0..120 {

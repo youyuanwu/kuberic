@@ -1,20 +1,28 @@
-pub(crate) const PUBLIC_V1_CONTROLLER_MODULES: &[&str] = &[
-    "cluster_api",
-    "crd",
-    "error",
-    "evaluator",
-    "executor",
-    "observation",
-    "public_v1_evidence",
-    "public_v1_history",
-    "public_v1_lifecycle",
-    "public_v1_normalize",
-    "public_v1_operations",
-    "public_v1_reconciliation",
-    "public_v1_service",
-    "public_v1_session_renewal",
-    "public_v1_topology",
-    "reconciler",
-    "testing",
-    "tests",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicV1ControllerRegistration {
+    Reconciler,
+    #[allow(dead_code)]
+    Alternate,
+}
+
+impl PublicV1ControllerRegistration {
+    #[allow(dead_code)]
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Reconciler => "reconciler",
+            Self::Alternate => "alternate_controller_owner",
+        }
+    }
+}
+
+pub(crate) const PUBLIC_V1_CONTROLLER_REGISTRATIONS: &[PublicV1ControllerRegistration] =
+    &[PublicV1ControllerRegistration::Reconciler];
+
+pub(crate) fn validate_public_v1_controller_registrations(
+    registrations: &[PublicV1ControllerRegistration],
+) -> Result<(), &'static str> {
+    if registrations != [PublicV1ControllerRegistration::Reconciler] {
+        return Err("Public V1 controller registrations changed");
+    }
+    Ok(())
+}
