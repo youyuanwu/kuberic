@@ -43,7 +43,12 @@ BUILD_ONLY_TESTS = {
         "kuberic-runtime",
         "kuberic-runtime::public_api_privacy",
         "external_applications_can_use_contracts_but_cannot_forge_host_capabilities",
-    )
+    ),
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::public_v1_conformance",
+        "public_v1_conformance_executes_strict_and_hosted_preview_scenarios",
+    ),
 }
 
 

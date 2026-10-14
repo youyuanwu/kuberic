@@ -18,7 +18,7 @@ default-filter = 'not package(=postgres-replicated) and not binary(=kubernetes_c
 
 [profile.build-only]
 inherits = "ci"
-default-filter = 'binary_id(=kuberic-runtime::public_api_privacy)'
+default-filter = 'binary_id(=kuberic-runtime::public_api_privacy) or (binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios))'
 test-threads = 1
 
 [profile.postgres]

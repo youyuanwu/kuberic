@@ -14,11 +14,14 @@ install-nextest:
     scripts/install_nextest.sh
 
 # Verify guards that need the build environment rather than an archive-only runner.
-nextest-build-only:
+nextest-build-only: install-nextest
     scripts/check_runtime_public_api.sh
+    cargo nextest run -j 1 -p kuberic-runtime --all-features \
+        --profile build-only --run-ignored only \
+        -E 'test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
 
 # Verify build-only guards and build one reusable all-features test archive.
-nextest-archive: install-nextest nextest-build-only
+nextest-archive: nextest-build-only
     mkdir -p "$(dirname "{{ nextest_archive }}")"
     cargo nextest archive --workspace --all-features --profile ci \
         --archive-file "{{ nextest_archive }}"

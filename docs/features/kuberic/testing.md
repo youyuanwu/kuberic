@@ -30,19 +30,20 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The consolidated inventory accounts for 1,388 tests: 1,134 ordinary, one
+The consolidated inventory accounts for 1,390 tests: 1,136 ordinary, two
 build-only, 213 directly runnable PostgreSQL tests, 19 live KinD tests covering
-12 scenario identities, one DEX live test and 20 mapped parent-driven
+12 scenario identities, one DEX live test and 19 mapped parent-driven
 subprocess helpers.
 Use its generated counts as the inventory evolves.
 
-The ignored runtime `public_api_privacy` binary belongs only to the `build-only`
-tier (`just nextest-list build-only`). It invokes Cargo and needs dependency
-caches and workspace sources, so CI runs `scripts/check_runtime_public_api.sh`
-in the build-artifact job before archiving, never on archive-only runners.
-`just nextest-build-only` runs the same guard, and `just nextest-archive`
-includes it as a prerequisite. Archive inventory validation still accounts for
-the ignored test exactly once.
+The ignored runtime `public_api_privacy` binary and the bounded Public V1
+conformance execution gate belong only to the `build-only` tier
+(`just nextest-list build-only`). The privacy guard invokes Cargo and needs
+dependency caches and workspace sources, while the conformance gate starts
+nested exact scenario runs. CI therefore runs both through
+`just nextest-build-only` before archiving, never on archive-only runners.
+`just nextest-archive` includes that recipe as a prerequisite. Archive inventory
+validation still accounts for both ignored tests exactly once.
 
 Internal lifecycle dependency isolation uses stable compiler and Clippy policy
 plus a focused ordinary source test:
@@ -131,9 +132,7 @@ cargo nextest run -j 1 \
   -p kuberic-runtime --all-features --profile ordinary \
   -E 'test(public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16) or test(built_in_preview_ksf_mappings_require_each_authorized_observation)'
 
-cargo nextest run -j 1 -p kuberic-runtime --all-features \
-  --profile ordinary --run-ignored only \
-  -E 'test(public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
+just nextest-build-only
 ```
 
 The direct binary covers immutable selection, exact engine/provider-writer/
