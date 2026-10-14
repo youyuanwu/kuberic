@@ -43,6 +43,7 @@ jobs:
           build-warnings: ""
 
       - uses: taiki-e/install-action@protoc
+      - uses: taiki-e/install-action@just
 
       - name: Install pinned cargo-nextest
         run: scripts/install_nextest.sh
