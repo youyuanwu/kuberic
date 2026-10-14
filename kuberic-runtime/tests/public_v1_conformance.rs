@@ -99,11 +99,11 @@ fn built_in_replacement_ksf_mappings_require_each_authorized_observation() {
             "KSF-15",
             &[
                 "hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children",
-                "public_v1_schema11_failed_build_containment_survives_reopen",
-                "public_v1_schema11_rebuild_then_cancellation_survives_reopen",
+                "public_v1_replacement_schema_failed_build_containment_survives_reopen",
+                "public_v1_replacement_schema_rebuild_then_cancellation_survives_reopen",
                 "public_v1_history_data_loss_attempt_renews_higher_epoch",
                 "public_v1_data_loss_renewal_requires_exact_replay_capability",
-                "public_v1_schema11_build_ambiguity_requires_retirement",
+                "public_v1_replacement_schema_build_ambiguity_requires_retirement",
             ][..],
         ),
         (

@@ -170,7 +170,7 @@ fn public_v1_source_uses_no_native_evidence() {
     ] {
         assert!(
             !build_record.contains(forbidden),
-            "schema-11 build record contains private evidence: {forbidden}"
+            "replacement-schema build record contains private evidence: {forbidden}"
         );
     }
 }
@@ -238,7 +238,7 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
 }
 
 #[test]
-fn public_v1_schema11_rejects_prior_preview_stores() {
+fn public_v1_replacement_schema_rejects_prior_preview_stores() {
     let preview = PublicV1Identity::new(42);
     for version in [8, 9, 10] {
         let root = test_root(&format!("reject-{version}"));
