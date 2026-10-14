@@ -12,14 +12,92 @@ use crate::evaluator::public_v1_history::{
     PublicV1HistoryPlan, plan_bootstrap_history, plan_recovery_report,
 };
 use crate::evaluator::public_v1_session_renewal::plan_session_renewal;
+use crate::evaluator::public_v1_topology::{
+    PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
+};
 use crate::executor::ExecutionKind;
 use crate::observation::RawAgentObservation;
 use crate::{ControllerError, Result};
+use kuberic_runtime::protocol::command::{InitializeAgentStore, ProtocolCommand};
+use kuberic_runtime::protocol::types::{
+    ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, PodUid, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, derive_agent_generation,
+    derive_initialization_id,
+};
 
 pub struct Reconciler {
     api: Arc<dyn ProductionClusterApi>,
     evaluation: EvaluationConfig,
     locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+}
+
+async fn cleanup_stale_scaffolding(
+    raw: &crate::observation::RawObservation,
+    current: Option<&ConfigurationDescriptor>,
+    api: &dyn ProductionClusterApi,
+) -> Result<bool> {
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    if let Some(pod) = raw.pods.iter().find(|pod| {
+        pod.labels()
+            .get(crate::crd::REPLICA_ID_LABEL)
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|replica_id| replica_id > i64::from(raw.set.spec.replicas))
+    }) {
+        let pod_uid = pod.uid().map(PodUid::new);
+        let replica_id = pod
+            .labels()
+            .get(crate::crd::REPLICA_ID_LABEL)
+            .and_then(|value| value.parse::<i64>().ok())
+            .expect("selected extra Pod has replica ID");
+        let pvc_name = format!("{}-{replica_id}-data", raw.set.name_any());
+        let pvc_uid = raw
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == pvc_name)
+            .and_then(kube::ResourceExt::uid)
+            .map(PvcUid::new);
+        api.delete_replica_scaffolding(
+            raw,
+            Some(&pod.name_any()),
+            pod_uid.as_ref(),
+            Some(&pvc_name),
+            pvc_uid.as_ref(),
+        )
+        .await?;
+        return Ok(true);
+    }
+    for member in &current.members {
+        let canonical_pvc_name = format!(
+            "{}-{}-data",
+            raw.set.name_any(),
+            member.identity.replica_id.value()
+        );
+        let canonical_pvc = raw
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == canonical_pvc_name);
+        let current_pod_present = raw
+            .pods
+            .iter()
+            .any(|pod| pod.uid().as_deref() == Some(member.identity.instance_id.as_str()));
+        if canonical_pvc.is_some() && !current_pod_present {
+            let pvc_uid = canonical_pvc
+                .and_then(kube::ResourceExt::uid)
+                .map(PvcUid::new);
+            api.delete_replica_scaffolding(
+                raw,
+                None,
+                None,
+                Some(&canonical_pvc_name),
+                pvc_uid.as_ref(),
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Reconciler {
@@ -57,20 +135,23 @@ impl Reconciler {
             .observe_public_v1_status(&scope)
             .await
             .map_err(ControllerError::InvalidAgentEvidence)?;
-        let reports = raw
-            .agents
-            .values()
-            .filter_map(|observation| match observation {
-                RawAgentObservation::PublicV1Report(report) => Some((**report).clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let current_topology = self
+            .api
+            .observe_public_v1_topology(&scope)
+            .await
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+        if cleanup_stale_scaffolding(&raw, current_topology.as_ref(), self.api.as_ref()).await? {
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            });
+        }
         let replica_ids = (1..=raw.set.spec.replicas)
             .map(|replica_id| {
                 kuberic_runtime::protocol::types::ReplicaId::new(i64::from(replica_id))
             })
             .collect::<Vec<_>>();
-        if bootstrap_resources_missing(&raw, &replica_ids) {
+        if bootstrap_resources_missing(&raw, &replica_ids, current_topology.as_ref()) {
             self.api.ensure_replica_support(&raw).await?;
             self.api
                 .ensure_replica_scaffolding(&raw, &replica_ids)
@@ -80,6 +161,79 @@ impl Reconciler {
                 kind: ReconcileKind::Executed,
             });
         }
+        if let Some(configuration) = current_topology.as_ref()
+            && let Some(member) = configuration.members.iter().find(|member| {
+                if member.identity.replica_id.value() > i64::from(raw.set.spec.replicas) {
+                    return false;
+                }
+                let old_missing = !raw
+                    .pods
+                    .iter()
+                    .any(|pod| pod.uid().as_deref() == Some(member.identity.instance_id.as_str()));
+                let replacement = raw.pods.iter().find(|pod| {
+                    pod.labels()
+                        .get(crate::crd::REPLICA_ID_LABEL)
+                        .is_some_and(|value| value == &member.identity.replica_id.to_string())
+                        && pod.uid().as_deref() != Some(member.identity.instance_id.as_str())
+                });
+                let replacement_ready = replacement.is_some_and(|pod| {
+                    pod.uid().is_some_and(|pod_uid| {
+                        raw.services.iter().any(|service| {
+                            service.spec.as_ref().is_some_and(|spec| {
+                                spec.selector.as_ref().is_some_and(|selector| {
+                                    selector
+                                        .get(crate::crd::INSTANCE_LABEL)
+                                        .is_some_and(|selected| selected == &pod_uid)
+                                }) && spec.ports.as_ref().is_some_and(|ports| {
+                                    ports
+                                        .iter()
+                                        .any(|port| port.name.as_deref() == Some("replication"))
+                                })
+                            })
+                        })
+                    })
+                });
+                old_missing && !replacement_ready
+            })
+        {
+            self.api
+                .ensure_replacement_scaffolding(&raw, member.identity.replica_id, &member.identity)
+                .await?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            });
+        }
+        if let Some(command) = next_initialization_command(&raw, &resource_uid, &replica_ids)? {
+            self.api
+                .execute_command(
+                    &raw,
+                    &ProtocolCommand::InitializeAgentStore(Box::new(command)),
+                )
+                .await?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            });
+        }
+        if let Some(message) = raw
+            .agents
+            .values()
+            .find_map(|observation| match observation {
+                RawAgentObservation::Invalid { message } => Some(message.as_str()),
+                _ => None,
+            })
+        {
+            return Err(ControllerError::InvalidAgentEvidence(message.to_string()));
+        }
+        let reports = raw
+            .agents
+            .values()
+            .filter_map(|observation| match observation {
+                RawAgentObservation::PublicV1Report(report) => Some((**report).clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let status = raw.set.status.as_ref();
         if let Some(renewal) = status
             .and_then(|status| status.public_v1_session_renewal.as_ref())
@@ -149,48 +303,279 @@ impl Reconciler {
                 kind: ReconcileKind::Applied,
             });
         }
-        if accepted.as_ref().is_some_and(|accepted| {
-            report.identity == accepted.identity && report.history == accepted.history
-        }) {
+        let Some(accepted) = accepted.as_ref() else {
+            let plan = plan_bootstrap_history(
+                None,
+                &resource_uid,
+                &report.identity,
+                report.storage_incarnation.clone(),
+            )
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+            let kind = match plan_kind_for_history(&plan) {
+                ExecutionKind::Applied => ReconcileKind::Applied,
+                ExecutionKind::Stable => ReconcileKind::Stable,
+                _ => ReconcileKind::Executed,
+            };
+            crate::executor::execute_public_v1_history(self.api.as_ref(), &scope, plan)
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
             return Ok(ReconcileAction {
-                requeue_after: Duration::from_secs(self.evaluation.stable_resync_seconds),
-                kind: ReconcileKind::Stable,
+                requeue_after: Duration::ZERO,
+                kind,
             });
-        }
-        let identity = accepted
-            .as_ref()
-            .map(|accepted| accepted.identity.clone())
-            .unwrap_or_else(|| report.identity.clone());
-        if report.identity != identity {
+        };
+        if reports.iter().any(|report| {
+            report.identity != accepted.identity
+                || report.resource_uid != resource_uid
+                || report.history != accepted.history
+        }) {
             return Err(ControllerError::InvalidAgentEvidence(
-                "public-v1 report identity differs from accepted history".into(),
+                "public-v1 report differs from accepted history".into(),
             ));
         }
-        let plan = plan_bootstrap_history(
+        let current = current_topology;
+        let topology_replicas = topology_replicas(&raw, &reports)?;
+        let switchover_target = raw
+            .set
+            .spec
+            .switchover
+            .as_ref()
+            .map(|request| ReplicaId::new(i64::from(request.target_replica_id)));
+        let resource_version = raw
+            .set
+            .resource_version()
+            .ok_or(ControllerError::ObservationStale)?;
+        match plan_public_v1_topology(
             accepted,
-            &resource_uid,
-            &identity,
-            report.storage_incarnation.clone(),
+            current.as_ref(),
+            &topology_replicas,
+            raw.set.spec.replicas,
+            switchover_target,
+            &resource_version,
         )
-        .map_err(ControllerError::InvalidAgentEvidence)?;
-        let kind = match plan_kind_for_history(&plan) {
-            ExecutionKind::Applied => ReconcileKind::Applied,
-            ExecutionKind::Stable => ReconcileKind::Stable,
-            _ => ReconcileKind::Executed,
-        };
-        crate::executor::execute_public_v1_history(self.api.as_ref(), &scope, plan)
-            .await
-            .map_err(ControllerError::InvalidAgentEvidence)?;
-        Ok(ReconcileAction {
-            requeue_after: Duration::ZERO,
-            kind,
-        })
+        .map_err(ControllerError::InvalidAgentEvidence)?
+        {
+            PublicV1TopologyPlan::Begin {
+                transition,
+                command,
+            } => {
+                self.api
+                    .begin_public_v1_operation(&scope, accepted, &transition, &command)
+                    .await
+                    .map_err(ControllerError::InvalidAgentEvidence)?;
+                Ok(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Applied,
+                })
+            }
+            PublicV1TopologyPlan::PersistTopology { expected, next } => {
+                self.api
+                    .persist_public_v1_topology(&scope, expected.as_ref(), &next)
+                    .await
+                    .map_err(ControllerError::InvalidAgentEvidence)?;
+                Ok(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Applied,
+                })
+            }
+            PublicV1TopologyPlan::Wait => Ok(ReconcileAction {
+                requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
+                kind: ReconcileKind::Waiting,
+            }),
+            PublicV1TopologyPlan::Stable => {
+                let primary = current
+                    .as_ref()
+                    .and_then(|configuration| {
+                        configuration
+                            .members
+                            .iter()
+                            .find(|member| member.role == ReplicaRole::Primary)
+                    })
+                    .map(|member| &member.identity);
+                self.api
+                    .converge_public_v1_write_service(&raw, primary)
+                    .await?;
+                Ok(ReconcileAction {
+                    requeue_after: Duration::from_secs(self.evaluation.stable_resync_seconds),
+                    kind: ReconcileKind::Stable,
+                })
+            }
+        }
     }
+}
+
+fn next_initialization_command(
+    raw: &crate::observation::RawObservation,
+    resource_uid: &ResourceUid,
+    replica_ids: &[ReplicaId],
+) -> Result<Option<InitializeAgentStore>> {
+    let policy = EffectivePolicy::fixed(raw.set.spec.replicas, raw.set.spec.failover_delay_seconds)
+        .ok_or_else(|| ControllerError::InvalidAgentEvidence("invalid replica policy".into()))?;
+    let mut members = Vec::with_capacity(replica_ids.len());
+    for replica_id in replica_ids {
+        let identity = observed_or_derived_identity(raw, resource_uid, *replica_id)?;
+        members.push(ConfigurationMember {
+            role: if *replica_id == replica_ids[0] {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            },
+            identity,
+        });
+    }
+    let configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        replica_ids[0],
+        members.clone(),
+        policy.write_quorum,
+    );
+    for member in members {
+        let key = raw.agents.iter().find_map(|(key, observation)| {
+            (key.replica_id == member.identity.replica_id
+                && matches!(observation, RawAgentObservation::Uninitialized(_)))
+            .then_some(key)
+        });
+        let Some(key) = key else {
+            continue;
+        };
+        let RawAgentObservation::Uninitialized(report) =
+            raw.agents.get(key).expect("selected fresh observation")
+        else {
+            unreachable!()
+        };
+        let initialization_id = derive_initialization_id(
+            resource_uid,
+            report.replica_id,
+            &report.pod_uid,
+            &report.pvc_uid,
+        );
+        if member.identity.instance_id != ReplicaInstanceId::new(report.pod_uid.as_str())
+            || member.identity.agent_generation != derive_agent_generation(&initialization_id)
+        {
+            return Err(ControllerError::InvalidAgentEvidence(
+                "fresh agent identity differs from desired bootstrap member".into(),
+            ));
+        }
+        return Ok(Some(InitializeAgentStore {
+            initialization_id,
+            resource_uid: resource_uid.clone(),
+            local_replica_id: report.replica_id,
+            expected_instance_id: member.identity.instance_id,
+            expected_pod_uid: report.pod_uid.clone(),
+            expected_pvc_uid: report.pvc_uid.clone(),
+            assigned_agent_generation: member.identity.agent_generation,
+            effective_policy: policy,
+            bootstrap_configuration: configuration,
+            provisioning: None,
+        }));
+    }
+    Ok(None)
+}
+
+fn observed_or_derived_identity(
+    raw: &crate::observation::RawObservation,
+    resource_uid: &ResourceUid,
+    replica_id: ReplicaId,
+) -> Result<ReplicaIdentity> {
+    if let Some(report) = raw
+        .agents
+        .values()
+        .find_map(|observation| match observation {
+            RawAgentObservation::PublicV1Report(report)
+                if report.replica.replica_id == replica_id =>
+            {
+                Some(report.replica.clone())
+            }
+            _ => None,
+        })
+    {
+        return Ok(report);
+    }
+    if let Some(fresh) = raw
+        .agents
+        .values()
+        .find_map(|observation| match observation {
+            RawAgentObservation::Uninitialized(report) if report.replica_id == replica_id => {
+                Some(report)
+            }
+            _ => None,
+        })
+    {
+        let initialization_id =
+            derive_initialization_id(resource_uid, replica_id, &fresh.pod_uid, &fresh.pvc_uid);
+        return Ok(ReplicaIdentity {
+            replica_id,
+            instance_id: ReplicaInstanceId::new(fresh.pod_uid.as_str()),
+            agent_generation: derive_agent_generation(&initialization_id),
+        });
+    }
+    let pod_name = format!("{}-{}", raw.set.name_any(), replica_id.value());
+    let pvc_name = format!("{pod_name}-data");
+    let pod_uid = raw
+        .pods
+        .iter()
+        .find(|pod| pod.name_any() == pod_name)
+        .and_then(kube::ResourceExt::uid)
+        .map(PodUid::new)
+        .ok_or(ControllerError::ObservationStale)?;
+    let pvc_uid = raw
+        .pvcs
+        .iter()
+        .find(|pvc| pvc.name_any() == pvc_name)
+        .and_then(kube::ResourceExt::uid)
+        .map(PvcUid::new)
+        .ok_or(ControllerError::ObservationStale)?;
+    let initialization_id = derive_initialization_id(resource_uid, replica_id, &pod_uid, &pvc_uid);
+    Ok(ReplicaIdentity {
+        replica_id,
+        instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+        agent_generation: derive_agent_generation(&initialization_id),
+    })
+}
+
+fn topology_replicas(
+    raw: &crate::observation::RawObservation,
+    reports: &[kuberic_runtime::protocol::public_operations::PublicV1AgentReport],
+) -> Result<Vec<PublicV1TopologyReplica>> {
+    let namespace = raw
+        .set
+        .namespace()
+        .ok_or(ControllerError::ObservationStale)?;
+    reports
+        .iter()
+        .filter(|report| report.replica.replica_id.value() <= i64::from(raw.set.spec.replicas))
+        .map(|report| {
+            let service = raw
+                .services
+                .iter()
+                .find(|service| {
+                    service.spec.as_ref().is_some_and(|spec| {
+                        spec.selector.as_ref().is_some_and(|selector| {
+                            selector
+                                .get(crate::crd::INSTANCE_LABEL)
+                                .is_some_and(|value| value == report.replica.instance_id.as_str())
+                        })
+                    }) && service.spec.as_ref().is_some_and(|spec| {
+                        spec.ports.as_ref().is_some_and(|ports| {
+                            ports
+                                .iter()
+                                .any(|port| port.name.as_deref() == Some("replication"))
+                        })
+                    })
+                })
+                .ok_or(ControllerError::ObservationStale)?;
+            Ok(PublicV1TopologyReplica {
+                report: report.clone(),
+                replication_address: format!("http://{}.{namespace}.svc:50052", service.name_any()),
+            })
+        })
+        .collect()
 }
 
 fn bootstrap_resources_missing(
     raw: &crate::observation::RawObservation,
     replica_ids: &[kuberic_runtime::protocol::types::ReplicaId],
+    current: Option<&ConfigurationDescriptor>,
 ) -> bool {
     let set_name = raw.set.name_any();
     if !raw
@@ -209,6 +594,14 @@ fn bootstrap_resources_missing(
         return true;
     }
     replica_ids.iter().any(|replica_id| {
+        if current.is_some_and(|configuration| {
+            configuration
+                .members
+                .iter()
+                .any(|member| member.identity.replica_id == *replica_id)
+        }) {
+            return false;
+        }
         let pod_name = format!("{set_name}-{}", replica_id.value());
         let pvc_name = format!("{pod_name}-data");
         let pod = raw.pods.iter().find(|pod| pod.name_any() == pod_name);

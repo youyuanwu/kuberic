@@ -195,6 +195,7 @@ async fn reconcile_to_effect(
 
 fn call_for(consumer: PublicV1EvidenceConsumer) -> PublicV1CallKind {
     match consumer {
+        PublicV1EvidenceConsumer::Topology => PublicV1CallKind::Configuration,
         PublicV1EvidenceConsumer::Failover | PublicV1EvidenceConsumer::DataLoss => {
             PublicV1CallKind::FailoverPromotion
         }

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -166,6 +167,7 @@ def validate_partitions(
 
 
 def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> None:
+    validate_kind_contract(root)
     inventory = listed_tests(nextest_json(root, extracted))
     assignments: dict[str, set[TestId]] = {}
     unassigned: list[TestId] = []
@@ -231,6 +233,27 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
     print(f"ordinary slice counts: {ordinary_counts}")
     print(f"postgres hash counts: {postgres_counts}")
     print("exact-once tier and partition validation passed")
+
+
+def validate_kind_contract(root: Path) -> None:
+    justfile = (root / "justfile").read_text()
+    workflow = (root / ".github/workflows/CI.yml").read_text()
+    scenarios = set(
+        re.findall(r"^\s*(bootstrap|replacement|failover)\)\s+test_names=", justfile, re.M)
+    )
+    if scenarios != {"bootstrap", "replacement", "failover"}:
+        raise ValueError(f"unexpected KinD scenario mapping: {sorted(scenarios)}")
+    all_match = re.search(r"expanded\+=\(([^)]*)\)", justfile)
+    if all_match is None or all_match.group(1).split() != [
+        "bootstrap",
+        "replacement",
+        "failover",
+    ]:
+        raise ValueError("KinD all expansion is not bootstrap replacement failover")
+    for arguments in re.findall(r"just level-triggered-kind-test ([^\n]+)", workflow):
+        for scenario in arguments.split():
+            if scenario not in scenarios | {"all"}:
+                raise ValueError(f"CI invokes unsupported KinD scenario: {scenario}")
 
 
 def main() -> int:

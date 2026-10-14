@@ -5,15 +5,16 @@ use kuberic_runtime::protocol::observation::ReplicaObservationKey;
 
 use crate::crd::KubericSet;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawAgentObservation {
     Absent,
     Unavailable { message: String },
     Invalid { message: String },
+    Uninitialized(kuberic_runtime::protocol::observation::UninitializedAgentObservation),
     PublicV1Report(Box<kuberic_runtime::protocol::public_operations::PublicV1AgentReport>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RawObservation {
     pub set: KubericSet,
     pub pods: Vec<Pod>,

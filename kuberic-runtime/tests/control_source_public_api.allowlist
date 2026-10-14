@@ -495,6 +495,7 @@ public-path documented fn crate::control::convert::fn normalize_execute_request 
 public-path documented fn crate::control::convert::fn normalize_public_v1_agent_status_report (report : proto :: AgentStatusReport ,) -> Result < PublicV1AgentReport , WireError >
 public-path documented fn crate::control::convert::fn normalize_replication_ack (ack : proto :: ReplicationAck ,) -> Result < ReplicationAcknowledgement , WireError >
 public-path documented fn crate::control::convert::fn normalize_replication_item (item : proto :: ReplicationItem ,) -> Result < ReplicationEnvelope , WireError >
+public-path documented fn crate::control::convert::fn normalize_uninitialized_agent_status_report (report : proto :: AgentStatusReport ,) -> Result < crate :: protocol :: observation :: UninitializedAgentObservation , WireError >
 public-path documented fn crate::control::convert::fn public_v1_agent_status_to_proto (report : & PublicV1AgentReport) -> proto :: AgentStatusReport
 public-path documented fn crate::control::convert::fn public_v1_history_command_to_proto (command : & PublicV1HistoryCommand ,) -> Result < proto :: PublicV1HistoryCommand , WireError >
 public-path documented fn crate::control::convert::fn public_v1_operation_command_to_proto (command : & PublicV1OperationCommand ,) -> Result < proto :: PublicV1OperationCommand , WireError >
@@ -669,7 +670,7 @@ public-path documented struct crate::protocol::types::StatusCondition
 public-path documented struct crate::protocol::types::SwitchoverHandoff
 public-path documented struct crate::protocol::types::SwitchoverPreparationId
 public-path documented struct crate::protocol::types::TransitionIntent
-public-path documented use crate::control::convert :: { CopyAcknowledgement , CopyEnvelope , ExecuteEnvelope , ReplicationAcknowledgement , ReplicationEnvelope , WireError , ensure_supported_version , normalize_copy_ack , normalize_copy_item , normalize_execute_request , normalize_public_v1_agent_status_report , normalize_replication_ack , normalize_replication_item , public_v1_agent_status_to_proto , public_v1_history_command_to_proto , public_v1_operation_command_to_proto , validate_copy_ack , validate_copy_item , validate_execute_request , validate_replication_ack , validate_replication_item , }
+public-path documented use crate::control::convert :: { CopyAcknowledgement , CopyEnvelope , ExecuteEnvelope , ReplicationAcknowledgement , ReplicationEnvelope , WireError , ensure_supported_version , normalize_copy_ack , normalize_copy_item , normalize_execute_request , normalize_public_v1_agent_status_report , normalize_replication_ack , normalize_replication_item , normalize_uninitialized_agent_status_report , public_v1_agent_status_to_proto , public_v1_history_command_to_proto , public_v1_operation_command_to_proto , validate_copy_ack , validate_copy_item , validate_execute_request , validate_replication_ack , validate_replication_item , }
 public-path documented use crate::protocol::validation::scale_down :: *
 public-path documented use crate::protocol::validation::scale_up :: *
 public-path documented variant crate::control::convert::WireError::InvalidAuthority((String))
@@ -695,7 +696,9 @@ public-path documented variant crate::protocol::command::ProtocolCommand::Initia
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1History((Box < PublicV1HistoryCommand >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1Operation((Box < PublicV1OperationCommand >))
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Initialize { { identity : PublicV1Identity , accepted : PublicV1AcceptedStatus , storage : ReplicaStorageIncarnationContext , } }
+public-path documented variant crate::protocol::command::PublicV1HistoryCommand::InstallInboundBuildAuthority { { authority : Box < PublicInboundBuildAuthority > , } }
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Recover { { accepted : PublicV1AcceptedStatus , intent : Box < PublicOperationIntent > , } }
+public-path documented variant crate::protocol::command::PublicV1HistoryCommand::RevokeInboundBuildAuthority { { authority : Box < PublicInboundBuildAuthority > , } }
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::SessionRenewal((Box < PublicV1SessionRenewalCommand >))
 public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::CloseAccessAndIngress { { accepted : PublicV1SessionRenewalStatus , } }
 public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::InstallFreshConfiguration { { accepted : PublicV1SessionRenewalStatus , configuration : ConfigurationDescriptor , } }

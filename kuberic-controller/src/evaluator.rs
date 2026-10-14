@@ -5,6 +5,7 @@ pub mod public_v1_history;
 #[cfg(feature = "runtime-test-bridge")]
 pub(crate) mod public_v1_lifecycle;
 pub mod public_v1_session_renewal;
+pub mod public_v1_topology;
 #[cfg(feature = "runtime-test-bridge")]
 #[doc(hidden)]
 pub mod testing;

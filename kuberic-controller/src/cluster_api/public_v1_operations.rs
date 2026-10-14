@@ -13,11 +13,13 @@ use kuberic_runtime::protocol::command::{
 #[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::public_operations::{
     PublicBuildAttemptReference, PublicConfiguration, PublicInboundBuildAuthority,
-    PublicOperationClass, PublicV1AcceptedStatus, PublicV1SessionRenewalStatus,
+    PublicOperationClass, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationIntent, PublicOperationProgram, PublicV1AgentReport, PublicV1CallKind,
+    PublicOperationIntent, PublicOperationProgram, PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicV1CallKind,
 };
+use kuberic_runtime::protocol::types::{ConfigurationDescriptor, ConfigurationId};
 #[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::types::{OperationId, ReplicaIdentity};
 
@@ -32,6 +34,32 @@ use crate::evaluator::public_v1_evidence::PublicV1ResourceAuthority;
 
 #[async_trait::async_trait]
 pub trait PublicV1OperationApi: Send + Sync {
+    async fn observe_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+    ) -> Result<Option<ConfigurationDescriptor>, String> {
+        Ok(None)
+    }
+
+    async fn persist_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: Option<&ConfigurationId>,
+        _next: &ConfigurationDescriptor,
+    ) -> Result<(), String> {
+        Err("public-v1 topology persistence is unsupported".into())
+    }
+
+    async fn begin_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_authority: &PublicV1AcceptedStatus,
+        _transition: &PublicV1AcceptedTransitionStatus,
+        _command: &kuberic_runtime::protocol::command::PublicV1OperationCommand,
+    ) -> Result<(), String> {
+        Err("public-v1 operation origination is unsupported".into())
+    }
+
     async fn observe_public_v1_operation(
         &self,
         scope: &PublicV1Scope,
@@ -519,6 +547,49 @@ impl HostedPublicV1Harness {
 #[async_trait::async_trait]
 #[cfg(feature = "runtime-test-bridge")]
 impl PublicV1OperationApi for HostedPublicV1Harness {
+    async fn observe_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+    ) -> Result<Option<ConfigurationDescriptor>, String> {
+        Ok(None)
+    }
+
+    async fn persist_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: Option<&ConfigurationId>,
+        next: &ConfigurationDescriptor,
+    ) -> Result<(), String> {
+        if next.configuration_id != next.expected_id() {
+            return Err("hosted public-v1 topology is invalid".into());
+        }
+        Ok(())
+    }
+
+    async fn begin_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        expected_authority: &PublicV1AcceptedStatus,
+        transition: &PublicV1AcceptedTransitionStatus,
+        command: &PublicV1OperationCommand,
+    ) -> Result<(), String> {
+        transition.validate()?;
+        command.validate().map_err(str::to_owned)?;
+        if &transition.evidence != expected_authority
+            || !operation_matches_transition(transition, &command.intent)
+            || command.target != transition.intent.source.storage_incarnation.replica
+        {
+            return Err("hosted public-v1 operation proposal is invalid".into());
+        }
+        self.dispatched
+            .lock()
+            .unwrap()
+            .push(ProtocolCommand::PublicV1Operation(Box::new(
+                command.clone(),
+            )));
+        Ok(())
+    }
+
     async fn observe_public_v1_operation(
         &self,
         scope: &PublicV1Scope,
@@ -813,6 +884,20 @@ impl PublicV1HistoryApi for HostedPublicV1Harness {
                 replica
                     .handle
                     .execute_public_v1(intent.as_ref().clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                replica
+                    .handle
+                    .install_public_v1_inbound_build_authority(authority)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                replica
+                    .handle
+                    .revoke_public_v1_inbound_build_authority(authority)
                     .await
                     .map_err(|error| error.to_string())?;
             }

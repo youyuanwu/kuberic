@@ -2257,6 +2257,7 @@ fn classify_replacement_store(
             observed: version,
         });
     }
+    recover_current_rollback_journal(path)?;
     let connection = open_read_only_connection(path).map_err(|error| {
         crate::host::HostError::Corrupt(format!(
             "cannot validate replacement SQLite metadata: {error}"
@@ -2268,6 +2269,43 @@ fn classify_replacement_store(
             expected: version,
             observed: state.identity.schema_version,
         });
+    }
+
+    fn recover_current_rollback_journal(path: &Path) -> Result<()> {
+        let journal = PathBuf::from(format!("{}-journal", path.display()));
+        if !journal.is_file() {
+            return Ok(());
+        }
+        let immutable = open_read_only_connection_with_immutable(path, true)?;
+        let exact_table: i64 = immutable.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_state'
+               AND sql LIKE '%singleton INTEGER PRIMARY KEY%'
+               AND sql LIKE '%state_json TEXT NOT NULL%'",
+            [],
+            |row| row.get(0),
+        )?;
+        let row_count: i64 = immutable.query_row(
+            "SELECT count(*) FROM agent_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if exact_table != 1 || row_count != 1 {
+            return Err(crate::host::HostError::Corrupt(
+                "schema-12 store with rollback journal lacks exact current layout".into(),
+            ));
+        }
+        drop(immutable);
+        let connection = open_writable_connection(path)?;
+        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION {
+            return Err(crate::host::HostError::SchemaMismatch {
+                expected: PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
+                observed: version,
+            });
+        }
+        drop(connection);
+        Ok(())
     }
     validate_identity(&state.identity)?;
     let replacement = state.public_v1_operation_state.as_ref().ok_or_else(|| {
@@ -2335,16 +2373,15 @@ fn open_writable_connection(path: &Path) -> Result<Connection> {
 
 fn configure_durability(connection: &Connection) -> Result<()> {
     let journal_mode: String =
-        connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-    if !journal_mode.eq_ignore_ascii_case("wal") {
+        connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
         return Err(crate::host::HostError::Corrupt(format!(
-            "SQLite refused WAL journaling and selected {journal_mode}"
+            "SQLite refused rollback journaling and selected {journal_mode}"
         )));
     }
     connection.execute_batch(
         "PRAGMA synchronous = FULL;
          PRAGMA foreign_keys = ON;
-         PRAGMA wal_autocheckpoint = 0;
          PRAGMA busy_timeout = 5000;",
     )?;
     let synchronous: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;

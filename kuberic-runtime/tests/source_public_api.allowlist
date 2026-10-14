@@ -49,6 +49,7 @@ private-path documented impl crate::host::process::ReplicaHandle::async fn publi
 private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_operation_intent (& self , operation_id : & crate :: protocol :: types :: OperationId ,) -> Result < Option < crate :: protocol :: public_operations :: PublicOperationIntent > >
 private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_process_endpoint (& self , role : crate :: protocol :: types :: ReplicaRole ,) -> Result < crate :: protocol :: types :: ProcessSessionEndpoint >
 private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_report (& self ,) -> Result < crate :: protocol :: public_operations :: PublicV1AgentReport >
+private-path documented impl crate::host::process::ReplicaHandle::async fn revoke_public_v1_inbound_build_authority (& self , authority : & crate :: protocol :: public_operations :: PublicInboundBuildAuthority ,) -> Result < () >
 private-path documented impl crate::host::process::ReplicaHandle::fn process_session_id (& self) -> crate :: protocol :: types :: ProcessSessionId
 private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_provider_writer_count (& self) -> usize
 private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_raw_retained_task_cardinality (& self) -> Result < (usize , usize) >

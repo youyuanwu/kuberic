@@ -71,6 +71,10 @@ pub(crate) trait StatelessRuntimeControl: Send + Sync {
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()>;
+    async fn revoke_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
 
     fn raw_retained_task_cardinality(&self) -> (usize, usize);
 }
@@ -971,9 +975,6 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        let mut settings = settings;
-        settings.replication_address =
-            format!("http://{}", context.public_v1_replication_address());
         stateless::StatelessReplicatorFactory::new(self.storage.clone())
             .create_replicator(context, state_provider, settings)
             .await

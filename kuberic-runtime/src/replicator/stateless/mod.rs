@@ -152,12 +152,34 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
             .await
     }
 
+    async fn revoke_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let _admission = self.inbound_build_admission_gate.lock().await;
+        let current = self
+            .context
+            .replacement_inbound_build_authority(&authority.attempt.build_id)
+            .await?;
+        if current.as_ref() != Some(authority) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.revoke_generation();
+        self.cancel_inbound_effects();
+        let _effect_drain = self.provider_effect_gate.lock().await;
+        self.state.lock().await.inbound_build = None;
+        self.context
+            .revoke_replacement_inbound_build_authority()
+            .await
+    }
+
     fn raw_retained_task_cardinality(&self) -> (usize, usize) {
         self.raw_retained_task_cardinality()
     }
 }
 
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PUBLIC_V1_DATA_SERVICE_REGISTRATIONS: &[&str] = &["ReplicationDataServer"];
 
 pub struct StatelessReplicatorFactory {
     storage: Arc<dyn DurableState>,
@@ -188,13 +210,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
                 "stateless replacement requires a replication address".into(),
             ));
         }
-        if parse_bind_address(&settings.replication_address)?
-            != context.public_v1_replication_address()
-        {
-            return Err(RuntimeError::Application(
-                "stateless replacement listener differs from process authority".into(),
-            ));
-        }
+        let bind_address = context.public_v1_replication_address();
         let provider = state_provider.ok_or_else(|| {
             RuntimeError::Application("stateless replacement requires a state provider".into())
         })?;
@@ -205,6 +221,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
             provider,
             self.storage.clone(),
             settings,
+            bind_address,
         ));
         engine
             .self_ref
@@ -385,6 +402,7 @@ pub struct StatelessReplicator {
     provider: Arc<dyn StateProvider>,
     storage: Arc<dyn DurableState>,
     settings: RwLock<ReplicatorSettings>,
+    bind_address: SocketAddr,
     streams: Arc<ServiceStreams>,
     state: Mutex<EngineState>,
     closed: AtomicBool,
@@ -417,6 +435,7 @@ impl StatelessReplicator {
         provider: Arc<dyn StateProvider>,
         storage: Arc<dyn DurableState>,
         settings: ReplicatorSettings,
+        bind_address: SocketAddr,
     ) -> Self {
         let (callback_containment, _) = watch::channel(true);
         Self {
@@ -426,6 +445,7 @@ impl StatelessReplicator {
             provider,
             storage,
             settings: RwLock::new(settings),
+            bind_address,
             streams: Arc::new(ServiceStreams::new()),
             state: Mutex::new(EngineState {
                 opened: false,
@@ -2097,10 +2117,10 @@ impl Replicator for StatelessReplicator {
             }
         }
         let address = self.settings.read().await.replication_address.clone();
-        let bind = parse_bind_address(&address)?;
-        let listener = TcpListener::bind(bind)
+        let listener = TcpListener::bind(self.bind_address)
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        debug_assert_eq!(PUBLIC_V1_DATA_SERVICE_REGISTRATIONS.len(), 1);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let service = ReplacementReplicationService {
             engine: self.self_ref.get().cloned().ok_or_else(|| {
@@ -2822,14 +2842,6 @@ impl proto::replication_data_server::ReplicationData for ReplacementReplicationS
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
-}
-
-fn parse_bind_address(address: &str) -> Result<SocketAddr> {
-    address
-        .strip_prefix("http://")
-        .unwrap_or(address)
-        .parse()
-        .map_err(|error| RuntimeError::Application(format!("invalid replication address: {error}")))
 }
 
 fn runtime_status(error: RuntimeError) -> Status {

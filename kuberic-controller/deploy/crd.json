@@ -231,6 +231,56 @@
                     ],
                     "type": "object"
                   },
+                  "publicV1Topology": {
+                    "nullable": true,
+                    "properties": {
+                      "canonicalConfigurationJson": {
+                        "minLength": 2,
+                        "type": "string"
+                      },
+                      "configurationId": {
+                        "type": "string"
+                      },
+                      "epoch": {
+                        "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                        "properties": {
+                          "configurationNumber": {
+                            "format": "int64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "dataLossNumber": {
+                            "format": "int64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "configurationNumber",
+                          "dataLossNumber"
+                        ],
+                        "type": "object"
+                      },
+                      "memberCount": {
+                        "format": "uint32",
+                        "minimum": 0.0,
+                        "type": "integer"
+                      },
+                      "primaryId": {
+                        "format": "int64",
+                        "minimum": 1.0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "canonicalConfigurationJson",
+                      "configurationId",
+                      "epoch",
+                      "memberCount",
+                      "primaryId"
+                    ],
+                    "type": "object"
+                  },
                   "publicV1Transition": {
                     "nullable": true,
                     "properties": {

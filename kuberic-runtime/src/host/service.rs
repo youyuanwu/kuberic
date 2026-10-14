@@ -35,6 +35,8 @@ use crate::protocol::types::{
 
 const AUTHORIZATION_HEADER: &str = "authorization";
 pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS: &[&str] =
+    &["AgentControlServer", "ReplicaPeerServer"];
 
 pub(crate) struct InitializationService {
     observed: ObservedStorageIdentity,
@@ -99,6 +101,7 @@ impl InitializationService {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let listener = TcpListener::bind(control_address).await?;
+        debug_assert_eq!(PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS.len(), 2);
         let control = self.clone();
         let peer = self;
         ready.send_replace(true);
@@ -544,6 +547,30 @@ where
             }
             PublicV1HistoryCommand::Recover { intent, .. } => {
                 self.execute_public_intent(*intent).await
+            }
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                let state = self.store.load_state().await?;
+                if authority.attempt.target != state.identity.local_identity {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "inbound build authority targets another replica".into(),
+                    ));
+                }
+                self.runtime
+                    .install_replacement_inbound_build_authority(&authority)
+                    .await
+                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                let state = self.store.load_state().await?;
+                if authority.attempt.target != state.identity.local_identity {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "inbound build authority targets another replica".into(),
+                    ));
+                }
+                self.runtime
+                    .revoke_replacement_inbound_build_authority(&authority)
+                    .await
+                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
             }
             PublicV1HistoryCommand::SessionRenewal(command) => {
                 self.execute_session_renewal(*command).await

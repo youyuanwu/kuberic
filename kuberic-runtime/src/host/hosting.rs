@@ -560,6 +560,19 @@ impl PodRuntime {
             .await
     }
 
+    pub(crate) async fn revoke_replacement_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.host
+            .registered
+            .get()
+            .and_then(|registered| registered.stateless_runtime_control.clone())
+            .ok_or(RuntimeError::NotOpen)?
+            .revoke_inbound_build_authority(authority)
+            .await
+    }
+
     pub(crate) fn replacement_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
         self.host
             .registered

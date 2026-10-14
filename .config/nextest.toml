@@ -5,12 +5,13 @@ dir = "target/nextest"
 fail-fast = false
 retries = 0
 test-threads = 4
+slow-timeout = { period = "270s", terminate-after = 1 }
 
 [profile.ci]
 inherits = "default"
 fail-fast = false
 retries = 0
-slow-timeout = { period = "300s", terminate-after = 1 }
+slow-timeout = { period = "270s", terminate-after = 1 }
 
 [profile.ordinary]
 inherits = "ci"

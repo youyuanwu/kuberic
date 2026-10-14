@@ -5,8 +5,8 @@ use kuberic_runtime::protocol::public_operations::{
     PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
-    HistoryContext, HistoryInitializationId, OperationId, ReplicaIdentity,
-    ReplicaStorageIncarnationContext, ResourceUid,
+    ConfigurationDescriptor, ConfigurationId, Epoch, HistoryContext, HistoryInitializationId,
+    OperationId, ReplicaId, ReplicaIdentity, ReplicaStorageIncarnationContext, ResourceUid,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -61,11 +61,69 @@ pub struct KubericSetStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_authority: Option<PublicV1AuthorityStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_v1_topology: Option<PublicV1TopologyState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_session_renewal: Option<PublicV1SessionRenewalState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_transition: Option<PublicV1TransitionState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_operation: Option<PublicV1OperationStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicV1TopologyState {
+    pub configuration_id: ConfigurationId,
+    pub epoch: Epoch,
+    pub primary_id: ReplicaId,
+    pub member_count: u32,
+    #[schemars(length(min = 2))]
+    pub canonical_configuration_json: String,
+}
+
+impl PublicV1TopologyState {
+    pub fn from_configuration(configuration: &ConfigurationDescriptor) -> Result<Self, String> {
+        if configuration.configuration_id != configuration.expected_id()
+            || configuration.members.is_empty()
+            || configuration
+                .members
+                .iter()
+                .filter(|member| {
+                    member.role == kuberic_runtime::protocol::types::ReplicaRole::Primary
+                })
+                .count()
+                != 1
+        {
+            return Err("invalid public-v1 topology configuration".into());
+        }
+        Ok(Self {
+            configuration_id: configuration.configuration_id.clone(),
+            epoch: configuration.epoch,
+            primary_id: configuration.primary_id,
+            member_count: configuration
+                .members
+                .len()
+                .try_into()
+                .map_err(|_| "public-v1 topology member count exceeds u32".to_string())?,
+            canonical_configuration_json: serde_json::to_string(configuration)
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
+    pub fn configuration(&self) -> Result<ConfigurationDescriptor, String> {
+        let configuration: ConfigurationDescriptor =
+            serde_json::from_str(&self.canonical_configuration_json)
+                .map_err(|error| error.to_string())?;
+        if configuration.configuration_id != self.configuration_id
+            || configuration.epoch != self.epoch
+            || configuration.primary_id != self.primary_id
+            || configuration.members.len() != self.member_count as usize
+            || configuration.configuration_id != configuration.expected_id()
+        {
+            return Err("public-v1 topology summary differs from canonical configuration".into());
+        }
+        Ok(configuration)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -251,6 +309,11 @@ impl KubericSetStatus {
             .as_ref()
             .map(PublicV1SessionRenewalState::renewal)
             .transpose()?;
+        let topology = self
+            .public_v1_topology
+            .as_ref()
+            .map(PublicV1TopologyState::configuration)
+            .transpose()?;
         let transition = self
             .public_v1_transition
             .as_ref()
@@ -263,6 +326,18 @@ impl KubericSetStatus {
             })
         {
             return Err("public-v1 session renewal lacks exact accepted history".into());
+        }
+        if let Some(topology) = &topology
+            && topology
+                .members
+                .iter()
+                .filter(|member| {
+                    member.role == kuberic_runtime::protocol::types::ReplicaRole::Primary
+                })
+                .count()
+                != 1
+        {
+            return Err("public-v1 topology lacks exactly one primary".into());
         }
         if let Some(transition) = &transition {
             if authority.as_ref() != Some(&transition.evidence) {
@@ -318,6 +393,7 @@ mod tests {
                 "publicV1Authority",
                 "publicV1Operation",
                 "publicV1SessionRenewal",
+                "publicV1Topology",
                 "publicV1Transition",
             ])
         );
@@ -325,6 +401,7 @@ mod tests {
             "publicV1Authority",
             "publicV1Operation",
             "publicV1SessionRenewal",
+            "publicV1Topology",
             "publicV1Transition",
         ] {
             assert!(

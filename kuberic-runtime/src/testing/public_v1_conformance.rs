@@ -172,6 +172,8 @@ struct ProductionSources<'a> {
     controller_lib: &'a str,
     controller_evaluator: &'a str,
     controller_cluster_api: &'a str,
+    control_services: &'a [&'a str],
+    data_services: &'a [&'a str],
 }
 
 fn production_sources() -> ProductionSources<'static> {
@@ -189,6 +191,8 @@ fn production_sources() -> ProductionSources<'static> {
         controller_lib: CONTROLLER_LIB,
         controller_evaluator: CONTROLLER_EVALUATOR,
         controller_cluster_api: CONTROLLER_CLUSTER_API,
+        control_services: crate::host::service::PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS,
+        data_services: crate::replicator::stateless::PUBLIC_V1_DATA_SERVICE_REGISTRATIONS,
     }
 }
 
@@ -283,11 +287,11 @@ fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipIn
             .collect(),
     );
     let services = sorted_unique(
-        [sources.service, sources.stateless]
-            .into_iter()
-            .flat_map(|source| {
-                discover_after(source, ".add_service(proto::", |character| character == ':')
-            })
+        sources
+            .control_services
+            .iter()
+            .chain(sources.data_services.iter())
+            .map(|name| (*name).to_string())
             .collect(),
     );
     let store_tables = sorted_unique(discover_after(
@@ -335,11 +339,13 @@ pub fn replacement_ownership_inventory() -> ReplacementOwnershipInventory {
 
 pub fn replacement_ownership_inventory_with_extra_endpoint_fixture() -> ReplacementOwnershipInventory
 {
-    let service = format!(
-        "{HOST_SERVICE}\n.add_service(proto::alternate_continuation_server::AlternateContinuationServer::new(extra))"
-    );
+    let control_services = [
+        "AgentControlServer",
+        "ReplicaPeerServer",
+        "AlternateContinuationServer",
+    ];
     discover_inventory(&ProductionSources {
-        service: &service,
+        control_services: &control_services,
         ..production_sources()
     })
 }
@@ -387,7 +393,7 @@ pub fn validate_replacement_ownership_inventory(
         || !inventory.services.iter().all(|name| {
             matches!(
                 name.as_str(),
-                "agent_control_server" | "replica_peer_server" | "replication_data_server"
+                "AgentControlServer" | "ReplicaPeerServer" | "ReplicationDataServer"
             )
         })
     {
@@ -438,6 +444,7 @@ pub fn validate_replacement_ownership_inventory(
             "public_v1_reconciliation",
             "public_v1_service",
             "public_v1_session_renewal",
+            "public_v1_topology",
             "reconciler",
             "testing",
             "tests",

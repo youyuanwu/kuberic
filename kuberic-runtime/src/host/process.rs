@@ -193,6 +193,29 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn revoke_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with Public V1 replacement authority".into(),
+            )
+        })?;
+        if !preview.binding.identity.is_public_v1()
+            || authority.attempt.target != self.store.load_state().await?.identity.local_identity
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "inbound build authority differs from the replacement target".into(),
+            ));
+        }
+        self.runtime
+            .revoke_replacement_inbound_build_authority(authority)
+            .await
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn execute_public_v1(
         &self,
         intent: crate::protocol::public_operations::PublicOperationIntent,

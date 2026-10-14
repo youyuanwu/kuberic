@@ -1173,12 +1173,17 @@ async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
             )
             .unwrap(),
         );
-        let replication_address = free_address();
+        let advertised_replication_address = free_address();
+        let replication_address =
+            std::net::SocketAddr::from(([0, 0, 0, 0], advertised_replication_address.port()));
         let storage = Arc::new(MemoryState::default());
         let application = Arc::new(
-            PreviewApplication::new(storage.clone(), format!("http://{replication_address}"))
-                .with_open_probe(database)
-                .with_failed_creation(),
+            PreviewApplication::new(
+                storage.clone(),
+                format!("http://{advertised_replication_address}"),
+            )
+            .with_open_probe(database)
+            .with_failed_creation(),
         );
         let mut running = ReplicaHost::new(
             ReplicaProcessConfig {
@@ -1206,7 +1211,7 @@ async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
         assert_eq!(application.factory_calls.load(Ordering::SeqCst), 0);
         assert_eq!(application.failed_factory_calls.load(Ordering::SeqCst), 0);
         assert_eq!(handle.public_v1_provider_writer_count(), 0);
-        drop(std::net::TcpListener::bind(replication_address).unwrap());
+        drop(std::net::TcpListener::bind(advertised_replication_address).unwrap());
 
         let generation = PublicProtocolGeneration::new(7);
         let initialization = derive_history_initialization_id(&resource_uid, generation);
@@ -1240,7 +1245,7 @@ async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
             "ApplicationOpen instruction was not durable before its effect"
         );
         assert_eq!(handle.public_v1_provider_writer_count(), 1);
-        assert!(std::net::TcpListener::bind(replication_address).is_err());
+        assert!(std::net::TcpListener::bind(advertised_replication_address).is_err());
 
         assert!(application.duplicate_creation().await.is_err());
         assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
@@ -1249,7 +1254,7 @@ async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
         handle.execute_public_v1(open).await.unwrap();
         assert_eq!(application.opens.load(Ordering::SeqCst), 1);
         assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
-        assert!(std::net::TcpListener::bind(replication_address).is_err());
+        assert!(std::net::TcpListener::bind(advertised_replication_address).is_err());
 
         handle
             .execute_public_v1(intent(
@@ -1262,7 +1267,7 @@ async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
             .await
             .unwrap();
         assert_eq!(handle.public_v1_provider_writer_count(), 0);
-        drop(std::net::TcpListener::bind(replication_address).unwrap());
+        drop(std::net::TcpListener::bind(advertised_replication_address).unwrap());
         running.shutdown();
         running.wait().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();

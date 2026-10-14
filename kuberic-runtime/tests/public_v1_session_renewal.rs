@@ -1509,3 +1509,60 @@ fn public_v1_replacement_schema_rejects_prior_preview_stores() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn public_v1_replacement_schema_recovers_hot_rollback_journal() {
+    let root = test_root("replacement_schema-hot-rollback");
+    let path = SqliteStore::metadata_database_path(&root);
+    let preview = PublicV1Identity::new(42);
+    let local = replica(1);
+    let store = SqliteStore::create_public_v1(
+        &path,
+        preview.clone(),
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource-hot-rollback"),
+            pod_uid: PodUid::new("pod-hot-rollback"),
+            pvc_uid: PvcUid::new("pvc-hot-rollback"),
+            initialization_id: InitializationId::new("hot-rollback-initialization"),
+            local_identity: local,
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        },
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let before = runtime.block_on(store.load_state()).unwrap();
+    drop(store);
+
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn fork() -> i32;
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        let pid = fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = DELETE;
+                     PRAGMA synchronous = FULL;
+                     PRAGMA cache_size = 1;
+                     BEGIN IMMEDIATE;
+                     UPDATE agent_state SET state_json = 'interrupted-current-state'
+                     WHERE singleton = 1;",
+                )
+                .unwrap();
+            std::process::abort();
+        }
+        let mut status = 0;
+        assert_eq!(waitpid(pid, &mut status, 0), pid);
+        assert_ne!(status, 0);
+    }
+    assert!(PathBuf::from(format!("{}-journal", path.display())).is_file());
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    assert_eq!(runtime.block_on(reopened.load_state()).unwrap(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}

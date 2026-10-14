@@ -6,12 +6,14 @@ use kuberic_runtime::protocol::command::{
     ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1Identity,
+    PublicBuildAttemptReference, PublicInboundBuildAuthority, PublicOperationClass,
+    PublicOperationIntent, PublicOperationProgram, PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
-    AgentGeneration, OperationId, PodUid, PublicProtocolGeneration, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaStorageIdentity, ReplicaStorageIncarnationContext,
-    ResourceUid, StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
+    AgentGeneration, ConfigurationId, Epoch, OperationId, PodUid, ProcessSessionId,
+    PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration,
+    derive_bootstrap_history, derive_history_initialization_id,
 };
 
 fn identity() -> ReplicaIdentity {
@@ -30,6 +32,22 @@ fn storage() -> ReplicaStorageIncarnationContext {
             pvc_uid: PvcUid::new("pvc-1"),
         },
         storage_generation: StorageGeneration::new("storage-1"),
+    }
+}
+
+fn target_storage() -> ReplicaStorageIncarnationContext {
+    let replica = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: AgentGeneration::new("generation-2"),
+    };
+    ReplicaStorageIncarnationContext {
+        replica,
+        storage: ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("pod-2"),
+            pvc_uid: PvcUid::new("pvc-2"),
+        },
+        storage_generation: StorageGeneration::new("storage-2"),
     }
 }
 
@@ -134,4 +152,51 @@ fn public_v1_operation_command_round_trips_and_rejects_partial_or_crossed_input(
     let mut crossed = request;
     crossed.expected_process_session_id = "other-session".into();
     assert!(validate_execute_request(&crossed).is_err());
+}
+
+#[test]
+fn public_v1_inbound_build_authority_commands_round_trip() {
+    let accepted = accepted();
+    let source_storage = storage();
+    let target_storage = target_storage();
+    let authority = PublicInboundBuildAuthority {
+        operation_id: OperationId::new("build-operation"),
+        operation_revision: 7,
+        attempt: PublicBuildAttemptReference {
+            resource_uid: ResourceUid::new("resource-1"),
+            epoch: Epoch::new(0, 2),
+            build_id: OperationId::new("build-attempt"),
+            source: source_storage.replica.clone(),
+            source_storage,
+            source_session: ProcessSessionId::new("source-session"),
+            target: target_storage.replica.clone(),
+            target_storage: target_storage.clone(),
+            target_session: ProcessSessionId::new("target-session"),
+        },
+        history: accepted.history,
+        current_configuration_id: ConfigurationId::new("configuration-2"),
+        target_address: "http://pod-2:50052".into(),
+    };
+    for command in [
+        PublicV1HistoryCommand::InstallInboundBuildAuthority {
+            authority: Box::new(authority.clone()),
+        },
+        PublicV1HistoryCommand::RevokeInboundBuildAuthority {
+            authority: Box::new(authority.clone()),
+        },
+    ] {
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: "resource-1".into(),
+            target: Some(target_storage.replica.clone().into()),
+            expected_process_session_id: "target-session".into(),
+            command: Some(proto::execute_command_request::Command::PublicV1History(
+                public_v1_history_command_to_proto(&command).unwrap(),
+            )),
+        };
+        assert_eq!(
+            normalize_execute_request(request).unwrap().command,
+            ProtocolCommand::PublicV1History(Box::new(command))
+        );
+    }
 }

@@ -23,6 +23,7 @@ page:control/convert/fn.normalize_execute_request.html
 page:control/convert/fn.normalize_public_v1_agent_status_report.html
 page:control/convert/fn.normalize_replication_ack.html
 page:control/convert/fn.normalize_replication_item.html
+page:control/convert/fn.normalize_uninitialized_agent_status_report.html
 page:control/convert/fn.public_v1_agent_status_to_proto.html
 page:control/convert/fn.public_v1_history_command_to_proto.html
 page:control/convert/fn.public_v1_operation_command_to_proto.html

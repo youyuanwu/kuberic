@@ -49,7 +49,29 @@ where
         .observe_public_v1_operation(scope)
         .await?
         .ok_or_else(|| "public-v1 operation lacks accepted transition status".to_string())?;
-    crate::executor::execute_public_v1_operation(api, scope, &expected, command).await?;
+    if let Ok(report) = api
+        .observe_public_v1_operation_report(scope, &expected)
+        .await
+    {
+        let plan = plan_public_v1_evidence(&expected, &report)?;
+        if !matches!(plan, PublicV1EvidencePlan::Wait) {
+            return reconcile_public_v1_consumer(api, scope, &report).await;
+        }
+    }
+    if let Err(dispatch_error) =
+        crate::executor::execute_public_v1_operation(api, scope, &expected, command).await
+    {
+        if let Ok(report) = api
+            .observe_public_v1_operation_report(scope, &expected)
+            .await
+        {
+            let outcome = reconcile_public_v1_consumer(api, scope, &report).await?;
+            if outcome != PublicV1ReconciliationOutcome::Waiting {
+                return Ok(outcome);
+            }
+        }
+        return Err(dispatch_error);
+    }
     let report = api
         .observe_public_v1_operation_report(scope, &expected)
         .await?;

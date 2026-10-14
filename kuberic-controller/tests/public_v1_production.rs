@@ -18,11 +18,11 @@ use kuberic_runtime::protocol::types::{
     derive_history_initialization_id, derive_initialization_id,
 };
 
-fn empty_observation() -> RawObservation {
+fn empty_observation(replicas: u32) -> RawObservation {
     let mut set = KubericSet::new(
         "sample",
         KubericSetSpec {
-            replicas: 1,
+            replicas,
             image: "example".into(),
             failover_delay_seconds: 30,
             switchover: None,
@@ -107,7 +107,7 @@ fn resources_ready(observation: &RawObservation) -> bool {
 #[tokio::test]
 async fn production_reconciler_bootstraps_then_stabilizes_on_public_v1_reports() {
     tokio::time::timeout(Duration::from_secs(270), async {
-        let api = Arc::new(InMemoryClusterApi::new(empty_observation()));
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(1)));
         let reconciler = Reconciler::new(
             api.clone(),
             kuberic_controller::production_evaluation_config(30, 5, 30),
@@ -117,52 +117,73 @@ async fn production_reconciler_bootstraps_then_stabilizes_on_public_v1_reports()
             assert_eq!(action.kind, ReconcileKind::Executed);
             let observed = api.observation().await;
             assert!(
-                observed.agents.is_empty(),
-                "fresh bootstrap must not manufacture or preseed agent reports"
+                observed
+                    .agents
+                    .values()
+                    .all(|agent| !matches!(agent, RawAgentObservation::PublicV1Report(_))),
+                "resource convergence must not preseed established Public V1 reports"
             );
             if resources_ready(&observed) {
                 break;
             }
         }
-        let mut observed = api.observation().await;
+        let observed = api.observation().await;
         assert!(resources_ready(&observed));
-        assert!(observed.agents.is_empty());
+        assert!(
+            observed
+                .agents
+                .values()
+                .any(|agent| matches!(agent, RawAgentObservation::Uninitialized(_)))
+        );
         let pod_uid = observed.pods[0].uid().expect("bootstrap Pod UID");
         assert_eq!(
             observed.pods[0].labels().get(INSTANCE_LABEL),
             Some(&pod_uid)
         );
-        let report = report_for(&observed);
-        assert!(
-            observed
-                .agents
-                .insert(
-                    ReplicaObservationKey::new(
-                        report.replica.replica_id,
-                        report.replica.instance_id.clone(),
-                    ),
-                    RawAgentObservation::PublicV1Report(Box::new(report)),
-                )
-                .is_none(),
-            "bootstrap report injection replaced preseeded evidence"
-        );
         api.set_observation(observed).await;
-        assert_eq!(
-            reconciler
+        let mut applied = false;
+        for _ in 0..32 {
+            match reconciler
                 .reconcile("default", "sample")
                 .await
                 .unwrap()
-                .kind,
-            ReconcileKind::Applied
-        );
-        assert_eq!(
-            reconciler
-                .reconcile("default", "sample")
-                .await
-                .unwrap()
-                .kind,
-            ReconcileKind::Stable
-        );
+                .kind
+            {
+                ReconcileKind::Applied | ReconcileKind::Executed => applied = true,
+                ReconcileKind::Stable => break,
+                ReconcileKind::Waiting => {}
+                other => panic!("unexpected production reconcile result: {other:?}"),
+            }
+        }
+        assert!(applied);
+        let observed = api.observation().await;
+        let status = observed.set.status.as_ref().expect("Public V1 status");
+        let topology = status
+            .public_v1_topology
+            .as_ref()
+            .expect("accepted Public V1 topology")
+            .configuration()
+            .unwrap();
+        assert_eq!(topology.members.len(), 1);
+        assert_eq!(topology.primary_id, ReplicaId::new(1));
+        let report = observed
+            .agents
+            .values()
+            .find_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report) => Some(report),
+                _ => None,
+            })
+            .expect("established Public V1 report");
+        assert_eq!(report.role, ReplicaRole::Primary);
+        assert_eq!(report.write_status, AccessStatus::Granted);
+        let selector = observed
+            .services
+            .iter()
+            .find(|service| service.metadata.name.as_deref() == Some("sample-write"))
+            .and_then(|service| service.spec.as_ref())
+            .and_then(|spec| spec.selector.as_ref())
+            .and_then(|selector| selector.get(INSTANCE_LABEL));
+        assert_eq!(selector, Some(&pod_uid));
     })
     .await
     .expect("public-v1 production reconciliation exceeded 270 seconds");
@@ -171,7 +192,7 @@ async fn production_reconciler_bootstraps_then_stabilizes_on_public_v1_reports()
 #[tokio::test]
 async fn production_reconciler_defers_preseeded_reports_until_resources_exist() {
     tokio::time::timeout(Duration::from_secs(270), async {
-        let source_api = Arc::new(InMemoryClusterApi::new(empty_observation()));
+        let source_api = Arc::new(InMemoryClusterApi::new(empty_observation(1)));
         let source_reconciler = Reconciler::new(
             source_api.clone(),
             kuberic_controller::production_evaluation_config(30, 5, 30),
@@ -190,7 +211,7 @@ async fn production_reconciler_defers_preseeded_reports_until_resources_exist() 
             }
         }
         let report = report_for(&source_api.observation().await);
-        let mut preseeded = empty_observation();
+        let mut preseeded = empty_observation(1);
         preseeded.agents.insert(
             ReplicaObservationKey::new(
                 report.replica.replica_id,
@@ -246,4 +267,568 @@ async fn production_reconciler_defers_preseeded_reports_until_resources_exist() 
     })
     .await
     .expect("preseeded-report bootstrap reconciliation exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_initializes_every_desired_replica_and_one_writer() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(30, 5, 30),
+        );
+        let mut stable = false;
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable, "three-replica Public V1 bootstrap did not converge");
+        let observed = api.observation().await;
+        assert_eq!(observed.pods.len(), 3);
+        assert_eq!(observed.pvcs.len(), 3);
+        let reports = observed
+            .agents
+            .values()
+            .filter_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report) => Some(report.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 3);
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| report.write_status == AccessStatus::Granted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .find(|report| report.write_status == AccessStatus::Granted)
+                .map(|report| report.replica.replica_id),
+            Some(ReplicaId::new(1))
+        );
+        let topology = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .expect("accepted topology")
+            .configuration()
+            .unwrap();
+        assert_eq!(topology.members.len(), 3);
+    })
+    .await
+    .expect("three-replica Public V1 bootstrap exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_originates_failover_and_retargets_writer() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        let primary_key = observed
+            .agents
+            .iter()
+            .find_map(|(key, agent)| match agent {
+                RawAgentObservation::PublicV1Report(report)
+                    if report.write_status == AccessStatus::Granted =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .expect("initial primary");
+        assert_eq!(primary_key.replica_id, ReplicaId::new(1));
+        observed.agents.remove(&primary_key);
+        api.set_observation(observed).await;
+
+        let mut stable = false;
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable, "Public V1 failover did not converge");
+        let observed = api.observation().await;
+        let reports = observed
+            .agents
+            .values()
+            .filter_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report) => Some(report.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 2);
+        let writer = reports
+            .iter()
+            .filter(|report| report.write_status == AccessStatus::Granted)
+            .collect::<Vec<_>>();
+        assert_eq!(writer.len(), 1);
+        assert_ne!(writer[0].replica.replica_id, ReplicaId::new(1));
+        let topology = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .expect("failover topology")
+            .configuration()
+            .unwrap();
+        assert_eq!(topology.members.len(), 2);
+        assert_eq!(topology.primary_id, writer[0].replica.replica_id);
+        let selector = observed
+            .services
+            .iter()
+            .find(|service| service.metadata.name.as_deref() == Some("sample-write"))
+            .and_then(|service| service.spec.as_ref())
+            .and_then(|spec| spec.selector.as_ref())
+            .and_then(|selector| selector.get(INSTANCE_LABEL));
+        assert_eq!(selector, Some(&writer[0].replica.instance_id.to_string()));
+    })
+    .await
+    .expect("Public V1 failover exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        let old = observed
+            .agents
+            .iter()
+            .find_map(|(key, agent)| match agent {
+                RawAgentObservation::PublicV1Report(report)
+                    if report.replica.replica_id == ReplicaId::new(2) =>
+                {
+                    Some((key.clone(), report.replica.clone()))
+                }
+                _ => None,
+            })
+            .expect("admitted secondary");
+        observed.agents.remove(&old.0);
+        observed
+            .pods
+            .retain(|pod| pod.uid().as_deref() != Some(old.1.instance_id.as_str()));
+        api.set_observation(observed).await;
+
+        let mut stable = false;
+        for iteration in 0..200 {
+            let action = match reconciler.reconcile("default", "sample").await {
+                Ok(action) => action,
+                Err(error) => panic!(
+                    "replacement iteration {iteration}: {error:?}; observation={:#?}",
+                    api.observation().await
+                ),
+            };
+            if action.kind == ReconcileKind::Stable {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable, "Public V1 replacement did not converge");
+        let observed = api.observation().await;
+        let replacement = observed
+            .agents
+            .values()
+            .find_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report)
+                    if report.replica.replica_id == ReplicaId::new(2) =>
+                {
+                    Some(report.as_ref())
+                }
+                _ => None,
+            })
+            .expect("replacement report");
+        assert_ne!(replacement.replica, old.1);
+        assert!(observed.pvcs.iter().any(|pvc| {
+            pvc.labels()
+                .get(kuberic_controller::crd::REPLICA_ID_LABEL)
+                .is_some_and(|value| value == "2")
+                && pvc.metadata.name.as_deref() != Some("sample-2-data")
+        }));
+        assert!(
+            !observed
+                .pvcs
+                .iter()
+                .any(|pvc| pvc.metadata.name.as_deref() == Some("sample-2-data"))
+        );
+        let topology = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .expect("replacement topology")
+            .configuration()
+            .unwrap();
+        assert!(
+            topology
+                .members
+                .iter()
+                .any(|member| member.identity == replacement.replica)
+        );
+        assert_eq!(
+            observed
+                .agents
+                .values()
+                .filter(|agent| matches!(
+                    agent,
+                    RawAgentObservation::PublicV1Report(report)
+                        if report.write_status == AccessStatus::Granted
+                ))
+                .count(),
+            1
+        );
+    })
+    .await
+    .expect("Public V1 replacement exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_originates_planned_switchover() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        observed.set.spec.switchover =
+            Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+                request_id: "switch-to-2".into(),
+                target_replica_id: 2,
+            });
+        api.set_observation(observed).await;
+        let mut stable = false;
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable);
+        let observed = api.observation().await;
+        let writers = observed
+            .agents
+            .values()
+            .filter_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report)
+                    if report.write_status == AccessStatus::Granted =>
+                {
+                    Some(report.replica.replica_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writers, vec![ReplicaId::new(2)]);
+    })
+    .await
+    .expect("Public V1 switchover exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_originates_desired_membership_changes() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(2)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        observed.set.spec.replicas = 3;
+        api.set_observation(observed).await;
+        let mut scaled_up = false;
+        for _ in 0..200 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                scaled_up = true;
+                break;
+            }
+        }
+        assert!(scaled_up);
+        let observed = api.observation().await;
+        assert_eq!(
+            observed
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_topology.as_ref())
+                .unwrap()
+                .configuration()
+                .unwrap()
+                .members
+                .len(),
+            3
+        );
+
+        let mut observed = observed;
+        observed.set.spec.replicas = 2;
+        api.set_observation(observed).await;
+        let mut scaled_down = false;
+        for _ in 0..200 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                scaled_down = true;
+                break;
+            }
+        }
+        if !scaled_down {
+            panic!(
+                "scale down did not converge: observation={:#?}",
+                api.observation().await
+            );
+        }
+        let observed = api.observation().await;
+        let topology = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .unwrap()
+            .configuration()
+            .unwrap();
+        assert_eq!(topology.members.len(), 2);
+        assert!(!observed.pods.iter().any(|pod| {
+            pod.labels()
+                .get(kuberic_controller::crd::REPLICA_ID_LABEL)
+                .is_some_and(|value| value == "3")
+        }));
+        assert_eq!(
+            observed
+                .agents
+                .values()
+                .filter(|agent| matches!(
+                    agent,
+                    RawAgentObservation::PublicV1Report(report)
+                        if report.write_status == AccessStatus::Granted
+                ))
+                .count(),
+            1
+        );
+    })
+    .await
+    .expect("Public V1 desired-membership change exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_replays_authority_for_new_process_session() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        let (key, mut restarted) = observed
+            .agents
+            .iter()
+            .find_map(|(key, agent)| match agent {
+                RawAgentObservation::PublicV1Report(report)
+                    if report.write_status == AccessStatus::Granted =>
+                {
+                    Some((key.clone(), report.as_ref().clone()))
+                }
+                _ => None,
+            })
+            .expect("current primary report");
+        restarted.process_session_id =
+            kuberic_runtime::protocol::types::ProcessSessionId::new("restarted-primary-session");
+        restarted.report_sequence = 1;
+        restarted.role = ReplicaRole::None;
+        restarted.read_status = AccessStatus::NotPrimary;
+        restarted.write_status = AccessStatus::NotPrimary;
+        restarted.progress.role = PublicProgressRole::Recovery;
+        restarted.service_location = None;
+        restarted.completed_operations.clear();
+        observed.agents.insert(
+            key,
+            RawAgentObservation::PublicV1Report(Box::new(restarted)),
+        );
+        api.set_observation(observed).await;
+
+        let mut stable = false;
+        for _ in 0..120 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable, "session renewal replay did not converge");
+        let observed = api.observation().await;
+        let writers = observed
+            .agents
+            .values()
+            .filter(|agent| {
+                matches!(
+                    agent,
+                    RawAgentObservation::PublicV1Report(report)
+                        if report.write_status == AccessStatus::Granted
+                )
+            })
+            .count();
+        assert_eq!(writers, 1);
+        assert!(observed.agents.values().any(|agent| matches!(
+            agent,
+            RawAgentObservation::PublicV1Report(report)
+                if report.process_session_id.as_str() == "restarted-primary-session"
+                    && report.role == ReplicaRole::Primary
+                    && report.write_status == AccessStatus::Granted
+        )));
+    })
+    .await
+    .expect("Public V1 session replay exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_consumes_completion_after_lost_dispatch_reply() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(1)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..80 {
+            reconciler.reconcile("default", "sample").await.unwrap();
+            if api
+                .observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_transition.is_some())
+            {
+                break;
+            }
+        }
+        assert!(
+            api.observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_transition.is_some())
+        );
+        api.unavailable_next_execute().await;
+        assert!(
+            reconciler.reconcile("default", "sample").await.is_ok(),
+            "durable matching completion must resolve an ambiguous dispatch reply"
+        );
+        let mut stable = false;
+        for _ in 0..80 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable);
+    })
+    .await
+    .expect("ambiguous dispatch reconciliation exceeded 270 seconds");
 }

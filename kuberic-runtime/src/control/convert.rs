@@ -168,6 +168,52 @@ pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
     }
 }
 
+pub fn normalize_uninitialized_agent_status_report(
+    report: proto::AgentStatusReport,
+) -> Result<crate::protocol::observation::UninitializedAgentObservation, WireError> {
+    if report.protocol_version != crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION {
+        return Err(WireError::UnsupportedProtocolVersion {
+            expected: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
+            observed: report.protocol_version,
+        });
+    }
+    if report.public_v1.is_some() {
+        return Err(WireError::InvalidAuthority(
+            "fresh agent status cannot carry established Public V1 evidence".into(),
+        ));
+    }
+    let storage_state = proto::AgentStorageState::try_from(report.storage_state).map_err(|_| {
+        WireError::InvalidEnum {
+            field: "agent_status.storage_state",
+            value: report.storage_state,
+        }
+    })?;
+    if storage_state != proto::AgentStorageState::Uninitialized
+        || !report.healthy
+        || !report.storage_error.is_empty()
+        || report.resource_uid.is_empty()
+        || report.process_session_id.is_empty()
+        || report.replica_id <= 0
+        || report.pod_uid.is_empty()
+        || report.pvc_uid.is_empty()
+    {
+        return Err(WireError::InvalidAuthority(
+            "fresh agent status is incomplete or unsafe".into(),
+        ));
+    }
+    Ok(
+        crate::protocol::observation::UninitializedAgentObservation {
+            protocol_version: report.protocol_version,
+            resource_uid: ResourceUid::new(report.resource_uid),
+            replica_id: ReplicaId::new(report.replica_id),
+            pod_uid: PodUid::new(report.pod_uid),
+            pvc_uid: PvcUid::new(report.pvc_uid),
+            process_session_id: ProcessSessionId::new(report.process_session_id),
+            report_sequence: 1,
+        },
+    )
+}
+
 /// Normalizes the production Public V1 report branch.
 pub fn normalize_public_v1_agent_status_report(
     report: proto::AgentStatusReport,

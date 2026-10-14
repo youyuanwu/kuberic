@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum PublicV1EvidenceConsumer {
+    Topology,
     Failover,
     Switchover,
     RepairReplacement,
@@ -248,6 +249,15 @@ fn decide(
 
 fn consumer_accepts_call(consumer: PublicV1EvidenceConsumer, call: PublicV1CallKind) -> bool {
     match consumer {
+        PublicV1EvidenceConsumer::Topology => matches!(
+            call,
+            PublicV1CallKind::Open
+                | PublicV1CallKind::Role
+                | PublicV1CallKind::Epoch
+                | PublicV1CallKind::Configuration
+                | PublicV1CallKind::CatchUp
+                | PublicV1CallKind::Progress
+        ),
         PublicV1EvidenceConsumer::Failover => matches!(
             call,
             PublicV1CallKind::InitialPrimary | PublicV1CallKind::FailoverPromotion

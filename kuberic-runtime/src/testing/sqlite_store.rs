@@ -250,6 +250,23 @@ impl SqliteStore {
                 }
                 Ok(())
             }
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                self.inner
+                    .install_public_v1_inbound_build_authority(authority)
+                    .await
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                let current = self
+                    .inner
+                    .public_v1_inbound_build_authority(&authority.attempt.build_id)
+                    .await?;
+                if current.as_ref() != Some(authority.as_ref()) {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "inbound build authority changed before revocation".into(),
+                    ));
+                }
+                self.inner.revoke_public_v1_inbound_build_authority().await
+            }
             PublicV1HistoryCommand::SessionRenewal(_) => {
                 Err(crate::host::HostError::CommandRejected(
                     "session-renewal commands require an attached public executor".into(),
