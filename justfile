@@ -22,6 +22,7 @@ nextest-build-only: install-nextest
 
 # Verify build-only guards and build one reusable all-features test archive.
 nextest-archive: nextest-build-only
+    cargo build -p postgres-replicated --bin postgres-replicated --all-features
     mkdir -p "$(dirname "{{ nextest_archive }}")"
     cargo nextest archive --workspace --all-features --profile ci \
         --archive-file "{{ nextest_archive }}"
