@@ -1,7 +1,7 @@
-# SF Public V1 Replacement Release: deferred MVP work
+# SF Public V1 Replacement: deferred MVP work
 
 - Work ID: sf-public-v1-phase7
-- Core outcome: Produce and validate one immutable replacement-only Public V1 release bundle from fresh state without activating it in production.
+- Core outcome: Replace the legacy built-in stack with the sole fresh-state Public V1 path and validate it through existing repository workflows.
 
 ## Decisions
 
