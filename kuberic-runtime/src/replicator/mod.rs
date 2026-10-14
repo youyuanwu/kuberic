@@ -3,6 +3,8 @@ pub(crate) mod copy;
 mod queue;
 pub(crate) mod quorum;
 pub(crate) mod sender;
+#[cfg(feature = "testing")]
+pub mod stateless;
 pub mod stream;
 
 pub(crate) mod log;
@@ -31,7 +33,13 @@ use crate::authority::{
 };
 use crate::effects::BuildPostcondition;
 use crate::engine::DurableState;
+#[cfg(feature = "testing")]
+use crate::host::store::PublicInboundBuildAdmission;
+#[cfg(feature = "testing")]
+use crate::protocol::public_operations::PreviewLifecycleBinding;
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
+#[cfg(feature = "testing")]
+use crate::protocol::public_operations::{PublicInboundBuildAuthority, PublicInboundBuildReceipt};
 use crate::replicator::configuration::ManagedReplicaConfiguration;
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 #[cfg(all(test, kuberic_workspace_tests))]
@@ -83,6 +91,15 @@ pub trait StateReplicator: Send + Sync {
     async fn get_replication_stream(&self) -> Result<OperationStream>;
     async fn get_copy_stream(&self) -> Result<OperationStream>;
     async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()>;
+}
+
+#[async_trait]
+#[cfg(feature = "testing")]
+pub(crate) trait StatelessPreviewControl: Send + Sync {
+    async fn install_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -471,7 +488,7 @@ impl From<PublicReplicaDescriptor> for ReplicaInformation {
             current_progress: replica.current_progress,
             catch_up_capability: replica.catch_up_capability,
             must_catchup: replica.must_catchup,
-            storage_incarnation: None,
+            storage_incarnation: replica.storage_incarnation,
         }
     }
 }
@@ -513,6 +530,42 @@ pub struct ReplicatorInterfaces {
     creation: Arc<ReplicatorCreation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum ReplicatorEngineSelection {
+    #[default]
+    LegacyManaged,
+    #[cfg(feature = "testing")]
+    StatelessPreview {
+        binding: PreviewLifecycleBinding,
+        replication_address: std::net::SocketAddr,
+    },
+}
+
+impl ReplicatorEngineSelection {
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self, Self::LegacyManaged)
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_binding(&self) -> Option<&PreviewLifecycleBinding> {
+        match self {
+            Self::LegacyManaged => None,
+            Self::StatelessPreview { binding, .. } => Some(binding),
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_replication_address(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::LegacyManaged => None,
+            Self::StatelessPreview {
+                replication_address,
+                ..
+            } => Some(*replication_address),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicatorCapabilities {
     pub catch_up_specific_quorum: bool,
@@ -546,6 +599,10 @@ struct ReplicatorCreation {
     guarded_control: StdMutex<Arc<dyn Replicator>>,
     capabilities: ReplicatorCapabilities,
     managed: Option<ManagedReplicatorCapabilities>,
+    #[cfg(feature = "testing")]
+    callback_containment: StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    #[cfg(feature = "testing")]
+    stateless_preview_control: StdMutex<Option<Arc<dyn StatelessPreviewControl>>>,
     settings: StdMutex<Option<BoundReplicatorSettings>>,
     armed: AtomicBool,
 }
@@ -568,6 +625,10 @@ impl ReplicatorCreation {
             guarded_control: StdMutex::new(guarded_control),
             capabilities,
             managed,
+            #[cfg(feature = "testing")]
+            callback_containment: StdMutex::new(None),
+            #[cfg(feature = "testing")]
+            stateless_preview_control: StdMutex::new(None),
             settings: StdMutex::new(None),
             armed: AtomicBool::new(true),
         }
@@ -719,6 +780,7 @@ pub(crate) struct ReplicatorAttachment {
     creation: Arc<ReplicatorCreation>,
     replicator: Arc<dyn Replicator>,
     primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+    has_provider_writer: bool,
 }
 
 #[doc(hidden)]
@@ -766,6 +828,34 @@ impl ReplicatorAttachment {
         self.creation.capabilities
     }
 
+    pub(crate) fn has_provider_writer(&self, _token: RuntimeHostToken) -> bool {
+        self.has_provider_writer
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn callback_containment(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.creation
+            .callback_containment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn stateless_preview_control(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<Arc<dyn StatelessPreviewControl>> {
+        self.creation
+            .stateless_preview_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn disarm(&self) {
         self.creation.armed.store(false, Ordering::Release);
     }
@@ -777,6 +867,32 @@ impl ReplicatorAttachment {
 }
 
 impl ReplicatorInterfaces {
+    #[cfg(feature = "testing")]
+    pub(crate) fn with_callback_containment(
+        self,
+        containment: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        *self
+            .creation
+            .callback_containment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(containment);
+        self
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn with_stateless_preview_control(
+        self,
+        control: Arc<dyn StatelessPreviewControl>,
+    ) -> Self {
+        *self
+            .creation
+            .stateless_preview_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control);
+        self
+    }
+
     pub fn secondary(
         replicator: Arc<dyn Replicator>,
         state_replicator: Option<Arc<dyn StateReplicator>>,
@@ -926,6 +1042,7 @@ impl ReplicatorInterfaces {
             creation: self.creation.clone(),
             replicator: self.replicator(),
             primary_replicator: self.primary_replicator(),
+            has_provider_writer: self.state_replicator.is_some(),
         })
     }
 
@@ -947,6 +1064,7 @@ pub struct ReplicatorFactoryContext {
     access: Arc<dyn PartitionAccessView>,
     reservation: Option<ReplicatorCreationReservation>,
     pub(crate) default_dependencies: Option<DefaultReplicatorDependencies>,
+    pub(crate) engine_selection: ReplicatorEngineSelection,
 }
 
 impl ReplicatorFactoryContext {
@@ -957,13 +1075,15 @@ impl ReplicatorFactoryContext {
         process_session_id: ProcessSessionId,
         access: Arc<dyn PartitionAccessView>,
         default_dependencies: DefaultReplicatorDependencies,
+        engine_selection: ReplicatorEngineSelection,
     ) -> Self {
         Self {
             identity,
             process_session_id,
             access,
             reservation: None,
-            default_dependencies: Some(default_dependencies),
+            default_dependencies: engine_selection.is_legacy().then_some(default_dependencies),
+            engine_selection,
         }
     }
 
@@ -1009,6 +1129,108 @@ impl ReplicatorFactoryContext {
             .map(|reservation| reservation.identity(RuntimeHostToken::new()))
             .ok_or_else(|| RuntimeError::Application("replicator creation is not reserved".into()))
     }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_binding(&self) -> Result<&PreviewLifecycleBinding> {
+        self.engine_selection.preview_binding().ok_or_else(|| {
+            RuntimeError::Application(
+                "stateless preview factory requires preview process selection".into(),
+            )
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn preview_replication_address(&self) -> Result<std::net::SocketAddr> {
+        self.engine_selection
+            .preview_replication_address()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "stateless preview factory requires a preview listener selection".into(),
+                )
+            })
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn publish_preview_progress(
+        &self,
+        applied_lsn: i64,
+        committed_lsn: i64,
+        ambiguous: bool,
+    ) -> Result<()> {
+        self.access
+            .publish_preview_progress(applied_lsn, committed_lsn, ambiguous)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn preview_inbound_build_authority(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        self.access.preview_inbound_build_authority(build_id).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn classify_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission> {
+        self.access
+            .classify_preview_inbound_build_authority(authority)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn install_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.access
+            .install_preview_inbound_build_authority(authority)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn preview_terminal_inbound_build_receipt(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildReceipt>> {
+        self.access
+            .preview_terminal_inbound_build_receipt(build_id)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn revoke_preview_inbound_build_authority(&self) -> Result<()> {
+        self.access.revoke_preview_inbound_build_authority().await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn preview_outbound_build_authority(
+        &self,
+        build_id: &OperationId,
+        current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        self.access
+            .preview_outbound_build_authority(build_id, current_configuration_id)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn complete_preview_inbound_build(
+        &self,
+        receipt: &PublicInboundBuildReceipt,
+    ) -> Result<()> {
+        self.access.complete_preview_inbound_build(receipt).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) async fn preview_storage_is_retired(
+        &self,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool> {
+        self.access.preview_storage_is_retired(storage).await
+    }
 }
 
 #[async_trait]
@@ -1018,6 +1240,60 @@ pub(crate) trait PartitionAccessView: Send + Sync {
     async fn read_status(&self) -> Result<AccessStatus>;
 
     async fn write_status(&self) -> Result<AccessStatus>;
+
+    #[cfg(feature = "testing")]
+    async fn publish_preview_progress(
+        &self,
+        applied_lsn: i64,
+        committed_lsn: i64,
+        ambiguous: bool,
+    ) -> Result<()>;
+
+    #[cfg(feature = "testing")]
+    async fn preview_inbound_build_authority(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>>;
+
+    #[cfg(feature = "testing")]
+    async fn classify_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission>;
+
+    #[cfg(feature = "testing")]
+    async fn install_preview_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
+
+    #[cfg(feature = "testing")]
+    async fn preview_terminal_inbound_build_receipt(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildReceipt>>;
+
+    #[cfg(feature = "testing")]
+    async fn revoke_preview_inbound_build_authority(&self) -> Result<()>;
+
+    #[cfg(feature = "testing")]
+    async fn preview_outbound_build_authority(
+        &self,
+        build_id: &OperationId,
+        current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>>;
+
+    #[cfg(feature = "testing")]
+    async fn complete_preview_inbound_build(
+        &self,
+        receipt: &PublicInboundBuildReceipt,
+    ) -> Result<()>;
+
+    #[cfg(feature = "testing")]
+    async fn preview_storage_is_retired(
+        &self,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool>;
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()>;
 
@@ -1191,6 +1467,11 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
+        if !context.engine_selection.is_legacy() || settings.public_v1 {
+            return Err(RuntimeError::Application(
+                "managed default factory requires legacy process and bundle selection".into(),
+            ));
+        }
         let state_provider = state_provider.ok_or_else(|| {
             RuntimeError::Application("the default replicator requires a state provider".into())
         })?;

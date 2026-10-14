@@ -83,8 +83,8 @@ pub type DeliveryId = u64;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Replication(proto::ReplicationItem),
-    Copy(proto::CopyItem),
+    Replication(Box<proto::ReplicationItem>),
+    Copy(Box<proto::CopyItem>),
 }
 
 impl Message {

@@ -114,6 +114,37 @@ fn public_v1_source_uses_no_native_evidence() {
                 "{relative} depends on private/native evidence: {forbidden}"
             );
         }
+
+        let stateless =
+            std::fs::read_to_string(manifest.join("src/replicator/stateless/mod.rs")).unwrap();
+        for forbidden in [
+            "ManagedReplicaStore",
+            "ReplicationProgressStore",
+            "LocalWriteJournal",
+            "BuildAuthorityStore",
+            "BuildProgressStore",
+            "authorize_request",
+            "bearer_token",
+        ] {
+            assert!(
+                !stateless.contains(forbidden),
+                "stateless preview depends on managed state or authorization: {forbidden}"
+            );
+        }
+        let hosting = std::fs::read_to_string(manifest.join("src/host/hosting.rs")).unwrap();
+        let projection = hosting
+            .split("refresh_stateless_preview_projection")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn provider_writer_lease_count")
+            .next()
+            .unwrap();
+        let completed = projection.find("PublicOperationStage::Completed").unwrap();
+        let succeeded = projection
+            .find("PublicOperationDisposition::Succeeded")
+            .unwrap();
+        let granted = projection.find("AccessStatus::Granted").unwrap();
+        assert!(completed < granted && succeeded < granted);
     }
 
     let build_store =

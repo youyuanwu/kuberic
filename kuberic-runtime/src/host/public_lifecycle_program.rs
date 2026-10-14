@@ -16,6 +16,17 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
         Some(P::Configuration(_)) => vec![Configuration],
         Some(P::CatchUp { .. }) => vec![Configuration, FirstCatchUp],
         Some(P::Progress { .. }) => vec![Progress],
+        Some(P::Swap {
+            controller_composed: true,
+            ..
+        }) => vec![
+            Revoke,
+            ProgramEpoch,
+            RefreshedConfiguration,
+            SecondCatchUp,
+            ReplicatorRole,
+            ApplicationRole,
+        ],
         Some(P::Swap { .. }) => vec![
             StartingConfiguration,
             FirstCatchUp,
@@ -95,8 +106,7 @@ pub(super) fn replica_set(
             .iter()
             .filter(|replica| {
                 configuration.members.iter().any(|member| {
-                    member.identity == replica.identity
-                        && member.role == crate::protocol::types::ReplicaRole::ActiveSecondary
+                    member.identity == replica.identity && member.role == replica.role
                 })
             })
             .cloned()
@@ -256,15 +266,28 @@ pub(super) async fn execute(
                 {
                     return Err(HostError::IdentityMismatch("open context changed".into()));
                 }
-                let control = callbacks.application.clone().open(context).await?;
-                if !Arc::ptr_eq(&control, &callbacks.replicator) {
+                let control = match callbacks.application.clone().open(context).await {
+                    Ok(control) => control,
+                    Err(error) => {
+                        callbacks.abort_once();
+                        return Err(error.into());
+                    }
+                };
+                if !callbacks.application_control_matches(&control) {
+                    callbacks.abort_once();
                     return Err(HostError::IdentityMismatch(
                         "application returned a different Replicator".into(),
                     ));
                 }
                 O::Done
             }
-            ReplicatorOpen => O::Endpoint(callbacks.replicator.open().await?),
+            ReplicatorOpen => match callbacks.replicator.open().await {
+                Ok(endpoint) => O::Endpoint(endpoint),
+                Err(error) => {
+                    callbacks.abort_once();
+                    return Err(error.into());
+                }
+            },
             ReplicatorRole | ApplicationRole => {
                 let (epoch, role) = match program {
                     P::Role { epoch, role } => (*epoch, *role),
@@ -408,12 +431,21 @@ pub(super) async fn execute(
                         rebuild_failure = Some("remote build target requires replacement");
                         O::RebuildRequired(Box::new(canonical))
                     }
-                    Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => {
-                        return Err(HostError::CommandRejected(
-                            "local-provider rebuild failure substituted for remote build failure"
-                                .into(),
-                        ));
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
+                        if matches!(failure.as_ref(), ReplicaRebuildRequired::LocalProvider(_)) =>
+                    {
+                        let state = store.load_state().await?;
+                        let canonical = super::enrich_local_rebuild_at_epoch(
+                            &state.identity,
+                            &intent,
+                            build.epoch,
+                            &state.identity.local_identity,
+                            *failure,
+                        )?;
+                        rebuild_failure = Some("local build source requires replacement");
+                        O::RebuildRequired(Box::new(canonical))
                     }
+                    Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => unreachable!(),
                     Err(error) => return Err(error.into()),
                 }
             }

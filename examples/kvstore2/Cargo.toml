@@ -8,6 +8,9 @@ rust-version.workspace = true
 description = "Level-triggered Kuberic KVStore conformance application"
 publish = false
 
+[features]
+testing = ["kuberic-runtime/testing"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

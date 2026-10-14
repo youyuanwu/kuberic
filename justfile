@@ -14,11 +14,14 @@ install-nextest:
     scripts/install_nextest.sh
 
 # Verify guards that need the build environment rather than an archive-only runner.
-nextest-build-only:
+nextest-build-only: install-nextest
     scripts/check_runtime_public_api.sh
+    cargo nextest run -j 1 -p kuberic-runtime --all-features \
+        --profile build-only --run-ignored only \
+        -E 'test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
 
 # Verify build-only guards and build one reusable all-features test archive.
-nextest-archive: install-nextest nextest-build-only
+nextest-archive: nextest-build-only
     mkdir -p "$(dirname "{{ nextest_archive }}")"
     cargo nextest archive --workspace --all-features --profile ci \
         --archive-file "{{ nextest_archive }}"
@@ -57,7 +60,11 @@ nextest-test partition="": install-nextest
     if [[ -n "{{ partition }}" ]]; then
       partition_args=(--partition "slice:{{ partition }}")
     fi
-    cargo nextest run --workspace --all-features --profile ordinary "${partition_args[@]}"
+    ordinary_target="$PWD/target/nextest-ordinary"
+    rm -rf "$ordinary_target"
+    CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 \
+      CARGO_TARGET_DIR="$ordinary_target" cargo nextest run -j 2 \
+      --workspace --all-features --profile ordinary "${partition_args[@]}"
 
 # Run the PostgreSQL tier serially, optionally as hash shard N/M.
 nextest-postgres partition="":

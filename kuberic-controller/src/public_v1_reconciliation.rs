@@ -32,3 +32,19 @@ pub async fn reconcile_public_v1_consumer(
     crate::executor::execute_public_v1_evidence(api, plan).await?;
     Ok(outcome)
 }
+
+pub async fn reconcile_public_v1_operation<A>(
+    api: &A,
+    command: kuberic_runtime::protocol::command::ProtocolCommand,
+) -> Result<PublicV1ReconciliationOutcome, String>
+where
+    A: crate::cluster_api::PublicV1OperationApi + PublicV1EvidenceApi,
+{
+    let expected = api
+        .observe_public_v1_operation()
+        .await?
+        .ok_or_else(|| "public-v1 operation lacks accepted transition status".to_string())?;
+    crate::executor::execute_public_v1_operation(api, &expected, command).await?;
+    let report = api.observe_public_v1_operation_report(&expected).await?;
+    reconcile_public_v1_consumer(api, &report).await
+}

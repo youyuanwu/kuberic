@@ -149,19 +149,19 @@ pub(crate) type DeliveryId = u64;
 /// Public wire messages; `bind` captures sessions before queuing or delaying one.
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
-    Replication(proto::ReplicationItem),
-    Copy(proto::CopyItem),
+    Replication(Box<proto::ReplicationItem>),
+    Copy(Box<proto::CopyItem>),
 }
 
 impl Message {
     fn identities(&self) -> Result<(ReplicaIdentity, ReplicaIdentity)> {
         match self {
             Self::Replication(item) => {
-                let item = replication_from_proto(item.clone())?;
+                let item = replication_from_proto(item.as_ref().clone())?;
                 Ok((item.sender, item.receiver))
             }
             Self::Copy(item) => {
-                let item = copy_from_proto(item.clone())?;
+                let item = copy_from_proto(item.as_ref().clone())?;
                 Ok((item.sender, item.receiver))
             }
         }
@@ -478,11 +478,11 @@ impl InProcessTransport {
                 let session = route.receiver_session.clone();
                 Stage::Receiving(Box::pin(async move {
                     sender.register_peer_session(identity, session).await?;
-                    Ok(target.data_plane().receive_replication(item).await?)
+                    Ok(target.data_plane().receive_replication(*item).await?)
                 }))
             }
             Message::Copy(item) => Stage::Copying(Box::pin(async move {
-                Ok(target.data_plane().receive_copy_item(item).await?)
+                Ok(target.data_plane().receive_copy_item(*item).await?)
             })),
         };
         self.next_delivery = self
@@ -528,7 +528,9 @@ impl InProcessTransport {
         let mut dispatched = 0;
         for (source, session, item) in ready {
             let message = match item {
-                Some(OutboundReplication::Replication(item)) => Message::Replication(item),
+                Some(OutboundReplication::Replication(item)) => {
+                    Message::Replication(Box::new(item))
+                }
                 Some(OutboundReplication::Copy(item)) => Message::Copy(item),
                 control => {
                     let output = match control {

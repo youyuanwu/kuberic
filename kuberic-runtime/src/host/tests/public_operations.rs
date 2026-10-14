@@ -1853,7 +1853,7 @@ async fn agent_service_retains_and_drains_the_preview_runtime() {
         .unwrap();
 
     assert!(
-        trace
+        !trace
             .events
             .lock()
             .unwrap()
@@ -2292,6 +2292,7 @@ impl PrimaryReplicator for TraceReplicator {
                         identity: replica.identity,
                         replication_address: replica.replication_address,
                         process_session_id: replica.process_session_id,
+                        storage_incarnation: replica.storage_incarnation,
                         role: replica.role,
                         current_progress: replica.current_progress,
                         catch_up_capability: replica.catch_up_capability,
@@ -2338,6 +2339,7 @@ impl PrimaryReplicator for TraceReplicator {
                         identity: replica.identity,
                         replication_address: replica.replication_address,
                         process_session_id: replica.process_session_id,
+                        storage_incarnation: replica.storage_incarnation,
                         role: replica.role,
                         current_progress: replica.current_progress,
                         catch_up_capability: replica.catch_up_capability,

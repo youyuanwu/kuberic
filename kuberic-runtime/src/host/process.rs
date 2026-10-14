@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::StatefulServiceReplica;
+use crate::protocol::public_operations::PreviewLifecycleBinding;
 use crate::protocol::types::{
     FaultType, PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid,
 };
@@ -750,6 +751,16 @@ pub struct ReplicaHandle {
     runtime: Arc<PodRuntime>,
     store: Arc<SqliteStore>,
     process_session: Arc<str>,
+    #[cfg(feature = "testing")]
+    preview: Option<PreviewProcessHandle>,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+struct PreviewProcessHandle {
+    binding: PreviewLifecycleBinding,
+    registry: Arc<crate::host::operation::PartitionOperationRegistry>,
+    report_sequence: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ReplicaHandle {
@@ -822,6 +833,375 @@ impl ReplicaHandle {
                 .collect(),
         })
     }
+
+    #[cfg(feature = "testing")]
+    pub async fn initialize_stateless_preview_history(
+        &self,
+        initialization_id: &crate::protocol::types::HistoryInitializationId,
+        history: &crate::protocol::types::HistoryContext,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<()> {
+        let preview = self.preview.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with stateless preview selection".into(),
+            )
+        })?;
+        if !preview.binding.preview.is_public_v1() {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "stateless preview requires Public V1".into(),
+            ));
+        }
+        self.store
+            .initialize_public_v1_history(initialization_id, history, storage)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn install_stateless_preview_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let preview = self.preview.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with stateless preview selection".into(),
+            )
+        })?;
+        if !preview.binding.preview.is_public_v1()
+            || authority.attempt.target != self.store.load_state().await?.identity.local_identity
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "inbound build authority differs from selected preview target".into(),
+            ));
+        }
+        self.runtime
+            .install_stateless_preview_inbound_build_authority(authority)
+            .await
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn execute_stateless_preview(
+        &self,
+        intent: crate::protocol::public_operations::PublicOperationIntent,
+    ) -> Result<()> {
+        use crate::host::state::{PublicOperationDisposition, PublicOperationStage};
+
+        let preview = self.preview.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with stateless preview selection".into(),
+            )
+        })?;
+        if intent.preview != preview.binding.preview
+            || intent.process_session_id.as_str() != self.process_session.as_ref()
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "public operation differs from the selected preview process".into(),
+            ));
+        }
+        let terminal_program = matches!(
+            intent.program.as_ref(),
+            Some(
+                crate::protocol::public_operations::PublicOperationProgram::Close
+                    | crate::protocol::public_operations::PublicOperationProgram::Abort
+            )
+        );
+        let open_program = matches!(
+            intent.program.as_ref(),
+            Some(crate::protocol::public_operations::PublicOperationProgram::Open { .. })
+        );
+        if !matches!(
+            intent.program,
+            Some(
+                crate::protocol::public_operations::PublicOperationProgram::Progress { .. }
+                    | crate::protocol::public_operations::PublicOperationProgram::Build(_)
+            )
+        ) {
+            self.runtime.fence_stateless_preview_access().await;
+        }
+        let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
+        if matches!(
+            intent.program,
+            Some(crate::protocol::public_operations::PublicOperationProgram::Open { .. })
+        ) {
+            let state = self.store.load_state().await?;
+            let mode = if state
+                .application_storage
+                .as_ref()
+                .is_some_and(|binding| binding.initializing)
+            {
+                crate::application::OpenMode::New
+            } else {
+                crate::application::OpenMode::Existing
+            };
+            callbacks.open_context = Some(self.runtime.public_open_context(mode).await);
+        }
+        let operation = crate::host::public_lifecycle::launch(
+            &preview.registry,
+            self.store.clone(),
+            intent,
+            callbacks,
+        )
+        .await?;
+        let terminal = operation.wait_for_terminal().await?;
+        if terminal.stage != PublicOperationStage::Completed
+            || terminal.disposition != Some(PublicOperationDisposition::Succeeded)
+        {
+            return Err(crate::host::HostError::CommandRejected(format!(
+                "public operation did not complete successfully: {:?}",
+                terminal.disposition
+            )));
+        }
+        if open_program {
+            self.runtime.complete_stateless_preview_open().await;
+            let state = self.store.load_state().await?;
+            if state
+                .application_storage
+                .as_ref()
+                .is_some_and(|binding| binding.initializing)
+            {
+                self.store.complete_application_initialization().await?;
+            }
+        }
+        if !terminal_program {
+            self.runtime
+                .refresh_stateless_preview_projection(
+                    self.store.as_ref(),
+                    &crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref()),
+                    true,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn execute_stateless_preview_command(
+        &self,
+        command: crate::protocol::command::ProtocolCommand,
+    ) -> Result<()> {
+        let crate::protocol::command::ProtocolCommand::PublicV1Operation(command) = command else {
+            return Err(crate::host::HostError::CommandRejected(
+                "stateless preview operation dispatcher received another command".into(),
+            ));
+        };
+        command
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        let state = self.store.load_state().await?;
+        if command.target != state.identity.local_identity {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "public-v1 operation command targets another replica".into(),
+            ));
+        }
+        self.execute_stateless_preview(command.intent).await
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn fence_stateless_preview_access(&self) {
+        self.runtime.fence_stateless_preview_access().await;
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn stateless_preview_process_endpoint(
+        &self,
+        role: crate::protocol::types::ReplicaRole,
+    ) -> Result<crate::protocol::types::ProcessSessionEndpoint> {
+        let state = self.store.load_state().await?;
+        let preview = state.public_operation_preview.ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "stateless preview process endpoint requires schema-11 state".into(),
+            )
+        })?;
+        Ok(crate::protocol::types::ProcessSessionEndpoint {
+            identity: state.identity.local_identity,
+            process_session_id: self.process_session_id(),
+            replicator_creation_id: self.runtime.stateless_preview_replicator_creation_id()?,
+            role,
+            storage_incarnation: preview.storage_incarnation.ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview process endpoint lacks storage authority".into(),
+                )
+            })?,
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn stateless_preview_next_operation_revision(&self) -> Result<u64> {
+        let preview = self
+            .store
+            .load_state()
+            .await?
+            .public_operation_preview
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview requires schema-11 operation state".into(),
+                )
+            })?;
+        preview
+            .operations
+            .values()
+            .map(|record| record.intent.revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview operation revision exhausted".into(),
+                )
+            })
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn stateless_preview_operation_intent(
+        &self,
+        operation_id: &crate::protocol::types::OperationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicOperationIntent>> {
+        let preview = self
+            .store
+            .load_state()
+            .await?
+            .public_operation_preview
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "stateless preview requires schema-11 operation state".into(),
+                )
+            })?;
+        Ok(preview
+            .operations
+            .get(operation_id)
+            .map(|record| record.intent.clone()))
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn authorize_stateless_preview_session_renewal(
+        &self,
+        required: crate::protocol::public_operations::ProcessSessionRenewalRequired,
+    ) -> Result<crate::protocol::public_operations::PublicV1SessionRenewalStatus> {
+        use crate::protocol::public_operations::PublicV1SessionRenewalStatus;
+
+        let mut current = PublicV1SessionRenewalStatus::required(required)
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.store
+            .persist_public_v1_session_renewal(None, &current)
+            .await?;
+        for next in [
+            current.close_access(),
+            current
+                .close_access()
+                .and_then(|status| status.freeze_surviving_set()),
+            current
+                .close_access()
+                .and_then(|status| status.freeze_surviving_set())
+                .and_then(|status| status.begin_epoch_barriers()),
+        ] {
+            let next =
+                next.map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        for survivor in current
+            .barriers
+            .iter()
+            .filter(|barrier| {
+                barrier.stage
+                    == crate::protocol::public_operations::PublicSessionEpochBarrierStage::Pending
+            })
+            .map(|barrier| barrier.survivor.clone())
+            .collect::<Vec<_>>()
+        {
+            let next = current
+                .record_epoch_updated(&survivor, current.required.renewal_epoch)
+                .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        if current.stage
+            == crate::protocol::public_operations::PublicSessionRenewalStage::EpochBarriersPending
+        {
+            let next = current
+                .finish_epoch_barriers()
+                .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        if let Some(replacement) = current.required.replacement.clone() {
+            let next = current
+                .replay_replacement_role(
+                    &replacement.process_session_id,
+                    current.required.renewal_epoch,
+                    current.required.predecessor.role,
+                )
+                .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+            self.store
+                .persist_public_v1_session_renewal(Some(&current), &next)
+                .await?;
+            current = next;
+        }
+        let next = current
+            .install_fresh_configuration(&current.required.fresh_configuration)
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.store
+            .persist_public_v1_session_renewal(Some(&current), &next)
+            .await?;
+        Ok(next)
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn persist_stateless_preview_session_renewal(
+        &self,
+        expected: Option<&crate::protocol::public_operations::PublicV1SessionRenewalStatus>,
+        next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    ) -> Result<()> {
+        self.store
+            .persist_public_v1_session_renewal(expected, next)
+            .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn stateless_preview_report(
+        &self,
+    ) -> Result<crate::protocol::public_operations::PublicV1AgentReport> {
+        let preview = self.preview.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with stateless preview selection".into(),
+            )
+        })?;
+        let session = crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref());
+        self.runtime
+            .refresh_stateless_preview_projection(self.store.as_ref(), &session, false)
+            .await?;
+        let projection = self
+            .runtime
+            .stateless_preview_report_projection(
+                session,
+                preview
+                    .report_sequence
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+            .await?;
+        crate::host::public_lifecycle::public_v1_report(
+            self.store.as_ref(),
+            &preview.binding.preview,
+            projection,
+        )
+        .await
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn process_session_id(&self) -> crate::protocol::types::ProcessSessionId {
+        crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref())
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn stateless_preview_provider_writer_count(&self) -> usize {
+        self.runtime.provider_writer_lease_count()
+    }
 }
 
 pub struct RunningReplica {
@@ -862,6 +1242,7 @@ pub struct ReplicaHost<A, R> {
     application_storage: ApplicationStorageState,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     resolver: Arc<R>,
+    preview_binding: Option<PreviewLifecycleBinding>,
 }
 
 impl<A, R> ReplicaHost<A, R>
@@ -881,7 +1262,14 @@ where
             application_storage,
             application_storage_paths: None,
             resolver,
+            preview_binding: None,
         }
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn with_stateless_preview(mut self, binding: PreviewLifecycleBinding) -> Self {
+        self.preview_binding = Some(binding);
+        self
     }
 
     /// Bind application paths at authorized initialization. Only an unfinished
@@ -921,6 +1309,16 @@ where
                 "transport window capacity must be positive".into(),
             ));
         }
+        if let Some(binding) = self.preview_binding.as_ref() {
+            binding.validate().map_err(|message| {
+                crate::host::HostError::InitializationNotAuthorized(message.into())
+            })?;
+            if !binding.preview.is_public_v1() || binding.resource_uid != self.config.resource_uid {
+                return Err(crate::host::HostError::InitializationNotAuthorized(
+                    "stateless preview binding differs from the selected process identity".into(),
+                ));
+            }
+        }
         let observed = ObservedStorageIdentity {
             resource_uid: self.config.resource_uid.clone(),
             pod_uid: self.config.pod_uid.clone(),
@@ -945,6 +1343,7 @@ where
                 self.application_storage == ApplicationStorageState::FreshEmpty,
                 paths.clone(),
                 startup_shutdown.clone(),
+                self.preview_binding.clone(),
             )
             .await?;
         }
@@ -952,7 +1351,22 @@ where
             return Ok(None);
         }
 
-        let store = Arc::new(SqliteStore::open_existing(&database_path, None)?);
+        let store = Arc::new(match self.preview_binding.as_ref() {
+            Some(binding) => {
+                #[cfg(feature = "testing")]
+                {
+                    SqliteStore::open_preview_bound_existing(&database_path, None, binding)?
+                }
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = binding;
+                    return Err(crate::host::HostError::InitializationNotAuthorized(
+                        "stateless preview is unavailable in production construction".into(),
+                    ));
+                }
+            }
+            None => SqliteStore::open_existing(&database_path, None)?,
+        });
         let identity = store.identity().await?;
         validate_established_identity(&identity, &observed, self.config.replica_id)?;
         let state = store.load_state().await?;
@@ -969,57 +1383,109 @@ where
                 "application storage paths differ from the authorized agent binding".into(),
             ));
         }
-        let runtime = Arc::new(PodRuntime::new(
-            identity.local_identity.clone(),
-            self.application,
-            store.clone(),
-        ));
+        let runtime = Arc::new(match self.preview_binding.clone() {
+            Some(binding) => {
+                #[cfg(feature = "testing")]
+                {
+                    PodRuntime::new_stateless_preview(
+                        identity.local_identity.clone(),
+                        self.application,
+                        store.clone(),
+                        binding,
+                        self.config.replication_address,
+                    )
+                }
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = binding;
+                    unreachable!("preview selection is rejected above")
+                }
+            }
+            None => PodRuntime::new(
+                identity.local_identity.clone(),
+                self.application,
+                store.clone(),
+            ),
+        });
         let agent = AgentService::new(
             store.clone(),
             runtime.clone(),
             runtime.clone(),
             self.config.bearer_token.clone(),
         )?;
-        let process_session: Arc<str> = Arc::from(agent.sessions().local_session().as_str());
+        let local_session = agent.sessions().local_session().clone();
         let sessions = agent.sessions().clone();
-        let transport = Arc::new(Mutex::new(ReliableTransport::new(
-            agent.sessions().local_session().clone(),
-            self.config.transport_window_capacity,
-        )?));
-        let build_runtime = runtime.build_runtime();
-        let outbound_runtime = Arc::new(runtime.outbound_runtime());
-        let peer_runtime = Arc::new(runtime.peer_discovery_runtime());
-        let dispatcher = Arc::new(GrpcOutboundDispatcher::new(
-            build_runtime,
-            transport.clone(),
-            self.resolver,
-            self.config.resource_uid.to_string(),
-            self.config.bearer_token,
-            self.config.rpc_deadline,
-        )?);
+        let process_session: Arc<str> = Arc::from(local_session.as_str());
+        #[cfg(feature = "testing")]
+        let preview_registry = match self.preview_binding.as_ref() {
+            Some(binding) => Some(
+                agent
+                    .public_operation_preview_runtime(binding.preview.clone())
+                    .await?,
+            ),
+            None => None,
+        };
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready, mut ready_rx) = watch::channel(false);
+        #[cfg(feature = "testing")]
+        let mut agent_task = if self.preview_binding.is_some() {
+            tokio::spawn(agent.serve_control_only(
+                self.config.control_address,
+                ready,
+                shutdown_rx.clone(),
+            ))
+        } else {
+            tokio::spawn(agent.serve(
+                self.config.control_address,
+                self.config.replication_address,
+                ready,
+                shutdown_rx.clone(),
+            ))
+        };
+        #[cfg(not(feature = "testing"))]
         let mut agent_task = tokio::spawn(agent.serve(
             self.config.control_address,
             self.config.replication_address,
             ready,
             shutdown_rx.clone(),
         ));
-        let mut outbound_task = tokio::spawn(run_outbound(
-            outbound_runtime,
-            transport.clone(),
-            dispatcher.clone(),
-            shutdown_rx.clone(),
-        ));
-        let mut peer_task = tokio::spawn(run_peer_discovery(
-            identity.local_identity,
-            peer_runtime,
-            store.clone(),
-            transport,
-            dispatcher,
-            sessions,
-            shutdown_rx,
-        ));
+        let preview_selected = self.preview_binding.is_some();
+        let (mut outbound_task, mut peer_task) = if preview_selected {
+            (
+                tokio::spawn(std::future::pending::<Result<()>>()),
+                tokio::spawn(std::future::pending::<Result<()>>()),
+            )
+        } else {
+            let transport = Arc::new(Mutex::new(ReliableTransport::new(
+                local_session,
+                self.config.transport_window_capacity,
+            )?));
+            let dispatcher = Arc::new(GrpcOutboundDispatcher::new(
+                runtime.build_runtime(),
+                transport.clone(),
+                self.resolver,
+                self.config.resource_uid.to_string(),
+                self.config.bearer_token,
+                self.config.rpc_deadline,
+            )?);
+            (
+                tokio::spawn(run_outbound(
+                    Arc::new(runtime.outbound_runtime()),
+                    transport.clone(),
+                    dispatcher.clone(),
+                    shutdown_rx.clone(),
+                )),
+                tokio::spawn(run_peer_discovery(
+                    identity.local_identity,
+                    Arc::new(runtime.peer_discovery_runtime()),
+                    store.clone(),
+                    transport,
+                    dispatcher,
+                    sessions,
+                    shutdown_rx,
+                )),
+            )
+        };
         let mut agent_finished = false;
         let mut outbound_finished = false;
         let mut peer_finished = false;
@@ -1126,6 +1592,15 @@ where
                 runtime,
                 store,
                 process_session,
+                #[cfg(feature = "testing")]
+                preview: self
+                    .preview_binding
+                    .zip(preview_registry)
+                    .map(|(binding, registry)| PreviewProcessHandle {
+                        binding,
+                        registry,
+                        report_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                    }),
             },
             shutdown,
             completion,
@@ -1180,6 +1655,7 @@ async fn serve_initialization(
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     mut startup_shutdown: watch::Receiver<bool>,
+    preview_binding: Option<PreviewLifecycleBinding>,
 ) -> Result<()> {
     let (initialized, mut initialized_rx) = watch::channel(false);
     let service = InitializationService::new(
@@ -1191,6 +1667,14 @@ async fn serve_initialization(
         fresh_application_state,
     )?
     .with_application_storage_paths(application_storage_paths);
+    #[cfg(feature = "testing")]
+    let service = service.with_stateless_preview(preview_binding);
+    #[cfg(not(feature = "testing"))]
+    if preview_binding.is_some() {
+        return Err(crate::host::HostError::InitializationNotAuthorized(
+            "stateless preview is unavailable in production construction".into(),
+        ));
+    }
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (ready, _) = watch::channel(false);
     let stop = tokio::spawn(async move {

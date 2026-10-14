@@ -42,17 +42,18 @@ pub use super::public_v1_session_renewal::{
     plan_session_renewal as plan_public_v1_session_renewal,
 };
 pub use crate::cluster_api::{
-    PreviewServiceApi, PublicV1EvidenceApi, PublicV1EvidenceEffect, PublicV1EvidenceResource,
-    PublicV1EvidenceState, PublicV1HistoryApi, PublicV1ResourceDisposition, PublicV1ResourceProof,
+    HostedPreviewReplica, HostedPublicV1Adapter, PreviewServiceApi, PublicV1EvidenceApi,
+    PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi,
+    PublicV1OperationApi, PublicV1ResourceDisposition, PublicV1ResourceProof,
     PublicV1SessionRenewalApi, preview_service_matches, preview_service_update,
 };
 pub use crate::executor::{
     execute_preview_service_location, execute_public_v1_evidence, execute_public_v1_history,
-    execute_public_v1_session_renewal,
+    execute_public_v1_operation, execute_public_v1_session_renewal,
 };
 pub use crate::normalize::normalize_public_v1_service_location;
 pub use crate::public_v1_reconciliation::{
-    PublicV1ReconciliationOutcome, reconcile_public_v1_consumer,
+    PublicV1ReconciliationOutcome, reconcile_public_v1_consumer, reconcile_public_v1_operation,
 };
 pub use k8s_openapi::api::core::v1::Service as PreviewWriteService;
 

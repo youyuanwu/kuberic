@@ -30,15 +30,19 @@ mod program;
 #[allow(unused_imports)]
 pub(crate) use program::{abort, operation_instructions, repeatable, replayable};
 
+type ApplicationControlMatch = Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) application: Arc<dyn StatefulServiceReplica>,
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
+    pub(crate) application_control_match: Option<ApplicationControlMatch>,
     pub(crate) capabilities: ReplicatorCapabilities,
     pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
+    pub(crate) wait_for_containment: bool,
     pub(crate) aborted: Arc<std::sync::Mutex<bool>>,
     #[cfg(all(test, feature = "testing"))]
     pub(crate) cut: Option<Arc<PublicOperationCut>>,
@@ -73,6 +77,14 @@ impl PublicOperationCut {
 }
 
 impl PublicLifecycleCallbacks {
+    pub(crate) fn application_control_matches(&self, control: &Arc<dyn Replicator>) -> bool {
+        Arc::ptr_eq(control, &self.replicator)
+            || self
+                .application_control_match
+                .as_ref()
+                .is_some_and(|matches| matches(control))
+    }
+
     pub(crate) fn abort_once(&self) {
         let mut aborted = self.aborted.lock().expect("preview abort lock");
         if !*aborted {
@@ -177,7 +189,9 @@ pub(crate) async fn launch(
                 return Ok::<(), HostError>(());
             }
             if let Some(witness) = callbacks.containment.clone() {
-                operation.track_containment(witness).await?;
+                operation
+                    .track_containment(witness, callbacks.wait_for_containment)
+                    .await?;
             }
             #[cfg(all(test, feature = "testing"))]
             operation.track_cut(callbacks.cut.clone()).await;
@@ -446,7 +460,7 @@ pub(super) fn enrich_local_rebuild(
     enrich_local_rebuild_at_epoch(identity, intent, input.epoch, &input.replica, failure)
 }
 
-fn enrich_local_rebuild_at_epoch(
+pub(super) fn enrich_local_rebuild_at_epoch(
     identity: &crate::host::state::StorageIdentity,
     intent: &PublicOperationIntent,
     epoch: crate::protocol::types::Epoch,
@@ -746,11 +760,13 @@ fn public_v1_completion_authority(
                 Some(*catch_up_specific_quorum),
             )
         }
+        PublicOperationProgram::Build(build) => {
+            (None, build.current_configuration_id.clone(), None, None)
+        }
         PublicOperationProgram::Open { .. }
         | PublicOperationProgram::Role { .. }
         | PublicOperationProgram::Epoch { .. }
         | PublicOperationProgram::Progress { .. }
-        | PublicOperationProgram::Build(_)
         | PublicOperationProgram::Remove(_)
         | PublicOperationProgram::Close
         | PublicOperationProgram::Abort => (None, None, None, None),

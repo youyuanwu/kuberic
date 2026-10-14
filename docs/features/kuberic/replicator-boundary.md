@@ -271,13 +271,13 @@ same-epoch primary-session substitution is invalid. Data-loss replacement
 preserves the Phase 5.2 logical authorization and still enforces exact captured
 replay capability before any callback.
 
-Public V1 currently has no transport authentication contract. The PostgreSQL
-oracle uses an unauthenticated lifecycle-owned gateway and the public
-coordination RPC accepts no Public V1 token. TLS identity, workload identity or
-an explicit token protocol may be designed later. Until then the exact
-descriptor and session checks are correctness fences, not proof of the peer's
-identity. This is a documented future gap; this phase does not define a
-production-activation policy for it.
+Public V1 has no transport authentication or peer-authorization contract by
+design. The PostgreSQL oracle uses an unauthenticated lifecycle-owned gateway
+and the public coordination RPC accepts no Public V1 token. TLS identity,
+workload identity or an explicit token protocol may be designed later as a
+separate transport-security feature. Exact descriptor and session checks are
+correctness fences, not credentials or proof of the peer's identity, and
+transport authentication is not a production-activation requirement.
 
 Phase 5.4 replaces the disposable schema-10 store with the final fresh
 schema-11 Public V1 store. Schemas 8, 9 and 10 are rejected before record

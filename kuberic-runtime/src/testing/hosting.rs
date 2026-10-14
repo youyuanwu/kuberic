@@ -147,7 +147,7 @@ impl PendingReplication {
 #[derive(Debug)]
 pub enum OutboundReplication {
     Replication(proto::ReplicationItem),
-    Copy(proto::CopyItem),
+    Copy(Box<proto::CopyItem>),
     Build(super::transport::ReplicaEndpoint),
     Remove(ReplicaId),
     Evict(ReplicaIdentity),

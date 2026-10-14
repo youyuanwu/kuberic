@@ -43,6 +43,7 @@ jobs:
           build-warnings: ""
 
       - uses: taiki-e/install-action@protoc
+      - uses: taiki-e/install-action@just
 
       - name: Install pinned cargo-nextest
         run: scripts/install_nextest.sh
@@ -56,8 +57,8 @@ jobs:
       - name: Test workspace documentation
         run: cargo test --doc --workspace --all-features
 
-      - name: Verify runtime public API (build-only)
-        run: scripts/check_runtime_public_api.sh
+      - name: Verify build-only gates
+        run: just nextest-build-only
 
       - name: Build reusable test archive
         run: |

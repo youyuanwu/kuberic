@@ -401,6 +401,36 @@ impl PublicV1HistoryCommand {
     }
 }
 
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicV1OperationCommand {
+    pub target: ReplicaIdentity,
+    pub intent: PublicOperationIntent,
+}
+
+#[cfg(feature = "testing")]
+impl PublicV1OperationCommand {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.intent.validate()?;
+        if self.target.replica_id.value() <= 0
+            || self.target.instance_id.is_empty()
+            || self.target.agent_generation.is_empty()
+        {
+            return Err("public-v1 operation target is incomplete");
+        }
+        if let Some(crate::protocol::public_operations::PublicOperationProgram::Open {
+            replica,
+            ..
+        }) = self.intent.program.as_ref()
+            && replica != &self.target
+        {
+            return Err("public-v1 Open target differs from the exact replica");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// One fenced, idempotent authority command issued after a full observation.
@@ -418,6 +448,8 @@ pub enum ProtocolCommand {
     DropReplicaIncarnation(Box<DropReplicaIncarnation>),
     #[cfg(feature = "testing")]
     PublicV1History(Box<PublicV1HistoryCommand>),
+    #[cfg(feature = "testing")]
+    PublicV1Operation(Box<PublicV1OperationCommand>),
 }
 
 impl ProtocolCommand {
@@ -433,7 +465,8 @@ impl ProtocolCommand {
             #[cfg(feature = "testing")]
             Self::RestartReplicaProcess(_)
             | Self::DropReplicaIncarnation(_)
-            | Self::PublicV1History(_) => EffectClass::ReconfigurationAction,
+            | Self::PublicV1History(_)
+            | Self::PublicV1Operation(_) => EffectClass::ReconfigurationAction,
         }
     }
 }

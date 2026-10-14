@@ -46,7 +46,9 @@ use crate::host::state::{
 };
 use crate::host::store::{AgentStore, BeginConfiguration, BeginEffect};
 #[cfg(any(test, feature = "testing"))]
-use crate::host::store::{BeginPublicOperation, RenewPublicDataLossAttempt};
+use crate::host::store::{
+    BeginPublicOperation, PublicInboundBuildAdmission, RenewPublicDataLossAttempt,
+};
 
 fn switchover_receipt_matches(
     receipt: &crate::receipts::SwitchoverReceipt,
@@ -248,6 +250,49 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                 "public-v1 build record terminal result differs from its operation".into(),
             ));
         }
+    }
+    if let Some(authority) = &preview.current_inbound_build_authority {
+        authority
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+        if authority.attempt.target != state.identity.local_identity
+            || preview
+                .storage_incarnation
+                .as_ref()
+                .is_some_and(|storage| storage != &authority.attempt.target_storage)
+            || preview.history.as_ref() != Some(&authority.history)
+        {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 inbound build authority differs from target durable authority".into(),
+            ));
+        }
+    }
+    for (build_id, receipt) in &preview.terminal_inbound_build_receipts {
+        receipt
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
+        if build_id != &receipt.authority.attempt.build_id
+            || receipt.authority.attempt.target != state.identity.local_identity
+            || receipt.authority.operation_revision > preview.inbound_build_generation
+        {
+            return Err(crate::host::HostError::Corrupt(
+                "public-v1 terminal inbound build receipt differs from target authority".into(),
+            ));
+        }
+    }
+    if preview
+        .current_inbound_build_authority
+        .as_ref()
+        .is_some_and(|authority| authority.operation_revision != preview.inbound_build_generation)
+    {
+        return Err(crate::host::HostError::Corrupt(
+            "public-v1 current inbound build generation is not the accepted generation".into(),
+        ));
+    }
+    for storage in &preview.retired_storage_incarnations {
+        storage
+            .validate()
+            .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
     }
     Ok(())
 }
@@ -608,6 +653,58 @@ impl SqliteStore {
         let result = action(&transaction)?;
         transaction.commit().map_err(contract_sqlite_error)?;
         Ok(result)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+fn classify_public_v1_inbound_build_authority(
+    state: &AgentState,
+    authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+) -> Result<PublicInboundBuildAdmission> {
+    authority
+        .validate()
+        .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+    let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
+        crate::host::HostError::CommandRejected(
+            "inbound build authority requires a public-v1 store".into(),
+        )
+    })?;
+    if !preview.identity.is_public_v1()
+        || authority.attempt.target != state.identity.local_identity
+        || preview.history.as_ref() != Some(&authority.history)
+        || preview.storage_incarnation.as_ref() != Some(&authority.attempt.target_storage)
+        || preview
+            .retired_storage_incarnations
+            .contains(&authority.attempt.target_storage)
+    {
+        return Err(crate::host::HostError::IdentityMismatch(
+            "inbound build authority differs from durable target authority".into(),
+        ));
+    }
+    if let Some(receipt) = preview
+        .terminal_inbound_build_receipts
+        .get(&authority.attempt.build_id)
+    {
+        if &receipt.authority != authority {
+            return Err(crate::host::HostError::DurableEffectConflict(
+                "completed inbound build changed exact authority".into(),
+            ));
+        }
+        return Ok(PublicInboundBuildAdmission::Current);
+    }
+    match &preview.current_inbound_build_authority {
+        Some(existing) if existing == authority => Ok(PublicInboundBuildAdmission::Current),
+        Some(existing) if authority.operation_revision <= existing.operation_revision => {
+            Err(crate::host::HostError::StaleEffectCompletion(
+                "inbound build authority did not supersede the accepted attempt".into(),
+            ))
+        }
+        _ if authority.operation_revision <= preview.inbound_build_generation => {
+            Err(crate::host::HostError::StaleEffectCompletion(
+                "inbound build authority revision is no longer current".into(),
+            ))
+        }
+        _ => Ok(PublicInboundBuildAdmission::Successor),
     }
 }
 
@@ -1985,11 +2082,97 @@ impl AgentStore for SqliteStore {
 
             let mut exact_blockers = std::collections::BTreeSet::new();
             if !intent.class.is_terminal()
-                && preview.operations.values().any(|record| record.intent.process_session_id != intent.process_session_id)
+                && preview
+                    .operations
+                    .values()
+                    .any(|record| record.intent.process_session_id != intent.process_session_id)
             {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "fresh session cannot resume predecessor public operations".into(),
-                ));
+                let renewal_authorized = preview.session_renewal.as_ref().is_some_and(|renewal| {
+                    let replacement_matches =
+                        renewal.required.replacement.as_ref().is_some_and(|replacement| {
+                            replacement.identity == state.identity.local_identity
+                                && replacement.process_session_id == intent.process_session_id
+                        });
+                    let history_matches = preview
+                        .history
+                        .as_ref()
+                        .is_some_and(|history| renewal.required.history == *history);
+                    let staged_authority = match (
+                        renewal.stage,
+                        intent.program.as_ref(),
+                    ) {
+                        (
+                            crate::protocol::public_operations::PublicSessionRenewalStage::
+                                ReplacementRolePending,
+                            Some(crate::protocol::public_operations::PublicOperationProgram::Open {
+                                replica,
+                                existing: true,
+                            }),
+                        ) => *replica == state.identity.local_identity,
+                        (
+                            crate::protocol::public_operations::PublicSessionRenewalStage::
+                                ReplacementRolePending,
+                            Some(crate::protocol::public_operations::PublicOperationProgram::Role {
+                                epoch,
+                                role,
+                            }),
+                        ) => {
+                            *epoch == renewal.required.renewal_epoch
+                                && *role == renewal.required.predecessor.role
+                        }
+                        (
+                            crate::protocol::public_operations::PublicSessionRenewalStage::
+                                ConfigurationPending,
+                            Some(crate::protocol::public_operations::PublicOperationProgram::Epoch {
+                                epoch,
+                            }),
+                        ) => *epoch == renewal.required.renewal_epoch,
+                        (
+                            crate::protocol::public_operations::PublicSessionRenewalStage::
+                                ConfigurationPending,
+                            Some(crate::protocol::public_operations::PublicOperationProgram::Role {
+                                epoch,
+                                role,
+                            }),
+                        ) => {
+                            *epoch == renewal.required.renewal_epoch
+                                && renewal.required.fresh_configuration.members.iter().any(
+                                    |member| {
+                                        member.identity == state.identity.local_identity
+                                            && member.role == *role
+                                    },
+                                )
+                        }
+                        (
+                            crate::protocol::public_operations::PublicSessionRenewalStage::
+                                ConfigurationPending,
+                            Some(
+                                crate::protocol::public_operations::PublicOperationProgram::
+                                    Configuration(configuration),
+                            ),
+                        ) => configuration.current == renewal.required.fresh_configuration,
+                        _ => false,
+                    };
+                    replacement_matches
+                        && history_matches
+                        && (renewal.stage
+                            == crate::protocol::public_operations::PublicSessionRenewalStage::
+                                Authorized
+                            || staged_authority)
+                });
+                if !renewal_authorized {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "fresh session cannot resume predecessor public operations".into(),
+                    ));
+                }
+                preview.operations.clear();
+                preview.current_operation = None;
+                preview.current_topology_operation = None;
+                preview.active_builds.clear();
+                preview.build_records.clear();
+                preview.absent_builds.clear();
+                preview.current_inbound_build_authority = None;
+                preview.writes_revoked = false;
             }
             if !intent.class.is_terminal() && !preview.history_barriers.is_empty() {
                 return Err(crate::host::HostError::CommandRejected(
@@ -2037,7 +2220,10 @@ impl AgentStore for SqliteStore {
                     } else {
                         None
                     };
-                    if preview.active_builds.contains_key(&build.replica.replica_id)
+                    if preview
+                        .retired_storage_incarnations
+                        .contains(&build.target_storage)
+                        || preview.active_builds.contains_key(&build.replica.replica_id)
                         || preview.operations.values().filter(|record| {
                             preview.current_topology_operation.as_ref().map_or_else(
                                 || {
@@ -2235,6 +2421,7 @@ impl AgentStore for SqliteStore {
                         preview.active_builds.clear();
                         preview.build_records.clear();
                         preview.absent_builds.clear();
+                        preview.current_inbound_build_authority = None;
                         preview.operations.clear();
                         preview.current_topology_operation = None;
                         preview.current_operation = None;
@@ -3256,8 +3443,19 @@ impl AgentStore for SqliteStore {
                         }
                         preview.active_builds.remove(&build.replica.replica_id);
                         preview.absent_builds.insert(build.attempt.clone());
-                        if let Some(build_record) =
-                            preview.build_records.get_mut(&build.attempt)
+                        if intent.preview.is_public_v1()
+                            && !preview
+                                .retired_storage_incarnations
+                                .contains(&build.target_storage)
+                        {
+                            preview
+                                .retired_storage_incarnations
+                                .push(build.target_storage.clone());
+                        }
+                        if let Some(build_record) = preview
+                            .build_records
+                            .values_mut()
+                            .find(|record| record.build_id == build.attempt)
                         {
                             if build_record.target != build.replica
                                 || build_record.target_storage != build.target_storage
@@ -3312,6 +3510,201 @@ impl AgentStore for SqliteStore {
             }
             write_agent_state(transaction, &state)
         })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn classify_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission> {
+        classify_public_v1_inbound_build_authority(&self.load_state().await?, authority)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn install_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            match classify_public_v1_inbound_build_authority(&state, authority)? {
+                PublicInboundBuildAdmission::Current => return Ok(()),
+                PublicInboundBuildAdmission::Successor => {}
+            }
+            let preview = state
+                .public_operation_preview
+                .as_mut()
+                .expect("classified public-v1 state");
+            preview.inbound_build_generation = authority.operation_revision;
+            preview.current_inbound_build_authority = Some(authority.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_inbound_build_authority(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        Ok(self
+            .load_state()
+            .await?
+            .public_operation_preview
+            .and_then(|preview| {
+                preview
+                    .current_inbound_build_authority
+                    .filter(|authority| &authority.attempt.build_id == build_id)
+            }))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_terminal_inbound_build_receipt(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildReceipt>> {
+        Ok(self
+            .load_state()
+            .await?
+            .public_operation_preview
+            .and_then(|preview| {
+                preview
+                    .terminal_inbound_build_receipts
+                    .get(build_id)
+                    .cloned()
+            }))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn revoke_public_v1_inbound_build_authority(&self) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "inbound build revocation requires a public-v1 store".into(),
+                )
+            })?;
+            preview.current_inbound_build_authority = None;
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_outbound_build_authority(
+        &self,
+        build_id: &OperationId,
+        current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        let state = self.load_state().await?;
+        let Some(preview) = state.public_operation_preview else {
+            return Ok(None);
+        };
+        let Some(record) = preview
+            .build_records
+            .values()
+            .find(|record| &record.build_id == build_id)
+        else {
+            return Ok(None);
+        };
+        let operation = preview
+            .operations
+            .get(&record.operation_id)
+            .ok_or_else(|| {
+                crate::host::HostError::Corrupt(
+                    "outbound build record lacks its durable operation".into(),
+                )
+            })?;
+        let Some(crate::protocol::public_operations::PublicOperationProgram::Build(build)) =
+            operation.intent.program.as_ref()
+        else {
+            return Err(crate::host::HostError::Corrupt(
+                "outbound build record operation changed kind".into(),
+            ));
+        };
+        if build.current_configuration_id.as_ref() != Some(current_configuration_id) {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "outbound build changed current configuration".into(),
+            ));
+        }
+        Ok(Some(
+            crate::protocol::public_operations::PublicInboundBuildAuthority {
+                operation_id: operation.intent.operation_id.clone(),
+                operation_revision: operation.intent.revision,
+                attempt: crate::protocol::public_operations::PublicBuildAttemptReference {
+                    resource_uid: state.identity.resource_uid,
+                    epoch: record.epoch,
+                    build_id: record.build_id.clone(),
+                    source: record.source.clone(),
+                    source_storage: record.source_storage.clone(),
+                    source_session: record.source_session.clone(),
+                    target: record.target.clone(),
+                    target_storage: record.target_storage.clone(),
+                    target_session: record.target_session.clone(),
+                },
+                history: record.history.clone(),
+                current_configuration_id: current_configuration_id.clone(),
+                target_address: record.target_address.clone(),
+            },
+        ))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn complete_public_v1_inbound_build(
+        &self,
+        receipt: &crate::protocol::public_operations::PublicInboundBuildReceipt,
+    ) -> Result<()> {
+        receipt
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "inbound build completion requires a public-v1 store".into(),
+                )
+            })?;
+            if let Some(existing) = preview
+                .terminal_inbound_build_receipts
+                .get(&receipt.authority.attempt.build_id)
+            {
+                if existing != receipt {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "terminal inbound build receipt changed".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            let authority = preview
+                .current_inbound_build_authority
+                .take()
+                .ok_or_else(|| {
+                    crate::host::HostError::StaleEffectCompletion(
+                        "inbound build completion lacks exact authority".into(),
+                    )
+                })?;
+            if authority != receipt.authority
+                || authority.attempt.target != state.identity.local_identity
+            {
+                return Err(crate::host::HostError::IdentityMismatch(
+                    "inbound build completion changed target".into(),
+                ));
+            }
+            preview
+                .terminal_inbound_build_receipts
+                .insert(receipt.authority.attempt.build_id.clone(), receipt.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    async fn public_v1_storage_is_retired(
+        &self,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool> {
+        Ok(self
+            .load_state()
+            .await?
+            .public_operation_preview
+            .is_some_and(|preview| preview.retired_storage_incarnations.contains(storage)))
     }
 
     #[cfg(all(feature = "testing", kuberic_workspace_tests))]
@@ -4619,8 +5012,8 @@ fn phase_tag(phase: LocalWritePhase) -> i64 {
 mod tests {
     use super::*;
     use crate::protocol::types::{
-        AgentGeneration, EffectivePolicy, InitializationId, PodUid, PvcUid, ReplicaId,
-        ReplicaIdentity, ReplicaInstanceId, ResourceUid,
+        AgentGeneration, ConfigurationId, EffectivePolicy, InitializationId, PodUid, PvcUid,
+        ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
     };
 
     fn identity() -> StorageIdentity {
@@ -4637,6 +5030,120 @@ mod tests {
             },
             effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_inbound_build_receipt_reopens_for_exact_replay_only() {
+        let directory = crate::host::tests::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let preview =
+            crate::protocol::public_operations::PublicOperationPreviewIdentity::public_v1(11);
+        let binding = crate::protocol::public_operations::PreviewLifecycleBinding {
+            preview: preview.clone(),
+            resource_uid: identity().resource_uid,
+            spec_generation: 1,
+            state_persistence: crate::protocol::public_operations::StatePersistence::Persisted,
+        };
+        let store = SqliteStore::create_preview_bound_authorized(
+            &path,
+            AgentState::new(identity()),
+            binding.clone(),
+        )
+        .unwrap();
+        let initialization = crate::protocol::types::derive_history_initialization_id(
+            &binding.resource_uid,
+            crate::protocol::types::PublicProtocolGeneration::new(11),
+        );
+        let history = crate::protocol::types::derive_bootstrap_history(
+            &binding.resource_uid,
+            crate::protocol::types::PublicProtocolGeneration::new(11),
+            &initialization,
+        );
+        let target_storage = crate::protocol::types::ReplicaStorageIncarnationContext {
+            replica: identity().local_identity,
+            storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new("scale-up-pod"),
+                pvc_uid: PvcUid::new("scale-up-pvc"),
+            },
+            storage_generation: crate::protocol::types::StorageGeneration::new(
+                "target-storage-generation",
+            ),
+        };
+        store
+            .initialize_public_v1_history(&initialization, &history, &target_storage)
+            .await
+            .unwrap();
+        let source = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source-pod"),
+            agent_generation: AgentGeneration::new("source-generation"),
+        };
+        let source_storage = crate::protocol::types::ReplicaStorageIncarnationContext {
+            replica: source.clone(),
+            storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new("source-pod"),
+                pvc_uid: PvcUid::new("source-pvc"),
+            },
+            storage_generation: crate::protocol::types::StorageGeneration::new(
+                "source-storage-generation",
+            ),
+        };
+        let authority = crate::protocol::public_operations::PublicInboundBuildAuthority {
+            operation_id: OperationId::new("receipt-operation"),
+            operation_revision: 7,
+            attempt: crate::protocol::public_operations::PublicBuildAttemptReference {
+                resource_uid: binding.resource_uid.clone(),
+                epoch: Epoch::new(0, 1),
+                build_id: OperationId::new("receipt-build"),
+                source,
+                source_storage,
+                source_session: crate::protocol::types::ProcessSessionId::new("source-session"),
+                target: target_storage.replica.clone(),
+                target_storage,
+                target_session: crate::protocol::types::ProcessSessionId::new("target-session"),
+            },
+            history,
+            current_configuration_id: ConfigurationId::new("receipt-configuration"),
+            target_address: "http://127.0.0.1:1".into(),
+        };
+        store
+            .install_public_v1_inbound_build_authority(&authority)
+            .await
+            .unwrap();
+        let receipt = crate::protocol::public_operations::PublicInboundBuildReceipt {
+            authority: authority.clone(),
+            final_sequence: 4,
+            replication_boundary_lsn: 3,
+            catch_up_boundary_lsn: 5,
+            durable_lsn: 5,
+        };
+        store
+            .complete_public_v1_inbound_build(&receipt)
+            .await
+            .unwrap();
+        drop(store);
+
+        let reopened =
+            SqliteStore::open_preview_bound_existing(&path, Some(&identity()), &binding).unwrap();
+        assert_eq!(
+            reopened
+                .public_v1_terminal_inbound_build_receipt(&authority.attempt.build_id)
+                .await
+                .unwrap(),
+            Some(receipt)
+        );
+        reopened
+            .install_public_v1_inbound_build_authority(&authority)
+            .await
+            .unwrap();
+        let mut changed = authority;
+        changed.target_address = "http://127.0.0.1:2".into();
+        assert!(
+            reopened
+                .install_public_v1_inbound_build_authority(&changed)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

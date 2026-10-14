@@ -37,11 +37,25 @@ private-path documented field crate::host::process::ReplicaProcessConfig::replic
 private-path documented field crate::host::process::ReplicaProcessConfig::resource_uid: ResourceUid
 private-path documented field crate::host::process::ReplicaProcessConfig::rpc_deadline: Duration
 private-path documented field crate::host::process::ReplicaProcessConfig::transport_window_capacity: usize
+private-path documented impl crate::host::process::ReplicaHandle::async fn authorize_stateless_preview_session_renewal (& self , required : crate :: protocol :: public_operations :: ProcessSessionRenewalRequired ,) -> Result < crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus >
 private-path documented impl crate::host::process::ReplicaHandle::async fn diagnostics (& self) -> Result < ReplicaDiagnostics >
+private-path documented impl crate::host::process::ReplicaHandle::async fn execute_stateless_preview (& self , intent : crate :: protocol :: public_operations :: PublicOperationIntent ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn execute_stateless_preview_command (& self , command : crate :: protocol :: command :: ProtocolCommand ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn fence_stateless_preview_access (& self)
+private-path documented impl crate::host::process::ReplicaHandle::async fn initialize_stateless_preview_history (& self , initialization_id : & crate :: protocol :: types :: HistoryInitializationId , history : & crate :: protocol :: types :: HistoryContext , storage : & crate :: protocol :: types :: ReplicaStorageIncarnationContext ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn install_stateless_preview_inbound_build_authority (& self , authority : & crate :: protocol :: public_operations :: PublicInboundBuildAuthority ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn persist_stateless_preview_session_renewal (& self , expected : Option < & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus > , next : & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_next_operation_revision (& self) -> Result < u64 >
+private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_operation_intent (& self , operation_id : & crate :: protocol :: types :: OperationId ,) -> Result < Option < crate :: protocol :: public_operations :: PublicOperationIntent > >
+private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_process_endpoint (& self , role : crate :: protocol :: types :: ReplicaRole ,) -> Result < crate :: protocol :: types :: ProcessSessionEndpoint >
+private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_report (& self ,) -> Result < crate :: protocol :: public_operations :: PublicV1AgentReport >
+private-path documented impl crate::host::process::ReplicaHandle::fn process_session_id (& self) -> crate :: protocol :: types :: ProcessSessionId
+private-path documented impl crate::host::process::ReplicaHandle::fn stateless_preview_provider_writer_count (& self) -> usize
 private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start (self) -> Result < RunningReplica >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start_with_shutdown (self , mut startup_shutdown : watch :: Receiver < bool > ,) -> Result < Option < RunningReplica > >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn new (config : ReplicaProcessConfig , application : Arc < A > , application_storage : ApplicationStorageState , resolver : Arc < R > ,) -> Self
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn with_application_storage_paths (mut self , paths : BTreeMap < String , PathBuf >) -> Self
+private-path documented impl crate::host::process::ReplicaHost < A , R >::fn with_stateless_preview (mut self , binding : PreviewLifecycleBinding) -> Self
 private-path documented impl crate::host::process::RunningReplica::async fn wait (& mut self) -> Result < () >
 private-path documented impl crate::host::process::RunningReplica::fn handle (& self) -> ReplicaHandle
 private-path documented impl crate::host::process::RunningReplica::fn shutdown (& self)

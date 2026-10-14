@@ -40,12 +40,12 @@ pub(crate) enum QueuedOutbound {
     Replication {
         receiver: ReplicaIdentity,
         sequence: u64,
-        item: proto::ReplicationItem,
+        item: Box<proto::ReplicationItem>,
     },
     Copy {
         receiver: ReplicaIdentity,
         sequence: u64,
-        item: proto::CopyItem,
+        item: Box<proto::CopyItem>,
     },
     Build(ReplicaEndpoint),
     Remove(ReplicaId),
@@ -516,8 +516,9 @@ where
             QueuedOutbound::Replication {
                 receiver,
                 sequence: _,
-                mut item,
+                item,
             } => {
+                let mut item = *item;
                 let session = self.peer_session(&receiver).await?;
                 self.runtime
                     .register_peer_session(receiver.clone(), session.clone())
@@ -585,7 +586,7 @@ where
                 receiver,
                 sequence: _,
                 item,
-            } => self.dispatch_copy(receiver, item, true).await,
+            } => self.dispatch_copy(receiver, *item, true).await,
             QueuedOutbound::Build(endpoint) => self.dispatch_build(endpoint).await,
             QueuedOutbound::Remove(replica_id) => {
                 let receiver = self.transport.lock().await.peer_for_replica(replica_id);
@@ -916,16 +917,19 @@ async fn queued_matches_runtime_authority(
         );
     };
     match queued {
-        QueuedOutbound::Replication { item, .. } => replication_from_proto(item.clone())
+        QueuedOutbound::Replication { item, .. } => replication_from_proto(item.as_ref().clone())
             .is_ok_and(|item| authority.validate_envelope(&item).is_ok()),
-        QueuedOutbound::Copy { item, .. } => normalize_copy_item(item.clone()).is_ok_and(|item| {
-            item.epoch == authority.current_configuration.epoch
-                && item.current_configuration_id == authority.current_configuration.configuration_id
-                && authority
-                    .secondary_removal
-                    .as_ref()
-                    .is_none_or(|e| item.receiver != e.preparation.intent.target)
-        }),
+        QueuedOutbound::Copy { item, .. } => {
+            normalize_copy_item(item.as_ref().clone()).is_ok_and(|item| {
+                item.epoch == authority.current_configuration.epoch
+                    && item.current_configuration_id
+                        == authority.current_configuration.configuration_id
+                    && authority
+                        .secondary_removal
+                        .as_ref()
+                        .is_none_or(|e| item.receiver != e.preparation.intent.target)
+            })
+        }
         QueuedOutbound::Build(_) | QueuedOutbound::Remove(_) | QueuedOutbound::Evict(_) => true,
     }
 }
@@ -1123,11 +1127,11 @@ fn sender_outbound_to_queued(outbound: SenderOutbound) -> Result<QueuedOutbound>
         } => QueuedOutbound::Replication {
             receiver,
             sequence: message.sequence,
-            item: replication_to_session_proto(
+            item: Box::new(replication_to_session_proto(
                 message.payload,
                 sender_session.as_str(),
                 receiver_session.as_str(),
-            ),
+            )),
         },
         SenderOutbound::Copy {
             receiver,
@@ -1137,11 +1141,11 @@ fn sender_outbound_to_queued(outbound: SenderOutbound) -> Result<QueuedOutbound>
         } => QueuedOutbound::Copy {
             receiver,
             sequence: message.sequence,
-            item: copy_to_session_proto(
+            item: Box::new(copy_to_session_proto(
                 message.payload,
                 sender_session.as_str(),
                 receiver_session.as_str(),
-            ),
+            )),
         },
         SenderOutbound::Build(endpoint) => QueuedOutbound::Build(endpoint),
         SenderOutbound::Remove(replica_id) => QueuedOutbound::Remove(replica_id),
@@ -1288,6 +1292,10 @@ pub(crate) fn copy_to_proto(item: CopyItem) -> proto::CopyItem {
         snapshot_chunk: item.snapshot_chunk,
         sender_session_id: String::new(),
         receiver_session_id: String::new(),
+        source_storage: None,
+        target_storage: None,
+        history: None,
+        target_address: String::new(),
     }
 }
 

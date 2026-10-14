@@ -686,6 +686,7 @@ public-path documented variant crate::protocol::command::ProtocolCommand::Initia
 public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSecondaryRemoval((Box < PrepareSecondaryRemoval >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PrepareSwitchover((Box < PrepareSwitchover >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1History((Box < PublicV1HistoryCommand >))
+public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1Operation((Box < PublicV1OperationCommand >))
 public-path documented variant crate::protocol::command::ProtocolCommand::RestartReplicaProcess((Box < RestartReplicaProcess >))
 public-path documented variant crate::protocol::command::ProtocolCommand::RetireReplica((Box < RetireReplica >))
 public-path documented variant crate::protocol::command::SafetyChange::RemoveWriteRouting
@@ -912,6 +913,7 @@ public-path hidden field crate::protocol::public_operations::PublicBuildAttemptR
 public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target_session: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target_storage: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::attempt: OperationId
+public-path hidden field crate::protocol::public_operations::PublicBuildInput::current_configuration_id: Option < ConfigurationId >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::epoch: Epoch
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::history: Option < HistoryContext >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::process_session_id: ProcessSessionId
@@ -945,6 +947,17 @@ public-path hidden field crate::protocol::public_operations::PublicFaultAction::
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::predecessor_session: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::resources: FrozenReplicaResources
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::target: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::attempt: PublicBuildAttemptReference
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::current_configuration_id: ConfigurationId
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::history: HistoryContext
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_revision: u64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::target_address: String
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::authority: PublicInboundBuildAuthority
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::catch_up_boundary_lsn: i64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::durable_lsn: i64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::final_sequence: u64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::replication_boundary_lsn: i64
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::current: ConfigurationDescriptor
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::data_loss_recovery: Option < PublicDataLossRecoveryInput >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::epoch: Epoch
@@ -986,6 +999,7 @@ public-path hidden field crate::protocol::public_operations::PublicReplicaDescri
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::replication_address: String
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::role: ReplicaRole
+public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::storage_incarnation: Option < ReplicaStorageIncarnationContext >
 public-path hidden field crate::protocol::public_operations::PublicServiceClear::action_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicServiceClear::service_resource_version: Option < String >
 public-path hidden field crate::protocol::public_operations::PublicServiceClear::service_uid: Option < String >
@@ -1095,6 +1109,8 @@ public-path hidden impl crate::protocol::public_operations::PublicDataLossRecove
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_id (& self) -> OperationId
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_kind (persistence : StatePersistence , fault : FaultType) -> PublicFaultActionKind
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicInboundBuildAuthority::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicInboundBuildReceipt::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn configuration (& self) -> PublicConfiguration
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn digest (& self) -> CanonicalOperationInputDigest
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn validate (& self) -> Result < () , & 'static str >
@@ -1143,6 +1159,8 @@ public-path hidden struct crate::protocol::public_operations::PublicDataLossReco
 public-path hidden struct crate::protocol::public_operations::PublicDataLossRecoveryStatus
 public-path hidden struct crate::protocol::public_operations::PublicDataLossSessionRenewal
 public-path hidden struct crate::protocol::public_operations::PublicFaultAction
+public-path hidden struct crate::protocol::public_operations::PublicInboundBuildAuthority
+public-path hidden struct crate::protocol::public_operations::PublicInboundBuildReceipt
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleInput
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleReport
 public-path hidden struct crate::protocol::public_operations::PublicOperationIntent
@@ -1211,7 +1229,7 @@ public-path hidden variant crate::protocol::public_operations::PublicOperationPr
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Progress { { capability : bool , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Remove((PublicBuildInput))
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Role { { epoch : Epoch , role : ReplicaRole , } }
-public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Swap { { starting : PublicConfiguration , refreshed : PublicConfiguration , epoch : Epoch , handoff : ReplicaRole , catch_up_specific_quorum : bool , mode : PublicCatchUpMode , } }
+public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Swap { { starting : PublicConfiguration , refreshed : PublicConfiguration , epoch : Epoch , handoff : ReplicaRole , catch_up_specific_quorum : bool , mode : PublicCatchUpMode , controller_composed : bool , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationReplayDisposition::Containment
 public-path hidden variant crate::protocol::public_operations::PublicOperationReplayDisposition::Convergent
 public-path hidden variant crate::protocol::public_operations::PublicOperationReplayDisposition::DataLoss((DataLossReplay))

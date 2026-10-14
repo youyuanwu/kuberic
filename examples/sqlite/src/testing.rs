@@ -486,7 +486,7 @@ pub async fn bootstrap(pods: &[&SqlitePod]) -> ConfigurationDescriptor {
         loop {
             let item = prepared.items.next().await.unwrap().unwrap();
             let last = item.final_item;
-            let message = transport.bind(Message::Copy(item)).unwrap();
+            let message = transport.bind(Message::Copy(Box::new(item))).unwrap();
             let delivery = transport.enqueue(message).unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
@@ -881,7 +881,7 @@ pub async fn deliver_copy(
     transport: &mut InProcessTransport,
     item: kuberic_runtime::control::proto::CopyItem,
 ) -> Result<kuberic_runtime::control::proto::CopyAck, TransportError> {
-    let message = transport.bind(Message::Copy(item))?;
+    let message = transport.bind(Message::Copy(Box::new(item)))?;
     let id = transport.enqueue(message)?;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

@@ -435,7 +435,7 @@ impl DurableFrameLog {
     }
 
     pub fn stage(&mut self, build: &str, sequence: u64, bytes: Vec<u8>) -> io::Result<()> {
-        if build.is_empty() || sequence == 0 {
+        if build.is_empty() {
             return Err(io::Error::other("invalid copy sequence"));
         }
         if let Some(existing) = self.chunks(build).and_then(|chunks| chunks.get(&sequence)) {
@@ -450,7 +450,12 @@ impl DurableFrameLog {
         }
         let mut meta = self.meta.clone();
         let chunks = meta.staging.entry(build.to_owned()).or_default();
-        if sequence != chunks.len() as u64 + 1 {
+        let expected = chunks
+            .keys()
+            .next()
+            .copied()
+            .map_or(sequence, |first| first + chunks.len() as u64);
+        if (chunks.is_empty() && sequence > 1) || sequence != expected {
             return Err(io::Error::other("copy sequence gap"));
         }
         chunks.insert(sequence, bytes);

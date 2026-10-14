@@ -18,7 +18,7 @@ default-filter = 'not package(=postgres-replicated) and not binary(=kubernetes_c
 
 [profile.build-only]
 inherits = "ci"
-default-filter = 'binary_id(=kuberic-runtime::public_api_privacy)'
+default-filter = 'binary_id(=kuberic-runtime::public_api_privacy) or (binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios))'
 test-threads = 1
 
 [profile.postgres]
@@ -54,6 +54,21 @@ test-group = 'postgres'
 [[profile.default.overrides]]
 filter = 'package(=sqlite-replicated)'
 test-group = 'sqlite'
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=built_in_preview_ksf_mappings_require_each_authorized_observation)'
+slow-timeout = { period = "270s", terminate-after = 1 }
+test-group = 'process-boundaries'
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
+slow-timeout = { period = "270s", terminate-after = 1 }
+test-group = 'process-boundaries'
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kuberic-runtime) and test(=host::sqlite_store::tests::terminal_inbound_build_receipt_reopens_for_exact_replay_only)'
+slow-timeout = { period = "270s", terminate-after = 1 }
+test-group = 'process-boundaries'
 
 [[profile.default.overrides]]
 filter = 'binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)'

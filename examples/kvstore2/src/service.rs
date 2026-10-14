@@ -3,9 +3,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceReplica};
 use kuberic_runtime::protocol::types::ReplicaRole;
+#[cfg(feature = "testing")]
+use kuberic_runtime::replicator::stateless::StatelessReplicatorFactory;
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
+    DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
     StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
@@ -18,8 +20,10 @@ pub struct KvService {
     provider: Arc<KvStateProvider>,
     replication_address: String,
     state_replicator: RwLock<Option<Arc<dyn StateReplicator>>>,
+    control: RwLock<Option<Arc<dyn Replicator>>>,
     partition: RwLock<Option<StatefulServicePartition>>,
     role: Mutex<ReplicaRole>,
+    stateless_preview: std::sync::atomic::AtomicBool,
 }
 
 impl KvService {
@@ -32,9 +36,19 @@ impl KvService {
             provider: Arc::new(KvStateProvider::new(persistence, copy_gate)),
             replication_address,
             state_replicator: RwLock::new(None),
+            control: RwLock::new(None),
             partition: RwLock::new(None),
             role: Mutex::new(ReplicaRole::None),
+            stateless_preview: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(feature = "testing")]
+    #[allow(dead_code)]
+    pub fn with_stateless_preview(self) -> Self {
+        self.stateless_preview
+            .store(true, std::sync::atomic::Ordering::Release);
+        self
     }
 
     pub fn persistence(&self) -> &Arc<KvPersistence> {
@@ -76,20 +90,41 @@ fn require_read_access(status: kuberic_runtime::protocol::types::AccessStatus) -
 #[async_trait]
 impl StatefulServiceReplica for KvService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        if let Some(control) = self.control.read().await.clone() {
+            return Ok(control);
+        }
         *self.partition.write().await = Some(context.partition.clone());
+        let preview = self
+            .stateless_preview
+            .load(std::sync::atomic::Ordering::Acquire);
+        let factory: Arc<dyn ReplicatorFactory> = if preview {
+            #[cfg(feature = "testing")]
+            {
+                Arc::new(StatelessReplicatorFactory::new(
+                    self.provider.persistence().clone(),
+                ))
+            }
+            #[cfg(not(feature = "testing"))]
+            {
+                unreachable!("preview construction is unavailable without testing")
+            }
+        } else {
+            Arc::new(DefaultReplicatorFactory::new(
+                self.provider.persistence().clone(),
+            ))
+        };
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new(
-                self.provider.persistence().clone(),
-            )))
+            .with_factory(factory)
             .create_replicator(
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: false,
+                    public_v1: preview,
                 }),
             )
             .await?;
+        let control = interfaces.replicator();
         let state_replicator = interfaces
             .state_replicator()
             .expect("default operation/copy capability");
@@ -101,7 +136,8 @@ impl StatefulServiceReplica for KvService {
         ));
         tokio::spawn(consume_stream(self.provider.persistence().clone(), copy));
         *self.state_replicator.write().await = Some(state_replicator);
-        Ok(interfaces.replicator())
+        *self.control.write().await = Some(control.clone());
+        Ok(control)
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
@@ -114,6 +150,7 @@ impl StatefulServiceReplica for KvService {
 
     async fn close(&self) -> Result<()> {
         self.state_replicator.write().await.take();
+        self.control.write().await.take();
         self.partition.write().await.take();
         *self.role.lock().unwrap() = ReplicaRole::None;
         Ok(())
