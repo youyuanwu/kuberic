@@ -164,18 +164,6 @@ pub struct AcceptSecondaryRemovalCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RestartReplicaProcess {
-    pub action: crate::protocol::public_operations::PublicFaultAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DropReplicaIncarnation {
-    pub action: crate::protocol::public_operations::PublicFaultAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PublicV1HistoryCommand {
     Initialize {
@@ -437,14 +425,6 @@ impl PublicV1OperationCommand {
 /// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
     InitializeAgentStore(Box<InitializeAgentStore>),
-    PrepareSwitchover(Box<PrepareSwitchover>),
-    EnsureConfiguration(Box<EnsureConfiguration>),
-    EnsureReplicaBuild(Box<EnsureReplicaBuild>),
-    PrepareSecondaryRemoval(Box<PrepareSecondaryRemoval>),
-    RetireReplica(Box<RetireReplica>),
-    AcceptSecondaryRemovalCommit(Box<AcceptSecondaryRemovalCommit>),
-    RestartReplicaProcess(Box<RestartReplicaProcess>),
-    DropReplicaIncarnation(Box<DropReplicaIncarnation>),
     PublicV1History(Box<PublicV1HistoryCommand>),
     PublicV1Operation(Box<PublicV1OperationCommand>),
 }
@@ -453,16 +433,9 @@ impl ProtocolCommand {
     pub fn effect_class(&self) -> EffectClass {
         match self {
             Self::InitializeAgentStore(_) => EffectClass::ConvergentEnsure,
-            Self::PrepareSwitchover(_)
-            | Self::PrepareSecondaryRemoval(_)
-            | Self::RetireReplica(_)
-            | Self::AcceptSecondaryRemovalCommit(_)
-            | Self::EnsureConfiguration(_)
-            | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
-            Self::RestartReplicaProcess(_)
-            | Self::DropReplicaIncarnation(_)
-            | Self::PublicV1History(_)
-            | Self::PublicV1Operation(_) => EffectClass::ReconfigurationAction,
+            Self::PublicV1History(_) | Self::PublicV1Operation(_) => {
+                EffectClass::ReconfigurationAction
+            }
         }
     }
 }

@@ -21,5 +21,6 @@ pub use public_v1_conformance::{
     ReplacementOwnershipInventory, assert_public_v1_conformance_gate,
     assert_public_v1_conformance_not_applicable, assert_public_v1_conformance_subject,
     execute_public_v1_conformance_subject, public_v1_postgres_conformance_scenarios,
-    replacement_ownership_inventory, validate_replacement_ownership_inventory,
+    replacement_ownership_inventory, replacement_ownership_inventory_with_extra_endpoint_fixture,
+    validate_replacement_ownership_inventory,
 };

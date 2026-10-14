@@ -15,7 +15,7 @@ from pathlib import Path
 KIND_PACKAGE = "kuberic-level-tests"
 KIND_PREFIX = "level_triggered_k8s::"
 DEX_LIVE_BINARY = "kuberic-dex::kubernetes_checkpoint_real"
-EXPECTED_KIND_LIVE_COUNT = 19
+EXPECTED_KIND_LIVE_COUNT = 3
 
 
 @dataclass(frozen=True, order=True)

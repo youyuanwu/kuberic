@@ -1,12 +1,8 @@
 //! Strict validation and conversion between protobuf and canonical protocol types.
 
-use std::collections::BTreeSet;
-
 use crate::protocol::command::{
-    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
-    ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
+    InitializeAgentStore, ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
 };
-use crate::protocol::observation::{AgentObservation, UninitializedAgentObservation};
 use crate::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
@@ -24,11 +20,8 @@ use crate::protocol::types::{
     ProvisioningPurpose, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity, ReplicaStorageIncarnationContext,
     ReplicatorCreationId, ResourceUid, StorageGeneration, SwitchoverHandoff, SwitchoverRequestId,
-    TransitionKind, derive_agent_generation,
 };
-use crate::protocol::validation::{
-    validate_configuration, validate_scale_up_provisioning, validate_transition_relationship,
-};
+use crate::protocol::validation::validate_configuration;
 use thiserror::Error;
 
 use crate::control::proto;
@@ -163,60 +156,6 @@ fn public_v1_operation_command_from_proto(
     Ok(command)
 }
 
-pub fn configuration_command_to_proto(
-    command: EnsureConfiguration,
-) -> proto::EnsureConfigurationCommand {
-    let transition_kind = match command.transition_kind {
-        TransitionKind::Bootstrap => proto::TransitionKind::Bootstrap,
-        TransitionKind::Replacement => proto::TransitionKind::Replacement,
-        TransitionKind::Failover => proto::TransitionKind::Failover,
-        TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
-        TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
-        TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
-        TransitionKind::DataLossRecovery => proto::TransitionKind::DataLossRecovery,
-    };
-    let primary_write_status = match command.primary_write_status {
-        AccessStatus::Granted => proto::AccessStatus::Granted,
-        AccessStatus::ReconfigurationPending => proto::AccessStatus::ReconfigurationPending,
-        AccessStatus::NotPrimary => proto::AccessStatus::NotPrimary,
-        AccessStatus::NoWriteQuorum => proto::AccessStatus::NoWriteQuorum,
-    };
-    proto::EnsureConfigurationCommand {
-        previous_policy: command.previous_policy.map(Into::into),
-        secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
-        scale_up_evidence: command.scale_up_evidence.map(|evidence| (*evidence).into()),
-        operation_id: command.operation_id.to_string(),
-        previous_configuration: command.previous_configuration.map(Into::into),
-        current_configuration: Some(command.current_configuration.into()),
-        previous_epoch: command.previous_epoch.map(Into::into),
-        current_epoch: Some(command.current_epoch.into()),
-        effective_policy: Some(command.effective_policy.into()),
-        local_replica_id: command.local_replica_id.value(),
-        expected_instance_id: command.expected_instance_id.to_string(),
-        expected_agent_generation: command.expected_agent_generation.to_string(),
-        transition_kind: transition_kind as i32,
-        grant_write: command.primary_write_status == AccessStatus::Granted,
-        current_only: command.current_only,
-        retire_build_id: command
-            .retire_build_ids
-            .first()
-            .map_or_else(String::new, ToString::to_string),
-        primary_write_status: primary_write_status as i32,
-        retire_build_ids: command
-            .retire_build_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        failover_safe_lsn: command.failover_safe_lsn,
-        switchover_handoff: command.switchover_handoff.map(Into::into),
-        retire_switchover_preparation_ids: command
-            .retire_switchover_preparation_ids
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-    }
-}
-
 /// Requires an exact protocol-version match; negotiation is intentionally unsupported.
 pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
     if observed == crate::protocol::PROTOCOL_VERSION {
@@ -227,11 +166,6 @@ pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
             observed,
         })
     }
-}
-
-/// Validates an agent report without retaining its canonical representation.
-pub fn validate_agent_status_report(report: &proto::AgentStatusReport) -> Result<(), WireError> {
-    normalize_agent_status_report(report.clone()).map(|_| ())
 }
 
 /// Normalizes the production Public V1 report branch.
@@ -1325,398 +1259,9 @@ fn public_v1_completion_to_proto(
     }
 }
 
-/// Converts a fully validated wire report into canonical observation evidence.
-pub fn normalize_agent_status_report(
-    report: proto::AgentStatusReport,
-) -> Result<AgentObservation, WireError> {
-    ensure_supported_version(report.protocol_version)?;
-    if report.resource_uid.is_empty() {
-        return Err(WireError::MissingField("agent_status.resource_uid"));
-    }
-    if report.process_session_id.is_empty() {
-        return Err(WireError::MissingField("agent_status.process_session_id"));
-    }
-    let storage_state = proto::AgentStorageState::try_from(report.storage_state).map_err(|_| {
-        WireError::InvalidEnum {
-            field: "agent_status.storage_state",
-            value: report.storage_state,
-        }
-    })?;
-    match storage_state {
-        proto::AgentStorageState::Uninitialized => {
-            if report.public_v1.is_some()
-                || report.replica_id <= 0
-                || report.pod_uid.is_empty()
-                || report.pvc_uid.is_empty()
-            {
-                return Err(WireError::InvalidAuthority(
-                    "uninitialized status contains invalid replacement authority".into(),
-                ));
-            }
-            Ok(AgentObservation::Uninitialized(
-                UninitializedAgentObservation {
-                    protocol_version: report.protocol_version,
-                    resource_uid: ResourceUid::new(report.resource_uid),
-                    replica_id: ReplicaId::new(report.replica_id),
-                    pod_uid: PodUid::new(report.pod_uid),
-                    pvc_uid: PvcUid::new(report.pvc_uid),
-                    process_session_id: ProcessSessionId::new(report.process_session_id),
-                    report_sequence: 0,
-                },
-            ))
-        }
-        proto::AgentStorageState::Initialized => Err(WireError::InvalidAuthority(
-            "initialized status must use Public V1 normalization".into(),
-        )),
-        proto::AgentStorageState::Unsafe => Ok(AgentObservation::Invalid {
-            message: report.storage_error,
-            uninitialized_report: None,
-        }),
-        proto::AgentStorageState::Unknown => Err(WireError::InvalidEnum {
-            field: "agent_status.storage_state",
-            value: report.storage_state,
-        }),
-    }
-}
-
-#[cfg(any())]
-pub fn normalize_agent_status_report(
-    report: proto::AgentStatusReport,
-) -> Result<AgentObservation, WireError> {
-    ensure_supported_version(report.protocol_version)?;
-    if report.public_v1.is_some() {
-        return Err(WireError::InvalidAuthority(
-            "legacy status cannot carry a public-v1 report branch".into(),
-        ));
-    }
-    if report.resource_uid.is_empty() {
-        return Err(WireError::MissingField("agent_status.resource_uid"));
-    }
-    if report.replication_address.len() > 512
-        || report.replication_address.chars().any(char::is_control)
-    {
-        return Err(WireError::InvalidAuthority(
-            "replicator address exceeds its bound".into(),
-        ));
-    }
-    if report.process_session_id.is_empty() {
-        return Err(WireError::MissingField("agent_status.process_session_id"));
-    }
-    let storage_state = proto::AgentStorageState::try_from(report.storage_state).map_err(|_| {
-        WireError::InvalidEnum {
-            field: "agent_status.storage_state",
-            value: report.storage_state,
-        }
-    })?;
-    match storage_state {
-        proto::AgentStorageState::Unknown => Err(WireError::InvalidEnum {
-            field: "agent_status.storage_state",
-            value: report.storage_state,
-        }),
-        proto::AgentStorageState::Uninitialized => {
-            if report.replica_id <= 0 {
-                return Err(WireError::InvalidAuthority(
-                    "uninitialized replica ID must be positive".to_string(),
-                ));
-            }
-            if report.pod_uid.is_empty() {
-                return Err(WireError::MissingField("agent_status.pod_uid"));
-            }
-            if report.pvc_uid.is_empty() {
-                return Err(WireError::MissingField("agent_status.pvc_uid"));
-            }
-            if report.identity.is_some() {
-                return Err(WireError::InvalidAuthority(
-                    "uninitialized agent status must not claim durable identity".to_string(),
-                ));
-            }
-            if report.epoch.is_some()
-                || report.previous_configuration.is_some()
-                || report.current_configuration.is_some()
-                || report.role != proto::ReplicaRole::Unknown as i32
-                || report.read_status != proto::AccessStatus::Unknown as i32
-                || report.write_status != proto::AccessStatus::Unknown as i32
-                || report.current_progress != 0
-                || report.verified_replication_lsn.is_some()
-                || report.committed_lsn != 0
-                || report.catch_up_capability.is_some()
-                || report.current_configuration_quorum_progress != 0
-                || report.catch_up_boundary.is_some()
-                || report.catch_up_complete
-                || report.deactivated_lsn.is_some()
-                || report.deactivation_epoch.is_some()
-                || !report.load_metrics.is_empty()
-                || report.reported_fault != proto::FaultType::Unknown as i32
-                || !report.pending_operation_id.is_empty()
-                || !report.retained_operation_id.is_empty()
-                || !report.builds.is_empty()
-                || report.prepared_switchover.is_some()
-                || report.prepared_secondary_removal.is_some()
-                || report.secondary_removal_evidence.is_some()
-                || report.retired_replica.is_some()
-                || report.accepted_secondary_removal.is_some()
-                || report.scale_up_intent.is_some()
-                || report.pending_configuration.is_some()
-                || !report.replication_address.is_empty()
-            {
-                return Err(WireError::InvalidAuthority(
-                    "uninitialized status contains durable authority".to_string(),
-                ));
-            }
-            Ok(AgentObservation::Uninitialized(
-                UninitializedAgentObservation {
-                    protocol_version: report.protocol_version,
-                    resource_uid: ResourceUid::new(report.resource_uid),
-                    replica_id: ReplicaId::new(report.replica_id),
-                    pod_uid: PodUid::new(report.pod_uid),
-                    pvc_uid: PvcUid::new(report.pvc_uid),
-                    process_session_id: ProcessSessionId::new(report.process_session_id),
-                    report_sequence: report.report_sequence,
-                },
-            ))
-        }
-        proto::AgentStorageState::Initialized => {
-            let identity: ReplicaIdentity = report
-                .identity
-                .clone()
-                .ok_or(WireError::MissingField("agent_status.identity"))?
-                .try_into()?;
-            if report.replica_id != 0 && report.replica_id != identity.replica_id.value() {
-                return Err(WireError::InvalidAuthority(
-                    "status replica ID differs from durable identity".to_string(),
-                ));
-            }
-            let epoch: Epoch = report
-                .epoch
-                .ok_or(WireError::MissingField("agent_status.epoch"))?
-                .into();
-            let role = proto::ReplicaRole::try_from(report.role)
-                .map_err(|_| WireError::InvalidEnum {
-                    field: "agent_status.role",
-                    value: report.role,
-                })
-                .and_then(role_from_proto)?;
-            let write_status = proto::AccessStatus::try_from(report.write_status)
-                .map_err(|_| WireError::InvalidEnum {
-                    field: "agent_status.write_status",
-                    value: report.write_status,
-                })
-                .and_then(access_status_from_proto)?;
-            let read_status = proto::AccessStatus::try_from(report.read_status)
-                .map_err(|_| WireError::InvalidEnum {
-                    field: "agent_status.read_status",
-                    value: report.read_status,
-                })
-                .and_then(access_status_from_proto)?;
-            if report.verified_replication_lsn.is_some_and(|verified| {
-                verified < 0
-                    || verified > report.current_progress
-                    || report.current_configuration.is_none()
-            }) {
-                return Err(WireError::InvalidAuthority(
-                    "verified replication progress is outside reported authority".to_string(),
-                ));
-            }
-            let reported_fault =
-                match proto::FaultType::try_from(report.reported_fault).map_err(|_| {
-                    WireError::InvalidEnum {
-                        field: "agent_status.reported_fault",
-                        value: report.reported_fault,
-                    }
-                })? {
-                    proto::FaultType::Unknown => None,
-                    proto::FaultType::Transient => {
-                        Some(crate::protocol::types::FaultType::Transient)
-                    }
-                    proto::FaultType::Permanent => {
-                        Some(crate::protocol::types::FaultType::Permanent)
-                    }
-                };
-            let mut load_names = BTreeSet::new();
-            let load_metrics = report
-                .load_metrics
-                .into_iter()
-                .map(|metric| {
-                    if metric.name.is_empty()
-                        || metric.value < 0
-                        || !load_names.insert(metric.name.clone())
-                    {
-                        return Err(WireError::InvalidAuthority(
-                            "load metrics require unique nonempty names and nonnegative values"
-                                .into(),
-                        ));
-                    }
-                    Ok(crate::protocol::types::LoadMetric {
-                        name: metric.name,
-                        value: metric.value,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut build_ids = BTreeSet::new();
-            let builds = report
-                .builds
-                .into_iter()
-                .map(|build| {
-                    if build.build_id.is_empty()
-                        || build.replication_boundary_lsn < 0
-                        || build.durable_lsn < 0
-                        || build
-                            .catch_up_boundary_lsn
-                            .is_some_and(|boundary| boundary < 0)
-                        || !build_ids.insert(build.build_id.clone())
-                    {
-                        return Err(WireError::InvalidAuthority(
-                            "build reports require unique IDs and nonnegative progress".into(),
-                        ));
-                    }
-                    Ok(AgentBuildReport {
-                        build_id: OperationId::new(build.build_id),
-                        target: build
-                            .target
-                            .ok_or(WireError::MissingField("build_status.target"))?
-                            .try_into()?,
-                        last_sequence: build.last_sequence,
-                        replication_boundary_lsn: build.replication_boundary_lsn,
-                        durable_lsn: build.durable_lsn,
-                        completed: build.completed,
-                        catch_up_boundary_lsn: build.catch_up_boundary_lsn,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let prepared_switchover = report
-                .prepared_switchover
-                .map(switchover_handoff_from_proto)
-                .transpose()?;
-            if report.deactivated_lsn.is_some() != report.deactivation_epoch.is_some() {
-                return Err(WireError::InvalidAuthority(
-                    "deactivation LSN and epoch must be reported together".into(),
-                ));
-            }
-            let previous_configuration = report
-                .previous_configuration
-                .map(ConfigurationDescriptor::try_from)
-                .transpose()?;
-            let current_configuration = report
-                .current_configuration
-                .map(ConfigurationDescriptor::try_from)
-                .transpose()?;
-            let pending_configuration = report
-                .pending_configuration
-                .map(|command| {
-                    normalize_execute_request(proto::ExecuteCommandRequest {
-                        protocol_version: crate::protocol::PROTOCOL_VERSION,
-                        resource_uid: report.resource_uid.clone(),
-                        target: Some(identity.clone().into()),
-                        expected_process_session_id: report.process_session_id.clone(),
-                        command: Some(
-                            proto::execute_command_request::Command::EnsureConfiguration(Box::new(
-                                command,
-                            )),
-                        ),
-                    })
-                    .and_then(|envelope| match envelope.command {
-                        ProtocolCommand::EnsureConfiguration(command) => Ok(command),
-                        _ => Err(WireError::InvalidAuthority(
-                            "pending configuration decoded as another command".into(),
-                        )),
-                    })
-                })
-                .transpose()?;
-            let report = AgentReport {
-                accepted_secondary_removal: report
-                    .accepted_secondary_removal
-                    .map(TryInto::try_into)
-                    .transpose()?,
-                scale_up_intent: report
-                    .scale_up_intent
-                    .map(TryInto::try_into)
-                    .transpose()?
-                    .map(Box::new),
-                protocol_version: report.protocol_version,
-                resource_uid: ResourceUid::new(report.resource_uid),
-                identity,
-                process_session_id: ProcessSessionId::new(report.process_session_id),
-                report_sequence: report.report_sequence,
-                role,
-                read_status,
-                write_status,
-                healthy: report.healthy,
-                epoch,
-                previous_configuration,
-                current_configuration,
-                current_progress: report.current_progress,
-                verified_replication_lsn: report.verified_replication_lsn,
-                committed_lsn: report.committed_lsn,
-                catch_up_capability: report.catch_up_capability,
-                current_configuration_quorum_progress: report.current_configuration_quorum_progress,
-                catch_up_boundary: report.catch_up_boundary,
-                catch_up_complete: report.catch_up_complete,
-                deactivated_lsn: report.deactivated_lsn,
-                deactivation_epoch: report.deactivation_epoch.map(Into::into),
-                load_metrics,
-                reported_fault,
-                pending_operation_id: (!report.pending_operation_id.is_empty())
-                    .then(|| OperationId::new(report.pending_operation_id)),
-                pending_configuration,
-                retained_operation_id: (!report.retained_operation_id.is_empty())
-                    .then(|| OperationId::new(report.retained_operation_id)),
-                builds,
-                prepared_switchover,
-                prepared_secondary_removal: report
-                    .prepared_secondary_removal
-                    .map(TryInto::try_into)
-                    .transpose()?,
-                secondary_removal_evidence: report
-                    .secondary_removal_evidence
-                    .map(TryInto::try_into)
-                    .transpose()?,
-                retired_replica: report.retired_replica.map(TryInto::try_into).transpose()?,
-                public_lifecycle_report: None,
-                restart_action: None,
-            };
-            crate::protocol::validation::validate_report_internal(&report)
-                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
-            Ok(AgentObservation::Report(Box::new(report)))
-        }
-        proto::AgentStorageState::Unsafe => {
-            if report.storage_error.is_empty() {
-                return Err(WireError::MissingField("agent_status.storage_error"));
-            }
-            if report.identity.is_some()
-                || report.epoch.is_some()
-                || report.previous_configuration.is_some()
-                || report.current_configuration.is_some()
-                || report.role != proto::ReplicaRole::Unknown as i32
-                || report.read_status != proto::AccessStatus::Unknown as i32
-                || report.write_status != proto::AccessStatus::Unknown as i32
-                || !report.builds.is_empty()
-                || report.deactivation_epoch.is_some()
-                || report.prepared_switchover.is_some()
-                || report.prepared_secondary_removal.is_some()
-                || report.secondary_removal_evidence.is_some()
-                || report.retired_replica.is_some()
-                || report.accepted_secondary_removal.is_some()
-                || report.scale_up_intent.is_some()
-            {
-                return Err(WireError::InvalidAuthority(
-                    "unsafe storage report contains untrusted authority".to_string(),
-                ));
-            }
-            Ok(AgentObservation::Invalid {
-                message: report.storage_error,
-                uninitialized_report: None,
-            })
-        }
-    }
-}
-
 /// Validates command fencing, policy, and PC/CC relationships.
 pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Result<(), WireError> {
     ensure_supported_version(request.protocol_version)?;
-    let command = request
-        .command
-        .as_ref()
-        .ok_or(WireError::MissingField("execute.command"))?;
     if request.resource_uid.is_empty() {
         return Err(WireError::MissingField("execute.resource_uid"));
     }
@@ -1725,69 +1270,16 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
             "execute.expected_process_session_id",
         ));
     }
-
-    match command {
-        proto::execute_command_request::Command::PublicV1History(command) => {
-            let command = public_v1_history_command_from_proto(command.clone())?;
-            let target = command.target();
-            let envelope_target: ReplicaIdentity = request
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("execute.target"))?
-                .try_into()?;
-            if target != &envelope_target {
-                return Err(WireError::InvalidAuthority(
-                    "public-v1 history target differs from envelope".into(),
-                ));
-            }
-            if command.resource_uid().as_str() != request.resource_uid {
-                return Err(WireError::InvalidAuthority(
-                    "public-v1 history resource differs from envelope".into(),
-                ));
-            }
-            Ok(())
-        }
-        proto::execute_command_request::Command::PublicV1Operation(command) => {
-            let command = public_v1_operation_command_from_proto(command.clone())?;
-            let envelope_target: ReplicaIdentity = request
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("execute.target"))?
-                .try_into()?;
-            if command.target != envelope_target
-                || command.intent.process_session_id.as_str() != request.expected_process_session_id
-                || command.intent.preview.protocol_version != request.protocol_version
-            {
-                return Err(WireError::InvalidAuthority(
-                    "public-v1 operation differs from its envelope fences".into(),
-                ));
-            }
-            Ok(())
-        }
-        proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(command) => {
-            let command: crate::protocol::command::AcceptSecondaryRemovalCommit =
-                (**command).clone().try_into()?;
-            validate_removal_envelope(
-                request,
-                &command.committed.evidence.preparation.intent.resource_uid,
-                &command.target,
-            )
-        }
-        proto::execute_command_request::Command::PrepareSecondaryRemoval(command) => {
-            let command: crate::protocol::command::PrepareSecondaryRemoval =
-                (**command).clone().try_into()?;
-            validate_removal_envelope(
-                request,
-                &command.intent.resource_uid,
-                &command.intent.primary,
-            )
-        }
-        proto::execute_command_request::Command::RetireReplica(command) => {
-            let command: crate::protocol::command::RetireReplica =
-                (**command).clone().try_into()?;
-            let intent = &command.committed.evidence.preparation.intent;
-            validate_removal_envelope(request, &intent.resource_uid, &intent.target)
-        }
+    let target: ReplicaIdentity = request
+        .target
+        .clone()
+        .ok_or(WireError::MissingField("execute.target"))?
+        .try_into()?;
+    match request
+        .command
+        .as_ref()
+        .ok_or(WireError::MissingField("execute.command"))?
+    {
         proto::execute_command_request::Command::InitializeAgentStore(command) => {
             for (field, value) in [
                 (
@@ -1816,516 +1308,47 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     return Err(WireError::MissingField(field));
                 }
             }
-            if command.resource_uid != request.resource_uid {
-                return Err(WireError::InvalidAuthority(
-                    "initialize resource UID differs from request fence".to_string(),
-                ));
-            }
-            if command.local_replica_id <= 0 {
-                return Err(WireError::InvalidAuthority(
-                    "initialize replica ID must be positive".to_string(),
-                ));
-            }
-            if command.expected_instance_id != command.expected_pod_uid {
-                return Err(WireError::InvalidAuthority(
-                    "initialize instance ID must equal exact Pod UID".to_string(),
-                ));
-            }
-            if derive_agent_generation(&InitializationId::new(command.initialization_id.as_str()))
-                .as_str()
-                != command.assigned_agent_generation
+            if command.resource_uid != request.resource_uid
+                || command.local_replica_id != target.replica_id.value()
+                || command.expected_instance_id != target.instance_id.as_str()
+                || command.assigned_agent_generation != target.agent_generation.as_str()
             {
                 return Err(WireError::InvalidAuthority(
-                    "assigned generation does not match initialization identity".to_string(),
+                    "initialization authority differs from execute envelope".into(),
                 ));
             }
-            let policy = command
-                .effective_policy
-                .as_ref()
-                .ok_or(WireError::MissingField("initialize.effective_policy"))?;
-            validate_policy(policy)?;
-            let bootstrap_configuration =
-                command
-                    .bootstrap_configuration
-                    .clone()
-                    .ok_or(WireError::MissingField(
-                        "initialize.bootstrap_configuration",
-                    ))?;
-            let bootstrap_configuration =
-                ConfigurationDescriptor::try_from(bootstrap_configuration)?;
-            let effective_policy = EffectivePolicy {
-                replica_set_size: policy.replica_set_size,
-                write_quorum: policy.write_quorum,
-                read_quorum: policy.read_quorum,
-                failover_delay_seconds: policy.failover_delay_seconds,
-            };
-            let target: ReplicaIdentity = request
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("execute.target"))?
-                .try_into()?;
-            let provisioning = command
-                .provisioning
-                .clone()
-                .map(provisioning_from_proto)
-                .transpose()?;
-            if let Some(provisioning) = provisioning {
-                let resource_uid = ResourceUid::new(&request.resource_uid);
-                if provisioning.target_identity(&resource_uid) != target {
-                    return Err(WireError::InvalidAuthority(
-                        "initialize target differs from exact provisioning".to_string(),
-                    ));
-                }
-                if let Some(scale_up) = provisioning.scale_up() {
-                    validate_scale_up_provisioning(&provisioning)
-                        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
-                    if bootstrap_configuration != scale_up.previous_configuration
-                        || effective_policy != scale_up.current_policy
-                    {
-                        return Err(WireError::InvalidAuthority(
-                            "initialize authority differs from frozen scale-up provisioning"
-                                .to_string(),
-                        ));
-                    }
-                } else {
-                    validate_transition_relationship(
-                        TransitionKind::Bootstrap,
-                        None,
-                        &bootstrap_configuration,
-                        &effective_policy,
-                    )
-                    .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
-                }
-            } else if !bootstrap_configuration
-                .members
-                .iter()
-                .any(|member| member.identity == target)
-            {
-                validate_transition_relationship(
-                    TransitionKind::Bootstrap,
-                    None,
-                    &bootstrap_configuration,
-                    &effective_policy,
-                )
-                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
-                return Err(WireError::InvalidAuthority(
-                    "initialize target is not an exact genesis member".to_string(),
-                ));
+            if let Some(policy) = command.effective_policy.as_ref() {
+                validate_policy(policy)?;
             } else {
-                validate_transition_relationship(
-                    TransitionKind::Bootstrap,
-                    None,
-                    &bootstrap_configuration,
-                    &effective_policy,
-                )
-                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+                return Err(WireError::MissingField("initialize.effective_policy"));
             }
-            Ok(())
-        }
-        proto::execute_command_request::Command::EnsureConfiguration(command) => {
-            let target: ReplicaIdentity = request
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("execute.target"))?
-                .try_into()?;
-            if command.operation_id.is_empty() {
-                return Err(WireError::MissingField("ensure_configuration.operation_id"));
-            }
-            let current = command
-                .current_configuration
-                .clone()
-                .ok_or(WireError::MissingField(
-                    "ensure_configuration.current_configuration",
-                ))?;
-            let current = ConfigurationDescriptor::try_from(current)?;
-            let current_epoch: Epoch = command
-                .current_epoch
-                .ok_or(WireError::MissingField(
-                    "ensure_configuration.current_epoch",
-                ))?
-                .into();
-            let policy = command
-                .effective_policy
-                .as_ref()
-                .ok_or(WireError::MissingField(
-                    "ensure_configuration.effective_policy",
-                ))?;
-            validate_policy(policy)?;
-            let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
-                .map_err(|_| WireError::InvalidEnum {
-                    field: "ensure_configuration.transition_kind",
-                    value: command.transition_kind,
-                })
-                .and_then(transition_kind_from_proto)?;
-            if command.expected_instance_id.is_empty() {
+            if command.bootstrap_configuration.is_none() {
                 return Err(WireError::MissingField(
-                    "ensure_configuration.expected_instance_id",
-                ));
-            }
-            if command.expected_agent_generation.is_empty() {
-                return Err(WireError::MissingField(
-                    "ensure_configuration.expected_agent_generation",
-                ));
-            }
-            if target.replica_id != ReplicaId::new(command.local_replica_id)
-                || target.instance_id.as_str() != command.expected_instance_id
-                || target.agent_generation.as_str() != command.expected_agent_generation
-            {
-                return Err(WireError::InvalidAuthority(
-                    "ensure target differs from command fence".to_string(),
-                ));
-            }
-            if current.epoch != current_epoch {
-                return Err(WireError::InvalidAuthority(
-                    "ensure current epoch differs from Current Configuration".to_string(),
-                ));
-            }
-            if current.members.len() as u32 != policy.replica_set_size
-                || current.write_quorum != policy.write_quorum
-            {
-                return Err(WireError::InvalidAuthority(
-                    "ensure policy differs from Current Configuration".to_string(),
-                ));
-            }
-            let previous = if let Some(previous) = command.previous_configuration.clone() {
-                let previous = ConfigurationDescriptor::try_from(previous)?;
-                let previous_epoch: Epoch = command
-                    .previous_epoch
-                    .ok_or(WireError::MissingField(
-                        "ensure_configuration.previous_epoch",
-                    ))?
-                    .into();
-                if previous.epoch != previous_epoch {
-                    return Err(WireError::InvalidAuthority(
-                        "ensure previous epoch differs from Previous Configuration".to_string(),
-                    ));
-                }
-                Some(previous)
-            } else if command.previous_epoch.is_some() {
-                return Err(WireError::InvalidAuthority(
-                    "ensure previous epoch exists without Previous Configuration".to_string(),
-                ));
-            } else {
-                None
-            };
-            if !current
-                .members
-                .iter()
-                .any(|member| member.identity == target)
-                && !previous.as_ref().is_some_and(|configuration| {
-                    configuration
-                        .members
-                        .iter()
-                        .any(|member| member.identity == target)
-                })
-            {
-                return Err(WireError::InvalidAuthority(
-                    "ensure target is outside Previous and Current Configuration".to_string(),
-                ));
-            }
-            let restoration = transition_kind == TransitionKind::PlannedSwitchover
-                && !command.current_only
-                && previous.is_none()
-                && command.primary_write_status
-                    == proto::AccessStatus::ReconfigurationPending as i32
-                && command.failover_safe_lsn.is_none()
-                && command.retire_build_ids.is_empty()
-                && command.retire_build_id.is_empty()
-                && current.primary_id == target.replica_id
-                && command.retire_switchover_preparation_ids.len() == 1
-                && !command.retire_switchover_preparation_ids[0]
-                    .operation_id
-                    .is_empty()
-                && command.retire_switchover_preparation_ids[0].generation > 0
-                && command
-                    .switchover_handoff
-                    .clone()
-                    .map(switchover_handoff_from_proto)
-                    .transpose()?
-                    .is_none_or(|handoff| {
-                        current_epoch == handoff.starting_epoch
-                            && current.configuration_id == handoff.starting_configuration_id
-                            && current.primary_id == handoff.source.replica_id
-                            && target == handoff.source
-                            && current
-                                .members
-                                .iter()
-                                .any(|member| member.identity == handoff.target)
-                            && command.retire_switchover_preparation_ids
-                                == [handoff.preparation().into()]
-                    });
-            if transition_kind == TransitionKind::SecondaryScaleDown {
-                let normalized =
-                    crate::control::scale_down::configuration_from_proto((**command).clone())?;
-                let intent = &normalized
-                    .secondary_removal_evidence
-                    .as_ref()
-                    .expect("validated evidence")
-                    .preparation
-                    .intent;
-                return validate_removal_envelope(request, &intent.resource_uid, &target);
-            }
-            if transition_kind == TransitionKind::ScaleUp || command.scale_up_evidence.is_some() {
-                let normalized =
-                    crate::control::scale_up::configuration_from_proto((**command).clone())?;
-                let intent = normalized
-                    .scale_up_evidence
-                    .as_ref()
-                    .expect("validated evidence")
-                    .intent();
-                return validate_removal_envelope(request, &intent.resource_uid, &target);
-            }
-            if command.secondary_removal_evidence.is_some()
-                || command.scale_up_evidence.is_some()
-                || command
-                    .previous_policy
-                    .as_ref()
-                    .is_some_and(|previous| previous != policy)
-            {
-                return Err(WireError::InvalidAuthority(
-                    "unexpected removal evidence or previous policy".into(),
-                ));
-            }
-            if command.current_only {
-                if previous.is_some() || transition_kind == TransitionKind::Bootstrap {
-                    return Err(WireError::InvalidAuthority(
-                        "current-only completion must omit PC for a non-bootstrap transition"
-                            .to_string(),
-                    ));
-                }
-                if transition_kind == TransitionKind::Replacement
-                    && command.retire_build_id.is_empty()
-                    && command.retire_build_ids.is_empty()
-                {
-                    return Err(WireError::InvalidAuthority(
-                        "replacement current-only completion must retire its build".to_string(),
-                    ));
-                }
-            } else if !restoration {
-                if !command.retire_build_id.is_empty() || !command.retire_build_ids.is_empty() {
-                    return Err(WireError::InvalidAuthority(
-                        "build retirement requires current-only completion".to_string(),
-                    ));
-                }
-                validate_transition_relationship(
-                    transition_kind,
-                    previous.as_ref(),
-                    &current,
-                    &EffectivePolicy {
-                        replica_set_size: policy.replica_set_size,
-                        write_quorum: policy.write_quorum,
-                        read_quorum: policy.read_quorum,
-                        failover_delay_seconds: policy.failover_delay_seconds,
-                    },
-                )
-                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
-            }
-            if transition_kind == TransitionKind::PlannedSwitchover && !restoration {
-                let handoff = command
-                    .switchover_handoff
-                    .clone()
-                    .ok_or(WireError::MissingField(
-                        "ensure_configuration.switchover_handoff",
-                    ))
-                    .and_then(switchover_handoff_from_proto)?;
-                let current_contains_handoff_members = current
-                    .members
-                    .iter()
-                    .any(|member| member.identity == handoff.source)
-                    && current
-                        .members
-                        .iter()
-                        .any(|member| member.identity == handoff.target);
-                let previous_matches_handoff = previous.as_ref().is_none_or(|configuration| {
-                    let source_is_primary = configuration.members.iter().any(|member| {
-                        member.identity == handoff.source && member.role == ReplicaRole::Primary
-                    });
-                    let target_is_primary = configuration.members.iter().any(|member| {
-                        member.identity == handoff.target && member.role == ReplicaRole::Primary
-                    });
-                    let exact_members_present = configuration
-                        .members
-                        .iter()
-                        .any(|member| member.identity == handoff.source)
-                        && configuration
-                            .members
-                            .iter()
-                            .any(|member| member.identity == handoff.target);
-                    exact_members_present
-                        && if source_is_primary {
-                            configuration.configuration_id == handoff.starting_configuration_id
-                                && configuration.epoch == handoff.starting_epoch
-                        } else {
-                            target_is_primary
-                                && current.primary_id == handoff.source.replica_id
-                                && configuration.epoch.data_loss_number
-                                    == handoff.starting_epoch.data_loss_number
-                                && configuration.epoch.configuration_number
-                                    > handoff.starting_epoch.configuration_number
-                        }
-                });
-                let retirement_ids = command
-                    .retire_switchover_preparation_ids
-                    .iter()
-                    .map(|id| (&id.operation_id, id.generation))
-                    .collect::<BTreeSet<_>>();
-                if !current_contains_handoff_members
-                    || !previous_matches_handoff
-                    || retirement_ids.len() != command.retire_switchover_preparation_ids.len()
-                    || command
-                        .retire_switchover_preparation_ids
-                        .iter()
-                        .any(|id| id.operation_id.is_empty() || id.generation == 0)
-                    || (command.current_only
-                        && target == handoff.source
-                        && (command.retire_switchover_preparation_ids.len() != 1
-                            || command.retire_switchover_preparation_ids[0]
-                                != handoff.preparation().into()))
-                    || (command.current_only
-                        && target != handoff.source
-                        && !command.retire_switchover_preparation_ids.is_empty())
-                    || (!command.current_only
-                        && !restoration
-                        && !command.retire_switchover_preparation_ids.is_empty())
-                {
-                    return Err(WireError::InvalidAuthority(
-                        "planned switchover handoff or retirement differs from authority"
-                            .to_string(),
-                    ));
-                }
-            } else if transition_kind != TransitionKind::PlannedSwitchover
-                && (command.switchover_handoff.is_some()
-                    || !command.retire_switchover_preparation_ids.is_empty())
-            {
-                return Err(WireError::InvalidAuthority(
-                    "non-switchover configuration contains switchover evidence".to_string(),
+                    "initialize.bootstrap_configuration",
                 ));
             }
             Ok(())
         }
-        proto::execute_command_request::Command::PrepareSwitchover(command) => {
-            let envelope_target: ReplicaIdentity = request
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("execute.target"))?
-                .try_into()?;
-            for (field, value) in [
-                (
-                    "prepare_switchover.operation_id",
-                    command.operation_id.as_str(),
-                ),
-                ("prepare_switchover.request_id", command.request_id.as_str()),
-                (
-                    "prepare_switchover.expected_instance_id",
-                    command.expected_instance_id.as_str(),
-                ),
-                (
-                    "prepare_switchover.expected_agent_generation",
-                    command.expected_agent_generation.as_str(),
-                ),
-            ] {
-                if value.is_empty() {
-                    return Err(WireError::MissingField(field));
-                }
-            }
-            if command.preparation_generation == 0 {
-                return Err(WireError::InvalidAuthority(
-                    "preparation generation must be positive".into(),
-                ));
-            }
-            let source: ReplicaIdentity = command
-                .source
-                .clone()
-                .ok_or(WireError::MissingField("prepare_switchover.source"))?
-                .try_into()?;
-            let target: ReplicaIdentity = command
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("prepare_switchover.target"))?
-                .try_into()?;
-            let current: ConfigurationDescriptor = command
-                .current_configuration
-                .clone()
-                .ok_or(WireError::MissingField(
-                    "prepare_switchover.current_configuration",
-                ))?
-                .try_into()?;
-            let current_primary = current
-                .members
-                .iter()
-                .find(|member| member.identity.replica_id == current.primary_id)
-                .expect("validated configuration has one primary");
-            if source != envelope_target
-                || source.replica_id != ReplicaId::new(command.local_replica_id)
-                || source.instance_id.as_str() != command.expected_instance_id
-                || source.agent_generation.as_str() != command.expected_agent_generation
-                || source != current_primary.identity
-                || target.replica_id == current.primary_id
-                || !current
-                    .members
-                    .iter()
-                    .any(|member| member.identity == target)
+        proto::execute_command_request::Command::PublicV1History(command) => {
+            let command = public_v1_history_command_from_proto(command.clone())?;
+            if command.target() != &target
+                || command.resource_uid().as_str() != request.resource_uid
             {
                 return Err(WireError::InvalidAuthority(
-                    "planned switchover preparation differs from current authority".to_string(),
+                    "public-v1 history differs from execute envelope".into(),
                 ));
             }
             Ok(())
         }
-        proto::execute_command_request::Command::EnsureReplicaBuild(command) => {
-            let target: ReplicaIdentity = request
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("execute.target"))?
-                .try_into()?;
-            if command.operation_id.is_empty()
-                || command.expected_instance_id.is_empty()
-                || command.expected_agent_generation.is_empty()
-            {
-                return Err(WireError::MissingField("ensure_build.fence"));
-            }
-            if command.retire
-                && (command.authority.is_some() || !command.source_session_id.is_empty())
+        proto::execute_command_request::Command::PublicV1Operation(command) => {
+            let command = public_v1_operation_command_from_proto(command.clone())?;
+            if command.target != target
+                || command.intent.process_session_id.as_str() != request.expected_process_session_id
+                || command.intent.preview.protocol_version != request.protocol_version
             {
                 return Err(WireError::InvalidAuthority(
-                    "build retirement cannot carry delivery authority".to_string(),
+                    "public-v1 operation differs from execute envelope".into(),
                 ));
-            }
-            if target.replica_id != ReplicaId::new(command.local_replica_id)
-                || target.instance_id.as_str() != command.expected_instance_id
-                || target.agent_generation.as_str() != command.expected_agent_generation
-            {
-                return Err(WireError::InvalidAuthority(
-                    "build command target differs from command fence".to_string(),
-                ));
-            }
-            let build_target: ReplicaIdentity = command
-                .target
-                .clone()
-                .ok_or(WireError::MissingField("ensure_build.target"))?
-                .try_into()?;
-            if let Some(authority) = command.authority.clone() {
-                let authority = build_authority_from_proto(authority)?;
-                if authority.build_id.as_str() != command.operation_id
-                    || authority.target != build_target
-                    || authority.target != target
-                    || command.source_session_id.is_empty()
-                {
-                    return Err(WireError::InvalidAuthority(
-                        "target build command differs from durable build authority".to_string(),
-                    ));
-                }
-            } else {
-                if build_target == target {
-                    return Err(WireError::InvalidAuthority(
-                        "source build command must target another exact replica".to_string(),
-                    ));
-                }
-                if !command.source_session_id.is_empty() {
-                    return Err(WireError::InvalidAuthority(
-                        "source build command cannot carry a peer session".to_string(),
-                    ));
-                }
             }
             Ok(())
         }
@@ -2356,15 +1379,6 @@ pub fn normalize_execute_request(
                 command,
             )?))
         }
-        proto::execute_command_request::Command::PrepareSecondaryRemoval(command) => {
-            ProtocolCommand::PrepareSecondaryRemoval(Box::new((*command).try_into()?))
-        }
-        proto::execute_command_request::Command::RetireReplica(command) => {
-            ProtocolCommand::RetireReplica(Box::new((*command).try_into()?))
-        }
-        proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(command) => {
-            ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new((*command).try_into()?))
-        }
         proto::execute_command_request::Command::InitializeAgentStore(command) => {
             ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {
                 initialization_id: InitializationId::new(command.initialization_id),
@@ -2389,142 +1403,6 @@ pub fn normalize_execute_request(
                     .provisioning
                     .map(provisioning_from_proto)
                     .transpose()?,
-            }))
-        }
-        proto::execute_command_request::Command::EnsureConfiguration(command) => {
-            let command = *command;
-            if command.transition_kind == proto::TransitionKind::SecondaryScaleDown as i32 {
-                ProtocolCommand::EnsureConfiguration(Box::new(
-                    crate::control::scale_down::configuration_from_proto(command)?,
-                ))
-            } else if command.transition_kind == proto::TransitionKind::ScaleUp as i32
-                || command.scale_up_evidence.is_some()
-            {
-                ProtocolCommand::EnsureConfiguration(Box::new(
-                    crate::control::scale_up::configuration_from_proto(command)?,
-                ))
-            } else {
-                let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
-                    .map_err(|_| WireError::InvalidEnum {
-                        field: "ensure.transition_kind",
-                        value: command.transition_kind,
-                    })
-                    .and_then(transition_kind_from_proto)?;
-                ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
-                    operation_id: OperationId::new(command.operation_id),
-                    previous_configuration: command
-                        .previous_configuration
-                        .map(ConfigurationDescriptor::try_from)
-                        .transpose()?,
-                    current_configuration: command
-                        .current_configuration
-                        .ok_or(WireError::MissingField("ensure.current_configuration"))?
-                        .try_into()?,
-                    previous_epoch: command.previous_epoch.map(Into::into),
-                    current_epoch: command
-                        .current_epoch
-                        .ok_or(WireError::MissingField("ensure.current_epoch"))?
-                        .into(),
-                    effective_policy: policy_from_proto(
-                        command
-                            .effective_policy
-                            .ok_or(WireError::MissingField("ensure.effective_policy"))?,
-                    )?,
-                    previous_policy: command.previous_policy.map(policy_from_proto).transpose()?,
-                    secondary_removal_evidence: None,
-                    scale_up_evidence: None,
-                    local_replica_id: ReplicaId::new(command.local_replica_id),
-                    expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
-                    expected_agent_generation: AgentGeneration::new(
-                        command.expected_agent_generation,
-                    ),
-                    transition_kind,
-                    failover_safe_lsn: command.failover_safe_lsn,
-                    primary_write_status: if command.primary_write_status
-                        == proto::AccessStatus::Unknown as i32
-                    {
-                        if command.grant_write {
-                            AccessStatus::Granted
-                        } else {
-                            AccessStatus::ReconfigurationPending
-                        }
-                    } else {
-                        proto::AccessStatus::try_from(command.primary_write_status)
-                            .map_err(|_| WireError::InvalidEnum {
-                                field: "ensure.primary_write_status",
-                                value: command.primary_write_status,
-                            })
-                            .and_then(access_status_from_proto)?
-                    },
-                    current_only: command.current_only,
-                    retire_build_ids: if command.retire_build_ids.is_empty() {
-                        (!command.retire_build_id.is_empty())
-                            .then(|| OperationId::new(command.retire_build_id))
-                            .into_iter()
-                            .collect()
-                    } else {
-                        command
-                            .retire_build_ids
-                            .into_iter()
-                            .map(OperationId::new)
-                            .collect()
-                    },
-                    switchover_handoff: command
-                        .switchover_handoff
-                        .map(switchover_handoff_from_proto)
-                        .transpose()?,
-                    retire_switchover_preparation_ids: command
-                        .retire_switchover_preparation_ids
-                        .into_iter()
-                        .map(|id| crate::protocol::types::SwitchoverPreparationId {
-                            operation_id: OperationId::new(id.operation_id),
-                            generation: id.generation,
-                        })
-                        .collect(),
-                }))
-            }
-        }
-        proto::execute_command_request::Command::PrepareSwitchover(command) => {
-            ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
-                preparation_generation: command.preparation_generation,
-                operation_id: OperationId::new(command.operation_id),
-                request_id: SwitchoverRequestId::new(command.request_id),
-                local_replica_id: ReplicaId::new(command.local_replica_id),
-                expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
-                expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
-                source: command
-                    .source
-                    .ok_or(WireError::MissingField("prepare_switchover.source"))?
-                    .try_into()?,
-                target: command
-                    .target
-                    .ok_or(WireError::MissingField("prepare_switchover.target"))?
-                    .try_into()?,
-                current_configuration: command
-                    .current_configuration
-                    .ok_or(WireError::MissingField(
-                        "prepare_switchover.current_configuration",
-                    ))?
-                    .try_into()?,
-            }))
-        }
-        proto::execute_command_request::Command::EnsureReplicaBuild(command) => {
-            ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
-                operation_id: OperationId::new(command.operation_id),
-                local_replica_id: ReplicaId::new(command.local_replica_id),
-                expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
-                expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
-                target: command
-                    .target
-                    .ok_or(WireError::MissingField("ensure_build.target"))?
-                    .try_into()?,
-                authority: command
-                    .authority
-                    .map(build_authority_from_proto)
-                    .transpose()?,
-                source_session_id: (!command.source_session_id.is_empty())
-                    .then(|| ProcessSessionId::new(command.source_session_id)),
-                retire: command.retire,
             }))
         }
     };
@@ -3093,22 +1971,6 @@ pub(crate) fn role_from_proto(role: proto::ReplicaRole) -> Result<ReplicaRole, W
     }
 }
 
-fn transition_kind_from_proto(kind: proto::TransitionKind) -> Result<TransitionKind, WireError> {
-    match kind {
-        proto::TransitionKind::Unknown => Err(WireError::InvalidEnum {
-            field: "ensure_configuration.transition_kind",
-            value: kind as i32,
-        }),
-        proto::TransitionKind::Bootstrap => Ok(TransitionKind::Bootstrap),
-        proto::TransitionKind::Replacement => Ok(TransitionKind::Replacement),
-        proto::TransitionKind::Failover => Ok(TransitionKind::Failover),
-        proto::TransitionKind::PlannedSwitchover => Ok(TransitionKind::PlannedSwitchover),
-        proto::TransitionKind::SecondaryScaleDown => Ok(TransitionKind::SecondaryScaleDown),
-        proto::TransitionKind::ScaleUp => Ok(TransitionKind::ScaleUp),
-        proto::TransitionKind::DataLossRecovery => Ok(TransitionKind::DataLossRecovery),
-    }
-}
-
 pub(crate) fn access_status_from_proto(
     status: proto::AccessStatus,
 ) -> Result<AccessStatus, WireError> {
@@ -3147,22 +2009,4 @@ pub(crate) fn policy_from_proto(
         read_quorum: policy.read_quorum,
         failover_delay_seconds: policy.failover_delay_seconds,
     })
-}
-
-fn validate_removal_envelope(
-    request: &proto::ExecuteCommandRequest,
-    resource_uid: &ResourceUid,
-    target: &ReplicaIdentity,
-) -> Result<(), WireError> {
-    let envelope_target: ReplicaIdentity = request
-        .target
-        .clone()
-        .ok_or(WireError::MissingField("execute.target"))?
-        .try_into()?;
-    if resource_uid.as_str() != request.resource_uid || target != &envelope_target {
-        return Err(WireError::InvalidAuthority(
-            "removal authority differs from envelope".into(),
-        ));
-    }
-    Ok(())
 }

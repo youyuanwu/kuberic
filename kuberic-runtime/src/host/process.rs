@@ -9,15 +9,13 @@ use std::time::Duration;
 use crate::StatefulServiceReplica;
 use crate::protocol::public_operations::PreviewLifecycleBinding;
 use crate::protocol::public_operations::{PublicOperationPreviewIdentity, StatePersistence};
-use crate::protocol::types::{
-    FaultType, PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid,
-};
+use crate::protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid};
 use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::host::Result;
 use crate::host::hosting::PodRuntime;
-use crate::host::provisioning::{ObservedStorageIdentity, validate_established_identity};
+use crate::host::provisioning::ObservedStorageIdentity;
 use crate::host::service::{AgentService, InitializationService, SHUTDOWN_TIMEOUT};
 use crate::host::sqlite_store::SqliteStore;
 use crate::host::store::AgentStore;
@@ -84,11 +82,11 @@ pub struct ReplicaHandle {
     runtime: Arc<PodRuntime>,
     store: Arc<SqliteStore>,
     process_session: Arc<str>,
-    preview: Option<PreviewProcessHandle>,
+    replacement: Option<ReplacementProcessHandle>,
 }
 
 #[derive(Clone)]
-struct PreviewProcessHandle {
+struct ReplacementProcessHandle {
     binding: PreviewLifecycleBinding,
     registry: Arc<crate::host::operation::PartitionOperationRegistry>,
     report_sequence: Arc<std::sync::atomic::AtomicU64>,
@@ -156,14 +154,14 @@ impl ReplicaHandle {
         history: &crate::protocol::types::HistoryContext,
         storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
     ) -> Result<()> {
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
         if !preview.binding.preview.is_public_v1() {
             return Err(crate::host::HostError::IdentityMismatch(
-                "stateless preview requires Public V1".into(),
+                "replacement runtime requires Public V1".into(),
             ));
         }
         self.store
@@ -176,20 +174,20 @@ impl ReplicaHandle {
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
         if !preview.binding.preview.is_public_v1()
             || authority.attempt.target != self.store.load_state().await?.identity.local_identity
         {
             return Err(crate::host::HostError::IdentityMismatch(
-                "inbound build authority differs from selected preview target".into(),
+                "inbound build authority differs from the replacement target".into(),
             ));
         }
         self.runtime
-            .install_stateless_preview_inbound_build_authority(authority)
+            .install_replacement_inbound_build_authority(authority)
             .await
             .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
     }
@@ -201,16 +199,16 @@ impl ReplicaHandle {
     ) -> Result<()> {
         use crate::host::state::{PublicOperationDisposition, PublicOperationStage};
 
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
         if intent.preview != preview.binding.preview
             || intent.process_session_id.as_str() != self.process_session.as_ref()
         {
             return Err(crate::host::HostError::IdentityMismatch(
-                "public operation differs from the selected preview process".into(),
+                "public operation differs from the replacement process".into(),
             ));
         }
         let terminal_program = matches!(
@@ -231,7 +229,7 @@ impl ReplicaHandle {
                     | crate::protocol::public_operations::PublicOperationProgram::Build(_)
             )
         ) {
-            self.runtime.fence_stateless_preview_access().await;
+            self.runtime.fence_replacement_access().await;
         }
         let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
         if matches!(
@@ -267,7 +265,7 @@ impl ReplicaHandle {
             )));
         }
         if open_program {
-            self.runtime.complete_stateless_preview_open().await;
+            self.runtime.complete_replacement_open().await;
             let state = self.store.load_state().await?;
             if state
                 .application_storage
@@ -279,7 +277,7 @@ impl ReplicaHandle {
         }
         if !terminal_program {
             self.runtime
-                .refresh_stateless_preview_projection(
+                .refresh_replacement_projection(
                     self.store.as_ref(),
                     &crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref()),
                     true,
@@ -296,7 +294,7 @@ impl ReplicaHandle {
     ) -> Result<()> {
         let crate::protocol::command::ProtocolCommand::PublicV1Operation(command) = command else {
             return Err(crate::host::HostError::CommandRejected(
-                "stateless preview operation dispatcher received another command".into(),
+                "replacement operation dispatcher received another command".into(),
             ));
         };
         command
@@ -313,7 +311,7 @@ impl ReplicaHandle {
 
     #[cfg(feature = "testing")]
     pub async fn fence_stateless_preview_access(&self) {
-        self.runtime.fence_stateless_preview_access().await;
+        self.runtime.fence_replacement_access().await;
     }
 
     #[cfg(feature = "testing")]
@@ -324,17 +322,17 @@ impl ReplicaHandle {
         let state = self.store.load_state().await?;
         let preview = state.public_operation_preview.ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "stateless preview process endpoint requires schema-11 state".into(),
+                "replacement process endpoint requires current state".into(),
             )
         })?;
         Ok(crate::protocol::types::ProcessSessionEndpoint {
             identity: state.identity.local_identity,
             process_session_id: self.process_session_id(),
-            replicator_creation_id: self.runtime.stateless_preview_replicator_creation_id()?,
+            replicator_creation_id: self.runtime.replacement_replicator_creation_id()?,
             role,
             storage_incarnation: preview.storage_incarnation.ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview process endpoint lacks storage authority".into(),
+                    "replacement process endpoint lacks storage authority".into(),
                 )
             })?,
         })
@@ -349,7 +347,7 @@ impl ReplicaHandle {
             .public_operation_preview
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview requires schema-11 operation state".into(),
+                    "replacement runtime requires operation state".into(),
                 )
             })?;
         preview
@@ -361,7 +359,7 @@ impl ReplicaHandle {
             .checked_add(1)
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview operation revision exhausted".into(),
+                    "replacement operation revision exhausted".into(),
                 )
             })
     }
@@ -378,7 +376,7 @@ impl ReplicaHandle {
             .public_operation_preview
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview requires schema-11 operation state".into(),
+                    "replacement runtime requires operation state".into(),
                 )
             })?;
         Ok(preview
@@ -482,18 +480,18 @@ impl ReplicaHandle {
     pub async fn stateless_preview_report(
         &self,
     ) -> Result<crate::protocol::public_operations::PublicV1AgentReport> {
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
         let session = crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref());
         self.runtime
-            .refresh_stateless_preview_projection(self.store.as_ref(), &session, false)
+            .refresh_replacement_projection(self.store.as_ref(), &session, false)
             .await?;
         let projection = self
             .runtime
-            .stateless_preview_report_projection(
+            .replacement_report_projection(
                 session,
                 preview
                     .report_sequence
@@ -521,7 +519,7 @@ impl ReplicaHandle {
     #[cfg(feature = "testing")]
     pub fn stateless_preview_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
         self.runtime
-            .stateless_preview_raw_retained_task_cardinality()
+            .replacement_raw_retained_task_cardinality()
             .map_err(Into::into)
     }
 }
@@ -564,7 +562,7 @@ pub struct ReplicaHost<A, R> {
     application_storage: ApplicationStorageState,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     _resolver: Arc<R>,
-    preview_binding: Option<PreviewLifecycleBinding>,
+    replacement_binding: Option<PreviewLifecycleBinding>,
 }
 
 impl<A, R> ReplicaHost<A, R>
@@ -579,7 +577,7 @@ where
         resolver: Arc<R>,
     ) -> Self {
         Self {
-            preview_binding: Some(PreviewLifecycleBinding {
+            replacement_binding: Some(PreviewLifecycleBinding {
                 preview: PublicOperationPreviewIdentity::public_v1(1),
                 resource_uid: config.resource_uid.clone(),
                 spec_generation: 1,
@@ -594,7 +592,7 @@ where
     }
 
     pub fn with_stateless_preview(mut self, binding: PreviewLifecycleBinding) -> Self {
-        self.preview_binding = Some(binding);
+        self.replacement_binding = Some(binding);
         self
     }
 
@@ -630,7 +628,7 @@ where
                 "replica ID must be positive".into(),
             ));
         }
-        let binding = self.preview_binding.as_ref().ok_or_else(|| {
+        let binding = self.replacement_binding.as_ref().ok_or_else(|| {
             crate::host::HostError::InitializationNotAuthorized(
                 "Public V1 lifecycle binding is required".into(),
             )
@@ -667,7 +665,7 @@ where
                 self.application_storage == ApplicationStorageState::FreshEmpty,
                 paths.clone(),
                 startup_shutdown.clone(),
-                self.preview_binding.clone(),
+                self.replacement_binding.clone(),
             )
             .await?;
         }
@@ -675,28 +673,15 @@ where
             return Ok(None);
         }
 
-        let store = Arc::new(SqliteStore::open_preview_bound_existing(
+        let store = Arc::new(SqliteStore::open_replacement_for_process(
             &database_path,
-            None,
+            &observed,
+            self.config.replica_id,
+            paths.as_ref(),
             binding,
         )?);
         let identity = store.identity().await?;
-        validate_established_identity(&identity, &observed, self.config.replica_id)?;
-        let state = store.load_state().await?;
-        if state
-            .application_storage
-            .as_ref()
-            .map(|binding| &binding.paths)
-            != paths.as_ref()
-        {
-            store
-                .record_partition_reports(state.load_metrics, Some(FaultType::Permanent))
-                .await?;
-            return Err(crate::host::HostError::InitializationNotAuthorized(
-                "application storage paths differ from the authorized agent binding".into(),
-            ));
-        }
-        let runtime = Arc::new(PodRuntime::new_stateless_preview(
+        let runtime = Arc::new(PodRuntime::new_replacement(
             identity.local_identity.clone(),
             self.application,
             store.clone(),
@@ -710,8 +695,8 @@ where
         )?;
         let local_session = agent.local_session().clone();
         let process_session: Arc<str> = Arc::from(local_session.as_str());
-        let preview_registry = agent
-            .public_operation_preview_runtime(binding.preview.clone())
+        let replacement_registry = agent
+            .public_operation_runtime(binding.preview.clone())
             .await?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready, mut ready_rx) = watch::channel(false);
@@ -785,9 +770,11 @@ where
                 runtime,
                 store,
                 process_session,
-                preview: Some(PreviewProcessHandle {
-                    binding: self.preview_binding.expect("validated Public V1 binding"),
-                    registry: preview_registry,
+                replacement: Some(ReplacementProcessHandle {
+                    binding: self
+                        .replacement_binding
+                        .expect("validated Public V1 binding"),
+                    registry: replacement_registry,
                     report_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 }),
             },
@@ -845,7 +832,7 @@ async fn serve_initialization(
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     mut startup_shutdown: watch::Receiver<bool>,
-    preview_binding: Option<PreviewLifecycleBinding>,
+    replacement_binding: Option<PreviewLifecycleBinding>,
 ) -> Result<()> {
     let (initialized, mut initialized_rx) = watch::channel(false);
     let service = InitializationService::new(
@@ -857,7 +844,7 @@ async fn serve_initialization(
         fresh_application_state,
     )?
     .with_application_storage_paths(application_storage_paths);
-    let service = service.with_stateless_preview(preview_binding);
+    let service = service.with_replacement_binding(replacement_binding);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (ready, _) = watch::channel(false);
     let stop = tokio::spawn(async move {

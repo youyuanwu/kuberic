@@ -22,10 +22,10 @@ pub struct SqliteStore {
     pub(super) inner: Arc<crate::host::sqlite_store::SqliteStore>,
 }
 
-pub const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 =
+pub const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 =
     crate::host::state::PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION;
 pub const PHASE6_PUBLIC_V1_SCHEMA_VERSION: u32 =
-    crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION;
+    crate::host::state::PUBLIC_V1_PHASE6_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicV1HistorySnapshot {
@@ -126,18 +126,6 @@ impl SqliteStore {
         crate::host::sqlite_store::SqliteStore::metadata_database_path(root)
     }
 
-    pub fn create_authorized(
-        path: impl AsRef<Path>,
-        state: AgentState,
-    ) -> crate::host::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(crate::host::sqlite_store::SqliteStore::create_authorized(
-                path,
-                super::convert(state),
-            )?),
-        })
-    }
-
     pub fn create_public_v1(
         path: impl AsRef<Path>,
         preview: PublicOperationPreviewIdentity,
@@ -151,7 +139,7 @@ impl SqliteStore {
         let resource_uid = identity.resource_uid.clone();
         Ok(Self {
             inner: Arc::new(
-                crate::host::sqlite_store::SqliteStore::create_preview_bound_authorized(
+                crate::host::sqlite_store::SqliteStore::create_replacement_authorized(
                     path,
                     crate::host::state::AgentState::new(super::convert(identity)),
                     PreviewLifecycleBinding {
@@ -171,21 +159,10 @@ impl SqliteStore {
     ) -> crate::host::Result<Self> {
         Ok(Self {
             inner: Arc::new(
-                crate::host::sqlite_store::SqliteStore::open_preview_existing(path, None, preview)?,
+                crate::host::sqlite_store::SqliteStore::open_replacement_existing(
+                    path, None, preview,
+                )?,
             ),
-        })
-    }
-
-    pub fn open_existing(
-        path: impl AsRef<Path>,
-        identity: Option<&StorageIdentity>,
-    ) -> crate::host::Result<Self> {
-        let identity = identity.map(super::convert);
-        Ok(Self {
-            inner: Arc::new(crate::host::sqlite_store::SqliteStore::open_existing(
-                path,
-                identity.as_ref(),
-            )?),
         })
     }
 

@@ -14,7 +14,7 @@ use kuberic_runtime::protocol::types::{
     derive_bootstrap_history, derive_history_initialization_id,
 };
 use kuberic_runtime::testing::sqlite_store::{
-    PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PublicV1ReportProjection, SqliteStore,
+    PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, PublicV1ReportProjection, SqliteStore,
 };
 use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
 
@@ -133,7 +133,7 @@ fn public_v1_source_uses_no_native_evidence() {
         }
         let hosting = std::fs::read_to_string(manifest.join("src/host/hosting.rs")).unwrap();
         let projection = hosting
-            .split("refresh_stateless_preview_projection")
+            .split("refresh_replacement_projection")
             .nth(1)
             .unwrap()
             .split("pub(crate) fn provider_writer_lease_count")
@@ -177,7 +177,7 @@ fn public_v1_source_uses_no_native_evidence() {
 
 #[tokio::test]
 async fn public_v1_evidence_report_is_structurally_public_only() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 12);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
     let root = test_root("report");
     let path = SqliteStore::metadata_database_path(&root);
     let resource_uid = ResourceUid::new("evidence-resource");

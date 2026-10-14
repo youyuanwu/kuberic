@@ -211,9 +211,7 @@ level-triggered-kind-test *scenarios: verify-kind-context
     expanded=()
     for scenario in "${requested[@]}"; do
       if [[ "$scenario" == "all" ]]; then
-        expanded+=(scale-up-adversarial scale-up scale-up-multi replacement quorum-loss adversarial switchover switchover-adversarial scale-down scale-down-adversarial)
-      elif [[ "$scenario" == "scale-up-full" ]]; then
-        expanded+=(scale-up scale-up-multi scale-up-adversarial)
+        expanded+=(bootstrap replacement failover)
       else
         expanded+=("$scenario")
       fi
@@ -223,15 +221,6 @@ level-triggered-kind-test *scenarios: verify-kind-context
         bootstrap) test_names=("level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write") ;;
         replacement) test_names=("level_triggered_k8s::replacement_preserves_quorum_write_and_retires_old_incarnation") ;;
         failover) test_names=("level_triggered_k8s::failover_fences_old_primary_and_preserves_committed_data") ;;
-        quorum-loss) test_names=("level_triggered_k8s::quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change") ;;
-        adversarial) test_names=("level_triggered_k8s::adversarial_restart_partition_and_healing_preserve_single_writer") ;;
-        switchover) test_names=("level_triggered_k8s::planned_switchover") ;;
-        switchover-adversarial) test_names=("level_triggered_k8s::planned_switchover_adversarial") ;;
-        scale-down) test_names=("level_triggered_k8s::scale_down" "level_triggered_k8s::scale_down_non_contiguous") ;;
-        scale-down-adversarial) test_names=("level_triggered_k8s::scale_down_adversarial_historical" "level_triggered_k8s::scale_down_adversarial_reachable" "level_triggered_k8s::scale_down_adversarial_unreachable" "level_triggered_k8s::scale_down_adversarial_absent_pod") ;;
-        scale-up) test_names=("level_triggered_k8s::scale_up") ;;
-        scale-up-multi) test_names=("level_triggered_k8s::scale_up_multi") ;;
-        scale-up-adversarial) test_names=("level_triggered_k8s::scale_up_adversarial_cancellation" "level_triggered_k8s::scale_up_adversarial_pre_admission_failover" "level_triggered_k8s::scale_up_adversarial_post_admission_recovery" "level_triggered_k8s::scale_up_adversarial_non_contiguous_restore") ;;
         *) echo "unknown level-triggered scenario: $scenario" >&2; exit 2 ;;
       esac
       started=$SECONDS

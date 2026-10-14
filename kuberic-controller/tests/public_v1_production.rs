@@ -63,7 +63,6 @@ fn observation() -> RawObservation {
             image: "example".into(),
             failover_delay_seconds: 30,
             switchover: None,
-            preview_lifecycle: None,
         },
     );
     set.metadata.namespace = Some("default".into());
@@ -80,6 +79,7 @@ fn observation() -> RawObservation {
             ReplicaObservationKey::new(ReplicaId::new(1), ReplicaInstanceId::new("pod-1")),
             RawAgentObservation::PublicV1Report(Box::new(report)),
         )]),
+        #[cfg(feature = "runtime-test-bridge")]
         exact_resources: Vec::new(),
         failures: Vec::new(),
         now_unix_seconds: 0,

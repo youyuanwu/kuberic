@@ -10,10 +10,10 @@ fn main() {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.ensure_configuration")
-        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.prepare_secondary_removal")
-        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.retire_replica")
-        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.accept_secondary_removal_commit")
+        .type_attribute(
+            ".kuberic.level.v1.ExecuteCommandRequest.command",
+            "#[allow(clippy::large_enum_variant)]",
+        )
         .boxed(".kuberic.level.v1.ScaleUpConfigurationEvidence.evidence.admission")
         .boxed(".kuberic.level.v1.ScaleUpConfigurationEvidence.evidence.failover")
         .compile_protos(

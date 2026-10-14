@@ -124,7 +124,7 @@ fn notify_inbound_build_boundary_waiting() {
 }
 
 #[async_trait]
-impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
+impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
     async fn install_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
@@ -135,7 +135,7 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
         }
         match self
             .context
-            .classify_preview_inbound_build_authority(authority)
+            .classify_replacement_inbound_build_authority(authority)
             .await?
         {
             crate::host::store::PublicInboundBuildAdmission::Current => return Ok(()),
@@ -148,7 +148,7 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
         let _effect_drain = self.provider_effect_gate.lock().await;
         self.state.lock().await.inbound_build = None;
         self.context
-            .install_preview_inbound_build_authority(authority)
+            .install_replacement_inbound_build_authority(authority)
             .await
     }
 
@@ -177,26 +177,26 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        let binding = context.preview_binding()?.clone();
+        let binding = context.replacement_binding().clone();
         if !binding.preview.is_public_v1() || !settings.public_v1 {
             return Err(RuntimeError::Application(
-                "stateless preview requires exact Public V1 process and bundle selection".into(),
+                "stateless replacement requires exact Public V1 process authority".into(),
             ));
         }
         if settings.replication_address.is_empty() {
             return Err(RuntimeError::Application(
-                "stateless preview requires a replication address".into(),
+                "stateless replacement requires a replication address".into(),
             ));
         }
         if parse_bind_address(&settings.replication_address)?
-            != context.preview_replication_address()?
+            != context.replacement_replication_address()
         {
             return Err(RuntimeError::Application(
-                "stateless preview bundle listener differs from process selection".into(),
+                "stateless replacement listener differs from process authority".into(),
             ));
         }
         let provider = state_provider.ok_or_else(|| {
-            RuntimeError::Application("stateless preview requires a state provider".into())
+            RuntimeError::Application("stateless replacement requires a state provider".into())
         })?;
         let engine = Arc::new(StatelessReplicator::new(
             context.identity()?,
@@ -209,7 +209,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
         engine
             .self_ref
             .set(Arc::downgrade(&engine))
-            .expect("stateless preview self reference is unset");
+            .expect("stateless replacement self reference is unset");
         let containment = engine.callback_containment();
         Ok(ReplicatorInterfaces::primary(
             engine.clone(),
@@ -221,7 +221,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
             },
         )
         .with_callback_containment(containment)
-        .with_stateless_preview_control(engine))
+        .with_stateless_runtime_control(engine))
     }
 }
 
@@ -492,10 +492,9 @@ impl StatelessReplicator {
     }
 
     async fn send_contained_build(&self, replica: ReplicaInformation) -> Result<()> {
-        let engine =
-            self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
-                RuntimeError::Application("preview creation is unattached".into())
-            })?;
+        let engine = self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
+            RuntimeError::Application("replacement creation is unattached".into())
+        })?;
         if engine
             .active_callbacks
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -564,7 +563,7 @@ impl StatelessReplicator {
             )
         };
         self.context
-            .publish_preview_progress(
+            .publish_replacement_progress(
                 applied_lsn,
                 committed_lsn,
                 ambiguous || local_rebuild_required,
@@ -661,7 +660,7 @@ impl StatelessReplicator {
 
     async fn revoke_inbound_effects(&self) -> Result<()> {
         self.context
-            .revoke_preview_inbound_build_authority()
+            .revoke_replacement_inbound_build_authority()
             .await?;
         self.cancel_inbound_effects();
         self.state.lock().await.inbound_build = None;
@@ -675,7 +674,7 @@ impl StatelessReplicator {
         let _effect = self.provider_effect_gate.lock().await;
         if item.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
-                "stateless preview requires protocol 11",
+                "stateless replacement requires Public V1",
             ));
         }
         let sender: ReplicaIdentity = item
@@ -1046,7 +1045,7 @@ impl StatelessReplicator {
                 || acknowledgement.committed_lsn < committed_lsn
             {
                 return Err(ReplicationSendFailure::Rejected(
-                    "stateless preview ACK changed exact authority".into(),
+                    "stateless replacement ACK changed exact authority".into(),
                 ));
             }
             Ok(())
@@ -1361,7 +1360,7 @@ impl StatelessReplicator {
         }
         let build_authority = self
             .context
-            .preview_outbound_build_authority(
+            .replacement_outbound_build_authority(
                 &replica.build_id,
                 &authority.current.configuration_id,
             )
@@ -1615,7 +1614,7 @@ impl StatelessReplicator {
         let _effect = self.provider_effect_gate.lock().await;
         if item.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
-                "stateless preview requires protocol 11",
+                "stateless replacement requires Public V1",
             ));
         }
         let build_id = crate::protocol::types::OperationId::new(item.build_id.clone());
@@ -1673,7 +1672,7 @@ impl StatelessReplicator {
             crate::protocol::types::ConfigurationId::new(item.current_configuration_id.clone());
         if let Some(receipt) = self
             .context
-            .preview_terminal_inbound_build_receipt(&build_id)
+            .replacement_terminal_inbound_build_receipt(&build_id)
             .await
             .map_err(runtime_status)?
         {
@@ -1725,7 +1724,7 @@ impl StatelessReplicator {
         }
         let durable_authority = self
             .context
-            .preview_inbound_build_authority(&build_id)
+            .replacement_inbound_build_authority(&build_id)
             .await
             .map_err(runtime_status)?
             .ok_or_else(|| Status::failed_precondition("build lacks durable inbound authority"))?;
@@ -1814,7 +1813,7 @@ impl StatelessReplicator {
                 if self.generation() != generation
                     || self
                         .context
-                        .preview_inbound_build_authority(&build_id)
+                        .replacement_inbound_build_authority(&build_id)
                         .await
                         .map_err(runtime_status)?
                         .as_ref()
@@ -1860,7 +1859,7 @@ impl StatelessReplicator {
             if self.generation() != generation
                 || self
                     .context
-                    .preview_inbound_build_authority(&build_id)
+                    .replacement_inbound_build_authority(&build_id)
                     .await
                     .map_err(runtime_status)?
                     .as_ref()
@@ -1885,7 +1884,7 @@ impl StatelessReplicator {
                 if self.generation() != generation
                     || self
                         .context
-                        .preview_inbound_build_authority(&build_id)
+                        .replacement_inbound_build_authority(&build_id)
                         .await
                         .map_err(runtime_status)?
                         .as_ref()
@@ -1928,7 +1927,7 @@ impl StatelessReplicator {
                 if self.generation() != generation
                     || self
                         .context
-                        .preview_inbound_build_authority(&build_id)
+                        .replacement_inbound_build_authority(&build_id)
                         .await
                         .map_err(runtime_status)?
                         .as_ref()
@@ -1955,7 +1954,7 @@ impl StatelessReplicator {
         if self.generation() != generation
             || self
                 .context
-                .preview_inbound_build_authority(&build_id)
+                .replacement_inbound_build_authority(&build_id)
                 .await
                 .map_err(runtime_status)?
                 .as_ref()
@@ -1996,7 +1995,7 @@ impl StatelessReplicator {
         }
         if item.final_item {
             self.context
-                .complete_preview_inbound_build(&PublicInboundBuildReceipt {
+                .complete_replacement_inbound_build(&PublicInboundBuildReceipt {
                     authority: durable_authority.clone(),
                     final_sequence: item.sequence,
                     replication_boundary_lsn: item.replication_boundary_lsn,
@@ -2103,9 +2102,9 @@ impl Replicator for StatelessReplicator {
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
         let (shutdown, mut shutdown_rx) = watch::channel(false);
-        let service = PreviewReplicationService {
+        let service = ReplacementReplicationService {
             engine: self.self_ref.get().cloned().ok_or_else(|| {
-                RuntimeError::Application("preview creation is unattached".into())
+                RuntimeError::Application("replacement creation is unattached".into())
             })?,
         };
         let task = tokio::spawn(async move {
@@ -2533,7 +2532,7 @@ impl StatelessReplicator {
         }
         for peer in peers.values() {
             if let Some(storage) = &peer.storage_incarnation
-                && self.context.preview_storage_is_retired(storage).await?
+                && self.context.replacement_storage_is_retired(storage).await?
             {
                 return Err(RuntimeError::AuthorityMismatch(
                     "static configuration readmits a durably retired storage incarnation".into(),
@@ -2714,10 +2713,9 @@ impl StateReplicator for StatelessReplicator {
         {
             return Err(self.fence_stale_write(lsn).await);
         }
-        let engine =
-            self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
-                RuntimeError::Application("preview creation is unattached".into())
-            })?;
+        let engine = self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
+            RuntimeError::Application("replacement creation is unattached".into())
+        })?;
         for peer in authority.peers.values() {
             let engine = engine.clone();
             let authority = authority.clone();
@@ -2750,7 +2748,7 @@ impl StateReplicator for StatelessReplicator {
     async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()> {
         if !settings.public_v1 {
             return Err(RuntimeError::Application(
-                "stateless preview cannot disable Public V1".into(),
+                "stateless replacement cannot disable Public V1".into(),
             ));
         }
         let mut current = self.settings.write().await;
@@ -2758,7 +2756,7 @@ impl StateReplicator for StatelessReplicator {
             && current.replication_address != settings.replication_address
         {
             return Err(RuntimeError::Application(
-                "stateless preview listener address is immutable after Open".into(),
+                "stateless replacement listener address is immutable after Open".into(),
             ));
         }
         *current = settings;
@@ -2771,12 +2769,12 @@ type ReplicationResponseStream =
 type CopyResponseStream =
     Pin<Box<dyn Stream<Item = std::result::Result<proto::CopyAck, Status>> + Send>>;
 
-struct PreviewReplicationService {
+struct ReplacementReplicationService {
     engine: Weak<StatelessReplicator>,
 }
 
 #[tonic::async_trait]
-impl proto::replication_data_server::ReplicationData for PreviewReplicationService {
+impl proto::replication_data_server::ReplicationData for ReplacementReplicationService {
     type ReplicateStream = ReplicationResponseStream;
     type BuildStream = CopyResponseStream;
 
@@ -2787,7 +2785,7 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
         let engine = self
             .engine
             .upgrade()
-            .ok_or_else(|| Status::unavailable("stateless preview is closed"))?;
+            .ok_or_else(|| Status::unavailable("stateless replacement is closed"))?;
         let mut incoming = request.into_inner();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();
@@ -2812,7 +2810,7 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
         let engine = self
             .engine
             .upgrade()
-            .ok_or_else(|| Status::unavailable("stateless preview is closed"))?;
+            .ok_or_else(|| Status::unavailable("stateless replacement is closed"))?;
         let mut incoming = request.into_inner();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();

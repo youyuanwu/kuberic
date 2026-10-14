@@ -645,14 +645,9 @@ message ExecuteCommandRequest {
   string resource_uid = 2;
   ReplicaIdentity target = 3;
   string expected_process_session_id = 4;
+  reserved 11 to 16;
   oneof command {
     InitializeAgentStoreCommand initialize_agent_store = 10;
-    EnsureConfigurationCommand ensure_configuration = 11;
-    EnsureReplicaBuildCommand ensure_replica_build = 12;
-    PrepareSwitchoverCommand prepare_switchover = 13;
-    PrepareSecondaryRemovalCommand prepare_secondary_removal = 14;
-    RetireReplicaCommand retire_replica = 15;
-    AcceptSecondaryRemovalCommitCommand accept_secondary_removal_commit = 16;
     PublicV1HistoryCommand public_v1_history = 17;
     PublicV1OperationCommand public_v1_operation = 18;
   }

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
-use kuberic_runtime::control::proto;
 use kuberic_runtime::protocol::observation::ReplicaObservationKey;
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::types::{ReplicaCleanupIdentity, ReplicaIdentity};
 
 use crate::crd::KubericSet;
@@ -10,16 +10,9 @@ use crate::crd::KubericSet;
 #[derive(Debug, Clone)]
 pub enum RawAgentObservation {
     Absent,
-    Unavailable {
-        message: String,
-    },
-    Invalid {
-        message: String,
-    },
-    Report(Box<proto::AgentStatusReport>),
+    Unavailable { message: String },
+    Invalid { message: String },
     PublicV1Report(Box<kuberic_runtime::protocol::public_operations::PublicV1AgentReport>),
-    #[cfg(feature = "public-v1")]
-    PreviewReport(Box<kuberic_runtime::protocol::observation::AgentReport>),
 }
 
 #[derive(Debug, Clone)]
@@ -30,11 +23,13 @@ pub struct RawObservation {
     pub services: Vec<Service>,
     pub secrets: Vec<Secret>,
     pub agents: BTreeMap<ReplicaObservationKey, RawAgentObservation>,
+    #[cfg(feature = "runtime-test-bridge")]
     pub exact_resources: Vec<RawScaleDownResources>,
     pub failures: Vec<RawObservationFailure>,
     pub now_unix_seconds: i64,
 }
 
+#[cfg(feature = "runtime-test-bridge")]
 #[derive(Debug, Clone)]
 pub enum ExactLookup<T> {
     Present(T),
@@ -42,6 +37,7 @@ pub enum ExactLookup<T> {
     Failed(String),
 }
 
+#[cfg(feature = "runtime-test-bridge")]
 #[derive(Debug, Clone)]
 pub struct RawScaleDownResources {
     pub target: ReplicaIdentity,

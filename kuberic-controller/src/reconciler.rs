@@ -65,20 +65,15 @@ impl Reconciler {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if raw.agents.values().any(|observation| {
-            matches!(
-                observation,
-                RawAgentObservation::Report(_) | RawAgentObservation::PreviewReport(_)
-            )
-        }) {
-            return Err(ControllerError::InvalidAgentEvidence(
-                "legacy agent observation reached public-v1 reconciliation".into(),
-            ));
-        }
         let status = raw.set.status.as_ref();
-        if let Some(renewal) = status.and_then(|status| status.public_v1_session_renewal.as_ref()) {
+        if let Some(renewal) = status
+            .and_then(|status| status.public_v1_session_renewal.as_ref())
+            .map(crate::crd::PublicV1SessionRenewalState::renewal)
+            .transpose()
+            .map_err(ControllerError::InvalidAgentEvidence)?
+        {
             let unreachable = Vec::new();
-            let plan = plan_session_renewal(renewal, &unreachable)
+            let plan = plan_session_renewal(&renewal, &unreachable)
                 .map_err(ControllerError::InvalidAgentEvidence)?;
             crate::executor::execute_public_v1_session_renewal(self.api.as_ref(), &scope, plan)
                 .await
@@ -98,7 +93,9 @@ impl Reconciler {
                     ControllerError::InvalidAgentEvidence(
                         "public-v1 transition lacks its operation command".into(),
                     )
-                })?;
+                })?
+                .command()
+                .map_err(ControllerError::InvalidAgentEvidence)?;
             crate::public_v1_reconciliation::reconcile_public_v1_operation(
                 self.api.as_ref(),
                 &scope,

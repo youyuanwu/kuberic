@@ -19,19 +19,17 @@ pub mod cluster_api;
 pub mod crd;
 mod error;
 pub mod evaluator;
+#[cfg(feature = "runtime-test-bridge")]
 mod exact_resources;
 pub mod executor;
-pub mod normalize;
+mod normalize;
 pub mod observation;
-pub mod plan;
-#[cfg(feature = "public-v1")]
 mod public_v1_reconciliation;
 pub mod reconciler;
 
 pub use error::{ControllerError, Result};
-pub use evaluator::{EvaluationConfig, evaluate};
+pub use evaluator::EvaluationConfig;
 pub use kuberic_runtime::{control, protocol};
-pub use plan::{Plan, UnsafeReason, WaitReason};
 
 #[derive(Debug, Parser)]
 struct Config {
@@ -76,7 +74,7 @@ pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error
     let agents = Arc::new(cluster_api::GrpcAgentApi::new(Duration::from_secs(
         config.rpc_deadline_seconds,
     )));
-    let api = Arc::new(cluster_api::KubeClusterApi::new_namespaced(
+    let api = Arc::new(cluster_api::KubeClusterApi::new(
         client.clone(),
         agents,
         config.agent_bearer_token,
@@ -156,18 +154,9 @@ pub fn production_evaluation_config(
     unsafe_requeue_seconds: u64,
 ) -> EvaluationConfig {
     EvaluationConfig {
-        enable_secondary_scale_down: true,
-        allow_scale_up: true,
-        supported_protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         stable_resync_seconds,
         wait_requeue_seconds,
         unsafe_requeue_seconds,
-        #[cfg(feature = "public-v1")]
-        public_operation_preview: Some(
-            kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity::public_v1(
-                1,
-            ),
-        ),
     }
 }
 
@@ -186,21 +175,8 @@ mod tests {
     #[test]
     fn production_enables_only_completed_membership_gates() {
         let config = super::production_evaluation_config(31, 7, 13);
-        assert!(config.enable_secondary_scale_down);
-        assert!(config.allow_scale_up);
-        assert_eq!(
-            config.supported_protocol_version,
-            kuberic_runtime::protocol::PROTOCOL_VERSION
-        );
         assert_eq!(config.stable_resync_seconds, 31);
         assert_eq!(config.wait_requeue_seconds, 7);
         assert_eq!(config.unsafe_requeue_seconds, 13);
-        assert_eq!(
-            config.public_operation_preview,
-            Some(
-                kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity::
-                    public_v1(1)
-            )
-        );
     }
 }

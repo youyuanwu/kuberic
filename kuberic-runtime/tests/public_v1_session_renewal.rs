@@ -22,7 +22,7 @@ use kuberic_runtime::protocol::types::{
     derive_data_loss_history, derive_history_initialization_id,
 };
 use kuberic_runtime::testing::sqlite_store::{
-    PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PublicV1BuildRetirementSnapshot,
+    PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, PublicV1BuildRetirementSnapshot,
     PublicV1OperationSnapshotDisposition, PublicV1OperationSnapshotStage, PublicV1ReportProjection,
     PublicV1SessionRenewalExecutor, SqliteStore,
 };
@@ -852,7 +852,7 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 
 #[tokio::test]
 async fn public_v1_schema11_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 12);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
     let root = test_root("schema11-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicOperationPreviewIdentity::public_v1(42);
@@ -1148,17 +1148,27 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
         .unwrap();
     let original_state: serde_json::Value = serde_json::from_str(&state_json).unwrap();
     let mut mismatched_record = original_state.clone();
+    let admission_revision = mismatched_record
+        .get("publicOperationPreview")
+        .and_then(|preview| preview.get("buildRecords"))
+        .and_then(|records| records.get("schema11-build"))
+        .and_then(|record| record.get("admissionRevision"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap();
     *mismatched_record
         .get_mut("publicOperationPreview")
         .and_then(|preview| preview.get_mut("buildRecords"))
         .and_then(|records| records.get_mut("schema11-build"))
         .and_then(|record| record.get_mut("admissionRevision"))
-        .unwrap() = serde_json::json!(2);
+        .unwrap() = serde_json::json!(admission_revision + 1);
     connection
         .execute(
             "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
             [serde_json::to_string(&mismatched_record).unwrap()],
         )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
     assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
     connection
@@ -1188,6 +1198,9 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
                 [serde_json::to_string(&changed).unwrap()],
             )
             .unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
     }
     connection
@@ -1210,6 +1223,9 @@ async fn public_v1_schema11_requires_a_fresh_exact_store() {
             "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
             [serde_json::to_string(&changed_storage).unwrap()],
         )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
     assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
     connection

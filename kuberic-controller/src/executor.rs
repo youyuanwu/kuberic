@@ -1,14 +1,4 @@
-use std::time::Duration;
-
-use crate::plan::Plan;
-use kuberic_runtime::protocol::command::{KubernetesChange, SafetyChange};
-use kuberic_runtime::protocol::observation::ObservationSnapshot;
-
-use crate::Result;
-use crate::cluster_api::ClusterApi;
-use crate::observation::RawObservation;
-
-#[cfg(feature = "public-v1")]
+#[cfg(feature = "runtime-test-bridge")]
 pub async fn execute_preview_service_location(
     api: &dyn crate::cluster_api::PreviewServiceApi,
     plan: crate::evaluator::test_bridge::PreviewServiceLocationPlan,
@@ -64,16 +54,15 @@ pub async fn execute_preview_service_location(
     }
 }
 
-#[cfg(feature = "public-v1")]
 pub async fn execute_public_v1_history<A>(
     api: &A,
     scope: &crate::cluster_api::PublicV1Scope,
-    plan: crate::evaluator::test_bridge::PublicV1HistoryPlan,
+    plan: crate::evaluator::public_v1_history::PublicV1HistoryPlan,
 ) -> std::result::Result<(), String>
 where
     A: crate::cluster_api::PublicV1HistoryApi + ?Sized,
 {
-    use crate::evaluator::test_bridge::PublicV1HistoryPlan;
+    use crate::evaluator::public_v1_history::PublicV1HistoryPlan;
     match plan {
         PublicV1HistoryPlan::Stable => Ok(()),
         PublicV1HistoryPlan::PersistStatus { expected, next } => {
@@ -102,16 +91,15 @@ where
     }
 }
 
-#[cfg(feature = "public-v1")]
 pub async fn execute_public_v1_session_renewal<A>(
     api: &A,
     scope: &crate::cluster_api::PublicV1Scope,
-    plan: crate::evaluator::test_bridge::PublicV1SessionRenewalPlan,
+    plan: crate::evaluator::public_v1_session_renewal::PublicV1SessionRenewalPlan,
 ) -> std::result::Result<(), String>
 where
     A: crate::cluster_api::PublicV1SessionRenewalApi + ?Sized,
 {
-    use crate::evaluator::test_bridge::PublicV1SessionRenewalPlan;
+    use crate::evaluator::public_v1_session_renewal::PublicV1SessionRenewalPlan;
     match plan {
         PublicV1SessionRenewalPlan::Stable | PublicV1SessionRenewalPlan::WaitForSurvivor { .. } => {
             Ok(())
@@ -153,11 +141,10 @@ where
     }
 }
 
-#[cfg(feature = "public-v1")]
 pub async fn execute_public_v1_operation<A>(
     api: &A,
     scope: &crate::cluster_api::PublicV1Scope,
-    expected: &crate::evaluator::test_bridge::PublicV1AcceptedTransitionStatus,
+    expected: &crate::evaluator::public_v1_evidence::PublicV1AcceptedTransitionStatus,
     command: kuberic_runtime::protocol::command::ProtocolCommand,
 ) -> std::result::Result<(), String>
 where
@@ -185,16 +172,15 @@ where
         .await
 }
 
-#[cfg(feature = "public-v1")]
 pub async fn execute_public_v1_evidence<A>(
     api: &A,
     scope: &crate::cluster_api::PublicV1Scope,
-    plan: crate::evaluator::test_bridge::PublicV1EvidencePlan,
+    plan: crate::evaluator::public_v1_evidence::PublicV1EvidencePlan,
 ) -> std::result::Result<(), String>
 where
     A: crate::cluster_api::PublicV1EvidenceApi + ?Sized,
 {
-    use crate::evaluator::test_bridge::PublicV1EvidencePlan;
+    use crate::evaluator::public_v1_evidence::PublicV1EvidencePlan;
     match plan {
         PublicV1EvidencePlan::PersistStatus { expected, next } => {
             let observed = api.observe_public_v1_evidence_status(scope).await?;
@@ -264,159 +250,4 @@ pub enum ExecutionKind {
     Stable,
     Applied,
     Executed,
-    Waiting,
-    Unsafe,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutionOutcome {
-    pub kind: ExecutionKind,
-    pub requeue_after: Duration,
-}
-
-pub async fn execute_plan(
-    api: &dyn ClusterApi,
-    observation: &RawObservation,
-    snapshot: &ObservationSnapshot,
-    plan: Plan,
-) -> Result<ExecutionOutcome> {
-    match plan {
-        Plan::Stable {
-            status,
-            requeue_after_seconds,
-        } => {
-            persist_if_changed(api, observation, snapshot, &status).await?;
-            Ok(ExecutionOutcome {
-                kind: ExecutionKind::Stable,
-                requeue_after: Duration::from_secs(requeue_after_seconds),
-            })
-        }
-        Plan::Apply { changes } => {
-            for change in changes {
-                execute_change(api, observation, change).await?;
-            }
-            Ok(ExecutionOutcome {
-                kind: ExecutionKind::Applied,
-                requeue_after: Duration::ZERO,
-            })
-        }
-        Plan::Execute { command } => {
-            api.execute_command(observation, &command).await?;
-            Ok(ExecutionOutcome {
-                kind: ExecutionKind::Executed,
-                requeue_after: Duration::ZERO,
-            })
-        }
-        Plan::Wait {
-            status,
-            requeue_after_seconds,
-            ..
-        } => {
-            persist_if_changed(api, observation, snapshot, &status).await?;
-            Ok(ExecutionOutcome {
-                kind: ExecutionKind::Waiting,
-                requeue_after: Duration::from_secs(requeue_after_seconds),
-            })
-        }
-        Plan::Unsafe {
-            status,
-            safety_changes,
-            requeue_after_seconds,
-            ..
-        } => {
-            for change in safety_changes {
-                match change {
-                    SafetyChange::RemoveWriteRouting => {
-                        api.remove_write_routing(observation).await?;
-                    }
-                }
-            }
-            persist_if_changed(api, observation, snapshot, &status).await?;
-            Ok(ExecutionOutcome {
-                kind: ExecutionKind::Unsafe,
-                requeue_after: Duration::from_secs(requeue_after_seconds),
-            })
-        }
-    }
-}
-
-async fn execute_change(
-    api: &dyn ClusterApi,
-    observation: &RawObservation,
-    change: KubernetesChange,
-) -> Result<()> {
-    match change {
-        KubernetesChange::DeleteScaleDownResource {
-            resource,
-            name,
-            uid,
-            resource_version,
-        } => {
-            api.delete_scale_down_resource(observation, resource, &name, &uid, &resource_version)
-                .await
-        }
-        KubernetesChange::EnsureReplicaSupport => api.ensure_replica_support(observation).await,
-        KubernetesChange::EnsureReplicaScaffolding { replica_ids } => {
-            api.ensure_replica_scaffolding(observation, &replica_ids)
-                .await
-        }
-        KubernetesChange::EnsureReplacementScaffolding {
-            replica_id,
-            replacing,
-        } => {
-            api.ensure_replacement_scaffolding(observation, replica_id, &replacing)
-                .await
-        }
-        KubernetesChange::DeleteReplicaScaffolding {
-            pod_name,
-            pod_uid,
-            pvc_name,
-            pvc_uid,
-        } => {
-            api.delete_replica_scaffolding(
-                observation,
-                pod_name.as_deref(),
-                pod_uid.as_ref(),
-                pvc_name.as_deref(),
-                pvc_uid.as_ref(),
-            )
-            .await
-        }
-        KubernetesChange::DeleteReplicaEndpoint { identity } => {
-            api.delete_replica_endpoint(observation, &identity).await
-        }
-        KubernetesChange::DeleteExactPod { pod_name, pod_uid } => {
-            api.delete_exact_pod(observation, &pod_name, &pod_uid).await
-        }
-        KubernetesChange::DeleteExactService {
-            name,
-            uid,
-            resource_version,
-        } => {
-            api.delete_exact_service(observation, &name, &uid, &resource_version)
-                .await
-        }
-        KubernetesChange::EnsureWriteRoutingService => {
-            api.ensure_write_routing_service(observation).await
-        }
-        KubernetesChange::PersistStatus { status } => {
-            api.replace_status(observation, &status).await
-        }
-        KubernetesChange::RemoveWriteRouting => api.remove_write_routing(observation).await,
-        KubernetesChange::PublishWriteRouting { primary } => {
-            api.publish_write_routing(observation, &primary).await
-        }
-    }
-}
-
-async fn persist_if_changed(
-    api: &dyn ClusterApi,
-    observation: &RawObservation,
-    snapshot: &ObservationSnapshot,
-    status: &kuberic_runtime::protocol::types::AcceptedStatus,
-) -> Result<()> {
-    if &snapshot.status != status {
-        api.replace_status(observation, status).await?;
-    }
-    Ok(())
 }

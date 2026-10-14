@@ -27,4 +27,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tonic.workspace = true
 tower = "0.5"

@@ -600,7 +600,7 @@ fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKin
         Some(PublicOperationProgram::Close) => Ok(PublicV1CallKind::Close),
         Some(PublicOperationProgram::Abort) => Ok(PublicV1CallKind::Abort),
         None => Err(HostError::Corrupt(
-            "schema-11 completion lacks a public call kind".into(),
+            "replacement completion lacks a public call kind".into(),
         )),
     }
 }
@@ -649,7 +649,7 @@ fn public_v1_completion_authority(
     }
     let Some(program) = intent.program.as_ref() else {
         return Err(HostError::Corrupt(
-            "schema-11 completion lacks public authority".into(),
+            "replacement completion lacks public authority".into(),
         ));
     };
     Ok(match program {
@@ -703,7 +703,7 @@ pub(crate) async fn public_v1_report(
     }
     let state = store.load_state().await?;
     let preview = state.public_operation_preview.ok_or_else(|| {
-        HostError::CommandRejected("public-v1 report requires preview store".into())
+        HostError::CommandRejected("Public V1 report requires replacement state".into())
     })?;
     if &preview.identity != identity {
         return Err(HostError::IdentityMismatch(
@@ -734,7 +734,7 @@ pub(crate) async fn public_v1_report(
                 PublicV1OperationResult::RebuildRequired(rebuild)
             } else {
                 match record.disposition.as_ref().ok_or_else(|| {
-                    HostError::Corrupt("schema-11 completed operation lacks a disposition".into())
+                    HostError::Corrupt("replacement operation lacks a disposition".into())
                 })? {
                     PublicOperationDisposition::Succeeded => PublicV1OperationResult::Succeeded,
                     PublicOperationDisposition::Failed(message) => {
@@ -750,10 +750,10 @@ pub(crate) async fn public_v1_report(
                 }
             };
             let history = record.accepted_history.clone().ok_or_else(|| {
-                HostError::Corrupt("schema-11 completion lacks accepted history".into())
+                HostError::Corrupt("replacement completion lacks accepted history".into())
             })?;
             let storage_incarnation = record.accepted_storage.clone().ok_or_else(|| {
-                HostError::Corrupt("schema-11 completion lacks accepted storage".into())
+                HostError::Corrupt("replacement completion lacks accepted storage".into())
             })?;
             let (
                 previous_configuration_id,

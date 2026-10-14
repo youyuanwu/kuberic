@@ -66,7 +66,7 @@ pub trait StateReplicator: Send + Sync {
 }
 
 #[async_trait]
-pub(crate) trait StatelessPreviewControl: Send + Sync {
+pub(crate) trait StatelessRuntimeControl: Send + Sync {
     async fn install_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
@@ -239,12 +239,12 @@ impl ReplicatorEngineSelection {
         }
     }
 
-    pub(crate) fn preview_binding(&self) -> Option<&PreviewLifecycleBinding> {
-        Some(&self.binding)
+    pub(crate) fn replacement_binding(&self) -> &PreviewLifecycleBinding {
+        &self.binding
     }
 
-    pub(crate) fn preview_replication_address(&self) -> Option<std::net::SocketAddr> {
-        Some(self.replication_address)
+    pub(crate) fn replacement_replication_address(&self) -> std::net::SocketAddr {
+        self.replication_address
     }
 }
 
@@ -275,7 +275,7 @@ struct ReplicatorCreation {
     guarded_control: StdMutex<Arc<dyn Replicator>>,
     capabilities: ReplicatorCapabilities,
     callback_containment: StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
-    stateless_preview_control: StdMutex<Option<Arc<dyn StatelessPreviewControl>>>,
+    stateless_runtime_control: StdMutex<Option<Arc<dyn StatelessRuntimeControl>>>,
     settings: StdMutex<Option<BoundReplicatorSettings>>,
     armed: AtomicBool,
 }
@@ -297,7 +297,7 @@ impl ReplicatorCreation {
             guarded_control: StdMutex::new(guarded_control),
             capabilities,
             callback_containment: StdMutex::new(None),
-            stateless_preview_control: StdMutex::new(None),
+            stateless_runtime_control: StdMutex::new(None),
             settings: StdMutex::new(None),
             armed: AtomicBool::new(true),
         }
@@ -488,12 +488,12 @@ impl ReplicatorAttachment {
             .clone()
     }
 
-    pub(crate) fn stateless_preview_control(
+    pub(crate) fn stateless_runtime_control(
         &self,
         _token: RuntimeHostToken,
-    ) -> Option<Arc<dyn StatelessPreviewControl>> {
+    ) -> Option<Arc<dyn StatelessRuntimeControl>> {
         self.creation
-            .stateless_preview_control
+            .stateless_runtime_control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -517,13 +517,13 @@ impl ReplicatorInterfaces {
         self
     }
 
-    pub(crate) fn with_stateless_preview_control(
+    pub(crate) fn with_stateless_runtime_control(
         self,
-        control: Arc<dyn StatelessPreviewControl>,
+        control: Arc<dyn StatelessRuntimeControl>,
     ) -> Self {
         *self
             .creation
-            .stateless_preview_control
+            .stateless_runtime_control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control);
         self
@@ -689,95 +689,91 @@ impl ReplicatorFactoryContext {
         context
     }
 
-    pub(crate) fn preview_binding(&self) -> Result<&PreviewLifecycleBinding> {
-        self.engine_selection.preview_binding().ok_or_else(|| {
-            RuntimeError::Application(
-                "stateless preview factory requires preview process selection".into(),
-            )
-        })
+    pub(crate) fn replacement_binding(&self) -> &PreviewLifecycleBinding {
+        self.engine_selection.replacement_binding()
     }
 
-    pub(crate) fn preview_replication_address(&self) -> Result<std::net::SocketAddr> {
-        self.engine_selection
-            .preview_replication_address()
-            .ok_or_else(|| {
-                RuntimeError::Application(
-                    "stateless preview factory requires a preview listener selection".into(),
-                )
-            })
+    pub(crate) fn replacement_replication_address(&self) -> std::net::SocketAddr {
+        self.engine_selection.replacement_replication_address()
     }
 
-    pub(crate) async fn publish_preview_progress(
+    pub(crate) async fn publish_replacement_progress(
         &self,
         applied_lsn: i64,
         committed_lsn: i64,
         ambiguous: bool,
     ) -> Result<()> {
         self.access
-            .publish_preview_progress(applied_lsn, committed_lsn, ambiguous)
+            .publish_replacement_progress(applied_lsn, committed_lsn, ambiguous)
             .await
     }
 
-    pub(crate) async fn preview_inbound_build_authority(
+    pub(crate) async fn replacement_inbound_build_authority(
         &self,
         build_id: &OperationId,
     ) -> Result<Option<PublicInboundBuildAuthority>> {
-        self.access.preview_inbound_build_authority(build_id).await
+        self.access
+            .replacement_inbound_build_authority(build_id)
+            .await
     }
 
-    pub(crate) async fn classify_preview_inbound_build_authority(
+    pub(crate) async fn classify_replacement_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<PublicInboundBuildAdmission> {
         self.access
-            .classify_preview_inbound_build_authority(authority)
+            .classify_replacement_inbound_build_authority(authority)
             .await
     }
 
-    pub(crate) async fn install_preview_inbound_build_authority(
+    pub(crate) async fn install_replacement_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
         self.access
-            .install_preview_inbound_build_authority(authority)
+            .install_replacement_inbound_build_authority(authority)
             .await
     }
 
-    pub(crate) async fn preview_terminal_inbound_build_receipt(
+    pub(crate) async fn replacement_terminal_inbound_build_receipt(
         &self,
         build_id: &OperationId,
     ) -> Result<Option<PublicInboundBuildReceipt>> {
         self.access
-            .preview_terminal_inbound_build_receipt(build_id)
+            .replacement_terminal_inbound_build_receipt(build_id)
             .await
     }
 
-    pub(crate) async fn revoke_preview_inbound_build_authority(&self) -> Result<()> {
-        self.access.revoke_preview_inbound_build_authority().await
+    pub(crate) async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
+        self.access
+            .revoke_replacement_inbound_build_authority()
+            .await
     }
 
-    pub(crate) async fn preview_outbound_build_authority(
+    pub(crate) async fn replacement_outbound_build_authority(
         &self,
         build_id: &OperationId,
         current_configuration_id: &crate::protocol::types::ConfigurationId,
     ) -> Result<Option<PublicInboundBuildAuthority>> {
         self.access
-            .preview_outbound_build_authority(build_id, current_configuration_id)
+            .replacement_outbound_build_authority(build_id, current_configuration_id)
             .await
     }
 
-    pub(crate) async fn complete_preview_inbound_build(
+    pub(crate) async fn complete_replacement_inbound_build(
         &self,
         receipt: &PublicInboundBuildReceipt,
     ) -> Result<()> {
-        self.access.complete_preview_inbound_build(receipt).await
+        self.access
+            .complete_replacement_inbound_build(receipt)
+            .await
     }
 
-    pub(crate) async fn preview_storage_is_retired(
+    pub(crate) async fn replacement_storage_is_retired(
         &self,
         storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
     ) -> Result<bool> {
-        self.access.preview_storage_is_retired(storage).await
+        self.access.replacement_storage_is_retired(storage).await
     }
 
     pub(crate) fn release_provider_writer(&self) {
@@ -793,47 +789,47 @@ pub(crate) trait PartitionAccessView: Send + Sync {
 
     async fn write_status(&self) -> Result<AccessStatus>;
 
-    async fn publish_preview_progress(
+    async fn publish_replacement_progress(
         &self,
         applied_lsn: i64,
         committed_lsn: i64,
         ambiguous: bool,
     ) -> Result<()>;
 
-    async fn preview_inbound_build_authority(
+    async fn replacement_inbound_build_authority(
         &self,
         build_id: &OperationId,
     ) -> Result<Option<PublicInboundBuildAuthority>>;
 
-    async fn classify_preview_inbound_build_authority(
+    async fn classify_replacement_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<PublicInboundBuildAdmission>;
 
-    async fn install_preview_inbound_build_authority(
+    async fn install_replacement_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()>;
 
-    async fn preview_terminal_inbound_build_receipt(
+    async fn replacement_terminal_inbound_build_receipt(
         &self,
         build_id: &OperationId,
     ) -> Result<Option<PublicInboundBuildReceipt>>;
 
-    async fn revoke_preview_inbound_build_authority(&self) -> Result<()>;
+    async fn revoke_replacement_inbound_build_authority(&self) -> Result<()>;
 
-    async fn preview_outbound_build_authority(
+    async fn replacement_outbound_build_authority(
         &self,
         build_id: &OperationId,
         current_configuration_id: &crate::protocol::types::ConfigurationId,
     ) -> Result<Option<PublicInboundBuildAuthority>>;
 
-    async fn complete_preview_inbound_build(
+    async fn complete_replacement_inbound_build(
         &self,
         receipt: &PublicInboundBuildReceipt,
     ) -> Result<()>;
 
-    async fn preview_storage_is_retired(
+    async fn replacement_storage_is_retired(
         &self,
         storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
     ) -> Result<bool>;
@@ -1003,7 +999,8 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
     ) -> Result<ReplicatorInterfaces> {
         let mut settings = settings;
         settings.public_v1 = true;
-        settings.replication_address = format!("http://{}", context.preview_replication_address()?);
+        settings.replication_address =
+            format!("http://{}", context.replacement_replication_address());
         stateless::StatelessReplicatorFactory::new(self.storage.clone())
             .create_replicator(context, state_provider, settings)
             .await

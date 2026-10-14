@@ -131,73 +131,245 @@ struct Gate {
 
 const PUBLIC_LIFECYCLE: &str = include_str!("../host/public_lifecycle.rs");
 const REPLICATOR: &str = include_str!("../replicator/mod.rs");
+const HOSTING: &str = include_str!("../host/hosting.rs");
 const HOST_PROCESS: &str = include_str!("../host/process.rs");
+const HOST_SERVICE: &str = include_str!("../host/service.rs");
 const SQLITE_STORE: &str = include_str!("../host/sqlite_store.rs");
 const STATELESS: &str = include_str!("../replicator/stateless/mod.rs");
+const CONTROL_CONVERT: &str = include_str!("../control/convert.rs");
 
 fn contract_gate() {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplacementOwnershipInventory {
-    pub factories: Vec<&'static str>,
-    pub host_attachments: Vec<&'static str>,
-    pub grpc_services: Vec<&'static str>,
-    pub report_branches: Vec<&'static str>,
-    pub store_tables: Vec<&'static str>,
-    pub startup_tasks: Vec<&'static str>,
+    pub factories: Vec<String>,
+    pub services: Vec<String>,
+    pub host_attachments: Vec<String>,
+    pub report_branches: Vec<String>,
+    pub store_tables: Vec<String>,
+    pub startup_owners: Vec<String>,
+}
+
+struct ProductionSources<'a> {
+    replicator: &'a str,
+    stateless: &'a str,
+    hosting: &'a str,
+    process: &'a str,
+    service: &'a str,
+    sqlite_store: &'a str,
+    control_convert: &'a str,
+}
+
+fn production_sources() -> ProductionSources<'static> {
+    ProductionSources {
+        replicator: REPLICATOR,
+        stateless: STATELESS,
+        hosting: HOSTING,
+        process: HOST_PROCESS,
+        service: HOST_SERVICE,
+        sqlite_store: SQLITE_STORE,
+        control_convert: CONTROL_CONVERT,
+    }
+}
+
+fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn discover_after(source: &str, marker: &str, end: impl Fn(char) -> bool) -> Vec<String> {
+    source
+        .match_indices(marker)
+        .filter_map(|(offset, _)| {
+            let value = &source[offset + marker.len()..];
+            let end = value.find(&end).unwrap_or(value.len());
+            let value = value[..end].trim();
+            (!value.is_empty()).then(|| value.rsplit("::").next().unwrap().to_string())
+        })
+        .collect()
+}
+
+fn struct_body<'a>(source: &'a str, declaration: &str) -> Option<&'a str> {
+    let start = source.find(declaration)?;
+    let open = source[start..].find('{')? + start;
+    let mut depth = 0_u32;
+    for (offset, character) in source[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&source[open + 1..open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn discover_attachments(source: &str) -> Vec<String> {
+    let body = struct_body(source, "struct RegisteredReplicator")
+        .expect("production RegisteredReplicator registration surface exists");
+    sorted_unique(discover_after(body, "Arc<dyn ", |character| {
+        !character.is_ascii_alphanumeric() && character != '_' && character != ':'
+    }))
+}
+
+fn discover_report_branches(source: &str) -> Vec<String> {
+    let body = struct_body(source, "    proto::AgentStatusReport {")
+        .expect("production agent report construction exists");
+    let mut depth = 0_i32;
+    let mut branches = Vec::new();
+    for line in body.lines() {
+        if depth == 0
+            && let Some((field, value)) = line.trim().split_once(':')
+            && value.trim_start().starts_with("Some(")
+        {
+            branches.push(field.trim().to_string());
+        }
+        depth += line.chars().filter(|character| *character == '{').count() as i32;
+        depth -= line.chars().filter(|character| *character == '}').count() as i32;
+    }
+    sorted_unique(branches)
+}
+
+fn discover_before(source: &str, marker: &str) -> Vec<String> {
+    source
+        .match_indices(marker)
+        .filter_map(|(offset, _)| {
+            let prefix = &source[..offset];
+            let start = prefix
+                .rfind(|character: char| {
+                    !character.is_ascii_alphanumeric() && character != '_' && character != ':'
+                })
+                .map_or(0, |index| index + 1);
+            let value = prefix[start..].trim();
+            (!value.is_empty()).then(|| value.rsplit("::").next().unwrap().to_string())
+        })
+        .collect()
+}
+
+fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipInventory {
+    let factories = sorted_unique(
+        [sources.replicator, sources.stateless]
+            .into_iter()
+            .flat_map(|source| {
+                discover_after(source, "impl ReplicatorFactory for ", |character| {
+                    character.is_whitespace() || character == '{'
+                })
+            })
+            .collect(),
+    );
+    let services = sorted_unique(
+        [sources.service, sources.stateless]
+            .into_iter()
+            .flat_map(|source| {
+                discover_after(source, ".add_service(proto::", |character| character == ':')
+            })
+            .collect(),
+    );
+    let store_tables = sorted_unique(discover_after(
+        sources.sqlite_store,
+        "CREATE TABLE ",
+        |character| !character.is_ascii_alphanumeric() && character != '_',
+    ));
+    let mut startup_owners = discover_before(sources.service, "::start(");
+    if sources.process.contains(".serve_control_only(") {
+        startup_owners.push("serve_control_only".into());
+    }
+    ReplacementOwnershipInventory {
+        factories,
+        services,
+        host_attachments: discover_attachments(sources.hosting),
+        report_branches: discover_report_branches(sources.control_convert),
+        store_tables,
+        startup_owners: sorted_unique(startup_owners),
+    }
 }
 
 pub fn replacement_ownership_inventory() -> ReplacementOwnershipInventory {
-    assert!(!REPLICATOR.contains("LegacyManaged"));
-    assert!(!REPLICATOR.contains("pub struct DefaultReplicator {"));
-    assert!(REPLICATOR.contains("stateless::StatelessReplicatorFactory::new"));
-    assert!(!PUBLIC_LIFECYCLE.contains("ManagedReplicatorCapabilities"));
-    assert!(HOST_PROCESS.contains("agent.serve_control_only("));
-    assert!(!HOST_PROCESS.contains("run_outbound("));
-    assert!(!HOST_PROCESS.contains("run_peer_discovery("));
-    assert!(STATELESS.contains(
-        "impl proto::replication_data_server::ReplicationData for PreviewReplicationService"
-    ));
-    assert!(SQLITE_STORE.contains("PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION"));
-    assert!(SQLITE_STORE.contains("CREATE TABLE agent_state"));
-    for removed in [
-        "CREATE TABLE replica_authority",
-        "CREATE TABLE runtime_lifecycle",
-        "CREATE TABLE replication_progress",
-        "CREATE TABLE local_writes",
-        "CREATE TABLE build_authority",
-        "CREATE TABLE build_progress",
-    ] {
-        assert!(!SQLITE_STORE.contains(removed), "{removed} survived");
-    }
-    ReplacementOwnershipInventory {
-        factories: vec!["stateless-public-v1"],
-        host_attachments: vec!["replicator", "primary-replicator", "state-provider"],
-        grpc_services: vec!["agent-control", "replica-peer", "stateless-replication"],
-        report_branches: vec!["public-v1"],
-        store_tables: vec!["agent_state"],
-        startup_tasks: vec!["agent-control", "public-operation-recovery"],
-    }
+    discover_inventory(&production_sources())
+}
+
+pub fn replacement_ownership_inventory_with_extra_endpoint_fixture() -> ReplacementOwnershipInventory
+{
+    let service = format!(
+        "{HOST_SERVICE}\n.add_service(proto::alternate_continuation_server::AlternateContinuationServer::new(extra))"
+    );
+    discover_inventory(&ProductionSources {
+        service: &service,
+        ..production_sources()
+    })
 }
 
 pub fn validate_replacement_ownership_inventory(
     inventory: &ReplacementOwnershipInventory,
 ) -> Result<(), String> {
-    let expected = ReplacementOwnershipInventory {
-        factories: vec!["stateless-public-v1"],
-        host_attachments: vec!["replicator", "primary-replicator", "state-provider"],
-        grpc_services: vec!["agent-control", "replica-peer", "stateless-replication"],
-        report_branches: vec!["public-v1"],
-        store_tables: vec!["agent_state"],
-        startup_tasks: vec!["agent-control", "public-operation-recovery"],
-    };
-    if inventory == &expected {
-        Ok(())
-    } else {
+    let reject = |category: &str, observed: &[String]| {
         Err(format!(
-            "replacement ownership inventory changed: expected {expected:?}, observed {inventory:?}"
+            "replacement {category} registrations changed: {observed:?}"
         ))
+    };
+    if inventory.factories.len() != 2
+        || !inventory
+            .factories
+            .iter()
+            .any(|name| name == "DefaultReplicatorFactory")
+        || !inventory
+            .factories
+            .iter()
+            .any(|name| name == "StatelessReplicatorFactory")
+    {
+        return reject("factory", &inventory.factories);
     }
+    if inventory.services.len() != 3
+        || !inventory.services.iter().all(|name| {
+            matches!(
+                name.as_str(),
+                "agent_control_server" | "replica_peer_server" | "replication_data_server"
+            )
+        })
+    {
+        return reject("service", &inventory.services);
+    }
+    if inventory.host_attachments.len() != 4
+        || !inventory.host_attachments.iter().all(|name| {
+            matches!(
+                name.as_str(),
+                "PrimaryReplicator" | "Replicator" | "StateProvider" | "StatelessRuntimeControl"
+            )
+        })
+    {
+        return reject("attachment", &inventory.host_attachments);
+    }
+    if inventory.report_branches.as_slice() != ["public_v1"] {
+        return reject("report", &inventory.report_branches);
+    }
+    if inventory.store_tables.as_slice() != ["agent_state"] {
+        return reject("table", &inventory.store_tables);
+    }
+    if inventory.startup_owners.len() != 2
+        || !inventory.startup_owners.iter().all(|name| {
+            matches!(
+                name.as_str(),
+                "PartitionOperationRuntime" | "serve_control_only"
+            )
+        })
+    {
+        return reject("startup owner", &inventory.startup_owners);
+    }
+    if REPLICATOR.contains("LegacyManaged")
+        || REPLICATOR.contains("pub struct DefaultReplicator {")
+        || !REPLICATOR.contains("stateless::StatelessReplicatorFactory::new")
+        || PUBLIC_LIFECYCLE.contains("ManagedReplicatorCapabilities")
+        || HOST_PROCESS.contains("run_outbound(")
+        || HOST_PROCESS.contains("run_peer_discovery(")
+    {
+        return Err("legacy replacement owner remains in production source".into());
+    }
+    Ok(())
 }
 
 fn replacement_ownership_gate() {

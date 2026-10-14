@@ -1,15 +1,13 @@
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::Pod;
 use kube::{Resource, ResourceExt};
-use kuberic_runtime::protocol::observation::{
-    ExactResourceObservation, ReplicaObservationKey, SecondaryScaleDownResourceObservation,
-};
+use kuberic_runtime::protocol::observation::{ExactResourceObservation, ReplicaObservationKey};
 use kuberic_runtime::protocol::types::{
-    CleanupResourceIdentity, Epoch, OperationId, PodUid, PvcUid, ReplicaCleanupIdentity, ReplicaId,
+    CleanupResourceIdentity, Epoch, PodUid, PvcUid, ReplicaCleanupIdentity, ReplicaId,
     ReplicaIdentity, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
     derive_replica_endpoint_name,
 };
 
-use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SCALE_UP_ALLOCATION_ANNOTATION, SET_UID_LABEL};
+use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL};
 use crate::observation::{
     ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
 };
@@ -264,18 +262,13 @@ fn replacement_candidate(raw: &RawObservation, target: &ReplicaIdentity, _epoch:
     {
         return true;
     }
-    let Some(RawAgentObservation::Report(report)) = raw.agents.get(&ReplicaObservationKey::new(
-        target.replica_id,
-        target.instance_id.clone(),
-    )) else {
+    let Some(RawAgentObservation::PublicV1Report(report)) = raw.agents.get(
+        &ReplicaObservationKey::new(target.replica_id, target.instance_id.clone()),
+    ) else {
         return false;
     };
-    kuberic_runtime::control::normalize_public_v1_agent_status_report((**report).clone()).is_ok_and(
-        |report| {
-            report.role != kuberic_runtime::protocol::types::ReplicaRole::Primary
-                && report.write_status != kuberic_runtime::protocol::types::AccessStatus::Granted
-        },
-    )
+    report.role != kuberic_runtime::protocol::types::ReplicaRole::Primary
+        && report.write_status != kuberic_runtime::protocol::types::AccessStatus::Granted
 }
 
 fn candidate(raw: &RawObservation, target: &ReplicaIdentity) -> Option<ReplicaCleanupIdentity> {
@@ -600,73 +593,6 @@ pub(crate) fn classify<K: ResourceExt>(
             }
         }
     }
-}
-
-pub(crate) fn normalized(
-    raw: &RawObservation,
-    resource_uid: &ResourceUid,
-) -> Vec<SecondaryScaleDownResourceObservation> {
-    raw.exact_resources
-        .iter()
-        .map(|r| SecondaryScaleDownResourceObservation {
-            resource_uid: resource_uid.clone(),
-            target: r.target.clone(),
-            identity: r.identity.clone(),
-            pod: classify(&r.identity.pod, &r.pod),
-            pod_allocation_operation_id: match &r.pod {
-                ExactLookup::Present(pod) => pod
-                    .annotations()
-                    .get(SCALE_UP_ALLOCATION_ANNOTATION)
-                    .filter(|operation_id| !operation_id.is_empty())
-                    .map(OperationId::new),
-                ExactLookup::NotFound | ExactLookup::Failed(_) => None,
-            },
-            pod_matches_allocation_metadata: match &r.pod {
-                ExactLookup::Present(pod) => pod_matches_scale_up_allocation_metadata(
-                    &raw.set,
-                    pod,
-                    r.target.replica_id,
-                    raw.set
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.authority.scale_up_allocation.as_ref())
-                        .filter(|allocation| allocation.target_replica_id == r.target.replica_id)
-                        .and_then(|allocation| allocation.pvc_uid.as_ref()),
-                ),
-                ExactLookup::NotFound | ExactLookup::Failed(_) => false,
-            },
-            pvc: classify(&r.identity.pvc, &r.pvc),
-            pvc_allocation_operation_id: match &r.pvc {
-                ExactLookup::Present(pvc) => pvc
-                    .annotations()
-                    .get(SCALE_UP_ALLOCATION_ANNOTATION)
-                    .filter(|operation_id| !operation_id.is_empty())
-                    .map(OperationId::new),
-                ExactLookup::NotFound | ExactLookup::Failed(_) => None,
-            },
-            endpoint: classify(&r.identity.endpoint, &r.endpoint),
-        })
-        .collect()
-}
-
-pub(crate) fn frozen_pod_target<'a>(
-    raw: &'a RawObservation,
-    pod: &Pod,
-) -> Option<&'a ReplicaIdentity> {
-    raw.exact_resources
-        .iter()
-        .find(|r| matches(&r.identity.pod, pod))
-        .map(|r| &r.target)
-}
-
-pub(crate) fn frozen_pvc_target<'a>(
-    raw: &'a RawObservation,
-    pvc: &PersistentVolumeClaim,
-) -> Option<&'a ReplicaIdentity> {
-    raw.exact_resources
-        .iter()
-        .find(|r| matches(&r.identity.pvc, pvc))
-        .map(|r| &r.target)
 }
 
 #[cfg(test)]

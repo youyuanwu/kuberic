@@ -1,5 +1,6 @@
 //! SQLite-backed agent persistence.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -19,7 +20,7 @@ use crate::host::state::PublicOperationContainment;
 use crate::host::state::{
     AgentState, PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, PublicInstructionOutcome,
     PublicOperationDisposition, PublicOperationPreviewState, PublicOperationRecord,
-    PublicOperationStage, SCHEMA_VERSION, StorageIdentity,
+    PublicOperationStage, StorageIdentity,
 };
 use crate::host::store::{
     AgentStore, BeginPublicOperation, PublicInboundBuildAdmission, RenewPublicDataLossAttempt,
@@ -29,29 +30,31 @@ const DATABASE_FILE: &str = "agent.sqlite3";
 
 fn validate_public_v1_state(state: &AgentState) -> Result<()> {
     let preview = state.public_operation_preview.as_ref().ok_or_else(|| {
-        crate::host::HostError::Corrupt("schema-11 store lacks public-v1 preview state".into())
+        crate::host::HostError::Corrupt("replacement store lacks Public V1 state".into())
     })?;
     if !preview.identity.is_public_v1() {
         return Err(crate::host::HostError::Corrupt(
-            "schema-11 store contains another preview identity".into(),
+            "replacement store contains another protocol identity".into(),
         ));
     }
     for (operation_id, operation) in &preview.operations {
         operation.intent.validate().map_err(|message| {
             crate::host::HostError::Corrupt(format!(
-                "invalid schema-11 operation {operation_id}: {message}"
+                "invalid replacement operation {operation_id}: {message}"
             ))
         })?;
         if operation_id != &operation.intent.operation_id {
             return Err(crate::host::HostError::Corrupt(
-                "schema-11 operation key differs from its intent".into(),
+                "replacement operation key differs from its intent".into(),
             ));
         }
         operation
             .accepted_history
             .as_ref()
             .ok_or_else(|| {
-                crate::host::HostError::Corrupt("schema-11 operation lacks accepted history".into())
+                crate::host::HostError::Corrupt(
+                    "replacement operation lacks accepted history".into(),
+                )
             })?
             .validate()
             .map_err(|message| crate::host::HostError::Corrupt(message.into()))?;
@@ -60,7 +63,7 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
             .as_ref()
             .ok_or_else(|| {
                 crate::host::HostError::Corrupt(
-                    "schema-11 operation lacks accepted storage incarnation".into(),
+                    "replacement operation lacks accepted storage incarnation".into(),
                 )
             })?
             .validate()
@@ -210,16 +213,7 @@ impl SqliteStore {
         pvc_root.join(".kuberic").join(DATABASE_FILE)
     }
 
-    pub(crate) fn create_authorized(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
-        if state.public_operation_preview.is_some() {
-            return Err(crate::host::HostError::InitializationNotAuthorized(
-                "legacy store creation cannot contain public-operation preview state".into(),
-            ));
-        }
-        Self::create_store(path, state)
-    }
-
-    pub(crate) fn create_preview_bound_authorized(
+    pub(crate) fn create_replacement_authorized(
         path: impl AsRef<Path>,
         mut state: AgentState,
         binding: PreviewLifecycleBinding,
@@ -234,12 +228,12 @@ impl SqliteStore {
         }
         if state.identity.resource_uid != binding.resource_uid {
             return Err(crate::host::HostError::IdentityMismatch(
-                "preview binding resource UID differs from store identity".into(),
+                "replacement binding resource UID differs from store identity".into(),
             ));
         }
         if state.public_operation_preview.is_some() {
             return Err(crate::host::HostError::InitializationNotAuthorized(
-                "public-operation preview state is already initialized".into(),
+                "Public V1 replacement state is already initialized".into(),
             ));
         }
         state.identity.schema_version = PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION;
@@ -249,14 +243,14 @@ impl SqliteStore {
 
     fn create_store(path: impl AsRef<Path>, state: AgentState) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let expected_version = state
-            .public_operation_preview
-            .as_ref()
-            .map(|_| PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION)
-            .unwrap_or(SCHEMA_VERSION);
-        if state.identity.schema_version != expected_version {
+        if state.public_operation_preview.is_none() {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "replacement store requires Public V1 state".into(),
+            ));
+        }
+        if state.identity.schema_version != PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION {
             return Err(crate::host::HostError::SchemaMismatch {
-                expected: expected_version,
+                expected: PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
                 observed: state.identity.schema_version,
             });
         }
@@ -269,7 +263,7 @@ impl SqliteStore {
             .create_new(true)
             .open(&path)?;
         let result = (|| {
-            let mut connection = open_connection(&path)?;
+            let mut connection = open_writable_connection(&path)?;
             configure_durability(&connection)?;
             create_schema(&mut connection, &state)?;
             Ok(Self {
@@ -284,119 +278,30 @@ impl SqliteStore {
         result
     }
 
-    pub(crate) fn open_existing(
+    pub(crate) fn open_replacement_existing(
         path: impl AsRef<Path>,
         expected_identity: Option<&StorageIdentity>,
+        expected_protocol: &PublicOperationPreviewIdentity,
     ) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        if !path.is_file() {
-            return Err(crate::host::HostError::MissingEstablishedStore);
-        }
-        let connection = open_connection(&path).map_err(|error| {
-            crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
-        })?;
-        configure_durability(&connection)
-            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-        validate_integrity(&connection)
-            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
-            return Err(crate::host::HostError::SchemaMismatch {
-                expected: SCHEMA_VERSION,
-                observed: version,
-            });
-        }
-        let state = load_state_from_connection(&connection)?;
-        if state.public_operation_preview.is_some() {
+        if !expected_protocol.is_valid() {
             return Err(crate::host::HostError::InitializationNotAuthorized(
-                "legacy store opener rejected public-operation preview state".into(),
+                "invalid Public V1 protocol identity".into(),
             ));
         }
-        if state.identity.schema_version != version {
-            return Err(crate::host::HostError::SchemaMismatch {
-                expected: version,
-                observed: state.identity.schema_version,
-            });
-        }
-        if let Some(expected) = expected_identity
-            && &state.identity != expected
-        {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
-                    .into(),
-            ));
-        }
-        Ok(Self {
-            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
-            path,
-            connection: Mutex::new(connection),
-        })
-    }
-
-    pub(crate) fn open_preview_existing(
-        path: impl AsRef<Path>,
-        expected_identity: Option<&StorageIdentity>,
-        expected_preview: &PublicOperationPreviewIdentity,
-    ) -> Result<Self> {
-        if !expected_preview.is_valid() {
-            return Err(crate::host::HostError::InitializationNotAuthorized(
-                "invalid public-operation preview identity".into(),
-            ));
-        }
-        if !expected_preview.is_public_v1() {
+        if !expected_protocol.is_public_v1() {
             return Err(crate::host::HostError::InitializationNotAuthorized(
                 "replacement store requires Public V1".into(),
             ));
         }
         let path = path.as_ref().to_path_buf();
-        if !path.is_file() {
-            return Err(crate::host::HostError::MissingEstablishedStore);
-        }
-        let connection = open_connection(&path).map_err(|error| {
+        classify_replacement_store(&path, expected_protocol, None, |actual| {
+            validate_expected_identity(actual, expected_identity)
+        })?;
+        let connection = open_writable_connection(&path).map_err(|error| {
             crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
         })?;
         configure_durability(&connection)
             .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-        validate_integrity(&connection)
-            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let expected_version = PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION;
-        if version != expected_version {
-            return Err(crate::host::HostError::SchemaMismatch {
-                expected: expected_version,
-                observed: version,
-            });
-        }
-        let state = load_state_from_connection(&connection)?;
-        if state.identity.schema_version != version {
-            return Err(crate::host::HostError::SchemaMismatch {
-                expected: version,
-                observed: state.identity.schema_version,
-            });
-        }
-        if let Some(expected) = expected_identity {
-            let mut expected = expected.clone();
-            expected.schema_version = expected_version;
-            if state.identity != expected {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
-                        .into(),
-                ));
-            }
-        }
-        let Some(preview) = &state.public_operation_preview else {
-            return Err(crate::host::HostError::InitializationNotAuthorized(
-                "public-operation preview opener rejected legacy state".into(),
-            ));
-        };
-        if &preview.identity != expected_preview {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "public-operation preview identity changed".into(),
-            ));
-        }
-        if expected_preview.is_public_v1() {
-            validate_public_v1_state(&state)?;
-        }
         Ok(Self {
             #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
             path,
@@ -404,7 +309,7 @@ impl SqliteStore {
         })
     }
 
-    pub(crate) fn open_preview_bound_existing(
+    pub(crate) fn open_replacement_bound_existing(
         path: impl AsRef<Path>,
         expected_identity: Option<&StorageIdentity>,
         expected_binding: &PreviewLifecycleBinding,
@@ -412,21 +317,66 @@ impl SqliteStore {
         expected_binding.validate().map_err(|message| {
             crate::host::HostError::InitializationNotAuthorized(message.into())
         })?;
-        let store =
-            Self::open_preview_existing(path, expected_identity, &expected_binding.preview)?;
-        let state =
-            load_state_from_connection(&store.connection.lock().expect("SQLite connection lock"))?;
+        let path = path.as_ref().to_path_buf();
+        classify_replacement_store(
+            &path,
+            &expected_binding.preview,
+            Some(expected_binding),
+            |actual| validate_expected_identity(actual, expected_identity),
+        )?;
+        let connection = open_writable_connection(&path).map_err(|error| {
+            crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
+        })?;
+        configure_durability(&connection)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        Ok(Self {
+            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+            path,
+            connection: Mutex::new(connection),
+        })
+    }
+
+    pub(crate) fn open_replacement_for_process(
+        path: impl AsRef<Path>,
+        observed: &crate::host::provisioning::ObservedStorageIdentity,
+        replica_id: crate::protocol::types::ReplicaId,
+        application_storage_paths: Option<&BTreeMap<String, PathBuf>>,
+        expected_binding: &PreviewLifecycleBinding,
+    ) -> Result<Self> {
+        expected_binding.validate().map_err(|message| {
+            crate::host::HostError::InitializationNotAuthorized(message.into())
+        })?;
+        let path = path.as_ref().to_path_buf();
+        let state = classify_replacement_store(
+            &path,
+            &expected_binding.preview,
+            Some(expected_binding),
+            |actual| {
+                crate::host::provisioning::validate_established_identity(
+                    actual, observed, replica_id,
+                )
+            },
+        )?;
         if state
-            .public_operation_preview
+            .application_storage
             .as_ref()
-            .and_then(|preview| preview.binding.as_ref())
-            != Some(expected_binding)
+            .map(|binding| &binding.paths)
+            != application_storage_paths
         {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "preview lifecycle binding or persistence classification changed".into(),
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "application storage paths differ from the authorized agent binding".into(),
             ));
         }
-        Ok(store)
+        let connection = open_writable_connection(&path).map_err(|error| {
+            crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
+        })?;
+        configure_durability(&connection)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        Ok(Self {
+            #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
+            path,
+            connection: Mutex::new(connection),
+        })
     }
 
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
@@ -558,7 +508,9 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
-                crate::host::HostError::CommandRejected("public-v1 preview store required".into())
+                crate::host::HostError::CommandRejected(
+                    "Public V1 replacement store required".into(),
+                )
             })?;
             if !preview.identity.is_public_v1()
                 || initialization_id.is_empty()
@@ -618,7 +570,7 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
-                crate::host::HostError::CommandRejected("public-v1 preview store required".into())
+                crate::host::HostError::CommandRejected("Public V1 replacement store required".into())
             })?;
             if !preview.identity.is_public_v1()
                 || preview.history.as_ref() != Some(&next.required.history)
@@ -1225,7 +1177,7 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
-                crate::host::HostError::CommandRejected("preview store required".into())
+                crate::host::HostError::CommandRejected("replacement store required".into())
             })?;
             if preview.identity != intent.preview {
                 return Err(crate::host::HostError::IdentityMismatch(
@@ -1681,13 +1633,13 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let preview = state.public_operation_preview.as_mut().ok_or_else(|| {
-                crate::host::HostError::CommandRejected("preview store required".into())
+                crate::host::HostError::CommandRejected("replacement store required".into())
             })?;
             let record = preview
                 .operations
                 .get_mut(&intent.operation_id)
                 .ok_or_else(|| {
-                    crate::host::HostError::CommandRejected("unknown preview operation".into())
+                    crate::host::HostError::CommandRejected("unknown replacement operation".into())
                 })?;
             if &record.intent != intent
                 || preview.identity != intent.preview
@@ -2271,7 +2223,113 @@ fn valid_public_operation_transition(
     )
 }
 
-fn open_connection(path: &Path) -> Result<Connection> {
+fn validate_expected_identity(
+    actual: &StorageIdentity,
+    expected: Option<&StorageIdentity>,
+) -> Result<()> {
+    if let Some(expected) = expected {
+        let mut expected = expected.clone();
+        expected.schema_version = PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION;
+        if actual != &expected {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "resource, Pod, PVC, replica incarnation, generation, or initialization changed"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn classify_replacement_store(
+    path: &Path,
+    expected_protocol: &PublicOperationPreviewIdentity,
+    expected_binding: Option<&PreviewLifecycleBinding>,
+    validate_identity: impl FnOnce(&StorageIdentity) -> Result<()>,
+) -> Result<AgentState> {
+    if !path.is_file() {
+        return Err(crate::host::HostError::MissingEstablishedStore);
+    }
+    let version = read_schema_version_immutable(path).map_err(|error| {
+        crate::host::HostError::Corrupt(format!(
+            "cannot classify existing SQLite metadata: {error}"
+        ))
+    })?;
+    if version != PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION {
+        return Err(crate::host::HostError::SchemaMismatch {
+            expected: PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
+            observed: version,
+        });
+    }
+    let connection = open_read_only_connection(path).map_err(|error| {
+        crate::host::HostError::Corrupt(format!(
+            "cannot validate replacement SQLite metadata: {error}"
+        ))
+    })?;
+    let state = load_state_from_connection(&connection)?;
+    if state.identity.schema_version != version {
+        return Err(crate::host::HostError::SchemaMismatch {
+            expected: version,
+            observed: state.identity.schema_version,
+        });
+    }
+    validate_identity(&state.identity)?;
+    let replacement = state.public_operation_preview.as_ref().ok_or_else(|| {
+        crate::host::HostError::InitializationNotAuthorized(
+            "replacement store lacks Public V1 state".into(),
+        )
+    })?;
+    if &replacement.identity != expected_protocol {
+        return Err(crate::host::HostError::IdentityMismatch(
+            "Public V1 protocol identity changed".into(),
+        ));
+    }
+    if let Some(expected_binding) = expected_binding
+        && replacement.binding.as_ref() != Some(expected_binding)
+    {
+        return Err(crate::host::HostError::IdentityMismatch(
+            "Public V1 lifecycle binding changed".into(),
+        ));
+    }
+    validate_public_v1_state(&state)?;
+    validate_integrity(&connection)
+        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+    Ok(state)
+}
+
+fn read_schema_version_immutable(path: &Path) -> Result<u32> {
+    let connection = open_read_only_connection_with_immutable(path, true)?;
+    Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+fn open_read_only_connection(path: &Path) -> Result<Connection> {
+    open_read_only_connection_with_immutable(path, false)
+}
+
+fn open_read_only_connection_with_immutable(path: &Path, immutable: bool) -> Result<Connection> {
+    let absolute = std::path::absolute(path)?;
+    let mut encoded = String::new();
+    for byte in absolute.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    let uri = if immutable {
+        format!("file:{encoded}?mode=ro&immutable=1")
+    } else {
+        format!("file:{encoded}?mode=ro")
+    };
+    Ok(Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?)
+}
+
+fn open_writable_connection(path: &Path) -> Result<Connection> {
     Ok(Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -2352,7 +2410,7 @@ mod tests {
 
     fn identity() -> StorageIdentity {
         StorageIdentity {
-            schema_version: SCHEMA_VERSION,
+            schema_version: crate::host::state::SCHEMA_VERSION,
             resource_uid: ResourceUid::new("scale-up-set"),
             pod_uid: PodUid::new("scale-up-pod"),
             pvc_uid: PvcUid::new("scale-up-pvc"),
@@ -2378,7 +2436,7 @@ mod tests {
             spec_generation: 1,
             state_persistence: crate::protocol::public_operations::StatePersistence::Persisted,
         };
-        let store = SqliteStore::create_preview_bound_authorized(
+        let store = SqliteStore::create_replacement_authorized(
             &path,
             AgentState::new(identity()),
             binding.clone(),
@@ -2458,7 +2516,8 @@ mod tests {
         drop(store);
 
         let reopened =
-            SqliteStore::open_preview_bound_existing(&path, Some(&identity()), &binding).unwrap();
+            SqliteStore::open_replacement_bound_existing(&path, Some(&identity()), &binding)
+                .unwrap();
         assert_eq!(
             reopened
                 .public_v1_terminal_inbound_build_receipt(&authority.attempt.build_id)
@@ -2478,23 +2537,5 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    #[test]
-    fn narrow_completion_schema_six_rejects_schema_five_without_migration() {
-        let directory = crate::host::tests::tempdir().unwrap();
-        let path = SqliteStore::metadata_database_path(directory.path());
-        let expected = identity();
-        drop(SqliteStore::create_authorized(&path, AgentState::new(expected.clone())).unwrap());
-        let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 5).unwrap();
-        drop(connection);
-        assert!(matches!(
-            SqliteStore::open_existing(&path, Some(&expected)),
-            Err(crate::host::HostError::SchemaMismatch {
-                expected: 6,
-                observed: 5
-            })
-        ));
     }
 }

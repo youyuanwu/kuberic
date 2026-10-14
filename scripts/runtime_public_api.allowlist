@@ -16,9 +16,7 @@ page:application/type.Lsn.html
 page:application/type.OperationData.html
 page:application/type.OperationDataStream.html
 page:control/convert/enum.WireError.html
-page:control/convert/fn.configuration_command_to_proto.html
 page:control/convert/fn.ensure_supported_version.html
-page:control/convert/fn.normalize_agent_status_report.html
 page:control/convert/fn.normalize_copy_ack.html
 page:control/convert/fn.normalize_copy_item.html
 page:control/convert/fn.normalize_execute_request.html
@@ -28,7 +26,6 @@ page:control/convert/fn.normalize_replication_item.html
 page:control/convert/fn.public_v1_agent_status_to_proto.html
 page:control/convert/fn.public_v1_history_command_to_proto.html
 page:control/convert/fn.public_v1_operation_command_to_proto.html
-page:control/convert/fn.validate_agent_status_report.html
 page:control/convert/fn.validate_copy_ack.html
 page:control/convert/fn.validate_copy_item.html
 page:control/convert/fn.validate_execute_request.html
@@ -180,14 +177,12 @@ page:protocol/command/enum.SafetyChange.html
 page:protocol/command/enum.ScaleDownResource.html
 page:protocol/command/index.html
 page:protocol/command/struct.AcceptSecondaryRemovalCommit.html
-page:protocol/command/struct.DropReplicaIncarnation.html
 page:protocol/command/struct.EnsureConfiguration.html
 page:protocol/command/struct.EnsureReplicaBuild.html
 page:protocol/command/struct.InitializeAgentStore.html
 page:protocol/command/struct.PrepareSecondaryRemoval.html
 page:protocol/command/struct.PrepareSwitchover.html
 page:protocol/command/struct.PublicV1OperationCommand.html
-page:protocol/command/struct.RestartReplicaProcess.html
 page:protocol/command/struct.RetireReplica.html
 page:protocol/constant.PROTOCOL_VERSION.html
 page:protocol/index.html

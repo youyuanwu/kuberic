@@ -1,4 +1,4 @@
-use kuberic_controller::crd::KubericSetStatus;
+use kuberic_controller::crd::{KubericSetStatus, PublicV1AuthorityStatus};
 use kuberic_runtime::control::{normalize_public_v1_agent_status_report, proto};
 use kuberic_runtime::protocol::public_operations::{
     PublicOperationPreviewIdentity, PublicV1AcceptedStatus,
@@ -35,14 +35,16 @@ fn old_and_partial_controller_inputs_reject_without_mutation() {
 
 #[test]
 fn old_and_partial_controller_status_reject_without_mutation() {
-    let mut old = KubericSetStatus::default();
-    old.authority.initialized = true;
-    let old_before = old.clone();
-    assert!(old.validate_public_v1().is_err());
-    assert_eq!(old, old_before);
+    assert!(
+        serde_json::from_value::<KubericSetStatus>(serde_json::json!({
+            "initialized": true,
+            "observedGeneration": 1
+        }))
+        .is_err()
+    );
 
     let partial = KubericSetStatus {
-        public_v1_authority: Some(PublicV1AcceptedStatus {
+        public_v1_authority: Some(PublicV1AuthorityStatus {
             identity: PublicOperationPreviewIdentity::public_v1(1),
             history_initialization_id: HistoryInitializationId::new(""),
             history: HistoryContext {
@@ -51,9 +53,21 @@ fn old_and_partial_controller_status_reject_without_mutation() {
                 history_id: HistoryId::new(""),
                 data_loss_number: 0,
             },
-            data_loss_recovery: None,
-            completed_operations: Vec::new(),
-            extensions: Default::default(),
+            completed_operation_count: 0,
+            canonical_authority_json: serde_json::to_string(&PublicV1AcceptedStatus {
+                identity: PublicOperationPreviewIdentity::public_v1(1),
+                history_initialization_id: HistoryInitializationId::new("different"),
+                history: HistoryContext {
+                    resource_uid: ResourceUid::new("resource-1"),
+                    protocol_generation: PublicProtocolGeneration::new(1),
+                    history_id: HistoryId::new("different"),
+                    data_loss_number: 0,
+                },
+                data_loss_recovery: None,
+                completed_operations: Vec::new(),
+                extensions: Default::default(),
+            })
+            .unwrap(),
         }),
         ..Default::default()
     };

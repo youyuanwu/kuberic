@@ -84,7 +84,7 @@ impl InitializationService {
         self
     }
 
-    pub(crate) fn with_stateless_preview(
+    pub(crate) fn with_replacement_binding(
         mut self,
         binding: Option<PreviewLifecycleBinding>,
     ) -> Self {
@@ -229,7 +229,7 @@ impl InitializationService {
         let binding = self.binding.as_ref().ok_or_else(|| {
             Status::failed_precondition("Public V1 lifecycle binding is required")
         })?;
-        match SqliteStore::create_preview_bound_authorized(
+        match SqliteStore::create_replacement_authorized(
             &self.database_path,
             state,
             binding.clone(),
@@ -238,7 +238,7 @@ impl InitializationService {
             Err(crate::host::HostError::Io(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
             {
-                SqliteStore::open_preview_bound_existing(
+                SqliteStore::open_replacement_bound_existing(
                     &self.database_path,
                     Some(&identity),
                     binding,
@@ -370,7 +370,7 @@ where
         self.session.id()
     }
 
-    pub(crate) async fn public_operation_preview_runtime(
+    pub(crate) async fn public_operation_runtime(
         &self,
         preview: crate::protocol::public_operations::PublicOperationPreviewIdentity,
     ) -> Result<Arc<crate::host::operation::PartitionOperationRegistry>> {
@@ -387,7 +387,7 @@ where
         let runtime =
             crate::host::operation_recovery::PartitionOperationRuntime::start(registry.clone());
         self.runtime
-            .bind_public_fault_preview(
+            .bind_public_fault_runtime(
                 self.store.clone(),
                 registry.clone(),
                 preview,
@@ -443,11 +443,11 @@ where
             )
         })?;
         self.runtime
-            .refresh_stateless_preview_projection(self.store.as_ref(), self.session.id(), false)
+            .refresh_replacement_projection(self.store.as_ref(), self.session.id(), false)
             .await?;
         let projection = self
             .runtime
-            .stateless_preview_report_projection(
+            .replacement_report_projection(
                 self.session.id().clone(),
                 self.report_sequence.fetch_add(1, Ordering::Relaxed),
             )
@@ -474,7 +474,7 @@ where
             intent.program,
             Some(PublicOperationProgram::Progress { .. } | PublicOperationProgram::Build(_))
         ) {
-            self.runtime.fence_stateless_preview_access().await;
+            self.runtime.fence_replacement_access().await;
         }
         let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
         if open_program {
@@ -508,7 +508,7 @@ where
             )));
         }
         if open_program {
-            self.runtime.complete_stateless_preview_open().await;
+            self.runtime.complete_replacement_open().await;
             if self
                 .store
                 .load_state()
@@ -522,7 +522,7 @@ where
         }
         if !terminal_program {
             self.runtime
-                .refresh_stateless_preview_projection(self.store.as_ref(), self.session.id(), true)
+                .refresh_replacement_projection(self.store.as_ref(), self.session.id(), true)
                 .await?;
         }
         Ok(())
@@ -577,7 +577,7 @@ where
         let callbacks = self.runtime.public_lifecycle_callbacks()?;
         let next = match &command {
             PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. } => {
-                self.runtime.fence_stateless_preview_access().await;
+                self.runtime.fence_replacement_access().await;
                 if let Some(registry) = self.registry.get() {
                     registry.fence();
                 }
@@ -668,11 +668,6 @@ where
                 self.execute_public_intent(command.intent)
                     .await
                     .map_err(status_from_agent)?;
-            }
-            _ => {
-                return Err(Status::failed_precondition(
-                    "legacy continuation commands are not supported",
-                ));
             }
         }
         Ok(proto::ExecuteCommandResponse {

@@ -46,7 +46,7 @@ struct RegisteredReplicator {
     primary: Option<Arc<dyn PrimaryReplicator>>,
     identity: ReplicatorCreationIdentity,
     callback_containment: Option<tokio::sync::watch::Receiver<bool>>,
-    stateless_preview_control: Option<Arc<dyn crate::replicator::StatelessPreviewControl>>,
+    stateless_runtime_control: Option<Arc<dyn crate::replicator::StatelessRuntimeControl>>,
     capabilities: ReplicatorCapabilities,
     provider: Option<Arc<dyn StateProvider>>,
     provider_writer_lease_consumed: Arc<AtomicBool>,
@@ -108,10 +108,10 @@ struct RuntimeHost {
     replicator_creation: StdMutex<ReplicatorCreationState>,
     aborted: AtomicBool,
     closed: AtomicBool,
-    preview_fault_fenced: AtomicBool,
-    preview_authority_fenced: AtomicBool,
-    preview_ambiguity_fenced: AtomicBool,
-    preview_fault_bridge: Mutex<Option<Arc<PreviewFaultBridge>>>,
+    replacement_fault_fenced: AtomicBool,
+    replacement_authority_fenced: AtomicBool,
+    replacement_ambiguity_fenced: AtomicBool,
+    replacement_fault_bridge: Mutex<Option<Arc<ReplacementFaultBridge>>>,
 }
 
 struct DeferredReplicator {
@@ -213,7 +213,7 @@ impl Drop for PodRuntime {
 }
 
 impl PodRuntime {
-    pub(crate) fn new_stateless_preview<A, S>(
+    pub(crate) fn new_replacement<A, S>(
         identity: ReplicaIdentity,
         application: Arc<A>,
         _store: Arc<S>,
@@ -245,10 +245,10 @@ impl PodRuntime {
                 replicator_creation: StdMutex::new(ReplicatorCreationState::Available),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
-                preview_fault_fenced: AtomicBool::new(false),
-                preview_authority_fenced: AtomicBool::new(false),
-                preview_ambiguity_fenced: AtomicBool::new(false),
-                preview_fault_bridge: Mutex::new(None),
+                replacement_fault_fenced: AtomicBool::new(false),
+                replacement_authority_fenced: AtomicBool::new(false),
+                replacement_ambiguity_fenced: AtomicBool::new(false),
+                replacement_fault_bridge: Mutex::new(None),
                 replica_session: OnceLock::new(),
             }),
         }
@@ -355,7 +355,7 @@ impl PodRuntime {
         })
     }
 
-    pub(crate) async fn refresh_stateless_preview_projection(
+    pub(crate) async fn refresh_replacement_projection(
         &self,
         store: &dyn crate::host::store::AgentStore,
         process_session: &ProcessSessionId,
@@ -476,17 +476,23 @@ impl PodRuntime {
                         member.identity == self.host.identity && member.role == selected_role
                     })
             });
-        let ambiguity_fenced = self.host.preview_ambiguity_fenced.load(Ordering::Acquire);
+        let ambiguity_fenced = self
+            .host
+            .replacement_ambiguity_fenced
+            .load(Ordering::Acquire);
         if allow_reopen && candidate_ready && !ambiguity_fenced {
             self.host
-                .preview_authority_fenced
+                .replacement_authority_fenced
                 .store(false, Ordering::Release);
         }
         let ready = candidate_ready
             && applied == committed
             && !ambiguity_fenced
-            && !self.host.preview_authority_fenced.load(Ordering::Acquire)
-            && !self.host.preview_fault_fenced.load(Ordering::Acquire);
+            && !self
+                .host
+                .replacement_authority_fenced
+                .load(Ordering::Acquire)
+            && !self.host.replacement_fault_fenced.load(Ordering::Acquire);
         let (role, read_status, write_status) = if ready {
             match selected_role {
                 ReplicaRole::Primary => {
@@ -528,42 +534,42 @@ impl PodRuntime {
         }) as usize
     }
 
-    pub(crate) async fn fence_stateless_preview_access(&self) {
+    pub(crate) async fn fence_replacement_access(&self) {
         self.host
-            .preview_authority_fenced
+            .replacement_authority_fenced
             .store(true, Ordering::Release);
         let mut state = self.host.state.write().await;
         state.projection.read_status = AccessStatus::NotPrimary;
         state.projection.write_status = AccessStatus::NotPrimary;
     }
 
-    pub(crate) async fn complete_stateless_preview_open(&self) {
+    pub(crate) async fn complete_replacement_open(&self) {
         self.host.state.write().await.projection.open = true;
     }
 
-    pub(crate) async fn install_stateless_preview_inbound_build_authority(
+    pub(crate) async fn install_replacement_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
         self.host
             .registered
             .get()
-            .and_then(|registered| registered.stateless_preview_control.clone())
+            .and_then(|registered| registered.stateless_runtime_control.clone())
             .ok_or(RuntimeError::NotOpen)?
             .install_inbound_build_authority(authority)
             .await
     }
 
-    pub(crate) fn stateless_preview_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
+    pub(crate) fn replacement_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
         self.host
             .registered
             .get()
-            .and_then(|registered| registered.stateless_preview_control.clone())
+            .and_then(|registered| registered.stateless_runtime_control.clone())
             .ok_or(RuntimeError::NotOpen)
             .map(|control| control.raw_retained_task_cardinality())
     }
 
-    pub(crate) async fn stateless_preview_report_projection(
+    pub(crate) async fn replacement_report_projection(
         &self,
         process_session_id: ProcessSessionId,
         report_sequence: u64,
@@ -600,20 +606,20 @@ impl PodRuntime {
         })
     }
 
-    pub(crate) async fn bind_public_fault_preview(
+    pub(crate) async fn bind_public_fault_runtime(
         &self,
         store: Arc<dyn crate::host::store::AgentStore>,
         registry: Arc<crate::host::operation::PartitionOperationRegistry>,
         preview: PublicOperationPreviewIdentity,
         process_session: ProcessSessionId,
     ) -> Result<()> {
-        let mut bridge = self.host.preview_fault_bridge.lock().await;
+        let mut bridge = self.host.replacement_fault_bridge.lock().await;
         if bridge.is_some() {
             return Err(RuntimeError::Application(
                 "public fault runtime is already bound".into(),
             ));
         }
-        *bridge = Some(Arc::new(PreviewFaultBridge {
+        *bridge = Some(Arc::new(ReplacementFaultBridge {
             store,
             registry,
             preview,
@@ -641,7 +647,7 @@ impl PodRuntime {
             .map_err(|_| RuntimeError::AuthorityNotAdmitted)
     }
 
-    pub(crate) fn stateless_preview_replicator_creation_id(
+    pub(crate) fn replacement_replicator_creation_id(
         &self,
     ) -> Result<crate::protocol::types::ReplicatorCreationId> {
         Ok(self
@@ -716,7 +722,7 @@ struct HostAccessView {
     partition_information: PartitionInformation,
 }
 
-struct PreviewFaultBridge {
+struct ReplacementFaultBridge {
     store: Arc<dyn crate::host::store::AgentStore>,
     registry: Arc<crate::host::operation::PartitionOperationRegistry>,
     preview: PublicOperationPreviewIdentity,
@@ -724,7 +730,7 @@ struct PreviewFaultBridge {
     admission: Mutex<()>,
 }
 
-impl PreviewFaultBridge {
+impl ReplacementFaultBridge {
     fn fence(&self) {
         self.registry.fence();
     }
@@ -812,7 +818,7 @@ impl PartitionAccessView for HostAccessView {
 
     async fn read_status(&self) -> Result<AccessStatus> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        if host.preview_fault_fenced.load(Ordering::Acquire) {
+        if host.replacement_fault_fenced.load(Ordering::Acquire) {
             return Ok(AccessStatus::NotPrimary);
         }
         Ok(host.state.read().await.projection.read_status)
@@ -820,13 +826,13 @@ impl PartitionAccessView for HostAccessView {
 
     async fn write_status(&self) -> Result<AccessStatus> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        if host.preview_fault_fenced.load(Ordering::Acquire) {
+        if host.replacement_fault_fenced.load(Ordering::Acquire) {
             return Ok(AccessStatus::NotPrimary);
         }
         Ok(host.state.read().await.projection.write_status)
     }
 
-    async fn publish_preview_progress(
+    async fn publish_replacement_progress(
         &self,
         applied_lsn: i64,
         committed_lsn: i64,
@@ -836,12 +842,12 @@ impl PartitionAccessView for HostAccessView {
         if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        host.preview_ambiguity_fenced
+        host.replacement_ambiguity_fenced
             .store(ambiguous, Ordering::Release);
         let fenced = ambiguous
             || applied_lsn != committed_lsn
-            || host.preview_authority_fenced.load(Ordering::Acquire)
-            || host.preview_fault_fenced.load(Ordering::Acquire);
+            || host.replacement_authority_fenced.load(Ordering::Acquire)
+            || host.replacement_fault_fenced.load(Ordering::Acquire);
         let mut state = host.state.write().await;
         state.projection.current_progress = applied_lsn;
         state.projection.committed_lsn = committed_lsn;
@@ -859,7 +865,7 @@ impl PartitionAccessView for HostAccessView {
         Ok(())
     }
 
-    async fn preview_inbound_build_authority(
+    async fn replacement_inbound_build_authority(
         &self,
         build_id: &OperationId,
     ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
@@ -871,7 +877,7 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
-    async fn classify_preview_inbound_build_authority(
+    async fn classify_replacement_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<crate::host::store::PublicInboundBuildAdmission> {
@@ -883,7 +889,7 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
-    async fn install_preview_inbound_build_authority(
+    async fn install_replacement_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
@@ -895,7 +901,7 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
-    async fn preview_terminal_inbound_build_receipt(
+    async fn replacement_terminal_inbound_build_receipt(
         &self,
         build_id: &OperationId,
     ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildReceipt>> {
@@ -907,7 +913,7 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
-    async fn revoke_preview_inbound_build_authority(&self) -> Result<()> {
+    async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
         self.bridge()
             .await?
             .store
@@ -916,7 +922,7 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
-    async fn preview_outbound_build_authority(
+    async fn replacement_outbound_build_authority(
         &self,
         build_id: &OperationId,
         current_configuration_id: &crate::protocol::types::ConfigurationId,
@@ -929,7 +935,7 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
-    async fn complete_preview_inbound_build(
+    async fn complete_replacement_inbound_build(
         &self,
         receipt: &crate::protocol::public_operations::PublicInboundBuildReceipt,
     ) -> Result<()> {
@@ -941,7 +947,7 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
-    async fn preview_storage_is_retired(
+    async fn replacement_storage_is_retired(
         &self,
         storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
     ) -> Result<bool> {
@@ -985,10 +991,10 @@ impl PartitionAccessView for HostAccessView {
 
     async fn report_fault(&self, fault: FaultType) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        let bridge = host.preview_fault_bridge.lock().await.clone();
+        let bridge = host.replacement_fault_bridge.lock().await.clone();
         if let Some(bridge) = &bridge {
             bridge.fence();
-            host.preview_fault_fenced.store(true, Ordering::Release);
+            host.replacement_fault_fenced.store(true, Ordering::Release);
         }
         {
             let mut state = host.state.write().await;
@@ -1013,9 +1019,9 @@ impl PartitionAccessView for HostAccessView {
 }
 
 impl HostAccessView {
-    async fn bridge(&self) -> Result<Arc<PreviewFaultBridge>> {
+    async fn bridge(&self) -> Result<Arc<ReplacementFaultBridge>> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        host.preview_fault_bridge
+        host.replacement_fault_bridge
             .lock()
             .await
             .clone()
@@ -1098,8 +1104,8 @@ impl ReplicatorRegistration for RuntimeHost {
                 primary: attachment.primary_replicator(RuntimeHostToken::new()),
                 identity: *identity,
                 callback_containment: attachment.callback_containment(RuntimeHostToken::new()),
-                stateless_preview_control: attachment
-                    .stateless_preview_control(RuntimeHostToken::new()),
+                stateless_runtime_control: attachment
+                    .stateless_runtime_control(RuntimeHostToken::new()),
                 capabilities: attachment.capabilities(RuntimeHostToken::new()),
                 provider,
                 provider_writer_lease_consumed,

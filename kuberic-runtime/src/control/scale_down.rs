@@ -183,64 +183,6 @@ fn access_proto(value: AccessStatus) -> i32 {
     }) as i32
 }
 
-pub(crate) fn configuration_from_proto(
-    value: proto::EnsureConfigurationCommand,
-) -> Result<crate::protocol::command::EnsureConfiguration, WireError> {
-    if value.grant_write
-        || !value.retire_build_id.is_empty()
-        || !value.retire_build_ids.is_empty()
-        || value.switchover_handoff.is_some()
-        || !value.retire_switchover_preparation_ids.is_empty()
-        || value.scale_up_evidence.is_some()
-    {
-        return Err(WireError::InvalidAuthority(
-            "removal cannot carry write grants or unrelated retirements".into(),
-        ));
-    }
-    let command = crate::protocol::command::EnsureConfiguration {
-        operation_id: OperationId::new(value.operation_id),
-        previous_configuration: value
-            .previous_configuration
-            .map(TryInto::try_into)
-            .transpose()?,
-        current_configuration: required(
-            value.current_configuration,
-            "ensure.current_configuration",
-        )?
-        .try_into()?,
-        previous_epoch: value.previous_epoch.map(Into::into),
-        current_epoch: required(value.current_epoch, "ensure.current_epoch")?.into(),
-        effective_policy: policy_from_proto(required(
-            value.effective_policy,
-            "ensure.effective_policy",
-        )?)?,
-        previous_policy: Some(policy_from_proto(required(
-            value.previous_policy,
-            "ensure.previous_policy",
-        )?)?),
-        secondary_removal_evidence: Some(
-            required(
-                value.secondary_removal_evidence,
-                "ensure.secondary_removal_evidence",
-            )?
-            .try_into()?,
-        ),
-        scale_up_evidence: None,
-        local_replica_id: ReplicaId::new(value.local_replica_id),
-        expected_instance_id: ReplicaInstanceId::new(value.expected_instance_id),
-        expected_agent_generation: AgentGeneration::new(value.expected_agent_generation),
-        transition_kind: TransitionKind::SecondaryScaleDown,
-        failover_safe_lsn: value.failover_safe_lsn,
-        primary_write_status: access(value.primary_write_status)?,
-        current_only: value.current_only,
-        retire_build_ids: Vec::new(),
-        switchover_handoff: None,
-        retire_switchover_preparation_ids: Vec::new(),
-    };
-    validate_secondary_removal_configuration(&command).map_err(authority)?;
-    Ok(command)
-}
-
 impl From<SecondaryRemovalWitness> for proto::SecondaryRemovalWitness {
     fn from(value: SecondaryRemovalWitness) -> Self {
         Self {

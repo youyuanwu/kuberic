@@ -13,10 +13,8 @@ fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
 
     let inventory = kuberic_runtime::testing::replacement_ownership_inventory();
     kuberic_runtime::testing::validate_replacement_ownership_inventory(&inventory).unwrap();
-    let mut mutation = inventory;
-    mutation
-        .grpc_services
-        .push("differently-named-extra-endpoint");
+    let mutation =
+        kuberic_runtime::testing::replacement_ownership_inventory_with_extra_endpoint_fixture();
     assert!(
         kuberic_runtime::testing::validate_replacement_ownership_inventory(&mutation).is_err(),
         "KSF-16 mutation oracle accepted an extra owner/endpoint"

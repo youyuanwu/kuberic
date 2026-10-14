@@ -1,25 +1,34 @@
+#[cfg(feature = "runtime-test-bridge")]
 use std::collections::BTreeMap;
+#[cfg(feature = "runtime-test-bridge")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::host::ReplicaHandle;
+use kuberic_runtime::protocol::command::ProtocolCommand;
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::command::{
-    ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
-    PublicV1SessionRenewalCommand,
+    PublicV1HistoryCommand, PublicV1OperationCommand, PublicV1SessionRenewalCommand,
 };
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::public_operations::{
     PublicBuildAttemptReference, PublicConfiguration, PublicInboundBuildAuthority,
-    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1AcceptedStatus,
-    PublicV1AgentReport, PublicV1CallKind, PublicV1SessionRenewalStatus,
+    PublicOperationClass, PublicV1AcceptedStatus, PublicV1SessionRenewalStatus,
 };
+use kuberic_runtime::protocol::public_operations::{
+    PublicOperationIntent, PublicOperationProgram, PublicV1AgentReport, PublicV1CallKind,
+};
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::types::{OperationId, ReplicaIdentity};
 
+use super::PublicV1Scope;
+#[cfg(feature = "runtime-test-bridge")]
 use super::{
-    PublicV1EvidenceApi, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1Scope,
-    PublicV1SessionRenewalApi,
+    PublicV1EvidenceApi, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1SessionRenewalApi,
 };
-use crate::evaluator::public_v1_evidence::{
-    PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
-};
+use crate::evaluator::public_v1_evidence::PublicV1AcceptedTransitionStatus;
+#[cfg(feature = "runtime-test-bridge")]
+use crate::evaluator::public_v1_evidence::PublicV1ResourceAuthority;
 
 #[async_trait::async_trait]
 pub trait PublicV1OperationApi: Send + Sync {
@@ -43,12 +52,14 @@ pub trait PublicV1OperationApi: Send + Sync {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "runtime-test-bridge")]
 pub struct HostedPreviewReplica {
     pub identity: ReplicaIdentity,
     pub replication_address: String,
     pub handle: ReplicaHandle,
 }
 
+#[cfg(feature = "runtime-test-bridge")]
 pub struct HostedPublicV1Adapter {
     replicas: Vec<HostedPreviewReplica>,
     history: Mutex<Option<PublicV1AcceptedStatus>>,
@@ -59,6 +70,7 @@ pub struct HostedPublicV1Adapter {
     suboperation_cut: Mutex<Option<usize>>,
 }
 
+#[cfg(feature = "runtime-test-bridge")]
 impl HostedPublicV1Adapter {
     pub fn new(
         replicas: Vec<HostedPreviewReplica>,
@@ -503,6 +515,7 @@ impl HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "runtime-test-bridge")]
 impl PublicV1OperationApi for HostedPublicV1Adapter {
     async fn observe_public_v1_operation(
         &self,
@@ -741,6 +754,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "runtime-test-bridge")]
 impl PublicV1HistoryApi for HostedPublicV1Adapter {
     async fn observe_public_v1_status(
         &self,
@@ -809,6 +823,7 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "runtime-test-bridge")]
 impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
     async fn observe_public_v1_session_renewal(
         &self,
@@ -885,6 +900,7 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "runtime-test-bridge")]
 impl PublicV1EvidenceApi for HostedPublicV1Adapter {
     async fn observe_public_v1_evidence_status(
         &self,

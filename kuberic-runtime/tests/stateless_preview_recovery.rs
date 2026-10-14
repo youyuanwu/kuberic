@@ -2624,13 +2624,27 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
         let root = test_root("crossed");
         let resource_uid = ResourceUid::new("preview-crossed");
         let database = SqliteStore::metadata_database_path(&root);
-        drop(
-            SqliteStore::create_authorized(
-                &database,
-                AgentState::new(store_identity(resource_uid.clone())),
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE agent_state (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    state_json TEXT NOT NULL
+                 );",
             )
-            .unwrap(),
-        );
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_state(singleton, state_json) VALUES(1, ?1)",
+                [
+                    serde_json::to_string(&AgentState::new(store_identity(resource_uid.clone())))
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 6).unwrap();
+        drop(connection);
         let replication_address = free_address();
         let preview = PublicOperationPreviewIdentity::public_v1(2);
         let binding = PreviewLifecycleBinding {
