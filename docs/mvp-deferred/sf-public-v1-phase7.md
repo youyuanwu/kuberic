@@ -7,17 +7,17 @@
 
 ### P7D-01: Image publication and production cutover
 - Status: DEFERRED
-- Reason: Phase 7A proves the exact replacement-only artifact and its unapplied manifests. Publishing and activating that artifact are irreversible operational actions requiring separate approval and fresh deployment state.
-- MVP alternative: Produce digest-addressed OCI layouts, a digest-pinned deployment overlay and verification evidence without publishing or applying them.
+- Reason: Phase 7A proves the exact replacement-only artifact by applying its generated test overlay only to a disposable owned verification cluster. Publishing or applying it elsewhere and activating it in production are irreversible operational actions requiring separate approval and fresh deployment state.
+- MVP alternative: Produce digest-addressed OCI layouts, a digest-pinned deployment overlay and verification evidence; permit application only in the disposable owned verification cluster, without image publication, cutover Lease acquisition, production mutation, destructive storage action or traffic enablement.
 - Revisit when: A separate explicit irreversible-cutover approval confirms required application exports completed or no old data is retained, and fresh controller, agent, application, namespace and resource state is ready.
-- Evidence: `docs/features/kuberic/stateless-default-replicator.md` separates replacement artifact finalization from the offline atomic cutover; `.paw/work/sf-public-v1-phase7/Spec.md` excludes every Phase 7B activation action.
+- Evidence: `docs/features/kuberic/stateless-default-replicator.md` separates replacement artifact finalization and test validation from the offline atomic production cutover; `docs/features/kuberic/service-fabric-alignment.md` requires an explicit irreversible approval before activation.
 
 ### P7D-02: Old-state migration and rolling compatibility
 - Status: DEFERRED
-- Reason: The replacement-only release is validated from fresh state and intentionally rejects every legacy and preview store rather than interpreting or enrolling it.
-- MVP alternative: Initialize only the replacement schema and fail closed on old controller, agent and application state.
+- Reason: The replacement-only release is validated from fresh state and intentionally rejects old controller and agent state plus every supported in-repository provider format rather than interpreting or enrolling it. Independent custom Replicators own classification and rejection of their provider storage because the protected public interfaces expose no generic storage-format introspection.
+- MVP alternative: Initialize only the replacement schema, fail closed on old controller/agent and supported-provider state, and require each independent custom Replicator to reject its own prior provider storage before participation.
 - Revisit when: A production adoption requirement explicitly requires retained data, backup restoration, enrollment, rolling upgrades or mixed-version operation.
-- Evidence: `docs/features/kuberic/stateless-default-replicator.md` defines fresh-storage activation and excludes preservation or rolling migration; Phase 7A acceptance requires rejection of schemas 6, 7 and 11.
+- Evidence: `docs/features/kuberic/stateless-default-replicator.md` defines fresh-storage activation, provider-owned application durability and no generic migration contract; `docs/features/kuberic/service-fabric-alignment.md` excludes preservation and mixed-version operation.
 
 ### P7D-03: Public V1 transport authentication or peer authorization
 - Status: DEFERRED
