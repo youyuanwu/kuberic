@@ -302,8 +302,12 @@ impl PublicV1SessionRenewalCommand {
 
     pub fn expected_endpoint(&self) -> &crate::protocol::types::ProcessSessionEndpoint {
         match self {
-            Self::CloseAccessAndIngress { accepted }
-            | Self::ReplayReplacementRole { accepted, .. } => accepted
+            Self::CloseAccessAndIngress { accepted } => accepted
+                .required
+                .replacement
+                .as_ref()
+                .unwrap_or(&accepted.required.predecessor),
+            Self::ReplayReplacementRole { accepted, .. } => accepted
                 .required
                 .replacement
                 .as_ref()

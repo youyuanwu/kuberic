@@ -18,6 +18,7 @@ use kuberic_runtime::protocol::types::{
     ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
     StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
 };
+use sha2::{Digest, Sha256};
 
 fn identity() -> ReplicaIdentity {
     ReplicaIdentity {
@@ -305,12 +306,24 @@ fn public_v1_session_renewal_commands_round_trip_with_one_kind_per_layer() {
             accepted: configuration_pending,
         },
     ];
-    for command in commands {
+    let expected_json_sha256 = [
+        "1d80825ec662b09baa81700558eb2b57eaf2423a52ca6779271de7e88cf92845",
+        "7f68901fa3c287915192259838eba920f196c855e64b9a4f43cc26857ee29d5f",
+        "0a132183aca9d5441d071962c6dc1e889855ace1eaa1ba0a6db084c2b4fbec65",
+        "3fd0f587726675d40a1b70e2f5484d5288fd2fb036bd59cef404c8fb118a6ed0",
+    ];
+    for (index, command) in commands.into_iter().enumerate() {
         let expected_endpoint = command.expected_endpoint().clone();
         let history = PublicV1HistoryCommand::SessionRenewal {
             command: Box::new(command),
         };
         let json = serde_json::to_value(&history).unwrap();
+        let canonical_json = serde_json::to_vec(&history).unwrap();
+        let digest = Sha256::digest(&canonical_json)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(digest, expected_json_sha256[index]);
         assert_eq!(
             json.get("kind").and_then(serde_json::Value::as_str),
             Some("sessionRenewal")

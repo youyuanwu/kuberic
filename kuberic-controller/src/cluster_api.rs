@@ -59,6 +59,7 @@ pub enum EffectRecord {
         pod_name: Option<String>,
         pvc_name: Option<String>,
     },
+    RoutePrimary(ReplicaIdentity),
     ReplaceStatus,
     Execute(ProtocolCommand),
 }
@@ -2968,6 +2969,11 @@ impl ClusterApi for InMemoryClusterApi {
             .ok_or(ControllerError::ObservationStale)?;
         service.spec.get_or_insert_default().selector =
             Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), selector)]));
+        if let Some(primary) = primary {
+            state
+                .effects
+                .push(EffectRecord::RoutePrimary(primary.clone()));
+        }
         Ok(())
     }
 

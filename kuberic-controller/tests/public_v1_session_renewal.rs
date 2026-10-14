@@ -349,6 +349,16 @@ async fn hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_ret
 fn public_v1_peer_withdrawal_advances_epoch_without_role_replay() {
     let required = requirement(ProcessSessionRenewalReason::PeerWithdrawal);
     required.validate().unwrap();
+    let accepted = PublicV1SessionRenewalStatus::required(required.clone()).unwrap();
+    let close = plan_public_v1_session_renewal(&accepted, &[]).unwrap();
+    assert!(matches!(
+        renewal_command(&close),
+        PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. }
+    ));
+    assert_eq!(
+        renewal_command(&close).expected_endpoint(),
+        &required.predecessor
+    );
     let pending = pending_barriers(required.clone());
     let updated = accept_public_v1_session_epoch_updated(
         &pending,

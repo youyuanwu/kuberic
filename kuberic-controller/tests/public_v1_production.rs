@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kube::ResourceExt;
-use kuberic_controller::cluster_api::{EffectRecord, InMemoryClusterApi};
+use kuberic_controller::cluster_api::{
+    EffectRecord, InMemoryClusterApi, PublicV1OperationApi, PublicV1Scope,
+};
 use kuberic_controller::crd::{INSTANCE_LABEL, KubericSet, KubericSetSpec};
 use kuberic_controller::observation::{RawAgentObservation, RawObservation};
 use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
@@ -502,6 +504,19 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                 .iter()
                 .any(|pvc| pvc.metadata.name.as_deref() == Some("sample-2-data"))
         );
+        let authority_operation = replacement_authority.operation_id.clone();
+        let authority_predecessor = replacement_authority.predecessor.clone();
+        let scope = PublicV1Scope {
+            namespace: "default".into(),
+            name: "sample".into(),
+            resource_uid: ResourceUid::new("resource-1"),
+        };
+        let effects_start = api.effects().await.len();
+        let mut bound_target = None;
+        let mut build_seen = false;
+        let mut admitted_with_authority = false;
+        let mut predecessor_cleaned_with_authority = false;
+        let mut rebind_rejected = false;
 
         let mut stable = false;
         for iteration in 0..200 {
@@ -512,12 +527,91 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                     api.observation().await
                 ),
             };
+            let observed = api.observation().await;
+            let authority = observed
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref());
+            if let Some(authority) = authority {
+                assert_eq!(authority.operation_id, authority_operation);
+                assert_eq!(authority.predecessor, authority_predecessor);
+                if let Some(target) = authority.replacement.as_ref() {
+                    if let Some(bound) = &bound_target {
+                        assert_eq!(target, bound);
+                    } else {
+                        bound_target = Some(target.clone());
+                    }
+                    if !rebind_rejected {
+                        assert!(
+                            api.bind_public_v1_replacement(
+                                &scope,
+                                &authority_operation,
+                                target,
+                            )
+                            .await
+                            .is_err()
+                        );
+                        rebind_rejected = true;
+                    }
+                }
+            }
+            let effects = api.effects().await;
+            let build_dispatched = effects[effects_start..].iter().any(|effect| {
+                matches!(
+                    effect,
+                    EffectRecord::Execute(
+                        kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(
+                            command
+                        )
+                    ) if matches!(
+                        command.intent.program,
+                        Some(
+                            kuberic_runtime::protocol::public_operations::PublicOperationProgram::Build(_)
+                        )
+                    )
+                )
+            });
+            if build_dispatched && !build_seen {
+                build_seen = true;
+                let authority = authority.expect("Build retains replacement authority");
+                assert_eq!(authority.replacement.as_ref(), bound_target.as_ref());
+            }
+            if let Some(target) = bound_target.as_ref() {
+                let admitted = observed
+                    .set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.public_v1_topology.as_ref())
+                    .and_then(|topology| topology.configuration().ok())
+                    .is_some_and(|configuration| {
+                        configuration
+                            .members
+                            .iter()
+                            .any(|member| member.identity == target.replica)
+                    });
+                let predecessor_present = observed
+                    .pvcs
+                    .iter()
+                    .any(|pvc| pvc.metadata.name.as_deref() == Some("sample-2-data"));
+                if admitted && predecessor_present {
+                    assert!(authority.is_some());
+                    admitted_with_authority = true;
+                }
+                if admitted && !predecessor_present && authority.is_some() {
+                    predecessor_cleaned_with_authority = true;
+                }
+            }
             if action.kind == ReconcileKind::Stable {
                 stable = true;
                 break;
             }
         }
         assert!(stable, "Public V1 replacement did not converge");
+        assert!(rebind_rejected);
+        assert!(build_seen);
+        assert!(admitted_with_authority);
+        assert!(predecessor_cleaned_with_authority);
         let observed = api.observation().await;
         let replacement = observed
             .agents
@@ -788,34 +882,47 @@ async fn production_reconciler_transfers_routing_before_removing_current_primary
         observed.set.spec.replicas = 2;
         api.set_observation(observed).await;
         let start = api.effects().await.len();
-        let mut restarted_after_swap = false;
+        let mut restarted_after_handoff = false;
         let mut remove_seen = false;
         for _ in 0..240 {
             reconciler.reconcile("default", "sample").await.unwrap();
             let effects = api.effects().await;
             let new_effects = &effects[start..];
-            if !restarted_after_swap
-                && new_effects.iter().any(|effect| {
-                    matches!(
-                        effect,
-                        EffectRecord::Execute(
-                            kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(
-                                command
-                            )
-                        ) if matches!(
-                            command.intent.program,
-                            Some(
-                                kuberic_runtime::protocol::public_operations::PublicOperationProgram::Swap { .. }
-                            )
-                        )
-                    )
-                })
-            {
-                reconciler = Reconciler::new(
-                    api.clone(),
-                    kuberic_controller::production_evaluation_config(0, 1, 1),
-                );
-                restarted_after_swap = true;
+            if !restarted_after_handoff {
+                let observed = api.observation().await;
+                let handoff = observed
+                    .set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.public_v1_topology.as_ref())
+                    .and_then(|topology| topology.configuration().ok())
+                    .filter(|configuration| {
+                        configuration.members.len() == 3
+                            && configuration.primary_id != ReplicaId::new(3)
+                            && configuration.members.iter().any(|member| {
+                                member.identity.replica_id == ReplicaId::new(3)
+                                    && member.role == ReplicaRole::ActiveSecondary
+                            })
+                    });
+                if handoff.is_some() {
+                    assert_eq!(
+                        observed
+                            .agents
+                            .values()
+                            .filter(|agent| matches!(
+                                agent,
+                                RawAgentObservation::PublicV1Report(report)
+                                    if report.write_status == AccessStatus::Granted
+                            ))
+                            .count(),
+                        1
+                    );
+                    reconciler = Reconciler::new(
+                        api.clone(),
+                        kuberic_controller::production_evaluation_config(0, 1, 1),
+                    );
+                    restarted_after_handoff = true;
+                }
             }
             if new_effects.iter().any(|effect| {
                 matches!(
@@ -871,10 +978,12 @@ async fn production_reconciler_transfers_routing_before_removing_current_primary
             }
         }
         let effects = api.effects().await;
-        assert!(restarted_after_swap);
+        assert!(restarted_after_handoff);
         assert!(remove_seen);
-        assert!(effects[start..].iter().any(|effect| {
-            matches!(
+        let new_effects = &effects[start..];
+        let catch_up = new_effects
+            .iter()
+            .position(|effect| matches!(
                 effect,
                 EffectRecord::Execute(
                     kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
@@ -884,8 +993,41 @@ async fn production_reconciler_transfers_routing_before_removing_current_primary
                         kuberic_runtime::protocol::public_operations::PublicOperationProgram::CatchUp { .. }
                     )
                 )
-            )
-        }));
+            ))
+            .expect("CatchUp effect");
+        let swap = new_effects
+            .iter()
+            .position(|effect| matches!(
+                effect,
+                EffectRecord::Execute(
+                    kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
+                ) if matches!(
+                    command.intent.program,
+                    Some(
+                        kuberic_runtime::protocol::public_operations::PublicOperationProgram::Swap { .. }
+                    )
+                )
+            ))
+            .expect("Swap effect");
+        let route = new_effects
+            .iter()
+            .position(|effect| matches!(effect, EffectRecord::RoutePrimary(_)))
+            .expect("route effect");
+        let remove = new_effects
+            .iter()
+            .position(|effect| matches!(
+                effect,
+                EffectRecord::Execute(
+                    kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
+                ) if matches!(
+                    command.intent.program,
+                    Some(
+                        kuberic_runtime::protocol::public_operations::PublicOperationProgram::Remove(_)
+                    )
+                )
+            ))
+            .expect("Remove effect");
+        assert!(catch_up < swap && swap < route && route < remove);
     })
     .await
     .expect("Public V1 primary removal ordering exceeded 270 seconds");
