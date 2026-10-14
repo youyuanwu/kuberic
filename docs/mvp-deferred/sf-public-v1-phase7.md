@@ -58,8 +58,8 @@
 - Status: DEFERRED
 - Reason: Repeating every mature source/provider test inside a cluster would duplicate coverage and materially increase runtime without proving a distinct deployment-specific failure for each case.
 - MVP alternative: Run the complete replacement boundary through existing nextest/provider tiers and retain bootstrap, replacement, and failover as the owned KinD deployment scenarios.
-- Revisit when: A demonstrated defect shows that an additional material-bound behavior has a distinct image or deployment failure mode not covered by the representative exact-OCI journey.
-- Evidence: `docs/features/kuberic/testing.md` separates source/provider, PostgreSQL and live-cluster tiers; `docs/features/kuberic/stateless-default-replicator.md` requires exact release evidence while preserving bounded verification.
+- Revisit when: A demonstrated defect shows that an additional material-bound behavior has a distinct image or deployment failure mode not covered by the owned bootstrap/replacement/failover journey.
+- Evidence: `docs/features/kuberic/testing.md` separates source/provider, PostgreSQL and live-cluster tiers and documents the existing Cargo, nextest, provider, Docker, Kustomize, CI, and KinD verification paths.
 
 ### P7D-09: Broad mutation-testing framework for replacement eligibility
 - Status: DEFERRED
