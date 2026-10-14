@@ -39,3 +39,31 @@
 - MVP alternative: Keep state providers authoritative for application bytes, progress, retained history and copy state.
 - Revisit when: A selected consumer requires the V2 transactional contract after the public-only V1 replacement is stable and activated.
 - Evidence: `docs/features/kuberic/service-fabric-alignment.md` places optional V2 after the Phase 7 public-only V1 replacement.
+
+### P7D-06: Dedicated reproducible-build or attestation infrastructure
+- Status: DEFERRED
+- Reason: Phase 7A needs one verifiable material identity and immutable artifact evidence, but it does not publish images or promise an external supply-chain attestation contract.
+- MVP alternative: Materialize one tracked-file build/test tree and bind its content digest, test archive, OCI layouts, manifests, results and canonical evidence through the repository's standard-library release script.
+- Revisit when: Phase 7B publication or a separately approved provenance, SBOM or external-attestation requirement needs independent verification outside repository CI.
+- Evidence: `README.md` documents source/local-CI distribution rather than published images; `docs/features/kuberic/stateless-default-replicator.md` requires immutable cutover evidence without prescribing a new attestation framework.
+
+### P7D-07: Generic host-side custom-provider storage introspection
+- Status: DEFERRED
+- Reason: Provider formats and durable application state are provider-owned, and the protected Public V1 interfaces expose no generic storage-format classification contract.
+- MVP alternative: Reject old replacement-agent and supported in-repository provider state at their existing boundaries; require each independent custom Replicator to classify and reject its own prior provider storage before participation.
+- Revisit when: A separately approved public provider-storage classification contract can be added without violating protected interface stability.
+- Evidence: `docs/features/kuberic/stateless-default-replicator.md` assigns application bytes and progress to the provider; the project requirement forbids changes to the protected Replicator and StateProvider method sets.
+
+### P7D-08: Full Phase 6 behavioral matrix inside KinD
+- Status: DEFERRED
+- Reason: Repeating every mature source/provider test inside a cluster would duplicate coverage and materially increase runtime without proving a distinct deployment-specific failure for each case.
+- MVP alternative: Run the complete Phase 6 boundary from one canonical tracked-material test archive and run the defined startup, lifecycle, failover, replacement-build, capability, transport and shutdown subset against the exact OCI images.
+- Revisit when: A demonstrated defect shows that an additional material-bound behavior has a distinct image or deployment failure mode not covered by the representative exact-OCI journey.
+- Evidence: `docs/features/kuberic/testing.md` separates source/provider, PostgreSQL and live-cluster tiers; `docs/features/kuberic/stateless-default-replicator.md` requires exact release evidence while preserving bounded verification.
+
+### P7D-09: Broad mutation-testing framework for replacement eligibility
+- Status: DEFERRED
+- Reason: KSF-16 needs proof that its concrete eligibility oracle detects semantic reintroduction, not an exhaustive mutation-testing campaign or new harness.
+- MVP alternative: Maintain exact source, artifact and runtime-registration allowlists and one differently named extra-owner or endpoint mutation fixture that must fail eligibility.
+- Revisit when: A regression escapes the allowlist model or the replacement capability surface expands enough that one representative mutation no longer validates the oracle.
+- Evidence: `docs/features/kuberic/service-fabric-alignment.md` defines KSF-16 as the legacy-continuation guard; the existing project test strategy favors bounded, risk-specific checks over a new general framework.
