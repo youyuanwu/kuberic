@@ -543,14 +543,39 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                         bound_target = Some(target.clone());
                     }
                     if !rebind_rejected {
+                        let before = authority.clone();
+                        let mut conflicting = target.clone();
+                        conflicting.replica.instance_id =
+                            ReplicaInstanceId::new("conflicting-replacement-pod");
+                        conflicting.replica.agent_generation =
+                            kuberic_runtime::protocol::types::AgentGeneration::new(
+                                "conflicting-replacement-generation",
+                            );
+                        conflicting.storage =
+                            ReplicaStorageIdentity::Persistent {
+                                pod_uid: PodUid::new("conflicting-replacement-pod"),
+                                pvc_uid: PvcUid::new("conflicting-replacement-pvc"),
+                            };
+                        conflicting.storage_generation =
+                            StorageGeneration::new("conflicting-replacement-storage");
                         assert!(
                             api.bind_public_v1_replacement(
                                 &scope,
                                 &authority_operation,
-                                target,
+                                &conflicting,
                             )
                             .await
                             .is_err()
+                        );
+                        assert_eq!(
+                            api.observation()
+                                .await
+                                .set
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.public_v1_replacement.as_ref())
+                                .unwrap(),
+                            &before
                         );
                         rebind_rejected = true;
                     }
