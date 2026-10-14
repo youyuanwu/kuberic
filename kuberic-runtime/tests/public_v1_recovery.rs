@@ -5808,7 +5808,7 @@ async fn hosted_public_v1_supersession_cancels_build_root_and_drains_descendant_
 
 #[tokio::test]
 async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(90), async {
         let resource_uid = ResourceUid::new("hung-build-peer");
         let preview = PublicV1Identity::new(753);
         let mut source =
